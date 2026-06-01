@@ -8,7 +8,6 @@ from typing import Any
 import yaml
 
 from .catalog import normalize_ollama_models, normalize_stack_profiles, normalize_vllm_models
-from .hardware import detect_inventory
 from .paths import config_root, data_root
 
 CONFIG_FILE = Path("config.yaml")
@@ -289,12 +288,12 @@ def normalized_catalogs(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def initial_config() -> dict[str, Any]:
-    inventory = detect_inventory()
-    default_profile = "qwen-mixed" if inventory.get("gpu_count", 0) >= 4 else "workstation-safe"
+    # SmolLM2-135M is tiny (~270 MB) and runs on a single small GPU, so it is a
+    # safe out-of-the-box default regardless of detected hardware.
     return {
         "name": "local-llm-stack",
         "backend": "compose",
-        "active_profile": default_profile,
+        "active_profile": "smollm2-135m-single",
         "catalog": {
             "builtin_models": True,
             "builtin_profiles": True,
