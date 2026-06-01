@@ -292,7 +292,7 @@ def test_kubeai_deploy_rerenders_from_updated_local_values(tmp_path: Path, monke
     def fake_deploy_rendered_artifacts(deployment: dict) -> None:
         observed["source"] = deployment["resource_profiles_source"]
 
-    monkeypatch.setattr(cli_mod, "deploy_rendered_artifacts", fake_deploy_rendered_artifacts)
+    monkeypatch.setattr(cli_mod.commands_runtime, "deploy_rendered_artifacts", fake_deploy_rendered_artifacts)
     cli_mod.DeployCLI.main(
         argv=False,
         detach=False,
@@ -325,7 +325,7 @@ def test_switch_apply_persists_only_active_profile_and_uses_transient_overrides(
         observed["namespace"] = deployment["cluster"]["namespace"]
         observed["profile"] = deployment["serving_profile"]["public_name"]
 
-    monkeypatch.setattr(cli_mod, "deploy_rendered_artifacts", fake_deploy_rendered_artifacts)
+    monkeypatch.setattr(cli_mod.commands_profile, "deploy_rendered_artifacts", fake_deploy_rendered_artifacts)
     cli_mod.SwitchCLI.main(
         argv=False,
         profile="qwen2-5-7b-instruct-turbo-default",
@@ -444,7 +444,7 @@ def test_kubeai_status_namespace_error_is_actionable(tmp_path: Path, monkeypatch
     def fake_status(namespace: str) -> None:
         raise cli_mod.CommandError(f"Command failed in namespace {namespace}")
 
-    monkeypatch.setattr(cli_mod, "kubeai_print_status", fake_status)
+    monkeypatch.setattr(cli_mod.commands_runtime, "kubeai_print_status", fake_status)
     try:
         cli_mod.StatusCLI.main(argv=False)
     except SystemExit as ex:

@@ -27,7 +27,7 @@ tests = [
 infer-stack = "infer_stack.cli:main"
 
 [tool.setuptools]
-packages = ["infer_stack", "infer_stack.backends"]
+packages = ["infer_stack", "infer_stack.backends", "infer_stack.cli"]
 include-package-data = true
 
 [tool.setuptools.package-data]
