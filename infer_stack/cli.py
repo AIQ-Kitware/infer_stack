@@ -64,7 +64,6 @@ from .docker_utils import (
     our_published_ports,
 )
 from .env_utils import parse_env_file
-from .exporters import export_benchmark_bundle
 from .hardware import detect_inventory, simulate_inventory
 from .kubeai_ops import CommandError, deploy_rendered_artifacts, print_status as kubeai_print_status
 from .paths import (
@@ -1637,63 +1636,6 @@ class KubeaiSyncResourceProfilesCLI(_PathOverridesMixin):
 
 
 # ---------------------------------------------------------------------------
-# Export / bundle commands (transitional; helm_audit owns the canonical path)
-# ---------------------------------------------------------------------------
-
-
-class _ExportBundleCLI(_SwitchPathOverridesCLI):
-    """Shared body for ``export-benchmark-bundle`` / ``export-helm-bundle``."""
-
-    profile = scfg.Value(None, type=str, position=1, help="Profile name to export.")
-    base_url = scfg.Value(None, type=str)
-    output_dir = scfg.Value(None, type=str)
-
-    @classmethod
-    def main(cls, argv=1, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        _apply_path_overrides(config)
-        if not config.profile:
-            raise SystemExit(f"{cls.__command__}: missing required profile name")
-        cfg = config_for_runtime(config)
-        plan = build_plan(
-            cfg,
-            profile_name=config.profile,
-            allow_unsupported=effective_allow_unsupported(config, cfg),
-            inventory=effective_inventory(config),
-        )
-        ensure_renderable(plan)
-        print(
-            "Benchmark bundle export here is transitional; prefer the helm_audit "
-            "integration layer for CRFM HELM bundle generation."
-        )
-        output_dir = None
-        if config.output_dir:
-            output_dir = Path(config.output_dir)
-            if not output_dir.is_absolute():
-                output_dir = Path.cwd() / output_dir
-        result = export_benchmark_bundle(
-            plan["deployment"],
-            base_url=config.base_url,
-            output_dir=output_dir,
-        )
-        print(f"Wrote {result['bundle_path']}")
-        print(f"Wrote {result['model_deployments_path']}")
-        return 0
-
-
-class ExportBenchmarkBundleCLI(_ExportBundleCLI):
-    """Export a benchmark bundle (transitional; helm_audit owns the canonical path)."""
-
-    __command__ = "export-benchmark-bundle"
-
-
-class ExportHelmBundleCLI(_ExportBundleCLI):
-    """Alias of export-benchmark-bundle that emits the legacy helm/ layout."""
-
-    __command__ = "export-helm-bundle"
-
-
-# ---------------------------------------------------------------------------
 # Runtime commands
 # ---------------------------------------------------------------------------
 
@@ -2808,8 +2750,6 @@ class ManageCLI(scfg.ModalCLI):
     describe_profile = DescribeProfileCLI
     verify_profile = VerifyProfileCLI
     kubeai_sync_resource_profiles = KubeaiSyncResourceProfilesCLI
-    export_benchmark_bundle = ExportBenchmarkBundleCLI
-    export_helm_bundle = ExportHelmBundleCLI
 
     # Runtime
     up = UpCLI

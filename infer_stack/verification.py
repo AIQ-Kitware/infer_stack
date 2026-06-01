@@ -4,16 +4,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import KUBEAI_GENERATED_SUBDIR, normalized_output
-from .exporters import benchmark_bundle_dir, helm_bundle_dir
 from .profile_runtime import default_base_url
 
 
 def verify_profile(deployment: dict[str, Any]) -> dict[str, Any]:
     service = deployment.get("services", [])[0] if deployment.get("services") else {}
-    profile_name = deployment["serving_profile"]["name"]
     output_root = Path(normalized_output(deployment.get("output"))["generated_dir"])
-    bundle_dir = benchmark_bundle_dir(profile_name, generated_dir=output_root)
-    legacy_bundle_dir = helm_bundle_dir(profile_name, generated_dir=output_root)
     expected = {
         "public_name": deployment["serving_profile"]["public_name"],
         "logical_model_name": service.get("logical_model_name", ""),
@@ -23,8 +19,6 @@ def verify_profile(deployment: dict[str, Any]) -> dict[str, Any]:
         "generated_artifacts": {
             "compose": str(output_root / "docker-compose.yml"),
             "kubeai_models": str(output_root / KUBEAI_GENERATED_SUBDIR / "models.yaml"),
-            "benchmark_bundle_dir": str(bundle_dir),
-            "legacy_helm_bundle_dir": str(legacy_bundle_dir),
         },
     }
     checks = {

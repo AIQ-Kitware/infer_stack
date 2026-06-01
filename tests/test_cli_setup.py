@@ -456,11 +456,12 @@ def test_kubeai_status_namespace_error_is_actionable(tmp_path: Path, monkeypatch
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict[str, object]) -> None:
-        self._payload = payload
+    """Minimal stand-in matching what ``_ready_openai_probe`` reads from a response."""
 
-    def raise_for_status(self) -> None:
-        return None
+    def __init__(self, payload: dict[str, object], *, status_code: int = 200, text: str = "") -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.text = text
 
     def json(self) -> dict[str, object]:
         return self._payload
