@@ -1072,8 +1072,14 @@ def _preflight_check_ports(cfg: dict[str, Any]) -> None:
     else:
         if (gateways.get("litellm") or {}).get("enabled") and ports.get("litellm"):
             candidates.append(("litellm", int(ports["litellm"]), "0.0.0.0"))
-        if (frontends.get("open_webui") or {}).get("enabled") and ports.get("open_webui"):
+        if (frontends.get("open_webui") or {}).get("enabled") and (frontends.get("open_webui") or {}).get("publish_port", True) and ports.get("open_webui"):
             candidates.append(("open-webui", int(ports["open_webui"]), "0.0.0.0"))
+        reverse_proxy = frontends.get("reverse_proxy") or {}
+        if reverse_proxy.get("enabled"):
+            if reverse_proxy.get("publish_http", True):
+                candidates.append(("reverse-proxy-http", int(reverse_proxy.get("http_port") or ports.get("reverse_proxy_http") or 80), reverse_proxy.get("http_bind_host") or "0.0.0.0"))
+            if reverse_proxy.get("publish_https", True):
+                candidates.append(("reverse-proxy-https", int(reverse_proxy.get("https_port") or ports.get("reverse_proxy_https") or 443), reverse_proxy.get("https_bind_host") or "0.0.0.0"))
         ollama = providers.get("ollama") or {}
         if ollama.get("enabled") and ollama.get("publish_port") and ports.get("ollama"):
             candidates.append(("ollama", int(ports["ollama"]), "127.0.0.1"))

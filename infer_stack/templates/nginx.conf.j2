@@ -1,0 +1,84 @@
+# Rendered by infer-stack.  To take full manual control, set
+# frontends.reverse_proxy.config_path to an existing nginx config file.
+upstream infer_stack_target {
+    server {{ rp.target_service }}:{{ rp.target_port }};
+}
+
+{% macro proxy_location(rp) %}
+location / {
+    proxy_pass         {{ rp.target_scheme }}://infer_stack_target;
+    proxy_redirect     off;
+    proxy_http_version 1.1;
+    proxy_cache_bypass $http_upgrade;
+    proxy_set_header   Upgrade $http_upgrade;
+    proxy_set_header   Connection "upgrade";
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   X-Forwarded-Host $server_name;
+    proxy_buffer_size           {{ rp.proxy_buffer_size }};
+    proxy_buffers               {{ rp.proxy_buffers }};
+    proxy_busy_buffers_size     {{ rp.proxy_busy_buffers_size }};
+    proxy_connect_timeout {{ rp.proxy_connect_timeout }};
+    proxy_read_timeout {{ rp.proxy_read_timeout }};
+    proxy_send_timeout {{ rp.proxy_send_timeout }};
+{% if rp.proxy_buffering is not none %}
+    proxy_buffering {{ 'on' if rp.proxy_buffering else 'off' }};
+{% endif %}
+{% if rp.proxy_cache is not none %}
+    proxy_cache {{ rp.proxy_cache }};
+{% endif %}
+    client_max_body_size {{ rp.client_max_body_size }};
+}
+{% endmacro %}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ rp.server_name }};
+{% if rp.ssl.enabled and rp.force_https %}
+
+    return 301 https://$host$request_uri;
+{% else %}
+
+{{ proxy_location(rp)|indent(4, true) }}
+{% endif %}
+}
+
+{% if rp.ssl.enabled %}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {{ rp.server_name }};
+
+    ssl_certificate {{ rp.ssl.certificate_container_path }};
+    ssl_certificate_key {{ rp.ssl.certificate_key_container_path }};
+{% if rp.ssl.dhparam %}
+    ssl_dhparam {{ rp.ssl.dhparam_container_path }};
+{% endif %}
+    ssl_protocols {{ rp.ssl.protocols }};
+    ssl_ciphers {{ rp.ssl.ciphers }};
+    ssl_prefer_server_ciphers {{ 'on' if rp.ssl.prefer_server_ciphers else 'off' }};
+    ssl_session_cache {{ rp.ssl.session_cache }};
+    ssl_ecdh_curve {{ rp.ssl.ecdh_curve }};
+    ssl_session_tickets {{ 'on' if rp.ssl.session_tickets else 'off' }};
+    ssl_stapling {{ 'on' if rp.ssl.stapling else 'off' }};
+    ssl_stapling_verify {{ 'on' if rp.ssl.stapling_verify else 'off' }};
+{% if rp.resolver %}
+    resolver {{ rp.resolver | join(' ') }} valid=300s;
+    resolver_timeout {{ rp.resolver_timeout }};
+{% endif %}
+{% if rp.hsts.enabled %}
+    add_header Strict-Transport-Security "max-age={{ rp.hsts.max_age }}{% if rp.hsts.include_subdomains %}; includeSubdomains{% endif %}{% if rp.hsts.preload %}; preload{% endif %}" always;
+{% endif %}
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+
+{{ proxy_location(rp)|indent(4, true) }}
+{% if rp.extra_config %}
+
+{{ rp.extra_config }}
+{% endif %}
+}
+{% endif %}

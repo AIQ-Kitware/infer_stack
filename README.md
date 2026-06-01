@@ -304,6 +304,83 @@ open_webui:
 and re-render. Existing accounts stored in the `postgres-open-webui`
 volume are preserved across the toggle.
 
+### Reverse proxy (TLS) and LDAP
+
+Open WebUI can be fronted by an opt-in nginx TLS reverse proxy, and its
+login can be backed by an LDAP directory. Both are off by default and
+configured as ordinary config fields. The built-in `openwebui-tls-ldap`
+profile wires them together as a worked example (Ollama + Open WebUI
+behind nginx, no public Open WebUI/Ollama ports); see
+[`examples/openwebui-tls-ldap/`](examples/openwebui-tls-ldap/).
+
+```bash
+infer-stack setup --backend compose --profile openwebui-tls-ldap
+```
+
+**Reverse proxy.** Enable it under `frontends.reverse_proxy`. It renders
+an nginx service plus a generated `state.runtime/nginx.conf`:
+
+```yaml
+frontends:
+  reverse_proxy:
+    enabled: true
+    target: open_webui        # or litellm / ollama / a custom upstream
+    server_name: host.example.com
+    ssl:
+      enabled: true
+      certificate: ./certs/site.crt
+      certificate_key: ./certs/site.key
+      dhparam: ./dhparam.pem   # optional
+```
+
+When `ssl.enabled` is true, port 80 redirects to HTTPS (`force_https`)
+and the cert/key/dhparam host paths are bind-mounted read-only. When
+`ssl.enabled` is false, only HTTP is published (HTTPS publishing is
+gated on TLS so you never get a `:443` mapping with nothing listening).
+
+> **Path caveat.** Relative `certificate`/`certificate_key`/`dhparam`/
+> `config_path` values are written verbatim into the generated
+> `docker-compose.yml`, so Docker Compose resolves them **relative to the
+> generated directory** (where the compose file lives), not your CWD.
+> `infer-stack render` warns when a referenced cert or config file is not
+> found. Use absolute paths if you want to avoid the ambiguity.
+
+**LDAP.** Enable it under `frontends.open_webui.ldap`. The directory
+settings render as Open WebUI `LDAP_*` environment variables, and
+secrets/site-specific values are emitted as `.env` placeholders
+(`LDAP_HOST`, `LDAP_PASSWD`, `LDAP_SEARCH_BASE`, …) so you can fill them
+in after the first render without re-touching the compose YAML:
+
+```yaml
+frontends:
+  open_webui:
+    ldap:
+      enabled: true
+      env_defaults:
+        LDAP_PORT: '636'
+        LDAP_USE_TLS: 'true'
+        LDAP_ATTRIBUTE_FOR_USERNAME: uid
+```
+
+**Manual escape hatches.** When the typed renderer is not enough, drop
+to manual control without leaving infer-stack:
+
+* `frontends.reverse_proxy.config_path` — mount an existing nginx config
+  file instead of rendering one.
+* `frontends.reverse_proxy.extra_config` — inject extra directives into
+  the rendered HTTPS `server` block.
+* Every rendered service (`ollama`, vLLM runtimes, `litellm`,
+  `open_webui`, `reverse_proxy`) accepts generic overrides:
+  `extra_env`, `env_file`, `extra_volumes`, `extra_hosts`, `labels`,
+  `additional_ports`, and `gpus` (scalar `all`/count or a structured
+  device-request list).
+
+Field precedence (lowest to highest) is: top-level config section
+(`reverse_proxy:` / `open_webui:` / `ollama:`) → the matching
+`frontends.*` / `providers.*` / `gateways.*` section → the active
+profile. Newer configs should prefer the `frontends.*` / `providers.*`
+form shown above.
+
 ### Persistent state and database layout
 
 Compose renders stateful services only when their components are enabled:

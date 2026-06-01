@@ -22,6 +22,68 @@ profiles:
         enabled: true
         provider: ollama
     routes: {}
+  openwebui-tls-ldap:
+    description: Ollama + Open WebUI behind an nginx TLS reverse proxy with LDAP login,
+      and no public Ollama/Open WebUI ports. Fill in LDAP and TLS settings in
+      config.yaml/.env before using on a real host.
+    providers:
+      ollama:
+        enabled: true
+        gpu_indices: auto
+        gpus: all
+        publish_port: false
+        keep_alive: 2m
+        context_length: 4096
+        num_parallel: 0
+        max_loaded_models: 1
+        max_queue: 8
+        extra_env:
+          OLLAMA_FLASH_ATTENTION: '1'
+          OLLAMA_NO_CLOUD: 'true'
+          OLLAMA_SCHED_SPREAD: 'true'
+    gateways:
+      litellm:
+        enabled: false
+    frontends:
+      open_webui:
+        enabled: true
+        provider: ollama
+        auth: true
+        publish_port: false
+        gpus: all
+        ldap:
+          enabled: true
+          server_label: OpenLDAP
+          server_host: ${LDAP_HOST}
+          server_port: ${LDAP_PORT}
+          use_tls: ${LDAP_USE_TLS}
+          validate_cert: ${LDAP_VALIDATE_CERTS}
+          app_dn: ${LDAP_BASEDN}
+          app_password: ${LDAP_PASSWD}
+          search_base: ${LDAP_SEARCH_BASE}
+          attribute_for_username: ${LDAP_ATTRIBUTE_FOR_USERNAME}
+          attribute_for_mail: mail
+          search_filter: ${LDAP_SEARCH_FILTER}
+          env_defaults:
+            LDAP_PORT: '636'
+            LDAP_USE_TLS: 'true'
+            LDAP_VALIDATE_CERTS: 'true'
+            LDAP_ATTRIBUTE_FOR_USERNAME: uid
+      reverse_proxy:
+        enabled: true
+        image: nginx:1.29.7-alpine
+        target: open_webui
+        server_name: openwebui.example.com
+        publish_http: true
+        publish_https: true
+        force_https: true
+        client_max_body_size: 1G
+        ssl:
+          enabled: true
+          certificate: ./certs/site.crt
+          certificate_key: ./certs/site.key
+          dhparam: ./dhparam.pem
+    routes: {}
   ollama-qwen3.5-4b-gateway:
     description: Qwen3.5 4B through Ollama behind LiteLLM/Open WebUI.
     providers:

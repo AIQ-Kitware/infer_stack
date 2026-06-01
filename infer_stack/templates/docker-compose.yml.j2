@@ -40,20 +40,49 @@ services:
     image: {{ lock.deployment.images.ollama }}
     container_name: ollama
     restart: unless-stopped
+{% if lock.deployment.providers.ollama.labels %}
+    labels:
+{% for key, value in lock.deployment.providers.ollama.labels.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.providers.ollama.env_file %}
+    env_file:
+{% for env_file in lock.deployment.providers.ollama.env_file %}
+      - {{ env_file }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.providers.ollama.extra_hosts %}
+    extra_hosts:
+{% for extra_host in lock.deployment.providers.ollama.extra_hosts %}
+      - {{ extra_host|compose_quote }}
+{% endfor %}
+{% endif %}
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      CUDA_VISIBLE_DEVICES: "{{ lock.deployment.providers.ollama.gpu_indices | join(',') }}"
-      OLLAMA_HOST: "{{ lock.deployment.providers.ollama.host }}"
-      OLLAMA_KEEP_ALIVE: "{{ lock.deployment.providers.ollama.keep_alive }}"
-      OLLAMA_CONTEXT_LENGTH: "{{ lock.deployment.providers.ollama.context_length }}"
-      OLLAMA_NUM_PARALLEL: "{{ lock.deployment.providers.ollama.num_parallel }}"
-      OLLAMA_MAX_LOADED_MODELS: "{{ lock.deployment.providers.ollama.max_loaded_models }}"
-      OLLAMA_MAX_QUEUE: "{{ lock.deployment.providers.ollama.max_queue }}"
+      CUDA_VISIBLE_DEVICES: {{ (lock.deployment.providers.ollama.gpu_indices | join(','))|compose_quote }}
+      OLLAMA_HOST: {{ lock.deployment.providers.ollama.host|compose_quote }}
+      OLLAMA_KEEP_ALIVE: {{ lock.deployment.providers.ollama.keep_alive|compose_quote }}
+      OLLAMA_CONTEXT_LENGTH: {{ lock.deployment.providers.ollama.context_length|compose_quote }}
+      OLLAMA_NUM_PARALLEL: {{ lock.deployment.providers.ollama.num_parallel|compose_quote }}
+      OLLAMA_MAX_LOADED_MODELS: {{ lock.deployment.providers.ollama.max_loaded_models|compose_quote }}
+      OLLAMA_MAX_QUEUE: {{ lock.deployment.providers.ollama.max_queue|compose_quote }}
+{% for key, value in lock.deployment.providers.ollama.extra_env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
     volumes:
       - {{ lock.deployment.state.ollama }}:/root/.ollama
-{% if lock.deployment.providers.ollama.publish_port %}
+{% for volume in lock.deployment.providers.ollama.extra_volumes %}
+      - {{ volume }}
+{% endfor %}
+{% if lock.deployment.providers.ollama.publish_port or lock.deployment.providers.ollama.additional_ports %}
     ports:
-  - "127.0.0.1:${INFER_STACK_OLLAMA_PORT:-{{ lock.deployment.ports.ollama or 11434 }}}:11434"
+{% if lock.deployment.providers.ollama.publish_port %}
+      - "127.0.0.1:{{ lock.deployment.ports.ollama or 11434 }}:11434"
+{% endif %}
+{% for port in lock.deployment.providers.ollama.additional_ports %}
+      - {{ port|compose_quote }}
+{% endfor %}
 {% endif %}
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
@@ -61,7 +90,9 @@ services:
       timeout: 10s
       retries: 30
       start_period: 60s
-{% if lock.deployment.providers.ollama.gpu_indices %}
+{% if lock.deployment.providers.ollama.gpus is not none %}
+{{ lock.deployment.providers.ollama.gpus|compose_gpus }}
+{% elif lock.deployment.providers.ollama.gpu_indices %}
     deploy:
       resources:
         reservations:
@@ -79,10 +110,25 @@ services:
     restart: unless-stopped
     ipc: host
     labels:
-      infer_stack.profile_name: "{{ svc.profile_name }}"
-      infer_stack.public_name: "{{ svc.profile_public_name }}"
-      infer_stack.logical_model_name: "{{ svc.logical_model_name }}"
-      infer_stack.protocol_mode: "{{ svc.protocol_mode }}"
+      infer_stack.profile_name: {{ svc.profile_name|compose_quote }}
+      infer_stack.public_name: {{ svc.profile_public_name|compose_quote }}
+      infer_stack.logical_model_name: {{ svc.logical_model_name|compose_quote }}
+      infer_stack.protocol_mode: {{ svc.protocol_mode|compose_quote }}
+{% for key, value in svc.labels.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% if svc.env_file %}
+    env_file:
+{% for env_file in svc.env_file %}
+      - {{ env_file }}
+{% endfor %}
+{% endif %}
+{% if svc.extra_hosts %}
+    extra_hosts:
+{% for extra_host in svc.extra_hosts %}
+      - {{ extra_host|compose_quote }}
+{% endfor %}
+{% endif %}
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       HF_TOKEN: ${HF_TOKEN}
@@ -98,9 +144,12 @@ services:
 {% if lock.deployment.vllm.enable_responses_api_store %}
       VLLM_ENABLE_RESPONSES_API_STORE: "1"
 {% endif %}
-      VLLM_LOGGING_LEVEL: "{{ lock.deployment.vllm.logging_level }}"
+      VLLM_LOGGING_LEVEL: {{ lock.deployment.vllm.logging_level|compose_quote }}
+{% for key, value in svc.extra_env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
     command:
-      - "{{ svc.hf_model_id }}"
+      - {{ svc.hf_model_id|compose_quote }}
       - --host
       - 0.0.0.0
       - --port
@@ -108,33 +157,33 @@ services:
       - --api-key
       - ${VLLM_BACKEND_API_KEY}
       - --served-model-name
-      - "{{ svc.served_model_name }}"
+      - {{ svc.served_model_name|compose_quote }}
       - --tensor-parallel-size
-      - "{{ svc.tensor_parallel_size }}"
+      - {{ svc.tensor_parallel_size|compose_quote }}
       - --data-parallel-size
-      - "{{ svc.data_parallel_size }}"
+      - {{ svc.data_parallel_size|compose_quote }}
       - --max-model-len
-      - "{{ svc.max_model_len }}"
+      - {{ svc.max_model_len|compose_quote }}
       - --gpu-memory-utilization
-      - "{{ svc.gpu_memory_utilization }}"
+      - {{ svc.gpu_memory_utilization|compose_quote }}
       - --max-num-batched-tokens
-      - "{{ svc.max_num_batched_tokens }}"
+      - {{ svc.max_num_batched_tokens|compose_quote }}
       - --max-num-seqs
-      - "{{ svc.max_num_seqs }}"
+      - {{ svc.max_num_seqs|compose_quote }}
 {% if svc.enable_prefix_caching %}
       - --enable-prefix-caching
 {% endif %}
 {% if svc.enable_auto_tool_choice %}
       - --enable-auto-tool-choice
       - --tool-call-parser
-      - "{{ svc.tool_call_parser }}"
+      - {{ svc.tool_call_parser|compose_quote }}
 {% endif %}
 {% if svc.reasoning_enabled and svc.reasoning_parser %}
       - --reasoning-parser
-      - "{{ svc.reasoning_parser }}"
+      - {{ svc.reasoning_parser|compose_quote }}
 {% endif %}
 {% for extra_arg in svc.extra_args %}
-      - "{{ extra_arg }}"
+      - {{ extra_arg|compose_quote }}
 {% endfor %}
     volumes:
       - {{ lock.deployment.state.hf_cache }}:/root/.cache/huggingface
@@ -142,14 +191,27 @@ services:
       - {{ lock.deployment.state.torch_cache }}:/root/.cache/torch
       - {{ lock.deployment.state.triton_cache }}:/root/.cache/triton
       - {{ lock.deployment.state.cuda_cache }}:/root/.cache/nvidia/ComputeCache
+{% for volume in svc.extra_volumes %}
+      - {{ volume }}
+{% endfor %}
+{% if svc.publish_port or svc.additional_ports %}
     ports:
+{% if svc.publish_port %}
       - "127.0.0.1:${INFER_STACK_VLLM_{{ loop.index0 }}_PORT:-{{ svc.host_port or (18000 + loop.index0) }}}:8000"
+{% endif %}
+{% for port in svc.additional_ports %}
+      - {{ port|compose_quote }}
+{% endfor %}
+{% endif %}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 30
       start_period: 1800s
+{% if svc.gpus is not none %}
+{{ svc.gpus|compose_gpus }}
+{% else %}
     deploy:
       resources:
         reservations:
@@ -157,6 +219,7 @@ services:
             - driver: nvidia
               device_ids: [{% for idx in svc.gpu_indices %}"{{ idx }}"{% if not loop.last %}, {% endif %}{% endfor %}]
               capabilities: [gpu]
+{% endif %}
 
 {% endfor %}
 {% if lock.deployment.gateways.litellm.enabled %}
@@ -164,6 +227,12 @@ services:
     image: {{ lock.deployment.images.litellm }}
     container_name: litellm
     restart: unless-stopped
+{% if lock.deployment.gateways.litellm.labels %}
+    labels:
+{% for key, value in lock.deployment.gateways.litellm.labels.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
     depends_on:
       postgres-litellm:
         condition: service_healthy
@@ -172,10 +241,25 @@ services:
     # dependency edges prevents Compose from restarting LiteLLM on every vLLM
     # model swap. Smoke tests and clients should retry until the selected
     # upstream model is healthy.
+{% if lock.deployment.gateways.litellm.env_file %}
+    env_file:
+{% for env_file in lock.deployment.gateways.litellm.env_file %}
+      - {{ env_file }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.gateways.litellm.extra_hosts %}
+    extra_hosts:
+{% for extra_host in lock.deployment.gateways.litellm.extra_hosts %}
+      - {{ extra_host|compose_quote }}
+{% endfor %}
+{% endif %}
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       VLLM_BACKEND_API_KEY: ${VLLM_BACKEND_API_KEY}
       DATABASE_URL: postgresql://${LITELLM_POSTGRES_USER}:${LITELLM_POSTGRES_PASSWORD}@postgres-litellm:5432/${LITELLM_POSTGRES_DB}
+{% for key, value in lock.deployment.gateways.litellm.extra_env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
     command:
       - --config
       - /app/config.yaml
@@ -185,8 +269,19 @@ services:
       - "1"
     volumes:
       - {{ lock.deployment.state.runtime }}/litellm_config.yaml:/app/config.yaml:ro
+{% for volume in lock.deployment.gateways.litellm.extra_volumes %}
+      - {{ volume }}
+{% endfor %}
+{% if lock.deployment.gateways.litellm.additional_ports or lock.deployment.ports.litellm %}
     ports:
       - "${INFER_STACK_LITELLM_PORT:-{{ lock.deployment.ports.litellm or 14042 }}}:4000"
+{% for port in lock.deployment.gateways.litellm.additional_ports %}
+      - {{ port|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.gateways.litellm.gpus is not none %}
+{{ lock.deployment.gateways.litellm.gpus|compose_gpus }}
+{% endif %}
 
 {% endif %}
 {% if lock.deployment.frontends.open_webui.enabled %}
@@ -194,13 +289,44 @@ services:
     image: {{ lock.deployment.images.open_webui }}
     container_name: open-webui
     restart: unless-stopped
+{% if lock.deployment.frontends.open_webui.labels %}
+    labels:
+{% for key, value in lock.deployment.frontends.open_webui.labels.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
     depends_on:
       postgres-open-webui:
         condition: service_healthy
+{% if lock.deployment.frontends.open_webui.provider == 'ollama' %}
+      ollama:
+        condition: service_started
+{% elif lock.deployment.frontends.open_webui.provider == 'litellm' %}
+      litellm:
+        condition: service_started
+{% endif %}
+{% if lock.deployment.frontends.open_webui.env_file %}
+    env_file:
+{% for env_file in lock.deployment.frontends.open_webui.env_file %}
+      - {{ env_file }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.open_webui.extra_hosts %}
+    extra_hosts:
+{% for extra_host in lock.deployment.frontends.open_webui.extra_hosts %}
+      - {{ extra_host|compose_quote }}
+{% endfor %}
+{% endif %}
     environment:
-      WEBUI_AUTH: "{{ 'True' if lock.deployment.frontends.open_webui.auth else 'False' }}"
+      WEBUI_AUTH: {{ ('True' if lock.deployment.frontends.open_webui.auth else 'False')|compose_quote }}
       ENABLE_PERSISTENT_CONFIG: "False"
       DATABASE_URL: postgresql://${OPENWEBUI_POSTGRES_USER}:${OPENWEBUI_POSTGRES_PASSWORD}@postgres-open-webui:5432/${OPENWEBUI_POSTGRES_DB}
+{% if lock.deployment.frontends.open_webui.webui_url %}
+      WEBUI_URL: {{ lock.deployment.frontends.open_webui.webui_url|compose_quote }}
+{% endif %}
+{% if lock.deployment.frontends.open_webui.cors_allow_origin %}
+      CORS_ALLOW_ORIGIN: {{ lock.deployment.frontends.open_webui.cors_allow_origin|compose_quote }}
+{% endif %}
 {% if lock.deployment.frontends.open_webui.provider == 'ollama' %}
       ENABLE_OLLAMA_API: "True"
       OLLAMA_BASE_URL: http://ollama:11434
@@ -210,8 +336,95 @@ services:
       OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
 {% endif %}
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+{% if lock.deployment.frontends.open_webui.ldap.enabled %}
+{% for key, value in lock.deployment.frontends.open_webui.ldap.env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
+{% for key, value in lock.deployment.frontends.open_webui.extra_env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
     volumes:
       - {{ lock.deployment.state.open_webui }}:/app/backend/data
+{% for volume in lock.deployment.frontends.open_webui.extra_volumes %}
+      - {{ volume }}
+{% endfor %}
+{% if lock.deployment.frontends.open_webui.publish_port or lock.deployment.frontends.open_webui.additional_ports %}
     ports:
+{% if lock.deployment.frontends.open_webui.publish_port %}
       - "${INFER_STACK_OPEN_WEBUI_PORT:-{{ lock.deployment.ports.open_webui or 13000 }}}:8080"
+{% endif %}
+{% for port in lock.deployment.frontends.open_webui.additional_ports %}
+      - {{ port|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.open_webui.gpus is not none %}
+{{ lock.deployment.frontends.open_webui.gpus|compose_gpus }}
+{% endif %}
+
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.enabled %}
+  {{ lock.deployment.frontends.reverse_proxy.service_name }}:
+    image: {{ lock.deployment.frontends.reverse_proxy.image }}
+    container_name: {{ lock.deployment.frontends.reverse_proxy.container_name }}
+    restart: unless-stopped
+{% if lock.deployment.frontends.reverse_proxy.labels %}
+    labels:
+{% for key, value in lock.deployment.frontends.reverse_proxy.labels.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.depends_on %}
+    depends_on:
+{% for service in lock.deployment.frontends.reverse_proxy.depends_on %}
+      - {{ service }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.env_file %}
+    env_file:
+{% for env_file in lock.deployment.frontends.reverse_proxy.env_file %}
+      - {{ env_file }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.extra_env %}
+    environment:
+{% for key, value in lock.deployment.frontends.reverse_proxy.extra_env.items() %}
+      {{ key }}: {{ value|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.extra_hosts %}
+    extra_hosts:
+{% for extra_host in lock.deployment.frontends.reverse_proxy.extra_hosts %}
+      - {{ extra_host|compose_quote }}
+{% endfor %}
+{% endif %}
+    volumes:
+      - {{ lock.deployment.frontends.reverse_proxy.nginx_config_path }}:/etc/nginx/conf.d/default.conf:ro
+{% if lock.deployment.frontends.reverse_proxy.ssl.enabled and lock.deployment.frontends.reverse_proxy.ssl.certificate %}
+      - {{ lock.deployment.frontends.reverse_proxy.ssl.certificate }}:{{ lock.deployment.frontends.reverse_proxy.ssl.certificate_container_path }}:ro
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.ssl.enabled and lock.deployment.frontends.reverse_proxy.ssl.certificate_key %}
+      - {{ lock.deployment.frontends.reverse_proxy.ssl.certificate_key }}:{{ lock.deployment.frontends.reverse_proxy.ssl.certificate_key_container_path }}:ro
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.ssl.enabled and lock.deployment.frontends.reverse_proxy.ssl.dhparam %}
+      - {{ lock.deployment.frontends.reverse_proxy.ssl.dhparam }}:{{ lock.deployment.frontends.reverse_proxy.ssl.dhparam_container_path }}:ro
+{% endif %}
+{% for volume in lock.deployment.frontends.reverse_proxy.extra_volumes %}
+      - {{ volume }}
+{% endfor %}
+{% if lock.deployment.frontends.reverse_proxy.publish_http or lock.deployment.frontends.reverse_proxy.publish_https or lock.deployment.frontends.reverse_proxy.additional_ports %}
+    ports:
+{% if lock.deployment.frontends.reverse_proxy.publish_http %}
+      - "{{ lock.deployment.frontends.reverse_proxy.http_bind_host }}{% if lock.deployment.frontends.reverse_proxy.http_bind_host %}:{% endif %}${INFER_STACK_REVERSE_PROXY_HTTP_PORT:-{{ lock.deployment.frontends.reverse_proxy.http_port }}}:80"
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.publish_https %}
+      - "{{ lock.deployment.frontends.reverse_proxy.https_bind_host }}{% if lock.deployment.frontends.reverse_proxy.https_bind_host %}:{% endif %}${INFER_STACK_REVERSE_PROXY_HTTPS_PORT:-{{ lock.deployment.frontends.reverse_proxy.https_port }}}:443"
+{% endif %}
+{% for port in lock.deployment.frontends.reverse_proxy.additional_ports %}
+      - {{ port|compose_quote }}
+{% endfor %}
+{% endif %}
+{% if lock.deployment.frontends.reverse_proxy.gpus is not none %}
+{{ lock.deployment.frontends.reverse_proxy.gpus|compose_gpus }}
+{% endif %}
 {% endif %}
