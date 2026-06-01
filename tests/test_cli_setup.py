@@ -455,6 +455,21 @@ def test_kubeai_status_namespace_error_is_actionable(tmp_path: Path, monkeypatch
     assert "setup --backend kubeai --namespace default" in text
 
 
+def test_status_reports_initialization_and_profile(tmp_path: Path) -> None:
+    # Before setup: status reports it is uninitialized and exits cleanly
+    # (no Docker / network / hardware probe required).
+    pre = run_cli(tmp_path, "status")
+    assert "Not initialized" in pre.stdout
+
+    # After setup: status reports the active profile and that it is not yet
+    # rendered, still without touching Docker.
+    run_cli(tmp_path, "setup", "--backend", "compose", "--profile", "smollm2-135m-single")
+    post = run_cli(tmp_path, "status")
+    assert "Not initialized" not in post.stdout
+    assert "active profile: smollm2-135m-single" in post.stdout
+    assert "rendered:       no" in post.stdout
+
+
 class _FakeResponse:
     """Minimal stand-in matching what ``_ready_openai_probe`` reads from a response."""
 

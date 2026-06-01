@@ -16,7 +16,7 @@ import scriptconfig as scfg
 import shlex
 import subprocess
 
-from .context import _apply_path_overrides, _as_mapping, backend_name, config_for_runtime, generated_dir, has_runtime_overrides, plan_path, render_is_stale, runtime_env_path
+from .context import _apply_path_overrides, _as_mapping, backend_name, config_for_runtime, config_path, config_root, generated_dir, has_runtime_overrides, kubeai_generated_dir, plan_path, render_is_stale, runtime_env_path
 from .compose import _compose_base_cmd, _compose_up_with_router_recreate, _kubeai_stub
 from .options import _BackendOverrideMixin, _ClusterOverridesMixin, _ComposeOverrideMixin, _PathOverridesMixin, _PlanOverridesCLI, _PortOverridesMixin
 from .commands_profile import RenderCLI
@@ -236,6 +236,107 @@ class EnvCLI(
         return 0
 
 
+def _enabled_components(deployment: dict[str, Any]) -> list[str]:
+    """Names of the components the resolved plan turned on."""
+    out: list[str] = []
+    providers = deployment.get("providers", {}) or {}
+    if (providers.get("ollama") or {}).get("enabled"):
+        out.append("ollama")
+    vllm = providers.get("vllm") or {}
+    if vllm.get("enabled"):
+        runtimes = vllm.get("runtimes") or {}
+        out.append(f"vllm({len(runtimes)})" if runtimes else "vllm")
+    if ((deployment.get("gateways", {}) or {}).get("litellm") or {}).get("enabled"):
+        out.append("litellm")
+    frontends = deployment.get("frontends", {}) or {}
+    if (frontends.get("open_webui") or {}).get("enabled"):
+        out.append("open_webui")
+    if (frontends.get("reverse_proxy") or {}).get("enabled"):
+        out.append("reverse_proxy")
+    return out
+
+
+def _access_endpoints(access: dict[str, Any]) -> list[tuple[str, str]]:
+    """(name, base_url) pairs from the resolved access map."""
+    out: list[tuple[str, str]] = []
+    for name, entry in (access or {}).items():
+        if isinstance(entry, dict) and entry.get("base_url"):
+            out.append((name, str(entry["base_url"])))
+    return out
+
+
+def _print_status_summary(cfg: dict[str, Any], *, initialized: bool) -> None:
+    """Print cheap, no-network context about the current stack.
+
+    Everything here comes from config.yaml, on-disk artifact existence, and the
+    already-resolved plan.yaml, so it never touches Docker, the network, or
+    hardware detection.
+    """
+    backend = backend_name(cfg)
+    print("infer-stack status")
+    print()
+    print(f"  initialized:    {'yes' if initialized else 'no'}  ({config_path()})")
+    print(f"  backend:        {backend}")
+    print(f"  active profile: {cfg.get('active_profile') or '<unset>'}")
+    print(f"  config dir:     {config_root()}")
+
+    out_dir = kubeai_generated_dir(cfg) if backend == "kubeai" else generated_dir(cfg)
+    rendered_marker = out_dir / ("models.yaml" if backend == "kubeai" else "docker-compose.yml")
+    print(f"  generated dir:  {out_dir}")
+
+    if not initialized:
+        print()
+        print(
+            "  Not initialized — run "
+            "`infer-stack setup --backend compose --profile <profile>` "
+            "to create config.yaml."
+        )
+        return
+
+    if rendered_marker.exists():
+        stale = render_is_stale(cfg)
+        print(f"  rendered:       yes{'  (stale — run `infer-stack render`)' if stale else ''}")
+    else:
+        print("  rendered:       no  (run `infer-stack render`)")
+
+    # The resolved view comes straight from plan.yaml (cheap file read; no
+    # hardware probe or re-resolution).
+    plan_file = plan_path(cfg)
+    if not plan_file.exists():
+        return
+    try:
+        plan = load_yaml(plan_file) or {}
+    except Exception:
+        return
+    deployment = plan.get("deployment", {}) or {}
+    validated = plan.get("validated", {}) or {}
+
+    description = (deployment.get("serving_profile", {}) or {}).get("description")
+    if description:
+        print(f"  description:    {description}")
+
+    if validated:
+        errors = validated.get("errors") or []
+        warnings = validated.get("warnings") or []
+        if errors:
+            vstate = f"{len(errors)} error(s)" + (f", {len(warnings)} warning(s)" if warnings else "")
+        elif warnings:
+            vstate = f"ok, {len(warnings)} warning(s)"
+        else:
+            vstate = "ok"
+        print(f"  validation:     {vstate}")
+
+    components = _enabled_components(deployment)
+    if components:
+        print(f"  components:     {', '.join(components)}")
+
+    endpoints = _access_endpoints(deployment.get("access", {}) or {})
+    if endpoints:
+        print("  endpoints:")
+        for name, url in endpoints:
+            print(f"    {name}: {url}")
+
+
 class StatusCLI(
     _PathOverridesMixin,
     _BackendOverrideMixin,
@@ -243,15 +344,24 @@ class StatusCLI(
     _PortOverridesMixin,
     _ClusterOverridesMixin,
 ):
-    """Show the runtime status of the rendered stack."""
+    """Show stack status: where config/artifacts live, the active profile,
+    whether it has been rendered, the resolved components/endpoints, and the
+    live container/cluster state."""
 
     @classmethod
     def main(cls, argv=1, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
+        initialized = config_path().exists()
+        cfg = config_for_runtime(config, allow_missing=True)
+        _print_status_summary(cfg, initialized=initialized)
+        if not initialized:
+            return 0
+
         if backend_name(cfg) == "kubeai":
             namespace = cfg.get("cluster", {}).get("namespace", "kubeai")
+            print()
+            print(f"cluster resources (namespace {namespace!r}):")
             try:
                 kubeai_print_status(namespace)
             except CommandError as ex:
@@ -262,6 +372,12 @@ class StatusCLI(
                     f"Original error: {ex}"
                 ) from ex
             return 0
+
+        compose_file = generated_dir(cfg) / "docker-compose.yml"
+        if not compose_file.exists():
+            return 0
+        print()
+        print("containers (docker compose ps):")
         proc = subprocess.run(_compose_base_cmd(cfg) + ["ps"])
         return int(proc.returncode)
 
