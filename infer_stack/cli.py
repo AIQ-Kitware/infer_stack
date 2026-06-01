@@ -232,19 +232,6 @@ def _arg_or_env(args_dict: dict[str, Any], attr: str, env_name: str, *, caster=N
         raise SystemExit(f"Invalid value for {env_name}: {env_value!r}") from ex
 
 
-def _configured_state_paths(state_root: str) -> dict[str, str]:
-    base = Path(state_root)
-    return {
-        "hf_cache": str(base / "hf-cache"),
-        "vllm_cache": str(base / "vllm-cache"),
-        "open_webui": str(base / "open-webui"),
-        "postgres_open_webui": str(base / "postgres-open-webui"),
-        "postgres_litellm": str(base / "postgres-litellm"),
-        "ollama": str(base / "ollama"),
-        "runtime": str(base / "runtime"),
-    }
-
-
 def apply_config_overrides(cfg: dict[str, Any], args: Any | None) -> dict[str, Any]:
     """Merge runtime overrides (CLI args + env vars) on top of ``cfg``.
 
@@ -292,18 +279,13 @@ def apply_config_overrides(cfg: dict[str, Any], args: Any | None) -> dict[str, A
     if postgres_port is not None:
         out["ports"]["postgres"] = postgres_port
 
-    state_root = _arg_or_env(overrides, "state_root", "INFER_STACK_STATE_ROOT")
-    if state_root:
-        out["state"].update(_configured_state_paths(state_root))
-
-    runtime_dir = _arg_or_env(overrides, "runtime_dir", "INFER_STACK_RUNTIME_DIR")
-    if runtime_dir:
-        out["state"]["runtime"] = runtime_dir
-
-    generated_dir_override = _arg_or_env(overrides, "generated_dir", "INFER_STACK_GENERATED_DIR")
-    if generated_dir_override:
-        out["output"]["generated_dir"] = generated_dir_override
-    elif not out["output"].get("generated_dir"):
+    # All rendered artifacts and bind-mount state live under a single root
+    # (``--data-dir`` / ``INFER_STACK_DATA_DIR``), which is baked into the
+    # absolute ``state.*`` and ``output.generated_dir`` paths at setup time.
+    # Granular per-knob path overrides were removed in favour of that one root;
+    # edit ``state.*`` / ``output.generated_dir`` in config.yaml directly for
+    # bespoke split layouts.
+    if not out["output"].get("generated_dir"):
         out["output"]["generated_dir"] = default_output_config()["generated_dir"]
 
     namespace = _arg_or_env(overrides, "namespace", "INFER_STACK_NAMESPACE")
@@ -335,7 +317,6 @@ _OVERRIDE_ATTRS = (
     "ingress_enabled",
     "simulate_hardware",
     "allowed_gpus",
-    "generated_dir",
 )
 
 _OVERRIDE_ENVS = (
@@ -348,7 +329,6 @@ _OVERRIDE_ENVS = (
     "INFER_STACK_NAMESPACE",
     "INFER_STACK_INGRESS_HOST",
     "INFER_STACK_INGRESS_ENABLED",
-    "INFER_STACK_GENERATED_DIR",
     "INFER_STACK_ALLOWED_GPUS",
 )
 
@@ -1127,7 +1107,6 @@ def _maybe_rerender(config: Any, cfg: dict[str, Any]) -> None:
             namespace=overrides.get("namespace"),
             ingress_host=overrides.get("ingress_host"),
             ingress_enabled=overrides.get("ingress_enabled"),
-            generated_dir=overrides.get("generated_dir"),
             allow_unsupported=bool(overrides.get("allow_unsupported")),
             simulate_hardware=overrides.get("simulate_hardware"),
             allowed_gpus=overrides.get("allowed_gpus"),
@@ -1190,18 +1169,6 @@ class _ClusterOverridesMixin(scfg.DataConfig):
     )
 
 
-class _GeneratedDirOverrideMixin(scfg.DataConfig):
-    generated_dir = scfg.Value(
-        None,
-        type=str,
-        help=(
-            "Directory to write rendered artifacts (docker-compose.yml, .env, "
-            "plan.yaml, kubeai/*) into. Defaults to <data-dir>/generated. May "
-            "also be set via INFER_STACK_GENERATED_DIR or output.generated_dir."
-        ),
-    )
-
-
 class _AllowUnsupportedMixin(scfg.DataConfig):
     allow_unsupported = scfg.Value(False, isflag=True, help="Allow validation errors when planning/rendering.")
 
@@ -1235,7 +1202,6 @@ class _PlanOverridesCLI(
     _ComposeOverrideMixin,
     _PortOverridesMixin,
     _ClusterOverridesMixin,
-    _GeneratedDirOverrideMixin,
     _AllowUnsupportedMixin,
     _SimulateHardwareMixin,
     _AllowedGpusMixin,
@@ -1291,13 +1257,10 @@ class SetupCLI(
     _ComposeOverrideMixin,
     _PortOverridesMixin,
     _ClusterOverridesMixin,
-    _GeneratedDirOverrideMixin,
 ):
     """Create / update config.yaml with the requested overrides applied."""
 
     reset = scfg.Value(False, isflag=True, help="Start from default config values before applying overrides.")
-    state_root = scfg.Value(None, type=str, help="Base directory for state.* paths.")
-    runtime_dir = scfg.Value(None, type=str, help="Override state.runtime specifically.")
     resource_profiles_file = scfg.Value(
         None,
         type=str,

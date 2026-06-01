@@ -23,9 +23,10 @@ Both can be overridden by env vars (``INFER_STACK_CONFIG_DIR`` /
 ``--data-dir``. The CLI flags translate into process-wide overrides via
 ``set_config_root`` / ``set_data_root``.
 
-Per-knob overrides (``INFER_STACK_GENERATED_DIR``,
-``INFER_STACK_STATE_ROOT``, ``output.generated_dir`` in ``config.yaml``,
-etc.) continue to apply on top of these roots.
+``--data-dir`` is the single knob for "put everything I generate in one
+place": at ``setup`` time it is baked into the absolute ``state.*`` and
+``output.generated_dir`` paths written to ``config.yaml``. For a bespoke
+split layout, edit those fields in ``config.yaml`` directly.
 """
 from __future__ import annotations
 

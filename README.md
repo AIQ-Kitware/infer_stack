@@ -128,36 +128,38 @@ profiles:
 from never changes which config it reads or where it writes rendered
 artifacts:
 
-| What | Default location | Override |
+There are exactly two path roots:
+
+| What | Default location | How to relocate |
 | --- | --- | --- |
-| `config.yaml`, `models.yaml`, `kubeai-values.local.yaml` | `~/.config/infer_stack/` (resp. `$XDG_CONFIG_HOME`) | `INFER_STACK_CONFIG_DIR` env var, or `--config-dir` |
-| Rendered `generated/` (docker-compose.yml, plan.yaml, kubeai/*) and `state/` (hf-cache, postgres volumes, bind mounts) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `INFER_STACK_DATA_DIR` env var, or `--data-dir` |
+| `config.yaml`, `models.yaml`, `kubeai-values.local.yaml` | `~/.config/infer_stack/` (resp. `$XDG_CONFIG_HOME`) | `--config-dir` (or `INFER_STACK_CONFIG_DIR`) |
+| **Everything generated** — `generated/` (docker-compose.yml, .env, plan.yaml, kubeai/*) **and** `state/` (hf-cache, postgres volumes, Ollama store, runtime bind mounts) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `--data-dir` (or `INFER_STACK_DATA_DIR`) |
 
-Per-knob overrides still apply on top:
-
-* `--generated-dir /path/to/out` (or `INFER_STACK_GENERATED_DIR`, or
-  `output.generated_dir` in `config.yaml`) only moves the rendered
-  artifacts.
-* `--state-root /path` (or `INFER_STACK_STATE_ROOT`) moves all
-  `state.*` paths together. Individual `state.runtime` etc. can be
-  overridden in `config.yaml`.
-
-Examples:
+`--data-dir` is the single knob for "put everything I generate in one
+directory." Set it once at `setup`; it is baked into the absolute
+`state.*` and `output.generated_dir` paths written to `config.yaml`, so
+later commands don't need it again:
 
 ```bash
-# Point at a checkout-local config for ad-hoc experiments.
-INFER_STACK_CONFIG_DIR=$PWD infer-stack setup --backend compose --profile <p>
+# All rendered artifacts and bind-mount state land under one directory.
+infer-stack setup \
+  --backend compose \
+  --profile ollama-direct \
+  --data-dir /data/service/docker/vllm-stack
 
-# Send rendered artifacts somewhere other than ~/.cache.
-infer-stack render --data-dir /srv/infer-stack
-
-# Or just the rendered output, leaving state/ in the cache dir.
-infer-stack render --generated-dir /tmp/scratch-out
+infer-stack render --yes
 ```
 
-`--config-dir` / `--data-dir` are per-subcommand flags (they live on
-every subcommand), so they appear **after** the subcommand name on the
-CLI. For "set once, applies to everything" use the env vars instead.
+```bash
+# Keep config.yaml in a checkout for ad-hoc experiments.
+infer-stack setup --config-dir $PWD --backend compose --profile <p> --data-dir $PWD/stack
+```
+
+`--config-dir` / `--data-dir` live on every subcommand, so they appear
+**after** the subcommand name. For "set once for the whole shell" use the
+env vars instead. For a bespoke split layout (e.g. big `state/` on a data
+disk, artifacts elsewhere), edit `state.*` / `output.generated_dir` in
+`config.yaml` directly.
 
 ## Constraining placement to specific GPUs
 

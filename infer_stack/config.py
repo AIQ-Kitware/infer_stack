@@ -15,9 +15,9 @@ CONFIG_FILE = Path("config.yaml")
 MODELS_FILE = Path("models.yaml")
 
 # Filenames/sub-paths inside whatever the resolved generated directory is.
-# The directory itself is configurable per machine and per user via
-# ``output.generated_dir`` in config.yaml, the ``INFER_STACK_GENERATED_DIR``
-# env var, or the ``--generated-dir`` CLI flag.
+# The directory itself defaults to ``<data-dir>/generated`` and is relocated
+# by pointing ``--data-dir`` / ``INFER_STACK_DATA_DIR`` at a new root at setup
+# time (or by editing ``output.generated_dir`` in config.yaml directly).
 GENERATED_DIR_NAME = "generated"
 PLAN_FILENAME = "plan.yaml"
 KUBEAI_GENERATED_SUBDIR = "kubeai"

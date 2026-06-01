@@ -58,12 +58,10 @@ completions-only. The goal is to validate Docker, GPU placement, LiteLLM, and
 Open WebUI before committing to a large model.
 
 ```bash
-mkdir -p /data/service/docker/infer-stack
 infer-stack setup \
   --backend compose \
   --profile gpt2-single \
-  --state-root /data/service/docker/infer-stack \
-  --generated-dir /data/service/docker/infer-stack/generated
+  --data-dir /data/service/docker/infer-stack
 ```
 
 Render and start:

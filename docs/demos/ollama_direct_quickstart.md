@@ -22,12 +22,10 @@ GPUs, while current official vLLM images require newer CUDA compute capability.
 ## 1. Set up the profile
 
 ```bash
-mkdir -p /data/service/docker/infer-stack
 infer-stack setup \
   --backend compose \
   --profile ollama-direct \
-  --state-root /data/service/docker/infer-stack \
-  --generated-dir /data/service/docker/infer-stack/generated
+  --data-dir /data/service/docker/infer-stack
 ```
 
 For a two-card 1080 Ti machine, the built-in profile pins Ollama to GPUs
