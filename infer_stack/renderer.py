@@ -10,8 +10,10 @@ def render_from_lock(lock_data: dict, *, assume_yes: bool = True) -> None:
     are unaffected. CLI entry points pass ``assume_yes=False`` to surface
     the per-file diff confirmation prompt.
     """
-    backend = str(lock_data.get("deployment", {}).get("backend", "compose")).lower()
-    if backend == "kubeai":
+    backend = str(
+        lock_data.get('deployment', {}).get('backend', 'compose')
+    ).lower()
+    if backend == 'kubeai':
         render_kubeai_artifacts(lock_data, assume_yes=assume_yes)
         return
     render_compose_artifacts(lock_data, assume_yes=assume_yes)

@@ -21,6 +21,7 @@ This package was split out of a single ``cli.py`` module. The layers are:
 ``infer_stack.cli`` re-exports the previously top-level names so existing
 ``from infer_stack.cli import ...`` imports keep working.
 """
+
 from __future__ import annotations
 
 import requests  # noqa: F401  (cli_mod.requests is patched in tests)
@@ -74,7 +75,12 @@ from .commands_runtime import (
     StopCLI,
     UpCLI,
 )
-from .commands_smoke import BenchmarkCLI, DiagnoseCLI, SmokeTestCLI, WaitReadyCLI
+from .commands_smoke import (
+    BenchmarkCLI,
+    DiagnoseCLI,
+    SmokeTestCLI,
+    WaitReadyCLI,
+)
 from .compose import (  # noqa: F401
     _compose_has_service,
     _litellm_delete_missed_config_model,
@@ -111,8 +117,8 @@ from .probes import (  # noqa: F401
 
 class ManageCLI(scfg.ModalCLI):
     description = (
-        "Render and run vLLM serving profiles through the Compose or KubeAI "
-        "backends. Primary workflow: setup -> render -> up (or deploy)."
+        'Render and run vLLM serving profiles through the Compose or KubeAI '
+        'backends. Primary workflow: setup -> render -> up (or deploy).'
     )
 
     # Config / profile management
@@ -159,5 +165,5 @@ def main(argv=None) -> int:
     return int(rv) if rv is not None else 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

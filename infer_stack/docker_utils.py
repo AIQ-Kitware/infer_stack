@@ -16,24 +16,26 @@ class PortInUseError(RuntimeError):
 
     def __init__(self, busy: list[tuple[str, int, str]]):
         self.busy = busy
-        lines = ["Cannot start stack: required host ports are already bound."]
+        lines = ['Cannot start stack: required host ports are already bound.']
         for service, port, host in busy:
-            lines.append("")
-            lines.append(f"  {service}: {host}:{port} is already in use. Find the owner with:")
+            lines.append('')
+            lines.append(
+                f'  {service}: {host}:{port} is already in use. Find the owner with:'
+            )
             lines.append(f"    ss -tlnp 'sport = :{port}'")
-            lines.append(f"    sudo lsof -nP -iTCP:{port} -sTCP:LISTEN")
-            lines.append(f"    docker ps --filter publish={port}")
-        lines.append("")
+            lines.append(f'    sudo lsof -nP -iTCP:{port} -sTCP:LISTEN')
+            lines.append(f'    docker ps --filter publish={port}')
+        lines.append('')
         lines.append(
-            "If the conflict is a leftover container from this stack, run "
-            "`infer-stack down` (or `docker stop <name> && docker rm <name>`)."
+            'If the conflict is a leftover container from this stack, run '
+            '`infer-stack down` (or `docker stop <name> && docker rm <name>`).'
         )
         lines.append(
-            "If a non-stack process owns the port, either stop that process or "
-            "pick different ports: `infer-stack setup --litellm-port N "
-            "--open-webui-port M`, then `infer-stack render --yes`."
+            'If a non-stack process owns the port, either stop that process or '
+            'pick different ports: `infer-stack setup --litellm-port N '
+            '--open-webui-port M`, then `infer-stack render --yes`.'
         )
-        super().__init__("\n".join(lines))
+        super().__init__('\n'.join(lines))
 
 
 def our_published_ports(
@@ -50,11 +52,18 @@ def our_published_ports(
     if not compose_file.exists():
         return set()
     cmd = compose_cmd.split() + [
-        "-f", str(compose_file), "--env-file", str(env_file),
-        "ps", "--format", "json",
+        '-f',
+        str(compose_file),
+        '--env-file',
+        str(env_file),
+        'ps',
+        '--format',
+        'json',
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=10
+        )
     except (subprocess.SubprocessError, OSError):
         return set()
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -64,7 +73,7 @@ def our_published_ports(
     # (newer versions) or a single JSON array (older versions). Accept both.
     text = proc.stdout.strip()
     parsed_any = False
-    if text.startswith("["):
+    if text.startswith('['):
         try:
             for entry in json.loads(text):
                 _collect_published_ports(entry, ports)
@@ -85,8 +94,8 @@ def our_published_ports(
 
 
 def _collect_published_ports(entry: dict, out: set[int]) -> None:
-    for pub in entry.get("Publishers") or []:
-        port = pub.get("PublishedPort")
+    for pub in entry.get('Publishers') or []:
+        port = pub.get('PublishedPort')
         if isinstance(port, int) and port > 0:
             out.add(port)
 
@@ -122,14 +131,24 @@ def check_ports_available(ports: list[tuple[str, int, str]]) -> None:
         raise PortInUseError(busy)
 
 
-def _cmd(compose_cmd: str, compose_file: Path, env_file: Path, *args: str) -> list[str]:
-    return compose_cmd.split() + ["-f", str(compose_file), "--env-file", str(env_file), *args]
+def _cmd(
+    compose_cmd: str, compose_file: Path, env_file: Path, *args: str
+) -> list[str]:
+    return compose_cmd.split() + [
+        '-f',
+        str(compose_file),
+        '--env-file',
+        str(env_file),
+        *args,
+    ]
 
 
 def run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
-        raise DockerCommandError(f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}")
+        raise DockerCommandError(
+            f'Command failed with exit code {proc.returncode}: {" ".join(cmd)}'
+        )
 
 
 def compose_up(
@@ -142,13 +161,13 @@ def compose_up(
     force_recreate: bool = False,
     services: list[str] | None = None,
 ) -> None:
-    args = ["up"]
+    args = ['up']
     if detach:
-        args.append("-d")
+        args.append('-d')
     if remove_orphans:
-        args.append("--remove-orphans")
+        args.append('--remove-orphans')
     if force_recreate:
-        args.append("--force-recreate")
+        args.append('--force-recreate')
     if services:
         args.extend(services)
     run(_cmd(compose_cmd, compose_file, env_file, *args))
@@ -156,10 +175,10 @@ def compose_up(
 
 def compose_down(compose_cmd: str, compose_file: Path, env_file: Path) -> None:
     """Stop and remove services. Never removes named volumes."""
-    run(_cmd(compose_cmd, compose_file, env_file, "down", "--remove-orphans"))
+    run(_cmd(compose_cmd, compose_file, env_file, 'down', '--remove-orphans'))
 
 
-def docker_rm_dirs(dirs: list[Path], docker_cmd: str = "docker") -> None:
+def docker_rm_dirs(dirs: list[Path], docker_cmd: str = 'docker') -> None:
     """Delete host directories that may be root-owned (written by Docker containers).
 
     Groups paths by parent directory and removes them from inside a temporary
@@ -173,9 +192,18 @@ def docker_rm_dirs(dirs: list[Path], docker_cmd: str = "docker") -> None:
             by_parent[d.parent].append(d.name)
 
     for parent, names in by_parent.items():
-        targets = " ".join(f"/mnt/{name}" for name in names)
-        cmd = [docker_cmd, "run", "--rm", "-v", f"{parent}:/mnt", "alpine",
-               "sh", "-c", f"rm -rf {targets}"]
+        targets = ' '.join(f'/mnt/{name}' for name in names)
+        cmd = [
+            docker_cmd,
+            'run',
+            '--rm',
+            '-v',
+            f'{parent}:/mnt',
+            'alpine',
+            'sh',
+            '-c',
+            f'rm -rf {targets}',
+        ]
         run(cmd)
 
 
@@ -193,8 +221,10 @@ def compose_recreate_router(
     on user actions, so a brief stale-cache window is fine, while
     force-recreating would log every user out of the chat UI.
     """
-    args = ["up"]
+    args = ['up']
     if detach:
-        args.append("-d")
-    args.extend(["--remove-orphans", "--force-recreate", "--no-deps", "litellm"])
+        args.append('-d')
+    args.extend(
+        ['--remove-orphans', '--force-recreate', '--no-deps', 'litellm']
+    )
     run(_cmd(compose_cmd, compose_file, env_file, *args))

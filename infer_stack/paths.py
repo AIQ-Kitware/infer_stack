@@ -28,6 +28,7 @@ place": at ``setup`` time it is baked into the absolute ``state.*`` and
 ``output.generated_dir`` paths written to ``config.yaml``. For a bespoke
 split layout, edit those fields in ``config.yaml`` directly.
 """
+
 from __future__ import annotations
 
 import os
@@ -36,19 +37,19 @@ from pathlib import Path
 import ubelt as ub
 
 
-CONFIG_DIR_ENV = "INFER_STACK_CONFIG_DIR"
-DATA_DIR_ENV = "INFER_STACK_DATA_DIR"
+CONFIG_DIR_ENV = 'INFER_STACK_CONFIG_DIR'
+DATA_DIR_ENV = 'INFER_STACK_DATA_DIR'
 
 _config_root_override: Path | None = None
 _data_root_override: Path | None = None
 
 
 def _default_config_root() -> Path:
-    return Path(ub.Path.appdir("infer_stack", type="config"))
+    return Path(ub.Path.appdir('infer_stack', type='config'))
 
 
 def _default_data_root() -> Path:
-    return Path(ub.Path.appdir("infer_stack", type="data"))
+    return Path(ub.Path.appdir('infer_stack', type='data'))
 
 
 def config_root() -> Path:
@@ -75,7 +76,9 @@ def set_config_root(path: Path | str | None) -> None:
     Pass ``None`` to clear the override and fall back to env var / default.
     """
     global _config_root_override
-    _config_root_override = Path(path).expanduser() if path is not None else None
+    _config_root_override = (
+        Path(path).expanduser() if path is not None else None
+    )
 
 
 def set_data_root(path: Path | str | None) -> None:

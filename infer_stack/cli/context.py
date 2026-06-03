@@ -77,18 +77,18 @@ def load_config() -> dict[str, Any]:
     path = config_path()
     if not path.exists():
         raise SystemExit(
-            f"No config.yaml found at {path}. Run "
-            "`infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default` first, "
-            f"or point ${CONFIG_DIR_ENV} / --config-dir at an existing config."
+            f'No config.yaml found at {path}. Run '
+            '`infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default` first, '
+            f'or point ${CONFIG_DIR_ENV} / --config-dir at an existing config.'
         )
     return _hydrate_config_defaults(load_yaml(path))
 
 
 def runtime_dir_for_config(cfg: dict[str, Any]) -> Path:
-    state = cfg.get("state", {})
-    runtime = state.get("runtime")
+    state = cfg.get('state', {})
+    runtime = state.get('runtime')
     if not runtime:
-        return data_root() / "runtime"
+        return data_root() / 'runtime'
     p = Path(runtime)
     if p.is_absolute():
         return p
@@ -96,15 +96,15 @@ def runtime_dir_for_config(cfg: dict[str, Any]) -> Path:
 
 
 def runtime_env_path(cfg: dict[str, Any]) -> Path:
-    return generated_dir(cfg) / ".env"
+    return generated_dir(cfg) / '.env'
 
 
 def runtime_litellm_config_path(cfg: dict[str, Any]) -> Path:
-    return runtime_dir_for_config(cfg) / "litellm_config.yaml"
+    return runtime_dir_for_config(cfg) / 'litellm_config.yaml'
 
 
 def backend_name(cfg: dict[str, Any]) -> str:
-    return str(cfg.get("backend", "compose")).lower()
+    return str(cfg.get('backend', 'compose')).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +125,11 @@ def _env_bool(name: str) -> bool | None:
     if value is None:
         return None
     lowered = value.lower()
-    if lowered in {"1", "true", "yes", "on", "enabled"}:
+    if lowered in {'1', 'true', 'yes', 'on', 'enabled'}:
         return True
-    if lowered in {"0", "false", "no", "off", "disabled"}:
+    if lowered in {'0', 'false', 'no', 'off', 'disabled'}:
         return False
-    raise SystemExit(f"Invalid boolean value for {name}: {value!r}")
+    raise SystemExit(f'Invalid boolean value for {name}: {value!r}')
 
 
 def _env_int(name: str) -> int | None:
@@ -139,7 +139,7 @@ def _env_int(name: str) -> int | None:
     try:
         return int(value)
     except ValueError as ex:
-        raise SystemExit(f"Invalid integer value for {name}: {value!r}") from ex
+        raise SystemExit(f'Invalid integer value for {name}: {value!r}') from ex
 
 
 def _as_mapping(args: Any) -> dict[str, Any]:
@@ -153,14 +153,16 @@ def _as_mapping(args: Any) -> dict[str, Any]:
     """
     if args is None:
         return {}
-    if hasattr(args, "asdict"):
+    if hasattr(args, 'asdict'):
         return dict(args.asdict())
-    if hasattr(args, "__dict__"):
+    if hasattr(args, '__dict__'):
         return dict(vars(args))
     return dict(args)
 
 
-def _arg_or_env(args_dict: dict[str, Any], attr: str, env_name: str, *, caster=None):
+def _arg_or_env(
+    args_dict: dict[str, Any], attr: str, env_name: str, *, caster=None
+):
     """Look up ``attr`` in the args dict, falling back to env var ``env_name``."""
     value = args_dict.get(attr)
     if value is not None:
@@ -173,10 +175,12 @@ def _arg_or_env(args_dict: dict[str, Any], attr: str, env_name: str, *, caster=N
     try:
         return caster(env_value)
     except ValueError as ex:
-        raise SystemExit(f"Invalid value for {env_name}: {env_value!r}") from ex
+        raise SystemExit(f'Invalid value for {env_name}: {env_value!r}') from ex
 
 
-def apply_config_overrides(cfg: dict[str, Any], args: Any | None) -> dict[str, Any]:
+def apply_config_overrides(
+    cfg: dict[str, Any], args: Any | None
+) -> dict[str, Any]:
     """Merge runtime overrides (CLI args + env vars) on top of ``cfg``.
 
     ``args`` may be an ``argparse.Namespace``, a ``scfg.DataConfig`` instance,
@@ -186,42 +190,44 @@ def apply_config_overrides(cfg: dict[str, Any], args: Any | None) -> dict[str, A
         return deepcopy(cfg)
     overrides = _as_mapping(args)
     out = deepcopy(cfg)
-    out.setdefault("runtime", {})
-    out.setdefault("ports", {})
-    out.setdefault("state", {})
-    out.setdefault("output", {})
-    out.setdefault("cluster", {})
-    out["cluster"].setdefault("ingress", {})
+    out.setdefault('runtime', {})
+    out.setdefault('ports', {})
+    out.setdefault('state', {})
+    out.setdefault('output', {})
+    out.setdefault('cluster', {})
+    out['cluster'].setdefault('ingress', {})
 
-    backend = _arg_or_env(overrides, "backend", "INFER_STACK_BACKEND")
+    backend = _arg_or_env(overrides, 'backend', 'INFER_STACK_BACKEND')
     if backend:
-        out["backend"] = backend
+        out['backend'] = backend
 
-    profile = _arg_or_env(overrides, "profile", "INFER_STACK_PROFILE")
+    profile = _arg_or_env(overrides, 'profile', 'INFER_STACK_PROFILE')
     if profile:
-        out["active_profile"] = profile
+        out['active_profile'] = profile
 
-    compose_cmd = _arg_or_env(overrides, "compose_cmd", "INFER_STACK_COMPOSE_CMD")
+    compose_cmd = _arg_or_env(
+        overrides, 'compose_cmd', 'INFER_STACK_COMPOSE_CMD'
+    )
     if compose_cmd:
-        out["runtime"]["compose_cmd"] = compose_cmd
+        out['runtime']['compose_cmd'] = compose_cmd
 
-    litellm_port = overrides.get("litellm_port")
+    litellm_port = overrides.get('litellm_port')
     if litellm_port is None:
-        litellm_port = _env_int("INFER_STACK_LITELLM_PORT")
+        litellm_port = _env_int('INFER_STACK_LITELLM_PORT')
     if litellm_port is not None:
-        out["ports"]["litellm"] = litellm_port
+        out['ports']['litellm'] = litellm_port
 
-    open_webui_port = overrides.get("open_webui_port")
+    open_webui_port = overrides.get('open_webui_port')
     if open_webui_port is None:
-        open_webui_port = _env_int("INFER_STACK_OPEN_WEBUI_PORT")
+        open_webui_port = _env_int('INFER_STACK_OPEN_WEBUI_PORT')
     if open_webui_port is not None:
-        out["ports"]["open_webui"] = open_webui_port
+        out['ports']['open_webui'] = open_webui_port
 
-    postgres_port = overrides.get("postgres_port")
+    postgres_port = overrides.get('postgres_port')
     if postgres_port is None:
-        postgres_port = _env_int("INFER_STACK_POSTGRES_PORT")
+        postgres_port = _env_int('INFER_STACK_POSTGRES_PORT')
     if postgres_port is not None:
-        out["ports"]["postgres"] = postgres_port
+        out['ports']['postgres'] = postgres_port
 
     # All rendered artifacts and bind-mount state live under a single root
     # (``--data-dir`` / ``INFER_STACK_DATA_DIR``), which is baked into the
@@ -229,51 +235,55 @@ def apply_config_overrides(cfg: dict[str, Any], args: Any | None) -> dict[str, A
     # Granular per-knob path overrides were removed in favour of that one root;
     # edit ``state.*`` / ``output.generated_dir`` in config.yaml directly for
     # bespoke split layouts.
-    if not out["output"].get("generated_dir"):
-        out["output"]["generated_dir"] = default_output_config()["generated_dir"]
+    if not out['output'].get('generated_dir'):
+        out['output']['generated_dir'] = default_output_config()[
+            'generated_dir'
+        ]
 
-    namespace = _arg_or_env(overrides, "namespace", "INFER_STACK_NAMESPACE")
+    namespace = _arg_or_env(overrides, 'namespace', 'INFER_STACK_NAMESPACE')
     if namespace:
-        out["cluster"]["namespace"] = namespace
+        out['cluster']['namespace'] = namespace
 
-    ingress_host = _arg_or_env(overrides, "ingress_host", "INFER_STACK_INGRESS_HOST")
+    ingress_host = _arg_or_env(
+        overrides, 'ingress_host', 'INFER_STACK_INGRESS_HOST'
+    )
     if ingress_host:
-        out["cluster"]["ingress"]["host"] = ingress_host
+        out['cluster']['ingress']['host'] = ingress_host
 
-    ingress_enabled = overrides.get("ingress_enabled")
+    ingress_enabled = overrides.get('ingress_enabled')
     if ingress_enabled is None:
-        ingress_enabled = _env_bool("INFER_STACK_INGRESS_ENABLED")
+        ingress_enabled = _env_bool('INFER_STACK_INGRESS_ENABLED')
     if ingress_enabled is not None:
-        out["cluster"]["ingress"]["enabled"] = bool(ingress_enabled)
+        out['cluster']['ingress']['enabled'] = bool(ingress_enabled)
 
     return out
 
 
 _OVERRIDE_ATTRS = (
-    "profile",
-    "backend",
-    "compose_cmd",
-    "litellm_port",
-    "open_webui_port",
-    "postgres_port",
-    "namespace",
-    "ingress_host",
-    "ingress_enabled",
-    "simulate_hardware",
-    "allowed_gpus",
+    'profile',
+    'backend',
+    'compose_cmd',
+    'litellm_port',
+    'open_webui_port',
+    'postgres_port',
+    'namespace',
+    'ingress_host',
+    'ingress_enabled',
+    'simulate_hardware',
+    'allowed_gpus',
 )
 
 _OVERRIDE_ENVS = (
-    "INFER_STACK_BACKEND",
-    "INFER_STACK_PROFILE",
-    "INFER_STACK_COMPOSE_CMD",
-    "INFER_STACK_LITELLM_PORT",
-    "INFER_STACK_OPEN_WEBUI_PORT",
-    "INFER_STACK_POSTGRES_PORT",
-    "INFER_STACK_NAMESPACE",
-    "INFER_STACK_INGRESS_HOST",
-    "INFER_STACK_INGRESS_ENABLED",
-    "INFER_STACK_ALLOWED_GPUS",
+    'INFER_STACK_BACKEND',
+    'INFER_STACK_PROFILE',
+    'INFER_STACK_COMPOSE_CMD',
+    'INFER_STACK_LITELLM_PORT',
+    'INFER_STACK_OPEN_WEBUI_PORT',
+    'INFER_STACK_POSTGRES_PORT',
+    'INFER_STACK_NAMESPACE',
+    'INFER_STACK_INGRESS_HOST',
+    'INFER_STACK_INGRESS_ENABLED',
+    'INFER_STACK_ALLOWED_GPUS',
 )
 
 
@@ -288,8 +298,10 @@ def has_runtime_overrides(args: Any | None) -> bool:
 
 def effective_allow_unsupported(args: Any | None, cfg: dict[str, Any]) -> bool:
     overrides = _as_mapping(args)
-    arg_value = bool(overrides.get("allow_unsupported"))
-    policy_value = bool(cfg.get("policy", {}).get("allow_unsupported_render", False))
+    arg_value = bool(overrides.get('allow_unsupported'))
+    policy_value = bool(
+        cfg.get('policy', {}).get('allow_unsupported_render', False)
+    )
     return arg_value or policy_value
 
 
@@ -299,22 +311,24 @@ def _parse_allowed_gpus(raw: Any) -> list[int] | None:
     Accepts ints (when the value comes from ``data=`` kwargs in the
     programmatic API), as well as strings of the form ``"1"`` or ``"1,3"``.
     """
-    if raw is None or raw == "":
+    if raw is None or raw == '':
         return None
     if isinstance(raw, (list, tuple)):
         items = list(raw)
     else:
-        items = [x.strip() for x in str(raw).split(",") if x.strip()]
+        items = [x.strip() for x in str(raw).split(',') if x.strip()]
     try:
         return [int(x) for x in items]
     except (TypeError, ValueError) as ex:
         raise SystemExit(
-            f"Invalid --allowed-gpus value {raw!r}: expected a comma-separated "
+            f'Invalid --allowed-gpus value {raw!r}: expected a comma-separated '
             f"list of integer GPU indices (e.g. '1' or '1,3'). {ex}"
         )
 
 
-def _filter_inventory_to_allowed(inventory: dict[str, Any], allowed: list[int] | None) -> dict[str, Any]:
+def _filter_inventory_to_allowed(
+    inventory: dict[str, Any], allowed: list[int] | None
+) -> dict[str, Any]:
     """Return a new inventory containing only the GPUs whose ``index`` is in ``allowed``.
 
     Real indices are preserved — there is no renumbering — so a profile
@@ -324,8 +338,10 @@ def _filter_inventory_to_allowed(inventory: dict[str, Any], allowed: list[int] |
     if not allowed:
         return inventory
     allowed_set = set(allowed)
-    filtered = [g for g in inventory.get("gpus", []) if g.get("index") in allowed_set]
-    return {"gpu_count": len(filtered), "gpus": filtered}
+    filtered = [
+        g for g in inventory.get('gpus', []) if g.get('index') in allowed_set
+    ]
+    return {'gpu_count': len(filtered), 'gpus': filtered}
 
 
 def effective_inventory(args: Any | None) -> dict[str, Any] | None:
@@ -335,9 +351,9 @@ def effective_inventory(args: Any | None) -> dict[str, Any] | None:
     resolver falls back to ``detect_inventory()`` at plan time.
     """
     overrides = _as_mapping(args)
-    spec = overrides.get("simulate_hardware")
+    spec = overrides.get('simulate_hardware')
     allowed = _parse_allowed_gpus(
-        overrides.get("allowed_gpus") or _env_text("INFER_STACK_ALLOWED_GPUS")
+        overrides.get('allowed_gpus') or _env_text('INFER_STACK_ALLOWED_GPUS')
     )
     if not spec and allowed is None:
         return None
@@ -345,16 +361,18 @@ def effective_inventory(args: Any | None) -> dict[str, Any] | None:
     return _filter_inventory_to_allowed(base, allowed)
 
 
-def config_for_runtime(args: Any | None, *, allow_missing: bool = False) -> dict[str, Any]:
+def config_for_runtime(
+    args: Any | None, *, allow_missing: bool = False
+) -> dict[str, Any]:
     if config_path().exists():
         cfg = load_config()
     elif allow_missing:
         cfg = initial_config()
     else:
         raise SystemExit(
-            f"No config.yaml found at {config_path()}. Run "
-            "`infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default` first, "
-            f"or point ${CONFIG_DIR_ENV} / --config-dir at an existing config."
+            f'No config.yaml found at {config_path()}. Run '
+            '`infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default` first, '
+            f'or point ${CONFIG_DIR_ENV} / --config-dir at an existing config.'
         )
     return apply_config_overrides(cfg, args)
 
@@ -374,10 +392,10 @@ def build_plan(
     resolved = resolve(cfg, inventory=inventory, profile_name=profile_name)
     report = validate_resolved(resolved)
     return {
-        "schema_version": 1,
-        "allow_unsupported": bool(allow_unsupported),
-        "validated": report,
-        "deployment": resolved,
+        'schema_version': 1,
+        'allow_unsupported': bool(allow_unsupported),
+        'validated': report,
+        'deployment': resolved,
     }
 
 
@@ -388,11 +406,11 @@ def save_plan(plan: dict[str, Any], cfg: dict[str, Any] | None = None) -> Path:
 
 
 def ensure_renderable(plan: dict[str, Any]) -> None:
-    validated = plan.get("validated", {}) or {}
-    if validated.get("errors") and not plan.get("allow_unsupported", False):
+    validated = plan.get('validated', {}) or {}
+    if validated.get('errors') and not plan.get('allow_unsupported', False):
         raise SystemExit(
-            "Refusing to render because the resolved plan contains validation errors. "
-            "Use `--allow-unsupported` to override."
+            'Refusing to render because the resolved plan contains validation errors. '
+            'Use `--allow-unsupported` to override.'
         )
 
 
@@ -402,18 +420,18 @@ def render_is_stale(cfg: dict[str, Any] | None = None) -> bool:
     current_plan = plan_path(cfg)
     backend = backend_name(cfg)
 
-    if backend == "kubeai":
+    if backend == 'kubeai':
         kubeai_root = kubeai_generated_dir(cfg)
         required_outputs = [
             current_plan,
-            kubeai_root / "namespace.yaml",
-            kubeai_root / "kubeai-values.yaml",
-            kubeai_root / "models.yaml",
+            kubeai_root / 'namespace.yaml',
+            kubeai_root / 'kubeai-values.yaml',
+            kubeai_root / 'models.yaml',
         ]
     else:
         required_outputs = [
             current_plan,
-            generated_dir(cfg) / "docker-compose.yml",
+            generated_dir(cfg) / 'docker-compose.yml',
             runtime_env_path(cfg),
         ]
         # litellm_config.yaml is optional now; direct Ollama/raw-server profiles
@@ -426,12 +444,19 @@ def render_is_stale(cfg: dict[str, Any] | None = None) -> bool:
         oldest_generated = min(p.stat().st_mtime for p in required_outputs)
         if cfg_path.stat().st_mtime > oldest_generated:
             return True
-        if backend == "kubeai":
+        if backend == 'kubeai':
             local_values_path = kubeai_local_values_path()
-            if local_values_path.exists() and local_values_path.stat().st_mtime > oldest_generated:
+            if (
+                local_values_path.exists()
+                and local_values_path.stat().st_mtime > oldest_generated
+            ):
                 return True
 
-    if any(current_plan.stat().st_mtime > p.stat().st_mtime for p in required_outputs if p != current_plan):
+    if any(
+        current_plan.stat().st_mtime > p.stat().st_mtime
+        for p in required_outputs
+        if p != current_plan
+    ):
         return True
     return False
 
@@ -440,7 +465,7 @@ def render_is_stale(cfg: dict[str, Any] | None = None) -> bool:
 def _apply_path_overrides(config: Any) -> None:
     """Honour ``--config-dir`` / ``--data-dir`` from a parsed subcommand config."""
     overrides = _as_mapping(config)
-    if overrides.get("config_dir"):
-        set_config_root(overrides["config_dir"])
-    if overrides.get("data_dir"):
-        set_data_root(overrides["data_dir"])
+    if overrides.get('config_dir'):
+        set_config_root(overrides['config_dir'])
+    if overrides.get('data_dir'):
+        set_data_root(overrides['data_dir'])
