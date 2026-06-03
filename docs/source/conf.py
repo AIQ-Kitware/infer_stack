@@ -140,8 +140,8 @@ def parse_version(fpath):
 
 
 project = 'infer_stack'
-copyright = '2026, Jon Crall'
-author = 'Jon Crall'
+copyright = '2026, jon.crall'
+author = 'jon.crall'
 modname = 'infer_stack'
 
 repo_dpath = dirname(dirname(dirname(__file__)))
@@ -381,7 +381,7 @@ latex_documents = [
         master_doc,
         'infer_stack.tex',
         'infer_stack Documentation',
-        'Jon Crall',
+        'jon.crall',
         'manual',
     ),
 ]

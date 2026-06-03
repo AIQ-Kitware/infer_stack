@@ -1,34 +1,167 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+requires = [
+  "setuptools>=68",
+  "setuptools>=77",
+  "wheel",
+]
 
 [project]
 name = "infer-stack"
-version = "0.5.0"
 description = "Profile-driven compose and KubeAI deployment compiler for inference stacks"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = [
+  "LICENSE",
+]
+authors = [ { name = "jon.crall", email = "jon.crall@kitware.com" } ]
 requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Utilities",
+]
+dynamic = [
+  "version",
+]
 dependencies = [
-  "PyYAML>=6.0",
-  "Jinja2>=3.1",
+  "jinja2>=3.1",
+  "pyyaml>=6.0",
   "requests>=2.31",
   "rich>=13.0",
   "scriptconfig>=0.9",
   "ubelt>=1.3",
 ]
-
-[project.optional-dependencies]
-tests = [
+optional-dependencies.tests = [
   "pytest>=7.0",
   "pytest-codeblocks>=0.17",
 ]
-
-[project.scripts]
-infer-stack = "infer_stack.cli:main"
+urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
+scripts.infer-stack = "infer_stack.cli:main"
 
 [tool.setuptools]
-packages = ["infer_stack", "infer_stack.backends", "infer_stack.cli"]
 include-package-data = true
+dynamic.readme.file = [
+  "README.md",
+]
+dynamic.readme.content-type = "text/markdown"
+dynamic.version.attr = "infer_stack.__version__"
+package-data.infer_stack = [
+  "templates/*.yaml",
+  "templates/*.j2",
+]
+package-data."*" = [
+  "requirements/*.txt",
+]
+packages.find.where = [
+  ".",
+]
+packages.find.include = [
+  "infer_stack*",
+]
 
-[tool.setuptools.package-data]
-infer_stack = ["templates/*.yaml", "templates/*.j2"]
+[tool.uv]
+exclude-newer = "2026-06-03"
+
+[tool.ruff]
+target-version = "py38"
+line-length = 80
+format.indent-style = "space"
+format.quote-style = "single"
+format.line-ending = "auto"
+format.skip-magic-trailing-comma = false
+format.docstring-code-format = false
+lint.select = [
+  "E",
+  "F",
+  "I",
+]
+lint.ignore = [
+  "E402",
+  "E501",
+]
+
+[tool.codespell]
+skip = [
+  "./docs/build",
+  "./*.egg-info",
+  "./build",
+  "./htmlcov",
+]
+count = true
+quiet-level = 3
+ignore-words-list = [
+  "wont",
+  "cant",
+  "ANS",
+  "doesnt",
+  "arent",
+  "ans",
+  "thats",
+  "datas",
+  "isnt",
+]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.ty]
+rules.unused-ignore-comment = "ignore"
+rules.unused-type-ignore-comment = "ignore"
+rules.unresolved-import = "ignore"
+
+[tool.pytest]
+ini_options.addopts = "-p no:doctest --xdoctest --xdoctest-style=google --ignore-glob=setup.py --ignore-glob=dev --ignore-glob=docs"
+ini_options.norecursedirs = ".git ignore build __pycache__ dev _skbuild docs"
+ini_options.filterwarnings = [
+  "default",
+  "ignore:.*No cfgstr given in Cacher constructor or call.*:Warning",
+  "ignore:.*Define the __nice__ method for.*:Warning",
+  "ignore:.*private pytest class or function.*:Warning",
+]
+
+[tool.coverage]
+run.branch = true
+report.exclude_lines = [
+  ".*  # nocover",
+  ".*  # pragma: no cover",
+  ".*if six.PY2:",
+  "^ *pass *$",
+  "^ *raise",
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "if _debug:",
+  "if 0:",
+  "if trace is not None",
+  "pragma: no cover",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "verbose = .*",
+]
+report.omit = [
+  "*/setup.py",
+  "infer_stack/__main__.py",
+]
+
+[tool.xcookie]
+tags = [
+  "github",
+  "kitware",
+  "purepy",
+]
+mod_name = "infer_stack"
+repo_name = "infer_stack"
+pkg_name = "infer-stack"
+min_python = "3.10"
+url = "https://github.com/AIQ-Kitware/infer_stack"
+author = "jon.crall"
+author_email = "jon.crall@kitware.com"
+description = "Profile-driven compose and KubeAI deployment compiler for inference stacks"
+use_setup_py = false
+use_pyproject_requirements = true
