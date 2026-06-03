@@ -38,6 +38,71 @@ class PortInUseError(RuntimeError):
         super().__init__('\n'.join(lines))
 
 
+class DockerComposeVersionError(RuntimeError):
+    """Docker Compose version is too old and unsupported."""
+
+    def __init__(self, found_version: str):
+        msg = (
+            f'Docker Compose version {found_version} is too old. '
+            'This tool requires Docker Compose v2.0 or later (the newer Go-based implementation).\n\n'
+            'Upgrade with one of:\n'
+            '  - macOS (Docker Desktop): Update Docker Desktop to 4.4.0+\n'
+            '  - Linux (docker-compose standalone): Install docker-compose-plugin\n'
+            '    pip install --upgrade docker-compose-plugin\n'
+            '    or: curl https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose\n'
+            '  - Docker Desktop (Windows/Linux): Update to version 4.4.0+\n\n'
+            'After upgrade, verify with: docker compose --version'
+        )
+        super().__init__(msg)
+
+
+def check_docker_compose_version(compose_cmd: str) -> None:
+    """Verify docker compose is v2.0 or later.
+
+    Raises DockerComposeVersionError if the version is too old.
+    """
+    try:
+        proc = subprocess.run(
+            compose_cmd.split() + ['--version'],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    if proc.returncode != 0:
+        return
+    output = proc.stdout.strip() + proc.stderr.strip()
+    version_str = _extract_docker_compose_version(output)
+    if version_str and _is_old_docker_compose(version_str):
+        raise DockerComposeVersionError(version_str)
+
+
+def _extract_docker_compose_version(output: str) -> str | None:
+    """Extract version number from docker-compose/docker compose output.
+
+    Examples of outputs:
+      - "docker-compose version 1.29.2, build unknown"
+      - "Docker Compose version v2.0.0 (deadbeef)"
+      - "Docker Compose version 2.6.1"
+    """
+    import re
+
+    match = re.search(r'version[:\s]+v?(\d+\.\d+)', output, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _is_old_docker_compose(version: str) -> bool:
+    """Check if version is less than 2.0."""
+    try:
+        major, minor = version.split('.', 1)
+        major_int = int(major)
+        return major_int < 2
+    except (ValueError, AttributeError):
+        return False
+
+
 def our_published_ports(
     compose_cmd: str, compose_file: Path, env_file: Path
 ) -> set[int]:

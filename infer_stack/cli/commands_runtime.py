@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..config import load_yaml
 from ..config import normalized_state
 from ..docker_utils import DockerCommandError
+from ..docker_utils import check_docker_compose_version
 from ..docker_utils import compose_down
 from ..docker_utils import compose_up
 from ..docker_utils import docker_rm_dirs
@@ -465,6 +466,8 @@ class StatusCLI(
         compose_file = generated_dir(cfg) / 'docker-compose.yml'
         if not compose_file.exists():
             return 0
+        compose_cmd = cfg['runtime']['compose_cmd']
+        check_docker_compose_version(compose_cmd)
         print()
         print('containers (docker compose ps):')
         proc = subprocess.run(_compose_base_cmd(cfg) + ['ps'])
