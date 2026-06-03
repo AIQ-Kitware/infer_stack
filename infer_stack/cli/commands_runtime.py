@@ -103,6 +103,8 @@ class UpCLI(_PlanOverridesCLI):
             raise SystemExit(
                 '`up` only supports the compose backend. Use `deploy` for kubeai.'
             )
+        compose_cmd = cfg['runtime']['compose_cmd']
+        check_docker_compose_version(compose_cmd)
         _maybe_rerender(config, cfg)
         _compose_up_with_router_recreate(cfg, detach=bool(config.detach))
         return 0
@@ -128,9 +130,11 @@ class DownCLI(
         # --remove-orphans still removes services from the previous profile
         # when the project name / generated directory is unchanged.
         _maybe_rerender(config, cfg)
+        compose_cmd = cfg['runtime']['compose_cmd']
+        check_docker_compose_version(compose_cmd)
         try:
             compose_down(
-                cfg['runtime']['compose_cmd'],
+                compose_cmd,
                 generated_dir(cfg) / 'docker-compose.yml',
                 runtime_env_path(cfg),
             )
