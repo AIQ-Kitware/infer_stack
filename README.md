@@ -1,5 +1,9 @@
 # Infer Stack
 
+[![PyPI version](https://img.shields.io/pypi/v/infer-stack.svg)](https://pypi.org/project/infer-stack/)
+[![Python versions](https://img.shields.io/pypi/pyversions/infer-stack.svg)](https://pypi.org/project/infer-stack/)
+[![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
+
 `infer_stack` manages **named stack profiles** for local and Kubernetes-backed inference.
 
 A stack profile is a small graph made from:
