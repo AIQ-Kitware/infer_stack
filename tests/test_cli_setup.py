@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Any
 
 import os
 import subprocess
@@ -644,7 +645,7 @@ def test_smoke_test_uses_chat_endpoint_for_chat_profiles(
 ) -> None:
     _setup_compose(tmp_path, 'qwen2-5-7b-instruct-turbo-default')
     _anchor_paths(tmp_path, monkeypatch)
-    posted: dict[str, object] = {}
+    posted: dict[str, Any] = {}
 
     def fake_get(url, **kwargs):
         return _FakeResponse(
@@ -672,7 +673,7 @@ def test_smoke_test_uses_completions_endpoint_for_completions_profiles(
 ) -> None:
     _setup_compose(tmp_path, 'helm-pythia-1b-v0')
     _anchor_paths(tmp_path, monkeypatch)
-    posted: dict[str, object] = {}
+    posted: dict[str, Any] = {}
 
     def fake_get(url, **kwargs):
         return _FakeResponse({'data': [{'id': 'eleutherai/pythia-1b-v0'}]})
@@ -698,7 +699,7 @@ def test_smoke_test_protocol_override_forces_completions(
 ) -> None:
     _setup_compose(tmp_path, 'qwen2-5-7b-instruct-turbo-default')
     _anchor_paths(tmp_path, monkeypatch)
-    posted: dict[str, object] = {}
+    posted: dict[str, Any] = {}
 
     def fake_get(url, **kwargs):
         return _FakeResponse(

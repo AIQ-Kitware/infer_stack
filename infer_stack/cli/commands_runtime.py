@@ -94,7 +94,7 @@ class UpCLI(_PlanOverridesCLI):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -116,7 +116,7 @@ class DownCLI(
     """Bring the rendered compose stack down (does not touch volumes)."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -161,7 +161,7 @@ class PurgeCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config, allow_missing=True)
@@ -231,7 +231,7 @@ class DeployCLI(_PlanOverridesCLI):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -283,7 +283,7 @@ class EnvCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -438,7 +438,7 @@ class StatusCLI(
     live container/cluster state."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         initialized = config_path().exists()
@@ -509,7 +509,7 @@ class LogsCLI(_ComposeWrapperBase):
     no_color = scfg.Value(False, isflag=True)
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -548,7 +548,7 @@ class PsCLI(_ComposeWrapperBase):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -572,7 +572,7 @@ class RestartCLI(_ComposeWrapperBase):
     timeout = scfg.Value(None, type=int, help='Stop timeout in seconds.')
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -593,7 +593,7 @@ class PullCLI(_ComposeWrapperBase):
     ignore_pull_failures = scfg.Value(False, isflag=True)
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -613,7 +613,7 @@ class StartCLI(_ComposeWrapperBase):
     """``docker compose start [services...]``."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -631,7 +631,7 @@ class StopCLI(_ComposeWrapperBase):
     timeout = scfg.Value(None, type=int)
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -660,7 +660,7 @@ class OllamaPullCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         if not config.model:
@@ -689,7 +689,7 @@ class OllamaListCLI(
     __command__ = 'ollama-list'
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -708,7 +708,7 @@ class OllamaPsCLI(
     __command__ = 'ollama-ps'
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)

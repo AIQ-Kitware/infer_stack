@@ -468,9 +468,8 @@ def _candidate_from_model(
     mdict = _to_dict(model)
     repo_id = str(mdict.get('id') or mdict.get('modelId') or '')
     tags = [str(t) for t in _as_list(mdict.get('tags'))]
-    config = (
-        mdict.get('config') if isinstance(mdict.get('config'), dict) else {}
-    )
+    _raw_config = mdict.get('config')
+    config: dict[str, Any] = _raw_config if isinstance(_raw_config, dict) else {}
     score, reasons, rejected_reason = _score_candidate(mdict, mode)
     author = str(mdict.get('author') or '') or None
     family = _infer_family(repo_id, tags, config)
@@ -793,12 +792,10 @@ def _discover_repo(
 ) -> DiscoverResult:
     info = _to_dict(inspector.model_info(repo_id))
     tags = [str(t) for t in _as_list(info.get('tags'))]
-    config = info.get('config') if isinstance(info.get('config'), dict) else {}
-    transformers_info = (
-        info.get('transformersInfo')
-        if isinstance(info.get('transformersInfo'), dict)
-        else {}
-    )
+    _raw_config = info.get('config')
+    config: dict[str, Any] = _raw_config if isinstance(_raw_config, dict) else {}
+    _raw_tinfo = info.get('transformersInfo')
+    transformers_info: dict[str, Any] = _raw_tinfo if isinstance(_raw_tinfo, dict) else {}
     pipeline_tag = info.get('pipeline_tag') or info.get('pipelineTag')
     siblings_raw = _as_list(info.get('siblings'))
     siblings = []

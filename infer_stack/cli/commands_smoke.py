@@ -399,7 +399,7 @@ class DiagnoseCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -504,7 +504,7 @@ class WaitReadyCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -561,7 +561,7 @@ class SmokeTestCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -665,7 +665,7 @@ class BenchmarkCLI(
     api_key = scfg.Value(None, type=str)
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         # benchmark_prompts.json is a user-supplied fixture. Look for it

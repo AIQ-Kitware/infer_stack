@@ -64,7 +64,7 @@ class InitCLI(_PathOverridesMixin):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg_path = config_path()
@@ -101,7 +101,7 @@ class SetupCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg_path = config_path()
@@ -140,7 +140,7 @@ class ResolveCLI(_PlanOverridesCLI):
     """Resolve the active profile into a deployment dict and print it."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -159,7 +159,7 @@ class ValidateCLI(_PlanOverridesCLI):
     """Resolve + validate the active profile; exit non-zero on validation errors."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -178,7 +178,7 @@ class LockCLI(_PlanOverridesCLI):
     """Write plan.yaml after resolving + validating the active profile."""
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -208,7 +208,7 @@ class RenderCLI(_PlanOverridesCLI):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config)
@@ -251,7 +251,7 @@ class SwitchCLI(_SwitchPathOverridesCLI):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         if not config.profile:
@@ -285,7 +285,7 @@ class ListModelsCLI(_PathOverridesMixin):
     __command__ = 'list-models'
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = load_config() if config_path().exists() else initial_config()
@@ -302,7 +302,7 @@ class ListProfilesCLI(_PathOverridesMixin):
     __command__ = 'list-profiles'
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = load_config() if config_path().exists() else initial_config()
@@ -334,7 +334,7 @@ class ExplainCLI(_PathOverridesMixin):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         if config.file:
@@ -368,7 +368,7 @@ class DescribeProfileCLI(
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         overrides = _as_mapping(config)
@@ -415,7 +415,7 @@ class VerifyProfileCLI(_SwitchPathOverridesCLI):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         if not config.profile:
@@ -445,7 +445,7 @@ class KubeaiSyncResourceProfilesCLI(_PathOverridesMixin):
     )
 
     @classmethod
-    def main(cls, argv=1, **kwargs):
+    def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         cfg = config_for_runtime(config, allow_missing=True)

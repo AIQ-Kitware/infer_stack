@@ -227,7 +227,7 @@ def test_litellm_config_model_delete_miss_is_nonfatal() -> None:
         def json(self):
             return {'error': 'Model with id=abc not found in db'}
 
-    assert _litellm_delete_missed_config_model(DummyResponse()) is True
+    assert _litellm_delete_missed_config_model(DummyResponse()) is True  # type: ignore
 
     class OtherResponse:
         text = 'permission denied'
@@ -235,7 +235,7 @@ def test_litellm_config_model_delete_miss_is_nonfatal() -> None:
         def json(self):
             raise ValueError
 
-    assert _litellm_delete_missed_config_model(OtherResponse()) is False
+    assert _litellm_delete_missed_config_model(OtherResponse()) is False  # type: ignore
 
 
 def test_schema_v5_default_model_and_protocol_helpers(tmp_path: Path) -> None:

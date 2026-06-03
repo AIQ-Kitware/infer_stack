@@ -1072,7 +1072,7 @@ def render_detailed_tables(
             gib_text(est.request_floor.fixed_bytes_per_gpu),
             'Per-sequence fixed recurrent/conv state',
         )
-        if cap.kv_budget_low_bytes_per_gpu is not None:
+        if cap.kv_budget_low_bytes_per_gpu is not None and cap.kv_budget_high_bytes_per_gpu is not None:
             t.add_row(
                 'kv_budget/GPU',
                 range_text(
