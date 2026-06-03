@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout source
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v6.0.3
     - name: Set up Python 3.14
       uses: actions/setup-python@v6.2.0
       with:
@@ -58,7 +58,7 @@ jobs:
         - auto
     steps:
     - name: Checkout source
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v6.0.3
     - name: Setup Python
       uses: actions/setup-python@v6.2.0
       with:
@@ -87,7 +87,7 @@ jobs:
     - build_sdist
     steps:
     - name: Checkout source
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v6.0.3
     - uses: actions/download-artifact@v7.0.0
       name: Download wheels
       with:
@@ -183,7 +183,7 @@ jobs:
     - build_sdist
     steps:
     - name: Checkout source
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v6.0.3
     - uses: actions/download-artifact@v7.0.0
       name: Download wheels
       with:
@@ -279,7 +279,7 @@ jobs:
     - live_deploy
     steps:
     - name: Checkout source
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v6.0.3
     - uses: actions/download-artifact@v7.0.0
       name: Download artifacts
       with:
