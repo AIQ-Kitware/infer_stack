@@ -23,6 +23,10 @@ Both can be overridden by env vars (``INFER_STACK_CONFIG_DIR`` /
 ``--data-dir``. The CLI flags translate into process-wide overrides via
 ``set_config_root`` / ``set_data_root``.
 
+``INFER_STACK_MODEL_PATH`` is a separate PATH-like catalog overlay for model and
+profile YAML files. It augments the configured catalog; it does not change the
+config root or data root.
+
 ``--data-dir`` is the single knob for "put everything I generate in one
 place": at ``setup`` time it is baked into the absolute ``state.*`` and
 ``output.generated_dir`` paths written to ``config.yaml``. For a bespoke
@@ -39,6 +43,7 @@ import ubelt as ub
 
 CONFIG_DIR_ENV = 'INFER_STACK_CONFIG_DIR'
 DATA_DIR_ENV = 'INFER_STACK_DATA_DIR'
+MODEL_PATH_ENV = 'INFER_STACK_MODEL_PATH'
 
 _config_root_override: Path | None = None
 _data_root_override: Path | None = None

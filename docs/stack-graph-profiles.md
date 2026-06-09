@@ -228,9 +228,11 @@ LiteLLM, or Open WebUI are rejected for `--backend kubeai`.
 
 ## Configuration files
 
-Custom provider models and stack profiles live in the configured
-`catalog.user_models_file`, which defaults to `~/.config/infer_stack/models.yaml`.
-Use provider-specific top-level keys:
+Custom provider models and stack profiles can come from the configured
+`catalog.user_models_file`, which defaults to `~/.config/infer_stack/models.yaml`,
+from additional paths in `catalog.model_path` / `catalog.model_paths`, or from
+`INFER_STACK_MODEL_PATH` for per-shell overlays. Use provider-specific top-level
+keys:
 
 ```yaml
 vllm_models:
@@ -251,3 +253,24 @@ profiles:
 
 `models:` is still interpreted as a vLLM model catalog for convenience, but new
 examples should use `vllm_models:` and `ollama_models:`.
+
+`INFER_STACK_MODEL_PATH` behaves like a PATH variable: entries are separated by
+`:` on POSIX systems and by `;` on Windows. Each entry can be a YAML file or a
+directory. Directory entries are scanned non-recursively for `models.yaml` / `models.yml`,
+`*.models.yaml` / `*.models.yml`, and `*.profiles.yaml` / `*.profiles.yml`. Later files override earlier files, so a
+repo-local experiment overlay can temporarily override or extend the normal user
+catalog without editing `config.yaml`:
+
+```bash
+export INFER_STACK_MODEL_PATH="${INFER_STACK_MODEL_PATH:+$INFER_STACK_MODEL_PATH:}$PWD/infer_stack_profiles"
+infer-stack describe-profile my-experiment-profile
+```
+
+For persistent extra catalogs, put the same directory or file path in
+`config.yaml`:
+
+```yaml
+catalog:
+  model_path:
+    - /srv/experiments/infer_stack_profiles
+```
