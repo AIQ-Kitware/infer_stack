@@ -4,6 +4,7 @@ from copy import deepcopy
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+import os
 
 import yaml
 
@@ -12,7 +13,7 @@ from .catalog import (
     normalize_stack_profiles,
     normalize_vllm_models,
 )
-from .paths import config_root, data_root
+from .paths import MODEL_PATH_ENV, config_root, data_root
 
 CONFIG_FILE = Path('config.yaml')
 MODELS_FILE = Path('models.yaml')
@@ -264,6 +265,140 @@ def deep_merge(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+
+def _as_list(value: Any) -> list[Any]:
+    """Return ``value`` as a list while treating strings as one entry."""
+    if value in (None, ''):
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _resolve_catalog_path(raw: Any, *, anchor: Path) -> Path:
+    path = Path(str(raw)).expanduser()
+    if not path.is_absolute():
+        path = anchor / path
+    return path
+
+
+def _split_model_path_env(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part for part in raw.split(os.pathsep) if part]
+
+
+def _catalog_files_from_entry(entry: Path) -> list[Path]:
+    """Expand one catalog search-path entry into model/profile YAML files.
+
+    Explicit file entries are loaded regardless of name. Directory entries are
+    scanned non-recursively for the intentionally narrow catalog names used by
+    infer-stack overlays: ``models.yaml``, ``*.models.yaml``,
+    ``*.profiles.yaml`` and their ``.yml`` variants. This avoids accidentally
+    loading unrelated YAML files
+    such as ``config.yaml`` or generated runtime files.
+    """
+    if entry.is_file():
+        return [entry]
+    if not entry.is_dir():
+        return []
+    files: list[Path] = []
+    for primary_name in (str(MODELS_FILE), 'models.yml'):
+        primary = entry / primary_name
+        if primary.exists() and primary.is_file() and primary not in files:
+            files.append(primary)
+    for pattern in (
+        '*.models.yaml',
+        '*.models.yml',
+        '*.profiles.yaml',
+        '*.profiles.yml',
+    ):
+        for candidate in sorted(entry.glob(pattern)):
+            if candidate.is_file() and candidate not in files:
+                files.append(candidate)
+    return files
+
+
+def _catalog_entries_from_config(
+    catalog_cfg: dict[str, Any], *, anchor: Path
+) -> list[Path]:
+    """Return catalog entries declared in config.yaml merge order.
+
+    ``user_models_file`` preserves the historical single-catalog behavior.
+    ``model_path`` / ``model_paths`` add PATH-like overlay entries without
+    replacing the user catalog. Relative config entries are anchored on
+    ``config_root()`` because they are part of the infer-stack configuration,
+    not the caller's shell working directory.
+    """
+    entries: list[Path] = []
+
+    raw_user_models = catalog_cfg.get('user_models_file', str(MODELS_FILE))
+    for raw in _as_list(raw_user_models):
+        entries.append(_resolve_catalog_path(raw, anchor=anchor))
+
+    for key in ('model_path', 'model_paths'):
+        for raw in _as_list(catalog_cfg.get(key)):
+            entries.append(_resolve_catalog_path(raw, anchor=anchor))
+
+    return entries
+
+
+def _catalog_entries_from_env(raw_env: str | None, *, anchor: Path) -> list[Path]:
+    """Return catalog entries declared by ``INFER_STACK_MODEL_PATH``.
+
+    Relative environment entries are anchored on the process working directory,
+    matching the ergonomics of shell variables such as ``PATH`` and
+    ``PYTHONPATH``.
+    """
+    return [
+        _resolve_catalog_path(raw, anchor=anchor)
+        for raw in _split_model_path_env(raw_env)
+    ]
+
+
+def catalog_files(config: dict[str, Any]) -> list[Path]:
+    """Return model/profile catalog overlay files in merge order.
+
+    Merge precedence is deterministic and backward compatible:
+
+    1. ``catalog.user_models_file`` (defaults to ``models.yaml`` under
+       ``config_root()``)
+    2. optional ``catalog.model_path`` / ``catalog.model_paths`` entries
+    3. optional ``INFER_STACK_MODEL_PATH`` entries, split like ``PATH``
+
+    Later files override earlier ones via ``deep_merge``.
+    """
+    catalog_cfg = config.get('catalog', {}) or {}
+    entries: list[Path] = []
+    entries.extend(
+        _catalog_entries_from_config(catalog_cfg, anchor=config_root())
+    )
+    entries.extend(
+        _catalog_entries_from_env(
+            os.environ.get(MODEL_PATH_ENV), anchor=Path.cwd()
+        )
+    )
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for entry in entries:
+        for candidate in _catalog_files_from_entry(entry):
+            key = candidate.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(candidate)
+    return files
+
+def load_catalog_overlays(config: dict[str, Any]) -> dict[str, Any]:
+    """Load and merge all configured model/profile catalog overlay files."""
+    merged: dict[str, Any] = {}
+    for path in catalog_files(config):
+        merged = deep_merge(merged, load_yaml(path))
+    return merged
+
 def merged_catalogs(config: dict[str, Any]) -> dict[str, Any]:
     catalog_cfg = config.get('catalog', {})
     built_vllm = (
@@ -281,11 +416,7 @@ def merged_catalogs(config: dict[str, Any]) -> dict[str, Any]:
         if catalog_cfg.get('builtin_profiles', True)
         else {}
     )
-    raw_user_models = catalog_cfg.get('user_models_file', str(MODELS_FILE))
-    user_models_path = Path(raw_user_models)
-    if not user_models_path.is_absolute():
-        user_models_path = config_root() / user_models_path
-    user = load_yaml(user_models_path) if user_models_path.exists() else {}
+    user = load_catalog_overlays(config)
 
     # User files may use the new provider-specific keys or the old generic
     # `models` key, which is interpreted as vLLM models.

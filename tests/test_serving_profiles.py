@@ -1150,3 +1150,78 @@ def test_normalized_output_anchors_relative_paths_on_data_root(
 
     normalized = normalized_output({'generated_dir': '/abs/path'})
     assert normalized['generated_dir'] == '/abs/path'
+
+
+def test_catalog_model_path_env_and_directory_overlays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from infer_stack.config import catalog_files, merged_catalogs
+
+    save_yaml(
+        tmp_path / 'models.yaml',
+        {
+            'vllm_models': {
+                'base-only': {'hf_model_id': 'example/base-only'},
+                'shared': {'hf_model_id': 'example/base-shared'},
+            },
+            'profiles': {
+                'base-profile': {'description': 'from base models.yaml'}
+            },
+        },
+    )
+    config_path_dir = tmp_path / 'repo-catalogs'
+    config_path_dir.mkdir()
+    save_yaml(
+        config_path_dir / 'incubilate.models.yaml',
+        {
+            'vllm_models': {
+                'config-only': {'hf_model_id': 'example/config-only'},
+                'shared': {'hf_model_id': 'example/config-shared'},
+            },
+            'profiles': {
+                'config-profile': {'description': 'from config model_path'}
+            },
+        },
+    )
+    # Directory expansion is intentionally narrow; unrelated YAML should not be
+    # treated as a catalog just because it lives beside catalog overlays.
+    save_yaml(
+        config_path_dir / 'config.yaml',
+        {'vllm_models': {'should-not-load': {'hf_model_id': 'bad/bad'}}},
+    )
+
+    env_path_dir = tmp_path / 'env-catalogs'
+    env_path_dir.mkdir()
+    save_yaml(
+        env_path_dir / 'experiment.profiles.yaml',
+        {
+            'vllm_models': {
+                'env-only': {'hf_model_id': 'example/env-only'},
+                'shared': {'hf_model_id': 'example/env-shared'},
+            },
+            'profiles': {
+                'env-profile': {'description': 'from INFER_STACK_MODEL_PATH'}
+            },
+        },
+    )
+
+    cfg = initial_config()
+    cfg['catalog']['model_path'] = 'repo-catalogs'
+    monkeypatch.setenv('INFER_STACK_MODEL_PATH', str(env_path_dir))
+
+    catalog_paths = [path.name for path in catalog_files(cfg)]
+    assert catalog_paths == [
+        'models.yaml',
+        'incubilate.models.yaml',
+        'experiment.profiles.yaml',
+    ]
+
+    cats = merged_catalogs(cfg)
+    assert 'base-only' in cats['vllm_models']
+    assert 'config-only' in cats['vllm_models']
+    assert 'env-only' in cats['vllm_models']
+    assert 'should-not-load' not in cats['vllm_models']
+    assert cats['vllm_models']['shared']['hf_model_id'] == 'example/env-shared'
+    assert 'base-profile' in cats['profiles']
+    assert 'config-profile' in cats['profiles']
+    assert 'env-profile' in cats['profiles']
