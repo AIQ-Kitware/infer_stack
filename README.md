@@ -34,6 +34,8 @@ infer-stack deploy
 infer-stack switch <profile> --apply  # re-render and converge; no separate up needed
 infer-stack status
 infer-stack smoke-test
+infer-stack version                   # print the installed version
+infer-stack config paths              # show where config / artifacts / caches live
 ```
 
 The CLI is built on [`scriptconfig`](https://gitlab.kitware.com/utils/scriptconfig),

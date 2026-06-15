@@ -27,9 +27,12 @@ from __future__ import annotations
 import requests  # noqa: F401  (cli_mod.requests is patched in tests)
 import scriptconfig as scfg
 
+from .. import __version__
+
 # Keep submodules importable as attributes (e.g. ``infer_stack.cli.commands_runtime``)
 # so tests can patch seams where they are actually looked up.
 from . import (  # noqa: F401
+    commands_meta,
     commands_profile,
     commands_runtime,
     commands_smoke,
@@ -74,6 +77,11 @@ from .commands_runtime import (
     StatusCLI,
     StopCLI,
     UpCLI,
+)
+from .commands_meta import (
+    ConfigModalCLI,
+    ConfigPathsCLI,
+    VersionCLI,
 )
 from .commands_smoke import (
     BenchmarkCLI,
@@ -120,6 +128,15 @@ class ManageCLI(scfg.ModalCLI):
         'Render and run vLLM serving profiles through the Compose or KubeAI '
         'backends. Primary workflow: setup -> render -> up (or deploy).'
     )
+
+    # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
+    # The ``version`` *subcommand* is registered below under a non-colliding
+    # attribute name; its CLI name comes from ``VersionCLI.__command__``.
+    __version__ = __version__
+
+    # Meta / introspection
+    version_command = VersionCLI
+    config = ConfigModalCLI
 
     # Config / profile management
     setup = SetupCLI
