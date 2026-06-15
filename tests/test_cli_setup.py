@@ -85,6 +85,7 @@ def test_setup_compose_then_render_without_manual_file_edits(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -103,6 +104,7 @@ def test_setup_kubeai_then_render_without_manual_file_edits(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -130,6 +132,7 @@ def test_setup_kubeai_with_resource_profiles_file_syncs_canonical_values(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -155,6 +158,7 @@ def test_render_overrides_backend_and_profile_without_persisting_config(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -192,6 +196,7 @@ def test_setup_supports_environment_fallbacks(tmp_path: Path) -> None:
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         env={
             'INFER_STACK_BACKEND': 'kubeai',
             'INFER_STACK_PROFILE': 'gpt-oss-20b-chat',
@@ -216,6 +221,7 @@ def test_kubeai_sync_resource_profiles_then_validate_without_config_duplication(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -240,6 +246,7 @@ def test_kubeai_config_fallback_still_works_before_and_after_render_without_sync
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -278,6 +285,7 @@ def test_kubeai_synced_source_is_preferred_over_config_and_preserves_unknown_fie
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -322,6 +330,7 @@ def test_kubeai_local_values_change_marks_render_stale(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -355,6 +364,7 @@ def test_kubeai_deploy_rerenders_from_updated_local_values(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -412,6 +422,7 @@ def test_switch_apply_persists_only_active_profile_and_uses_transient_overrides(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -460,6 +471,7 @@ def test_switch_apply_compose_recreates_router_when_config_changes(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -505,6 +517,7 @@ def test_openwebui_state_paths_are_not_deleted_or_reinitialized_on_switch(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -559,6 +572,7 @@ def test_kubeai_status_namespace_error_is_actionable(
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'kubeai',
         '--profile',
@@ -595,6 +609,7 @@ def test_status_reports_initialization_and_profile(tmp_path: Path) -> None:
     run_cli(
         tmp_path,
         'setup',
+        '--yes',
         '--backend',
         'compose',
         '--profile',
@@ -636,7 +651,9 @@ def _smoke_test_kwargs(**overrides) -> dict:
 
 
 def _setup_compose(tmp_path: Path, profile: str) -> None:
-    run_cli(tmp_path, 'setup', '--backend', 'compose', '--profile', profile)
+    run_cli(
+        tmp_path, 'setup', '--yes', '--backend', 'compose', '--profile', profile
+    )
     run_cli(tmp_path, 'render', '--yes', '--simulate-hardware', '1x96')
 
 
@@ -721,3 +738,56 @@ def test_smoke_test_protocol_override_forces_completions(
     )
     assert posted['url'].endswith('/completions')
     assert 'prompt' in posted['json']
+
+
+def test_setup_data_dir_relocates_state_and_preserves_other_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``setup --data-dir`` against an existing config moves the managed data
+    tree to the new root while leaving every other field untouched."""
+    old_root = tmp_path / 'old-data'
+    new_root = tmp_path / 'new-data'
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(old_root))
+
+    cli_mod.SetupCLI.main(
+        argv=[
+            '--backend',
+            'compose',
+            '--profile',
+            'qwen2-5-7b-instruct-turbo-default',
+            '--yes',
+        ]
+    )
+    cfg = yaml.safe_load((tmp_path / 'config.yaml').read_text())
+    assert cfg['state']['hf_cache'] == str(old_root / 'hf-cache')
+
+    cli_mod.SetupCLI.main(argv=['--data-dir', str(new_root), '--yes'])
+    cfg2 = yaml.safe_load((tmp_path / 'config.yaml').read_text())
+    # The data tree moved...
+    assert cfg2['state']['hf_cache'] == str(new_root / 'hf-cache')
+    assert cfg2['output']['generated_dir'] == str(new_root / 'generated')
+    # ...but nothing else did.
+    assert cfg2['backend'] == 'compose'
+    assert cfg2['active_profile'] == 'qwen2-5-7b-instruct-turbo-default'
+
+
+def test_setup_declined_diff_writes_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Without ``--yes``, declining the diff prompt leaves no files behind."""
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    # Simulate the user answering "no" at the confirmation prompt.
+    monkeypatch.setattr(
+        'infer_stack.diff_prompt.Confirm.ask', lambda *a, **k: False
+    )
+
+    raised = False
+    try:
+        cli_mod.SetupCLI.main(argv=['--backend', 'compose'])
+    except SystemExit:
+        raised = True
+    assert raised, 'declining the prompt should abort via SystemExit'
+    assert not (tmp_path / 'config.yaml').exists()
+    assert not (tmp_path / 'models.yaml').exists()

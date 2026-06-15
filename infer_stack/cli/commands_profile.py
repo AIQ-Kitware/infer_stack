@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ..catalog import PROFILE_NAME_ALIASES
 from ..catalog import profile_summary
+from ..config import dump_yaml
 from ..config import initial_config
 from ..config import load_kubeai_resource_profiles
 from ..config import load_yaml
@@ -9,6 +10,7 @@ from ..config import normalized_catalogs
 from ..config import save_kubeai_resource_profiles
 from ..config import save_yaml
 from ..contracts import load_profile_contract
+from ..diff_prompt import confirm_and_write
 from ..kubeai_ops import deploy_rendered_artifacts
 from ..renderer import render_from_lock
 from ..verification import verify_profile
@@ -62,6 +64,13 @@ class InitCLI(_PathOverridesMixin):
     force = scfg.Value(
         False, isflag=True, help='Overwrite an existing config.yaml.'
     )
+    yes = scfg.Value(
+        False,
+        isflag=True,
+        short_alias=['y'],
+        help='Apply the writes without prompting. Without this, init shows a '
+        'per-file diff and asks for confirmation.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -72,9 +81,13 @@ class InitCLI(_PathOverridesMixin):
             raise SystemExit(
                 'config.yaml already exists. Use --force to overwrite.'
             )
-        save_yaml(cfg_path, initial_config())
+        planned = {cfg_path: dump_yaml(initial_config())}
         if not models_path().exists():
-            save_yaml(models_path(), {'models': {}, 'profiles': {}})
+            planned[models_path()] = dump_yaml({'models': {}, 'profiles': {}})
+        if not confirm_and_write(
+            planned, assume_yes=bool(config.yes), title='Pending init'
+        ):
+            raise SystemExit('Aborted by user; no files were written.')
         print(f'Wrote {cfg_path}')
         return 0
 
@@ -99,6 +112,13 @@ class SetupCLI(
         type=str,
         help='For kubeai setups, sync a local Helm values file with resourceProfiles into kubeai-values.local.yaml.',
     )
+    yes = scfg.Value(
+        False,
+        isflag=True,
+        short_alias=['y'],
+        help='Apply the config writes without prompting. Without this, setup '
+        'shows a per-file diff and asks for confirmation.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -110,9 +130,13 @@ class SetupCLI(
         else:
             cfg = initial_config()
         cfg = apply_config_overrides(cfg, config)
-        save_yaml(cfg_path, cfg)
+        planned = {cfg_path: dump_yaml(cfg)}
         if not models_path().exists():
-            save_yaml(models_path(), {'models': {}, 'profiles': {}})
+            planned[models_path()] = dump_yaml({'models': {}, 'profiles': {}})
+        if not confirm_and_write(
+            planned, assume_yes=bool(config.yes), title='Pending setup'
+        ):
+            raise SystemExit('Aborted by user; no files were written.')
         if config.resource_profiles_file:
             # User-supplied path: anchor on CWD so a typed relative path
             # behaves as the user expects.
@@ -258,7 +282,12 @@ class SwitchCLI(_SwitchPathOverridesCLI):
             raise SystemExit('switch: missing required profile name')
         persisted_cfg = load_config()
         persisted_cfg['active_profile'] = config.profile
-        save_yaml(config_path(), persisted_cfg)
+        if not confirm_and_write(
+            {config_path(): dump_yaml(persisted_cfg)},
+            assume_yes=bool(config.yes),
+            title='Pending active_profile change',
+        ):
+            raise SystemExit('Aborted by user; no files were written.')
         cfg = apply_config_overrides(persisted_cfg, config)
 
         plan = build_plan(

@@ -115,3 +115,27 @@ def confirm_writes(
         return True
 
     return Confirm.ask('Apply these changes?', default=False, console=console)
+
+
+def confirm_and_write(
+    planned: Mapping[Path, str],
+    *,
+    assume_yes: bool,
+    console: Console | None = None,
+    title: str = 'Pending changes',
+) -> bool:
+    """Preview ``planned`` writes, then commit them if accepted.
+
+    A single gate for "I am about to overwrite files" so no call site can
+    write user-facing config without the user first seeing a per-file diff.
+    Returns True if the writes were applied, False if the user declined (in
+    which case nothing is written).
+    """
+    if not confirm_writes(
+        planned, assume_yes=assume_yes, console=console, title=title
+    ):
+        return False
+    for path, text in planned.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding='utf-8')
+    return True

@@ -4,6 +4,7 @@ from ..config import CONFIG_FILE
 from ..config import MODELS_FILE
 from ..config import deep_merge
 from ..config import default_output_config
+from ..config import default_state_paths
 from ..config import generated_dir_for_config
 from ..config import initial_config
 from ..config import kubeai_generated_dir_for_config
@@ -235,7 +236,24 @@ def apply_config_overrides(
     # Granular per-knob path overrides were removed in favour of that one root;
     # edit ``state.*`` / ``output.generated_dir`` in config.yaml directly for
     # bespoke split layouts.
-    if not out['output'].get('generated_dir'):
+    #
+    # When the data root is *explicitly* relocated via ``--data-dir``,
+    # re-anchor the managed state tree + generated dir onto the new root.
+    # ``set_data_root`` has already been applied by ``_apply_path_overrides``,
+    # so the ``default_*`` helpers reflect the new location. Without this,
+    # ``setup --data-dir X`` against an existing config would silently no-op,
+    # since these paths are stored absolute and baked once at first setup.
+    #
+    # Triggered on the CLI flag only, not ``INFER_STACK_DATA_DIR``: the env var
+    # is the ambient anchor a fresh config already picks up, and regenerating
+    # from defaults on every plain ``setup`` would clobber hand-edited custom
+    # ``state.*`` paths. The flag is the unambiguous "relocate now" signal.
+    if overrides.get('data_dir'):
+        out['state'] = default_state_paths()
+        out['output']['generated_dir'] = default_output_config()[
+            'generated_dir'
+        ]
+    elif not out['output'].get('generated_dir'):
         out['output']['generated_dir'] = default_output_config()[
             'generated_dir'
         ]

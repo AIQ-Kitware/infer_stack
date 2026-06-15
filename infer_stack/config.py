@@ -224,9 +224,18 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding='utf-8')) or {}
 
 
+def dump_yaml(data: dict[str, Any]) -> str:
+    """Serialize ``data`` to the canonical YAML text ``save_yaml`` writes.
+
+    Exposed so diff-preview call sites can render the exact bytes that will
+    land on disk before committing the write.
+    """
+    return yaml.safe_dump(data, sort_keys=False)
+
+
 def save_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf-8')
+    path.write_text(dump_yaml(data), encoding='utf-8')
 
 
 def _load_template_yaml(name: str) -> dict[str, Any]:
