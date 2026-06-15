@@ -86,7 +86,48 @@ def test_config_paths_kubeai_includes_generated_dir(tmp_path: Path) -> None:
     assert 'kubeai_generated_dir' in out
 
 
+def test_config_paths_omits_data_root(tmp_path: Path) -> None:
+    # data_root is only a default anchor for relative paths; with absolute
+    # state/output paths it is unused, so it should not be reported.
+    out = run_cli(tmp_path, 'config', 'paths').stdout
+    assert 'data_root' not in out
+    assert 'generated_dir' in out
+
+
 def test_config_paths_rejects_unknown_target(tmp_path: Path) -> None:
     result = run_cli(tmp_path, 'config', 'paths', 'bogus', check=False)
     assert result.returncode != 0
     assert 'Unknown path group' in (result.stderr + result.stdout)
+
+
+def test_render_rich_colorizes_status() -> None:
+    import io
+
+    from rich.console import Console
+
+    from infer_stack.cli.commands_meta import _render_rich
+
+    groups = {
+        'config': [
+            {
+                'label': 'config.yaml',
+                'kind': 'file',
+                'status': 'exists',
+                'path': '/tmp/x/config.yaml',
+            },
+            {
+                'label': 'models.yaml',
+                'kind': 'file',
+                'status': 'missing',
+                'path': '/tmp/x/models.yaml',
+            },
+        ]
+    }
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=True, width=100)
+    _render_rich(groups, 'compose', console)
+    out = buf.getvalue()
+    assert 'config.yaml' in out
+    assert 'models.yaml' in out
+    # ANSI escape sequences are emitted on a (forced) terminal.
+    assert '\x1b[' in out

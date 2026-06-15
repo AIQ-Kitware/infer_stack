@@ -31,7 +31,6 @@ from .context import plan_path
 from .context import runtime_dir_for_config
 from .options import _PathOverridesMixin
 from ..paths import config_root
-from ..paths import data_root
 
 
 class VersionCLI(scfg.DataConfig):
@@ -66,15 +65,77 @@ def _entry(label: str, path: Path, *, kind: str) -> dict[str, str]:
     }
 
 
+def _status_style(status: str) -> str:
+    if status == 'exists':
+        return 'green'
+    if status == 'missing':
+        return 'yellow'
+    if status == 'glob':
+        return 'cyan'
+    return 'red'  # error:* / permission-denied
+
+
+def _render_plain(groups: dict, backend: str) -> None:
+    print('infer-stack paths')
+    print(f'backend: {backend}')
+    for group, entries in groups.items():
+        print(f'{group}:')
+        for e in entries:
+            print(
+                f'  {e["label"]} ({e["kind"]}, {e["status"]}): {e["path"]}'
+            )
+
+
+def _render_rich(groups: dict, backend: str, console) -> None:
+    from rich.table import Table
+    from rich.text import Text
+
+    console.print('[bold]infer-stack paths[/bold]')
+    console.print(f'backend: [bold cyan]{backend}[/bold cyan]')
+    for group, entries in groups.items():
+        table = Table(
+            title=group,
+            title_justify='left',
+            title_style='bold magenta',
+            box=None,
+            header_style='dim',
+            pad_edge=False,
+            padding=(0, 2, 0, 0),
+        )
+        table.add_column('name', style='cyan', no_wrap=True)
+        table.add_column('kind', style='dim')
+        table.add_column('status', no_wrap=True)
+        table.add_column('path', overflow='fold')
+        for e in entries:
+            status = e['status']
+            if status == 'exists':
+                path_text = Text(e['path'])
+            elif status == 'missing':
+                path_text = Text(e['path'], style='dim')
+            else:
+                path_text = Text(e['path'], style='red')
+            table.add_row(
+                e['label'],
+                e['kind'],
+                Text(status, style=_status_style(status)),
+                path_text,
+            )
+        console.print(table)
+
+
 class ConfigPathsCLI(_PathOverridesMixin):
     """Show the config, data, and bind-mount paths infer-stack uses.
 
     Reports the editable config files under ``config_root()`` plus the
-    rendered-artifact and bind-mount locations under ``data_root()``. Each
-    entry is tagged with its kind (file/dir) and an exists/missing status, so
-    the same command works as a layout reference and a quick health check.
-    Honours ``--config-dir`` / ``--data-dir`` (and the matching env vars) so it
-    reports the layout a given invocation would actually use.
+    resolved rendered-artifact and bind-mount locations (``generated_dir``,
+    ``runtime_dir``, and the ``state.*`` caches). Each entry is tagged with its
+    kind (file/dir) and an exists/missing status, so the same command works as
+    a layout reference and a quick health check. Honours ``--config-dir`` /
+    ``--data-dir`` (and the matching env vars) so it reports the layout a given
+    invocation would actually use.
+
+    Output is colorized when writing to a terminal; piped/redirected output
+    stays plain so it remains greppable (use ``--json`` for machine parsing).
     """
 
     __command__ = 'paths'
@@ -123,7 +184,6 @@ class ConfigPathsCLI(_PathOverridesMixin):
             groups['config'] = entries
         if target in {'all', 'data'}:
             entries = [
-                _entry('data_root', data_root(), kind='dir'),
                 _entry('generated_dir', generated_dir(cfg), kind='dir'),
                 _entry('plan.yaml', plan_path(cfg), kind='file'),
                 _entry(
@@ -150,14 +210,13 @@ class ConfigPathsCLI(_PathOverridesMixin):
             print(json.dumps(groups, indent=2))
             return 0
 
-        print('infer-stack paths')
-        print(f'backend: {backend}')
-        for group, entries in groups.items():
-            print(f'{group}:')
-            for e in entries:
-                print(
-                    f'  {e["label"]} ({e["kind"]}, {e["status"]}): {e["path"]}'
-                )
+        from rich.console import Console
+
+        console = Console()
+        if console.is_terminal:
+            _render_rich(groups, backend, console)
+        else:
+            _render_plain(groups, backend)
         return 0
 
 
