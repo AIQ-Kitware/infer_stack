@@ -561,3 +561,64 @@ new model through the legacy config schema, but will decide after reading the
 renderer's exact inputs.
 
 **Next:** Compose render/realize/observe/teardown behind a docker-runner seam.
+
+## 2026-06-16 17:10:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session;
+committed placement as `3f136a3`. Built Compose backend slice 2.
+
+**What I built (same branch):** `leasing/compose.py` — a focused compose
+renderer + `ComposeBackend`, plus a controller `converge` branch.
+- Decided **focused renderer over reusing legacy `resolve()`/`render_compose_artifacts`**:
+  the legacy renderer is welded to the resolved-deployment v5 schema
+  (providers/gateways/frontends, jinja templates, diff-gated writes); synthesizing
+  that from DeploymentGroups would be a large fragile mapping. The focused
+  renderer emits a compose dict straight from groups and *reuses
+  `profile_runtime.vllm_args`* for the genuinely tricky vLLM flag-building.
+- `ComposeBackend` is converge-style: place (pinned from a persisted sidecar) ->
+  render -> write compose.yml + sidecar -> `docker compose up -d
+  --remove-orphans`. observe() parses `docker compose ps --format json` and maps
+  running services back to group ids via the sidecar. Docker is an injected
+  `run(args)->str` seam.
+- Controller `reconcile` now prefers `backend.converge(desired)` when present
+  (whole-union convergence) and falls back to the per-group realize/teardown
+  loop for Memory/Null backends. Computed realized/torn_down from before/after
+  observe() diffs.
+- Wired `--backend compose` into the CLI (`detect_inventory`, data_root state
+  dir, `--allowed-gpus`). 90 leasing/CLI tests, 7 xdoctests, ruff clean. Tested
+  with a *stateful* FakeDocker (`up` reflects the rendered compose file, `ps`
+  returns it, `--remove-orphans` drops gone services) so converge->observe is
+  coherent end to end without docker.
+
+**Decisions / reflections:**
+- Per-group `realize`/`teardown` never fit compose's one-file model; rather than
+  contort the protocol I added an optional `converge` the controller detects via
+  `hasattr`. ComposeBackend therefore implements converge/observe/probe_ready
+  (not realize/teardown) — it duck-types into the controller's converge path.
+- `--remove-orphans` *is* teardown: converge always renders only the desired
+  groups, so a dropped group's service becomes an orphan and is removed. No
+  separate teardown docker call needed.
+- Placement stability via the persisted sidecar: converge feeds current
+  assignments as `pinned`, so adding/removing a group never migrates a running
+  model's GPUs.
+
+**Risks / unknowns (for when you test on the GPU host):**
+- Readiness is only "container running" this slice. `acquire --backend compose`
+  returns once the vLLM *container* is up, NOT once the model has finished
+  loading/serving. Real generation-probe readiness + Ollama pull/warmup come in
+  slice 3.
+- The env-file `base_url` is still the `--base-url` placeholder (default
+  :14042). With compose-and-no-LiteLLM the real endpoint is the per-vLLM direct
+  port (18000+i). The LiteLLM front door in slice 3 is what makes one stable
+  base_url correct; until then pass `--base-url` explicitly or hit the direct
+  port.
+- Cross-process compose-file writes are not yet file-locked — concurrent
+  `acquire`s from two processes could race on the compose file. The ledger's
+  BEGIN IMMEDIATE covers the lease rows but not the file; a flock around
+  converge is on the slice-3/hardening list.
+- No real docker/GPU run in this sandbox; the FakeDocker proves the logic. You
+  validate the real path.
+
+**Next (slice 3):** LiteLLM front door (alias routing -> served names, real
+base_url) + real readiness (`_wait_until_ready` generation probe, Ollama
+pull/warmup) + a converge file-lock.

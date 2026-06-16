@@ -28,6 +28,7 @@ import scriptconfig as scfg
 from ..leasing import (
     Catalog,
     CatalogError,
+    ComposeBackend,
     Controller,
     Ledger,
     NullBackend,
@@ -43,7 +44,7 @@ from ..leasing.envfile import (
 )
 from ..paths import config_root
 from .context import _apply_path_overrides
-from .options import _PathOverridesMixin
+from .options import _AllowedGpusMixin, _PathOverridesMixin
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -86,13 +87,28 @@ def _collect_names(value) -> list[str]:
     return out
 
 
-def _make_backend(name):
+def _parse_gpus(text) -> list[int] | None:
+    if text in (None, ''):
+        return None
+    return [int(p) for p in str(text).split(',') if p.strip() != '']
+
+
+def _make_backend(config):
+    name = config.backend
     if name in (None, '', 'null', 'dry-run'):
         return NullBackend()
+    if name == 'compose':
+        from ..hardware import detect_inventory
+        from ..paths import data_root
+
+        return ComposeBackend(
+            state_dir=data_root() / 'leasing' / 'compose',
+            inventory=detect_inventory(),
+            allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
+        )
     raise SystemExit(
-        f'backend {name!r} is not implemented in the leasing CLI yet; the '
-        'Compose/KubeAI backends land in a later stage. Use --backend null '
-        '(dry-run) for now.'
+        f'backend {name!r} is not implemented in the leasing CLI yet '
+        '(kubeai is a later stage). Use --backend null or compose.'
     )
 
 
@@ -100,7 +116,7 @@ def _open_controller(config) -> Controller:
     _apply_path_overrides(config)
     ledger_path = config.ledger or str(default_ledger_path())
     ledger = Ledger(SqliteStore(ledger_path))
-    return Controller(ledger, _make_backend(config.backend))
+    return Controller(ledger, _make_backend(config))
 
 
 def _load_catalog(config) -> Catalog:
@@ -197,11 +213,11 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-class _LeasingCommonMixin(_PathOverridesMixin):
+class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin):
     backend = scfg.Value(
         'null',
         choices=['null', 'compose', 'kubeai'],
-        help='Serving backend. Only "null" (dry-run) is implemented so far.',
+        help='Serving backend. "null" (dry-run) and "compose" are implemented.',
     )
     ledger = scfg.Value(
         None, type=str, help='Path to the lease ledger sqlite db.'

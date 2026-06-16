@@ -99,9 +99,22 @@ class Controller:
         return desired
 
     def reconcile(self) -> ReconcileResult:
-        """Converge the backend to the ledger's desired state."""
+        """Converge the backend to the ledger's desired state.
+
+        A backend may implement a single ``converge(desired)`` (whole-union
+        convergence — e.g. Compose renders one file and ``up``s it); otherwise
+        the per-group ``realize``/``teardown`` loop is used.
+        """
         self.ledger.sweep()
         desired = self.desired_groups()
+        if hasattr(self.backend, 'converge'):
+            before = set(self.backend.observe())
+            self.backend.converge(desired)
+            after = set(self.backend.observe())
+            return ReconcileResult(
+                realized=sorted(after - before),
+                torn_down=sorted(before - after),
+            )
         desired_ids = {g.id for g in desired}
         actual = self.backend.observe()
         result = ReconcileResult()

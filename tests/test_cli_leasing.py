@@ -153,9 +153,9 @@ def test_run_releases_on_exit(env, capsys):
     assert data['leases'][0]['state'] == 'released'
 
 
-def test_unknown_backend_errors(env):
+def test_unimplemented_backend_errors(env):
     with pytest.raises(SystemExit):
-        AcquireCLI.main(argv=['qwen-coder', '--backend', 'compose', *_base(env)])
+        AcquireCLI.main(argv=['qwen-coder', '--backend', 'kubeai', *_base(env)])
 
 
 def test_unknown_endpoint_errors(env):

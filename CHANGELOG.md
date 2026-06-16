@@ -37,6 +37,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   reservations), display-GPU skipping, and `pinned` assignments so adding or
   removing a group does not reshuffle already-running models. This is the placer
   the Compose backend will use; multi-node/bin-packing stay out of scope.
+* Compose backend (`infer_stack.leasing.compose`): a focused renderer that turns
+  the live set of deployment groups directly into a docker-compose project
+  (reusing `profile_runtime.vllm_args`), and a `ComposeBackend` that converges
+  the whole union on each reconcile (`docker compose up -d --remove-orphans`),
+  persisting GPU assignments so reconciles don't reshuffle running models.
+  Docker is invoked through an injected `run` seam (unit-tested against a fake;
+  real docker/GPU path validated on a host). The controller now prefers a
+  backend's `converge(desired)` over per-group realize/teardown. `infer-stack
+  ... --backend compose` is wired up. Readiness here is "container running";
+  the HTTP generation probe, Ollama pull/warmup, and the LiteLLM front door
+  (which supplies the real descriptor base_url) arrive in the next slice.
 
 ## [Version 0.0.1] -
 

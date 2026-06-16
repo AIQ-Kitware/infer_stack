@@ -17,6 +17,7 @@ from .catalog import (
     ModelSpec,
     RuntimeHostSpec,
 )
+from .compose import ComposeBackend, RenderedCompose, render_compose
 from .controller import (
     AcquireOutcome,
     Controller,
@@ -57,6 +58,7 @@ __all__ = [
     'Backend',
     'Catalog',
     'CatalogError',
+    'ComposeBackend',
     'Controller',
     'DeploymentGroup',
     'EndpointRequest',
@@ -73,6 +75,7 @@ __all__ = [
     'ReconcileResult',
     'ReleaseOutcome',
     'ReleaseResult',
+    'RenderedCompose',
     'RuntimeHostSpec',
     'Sharing',
     'SqliteStore',
@@ -84,6 +87,7 @@ __all__ = [
     'default_ledger_path',
     'ollama_structural',
     'plan_placement',
+    'render_compose',
     'required_gpu_count',
     'vllm_structural',
 ]
