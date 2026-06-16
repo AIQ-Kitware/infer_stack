@@ -520,3 +520,44 @@ processes is still only single-process tested.
 **Next:** the Compose backend implementing the `Backend` Protocol — the first
 time this touches docker/GPUs (renderer adapter from DeploymentGroups, GPU
 placement over the union, cross-process compose-file lock).
+
+## 2026-06-16 16:35:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session;
+committed the CLI as `0100a52`. Starting the Compose backend, which I'm building
+in fully-testable sub-slices because this sandbox has no GPUs/docker.
+
+**What I built (same branch):** sub-slice 1 — the single-host GPU placement
+planner `leasing/placement.py`. `plan_placement(groups, inventory, *,
+allowed_gpus, reserved, pinned, skip_display) -> GpuPlan`. Reuses the resolver's
+`_first_fit` and `_available_gpu_indices`. 15 tests (simulated inventories),
+71 leasing/CLI tests total, 7 xdoctests, ruff clean.
+
+**Decisions / reflections:**
+- This is the placement-over-the-union the ledger deliberately deferred. I made
+  it a standalone module (not buried in the Compose backend) because it is pure,
+  fully testable without docker, and Phase-2 raw-GPU reservations need the same
+  `reserved` exclusion.
+- Three-tier deterministic order — pinned, then explicit, then first-fit — with
+  groups sorted by (created_at, id). `pinned` is the stability mechanism: a
+  group already running on [0,1] keeps it when a sibling is added, so reconciles
+  don't reshuffle live models. An invalid pin (GPU gone) silently re-places.
+- Ollama daemons pin explicitly (their host `gpu_indices`, possibly `[]` for
+  CPU); vLLM groups first-fit by `tp × dp`. One planner, both engines.
+- Deferred VRAM-fit validation: the leasing catalog doesn't carry per-model
+  memory yet, so placement is by GPU *count* only. The legacy validator's
+  VRAM/headroom check is the reference to port when ModelSpec grows a
+  `min_vram_gib` field.
+
+**Risks / unknowns:** still no docker. The next sub-slices (render
+DeploymentGroups -> compose artifacts + `docker compose up`; observe via
+`docker compose ps`; teardown) will be built behind an injected runner seam and
+unit-tested against fakes, but the real docker/GPU path can only be validated by
+the user on the GPU host — I'll mark that explicitly. The big open design choice
+for the next slice: reuse the legacy `resolve()` + compose renderer by
+synthesizing a config from the groups, vs. write a focused renderer straight
+from DeploymentGroups. Leaning toward a focused renderer to avoid forcing the
+new model through the legacy config schema, but will decide after reading the
+renderer's exact inputs.
+
+**Next:** Compose render/realize/observe/teardown behind a docker-runner seam.

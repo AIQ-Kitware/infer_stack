@@ -31,6 +31,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   the child, and releases on exit — the kwdagger pipeline-node seam. Until the
   Compose/KubeAI backends land, `--backend null` (default) exercises the whole
   surface without serving anything real.
+* Single-host GPU placement planner (`infer_stack.leasing.placement`): assigns
+  GPUs across the whole live set of deployment groups (reusing the resolver's
+  `_first_fit`), honoring `allowed_gpus`, `reserved` GPUs (for Phase-2 raw-GPU
+  reservations), display-GPU skipping, and `pinned` assignments so adding or
+  removing a group does not reshuffle already-running models. This is the placer
+  the Compose backend will use; multi-node/bin-packing stay out of scope.
 
 ## [Version 0.0.1] -
 

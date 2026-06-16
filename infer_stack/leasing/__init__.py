@@ -43,6 +43,12 @@ from .models import (
     ollama_structural,
     vllm_structural,
 )
+from .placement import (
+    GpuPlan,
+    available_indices,
+    plan_placement,
+    required_gpu_count,
+)
 from .store import SqliteStore
 
 __all__ = [
@@ -55,6 +61,7 @@ __all__ = [
     'DeploymentGroup',
     'EndpointRequest',
     'EndpointSpec',
+    'GpuPlan',
     'GroupState',
     'Ledger',
     'Lease',
@@ -71,9 +78,12 @@ __all__ = [
     'SqliteStore',
     'SweepResult',
     'WaitResult',
+    'available_indices',
     'capacity_satisfies',
     'compatibility_key',
     'default_ledger_path',
     'ollama_structural',
+    'plan_placement',
+    'required_gpu_count',
     'vllm_structural',
 ]
