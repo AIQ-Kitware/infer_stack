@@ -43,18 +43,24 @@ def build_descriptor(
     *,
     base_url: str,
     api_key_env: str = 'LITELLM_MASTER_KEY',
+    request_names: dict[str, str] | None = None,
     cuda_visible_devices: str | None = None,
 ) -> dict[str, Any]:
     """Build the endpoint descriptor for one lease.
 
     Only the endpoints this lease actually requested are included (a coalesced
-    group may serve more).
+    group may serve more). ``request_names`` overrides the model name a client
+    must request per endpoint — e.g. behind a LiteLLM front door the client asks
+    for the endpoint *alias*, not the upstream served name.
     """
     endpoints: dict[str, str] = {}
     for group in groups:
         for endpoint, payload in group.served.items():
             if endpoint in lease.endpoints:
-                endpoints[endpoint] = _request_model_name(payload, endpoint)
+                if request_names and endpoint in request_names:
+                    endpoints[endpoint] = request_names[endpoint]
+                else:
+                    endpoints[endpoint] = _request_model_name(payload, endpoint)
     # preserve the lease's requested order where possible
     ordered = {ep: endpoints[ep] for ep in lease.endpoints if ep in endpoints}
     descriptor: dict[str, Any] = {

@@ -23,21 +23,27 @@ from infer_stack.leasing import (
 from infer_stack.leasing.models import DeploymentGroup, GroupState
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
-IMAGES = {'vllm': 'vllm/vllm-openai:test', 'ollama': 'ollama/ollama:test'}
+IMAGES = {
+    'vllm': 'vllm/vllm-openai:test',
+    'ollama': 'ollama/ollama:test',
+    'litellm': 'ghcr.io/berriai/litellm:test',
+}
 PORTS = {'ollama': 11434}
 
 
 def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm', t=0.0):
+    # endpoint (public alias) is the group id; served_model_name is the upstream
+    served_name = served or gid
     return DeploymentGroup(
         gid, 'ck-' + gid, 'vllm', 'shared-compatible', {},
         {
             'engine': 'vllm',
             'hf_model_id': hf,
-            'served_model_name': served or gid,
+            'served_model_name': served_name,
             'runtime': {'tensor_parallel_size': tp, 'max_model_len': max_len},
             'reclaim': reclaim,
         },
-        {served or gid: {'served_model_name': served or gid}},
+        {gid: {'served_model_name': served_name}},
         GroupState.LIVE, t, t,
     )
 
@@ -72,6 +78,21 @@ class FakeDocker:
                 [{'Service': s, 'State': 'running'} for s in self.running]
             )
         return ''
+
+
+class FakeHttp:
+    """Fake /v1/models that lists whatever aliases the LiteLLM config declares."""
+
+    def __init__(self, state_dir):
+        self.state_dir = Path(state_dir)
+
+    def __call__(self, url):
+        cfg = self.state_dir / 'litellm_config.yaml'
+        names = []
+        if cfg.exists():
+            data = yaml.safe_load(cfg.read_text()) or {}
+            names = [e['model_name'] for e in data.get('model_list', [])]
+        return 200, {'data': [{'id': n} for n in names]}
 
 
 # -- pure render -----------------------------------------------------------
@@ -133,6 +154,7 @@ def make_backend(tmp_path, *, spec='4x80', **kw):
         state_dir=tmp_path,
         inventory=simulate_inventory(spec),
         run=FakeDocker(),
+        http_get=FakeHttp(tmp_path),
         images=IMAGES, ports=PORTS, state=STATE,
         **kw,
     )
@@ -207,12 +229,56 @@ def test_controller_compose_end_to_end(tmp_path):
     out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder', 'reranker']))
     assert out.wait.ready is True
     assert set(backend.observe()) == set(g.id for g in out.groups)
-    # two services in the rendered compose, on distinct GPUs
+    # two vLLM services + the LiteLLM front door
     compose = yaml.safe_load(backend.compose_file.read_text())
-    assert len(compose['services']) == 2
+    group_services = [s for s in compose['services'] if s.startswith('vllm-')]
+    assert len(group_services) == 2
+    assert 'litellm' in compose['services']
 
     # release the lease: reranker is stop-policy -> torn down; qwen keep-warm stays
     qwen_gid = next(g.id for g in out.groups
                     if 'qwen-coder' in g.served)
     ctl.release(out.lease.id)
     assert backend.observe() == {qwen_gid}
+
+
+# -- LiteLLM front door ----------------------------------------------------
+
+
+def test_render_litellm_front_door(tmp_path):
+    rc = render_compose(
+        [vllm('grp-a', served='qwen-served')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, litellm_port=14042, aux_dir=tmp_path,
+    )
+    assert 'litellm' in rc.compose['services']
+    litellm = rc.compose['services']['litellm']
+    assert litellm['ports'] == ['14042:4000']
+    cfg = yaml.safe_load(rc.litellm_config)
+    entry = cfg['model_list'][0]
+    assert entry['model_name'] == 'grp-a'                  # alias = endpoint
+    assert entry['litellm_params']['model'] == 'openai/qwen-served'
+    assert entry['litellm_params']['api_base'] == 'http://vllm-grp-a:8000/v1'
+
+
+def test_access_reports_litellm_base_url(tmp_path):
+    be = make_backend(tmp_path)
+    info = be.access(['qwen-coder', 'reranker'])
+    assert info['base_url'] == 'http://127.0.0.1:14042/v1'
+    assert info['api_key_env'] == 'LITELLM_MASTER_KEY'
+    assert info['request_names'] == {'qwen-coder': 'qwen-coder',
+                                     'reranker': 'reranker'}
+
+
+def test_access_none_without_litellm(tmp_path):
+    be = make_backend(tmp_path, litellm=False)
+    assert be.access(['x']) is None
+
+
+def test_probe_ready_requires_routable_alias(tmp_path):
+    be = make_backend(tmp_path)
+    g = vllm('a', served='a-served')
+    be.converge([g])                       # writes litellm config listing 'a'
+    assert be.probe_ready(g, 'a').ready is True
+    # an endpoint the gateway doesn't list is not ready
+    assert be.probe_ready(g, 'ghost').ready is False

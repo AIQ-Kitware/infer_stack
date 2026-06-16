@@ -622,3 +622,52 @@ renderer + `ComposeBackend`, plus a controller `converge` branch.
 **Next (slice 3):** LiteLLM front door (alias routing -> served names, real
 base_url) + real readiness (`_wait_until_ready` generation probe, Ollama
 pull/warmup) + a converge file-lock.
+
+## 2026-06-16 17:45:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session;
+committed compose slice 2 as `301d4de`. Built slice 3.
+
+**What I built (same branch):** the LiteLLM front door + access/descriptor
+wiring + converge file-lock + routability readiness, all in `compose.py` +
+`envfile.py` + `commands_leasing.py`.
+- LiteLLM service + config rendered from the group set (default on): one
+  `model_list` entry per served endpoint alias -> upstream `openai/<served>` at
+  `http://vllm-<gid>:8000/v1` (or `ollama/<tag>`). This is what makes one stable
+  `base_url` possible and is why the alias (endpoint name), not the upstream
+  served name, is what a client requests.
+- `ComposeBackend.access(endpoints)` returns the real `base_url` (LiteLLM port),
+  `api_key_env`, and per-endpoint request names. The CLI's new `_descriptor_for`
+  prefers `backend.access` over the `--base-url` placeholder; `build_descriptor`
+  gained a `request_names` override. NullBackend has no `access` -> CLI falls
+  back unchanged (verified by smoke).
+- `probe_ready` upgraded: container-running (observe) AND the alias appears in
+  the gateway's `/v1/models`, via an injected `http_get` seam. Tested with a
+  fake HTTP that lists whatever the rendered LiteLLM config declares — realistic
+  and fully offline.
+- `converge` wrapped in an `fcntl.flock` (the cross-process compose-file race I
+  flagged in slice 2). 94 leasing/CLI tests, 7 xdoctests, ruff clean.
+
+**Decisions / reflections:**
+- Backend-supplied access (a 5th, optional method discovered via `getattr`) is
+  the clean fix for "who knows the real base_url": the backend does, not the
+  CLI. Same hasattr/duck-type pattern as `converge`. Keeps Null/Memory backends
+  untouched.
+- Readiness = "alias listed by the gateway" is the honest, testable middle
+  between "container up" (too weak) and "generation succeeds" (needs a live
+  model). A real generation probe + Ollama pull/warmup is the remaining rung.
+- Caught a test-helper bug while wiring this: my `vllm()` test helper had keyed
+  the group's `served` map by the *served name* instead of the endpoint alias,
+  so the LiteLLM alias didn't match the probed endpoint. Fixed the helper to key
+  by endpoint (group id) with served_model_name as the value — which is exactly
+  the endpoint-vs-served distinction the front door depends on.
+
+**Risks / unknowns (for host testing):** still no real docker/HTTP here — the
+seams prove the logic; the LiteLLM container actually starting, vLLM upstreams
+becoming healthy, and the gateway listing models is the host-validated part.
+Ollama pull/warmup not implemented (a daemon serves a tag lazily; readiness
+should pull + warm it). The flock only guards a single host's state dir.
+
+**Next:** the migration bridge (`migrate-config` from legacy profiles; `switch`
+as a standing-lease shim) and Ollama pull/warmup readiness; then consumer
+integration in eval_audit / aiq-eval-runner.

@@ -9,17 +9,25 @@ removing a group re-renders and converges; pinned placement (persisted in a
 sidecar) keeps already-running models on their GPUs, and ``--remove-orphans``
 tears down services whose group is gone.
 
-Docker is invoked through an injected ``run(args) -> str`` seam, so all of the
-logic here is unit-testable without docker. The default seam shells out to
-``docker compose``; the real docker/GPU path is validated on a GPU host.
+A **LiteLLM front door** (default on) gives one stable ``base_url`` and routes
+each endpoint *alias* to its upstream vLLM/Ollama service, so a client always
+talks to ``http://host:<litellm>/v1`` and asks for the public endpoint name.
+That is what makes the endpoint descriptor's ``base_url`` correct (the backend
+supplies it via :meth:`ComposeBackend.access`).
 
-Readiness in this slice is "the container is running" (via ``observe``); the
-HTTP generation probe and the Ollama pull/warmup rung land in the next slice,
-together with the LiteLLM gateway that maps endpoint aliases onto served names.
+Docker and HTTP are invoked through injected seams (``run`` / ``http_get``), so
+all logic here is unit-testable without docker or a network. The real
+docker/GPU path is validated on a GPU host. ``converge`` is serialized with a
+file lock so concurrent processes don't clobber the shared compose file.
+
+Slice status: readiness probes the LiteLLM ``/v1/models`` listing (model is
+routable). The Ollama tag pull/warmup rung is a follow-up.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,8 +42,13 @@ from .models import DeploymentGroup
 from .placement import plan_placement
 
 VLLM_HOST_PORT_BASE = 18000
+LITELLM_CONTAINER_PORT = 4000
 STATE_FILENAME = 'leasing-compose-state.json'
 COMPOSE_FILENAME = 'docker-compose.yml'
+LITELLM_CONFIG_FILENAME = 'litellm_config.yaml'
+LOCK_FILENAME = '.converge.lock'
+LITELLM_SERVICE = 'litellm'
+API_KEY_ENV = 'LITELLM_MASTER_KEY'
 
 VLLM_DEFAULTS = {
     'gpu_memory_utilization': 0.9,
@@ -52,6 +65,7 @@ ENGINE_LABEL = 'infer-stack.engine'
 class RenderedCompose:
     compose: dict[str, Any]
     services: dict[str, str] = field(default_factory=dict)  # service -> group id
+    litellm_config: str | None = None
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -170,6 +184,64 @@ def _ollama_service(
     return service
 
 
+def _litellm_model_list(
+    groups: list[DeploymentGroup], assignments: dict[str, list[int]]
+) -> list[dict[str, Any]]:
+    """One LiteLLM ``model_list`` entry per served endpoint alias."""
+    entries: list[dict[str, Any]] = []
+    for group in sorted(groups, key=lambda g: (g.created_at, g.id)):
+        if group.id not in assignments:
+            continue
+        if group.engine == 'vllm':
+            served = group.spec.get('served_model_name') or group.id
+            api_base = f'http://vllm-{group.id}:8000/v1'
+            for endpoint in sorted(group.served):
+                entries.append(
+                    {
+                        'model_name': endpoint,
+                        'litellm_params': {
+                            'model': f'openai/{served}',
+                            'api_base': api_base,
+                            'api_key': 'EMPTY',
+                        },
+                    }
+                )
+        elif group.engine == 'ollama':
+            api_base = f'http://ollama-{group.id}:11434'
+            for endpoint, payload in sorted(group.served.items()):
+                tag = payload.get('model', endpoint)
+                entries.append(
+                    {
+                        'model_name': endpoint,
+                        'litellm_params': {
+                            'model': f'ollama/{tag}',
+                            'api_base': api_base,
+                        },
+                    }
+                )
+    return entries
+
+
+def _litellm_service(
+    service_names: list[str], host_port: int, images: dict[str, str], aux_dir: str
+) -> dict[str, Any]:
+    return {
+        'image': images['litellm'],
+        'command': [
+            '--config',
+            '/etc/litellm/config.yaml',
+            '--port',
+            str(LITELLM_CONTAINER_PORT),
+        ],
+        'ports': [f'{host_port}:{LITELLM_CONTAINER_PORT}'],
+        'volumes': [f'{aux_dir}/{LITELLM_CONFIG_FILENAME}:/etc/litellm/config.yaml:ro'],
+        'environment': {f'{API_KEY_ENV}': '${' + API_KEY_ENV + ':-sk-local}'},
+        'depends_on': sorted(service_names),
+        'restart': 'unless-stopped',
+        'labels': {ENGINE_LABEL: 'litellm'},
+    }
+
+
 def render_compose(
     groups: list[DeploymentGroup],
     assignments: dict[str, list[int]],
@@ -177,10 +249,15 @@ def render_compose(
     images: dict[str, str],
     ports: dict[str, int],
     state: dict[str, str],
+    litellm: bool = False,
+    litellm_port: int = 14042,
+    aux_dir: str | Path | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed groups.
 
-    Groups absent from ``assignments`` (placement failures) are skipped.
+    Groups absent from ``assignments`` (placement failures) are skipped. When
+    ``litellm`` is set, a front-door service + config is added so every endpoint
+    alias is reachable at one ``base_url``.
     """
     services: dict[str, Any] = {}
     service_map: dict[str, str] = {}
@@ -204,13 +281,44 @@ def render_compose(
         else:
             continue
         service_map[name] = group.id
-    return RenderedCompose(compose={'services': services}, services=service_map)
+
+    litellm_config = None
+    if litellm and service_map:
+        entries = _litellm_model_list(groups, assignments)
+        litellm_config = yaml.safe_dump(
+            {
+                'model_list': entries,
+                'general_settings': {
+                    'master_key': f'os.environ/{API_KEY_ENV}'
+                },
+            },
+            sort_keys=False,
+        )
+        services[LITELLM_SERVICE] = _litellm_service(
+            list(service_map), litellm_port, images, str(aux_dir or '.')
+        )
+    return RenderedCompose(
+        compose={'services': services},
+        services=service_map,
+        litellm_config=litellm_config,
+    )
 
 
 def _default_docker_run(args: list[str]) -> str:
     import subprocess
 
     return subprocess.check_output(args, text=True)
+
+
+def _default_http_get(url: str) -> tuple[int, dict[str, Any]]:
+    import requests
+
+    resp = requests.get(url, timeout=10)
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    return resp.status_code, body
 
 
 def _parse_ps(out: str) -> set[str]:
@@ -246,8 +354,9 @@ def _parse_ps(out: str) -> set[str]:
 class ComposeBackend:
     """Single-host docker compose backend (converge-style).
 
-    Driven by the controller's ``converge`` path. ``run`` is the injected docker
-    seam; default shells out to ``docker compose``.
+    Driven by the controller's ``converge`` path. ``run`` / ``http_get`` are the
+    injected docker/HTTP seams; defaults shell out to ``docker compose`` and
+    ``requests``.
     """
 
     def __init__(
@@ -256,6 +365,7 @@ class ComposeBackend:
         state_dir: str | Path,
         inventory: dict[str, Any],
         run: Callable[[list[str]], str] | None = None,
+        http_get: Callable[[str], tuple[int, dict[str, Any]]] | None = None,
         images: dict[str, str] | None = None,
         ports: dict[str, int] | None = None,
         state: dict[str, str] | None = None,
@@ -263,11 +373,13 @@ class ComposeBackend:
         reserved: list[int] | tuple[int, ...] = (),
         project: str = 'infer-stack',
         skip_display: bool = True,
+        litellm: bool = True,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.inventory = inventory
         self.run = run or _default_docker_run
+        self.http_get = http_get or _default_http_get
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
         self.state = state or default_state_paths()
@@ -275,6 +387,7 @@ class ComposeBackend:
         self.reserved = tuple(reserved)
         self.project = project
         self.skip_display = skip_display
+        self.litellm = litellm
         self.last_errors: list[str] = []
 
     @property
@@ -284,6 +397,10 @@ class ComposeBackend:
     @property
     def _state_file(self) -> Path:
         return self.state_dir / STATE_FILENAME
+
+    @property
+    def litellm_port(self) -> int:
+        return self.ports.get('litellm', DEFAULT_PORTS['litellm'])
 
     def _load_sidecar(self) -> dict[str, Any]:
         if self._state_file.exists():
@@ -306,33 +423,52 @@ class ComposeBackend:
             ]
         )
 
+    @contextlib.contextmanager
+    def _converge_lock(self):
+        """Serialize converge across processes sharing this state dir."""
+        handle = open(self.state_dir / LOCK_FILENAME, 'w')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+
     def converge(self, desired: list[DeploymentGroup]):
         """Place, render, and ``docker compose up`` the desired union."""
         desired = list(desired)
-        pinned = self._load_sidecar().get('assignments', {})
-        plan = plan_placement(
-            desired,
-            self.inventory,
-            allowed_gpus=self.allowed_gpus,
-            reserved=self.reserved,
-            pinned=pinned,
-            skip_display=self.skip_display,
-        )
-        self.last_errors = plan.errors
-        rendered = render_compose(
-            desired,
-            plan.assignments,
-            images=self.images,
-            ports=self.ports,
-            state=self.state,
-        )
-        self.compose_file.write_text(
-            yaml.safe_dump(rendered.compose, sort_keys=False)
-        )
-        self._save_sidecar(
-            {'assignments': plan.assignments, 'services': rendered.services}
-        )
-        self._compose(['up', '-d', '--remove-orphans'])
+        with self._converge_lock():
+            pinned = self._load_sidecar().get('assignments', {})
+            plan = plan_placement(
+                desired,
+                self.inventory,
+                allowed_gpus=self.allowed_gpus,
+                reserved=self.reserved,
+                pinned=pinned,
+                skip_display=self.skip_display,
+            )
+            self.last_errors = plan.errors
+            rendered = render_compose(
+                desired,
+                plan.assignments,
+                images=self.images,
+                ports=self.ports,
+                state=self.state,
+                litellm=self.litellm,
+                litellm_port=self.litellm_port,
+                aux_dir=self.state_dir,
+            )
+            if rendered.litellm_config is not None:
+                (self.state_dir / LITELLM_CONFIG_FILENAME).write_text(
+                    rendered.litellm_config
+                )
+            self.compose_file.write_text(
+                yaml.safe_dump(rendered.compose, sort_keys=False)
+            )
+            self._save_sidecar(
+                {'assignments': plan.assignments, 'services': rendered.services}
+            )
+            self._compose(['up', '-d', '--remove-orphans'])
         return plan
 
     def observe(self) -> set[str]:
@@ -342,14 +478,40 @@ class ComposeBackend:
         services = self._load_sidecar().get('services', {})
         return {services[name] for name in running if name in services}
 
+    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
+        """Where a client reaches these endpoints, for the env-file descriptor.
+
+        With the LiteLLM front door, that is one ``base_url`` and the request
+        model name is the endpoint alias itself. Returns ``None`` (let the CLI
+        fall back) when LiteLLM is off, since there is then no single base URL.
+        """
+        if not self.litellm:
+            return None
+        return {
+            'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
+            'api_key_env': API_KEY_ENV,
+            'request_names': {ep: ep for ep in endpoints},
+        }
+
     def probe_ready(
         self, group: DeploymentGroup, endpoint: str
     ) -> Readiness:
-        # Slice 2: readiness == container running. The HTTP generation probe and
-        # the Ollama pull/warmup rung arrive with the LiteLLM gateway slice.
-        if group.id in self.observe():
+        """Ready == container running and (with LiteLLM) the alias is routable."""
+        if group.id not in self.observe():
+            return Readiness(False, 'container not running')
+        if not self.litellm:
             return Readiness(True, 'container running')
-        return Readiness(False, 'container not running')
+        url = f'http://127.0.0.1:{self.litellm_port}/v1/models'
+        try:
+            status, body = self.http_get(url)
+        except Exception as ex:  # noqa: BLE001 - readiness is best-effort
+            return Readiness(False, f'probe error: {ex}')
+        if status != 200:
+            return Readiness(False, f'/v1/models returned {status}')
+        listed = {m.get('id') for m in (body.get('data') or [])}
+        if endpoint in listed:
+            return Readiness(True, 'routable')
+        return Readiness(False, f'{endpoint} not yet listed by the gateway')
 
     def down(self) -> None:
         """Tear the whole project down (for an explicit stop)."""

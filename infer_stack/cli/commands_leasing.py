@@ -146,12 +146,29 @@ def _resolve_session(config) -> str | None:
     return sid
 
 
-def _emit_acquire(config, outcome) -> int:
-    descriptor = build_descriptor(
-        outcome.lease,
-        outcome.groups,
-        base_url=config.base_url,
-        api_key_env=config.api_key_env,
+def _descriptor_for(controller, lease, groups, config):
+    """Build the descriptor, preferring backend-supplied access (real base_url)."""
+    base_url = config.base_url
+    api_key_env = config.api_key_env
+    request_names = None
+    access = getattr(controller.backend, 'access', None)
+    info = access(list(lease.endpoints)) if access else None
+    if info:
+        base_url = info.get('base_url', base_url)
+        api_key_env = info.get('api_key_env', api_key_env)
+        request_names = info.get('request_names')
+    return build_descriptor(
+        lease,
+        groups,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        request_names=request_names,
+    )
+
+
+def _emit_acquire(config, controller, outcome) -> int:
+    descriptor = _descriptor_for(
+        controller, outcome.lease, outcome.groups, config
     )
     if config.env_file:
         Path(config.env_file).expanduser().write_text(
@@ -205,7 +222,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         timeout=float(config.timeout),
         interval=float(config.interval),
     )
-    return _emit_acquire(config, outcome)
+    return _emit_acquire(config, controller, outcome)
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +428,8 @@ class RunCLI(_LeasingCommonMixin):
             raise SystemExit(
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )
-        descriptor = build_descriptor(
-            outcome.lease,
-            outcome.groups,
-            base_url=config.base_url,
-            api_key_env=config.api_key_env,
+        descriptor = _descriptor_for(
+            controller, outcome.lease, outcome.groups, config
         )
         env = dict(os.environ)
         env.update(descriptor_env(descriptor))

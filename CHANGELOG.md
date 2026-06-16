@@ -45,9 +45,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   Docker is invoked through an injected `run` seam (unit-tested against a fake;
   real docker/GPU path validated on a host). The controller now prefers a
   backend's `converge(desired)` over per-group realize/teardown. `infer-stack
-  ... --backend compose` is wired up. Readiness here is "container running";
-  the HTTP generation probe, Ollama pull/warmup, and the LiteLLM front door
-  (which supplies the real descriptor base_url) arrive in the next slice.
+  ... --backend compose` is wired up.
+* Compose LiteLLM front door + readiness + converge lock: the Compose backend
+  now renders a LiteLLM gateway (default on) that routes each endpoint alias to
+  its upstream vLLM/Ollama service, giving one stable `base_url`. `ComposeBackend
+  .access()` supplies that real base_url + per-endpoint request name into the
+  env-file descriptor (the CLI prefers it over the `--base-url` placeholder).
+  `probe_ready` now checks the gateway's `/v1/models` listing (model is
+  routable) via an injected HTTP seam, and `converge` is serialized with a file
+  lock so concurrent processes don't clobber the shared compose file. (Ollama
+  tag pull/warmup is a remaining readiness follow-up.)
 
 ## [Version 0.0.1] -
 
