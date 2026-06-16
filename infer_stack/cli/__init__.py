@@ -32,6 +32,7 @@ from .. import __version__
 # Keep submodules importable as attributes (e.g. ``infer_stack.cli.commands_runtime``)
 # so tests can patch seams where they are actually looked up.
 from . import (  # noqa: F401
+    commands_leasing,
     commands_meta,
     commands_profile,
     commands_runtime,
@@ -77,6 +78,14 @@ from .commands_runtime import (
     StatusCLI,
     StopCLI,
     UpCLI,
+)
+from .commands_leasing import (
+    AcquireCLI,
+    LeasesCLI,
+    ReleaseCLI,
+    RenewCLI,
+    RunCLI,
+    ServeCLI,
 )
 from .commands_meta import (
     ConfigModalCLI,
@@ -167,6 +176,14 @@ class ManageCLI(scfg.ModalCLI):
     ollama_pull = OllamaPullCLI
     ollama_list = OllamaListCLI
     ollama_ps = OllamaPsCLI
+
+    # Leasing model (acquire/release/run/serve + status)
+    acquire = AcquireCLI
+    release = ReleaseCLI
+    renew = RenewCLI
+    run = RunCLI
+    serve = ServeCLI
+    leases = LeasesCLI
 
     # Compose day-2-ops wrappers
     logs = LogsCLI

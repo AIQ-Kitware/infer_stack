@@ -469,3 +469,54 @@ per-call — the Protocol allows either, but I haven't validated the batch shape
 **Next:** the Compose backend implementing this Protocol (reuse `_first_fit`,
 `_wait_until_ready` + Ollama pull/warmup, the live LiteLLM router refresh), then
 the `acquire`/`release`/`run`/`status` CLI emitting the `contracts.py` env-file.
+
+## 2026-06-16 16:05:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session;
+committed the controller as `b512c62`, then built the CLI surface.
+
+**What I built (same branch):** the leasing CLI verbs + the env-file/descriptor
+emitter + a dry-run backend.
+- `leasing/envfile.py`: the endpoint descriptor (aligned with `contracts.py`:
+  base_url / api_key_env / models) and its sourceable shell env-file
+  (`INFER_STACK_SESSION_ID`, `OPENAI_BASE_URL`, `INFER_STACK_ENDPOINT_<NAME>`,
+  `INFER_STACK_MODELS`, optional `CUDA_VISIBLE_DEVICES`). `read_session_id`
+  recovers the session from a written env-file so `release --env-file` works.
+- `leasing/backend.py`: added `NullBackend` (dry-run) — `observe()` returns the
+  empty set so the controller no-op-realizes everything and never tears down;
+  readiness is immediate; no in-memory state, so it stays coherent across
+  separate CLI invocations (the persistent ledger is the only truth).
+- `cli/commands_leasing.py`: `acquire` / `serve` / `release` / `renew` / `run` /
+  `leases`, registered on `ManageCLI`. `run -- <cmd>` acquires, injects the
+  endpoint env into the child, runs, releases on exit, propagates exit code.
+- 13 CLI tests + a real end-to-end shell smoke through `python -m
+  infer_stack.cli`. 66 leasing/CLI tests total, 6 xdoctests, ruff clean.
+
+**Decisions / reflections:**
+- Named the status verb `leases` (not `status`) because the legacy profile model
+  already owns `infer-stack status`. The two models coexist during the
+  transition; `leases` is unambiguously the new one.
+- Default `--backend null`. The whole acquire/release/run/env-file flow is
+  exercisable without docker, which is the point of doing the CLI before the
+  Compose backend: it locks the user-facing contract (verbs + env-file shape)
+  that the consumer repos and the Compose backend then build against.
+- Hit the scriptconfig smartcast trap: a `nargs='*'` positional smart-splits
+  string elements on commas, which mangled `run -- python -c "import os, ..."`
+  into a nested list. Fix: `type=str` on the positional/`command` values and do
+  comma-splitting myself in `_collect_names`. (Worth a dev/lesson if it recurs.)
+- For Ollama the env-file's request-model name is the *tag* (e.g. `qwen3.5:4b`),
+  not the endpoint name — confirmed in the smoke (`INFER_STACK_MODELS=qwen3.5:4b`).
+  `build_descriptor` reads it from the group's per-endpoint served payload.
+
+**Risks / unknowns:** `base_url` in the descriptor is a dry-run placeholder
+(`--base-url`, default the LiteLLM port) — the real URL must come from the
+Compose/KubeAI backend once it exists, so the descriptor's `base_url` and
+`api_key_env` will be backend-supplied later (likely a 5th backend method or an
+access() call). `run` releases in a `finally`, but a hard kill (SIGKILL) skips
+it — that's exactly why `run` defaults `--ttl 2h` as the backstop, and why a
+periodic `sweep` (who runs it?) is still an open v1 question. Concurrency across
+processes is still only single-process tested.
+
+**Next:** the Compose backend implementing the `Backend` Protocol — the first
+time this touches docker/GPUs (renderer adapter from DeploymentGroups, GPU
+placement over the union, cross-process compose-file lock).

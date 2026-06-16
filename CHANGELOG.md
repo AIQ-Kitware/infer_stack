@@ -24,6 +24,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   groups), enforces TTL on every reconcile, scopes readiness waits to the
   endpoints a lease requested, and exposes thin `acquire`/`release`. The Compose
   and KubeAI backends will implement the same protocol.
+* Leasing CLI verbs: `infer-stack acquire` / `release` / `renew` / `run` /
+  `serve` / `leases`, plus an endpoint-descriptor env-file
+  (`infer_stack.leasing.envfile`, aligned with the `contracts.py` shape) and a
+  dry-run `NullBackend`. `run -- <cmd>` acquires, injects the endpoint env into
+  the child, and releases on exit — the kwdagger pipeline-node seam. Until the
+  Compose/KubeAI backends land, `--backend null` (default) exercises the whole
+  surface without serving anything real.
 
 ## [Version 0.0.1] -
 

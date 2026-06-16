@@ -116,3 +116,29 @@ class MemoryBackend:
             self.ready_overrides[group_id] = ready
         else:
             self.ready_overrides[(group_id, endpoint)] = ready
+
+
+class NullBackend:
+    """A no-op backend that serves nothing — for ``--dry-run`` and ``leases``.
+
+    It never starts a process. ``observe`` returns the empty set, so the
+    controller treats every desired group as freshly realized (a no-op) and
+    never tears anything down; readiness is immediate. Because it keeps no
+    in-memory state, behaviour stays coherent across separate CLI invocations:
+    the persistent ledger is the only source of truth. Use this to exercise
+    acquire/release/run plumbing before the Compose backend exists.
+    """
+
+    def realize(self, group: DeploymentGroup) -> None:
+        pass
+
+    def teardown(self, group: DeploymentGroup) -> None:
+        pass
+
+    def observe(self) -> set[str]:
+        return set()
+
+    def probe_ready(
+        self, group: DeploymentGroup, endpoint: str
+    ) -> Readiness:
+        return Readiness(True, 'dry-run')
