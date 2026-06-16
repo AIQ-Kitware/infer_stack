@@ -9,12 +9,20 @@ kubeai) and the CLI verbs are built on top of this in later phases.
 
 from __future__ import annotations
 
+from .backend import Backend, MemoryBackend, Readiness
 from .catalog import (
     Catalog,
     CatalogError,
     EndpointSpec,
     ModelSpec,
     RuntimeHostSpec,
+)
+from .controller import (
+    AcquireOutcome,
+    Controller,
+    ReconcileResult,
+    ReleaseOutcome,
+    WaitResult,
 )
 from .ledger import (
     AcquireResult,
@@ -38,9 +46,12 @@ from .models import (
 from .store import SqliteStore
 
 __all__ = [
+    'AcquireOutcome',
     'AcquireResult',
+    'Backend',
     'Catalog',
     'CatalogError',
+    'Controller',
     'DeploymentGroup',
     'EndpointRequest',
     'EndpointSpec',
@@ -48,12 +59,17 @@ __all__ = [
     'Ledger',
     'Lease',
     'LeaseState',
+    'MemoryBackend',
     'ModelSpec',
+    'Readiness',
+    'ReconcileResult',
+    'ReleaseOutcome',
     'ReleaseResult',
     'RuntimeHostSpec',
     'Sharing',
     'SqliteStore',
     'SweepResult',
+    'WaitResult',
     'capacity_satisfies',
     'compatibility_key',
     'default_ledger_path',

@@ -17,6 +17,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   profiles as the primary unit), with cross-reference validation and
   `resolve_endpoint` / `resolve_names` that turn endpoint and bundle names into
   ledger `EndpointRequest`s (vLLM per-model, Ollama per-daemon).
+* Backend protocol + controller (`infer_stack.leasing.backend` /
+  `.controller`): a 4-method `Backend` seam (`realize`/`teardown`/`observe`/
+  `probe_ready`), a `MemoryBackend` for tests/dry-runs, and a `Controller` that
+  reconciles the ledger's desired state onto a backend (LIVE + keep-warm-idle
+  groups), enforces TTL on every reconcile, scopes readiness waits to the
+  endpoints a lease requested, and exposes thin `acquire`/`release`. The Compose
+  and KubeAI backends will implement the same protocol.
 
 ## [Version 0.0.1] -
 

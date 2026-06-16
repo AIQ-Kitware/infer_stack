@@ -419,3 +419,53 @@ future work). No backwards-compat shim yet between the old and new catalogs.
 (`realize`/`teardown`/`observe`/`probe_ready`), testable first with a fake
 backend, then a Compose implementation reusing the existing placement/readiness
 machinery.
+
+## 2026-06-16 15:30:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session;
+committed the catalog as `1274470`, then built the reconcile layer.
+
+**What I built (same branch):** the backend seam + controller.
+- `backend.py`: a tiny 4-method `Backend` Protocol
+  (`realize`/`teardown`/`observe`/`probe_ready`, all idempotent) + `Readiness` +
+  a `MemoryBackend` (records calls, configurable per-group/per-endpoint
+  readiness) for tests and dry-runs. This Protocol is the single thing a real
+  backend (Compose/KubeAI) must implement — and the deliberate line between
+  "infer-stack coordinates" and "the backend/k8s schedules".
+- `controller.py`: `Controller(ledger, backend)` with the desired-vs-actual
+  reconcile loop, `wait_ready`, and thin `acquire`/`release`. 11 controller
+  tests (incl. catalog integration), 43 leasing tests total, 5 xdoctests, ruff
+  clean.
+
+**Decisions / reflections:**
+- Named the orchestrator `Controller` (module `controller.py`) and kept the
+  reconcile *loop* as its `reconcile()` method. The design doc says "Reconciler";
+  I went with Controller because the object also owns the thin acquire/release
+  orchestration, and "reconciler" reads odd as the home of `acquire`. The loop
+  is still literally a reconciler.
+- `reconcile()` calls `ledger.sweep()` first. Without it, a group whose only
+  lease has expired by time still has `state == LIVE` in the row (nothing
+  flipped it), so it would stay "desired". Sweeping makes TTL self-enforcing on
+  every reconcile — the crash backstop actually fires.
+- Desired set = LIVE groups + IDLE groups whose reclaim policy is keep-warm.
+  Teardown falls out of the diff (actual - desired). I deliberately did NOT add
+  a STOPPED group state: after teardown the backend's `observe()` no longer
+  returns the group, so it isn't re-torn-down, and a later acquire reuses the
+  IDLE row and re-realizes it. Fewer states, same behavior.
+- `wait_ready` is scoped to the endpoints the *lease* requested, not all of a
+  coalesced group's served endpoints. Important for Ollama: a daemon may serve
+  several tags; a node acquiring one tag shouldn't block on a sibling tag's
+  health. Tested explicitly.
+
+**Risks / unknowns:** still no real backend — `MemoryBackend` proves the
+control logic but not the docker/GPU reality. The reclaim model has no
+*pressure* concept yet: keep-warm idle groups stay up forever (reclaimed only
+when explicitly stop/scale-to-zero, or reused). That's intended for now but the
+Compose backend will need a pressure-driven reaper when GPUs are contended.
+`realize` is per-group; the Compose backend renders one compose file for the
+union, so it will likely converge the whole desired set at once rather than
+per-call — the Protocol allows either, but I haven't validated the batch shape.
+
+**Next:** the Compose backend implementing this Protocol (reuse `_first_fit`,
+`_wait_until_ready` + Ollama pull/warmup, the live LiteLLM router refresh), then
+the `acquire`/`release`/`run`/`status` CLI emitting the `contracts.py` env-file.
