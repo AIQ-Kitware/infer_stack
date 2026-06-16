@@ -671,3 +671,53 @@ should pull + warm it). The flock only guards a single host's state dir.
 **Next:** the migration bridge (`migrate-config` from legacy profiles; `switch`
 as a standing-lease shim) and Ollama pull/warmup readiness; then consumer
 integration in eval_audit / aiq-eval-runner.
+
+## 2026-06-16 18:30:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session.
+User redirected: drop the migration-bridge / back-compat work (no backwards
+compatibility needed) and instead make the code more maintainable. They chose
+"consolidate shared machinery" — fold duplicated logic into one reused core,
+without deleting the legacy CLI surface.
+
+**What I did (two tested commits):**
+1. `9c8e05a` GPU primitives -> `hardware.py`: `leasing/placement` had been
+   importing the resolver's *private* `_first_fit`/`_available_gpu_indices`.
+   Moved those + `_resolve_gpu_indices` to `infer_stack.hardware` as public
+   functions; resolver imports them back under the old private aliases (zero
+   internal churn), leasing imports the public names. One home for GPU-pool
+   placement.
+2. HTTP probes -> new `infer_stack/probe.py`: `cli/probes.py` had
+   `_ready_openai_probe`/`_ready_ollama_probe` (pure HTTP, but stuck in the cli
+   layer), while `leasing/compose` had its own weaker `/v1/models` check. Moved
+   the probes to a layer-neutral `probe.py` over an injectable `http` client;
+   `cli/probes` re-exports them under the old names for legacy callers; leasing's
+   `probe_ready` now calls `openai_ready(require_listed=True,
+   require_generation=...)`, so it gained the advertised-alias check and an
+   optional real-generation rung for free.
+
+**Decisions / reflections:**
+- Verified the test patch mechanism before moving the probes: the suite does
+  `monkeypatch.setattr(cli_mod.requests, 'get', ...)` — patching the shared
+  `requests` *module object*'s attributes, which intercepts `requests.get`
+  everywhere regardless of which module calls it. So relocating the probe body
+  was safe; full suite (197) confirms it.
+- Kept the schema-tied helpers (`_default_model_for_deployment`,
+  `_resolve_smoke_protocol_from_deployment`) in `cli/probes` — they read the
+  legacy v5 deployment dict and aren't shareable. Only the pure HTTP probes
+  moved.
+- Layering: `probe.py` and the GPU primitives in `hardware.py` are below both
+  `cli` and `leasing`, so neither consolidation created an upward import. This
+  is the right shape — shared mechanism sinks to a common low layer.
+- Standardized leasing's HTTP seam from a bespoke `http_get(url)->(status,body)`
+  callable to a requests-like `http` client (`.get`/`.post`), matching the probe
+  and the real `requests` — one seam shape across the codebase.
+
+**Risks:** behavior-preserving by construction; the only behavior *change* is
+leasing readiness getting stricter (alias must be advertised), which matches
+intent. Full suite green. Still no real docker/HTTP here — seams prove it.
+
+**Next:** Ollama pull/warmup readiness (could reuse `probe.ollama_ready`), then
+consumer integration; further consolidation candidates if any surface (the
+LiteLLM config template vs the leasing dict builder is the remaining duplicate,
+but template-vs-dict makes it lower-value).

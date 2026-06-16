@@ -29,13 +29,16 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import requests
 import yaml
 
 from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
+from ..probe import openai_ready
 from ..profile_runtime import vllm_args
 from .backend import Readiness
 from .models import DeploymentGroup
@@ -310,17 +313,6 @@ def _default_docker_run(args: list[str]) -> str:
     return subprocess.check_output(args, text=True)
 
 
-def _default_http_get(url: str) -> tuple[int, dict[str, Any]]:
-    import requests
-
-    resp = requests.get(url, timeout=10)
-    try:
-        body = resp.json()
-    except ValueError:
-        body = {}
-    return resp.status_code, body
-
-
 def _parse_ps(out: str) -> set[str]:
     """Parse running service names from ``docker compose ps --format json``.
 
@@ -365,7 +357,7 @@ class ComposeBackend:
         state_dir: str | Path,
         inventory: dict[str, Any],
         run: Callable[[list[str]], str] | None = None,
-        http_get: Callable[[str], tuple[int, dict[str, Any]]] | None = None,
+        http: Any = None,
         images: dict[str, str] | None = None,
         ports: dict[str, int] | None = None,
         state: dict[str, str] | None = None,
@@ -374,12 +366,13 @@ class ComposeBackend:
         project: str = 'infer-stack',
         skip_display: bool = True,
         litellm: bool = True,
+        require_generation: bool = False,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.inventory = inventory
         self.run = run or _default_docker_run
-        self.http_get = http_get or _default_http_get
+        self.http = http or requests
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
         self.state = state or default_state_paths()
@@ -388,6 +381,7 @@ class ComposeBackend:
         self.project = project
         self.skip_display = skip_display
         self.litellm = litellm
+        self.require_generation = require_generation
         self.last_errors: list[str] = []
 
     @property
@@ -496,22 +490,27 @@ class ComposeBackend:
     def probe_ready(
         self, group: DeploymentGroup, endpoint: str
     ) -> Readiness:
-        """Ready == container running and (with LiteLLM) the alias is routable."""
+        """Ready == container running and (with LiteLLM) the alias is routable.
+
+        Delegates the HTTP check to the shared :func:`infer_stack.probe.openai_ready`
+        — ``require_listed`` confirms the alias is advertised by the gateway, and
+        ``require_generation`` (off by default) additionally runs a tiny chat.
+        """
         if group.id not in self.observe():
             return Readiness(False, 'container not running')
         if not self.litellm:
             return Readiness(True, 'container running')
-        url = f'http://127.0.0.1:{self.litellm_port}/v1/models'
-        try:
-            status, body = self.http_get(url)
-        except Exception as ex:  # noqa: BLE001 - readiness is best-effort
-            return Readiness(False, f'probe error: {ex}')
-        if status != 200:
-            return Readiness(False, f'/v1/models returned {status}')
-        listed = {m.get('id') for m in (body.get('data') or [])}
-        if endpoint in listed:
-            return Readiness(True, 'routable')
-        return Readiness(False, f'{endpoint} not yet listed by the gateway')
+        key = os.environ.get(API_KEY_ENV)
+        headers = {'Authorization': f'Bearer {key}'} if key else {}
+        ok, reason = openai_ready(
+            base_url=f'http://127.0.0.1:{self.litellm_port}/v1',
+            headers=headers,
+            model=endpoint,
+            require_listed=True,
+            require_generation=self.require_generation,
+            http=self.http,
+        )
+        return Readiness(ok, reason)
 
     def down(self) -> None:
         """Tear the whole project down (for an explicit stop)."""

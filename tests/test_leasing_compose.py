@@ -80,19 +80,37 @@ class FakeDocker:
         return ''
 
 
+class FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
 class FakeHttp:
-    """Fake /v1/models that lists whatever aliases the LiteLLM config declares."""
+    """Fake requests-like client whose /models lists the LiteLLM config aliases."""
 
     def __init__(self, state_dir):
         self.state_dir = Path(state_dir)
 
-    def __call__(self, url):
+    def _model_names(self):
         cfg = self.state_dir / 'litellm_config.yaml'
-        names = []
-        if cfg.exists():
-            data = yaml.safe_load(cfg.read_text()) or {}
-            names = [e['model_name'] for e in data.get('model_list', [])]
-        return 200, {'data': [{'id': n} for n in names]}
+        if not cfg.exists():
+            return []
+        data = yaml.safe_load(cfg.read_text()) or {}
+        return [e['model_name'] for e in data.get('model_list', [])]
+
+    def get(self, url, **kw):
+        if url.endswith('/models'):
+            data = [{'id': n} for n in self._model_names()]
+            return FakeResp(200, {'data': data})
+        return FakeResp(404, {'detail': 'not found'})
+
+    def post(self, url, **kw):
+        return FakeResp(200, {'choices': [{'message': {'content': 'ok'}}]})
 
 
 # -- pure render -----------------------------------------------------------
@@ -154,7 +172,7 @@ def make_backend(tmp_path, *, spec='4x80', **kw):
         state_dir=tmp_path,
         inventory=simulate_inventory(spec),
         run=FakeDocker(),
-        http_get=FakeHttp(tmp_path),
+        http=FakeHttp(tmp_path),
         images=IMAGES, ports=PORTS, state=STATE,
         **kw,
     )

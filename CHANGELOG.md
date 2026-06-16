@@ -63,6 +63,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     `resolve_gpu_indices`) moved to `infer_stack.hardware` and reused by both
     the resolver and the leasing placement planner (no more importing the
     resolver's private functions).
+  - HTTP readiness probes moved to a new layer-neutral `infer_stack.probe`
+    (`openai_ready` / `ollama_ready`) over an injectable HTTP client. `cli.probes`
+    re-exports them for the legacy `wait-ready`/`switch` callers; the leasing
+    Compose backend reuses the same probe (so its readiness gained the
+    advertised-alias and optional-generation checks). One probe implementation
+    instead of two.
 
 ## [Version 0.0.1] -
 
