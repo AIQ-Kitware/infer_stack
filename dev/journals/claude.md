@@ -300,3 +300,81 @@ Model: claude-sonnet-4-6 (via eval_audit harness).
 **Confidence:** High. The rename is purely mechanical (string substitution + directory mv). All 22 Python files compile cleanly. No residual `vllm_service`/`vllm-stack`/`VLLM_SERVICE` references remain outside historical journal entries and the tarball artifact.
 
 **Next steps for the user:** Update `eval_audit` (the parent repo) to reference `infer_stack` instead of `vllm_service` in any imports, config references, or scripts that use the submodule. The GitHub remote rename is also handled separately by the user.
+
+## 2026-06-16 14:43:08 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.
+
+**User intent:** Begin the long-discussed `infer-stack` redesign toward a
+leasing/controller model so multiple users running multiple `kwdagger`
+pipelines can `acquire` the models a node needs, block until ready, and
+`release` after — instead of the current single global "active profile" that is
+last-render-wins under a shared data dir. The full critique + staged plan lives
+in the *parent* repo at `aiq-eval-runner/dev/infer-stack-redesign-critique.md`
+(grounded in the two real consumers: aiq-eval-runner's Incubilate/Contextual
+Drag and eval_audit's HELM/kwdagger path). User explicitly asked to start on a
+new branch and bump versions; chose sqlite for the store (open question #1 in
+that doc). This is Phase 1's foundation.
+
+**What I built (branch `dev/leasing-controller`, version 0.6.1 -> 0.7.0):**
+A new backend-agnostic `infer_stack/leasing/` subpackage — the *controller*
+half, deliberately separate from the existing stateless compiler
+(`resolver`/`validator`/`renderer`), which is kept intact.
+- `models.py`: `EndpointRequest` (catalog-resolved input), `Lease`,
+  `DeploymentGroup`, the `compatibility_key` (pure structural identity hash),
+  `vllm_structural`/`ollama_structural` builders, and `capacity_satisfies`
+  (subsumption, not equality).
+- `store.py`: `SqliteStore` — autocommit + WAL + `busy_timeout`, with a
+  `transaction()` context manager that issues `BEGIN IMMEDIATE` so the
+  find-or-create-group critical section is race-safe across processes.
+- `ledger.py`: `Ledger.acquire/release/renew/sweep/reclaimable_groups/status`.
+  Demand = count of *protecting* leases (ACTIVE and not past TTL), computed by a
+  SQL `COUNT(DISTINCT lease_id)` join, not stored. Groups flip LIVE<->IDLE on
+  demand; teardown of IDLE groups is left to the future reconciler per reclaim
+  policy.
+- 17 unit tests + 3 xdoctests, all passing; ruff clean; existing fast suite
+  unaffected. Ran via `uv run --extra tests --with xdoctest` (xdoctest is in
+  pyproject addopts but not the tests extra — had to add it; the system python
+  has no pytest).
+
+**Key design decisions / reflections:**
+- The central reframe is compiler-vs-controller. I resisted bolting acquire/TTL
+  onto the resolver; the ledger is a separate stateful layer with its own store.
+  This is what makes "last render wins" go away: desired state becomes the union
+  of live leases, not one mutated profile.
+- Coalescing grain = "the thing that gets a process": per-model for vLLM,
+  per-daemon for Ollama. Modeled uniformly by making the Ollama structural key
+  the *host config* (no tag), so many tag endpoints collapse to one group whose
+  `served` map accumulates the tags. This kept one code path for both engines.
+- Compatibility is structural-equality + capacity-subsumption, NOT a single
+  equality key. A 32k deployment serves an 8k request; the reverse makes a new
+  group. Sharing policy is handled in the ledger (dedicated => always new),
+  deliberately kept OUT of the hash so the key stays a clean deployment identity.
+- TTL is soft and is the crash backstop: protection lapses by time immediately
+  in the demand query; `sweep()` only *materializes* the EXPIRED state for
+  status/reclaim. A job killed by SIGKILL (no release) is recovered by TTL.
+
+**Uncertainties / risks / what might break:**
+- The ledger is pure bookkeeping with NO backend yet — nothing realizes,
+  probes, or tears down deployments. `AcquireResult.groups` is the handoff
+  point for the next slice (reconciler + 4-method backend protocol + readiness
+  with the Ollama pull/warmup rung).
+- `EndpointRequest` is hand-built in tests; the catalog.yaml parser that
+  produces them (new schema: models/endpoints/hosts/bundles) is not written.
+- Cross-process concurrency relies on `BEGIN IMMEDIATE` + WAL + busy_timeout; I
+  reasoned it through and unit-tested the single-process invariants, but did not
+  write a true multi-process stress test. If contention shows up, that's where
+  to look first.
+- Group `spec` is taken from the first creating request; coalesced requests'
+  specs are assumed compatible by construction. Correct given the compat key,
+  but worth remembering when the backend starts consuming `spec`.
+
+**Confident about:** the object model and the coalescing/TTL/demand semantics
+(well covered by tests), the layering (controller cleanly separated from the
+compiler, no edits to existing modules beyond the version bump), and that this
+is the right minimal foundation for Phases 1-4.
+
+**Next steps:** catalog.yaml parser -> EndpointRequest; the Reconciler + Backend
+protocol (`realize/teardown/observe/probe_ready`) with Compose first (reuse
+`_first_fit`, `_wait_until_ready`, the live LiteLLM router refresh); then the
+`acquire`/`release`/`run`/`status` CLI emitting the `contracts.py` env-file.
