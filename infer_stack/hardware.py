@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import subprocess
+from copy import deepcopy
 from typing import Any
 
 
@@ -68,3 +69,59 @@ def detect_inventory() -> dict[str, Any]:
         'gpu_count': len(gpus),
         'gpus': gpus,
     }
+
+
+# ---------------------------------------------------------------------------
+# Low-level GPU-pool placement primitives.
+#
+# Shared by the legacy resolver (single profile) and the leasing placement
+# planner (the union of live deployment groups), so there is one home for
+# "which GPUs are available" and "first-fit N of them".
+# ---------------------------------------------------------------------------
+
+
+def available_gpu_indices(
+    inventory: dict[str, Any], reserve_display_gpu: str | bool | None
+) -> list[int]:
+    """GPU indices in the inventory, optionally skipping display-active ones."""
+    gpus = deepcopy(inventory.get('gpus', []))
+    if reserve_display_gpu in ('auto', True):
+        return [g['index'] for g in gpus if not g.get('display_active')]
+    return [g['index'] for g in gpus]
+
+
+def first_fit(available: list[int], count: int) -> tuple[list[int], str | None]:
+    """Take the first ``count`` available indices, or report the shortfall."""
+    if len(available) < count:
+        return (
+            available[:],
+            f'need {count} GPUs but only {len(available)} available',
+        )
+    return available[:count], None
+
+
+def resolve_gpu_indices(
+    *,
+    name: str,
+    placement: dict[str, Any],
+    topology: dict[str, Any],
+    preferred_gpu_count: int,
+    available: list[int],
+) -> tuple[list[int], str | None]:
+    """Resolve a single runtime's GPU indices from its placement/topology."""
+    strategy = placement.get('strategy', 'first_fit')
+    if strategy in {'exact', 'multi_gpu', 'single_gpu'}:
+        gpu_indices = list(placement.get('gpu_indices', []))
+        if not gpu_indices:
+            return (
+                [],
+                f'{name} uses {strategy} placement but no gpu_indices were provided',
+            )
+        return gpu_indices, None
+    gpu_count = int(
+        placement.get(
+            'gpu_count',
+            topology.get('tensor_parallel_size', preferred_gpu_count) or 1,
+        )
+    )
+    return first_fit(available, gpu_count)

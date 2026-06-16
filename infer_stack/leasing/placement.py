@@ -26,7 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..resolver import _available_gpu_indices, _first_fit
+from ..hardware import available_gpu_indices as _available_gpu_indices
+from ..hardware import first_fit as _first_fit
 from .models import DeploymentGroup
 
 OLLAMA = 'ollama'

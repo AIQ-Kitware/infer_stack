@@ -21,28 +21,15 @@ from .config import (
     normalized_state,
     resource_profiles_to_kubeai_values,
 )
-from .hardware import detect_inventory
-
-
-def _available_gpu_indices(
-    inventory: dict[str, Any], reserve_display_gpu: str | bool | None
-) -> list[int]:
-    gpus = deepcopy(inventory.get('gpus', []))
-    if reserve_display_gpu == 'auto':
-        return [g['index'] for g in gpus if not g.get('display_active')]
-    if reserve_display_gpu is True:
-        return [g['index'] for g in gpus if not g.get('display_active')]
-    return [g['index'] for g in gpus]
-
-
-def _first_fit(
-    available: list[int], count: int
-) -> tuple[list[int], str | None]:
-    if len(available) < count:
-        return available[
-            :
-        ], f'need {count} GPUs but only {len(available)} available'
-    return available[:count], None
+from .hardware import (
+    available_gpu_indices as _available_gpu_indices,
+)
+from .hardware import (
+    detect_inventory,
+)
+from .hardware import (
+    resolve_gpu_indices as _resolve_gpu_indices,
+)
 
 
 def _runtime_value(
@@ -111,32 +98,6 @@ def _service_override_fields(raw: dict[str, Any]) -> dict[str, Any]:
         'additional_ports': _as_string_list(raw.get('additional_ports', [])),
         'gpus': raw.get('gpus'),
     }
-
-
-def _resolve_gpu_indices(
-    *,
-    name: str,
-    placement: dict[str, Any],
-    topology: dict[str, Any],
-    preferred_gpu_count: int,
-    available: list[int],
-) -> tuple[list[int], str | None]:
-    strategy = placement.get('strategy', 'first_fit')
-    if strategy in {'exact', 'multi_gpu', 'single_gpu'}:
-        gpu_indices = list(placement.get('gpu_indices', []))
-        if not gpu_indices:
-            return (
-                [],
-                f'{name} uses {strategy} placement but no gpu_indices were provided',
-            )
-        return gpu_indices, None
-    gpu_count = int(
-        placement.get(
-            'gpu_count',
-            topology.get('tensor_parallel_size', preferred_gpu_count) or 1,
-        )
-    )
-    return _first_fit(available, gpu_count)
 
 
 def _merge(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:

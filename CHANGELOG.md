@@ -56,6 +56,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   lock so concurrent processes don't clobber the shared compose file. (Ollama
   tag pull/warmup is a remaining readiness follow-up.)
 
+### Changed
+* Consolidate shared machinery so the legacy and leasing code paths reuse one
+  implementation instead of duplicating it:
+  - GPU-pool placement primitives (`available_gpu_indices` / `first_fit` /
+    `resolve_gpu_indices`) moved to `infer_stack.hardware` and reused by both
+    the resolver and the leasing placement planner (no more importing the
+    resolver's private functions).
+
 ## [Version 0.0.1] -
 
 ### Added
