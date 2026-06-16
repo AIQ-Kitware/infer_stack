@@ -378,3 +378,44 @@ is the right minimal foundation for Phases 1-4.
 protocol (`realize/teardown/observe/probe_ready`) with Compose first (reuse
 `_first_fit`, `_wait_until_ready`, the live LiteLLM router refresh); then the
 `acquire`/`release`/`run`/`status` CLI emitting the `contracts.py` env-file.
+
+## 2026-06-16 15:05:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Continuation of
+the same session; committed the ledger as `b1ebf17`, then built the next stage.
+
+**What I built (same branch `dev/leasing-controller`):** the serving-catalog
+parser `infer_stack/leasing/catalog.py` — the declarative input side of the
+controller and the new replacement for "profiles" as the primary unit. Schema:
+`models` / `endpoints` / `runtime_hosts` / `bundles`. `Catalog.from_dict`/`load`
+parse + validate (cross-reference checks: vllm endpoint -> model, ollama
+endpoint -> host, bundle -> endpoints, known engines). `resolve_endpoint` and
+`resolve_names` turn endpoint/bundle names into the ledger's `EndpointRequest`s,
+so the catalog composes directly with what I built in the prior commit. 15
+catalog tests incl. ledger-integration (alias endpoints coalesce; an ollama
+bundle collapses to one daemon group serving both tags), 32 leasing tests total,
+4 xdoctests, ruff clean.
+
+**Decisions / reflections:**
+- Kept the catalog in the `leasing/` subpackage (not the legacy top-level
+  `catalog.py`) — it is the *serving* catalog for the new model and should not
+  be conflated with the old vllm_models/profiles catalog.
+- `served_name`/`public_name` is the endpoint's exposed name; the alias case
+  (two endpoint names, same model+runtime) intentionally produces the same
+  `compat_key`, so distinct catalog entries still coalesce onto one deployment.
+  This validates the "compat key = deployment identity, not endpoint name"
+  decision from the ledger stage.
+- vLLM `EndpointRequest.spec` carries hf_model_id + runtime + reclaim; ollama
+  `spec` carries host/image/settings/gpu_indices + reclaim. These are the
+  payloads the (not-yet-written) backend will consume to realize a process.
+
+**Risks / unknowns:** still no backend — `spec` shapes are my best guess at what
+compose/kubeai renderers will need and may shift when the reconciler lands. The
+new catalog schema is not yet wired to any CLI or migrated from the existing
+`config.yaml`/profiles (the legacy `_legacy_profile_to_stack` migration is
+future work). No backwards-compat shim yet between the old and new catalogs.
+
+**Next:** the Reconciler + a 4-method Backend protocol
+(`realize`/`teardown`/`observe`/`probe_ready`), testable first with a fake
+backend, then a Compose implementation reusing the existing placement/readiness
+machinery.

@@ -9,6 +9,13 @@ kubeai) and the CLI verbs are built on top of this in later phases.
 
 from __future__ import annotations
 
+from .catalog import (
+    Catalog,
+    CatalogError,
+    EndpointSpec,
+    ModelSpec,
+    RuntimeHostSpec,
+)
 from .ledger import (
     AcquireResult,
     Ledger,
@@ -32,13 +39,18 @@ from .store import SqliteStore
 
 __all__ = [
     'AcquireResult',
+    'Catalog',
+    'CatalogError',
     'DeploymentGroup',
     'EndpointRequest',
+    'EndpointSpec',
     'GroupState',
     'Ledger',
     'Lease',
     'LeaseState',
+    'ModelSpec',
     'ReleaseResult',
+    'RuntimeHostSpec',
     'Sharing',
     'SqliteStore',
     'SweepResult',
