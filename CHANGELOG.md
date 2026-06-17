@@ -64,6 +64,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* Test isolation: the subprocess `run_cli` helpers in `tests/test_cli_meta.py`
+  and `tests/test_cli_setup.py` used `env.setdefault('INFER_STACK_CONFIG_DIR'/
+  'INFER_STACK_DATA_DIR', tmp_path)`, which let an ambient `INFER_STACK_*`
+  exported in the caller's shell leak in — the tests then read the real config/
+  data dir and failed (e.g. on a box where those were exported for manual
+  testing). Force the vars to `tmp_path` instead.
 * Compose GPU reservation emitted `capabilities: [["gpu"]]` (list-of-lists),
   which `docker compose` rejects ("capabilities.0 must be a string"); now emits
   `capabilities: ["gpu"]`. Found while testing the Compose backend on real

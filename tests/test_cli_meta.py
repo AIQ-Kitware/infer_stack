@@ -8,7 +8,6 @@ from pathlib import Path
 
 from infer_stack import __version__
 
-
 MANAGE_PY = Path(__file__).resolve().parents[1] / 'manage.py'
 
 
@@ -16,8 +15,10 @@ def run_cli(
     tmp_path: Path, *args: str, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env.setdefault('INFER_STACK_CONFIG_DIR', str(tmp_path))
-    env.setdefault('INFER_STACK_DATA_DIR', str(tmp_path))
+    # Force (not setdefault) so an ambient INFER_STACK_* in the caller's shell
+    # can't leak in and point the test at the real config/data dir.
+    env['INFER_STACK_CONFIG_DIR'] = str(tmp_path)
+    env['INFER_STACK_DATA_DIR'] = str(tmp_path)
     return subprocess.run(
         [sys.executable, str(MANAGE_PY), *args],
         env=env,

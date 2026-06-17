@@ -1,16 +1,15 @@
 from __future__ import annotations
-from typing import Any
 
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from infer_stack import cli as cli_mod
-
 
 MANAGE_PY = Path(__file__).resolve().parents[1] / 'manage.py'
 
@@ -33,9 +32,12 @@ def run_cli(
 ) -> subprocess.CompletedProcess[str]:
     full_env = os.environ.copy()
     # Anchor config + rendered artifacts under tmp_path so tests are
-    # independent of the user's ~/.config and ~/.cache directories.
-    full_env.setdefault('INFER_STACK_CONFIG_DIR', str(tmp_path))
-    full_env.setdefault('INFER_STACK_DATA_DIR', str(tmp_path))
+    # independent of the user's ~/.config and ~/.cache directories *and* of any
+    # ambient INFER_STACK_* env vars in the caller's shell (force, not
+    # setdefault — setdefault would let an exported INFER_STACK_DATA_DIR leak in
+    # and the test would read the real data dir).
+    full_env['INFER_STACK_CONFIG_DIR'] = str(tmp_path)
+    full_env['INFER_STACK_DATA_DIR'] = str(tmp_path)
     if env:
         full_env.update(env)
     return subprocess.run(

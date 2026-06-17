@@ -802,3 +802,25 @@ F1 is verified at the schema level, not just the dict.
 
 **Next:** keep fixing what yardrat surfaces (likely F2/F3 ergonomics next, maybe
 the F5 skip_display knob so both GPUs are testable), updating the findings log.
+
+## 2026-06-17 13:05:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. yardrat reported
+8 pytest failures — all in the *legacy* `test_cli_meta.py` / `test_cli_setup.py`
+(setup/render/status/config-paths), none in the leasing code, and the full suite
+passes clean here. Root cause (F7, FIXED): both files' subprocess `run_cli`
+helpers anchored the tmp dirs with `env.setdefault('INFER_STACK_CONFIG_DIR'/
+'DATA_DIR', tmp_path)`. The user had `INFER_STACK_DATA_DIR=~/infer-stack-test/data`
+exported from the test-plan blocks, so `setdefault` was a no-op and the tests
+read the real data dir — which also held a live `infer-stack` compose project
+(hence the `docker compose ps` table leaking into the status test). Reproduced
+locally by exporting the same var (got the identical failure), fixed by forcing
+the vars (`env[...] = tmp_path`), and verified the fix makes all of test_cli_meta
++ test_cli_setup pass *even with the ambient var set* (29 passed).
+
+**Takeaway:** `os.environ.copy()` + `setdefault` is a latent isolation hole for
+any test that anchors via env vars — an ambient export silently wins. Force the
+vars. (The in-process `_anchor_paths` used `monkeypatch.setenv`, which already
+forces, so those tests were fine — the bug was only in the subprocess helpers.)
+This is a test-isolation bug, not a regression from the leasing branch; worth a
+dev/lesson if it recurs.
