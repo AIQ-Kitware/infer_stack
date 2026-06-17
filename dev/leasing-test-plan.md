@@ -154,8 +154,8 @@ While it blocks, in a second shell watch:
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
-docker compose -p infer-stack -f "$C/docker-compose.yml" ps
-docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=80 | tail -80
+infer-stack ps
+infer-stack logs --tail=80 | tail -80
 ```
 On success, verify serving + descriptor, then release:
 ```bash
@@ -181,7 +181,7 @@ export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner alice --require-generation --timeout 1200
 infer-stack acquire qwen-dup   --backend compose --catalog "$CAT" --owner bob   --require-generation --timeout 1200
 infer-stack leases --json     # ONE group, demand 2; two leases
-docker compose -p infer-stack -f "$C/docker-compose.yml" ps   # exactly one vllm-… service
+infer-stack ps   # exactly one vllm-… service
 ```
 Cleanup:
 ```bash
@@ -244,7 +244,7 @@ export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export CAT=~/infer-stack-test/catalog.yaml
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-ollama --backend compose --catalog "$CAT" --require-generation --timeout 900 --env-file /tmp/o.env
-docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=80 | grep -i pull   # expect "ollama pull qwen2.5:0.5b"
+infer-stack logs --tail=80 | grep -i pull   # expect "ollama pull qwen2.5:0.5b"
 set -a; . /tmp/o.env; set +a
 curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
   -d '{"model":"qwen-ollama","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
@@ -286,8 +286,8 @@ acquire → confirm the vLLM bf16/Turing crash in the logs (F4).
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
-docker compose -p infer-stack -f "$C/docker-compose.yml" ps
-docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=120
+infer-stack ps
+infer-stack logs --tail=120
 infer-stack leases --json
 echo '--- rendered compose ---';   cat "$C/docker-compose.yml"
 echo '--- litellm config ---';     cat "$C/litellm_config.yaml"

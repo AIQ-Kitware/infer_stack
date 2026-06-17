@@ -57,6 +57,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* The day-2 compose wrappers (`logs`, `ps`, `restart`, `pull`, `start`, `stop`)
+  now target the **leasing** Compose deployment when one exists
+  (`data_root/leasing/compose`, project `infer-stack`) — so `infer-stack logs
+  -f` / `infer-stack ps` work for a leasing user with no `config.yaml`. They
+  fall back to the legacy rendered stack when there's no leasing deployment.
+  (The `ollama-*` wrappers remain legacy: they exec a fixed `ollama` service
+  that the leasing model names per-daemon.)
 * Keep the legacy meta commands relevant post-refactor: `infer-stack config
   paths` (also exposed top-level as `infer-stack paths`) gained a `leasing`
   group showing the lease ledger, the compose state dir, and its rendered

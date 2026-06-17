@@ -893,3 +893,29 @@ making it look like all my PART-2 edits had vanished. They were safe in
 Lesson: never `git stash` uncommitted work in a tree where a build tool mutates
 a tracked file (uv.lock) — and never hide `git stash pop` output. To check
 pre-existing lint, use `git show HEAD:file | ruff -` or a worktree, not stash.
+
+## 2026-06-17 15:30:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. User: `infer-stack
+logs -f` failed for a leasing user ("No config.yaml found ...").
+
+**Root cause:** the day-2 compose wrappers (logs/ps/restart/pull/start/stop) were
+bound to the legacy model — `config_for_runtime(config)` (needs config.yaml) +
+`_compose_base_cmd(cfg)` (targets generated/docker-compose.yml). The leasing
+model has no config.yaml and its compose lives at
+`data_root/leasing/compose/docker-compose.yml` (project `infer-stack`).
+
+**Fix:** added `_day2_compose_base(config, command)` — prefers the leasing
+compose project when its file exists (no config.yaml needed), else the legacy
+rendered stack (kubeai still stubs). Routed all six generic wrappers through it
+(also collapsed their repeated 4-line config+kubeai+base preamble to one line).
+Added `LEASING_PROJECT='infer-stack'` constant in leasing/compose.py so the
+project name is shared, not duplicated. Smoke: `infer-stack ps`/`logs` now run
+against the leasing compose with no config.yaml. Left ollama-* wrappers legacy
+(they `exec` a fixed `ollama` service; leasing names daemons per-group — a
+separate fix if needed).
+
+**Precedence decision:** prefer leasing-if-its-file-exists. A pure-legacy user
+has no leasing file -> unchanged. A user who once leased keeps the (possibly
+empty) leasing compose file, so their day-2 ops point at the leasing project —
+acceptable given leasing is the model; documented in the wrapper docstring.

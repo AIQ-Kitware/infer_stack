@@ -516,12 +516,38 @@ class StatusCLI(
 # ---------------------------------------------------------------------------
 
 
+def _day2_compose_base(config, command: str) -> list[str]:
+    """``docker compose -p <proj> -f <file>`` base for the day-2 wrappers.
+
+    Prefer the leasing Compose deployment when present — it is the current model
+    and needs no ``config.yaml`` — otherwise the legacy rendered stack (which
+    requires ``setup`` + ``render``). Raises the kubeai stub for a legacy kubeai
+    config, since compose day-2 ops don't apply there.
+    """
+    from ..leasing.compose import COMPOSE_FILENAME, LEASING_PROJECT
+    from ..paths import data_root
+
+    leasing_file = data_root() / 'leasing' / 'compose' / COMPOSE_FILENAME
+    if leasing_file.exists():
+        return [
+            'docker', 'compose', '-p', LEASING_PROJECT, '-f', str(leasing_file)
+        ]
+    cfg = config_for_runtime(config)
+    if backend_name(cfg) != 'compose':
+        _kubeai_stub(command)
+    return _compose_base_cmd(cfg)
+
+
 class _ComposeWrapperBase(
     _PathOverridesMixin,
     _BackendOverrideMixin,
     _ComposeOverrideMixin,
 ):
-    """Common fields for ``docker compose <subcmd>`` wrappers."""
+    """Common fields for ``docker compose <subcmd>`` wrappers.
+
+    These target the leasing Compose deployment when one exists (no
+    ``config.yaml`` needed), else the legacy rendered stack.
+    """
 
     services = scfg.Value(
         None,
@@ -552,10 +578,7 @@ class LogsCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('logs')
-        cmd = _compose_base_cmd(cfg) + ['logs']
+        cmd = _day2_compose_base(config, 'logs') + ['logs']
         if config.follow:
             cmd.append('--follow')
         if config.tail is not None:
@@ -591,10 +614,7 @@ class PsCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('ps')
-        cmd = _compose_base_cmd(cfg) + ['ps']
+        cmd = _day2_compose_base(config, 'ps') + ['ps']
         if config.all:
             cmd.append('--all')
         if config.services_only:
@@ -615,10 +635,7 @@ class RestartCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('restart')
-        cmd = _compose_base_cmd(cfg) + ['restart']
+        cmd = _day2_compose_base(config, 'restart') + ['restart']
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])
@@ -636,10 +653,7 @@ class PullCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('pull')
-        cmd = _compose_base_cmd(cfg) + ['pull']
+        cmd = _day2_compose_base(config, 'pull') + ['pull']
         if config.quiet:
             cmd.append('--quiet')
         if config.ignore_pull_failures:
@@ -656,10 +670,7 @@ class StartCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('start')
-        cmd = _compose_base_cmd(cfg) + ['start']
+        cmd = _day2_compose_base(config, 'start') + ['start']
         cmd.extend(config.services or [])
         proc = subprocess.run(cmd)
         return int(proc.returncode)
@@ -674,10 +685,7 @@ class StopCLI(_ComposeWrapperBase):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        cfg = config_for_runtime(config)
-        if backend_name(cfg) != 'compose':
-            _kubeai_stub('stop')
-        cmd = _compose_base_cmd(cfg) + ['stop']
+        cmd = _day2_compose_base(config, 'stop') + ['stop']
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])

@@ -44,6 +44,7 @@ from .backend import Readiness
 from .models import DeploymentGroup
 from .placement import plan_placement
 
+LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
 VLLM_HOST_PORT_BASE = 18000
 LITELLM_CONTAINER_PORT = 4000
 STATE_FILENAME = 'leasing-compose-state.json'
@@ -379,7 +380,7 @@ class ComposeBackend:
         state: dict[str, str] | None = None,
         allowed_gpus: list[int] | None = None,
         reserved: list[int] | tuple[int, ...] = (),
-        project: str = 'infer-stack',
+        project: str = LEASING_PROJECT,
         skip_display: bool = True,
         litellm: bool = True,
         require_generation: bool = False,
