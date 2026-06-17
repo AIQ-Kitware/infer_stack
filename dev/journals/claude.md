@@ -877,3 +877,19 @@ F2 to "managed: reused if pinned, else generated".
 **Still TODO this turn:** verify `infer-stack config paths` and `infer-stack
 status` are correct/relevant post-refactor (maybe elevate `config paths` ->
 top-level `paths`). Doing that next.
+
+Did it: both worked but were legacy-only. Added a `leasing` group to `config
+paths` (ledger, compose dir + docker-compose.yml/litellm_config.yaml/.env/
+sidecar), exposed a top-level `infer-stack paths` alias, and gave legacy
+`status` a one-line leasing summary (active leases / live groups -> `infer-stack
+leases`). 13 meta tests + the legacy status test pass.
+
+**Process scar (my mistake):** to check whether some `ruff` errors in cli/ were
+pre-existing, I ran `git stash && ruff && git stash pop` in a bash one-liner. A
+concurrent `uv run` touched `uv.lock`, the `pop` hit a conflict and aborted
+SILENTLY (`>/dev/null`), and the working tree reverted to the last commit —
+making it look like all my PART-2 edits had vanished. They were safe in
+`stash@{0}`; `git checkout -- uv.lock` then `git stash pop` restored them.
+Lesson: never `git stash` uncommitted work in a tree where a build tool mutates
+a tracked file (uv.lock) — and never hide `git stash pop` output. To check
+pre-existing lint, use `git show HEAD:file | ruff -` or a worktree, not stash.

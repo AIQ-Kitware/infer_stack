@@ -28,6 +28,13 @@ import requests  # noqa: F401  (cli_mod.requests is patched in tests)
 import scriptconfig as scfg
 
 from .. import __version__
+from ..kubeai_ops import (  # noqa: F401
+    CommandError,
+    deploy_rendered_artifacts,
+)
+from ..kubeai_ops import (  # noqa: F401
+    print_status as kubeai_print_status,
+)
 
 # Keep submodules importable as attributes (e.g. ``infer_stack.cli.commands_runtime``)
 # so tests can patch seams where they are actually looked up.
@@ -42,10 +49,19 @@ from . import (  # noqa: F401
     options,
     probes,
 )
-from ..kubeai_ops import (  # noqa: F401
-    CommandError,
-    deploy_rendered_artifacts,
-    print_status as kubeai_print_status,
+from .commands_leasing import (
+    AcquireCLI,
+    LeasesCLI,
+    ReleaseCLI,
+    RenewCLI,
+    RunCLI,
+    SecretsCLI,
+    ServeCLI,
+)
+from .commands_meta import (
+    ConfigModalCLI,
+    ConfigPathsCLI,
+    VersionCLI,
 )
 from .commands_profile import (
     DescribeProfileCLI,
@@ -78,20 +94,6 @@ from .commands_runtime import (
     StatusCLI,
     StopCLI,
     UpCLI,
-)
-from .commands_leasing import (
-    AcquireCLI,
-    LeasesCLI,
-    ReleaseCLI,
-    RenewCLI,
-    RunCLI,
-    SecretsCLI,
-    ServeCLI,
-)
-from .commands_meta import (
-    ConfigModalCLI,
-    ConfigPathsCLI,
-    VersionCLI,
 )
 from .commands_smoke import (
     BenchmarkCLI,
@@ -127,7 +129,6 @@ from .probes import (  # noqa: F401
     _resolve_smoke_protocol_from_deployment,
 )
 
-
 # ---------------------------------------------------------------------------
 # Modal CLI + entry point
 # ---------------------------------------------------------------------------
@@ -147,6 +148,7 @@ class ManageCLI(scfg.ModalCLI):
     # Meta / introspection
     version_command = VersionCLI
     config = ConfigModalCLI
+    paths = ConfigPathsCLI  # top-level alias for `config paths`
 
     # Config / profile management
     setup = SetupCLI

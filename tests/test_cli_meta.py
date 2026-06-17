@@ -61,9 +61,38 @@ def test_config_paths_status_tracks_existence(tmp_path: Path) -> None:
 
 def test_config_paths_json_emits_structured_groups(tmp_path: Path) -> None:
     payload = json.loads(run_cli(tmp_path, 'config', 'paths', '--json').stdout)
-    assert set(payload) == {'config', 'data', 'state'}
+    assert set(payload) == {'config', 'data', 'state', 'leasing'}
     entry = payload['config'][0]
     assert set(entry) == {'label', 'kind', 'status', 'path'}
+
+
+def test_config_paths_includes_leasing_group(tmp_path: Path) -> None:
+    out = run_cli(tmp_path, 'config', 'paths', 'leasing').stdout
+    assert 'leasing:' in out
+    assert 'ledger' in out
+    assert 'docker-compose.yml' in out
+    assert 'env (secrets)' in out
+
+
+def test_paths_top_level_alias_works(tmp_path: Path) -> None:
+    out = run_cli(tmp_path, 'paths').stdout
+    assert 'config:' in out
+    assert 'leasing:' in out
+
+
+def test_status_summarizes_leases_when_present(tmp_path: Path) -> None:
+    from infer_stack.leasing import (
+        EndpointRequest,
+        Ledger,
+        SqliteStore,
+        vllm_structural,
+    )
+
+    # A lease in the ledger at the anchored data dir (default_ledger_path()).
+    led = Ledger(SqliteStore(tmp_path / 'leasing' / 'ledger.db'))
+    led.acquire('me', [EndpointRequest('m', 'vllm', vllm_structural(model_ref='m'))])
+    out = run_cli(tmp_path, 'status').stdout
+    assert 'leasing:' in out and 'active lease' in out
 
 
 def test_config_paths_target_filters_to_single_group(tmp_path: Path) -> None:

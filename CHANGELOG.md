@@ -57,6 +57,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* Keep the legacy meta commands relevant post-refactor: `infer-stack config
+  paths` (also exposed top-level as `infer-stack paths`) gained a `leasing`
+  group showing the lease ledger, the compose state dir, and its rendered
+  artifacts (docker-compose.yml, litellm_config.yaml, the secrets `.env`,
+  sidecar). `infer-stack status` now prints a one-line leasing summary (active
+  leases / live groups) pointing at `infer-stack leases`.
 * Managed LiteLLM secret + `infer-stack secrets`. The Compose backend now owns
   `LITELLM_MASTER_KEY` (reused from the state dir's `.env` if you pin one, else
   generated via `ensure_secret`), bakes it into the LiteLLM service, uses it for

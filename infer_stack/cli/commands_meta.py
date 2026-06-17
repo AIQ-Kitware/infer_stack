@@ -18,19 +18,20 @@ from typing import Any
 import scriptconfig as scfg
 
 from .. import __version__
-from ..config import kubeai_local_values_path
-from ..config import normalized_state
-from .context import _apply_path_overrides
-from .context import _safe_load_config
-from .context import backend_name
-from .context import config_path
-from .context import generated_dir
-from .context import kubeai_generated_dir
-from .context import models_path
-from .context import plan_path
-from .context import runtime_dir_for_config
-from .options import _PathOverridesMixin
+from ..config import kubeai_local_values_path, normalized_state
 from ..paths import config_root
+from .context import (
+    _apply_path_overrides,
+    _safe_load_config,
+    backend_name,
+    config_path,
+    generated_dir,
+    kubeai_generated_dir,
+    models_path,
+    plan_path,
+    runtime_dir_for_config,
+)
+from .options import _PathOverridesMixin
 
 
 class VersionCLI(scfg.DataConfig):
@@ -143,7 +144,7 @@ class ConfigPathsCLI(_PathOverridesMixin):
     target: Any = scfg.Value(
         'all',
         position=1,
-        help='Path group to show: all, config, data, or state.',
+        help='Path group to show: all, config, data, state, or leasing.',
     )
     json: Any = scfg.Value(
         False,
@@ -157,7 +158,7 @@ class ConfigPathsCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
 
         target = str(config.target or 'all').strip().lower()
-        valid = {'all', 'config', 'data', 'state'}
+        valid = {'all', 'config', 'data', 'state', 'leasing'}
         if target not in valid:
             raise SystemExit(
                 f'Unknown path group {target!r}. Expected one of: '
@@ -204,6 +205,32 @@ class ConfigPathsCLI(_PathOverridesMixin):
             groups['state'] = [
                 _entry(name, Path(value), kind='dir')
                 for name, value in state.items()
+            ]
+        if target in {'all', 'leasing'}:
+            from ..paths import data_root
+
+            compose_dir = data_root() / 'leasing' / 'compose'
+            groups['leasing'] = [
+                _entry(
+                    'ledger', data_root() / 'leasing' / 'ledger.db', kind='file'
+                ),
+                _entry('compose_dir', compose_dir, kind='dir'),
+                _entry(
+                    'docker-compose.yml',
+                    compose_dir / 'docker-compose.yml',
+                    kind='file',
+                ),
+                _entry(
+                    'litellm_config.yaml',
+                    compose_dir / 'litellm_config.yaml',
+                    kind='file',
+                ),
+                _entry('env (secrets)', compose_dir / '.env', kind='file'),
+                _entry(
+                    'compose_state',
+                    compose_dir / 'leasing-compose-state.json',
+                    kind='file',
+                ),
             ]
 
         if config.json:

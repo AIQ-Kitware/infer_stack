@@ -1,22 +1,29 @@
 from __future__ import annotations
 
-from ..config import load_yaml
-from ..config import normalized_state
-from ..docker_utils import DockerCommandError
-from ..docker_utils import check_docker_compose_version
-from ..docker_utils import compose_down
-from ..docker_utils import compose_up
-from ..docker_utils import docker_rm_dirs
-from ..env_utils import parse_env_file
-from ..kubeai_ops import CommandError
-from ..kubeai_ops import deploy_rendered_artifacts
-from ..kubeai_ops import print_status as kubeai_print_status
-from pathlib import Path
-from typing import Any
-import scriptconfig as scfg
 import shlex
 import subprocess
+from pathlib import Path
+from typing import Any
 
+import scriptconfig as scfg
+
+from ..config import load_yaml, normalized_state
+from ..docker_utils import (
+    DockerCommandError,
+    check_docker_compose_version,
+    compose_down,
+    compose_up,
+    docker_rm_dirs,
+)
+from ..env_utils import parse_env_file
+from ..kubeai_ops import CommandError, deploy_rendered_artifacts
+from ..kubeai_ops import print_status as kubeai_print_status
+from .commands_profile import RenderCLI
+from .compose import (
+    _compose_base_cmd,
+    _compose_up_with_router_recreate,
+    _kubeai_stub,
+)
 from .context import (
     _apply_path_overrides,
     _as_mapping,
@@ -31,11 +38,6 @@ from .context import (
     render_is_stale,
     runtime_env_path,
 )
-from .compose import (
-    _compose_base_cmd,
-    _compose_up_with_router_recreate,
-    _kubeai_stub,
-)
 from .options import (
     _BackendOverrideMixin,
     _ClusterOverridesMixin,
@@ -44,7 +46,6 @@ from .options import (
     _PlanOverridesCLI,
     _PortOverridesMixin,
 )
-from .commands_profile import RenderCLI
 
 
 def _maybe_rerender(config: Any, cfg: dict[str, Any]) -> None:
@@ -431,6 +432,36 @@ def _print_status_summary(cfg: dict[str, Any], *, initialized: bool) -> None:
             print(f'    {name}: {url}')
 
 
+def _print_leasing_summary() -> None:
+    """One-line pointer to the leasing model's state, when a ledger exists.
+
+    Keeps the legacy ``status`` relevant after the leasing redesign: leases live
+    in their own ledger (``infer-stack leases``), not in the active-profile
+    deployment this command otherwise reports on.
+    """
+    from ..leasing import (
+        GroupState,
+        LeaseState,
+        Ledger,
+        SqliteStore,
+        default_ledger_path,
+    )
+
+    path = default_ledger_path()
+    if not path.exists():
+        return
+    leases, groups = Ledger(SqliteStore(str(path))).status()
+    if not leases and not groups:
+        return
+    active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)
+    live = sum(1 for g in groups if g.state == GroupState.LIVE)
+    print()
+    print(
+        f'leasing: {active} active lease(s), {live} live group(s) '
+        '(see `infer-stack leases`)'
+    )
+
+
 class StatusCLI(
     _PathOverridesMixin,
     _BackendOverrideMixin,
@@ -440,7 +471,8 @@ class StatusCLI(
 ):
     """Show stack status: where config/artifacts live, the active profile,
     whether it has been rendered, the resolved components/endpoints, and the
-    live container/cluster state."""
+    live container/cluster state. Leases (the newer model) are summarized too;
+    see ``infer-stack leases`` for detail."""
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -449,6 +481,7 @@ class StatusCLI(
         initialized = config_path().exists()
         cfg = config_for_runtime(config, allow_missing=True)
         _print_status_summary(cfg, initialized=initialized)
+        _print_leasing_summary()
         if not initialized:
             return 0
 
