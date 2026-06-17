@@ -73,7 +73,9 @@ Why it's a *medium* change, not a one-liner (scope notes for whoever picks it up
 
 Today a `DeploymentGroup.id` is random (`grp-<hex>`) and the compose service /
 LiteLLM upstream are derived from it (`vllm-<id>`, `http://vllm-<id>:8000`). For
-#1 the upstream must be predictable. Recommendation, in order:
+#1 the upstream must be predictable. **Decision (maintainer): use the compat-key
+hash (option 1) — after the GPU e2e dashboards are green.** Recommendation, in
+order:
 
 - **Preferred — derive the id from the compatibility key:** `grp-<short hash of
   compat_key>`. Coalescing already keys on the compat_key, so the id becomes a
@@ -93,16 +95,29 @@ LiteLLM upstream are derived from it (`vllm-<id>`, `http://vllm-<id>:8000`). For
   footgun the maintainer worried about; avoid it. Per-user isolation is what the
   `--dedicated` flag is for, handled by the nonce salt above.
 
-### Keep-warm vs. live demand on a GPU-constrained host
+### Keep-warm should yield its GPU to live demand (resolved policy)
 
 Surfaced by the GPU e2e suite: a `reclaim: keep-warm` group survives `release`
 and keeps its GPU. On a host where few GPUs are usable (e.g. yardrat: only GPU 0,
-GPU 1 is display), one idle keep-warm group starves later acquires — they can't
-place and time out. The e2e harness now resets between tiers to isolate this, but
-the product question stands: **should a new lease with real demand be able to
-reclaim an idle keep-warm group's GPU** (evict-to-make-room) rather than fail to
-place? Probably yes, with a policy knob. Until then, keep-warm on a 1–2 GPU box
-is effectively "pin a GPU."
+GPU 1 is display), an idle keep-warm group starves later acquires — they can't
+place and time out.
+
+**Resolved policy (maintainer):** the decision turns on what "idle" means, which
+is unambiguous here because `demand` counts active, un-expired leases:
+
+- **LIVE (demand ≥ 1, a lease is held): never reclaim.** A held lease protects
+  the group whether or not requests are currently flowing — "I'm holding this
+  GPU, don't touch it." Respect it.
+- **IDLE (demand == 0: every lease released, or TTL-expired and not renewed):
+  reclaimable.** No one is holding it; it's warm only as a courtesy. A new lease
+  with real demand may **evict it to free the GPU** instead of failing to place.
+
+So keep-warm means "stay resident *if there's room*; yield to real demand when
+GPUs are contended" — not "pin a GPU forever." Implementation: when placement
+fails for a LIVE-demand group, allow it to reclaim an IDLE group's GPU (tear the
+idle one down, place the new one). The ledger already distinguishes LIVE vs IDLE
+by demand, so this is a placement/reclaim policy change, not a new state. (The
+e2e harness resets between tiers regardless, so this isn't blocking the suite.)
 
 ### #2 — DB-backed live model management (retry later)
 
