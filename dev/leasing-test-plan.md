@@ -101,41 +101,7 @@ endpoints:
 runtime_hosts:
   local-ollama:
     engine: ollama
-    placement: {models)
-mkdir -p ~/infer-stack-test
-cat > ~/infer-stack-test/catalog.yaml <<'YAML'
-models:
-  qwen05b: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}
-  qwen15b: {source: hf://Qwen/Qwen2.5-1.5B-Instruct}
-endpoints:
-  qwen-small:
-    engine: vllm
-    model: qwen05b
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
-    reclaim: {policy: stop}
-  qwen-dup:                       # same model+runtime, exposed as qwen-small -> must coalesce
-    engine: vllm
-    model: qwen05b
-    public_name: qwen-small
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
-  qwen-15b:                       # 2nd distinct model -> exercises the display-GPU limit (F5)
-    engine: vllm
-    model: qwen15b
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
-    reclaim: {policy: keep-warm}
-  qwen-ollama:
-    engine: ollama
-    host: local-ollama
-    model: qwen2.5:0.5b
-runtime_hosts:
-  local-ollama:
-    engine: ollama
     placement: {gpu_indices: [0]}            # run only when no vLLM lease holds GPU 0 (or [] for CPU)
-    settings: {keep_alive: 5m}
-bundles:
-  pair: [qwen-small, qwen-15b]
-YAML
-echo "catalog written to ~/infer-stack-test/catalog.yaml"gpu_indices: [0]}            # run only when no vLLM lease holds GPU 0 (or [] for CPU)
     settings: {keep_alive: 5m}
 bundles:
   pair: [qwen-small, qwen-15b]
