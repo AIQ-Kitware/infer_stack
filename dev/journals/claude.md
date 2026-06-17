@@ -794,8 +794,11 @@ and explicit calls-out of the predicted issues.
 
 **Reflection:** the offline seam tests (FakeDocker) gave false confidence on the
 rendered artifact's *schema* — they checked the dict we built, not whether
-docker accepts it. A cheap guard would be a test that runs `docker compose -f
-<rendered> config -q` when docker is available (skip otherwise). Worth adding.
+docker accepts it. Added the guard: a parametrized test that writes the rendered
+project and runs `docker compose config -q` (skipped where docker compose is
+absent). It runs against real `docker compose` even in this sandbox (~sub-second
+each) and now passes for vllm-single / vllm-tp2 / vllm+ollama / no-litellm — so
+F1 is verified at the schema level, not just the dict.
 
 **Next:** keep fixing what yardrat surfaces (likely F2/F3 ergonomics next, maybe
 the F5 skip_display knob so both GPUs are testable), updating the findings log.

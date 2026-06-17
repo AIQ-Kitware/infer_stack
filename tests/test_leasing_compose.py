@@ -7,8 +7,11 @@ or GPUs. The real docker/GPU path is validated separately on a GPU host.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from infer_stack.hardware import simulate_inventory
@@ -18,6 +21,7 @@ from infer_stack.leasing import (
     Controller,
     Ledger,
     SqliteStore,
+    plan_placement,
     render_compose,
 )
 from infer_stack.leasing.models import DeploymentGroup, GroupState
@@ -347,3 +351,68 @@ def test_ollama_not_ready_when_pull_fails(tmp_path):
     r = be.probe_ready(g, 'daemon')
     assert r.ready is False
     assert 'pulling' in r.detail
+
+
+# -- docker compose schema validation --------------------------------------
+#
+# The fake-docker tests above check the dict we *build*, not whether docker
+# accepts it (which is how `capabilities: [["gpu"]]` slipped through to real
+# hardware). `docker compose config -q` runs Compose's schema validation
+# without pulling images, starting containers, or needing a GPU, so it is fast
+# and catches that whole class of bug. Skipped where docker compose is absent.
+
+
+def _docker_compose_available() -> bool:
+    if shutil.which('docker') is None:
+        return False
+    try:
+        subprocess.run(
+            ['docker', 'compose', 'version'],
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+requires_compose = pytest.mark.skipif(
+    not _docker_compose_available(),
+    reason='docker compose not available',
+)
+
+
+def _render(groups, *, litellm, tmp_path):
+    plan = plan_placement(groups, simulate_inventory('2x48'))
+    return render_compose(
+        groups, plan.assignments,
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=litellm, litellm_port=14042, aux_dir=tmp_path,
+    )
+
+
+@requires_compose
+@pytest.mark.parametrize(
+    'name, groups, litellm',
+    [
+        ('vllm-single', [vllm('grp-v', served='qwen')], True),
+        ('vllm-tp2', [vllm('grp-v', served='qwen', tp=2)], True),
+        ('vllm-and-ollama',
+         [vllm('grp-v', served='qwen', t=0), ollama('grp-o', tag='m:1b', t=1)],
+         True),
+        ('no-litellm', [vllm('grp-v', served='qwen')], False),
+    ],
+)
+def test_rendered_compose_passes_docker_schema(name, groups, litellm, tmp_path):
+    rc = _render(groups, litellm=litellm, tmp_path=tmp_path)
+    if rc.litellm_config is not None:
+        (tmp_path / 'litellm_config.yaml').write_text(rc.litellm_config)
+    compose_file = tmp_path / 'docker-compose.yml'
+    compose_file.write_text(yaml.safe_dump(rc.compose, sort_keys=False))
+    result = subprocess.run(
+        ['docker', 'compose', '-p', 'infer-stack-validate',
+         '-f', str(compose_file), 'config', '-q'],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f'{name}: {result.stderr}'

@@ -67,7 +67,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 * Compose GPU reservation emitted `capabilities: [["gpu"]]` (list-of-lists),
   which `docker compose` rejects ("capabilities.0 must be a string"); now emits
   `capabilities: ["gpu"]`. Found while testing the Compose backend on real
-  2-GPU hardware (see `dev/leasing-test-plan.md`).
+  2-GPU hardware (see `dev/leasing-test-plan.md`). Guarded against recurrence by
+  a test that runs `docker compose config -q` on the rendered project (skipped
+  where docker compose is unavailable) — it validates the artifact's schema, not
+  just the dict we build.
 
 ### Changed
 * Consolidate shared machinery so the legacy and leasing code paths reuse one
