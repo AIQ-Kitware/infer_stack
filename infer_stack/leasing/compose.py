@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -226,12 +227,16 @@ def _litellm_model_list(
     return entries
 
 
+CONFIG_HASH_LABEL = 'infer-stack.config-hash'
+
+
 def _litellm_service(
     service_names: list[str],
     host_port: int,
     images: dict[str, str],
     aux_dir: str,
     master_key: str | None = None,
+    config_hash: str | None = None,
 ) -> dict[str, Any]:
     # Bake the managed key in literally (not ${...}) so the container and the
     # readiness probe always agree regardless of the caller's shell env.
@@ -240,6 +245,16 @@ def _litellm_service(
         if master_key is not None
         else '${' + API_KEY_ENV + ':-sk-local}'
     )
+    labels = {ENGINE_LABEL: 'litellm'}
+    if config_hash is not None:
+        # LiteLLM reads its routing config once at startup; the file is bind-
+        # mounted, so a config change alone does NOT change this service's spec
+        # and `docker compose up -d` would leave the old container (and old
+        # routes) running. Stamping the config hash onto a label makes the spec
+        # change exactly when the config does, so converge recreates LiteLLM and
+        # it picks up new/removed aliases. Without this, coalescing a second
+        # alias onto a live group never becomes routable (readiness times out).
+        labels[CONFIG_HASH_LABEL] = config_hash
     return {
         'image': images['litellm'],
         'command': [
@@ -253,7 +268,7 @@ def _litellm_service(
         'environment': {API_KEY_ENV: key_value},
         'depends_on': sorted(service_names),
         'restart': 'unless-stopped',
-        'labels': {ENGINE_LABEL: 'litellm'},
+        'labels': labels,
     }
 
 
@@ -310,12 +325,16 @@ def render_compose(
             },
             sort_keys=False,
         )
+        config_hash = hashlib.sha256(
+            litellm_config.encode('utf-8')
+        ).hexdigest()[:12]
         services[LITELLM_SERVICE] = _litellm_service(
             list(service_map),
             litellm_port,
             images,
             str(aux_dir or '.'),
             master_key=litellm_master_key,
+            config_hash=config_hash,
         )
     return RenderedCompose(
         compose={'services': services},

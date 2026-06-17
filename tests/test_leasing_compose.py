@@ -303,6 +303,34 @@ def test_render_litellm_front_door(tmp_path):
     assert entry['litellm_params']['api_base'] == 'http://vllm-grp-a:8000/v1'
 
 
+def test_litellm_config_hash_label_tracks_model_list(tmp_path):
+    """The litellm service must change when its routing config changes.
+
+    Regression: a second alias coalesced onto a live group rewrote the config
+    file, but `docker compose up -d` left the old litellm container running
+    (spec unchanged), so the new alias never became routable. Stamping the
+    config hash onto a label makes converge recreate litellm on a config change.
+    """
+    from infer_stack.leasing.compose import CONFIG_HASH_LABEL
+
+    def label(group):
+        rc = render_compose(
+            [group], {group.id: [0]}, images=IMAGES, ports=PORTS, state=STATE,
+            litellm=True, litellm_port=14042, aux_dir=tmp_path,
+        )
+        return rc.compose['services']['litellm']['labels'][CONFIG_HASH_LABEL]
+
+    one = vllm('grp-a', served='qwen-served')
+    # same group serving two aliases (the coalesced case)
+    two = vllm('grp-a', served='qwen-served')
+    two.served['extra-alias'] = {'served_model_name': 'qwen-served'}
+
+    h_one, h_two = label(one), label(two)
+    assert h_one and h_two
+    assert h_one != h_two            # config changed -> spec (label) changed
+    assert label(one) == h_one       # stable for identical input (idempotent)
+
+
 def test_access_reports_litellm_base_url(tmp_path):
     be = make_backend(tmp_path)
     info = be.access(['qwen-coder', 'reranker'])

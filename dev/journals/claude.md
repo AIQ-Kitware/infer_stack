@@ -1029,3 +1029,60 @@ the F5 wiring (unit-tested) and that 45_both_gpus skips cleanly off-GPU
 Takeaway: when a walkthrough forces you to repeat a flag or hand-run a step the
 tool "should" own, that repetition is the spec for the next ergonomic feature —
 write the demo first, let it surface the smell, then decide.
+
+## 2026-06-17 16:55 -0400
+
+Model: claude-opus-4-8 (Claude Code, 1M context).
+
+User intent: mid GPU e2e run, `50_coalescing/coalesce-acquire` failed after a
+1200s timeout and they had no report (interrupted, no rsync). Two harness asks —
+(1) a trap so Ctrl-C still writes the report + rsync line, (2) the rsync must
+exclude the heavy cache dirs. They then rsynced the logs so I could diagnose.
+
+Diagnosis from the synced log (a real product bug, not a test flake): alice's
+`qwen-small` came up ready on group grp-…; bob's `qwen-dup` (which has
+`public_name: qwen-small`) correctly coalesced onto the same group (demand 2,
+one container), but its readiness probe waited on alias `qwen-dup` while the
+running LiteLLM gateway only knew `qwen-small` → never ready → 1200s timeout.
+Root cause: the ledger merge DOES add `qwen-dup` to group.served and converge
+re-renders litellm_config.yaml with it, but LiteLLM reads that bind-mounted file
+only at startup, and `docker compose up -d` doesn't recreate the litellm service
+because its *spec* didn't change — only the mounted file did. So the live
+gateway kept the old routes. (Confirmed the controller re-reads groups via
+ledger.status() before converge, so the rendered file is correct — only the
+restart was missing.)
+
+Fix: stamp a `infer-stack.config-hash` label (sha256 of the rendered config) on
+the litellm service. The spec now changes iff the routing changes, so converge
+recreates litellm exactly when needed and is otherwise idempotent. Unit test in
+test_leasing_compose asserts the label tracks the model_list (changes on a 2nd
+alias, stable for identical input). 214 passed.
+
+Also: `coalesce-one-container` falsely failed counting 2 vllm groups — the 2nd
+was a reclaim:stop group from tier 40 lingering as state=stopped in the ledger.
+Tightened the e2e check to count only LIVE vllm groups. (Whether the ledger
+should prune/hide stopped groups from `leases` is a separate question — noted,
+not changed.)
+
+Harness work: run.sh now has a `finish` EXIT trap (idempotent) that assembles
+the report, writes a `rsync-back.sh`, and prints the summary + rsync line; an
+INT/TERM trap exits so finish runs on Ctrl-C. Verified both paths (normal +
+SIGINT mid-run → partial report). The data dir lives inside the results dir, so
+it also holds the multi-GB HF/kernel caches; the printed rsync line and
+rsync-back.sh carry --exclude globs that drop *-cache/, ollama/, open-webui/,
+postgres-*/, runtime/ (keeping leasing/: ledger + compose + litellm config +
+.env). Moved per-step scratch (.lastout/.asserts/.notes) out of logs/ into a
+.scratch/ dir (also excluded) so the rsync'd logs/ holds only real .log files.
+
+State of mind: confident in the litellm-reload fix — the mechanism matches the
+symptom exactly and is unit-tested; the recreate cost is a brief gateway blip
+only when routing actually changes, which is acceptable under converge. The
+"stopped groups linger in the ledger" smell is real but I left it alone (out of
+scope, and `leases` showing history may be intentional). Next GPU run should get
+50_coalescing fully green and, with the trap+excludes, always return a
+reviewable report even on Ctrl-C.
+
+Takeaway: a bind-mounted config is not part of a container's compose identity —
+if a sidecar reads its config only at startup, give its service a content-hash
+label so converge restarts it when the content changes. Otherwise "I rewrote the
+file" silently diverges from "the running process sees the file".

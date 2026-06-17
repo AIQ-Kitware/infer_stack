@@ -28,10 +28,12 @@ expect_out '"demand": 2'
 count_out '"state": "active"' 2
 end_step
 
-step coalesce-one-container 'exactly one vllm service is running'
+step coalesce-one-container 'exactly one live vllm group / running container'
 run "infer-stack ps | grep -c vllm || true"
-note "vllm service count (expect 1): $(cat "$LAST_OUT_FILE")"
-run "infer-stack leases --json | python3 -c 'import json,sys; g=json.load(sys.stdin)[\"groups\"]; print(len([x for x in g if x[\"engine\"]==\"vllm\"]))'"
+note "running vllm containers (expect 1): $(cat "$LAST_OUT_FILE")"
+# Count only LIVE vllm groups — a reclaim:stop group from an earlier tier lingers
+# in the ledger as state=stopped and must not count toward 'one container'.
+run "infer-stack leases --json | python3 -c 'import json,sys; g=json.load(sys.stdin)[\"groups\"]; print(len([x for x in g if x[\"engine\"]==\"vllm\" and x[\"state\"]==\"live\"]))'"
 expect_out '1'
 end_step
 

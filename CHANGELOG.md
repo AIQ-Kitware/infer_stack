@@ -85,6 +85,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* LiteLLM now reloads when its routing config changes. The gateway reads its
+  model_list once at startup from a bind-mounted file; converge rewrote that
+  file but `docker compose up -d` left the old container running (its service
+  spec was unchanged), so a newly added/removed alias never became routable. In
+  practice: coalescing a second alias onto a live group (e.g. an endpoint with a
+  `public_name`) added it to the rendered config but the running gateway never
+  picked it up, so that lease's readiness probe timed out. The LiteLLM service
+  now carries a `infer-stack.config-hash` label derived from the config content,
+  so converge recreates it exactly when the routing changes (and leaves it alone
+  otherwise). Found by the `50_coalescing` e2e tier on GPU hardware.
 * Display-attached GPUs are now usable on demand. The placer still skips them by
   default (so a workstation's monitor GPU is left alone), but the leasing verbs
   gained `--include-display-gpus`, wired to the Compose backend's `skip_display`,
