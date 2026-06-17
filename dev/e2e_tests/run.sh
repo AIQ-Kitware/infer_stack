@@ -119,6 +119,16 @@ RSYNC_EXCLUDES=(
     "--exclude=infer-stack-data/postgres-*/"
     "--exclude=infer-stack-data/runtime/"
 )
+# Compute the pull command once so it can be shown at the START (for syncing
+# partial results mid-run) and again at the end.
+_exc=''
+for e in "${RSYNC_EXCLUDES[@]}"; do _exc+=" $e"; done
+RSYNC_LINE="rsync -av${_exc} '$HOST:$RESULTS/' './e2e-report-$TS/'"
+{ echo '#!/usr/bin/env bash'
+  echo '# Pull this report back (excludes the heavy weight/kernel caches).'
+  echo '# Safe to run mid-run for partial results.'
+  echo "$RSYNC_LINE"
+} > "$RESULTS/rsync-back.sh" 2>/dev/null || true
 
 _finished=0
 finish() {
@@ -127,15 +137,6 @@ finish() {
     echo
     python3 "$E2E_ROOT/render_report.py" --assemble --results "$RESULTS" \
         2>/dev/null || echo '(report assembly failed; results.jsonl + logs/ still usable)'
-
-    local exc=''
-    for e in "${RSYNC_EXCLUDES[@]}"; do exc+=" $e"; done
-    local rsync_line="rsync -av${exc} '$HOST:$RESULTS/' './e2e-report-$TS/'"
-    # Drop a ready-to-read pull command next to the report.
-    { echo '#!/usr/bin/env bash'
-      echo '# Pull this report back (excludes the heavy weight/kernel caches).'
-      echo "$rsync_line"
-    } > "$RESULTS/rsync-back.sh" 2>/dev/null || true
 
     local summary
     summary="$(python3 -c "
@@ -154,16 +155,29 @@ print(f'{p} passed, {f} failed, {s} skipped')
     echo "  report:  $RESULTS/report.md"
     echo
     echo "  rsync back (excludes weight/kernel caches):"
-    echo "    $rsync_line"
+    echo "    $RSYNC_LINE"
     echo "================================================================"
 }
 trap 'finish' EXIT
 trap 'echo; echo "[interrupted — assembling partial report]"; exit 130' INT TERM
 
+# Isolate GPU tiers: tear down any running stack between tiers so a leftover
+# group (especially a keep-warm one that survives `release`) can't hold the only
+# usable GPU and starve the next tier. Cheap relative to a tier; weights stay
+# cached so it's a reload, not a re-download.
+reset_between_tiers() {
+    local cf="$INFER_STACK_DATA_DIR/leasing/compose/docker-compose.yml"
+    [ -f "$cf" ] || return 0
+    docker compose -p infer-stack -f "$cf" down --remove-orphans >/dev/null 2>&1 || true
+}
+
 # ---- select + run test scripts ----------------------------------------------
 echo
 echo "infer-stack leasing e2e — $TIERS"
 echo "results: $RESULTS"
+echo
+echo "rsync back (run any time for partial results; also in $RESULTS/rsync-back.sh):"
+echo "  $RSYNC_LINE"
 echo
 
 for f in "$E2E_ROOT"/tests/*.sh; do
@@ -178,6 +192,11 @@ for f in "$E2E_ROOT"/tests/*.sh; do
     fi
     export E2E_SECTION="${name%.sh}"
     echo "── $E2E_SECTION ──────────────────────────────────────────"
+    # Reset GPU state before each serving tier (not before cleanup, which downs
+    # the stack itself). Keeps tiers isolated on a GPU-constrained box.
+    if [ "$GPU" = 1 ] && [ "$prefix" != '99' ]; then
+        reset_between_tiers
+    fi
     bash "$f"
 done
 
