@@ -94,7 +94,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   picked it up, so that lease's readiness probe timed out. The LiteLLM service
   now carries a `infer-stack.config-hash` label derived from the config content,
   so converge recreates it exactly when the routing changes (and leaves it alone
-  otherwise). Found by the `50_coalescing` e2e tier on GPU hardware.
+  otherwise). Found by the `50_coalescing` e2e tier on GPU hardware. This trades
+  a brief gateway blip on a model add/remove for correctness; keeping LiteLLM up
+  across switches (as the legacy stack did) is tracked in
+  `dev/leasing-followups.md`.
 * Display-attached GPUs are now usable on demand. The placer still skips them by
   default (so a workstation's monitor GPU is left alone), but the leasing verbs
   gained `--include-display-gpus`, wired to the Compose backend's `skip_display`,
