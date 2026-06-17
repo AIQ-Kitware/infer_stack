@@ -300,3 +300,48 @@ def test_probe_ready_requires_routable_alias(tmp_path):
     assert be.probe_ready(g, 'a').ready is True
     # an endpoint the gateway doesn't list is not ready
     assert be.probe_ready(g, 'ghost').ready is False
+
+
+# -- Ollama pull / warmup readiness ----------------------------------------
+
+
+def test_ollama_probe_pulls_tag_then_ready(tmp_path):
+    be = make_backend(tmp_path)
+    g = ollama('daemon', tag='qwen3.5:4b')
+    be.converge([g])
+    r = be.probe_ready(g, 'daemon')
+    assert r.ready is True
+    # the tag was pulled into the daemon via `docker compose exec ... ollama pull`
+    pulls = [c for c in be.run.calls if 'pull' in c]
+    assert pulls and 'qwen3.5:4b' in pulls[0]
+
+
+def test_ollama_pull_is_idempotent(tmp_path):
+    be = make_backend(tmp_path)
+    g = ollama('daemon', tag='m:1b')
+    be.converge([g])
+    be.probe_ready(g, 'daemon')
+    be.probe_ready(g, 'daemon')
+    assert len([c for c in be.run.calls if 'pull' in c]) == 1
+
+
+class _FailingExecDocker(FakeDocker):
+    def __call__(self, args):
+        if 'exec' in args and 'pull' in args:
+            raise RuntimeError('daemon not ready')
+        return super().__call__(args)
+
+
+def test_ollama_not_ready_when_pull_fails(tmp_path):
+    be = ComposeBackend(
+        state_dir=tmp_path,
+        inventory=simulate_inventory('4x80'),
+        run=_FailingExecDocker(),
+        http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    g = ollama('daemon', tag='m:1b')
+    be.converge([g])
+    r = be.probe_ready(g, 'daemon')
+    assert r.ready is False
+    assert 'pulling' in r.detail

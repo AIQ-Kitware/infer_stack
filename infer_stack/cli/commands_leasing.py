@@ -105,6 +105,7 @@ def _make_backend(config):
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
+            require_generation=bool(getattr(config, 'require_generation', False)),
         )
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI yet '
@@ -238,6 +239,12 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin):
     )
     ledger = scfg.Value(
         None, type=str, help='Path to the lease ledger sqlite db.'
+    )
+    require_generation = scfg.Value(
+        False,
+        isflag=True,
+        help='Readiness requires a real generation, not just model listing '
+        '(compose backend; Ollama always generates to warm the tag).',
     )
 
 

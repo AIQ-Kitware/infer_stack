@@ -56,6 +56,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   lock so concurrent processes don't clobber the shared compose file. (Ollama
   tag pull/warmup is a remaining readiness follow-up.)
 
+### Added (continued)
+* Ollama pull/warmup readiness in the Compose backend: a daemon serves a tag
+  lazily, so `probe_ready` now pulls the endpoint's tag into its daemon
+  (`docker compose exec … ollama pull`, idempotent) and forces a generation
+  through the front door to warm it before reporting ready. A `--require-generation`
+  flag opts vLLM readiness into the same real-generation check.
+
 ### Changed
 * Consolidate shared machinery so the legacy and leasing code paths reuse one
   implementation instead of duplicating it:

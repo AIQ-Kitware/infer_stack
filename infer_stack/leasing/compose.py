@@ -383,6 +383,7 @@ class ComposeBackend:
         self.litellm = litellm
         self.require_generation = require_generation
         self.last_errors: list[str] = []
+        self._pulled: set[str] = set()  # (group:tag) pulled this process
 
     @property
     def compose_file(self) -> Path:
@@ -487,6 +488,28 @@ class ComposeBackend:
             'request_names': {ep: ep for ep in endpoints},
         }
 
+    def _ensure_ollama_tag(
+        self, group: DeploymentGroup, endpoint: str
+    ) -> str | None:
+        """Pull the endpoint's Ollama tag into its daemon (idempotent).
+
+        An Ollama daemon loads tags lazily, so a tag must be present before it
+        can serve. Returns an error reason if the pull failed (retry next poll),
+        else ``None``.
+        """
+        tag = (group.served.get(endpoint) or {}).get('model')
+        if not tag:
+            return None
+        key = f'{group.id}:{tag}'
+        if key in self._pulled:
+            return None
+        try:
+            self._compose(['exec', '-T', f'ollama-{group.id}', 'ollama', 'pull', tag])
+        except Exception as ex:  # noqa: BLE001 - readiness is retryable
+            return f'pulling {tag}: {ex}'
+        self._pulled.add(key)
+        return None
+
     def probe_ready(
         self, group: DeploymentGroup, endpoint: str
     ) -> Readiness:
@@ -494,12 +517,20 @@ class ComposeBackend:
 
         Delegates the HTTP check to the shared :func:`infer_stack.probe.openai_ready`
         — ``require_listed`` confirms the alias is advertised by the gateway, and
-        ``require_generation`` (off by default) additionally runs a tiny chat.
+        ``require_generation`` additionally runs a tiny chat. For Ollama the tag
+        is pulled first and a generation is forced, so readiness means the tag is
+        actually loaded and serving (not just lazily configured).
         """
         if group.id not in self.observe():
             return Readiness(False, 'container not running')
         if not self.litellm:
             return Readiness(True, 'container running')
+        require_generation = self.require_generation
+        if group.engine == 'ollama':
+            error = self._ensure_ollama_tag(group, endpoint)
+            if error:
+                return Readiness(False, error)
+            require_generation = True  # warm the tag so it is resident
         key = os.environ.get(API_KEY_ENV)
         headers = {'Authorization': f'Bearer {key}'} if key else {}
         ok, reason = openai_ready(
@@ -507,7 +538,7 @@ class ComposeBackend:
             headers=headers,
             model=endpoint,
             require_listed=True,
-            require_generation=self.require_generation,
+            require_generation=require_generation,
             http=self.http,
         )
         return Readiness(ok, reason)

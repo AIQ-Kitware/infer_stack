@@ -721,3 +721,43 @@ intent. Full suite green. Still no real docker/HTTP here — seams prove it.
 consumer integration; further consolidation candidates if any surface (the
 LiteLLM config template vs the leasing dict builder is the remaining duplicate,
 but template-vs-dict makes it lower-value).
+
+## 2026-06-16 18:55:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Same session.
+Did the next functional step: Ollama pull/warmup readiness.
+
+**What I built:** `ComposeBackend.probe_ready` now handles the Ollama lazy-load
+gap. An Ollama daemon being up (and the alias being in the LiteLLM config) does
+NOT mean the tag is resident, so for ollama groups probe_ready:
+1. pulls the endpoint's tag into the daemon via `docker compose exec -T
+   ollama-<gid> ollama pull <tag>` (idempotent; tracked in `self._pulled` so
+   it's issued once per process; failures are retryable so the poll loop heals
+   once the daemon accepts the pull), then
+2. forces `require_generation=True` so the front-door readiness check runs a
+   real chat through LiteLLM->ollama — which both confirms the tag loads and
+   warms it.
+vLLM readiness is unchanged (alias-listed by default); a new `--require-generation`
+CLI flag opts vLLM into the same real-generation check.
+
+**Decisions / reflections:**
+- Kept everything through the LiteLLM front door (one base_url) rather than
+  reusing `probe.ollama_ready` against the daemon directly — the only
+  ollama-specific action is the *pull*, which needs no host-port tracking
+  (`exec` by service name). So I did NOT end up calling `probe.ollama_ready`
+  here; it stays for the legacy direct-ollama path. The unifying insight: with a
+  gateway, readiness is engine-agnostic (openai_ready) and the only divergence
+  is the side-effecting pull.
+- Pull lives in probe_ready (not converge) on purpose: right after `up -d` the
+  daemon isn't ready to accept a pull, and the poll loop is exactly the retry
+  mechanism. Idempotence + `_pulled` keep it from re-pulling.
+- "alias listed" is too weak for ollama (LiteLLM lists configured-but-unpulled
+  tags), which is why ollama forces generation — the honest readiness signal.
+
+**Risks:** as ever, no real docker/ollama here — FakeDocker handles `exec` and
+the pull command is asserted; the real pull (which can download GBs and block
+the first poll) is host-validated. 17 compose tests (3 new ollama), 88
+leasing/CLI + 7 xdoctests green.
+
+**Next:** consumer integration — wrap eval_audit's MaterializeHelmRunNode command
+with `infer-stack run`, and switch aiq-eval-runner Incubilate to acquire/release.
