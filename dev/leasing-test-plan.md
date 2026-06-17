@@ -23,6 +23,13 @@ Two hardware facts shape the whole plan:
 Newest first. `FIXED` = patched on the branch; `OPEN` = still to address;
 `CONFIRM` = expected, verify on hardware.
 
+- **F10 — manual chat `curl` got `model=None`. DOC FIX (system is fine).**
+  The chat-completions `curl` omitted `-H "Content-Type: application/json"`, so
+  `curl -d` sent form-encoding and LiteLLM didn't parse the JSON body
+  (`Invalid model name passed in model=None`). Added the header. Confirms the
+  serving path works end-to-end: vLLM healthy, `/v1/models` lists the alias, and
+  `acquire --require-generation` already did a real chat through the gateway
+  (the probe posts via `requests(json=…)`, which sets the header).
 - **F9 — vLLM rejects `--disable-log-requests`. FIXED.** `vllm_args` appended it
   unconditionally; vLLM v0.19.1 removed it (`unrecognized arguments`), so vLLM
   crashed and LiteLLM reported `Connection error … Model Group=qwen-small`.
@@ -154,7 +161,7 @@ On success, verify serving + descriptor, then release:
 ```bash
 set -a; . /tmp/is.env; set +a       # exports OPENAI_BASE_URL + OPENAI_API_KEY
 curl -s "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $OPENAI_API_KEY" | python -m json.tool
-curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
+curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
   -d '{"model":"qwen-small","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
 infer-stack release --env-file /tmp/is.env
 ```
@@ -220,7 +227,7 @@ TTL expiry.
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack run --endpoint qwen-small --backend compose --catalog "$CAT" --require-generation -- \
-  bash -c 'curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
+  bash -c 'curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
     -d "{\"model\":\"$INFER_STACK_ENDPOINT_QWEN_SMALL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}"'
 echo "exit=$?"
 infer-stack leases            # the run lease should be released
@@ -239,7 +246,7 @@ export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-ollama --backend compose --catalog "$CAT" --require-generation --timeout 900 --env-file /tmp/o.env
 docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=80 | grep -i pull   # expect "ollama pull qwen2.5:0.5b"
 set -a; . /tmp/o.env; set +a
-curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
+curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
   -d '{"model":"qwen-ollama","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
 infer-stack release --env-file /tmp/o.env
 ```
