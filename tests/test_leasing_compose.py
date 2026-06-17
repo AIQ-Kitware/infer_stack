@@ -211,6 +211,24 @@ def test_converge_removes_dropped_group(tmp_path):
     assert be.observe() == {'a'}
 
 
+def test_observe_tolerates_unreadable_compose_file(tmp_path):
+    # A stale/invalid file makes `docker compose ps` raise; observe must not
+    # propagate it (else acquire bricks before converge can overwrite the file).
+    class RaisingPs(FakeDocker):
+        def __call__(self, args):
+            if 'ps' in args:
+                raise RuntimeError('compose schema error on a stale file')
+            return super().__call__(args)
+
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+        run=RaisingPs(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    be.converge([vllm('a')])         # writes a good compose file
+    assert be.observe() == set()     # ps raises -> lenient empty, no crash
+
+
 def test_probe_ready_tracks_running(tmp_path):
     be = make_backend(tmp_path)
     g = vllm('a')

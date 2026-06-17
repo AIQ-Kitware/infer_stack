@@ -23,6 +23,19 @@ Two hardware facts shape the whole plan:
 Newest first. `FIXED` = patched on the branch; `OPEN` = still to address;
 `CONFIRM` = expected, verify on hardware.
 
+- **F8 — a stale/invalid compose file bricked `acquire`. FIXED.**
+  `reconcile` calls `observe()` (which runs `docker compose ps`, validating the
+  on-disk file) *before* `converge()` rewrites it. A stale file from an earlier
+  (pre-fix) run made `ps` raise and crashed the whole acquire before converge
+  could overwrite it. `observe()` is now lenient (returns "nothing observed" on
+  any docker/parse error), so converge self-heals the file. If you hit this on
+  a box with an old compose file, the fix overwrites it on the next acquire; or
+  clean it: `rm -rf "$INFER_STACK_DATA_DIR/leasing/compose"`.
+- **F7 — unit-test isolation: ambient `INFER_STACK_*` leaked into the legacy CLI
+  tests. FIXED.** The subprocess `run_cli` helpers used `setdefault`, so an
+  exported `INFER_STACK_DATA_DIR` (from these test-plan blocks) made the tests
+  read the real data dir. Forced to `tmp_path`. (Run unit tests in any shell
+  now; the leasing acquire/run commands still use the export intentionally.)
 - **F1 — `capabilities: [[gpu]]` rejected by Compose schema. FIXED.**
   `services.*.deploy.resources.reservations.devices.0.capabilities.0 must be a
   string`. `_gpu_reservation` emitted a list-of-lists; Compose wants a list of
@@ -88,7 +101,41 @@ endpoints:
 runtime_hosts:
   local-ollama:
     engine: ollama
+    placement: {models)
+mkdir -p ~/infer-stack-test
+cat > ~/infer-stack-test/catalog.yaml <<'YAML'
+models:
+  qwen05b: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}
+  qwen15b: {source: hf://Qwen/Qwen2.5-1.5B-Instruct}
+endpoints:
+  qwen-small:
+    engine: vllm
+    model: qwen05b
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    reclaim: {policy: stop}
+  qwen-dup:                       # same model+runtime, exposed as qwen-small -> must coalesce
+    engine: vllm
+    model: qwen05b
+    public_name: qwen-small
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+  qwen-15b:                       # 2nd distinct model -> exercises the display-GPU limit (F5)
+    engine: vllm
+    model: qwen15b
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    reclaim: {policy: keep-warm}
+  qwen-ollama:
+    engine: ollama
+    host: local-ollama
+    model: qwen2.5:0.5b
+runtime_hosts:
+  local-ollama:
+    engine: ollama
     placement: {gpu_indices: [0]}            # run only when no vLLM lease holds GPU 0 (or [] for CPU)
+    settings: {keep_alive: 5m}
+bundles:
+  pair: [qwen-small, qwen-15b]
+YAML
+echo "catalog written to ~/infer-stack-test/catalog.yaml"gpu_indices: [0]}            # run only when no vLLM lease holds GPU 0 (or [] for CPU)
     settings: {keep_alive: 5m}
 bundles:
   pair: [qwen-small, qwen-15b]

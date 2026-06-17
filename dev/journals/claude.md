@@ -824,3 +824,22 @@ vars. (The in-process `_anchor_paths` used `monkeypatch.setenv`, which already
 forces, so those tests were fine — the bug was only in the subprocess helpers.)
 This is a test-isolation bug, not a regression from the leasing branch; worth a
 dev/lesson if it recurs.
+
+## 2026-06-17 13:40:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. yardrat re-ran
+acquire and hit the *same* capabilities error — but now during `ps`, not `up`
+(F8). Root cause: the bad `docker-compose.yml` from run #1 (pre-fix, with
+`capabilities: [[gpu]]`) was still on disk, and `reconcile`'s converge branch
+calls `observe()` (→ `docker compose ps`, which validates the file) *before*
+`converge()` rewrites it. So a stale/invalid file crashed acquire before the fix
+could take effect. Fixed by making `observe()` best-effort: catch any
+docker/parse error and return an empty set, so converge overwrites the file and
+self-heals. Test added with a runner that raises on `ps`.
+
+**Takeaway / design lesson:** a reconcile step that *reads* actual state must be
+tolerant — `docker compose ps` doubly so, because it validates the whole file,
+not just lists containers. Read-side operations should degrade to "unknown ->
+empty", never abort the write that would fix the very file they choke on. The
+generic shape: in a desired-state reconciler, observe() must never be able to
+prevent converge().

@@ -469,7 +469,16 @@ class ComposeBackend:
     def observe(self) -> set[str]:
         if not self.compose_file.exists():
             return set()
-        running = _parse_ps(self._compose(['ps', '--format', 'json']))
+        try:
+            out = self._compose(['ps', '--format', 'json'])
+        except Exception:  # noqa: BLE001 - observe is best-effort
+            # A stale/invalid compose file on disk (e.g. left by an older
+            # version) or a transient docker error must not brick acquire:
+            # `docker compose ps` validates the file, so a bad file would raise
+            # here *before* converge gets to overwrite it. Treat as "nothing
+            # observed" and let converge rewrite + reconcile.
+            return set()
+        running = _parse_ps(out)
         services = self._load_sidecar().get('services', {})
         return {services[name] for name in running if name in services}
 

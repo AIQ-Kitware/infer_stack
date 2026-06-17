@@ -64,6 +64,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* Compose `observe()` is now resilient to a stale/invalid on-disk compose file.
+  `reconcile` observes (via `docker compose ps`, which validates the file)
+  before `converge` rewrites it, so a bad file left by an earlier run would
+  crash `acquire` before it could be fixed. `observe()` now returns "nothing
+  observed" on any docker/parse error and lets converge overwrite the file
+  (self-heal).
 * Test isolation: the subprocess `run_cli` helpers in `tests/test_cli_meta.py`
   and `tests/test_cli_setup.py` used `env.setdefault('INFER_STACK_CONFIG_DIR'/
   'INFER_STACK_DATA_DIR', tmp_path)`, which let an ambient `INFER_STACK_*`
