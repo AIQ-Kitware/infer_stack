@@ -12,7 +12,7 @@ ENVF="$E2E_RESULTS/ollama.env"
 
 step ollama-acquire 'acquire an ollama endpoint -> daemon up, tag pulled+warmed'
 run "infer-stack acquire qwen-ollama --backend compose --catalog \"$E2E_CAT\" \
-      --require-generation --timeout 900 --env-file \"$ENVF\" --json"
+      --require-generation --timeout 300 --env-file \"$ENVF\" --json"
 expect_rc 0
 expect_out '"ready": true'
 run 'infer-stack logs --tail=120'

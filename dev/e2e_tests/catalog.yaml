@@ -1,31 +1,39 @@
 # Catalog for the leasing e2e harness, tailored to yardrat:
 #   GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1 Quadro RTX 5000 (16 GiB,
-#   display-attached -> skipped by the placer). Both Turing (sm_75): fp16 only,
-#   no bf16/FP8, so every vLLM endpoint pins `--dtype=half`.
-# Tiny ungated chat models so `acquire` timeouts reflect logic, not 10GB pulls.
+#   display-attached -> skipped unless --include-display-gpus). Both Turing
+#   (sm_75): fp16 only, no bf16/FP8, so every vLLM endpoint pins `--dtype=half`.
+#
+# SPEED: these are the smallest sane ungated chat models (SmolLM2 135M/360M) and
+# every vLLM endpoint runs with `--enforce-eager` (skip torch.compile + CUDA
+# graph capture, which dominate vLLM startup and are model-size-independent) and
+# a small max_model_len (less KV alloc / smaller capture). We're validating the
+# leasing plumbing, not model perf, so eager + tiny is the right trade.
+#
+# Endpoint NAMES are kept stable (qwen-*) so the test scripts don't change; the
+# underlying model is SmolLM2. The alias is what clients/tests request.
 models:
-  qwen05b: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}
-  qwen15b: {source: hf://Qwen/Qwen2.5-1.5B-Instruct}
+  smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
+  smol360: {source: hf://HuggingFaceTB/SmolLM2-360M-Instruct}
 endpoints:
   qwen-small:
     engine: vllm
-    model: qwen05b
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    model: smol135
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
     reclaim: {policy: stop}
   qwen-dup:                       # same model+runtime, aliased to qwen-small -> must coalesce
     engine: vllm
-    model: qwen05b
+    model: smol135
     public_name: qwen-small
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
-  qwen-15b:                       # 2nd distinct model -> exercises the display-GPU limit (F5)
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
+  qwen-15b:                       # 2nd distinct model -> for the both-GPU / display-GPU tiers
     engine: vllm
-    model: qwen15b
-    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    model: smol360
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
     reclaim: {policy: keep-warm}
   qwen-ollama:
     engine: ollama
     host: local-ollama
-    model: qwen2.5:0.5b
+    model: smollm2:135m
 runtime_hosts:
   local-ollama:
     engine: ollama
