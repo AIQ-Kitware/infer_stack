@@ -62,12 +62,26 @@ step() {
 
 # run '<shell command string>'   — executes via `bash -c`, captures combined
 # output to the step log and to LAST_OUT_FILE, records RC and the duration.
+# A heartbeat prints elapsed seconds every 20s so a long acquire/serve doesn't
+# look hung (it writes to the console, not to the captured output).
 run() {
     local start end
     printf '\n$ %s\n' "$1" >> "$CUR_LOG"
     start="$(_now)"
+    ( while true; do
+        sleep 20
+        printf '    %s… still running (%ds)%s\n' "$C_DIM" \
+            "$(awk -v a="$start" -v b="$(_now)" 'BEGIN{printf "%d", b-a}')" \
+            "$C_RST"
+      done ) &
+    local hb=$!
     bash -c "$1" > "$LAST_OUT_FILE" 2>&1
     RC=$?
+    # Kill the heartbeat AND its in-flight `sleep` child (grab the child before
+    # killing the parent, else it gets reparented and lingers up to 20s).
+    local hbkids; hbkids="$(pgrep -P "$hb" 2>/dev/null)"
+    kill "$hb" $hbkids 2>/dev/null
+    wait "$hb" 2>/dev/null
     end="$(_now)"
     DUR="$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')"
     cat "$LAST_OUT_FILE" >> "$CUR_LOG"

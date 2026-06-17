@@ -53,6 +53,24 @@ placer — that's finding F5, which test `60_dedicated_f5` deliberately probes).
 
 Run a subset: `./run.sh --gpu --only '40 50'`. `99_cleanup` always runs.
 
+GPU tiers are isolated: before each serving tier the runner tears down the
+`infer-stack` compose project **and wipes the ledger**, so a leftover group from
+one tier can't hold the only usable GPU and starve the next. Long-running steps
+(model cold-starts) print a `… still running (Ns)` heartbeat every 20s so they
+don't look hung.
+
+## Stuck run? `cleanup.sh`
+
+If you Ctrl-C mid-run (or a box is left with leftover containers), reclaim it:
+
+```bash
+./cleanup.sh                    # down the 'infer-stack' compose project + stragglers
+./cleanup.sh --wipe-ledger DIR  # + wipe the ledger under a run's results/<ts>/infer-stack-data
+```
+
+The compose project is always named `infer-stack`, so the teardown works without
+needing the original run's data dir.
+
 ## The report
 
 `run.sh` writes a timestamped dir under `results/` (gitignored):

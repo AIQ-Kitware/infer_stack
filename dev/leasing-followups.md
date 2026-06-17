@@ -151,3 +151,26 @@ Also: reclaim:stop deployment groups linger in the ledger as `state=stopped` and
 still show up in `infer-stack leases` / its group list. Decide whether `leases`
 should hide/prune stopped groups or keep them as history. (Surfaced by the
 `50_coalescing` e2e tier needing to filter to `state==live`.)
+
+### Ledger accumulation / leaked-active-lease (real, found by GPU e2e)
+
+The GPU e2e suite surfaced a cluster of related product issues (worked around in
+the harness by wiping the ledger between tiers; worth fixing in the product):
+
+- **A not-ready `acquire` keeps its lease ACTIVE with no auto-cleanup.** Unlike
+  `run` (which releases in a `finally`), a plain `acquire` that times out / never
+  becomes ready leaves the lease active, so its group stays LIVE and holds a GPU
+  indefinitely. Decide: should `acquire --timeout` that fails auto-release? At
+  minimum it's a footgun — a failed acquire silently pins a GPU.
+- **Re-acquiring a model spawns a new group instead of reviving a compatible
+  idle one.** Repeated acquire/release of the same model accumulates distinct
+  group rows (different ids) rather than coalescing onto the existing idle group.
+  Fixing this is largely the deterministic-group-id work above (a compat-key id
+  makes "the qwen-small group" a single stable row).
+- **Ledger vs. reality drift.** If a group's container is removed out-of-band
+  (here: the harness `compose down` between tiers), the ledger still believes it
+  is LIVE and the next reconcile re-realizes it. Reconcile trusts the ledger as
+  desired-state and never prunes a LIVE group whose lease leaked. Combined with
+  the first bullet, one leaked active lease re-spawns a GPU-hogging group on
+  every subsequent reconcile. An `observe()`-driven reconciliation of ledger
+  state (or just fixing the leak) would close this.

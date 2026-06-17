@@ -167,8 +167,19 @@ trap 'echo; echo "[interrupted — assembling partial report]"; exit 130' INT TE
 # cached so it's a reload, not a re-download.
 reset_between_tiers() {
     local cf="$INFER_STACK_DATA_DIR/leasing/compose/docker-compose.yml"
-    [ -f "$cf" ] || return 0
-    docker compose -p infer-stack -f "$cf" down --remove-orphans >/dev/null 2>&1 || true
+    [ -f "$cf" ] && \
+        docker compose -p infer-stack -f "$cf" down --remove-orphans \
+        >/dev/null 2>&1 || true
+    # Also tear down by project name in case the file is gone/stale.
+    docker compose -p infer-stack down --remove-orphans >/dev/null 2>&1 || true
+    # Wipe the shared ledger so each tier starts with zero leases/groups.
+    # Otherwise a leftover LIVE group — e.g. an `acquire` that returned
+    # not-ready keeps its lease active, or a swallowed cleanup missed one —
+    # persists in the ledger, gets re-realized by the next tier's reconcile,
+    # and holds the only usable GPU (starving the tier). Per-tier isolation.
+    rm -f "$INFER_STACK_DATA_DIR"/leasing/ledger.db \
+          "$INFER_STACK_DATA_DIR"/leasing/ledger.db-wal \
+          "$INFER_STACK_DATA_DIR"/leasing/ledger.db-shm 2>/dev/null || true
 }
 
 # ---- select + run test scripts ----------------------------------------------
