@@ -57,6 +57,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* Managed LiteLLM secret + `infer-stack secrets`. The Compose backend now owns
+  `LITELLM_MASTER_KEY` (reused from the state dir's `.env` if you pin one, else
+  generated via `ensure_secret`), bakes it into the LiteLLM service, uses it for
+  the readiness probe, and ships it in the `--env-file` descriptor as
+  `OPENAI_API_KEY` — so `source`-ing the env-file fully configures an OpenAI
+  client (no manual `export`). `infer-stack secrets [KEY]` prints the managed
+  secrets (`$(infer-stack secrets LITELLM_MASTER_KEY)`), restoring the legacy
+  `infer-stack env` ergonomic for the leasing model.
 * Ollama pull/warmup readiness in the Compose backend: a daemon serves a tag
   lazily, so `probe_ready` now pulls the endpoint's tag into its daemon
   (`docker compose exec … ollama pull`, idempotent) and forces a generation
@@ -64,6 +72,9 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* `vllm_args` no longer emits `--disable-log-requests`, which vLLM v0.19.1
+  rejects (`unrecognized arguments`) — it crashed vLLM, surfacing as a LiteLLM
+  "Connection error". Engine-version-specific flags can go in `extra_args`.
 * Compose `observe()` is now resilient to a stale/invalid on-disk compose file.
   `reconcile` observes (via `docker compose ps`, which validates the file)
   before `converge` rewrites it, so a bad file left by an earlier run would

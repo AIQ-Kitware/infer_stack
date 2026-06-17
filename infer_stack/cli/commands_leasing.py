@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
 import scriptconfig as scfg
 
+from ..env_utils import parse_env_file
 from ..leasing import (
     Catalog,
     CatalogError,
@@ -42,7 +44,7 @@ from ..leasing.envfile import (
     read_session_id,
     render_env_file,
 )
-from ..paths import config_root
+from ..paths import config_root, data_root
 from .context import _apply_path_overrides
 from .options import _AllowedGpusMixin, _PathOverridesMixin
 
@@ -99,7 +101,6 @@ def _make_backend(config):
         return NullBackend()
     if name == 'compose':
         from ..hardware import detect_inventory
-        from ..paths import data_root
 
         return ComposeBackend(
             state_dir=data_root() / 'leasing' / 'compose',
@@ -151,18 +152,21 @@ def _descriptor_for(controller, lease, groups, config):
     """Build the descriptor, preferring backend-supplied access (real base_url)."""
     base_url = config.base_url
     api_key_env = config.api_key_env
+    api_key = None
     request_names = None
     access = getattr(controller.backend, 'access', None)
     info = access(list(lease.endpoints)) if access else None
     if info:
         base_url = info.get('base_url', base_url)
         api_key_env = info.get('api_key_env', api_key_env)
+        api_key = info.get('api_key')
         request_names = info.get('request_names')
     return build_descriptor(
         lease,
         groups,
         base_url=base_url,
         api_key_env=api_key_env,
+        api_key=api_key,
         request_names=request_names,
     )
 
@@ -506,4 +510,43 @@ class LeasesCLI(_LeasingCommonMixin):
                 f'  {g.id}  {g.engine}  state={g.state}  demand={g.demand}  '
                 f'served={",".join(sorted(g.served)) or "-"}'
             )
+        return 0
+
+
+class SecretsCLI(_PathOverridesMixin):
+    """Print the compose backend's managed secrets (e.g. the LiteLLM key).
+
+    infer-stack owns these — generated and persisted. Use
+    ``$(infer-stack secrets LITELLM_MASTER_KEY)`` in scripts, or
+    ``eval "$(infer-stack secrets)"`` to export them all. (Acquiring with
+    ``--env-file`` also writes ``OPENAI_API_KEY`` + ``OPENAI_BASE_URL`` for you.)
+    """
+
+    __command__ = 'secrets'
+
+    key = scfg.Value(
+        None,
+        position=1,
+        type=str,
+        help="Print only this variable's value; empty = all as export lines.",
+    )
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        env_path = data_root() / 'leasing' / 'compose' / '.env'
+        if not env_path.exists():
+            raise SystemExit(
+                f'no managed secrets at {env_path}; run an `acquire`/`serve` '
+                'with --backend compose first'
+            )
+        env = parse_env_file(env_path)
+        if config.key:
+            if config.key not in env:
+                raise SystemExit(f'{config.key!r} not found in {env_path}')
+            print(env[config.key])
+            return 0
+        for name, value in env.items():
+            print(f'export {name}={shlex.quote(value)}')
         return 0

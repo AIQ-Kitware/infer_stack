@@ -843,3 +843,37 @@ not just lists containers. Read-side operations should degrade to "unknown ->
 empty", never abort the write that would fix the very file they choke on. The
 generic shape: in a desired-state reconciler, observe() must never be able to
 prevent converge().
+
+## 2026-06-17 14:30:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. Two more yardrat
+findings + an ergonomics fix the user flagged.
+
+**F9 (FIXED):** vLLM v0.19.1 rejects `--disable-log-requests` (vllm_args emitted
+it unconditionally) -> vLLM crashed -> LiteLLM "Connection error". Dropped the
+flag (only the leasing + kubeai renderers used it; the legacy compose template
+never did; no test asserted it). Engine-version-specific flags belong in
+`extra_args`.
+
+**Ergonomics regression the user caught:** the leasing Compose backend had made
+the *user* invent + export `LITELLM_MASTER_KEY` (probe read os.environ;
+container got it via `${...}`). The legacy renderer instead *owned* the secret
+(ensure_secret -> .env) and you fetched it with `infer-stack env`. Restored:
+ComposeBackend.master_key() manages the key in the state dir's `.env` (reuse if
+pinned, else generate), bakes the *literal* into the LiteLLM service (so
+container + probe agree regardless of shell), uses it for the probe, and
+access() returns it; the env-file descriptor now carries `OPENAI_API_KEY` (+
+OPENAI_BASE_URL) so `source is.env` configures an OpenAI client outright; new
+`infer-stack secrets [KEY]` prints managed secrets. Baked the literal (not
+`${...}`) on purpose: the user had the var exported, and compose lets shell env
+override `.env`, which would desync container vs probe.
+
+**Wording:** user softened "never user-supplied" (a user *can* pin a key in
+`.env`; ensure_secret reuses it). Aligned the master_key() docstring + test-plan
+F2 to "managed: reused if pinned, else generated".
+
+208 tests pass; ruff clean.
+
+**Still TODO this turn:** verify `infer-stack config paths` and `infer-stack
+status` are correct/relevant post-refactor (maybe elevate `config paths` ->
+top-level `paths`). Doing that next.

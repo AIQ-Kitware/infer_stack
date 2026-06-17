@@ -29,7 +29,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +37,7 @@ import requests
 import yaml
 
 from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
+from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import vllm_args
 from .backend import Readiness
@@ -226,8 +226,19 @@ def _litellm_model_list(
 
 
 def _litellm_service(
-    service_names: list[str], host_port: int, images: dict[str, str], aux_dir: str
+    service_names: list[str],
+    host_port: int,
+    images: dict[str, str],
+    aux_dir: str,
+    master_key: str | None = None,
 ) -> dict[str, Any]:
+    # Bake the managed key in literally (not ${...}) so the container and the
+    # readiness probe always agree regardless of the caller's shell env.
+    key_value = (
+        master_key
+        if master_key is not None
+        else '${' + API_KEY_ENV + ':-sk-local}'
+    )
     return {
         'image': images['litellm'],
         'command': [
@@ -238,7 +249,7 @@ def _litellm_service(
         ],
         'ports': [f'{host_port}:{LITELLM_CONTAINER_PORT}'],
         'volumes': [f'{aux_dir}/{LITELLM_CONFIG_FILENAME}:/etc/litellm/config.yaml:ro'],
-        'environment': {f'{API_KEY_ENV}': '${' + API_KEY_ENV + ':-sk-local}'},
+        'environment': {API_KEY_ENV: key_value},
         'depends_on': sorted(service_names),
         'restart': 'unless-stopped',
         'labels': {ENGINE_LABEL: 'litellm'},
@@ -254,6 +265,7 @@ def render_compose(
     state: dict[str, str],
     litellm: bool = False,
     litellm_port: int = 14042,
+    litellm_master_key: str | None = None,
     aux_dir: str | Path | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed groups.
@@ -298,7 +310,11 @@ def render_compose(
             sort_keys=False,
         )
         services[LITELLM_SERVICE] = _litellm_service(
-            list(service_map), litellm_port, images, str(aux_dir or '.')
+            list(service_map),
+            litellm_port,
+            images,
+            str(aux_dir or '.'),
+            master_key=litellm_master_key,
         )
     return RenderedCompose(
         compose={'services': services},
@@ -397,6 +413,25 @@ class ComposeBackend:
     def litellm_port(self) -> int:
         return self.ports.get('litellm', DEFAULT_PORTS['litellm'])
 
+    @property
+    def _env_path(self) -> Path:
+        return self.state_dir / '.env'
+
+    def master_key(self) -> str:
+        """The managed LiteLLM master key.
+
+        infer-stack manages this secret in the state dir's ``.env``: reused if
+        already present (you may pin your own ``sk-`` key there), otherwise
+        generated and persisted. The caller doesn't need to invent or export it
+        — it is baked into the LiteLLM service, used by the readiness probe, and
+        shipped in the env-file descriptor (``infer-stack secrets`` prints it).
+        """
+        existing = parse_env_file(self._env_path)
+        key = ensure_secret(existing, API_KEY_ENV, prefix='sk-')
+        if key != existing.get(API_KEY_ENV):
+            write_env_file(self._env_path, {API_KEY_ENV: key})
+        return key
+
     def _load_sidecar(self) -> dict[str, Any]:
         if self._state_file.exists():
             return json.loads(self._state_file.read_text())
@@ -451,6 +486,7 @@ class ComposeBackend:
                 state=self.state,
                 litellm=self.litellm,
                 litellm_port=self.litellm_port,
+                litellm_master_key=self.master_key() if self.litellm else None,
                 aux_dir=self.state_dir,
             )
             if rendered.litellm_config is not None:
@@ -494,6 +530,7 @@ class ComposeBackend:
         return {
             'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
             'api_key_env': API_KEY_ENV,
+            'api_key': self.master_key(),
             'request_names': {ep: ep for ep in endpoints},
         }
 
@@ -540,8 +577,7 @@ class ComposeBackend:
             if error:
                 return Readiness(False, error)
             require_generation = True  # warm the tag so it is resident
-        key = os.environ.get(API_KEY_ENV)
-        headers = {'Authorization': f'Bearer {key}'} if key else {}
+        headers = {'Authorization': f'Bearer {self.master_key()}'}
         ok, reason = openai_ready(
             base_url=f'http://127.0.0.1:{self.litellm_port}/v1',
             headers=headers,

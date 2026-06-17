@@ -23,6 +23,10 @@ Two hardware facts shape the whole plan:
 Newest first. `FIXED` = patched on the branch; `OPEN` = still to address;
 `CONFIRM` = expected, verify on hardware.
 
+- **F9 — vLLM rejects `--disable-log-requests`. FIXED.** `vllm_args` appended it
+  unconditionally; vLLM v0.19.1 removed it (`unrecognized arguments`), so vLLM
+  crashed and LiteLLM reported `Connection error … Model Group=qwen-small`.
+  Dropped the flag (put engine-version-specific flags in `extra_args` if needed).
 - **F8 — a stale/invalid compose file bricked `acquire`. FIXED.**
   `reconcile` calls `observe()` (which runs `docker compose ps`, validating the
   on-disk file) *before* `converge()` rewrites it. A stale file from an earlier
@@ -40,10 +44,13 @@ Newest first. `FIXED` = patched on the branch; `OPEN` = still to address;
   `services.*.deploy.resources.reservations.devices.0.capabilities.0 must be a
   string`. `_gpu_reservation` emitted a list-of-lists; Compose wants a list of
   strings (`capabilities: [gpu]`). Fixed in `leasing/compose.py` + test.
-- **F2 — LiteLLM auth: the probe must send the master key. CONFIRM/SETUP.**
-  `probe_ready` sends `Authorization: Bearer $LITELLM_MASTER_KEY` from the host
-  env; the container reads the same var via Compose interpolation. Export it
-  before `acquire` or readiness 401s forever.
+- **F2 — LiteLLM auth: no manual key needed. FIXED.** infer-stack manages
+  `LITELLM_MASTER_KEY` in the compose state dir's `.env` (generated, or reused
+  if you pin your own `sk-` key there), bakes it into the LiteLLM service, uses
+  it for the probe, and ships it in the `--env-file` as `OPENAI_API_KEY`. So
+  `source` the env-file and your OpenAI client is fully configured — no `export
+  LITELLM_MASTER_KEY`. Fetch it ad-hoc with
+  `$(infer-stack secrets LITELLM_MASTER_KEY)`.
 - **F3 — vLLM false-ready without `--require-generation`. CONFIRM.**
   Default readiness is "alias listed by LiteLLM", true before vLLM finishes
   loading. Use `--require-generation` for honest readiness.
@@ -131,8 +138,8 @@ containers (null backend).
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test          # F2: needed by container AND probe
 export CAT=~/infer-stack-test/catalog.yaml
+# infer-stack manages LITELLM_MASTER_KEY for you — no export needed.
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" \
   --require-generation --env-file /tmp/is.env --timeout 1200
 ```
@@ -145,10 +152,9 @@ docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=80 | tail -
 ```
 On success, verify serving + descriptor, then release:
 ```bash
-export LITELLM_MASTER_KEY=sk-local-test
-set -a; . /tmp/is.env; set +a
-curl -s "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $LITELLM_MASTER_KEY" | python -m json.tool
-curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+set -a; . /tmp/is.env; set +a       # exports OPENAI_BASE_URL + OPENAI_API_KEY
+curl -s "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $OPENAI_API_KEY" | python -m json.tool
+curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{"model":"qwen-small","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
 infer-stack release --env-file /tmp/is.env
 ```
@@ -163,7 +169,6 @@ since `--require-generation`), F4 (dtype crash in vLLM logs).
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner alice --require-generation --timeout 1200
@@ -184,7 +189,6 @@ infer-stack leases --json | python -c 'import json,sys; [print(l["id"]) for l in
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner a --require-generation --timeout 1200
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner b --dedicated --require-generation --timeout 300
@@ -200,7 +204,6 @@ placement error, no container) so its acquire times out. Confirm via `leases`
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --ttl 90s --require-generation --env-file /tmp/is.env --timeout 1200
 sleep 100
@@ -215,10 +218,9 @@ TTL expiry.
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack run --endpoint qwen-small --backend compose --catalog "$CAT" --require-generation -- \
-  bash -c 'curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  bash -c 'curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
     -d "{\"model\":\"$INFER_STACK_ENDPOINT_QWEN_SMALL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}"'
 echo "exit=$?"
 infer-stack leases            # the run lease should be released
@@ -232,13 +234,12 @@ infer-stack run --endpoint qwen-small --backend compose --catalog "$CAT" -- bash
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-ollama --backend compose --catalog "$CAT" --require-generation --timeout 900 --env-file /tmp/o.env
 docker compose -p infer-stack -f "$C/docker-compose.yml" logs --tail=80 | grep -i pull   # expect "ollama pull qwen2.5:0.5b"
 set -a; . /tmp/o.env; set +a
-curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+curl -s "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{"model":"qwen-ollama","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
 infer-stack release --env-file /tmp/o.env
 ```
@@ -249,7 +250,6 @@ infer-stack release --env-file /tmp/o.env
 
 ```bash
 export INFER_STACK_DATA_DIR=~/infer-stack-test/data
-export LITELLM_MASTER_KEY=sk-local-test
 export CAT=~/infer-stack-test/catalog.yaml
 ( infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner u1 --require-generation --timeout 1200 ) &
 ( infer-stack acquire qwen-dup   --backend compose --catalog "$CAT" --owner u2 --require-generation --timeout 1200 ) &

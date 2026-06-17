@@ -308,8 +308,45 @@ def test_access_reports_litellm_base_url(tmp_path):
     info = be.access(['qwen-coder', 'reranker'])
     assert info['base_url'] == 'http://127.0.0.1:14042/v1'
     assert info['api_key_env'] == 'LITELLM_MASTER_KEY'
+    assert info['api_key'].startswith('sk-')      # infer-stack manages the key
     assert info['request_names'] == {'qwen-coder': 'qwen-coder',
                                      'reranker': 'reranker'}
+
+
+def test_master_key_managed_stable_and_persisted(tmp_path):
+    be = make_backend(tmp_path)
+    k1 = be.master_key()
+    assert k1.startswith('sk-')
+    assert be.master_key() == k1                  # reused, not regenerated
+    # a fresh backend over the same state dir recovers the same key
+    assert make_backend(tmp_path).master_key() == k1
+
+
+def test_converge_bakes_master_key_into_litellm(tmp_path):
+    be = make_backend(tmp_path)
+    be.converge([vllm('a')])
+    compose = yaml.safe_load(be.compose_file.read_text())
+    baked = compose['services']['litellm']['environment']['LITELLM_MASTER_KEY']
+    assert baked == be.master_key() and baked.startswith('sk-')
+
+
+def test_envfile_carries_managed_api_key(tmp_path):
+    from infer_stack.leasing.envfile import build_descriptor, render_env_file
+    from infer_stack.leasing.models import Lease
+
+    be = make_backend(tmp_path)
+    info = be.access(['qwen-coder'])
+    lease = Lease('sess-x', 'me', 'active', 0.0, None, None, 0.0,
+                  endpoints=['qwen-coder'])
+    g = DeploymentGroup('g', 'ck', 'vllm', 'shared-compatible', {}, {},
+                        {'qwen-coder': {'served_model_name': 'qwen-coder'}},
+                        GroupState.LIVE, 0.0, 0.0)
+    d = build_descriptor(lease, [g], base_url=info['base_url'],
+                         api_key_env=info['api_key_env'], api_key=info['api_key'],
+                         request_names=info['request_names'])
+    env = render_env_file(d)
+    assert 'OPENAI_API_KEY=sk-' in env            # source-and-go: key is in the env-file
+    assert f"OPENAI_BASE_URL={info['base_url']}" in env
 
 
 def test_access_none_without_litellm(tmp_path):

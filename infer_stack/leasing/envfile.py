@@ -43,6 +43,7 @@ def build_descriptor(
     *,
     base_url: str,
     api_key_env: str = 'LITELLM_MASTER_KEY',
+    api_key: str | None = None,
     request_names: dict[str, str] | None = None,
     cuda_visible_devices: str | None = None,
 ) -> dict[str, Any]:
@@ -73,6 +74,8 @@ def build_descriptor(
         'endpoints': ordered,
         'models': list(ordered.values()),
     }
+    if api_key:
+        descriptor['api_key'] = api_key
     if cuda_visible_devices is not None:
         descriptor['cuda_visible_devices'] = cuda_visible_devices
     return descriptor
@@ -83,6 +86,10 @@ def descriptor_env(descriptor: dict[str, Any]) -> dict[str, str]:
     env: dict[str, str] = {SESSION_ENV: descriptor['session_id']}
     if descriptor.get('base_url'):
         env['OPENAI_BASE_URL'] = descriptor['base_url']
+    if descriptor.get('api_key'):
+        # The actual key, so `source <env-file>` configures an OpenAI client
+        # outright (OPENAI_BASE_URL + OPENAI_API_KEY) — no manual export.
+        env['OPENAI_API_KEY'] = descriptor['api_key']
     if descriptor.get('api_key_env'):
         env['INFER_STACK_API_KEY_ENV'] = descriptor['api_key_env']
     for endpoint, model in descriptor.get('endpoints', {}).items():

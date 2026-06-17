@@ -85,6 +85,7 @@ from .commands_leasing import (
     ReleaseCLI,
     RenewCLI,
     RunCLI,
+    SecretsCLI,
     ServeCLI,
 )
 from .commands_meta import (
@@ -184,6 +185,7 @@ class ManageCLI(scfg.ModalCLI):
     run = RunCLI
     serve = ServeCLI
     leases = LeasesCLI
+    secrets = SecretsCLI
 
     # Compose day-2-ops wrappers
     logs = LogsCLI
