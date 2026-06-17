@@ -85,6 +85,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* Display-attached GPUs are now usable on demand. The placer still skips them by
+  default (so a workstation's monitor GPU is left alone), but the leasing verbs
+  gained `--include-display-gpus`, wired to the Compose backend's `skip_display`,
+  so a host whose only spare GPU happens to drive a display can place models on
+  it (and spread distinct models across every GPU). Demoed by the `45_both_gpus`
+  e2e tier; see `dev/leasing-demo.md` and `dev/e2e_tests/`.
 * `vllm_args` no longer emits `--disable-log-requests`, which vLLM v0.19.1
   rejects (`unrecognized arguments`) — it crashed vLLM, surfacing as a LiteLLM
   "Connection error". Engine-version-specific flags can go in `extra_args`.

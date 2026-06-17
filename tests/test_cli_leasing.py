@@ -169,3 +169,33 @@ def test_missing_catalog_errors(env):
             argv=['qwen-coder', '--ledger', env.db, '--catalog',
                   str(env.tmp / 'nope.yaml')]
         )
+
+
+def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
+    """--include-display-gpus must flip the compose backend's skip_display."""
+    import infer_stack.cli.commands_leasing as mod
+
+    seen = {}
+
+    class FakeCompose:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    import infer_stack.hardware as hw
+
+    monkeypatch.setattr(mod, 'ComposeBackend', FakeCompose)
+    # _make_backend does `from ..hardware import detect_inventory` lazily.
+    monkeypatch.setattr(hw, 'detect_inventory', lambda: {})
+
+    cfg = AcquireCLI.cli(
+        argv=['qwen-coder', '--backend', 'compose', '--include-display-gpus'],
+        strict=False,
+    )
+    mod._make_backend(cfg)
+    assert seen['skip_display'] is False
+
+    seen.clear()
+    cfg = AcquireCLI.cli(argv=['qwen-coder', '--backend', 'compose'],
+                         strict=False)
+    mod._make_backend(cfg)
+    assert seen['skip_display'] is True

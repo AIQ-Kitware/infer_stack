@@ -972,3 +972,60 @@ Takeaways: (1) a runbook and a harness are different artifacts — the runbook i
 for a human debugging, the harness is for "run it, rsync the verdict"; keep both,
 cross-link them. (2) Put the report emitter and assembler in one stdlib python
 file the bash DSL shells out to — bash stays declarative, JSON stays correct.
+
+## 2026-06-17 16:10 -0400
+
+Model: claude-opus-4-8 (Claude Code, 1M context).
+
+User intent (mid GPU e2e run, no errors through step 50): two follow-ups —
+(1) an e2e test that exercises BOTH GPUs, and (2) a companion to
+leasing-test-plan.md that is demo-minded (not test-minded): a real-world
+walkthrough on yardrat that does a real `setup` of the user config + the real
+docker-mounted storage location, then deploys a big model behind Open WebUI.
+Copy-pastable, no cross-block env deps, and "set up the important stuff once so
+the commands are concise — if they aren't, that's a design smell to consider."
+
+What I did:
+- Closed F5 (was OPEN). The placer's `skip_display` had no CLI knob, so GPU 1
+  (display-attached) was unreachable and "both GPUs" was impossible. Added a
+  `_DisplayGpuMixin` (`--include-display-gpus`, alias `--include-display-gpus`)
+  to the leasing common flags and wired `_make_backend` to pass
+  `skip_display=not include_display_gpus`. Unit-tested the wiring by stubbing
+  ComposeBackend + hardware.detect_inventory (213 passed, was 212). Updated the
+  test-plan F5 entry to FIXED and CHANGELOG Fixed.
+- Added e2e tier `45_both_gpus`: acquires two distinct models with
+  `--include-display-gpus`, then asserts the backend sidecar
+  (`leasing-compose-state.json`) placed them on two DISTINCT gpus (`[0, 1]`) and
+  that both answer through the one gateway. Reads the sidecar rather than
+  nvidia-smi because the assignment is the thing under test and it's
+  deterministic.
+- Wrote `dev/leasing-demo.md`: §1 one-time setup (persist INFER_STACK_DATA_DIR
+  in ~/.bashrc as the storage knob + catalog at the default config root so
+  serve/acquire need no --catalog), §2 `serve` a 14B model (ungated, fp16/Turing,
+  fits the 48 GiB GPU 0), §3 talk to the stable LiteLLM front door using
+  `$(infer-stack secrets …)`, §4 a hand-run Open WebUI container pointed at the
+  gateway via host.docker.internal with persistent history under the data dir,
+  §5 switch models around (the stated point of the tool), §6 teardown.
+
+State of mind / the smell audit: the user explicitly asked me to treat clunky
+steps as design smells, so the demo ends with five, ranked: (1) `--backend
+compose` repeated on every call (no persisted default backend), (2) storage
+location is env/flag-only for leasing — legacy `setup` baked state paths into
+config.yaml but the leasing Compose backend reads data_root() directly, so the
+durable user config can't express "where my weights live"; that's why §1a writes
+~/.bashrc, (3) no endpoint-addressed teardown for standing `serve` leases (must
+copy a session id), (4) Open WebUI is unmanaged in the leasing model (legacy
+rendered it), (5) HF_TOKEN has no managed slot next to LITELLM_MASTER_KEY. I
+believe 1–3 are the cheap, high-value wins and said so. I did NOT implement them
+this turn — the ask was to "see first," and they're design changes worth a
+decision, not reflexes.
+
+Uncertainty: the demo's GPU/Open WebUI blocks are written to verified
+paths/ports/verbs but have not been run on hardware (yardrat run pending);
+the 14B first-serve downloads ~28 GiB so the §2 timeout is 3600s. Confident in
+the F5 wiring (unit-tested) and that 45_both_gpus skips cleanly off-GPU
+(exit, not return — last turn's bug).
+
+Takeaway: when a walkthrough forces you to repeat a flag or hand-run a step the
+tool "should" own, that repetition is the spec for the next ergonomic feature —
+write the demo first, let it surface the smell, then decide.

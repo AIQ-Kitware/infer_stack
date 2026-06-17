@@ -67,9 +67,11 @@ Newest first. `FIXED` = patched on the branch; `OPEN` = still to address;
   Default readiness is "alias listed by LiteLLM", true before vLLM finishes
   loading. Use `--require-generation` for honest readiness.
 - **F4 — Turing dtype. CONFIRM.** Needs `extra_args: ['--dtype=half']`.
-- **F5 — Display GPU unusable, no override knob. OPEN.** Only GPU 0 is
-  placeable; 2-distinct-model / dedicated tests fail placement. Needs a
-  `--include-display-gpus` / `skip_display` CLI flag (not yet added).
+- **F5 — Display GPU unusable, no override knob. FIXED.** The placer skips
+  display-attached GPUs by default (keeps a desktop responsive). Added
+  `--include-display-gpus` to the leasing verbs, wired to the Compose backend's
+  `skip_display`. With it, GPU 1 (the display GPU) is placeable, so two distinct
+  models spread across both GPUs. Exercised by e2e tier `45_both_gpus`.
 - **F6 — No first-class dtype / protocol / image knobs. OPEN.** dtype only via
   `extra_args`; readiness probe is always `protocol=chat` (completions-only
   models fail it); images pinned in `config.py` with no leasing-CLI override.

@@ -42,8 +42,9 @@ placer — that's finding F5, which test `60_dedicated_f5` deliberately probes).
 | `20_ergonomics` | no | `paths`, `config paths leasing`, `status`, `secrets`, day-2 fallback |
 | `30_negative` | no | unknown endpoint / kubeai / missing catalog fail *friendly* (no traceback) |
 | `40_single_vllm` | yes | acquire a vLLM model, real chat completion, day-2 `ps`, release |
+| `45_both_gpus` | yes | `--include-display-gpus` spreads two models across GPU 0 + GPU 1 |
 | `50_coalescing` | yes | two leases on one model → one group (demand 2), one container |
-| `60_dedicated_f5` | yes | dedicated 2nd group can't place on a 1-GPU box (F5) |
+| `60_dedicated_f5` | yes | a dedicated group needs its own GPU; placement on a busy box |
 | `70_ttl_reclaim` | yes | short TTL expires; reclaim:stop group reclaimed |
 | `80_run_wrapper` | yes | `run -- <cmd>` injects env, releases on exit, propagates exit code |
 | `85_ollama` | yes | ollama daemon lazy pull/warmup + chat through the gateway |

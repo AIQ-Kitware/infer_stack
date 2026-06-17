@@ -46,7 +46,7 @@ from ..leasing.envfile import (
 )
 from ..paths import config_root, data_root
 from .context import _apply_path_overrides
-from .options import _AllowedGpusMixin, _PathOverridesMixin
+from .options import _AllowedGpusMixin, _DisplayGpuMixin, _PathOverridesMixin
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -106,6 +106,9 @@ def _make_backend(config):
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
+            skip_display=not bool(
+                getattr(config, 'include_display_gpus', False)
+            ),
             require_generation=bool(getattr(config, 'require_generation', False)),
         )
     raise SystemExit(
@@ -235,7 +238,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin):
+class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
     backend = scfg.Value(
         'null',
         choices=['null', 'compose', 'kubeai'],

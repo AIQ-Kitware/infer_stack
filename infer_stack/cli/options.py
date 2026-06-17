@@ -103,6 +103,20 @@ class _AllowedGpusMixin(scfg.DataConfig):
     )
 
 
+class _DisplayGpuMixin(scfg.DataConfig):
+    include_display_gpus = scfg.Value(
+        False,
+        isflag=True,
+        alias=['include-display-gpus'],
+        help=(
+            'Allow placement onto display-attached GPUs. By default the '
+            'placer skips any GPU driving a display (so a desktop stays '
+            'responsive). Set this to use every GPU on a workstation whose '
+            'spare GPU happens to have a monitor plugged in.'
+        ),
+    )
+
+
 class _PlanOverridesCLI(
     _PathOverridesMixin,
     _ProfileOverrideMixin,
