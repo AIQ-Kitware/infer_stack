@@ -761,3 +761,41 @@ leasing/CLI + 7 xdoctests green.
 
 **Next:** consumer integration — wrap eval_audit's MaterializeHelmRunNode command
 with `infer-stack run`, and switch aiq-eval-runner Incubilate to acquire/release.
+
+## 2026-06-17 12:20:00 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code. User started
+testing the Compose backend on real hardware (yardrat: 2 GPUs — RTX 8000 free,
+RTX 5000 display-attached; both Turing/sm_75, fp16-only).
+
+**First real-hardware bug (F1), FIXED:** `docker compose up` rejected the
+rendered file — `_gpu_reservation` emitted `capabilities: [['gpu']]` but the
+Compose schema wants a list of *strings* (`capabilities: ['gpu']`). My nested
+list was a python-on-whales-ism. Fixed + locked with a test asserting
+`devs['capabilities'] == ['gpu']`. This is exactly the class of bug the unit
+tests couldn't catch (they asserted device_ids, never the capabilities shape,
+and no real `docker compose config` validation runs offline).
+
+**Wrote `dev/leasing-test-plan.md`** — a living runbook: setup, 9 staged test
+blocks (each self-contained, re-exporting its own env so blocks don't depend on
+each other), a findings/fixes log, debug-capture, and cleanup. Tailored to
+yardrat: Turing `--dtype=half` in every vLLM endpoint, tiny ungated chat models,
+and explicit calls-out of the predicted issues.
+
+**Predicted issues now documented as findings to confirm/fix:**
+- F2 (setup): the readiness probe must send `LITELLM_MASTER_KEY`; export it or
+  readiness 401s. The container reads the same var via Compose interpolation.
+- F3: vLLM without `--require-generation` is false-ready (alias listed before
+  vLLM loads; `depends_on` doesn't gate on health).
+- F5 (OPEN): display-active GPU 1 is skipped and there's no CLI knob to include
+  it; `--allowed-gpus` filters after the skip. Blocks 2-distinct-model tests.
+- F6 (OPEN): no first-class dtype/protocol/image knobs — dtype via extra_args,
+  readiness always chat (completions-only models fail), images pinned in config.
+
+**Reflection:** the offline seam tests (FakeDocker) gave false confidence on the
+rendered artifact's *schema* — they checked the dict we built, not whether
+docker accepts it. A cheap guard would be a test that runs `docker compose -f
+<rendered> config -q` when docker is available (skip otherwise). Worth adding.
+
+**Next:** keep fixing what yardrat surfaces (likely F2/F3 ergonomics next, maybe
+the F5 skip_display knob so both GPUs are testable), updating the findings log.

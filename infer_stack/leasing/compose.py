@@ -79,7 +79,7 @@ def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
                     {
                         'driver': 'nvidia',
                         'device_ids': [str(i) for i in indices],
-                        'capabilities': [['gpu']],
+                        'capabilities': ['gpu'],
                     }
                 ]
             }

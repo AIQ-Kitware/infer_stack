@@ -130,6 +130,8 @@ def test_render_vllm_service():
     assert svc['ports'] == ['18000:8000']
     devs = svc['deploy']['resources']['reservations']['devices'][0]
     assert devs['device_ids'] == ['0', '1']
+    # Compose schema: capabilities is a list of *strings* (not [["gpu"]]).
+    assert devs['capabilities'] == ['gpu']
     assert svc['labels']['infer-stack.group'] == 'grp-a'
     assert rc.services == {'vllm-grp-a': 'grp-a'}
 

@@ -63,6 +63,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   through the front door to warm it before reporting ready. A `--require-generation`
   flag opts vLLM readiness into the same real-generation check.
 
+### Fixed
+* Compose GPU reservation emitted `capabilities: [["gpu"]]` (list-of-lists),
+  which `docker compose` rejects ("capabilities.0 must be a string"); now emits
+  `capabilities: ["gpu"]`. Found while testing the Compose backend on real
+  2-GPU hardware (see `dev/leasing-test-plan.md`).
+
 ### Changed
 * Consolidate shared machinery so the legacy and leasing code paths reuse one
   implementation instead of duplicating it:
