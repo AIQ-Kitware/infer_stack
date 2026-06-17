@@ -9,6 +9,11 @@ Every test block is self-contained: it re-exports the env it needs, so blocks do
 not depend on each other (only on the one-time **Setup** that writes
 `catalog.yaml`). Copy-paste a whole block.
 
+> **Prefer the executable harness.** `dev/e2e_tests/` runs these same scenarios,
+> asserts the wiring, and writes one `report.md` (+ logs + rendered artifacts)
+> you can `rsync` back: `cd dev/e2e_tests && ./run.sh --gpu`. This runbook stays
+> as the hand-driven / debugging reference.
+
 Two hardware facts shape the whole plan:
 - GPU 1 has the display, and the placer skips display-active GPUs by default, so
   **only GPU 0 is usable** unless that's overridden. `--allowed-gpus` filters

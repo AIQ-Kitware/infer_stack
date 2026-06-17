@@ -1,0 +1,35 @@
+# Catalog for the leasing e2e harness, tailored to yardrat:
+#   GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1 Quadro RTX 5000 (16 GiB,
+#   display-attached -> skipped by the placer). Both Turing (sm_75): fp16 only,
+#   no bf16/FP8, so every vLLM endpoint pins `--dtype=half`.
+# Tiny ungated chat models so `acquire` timeouts reflect logic, not 10GB pulls.
+models:
+  qwen05b: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}
+  qwen15b: {source: hf://Qwen/Qwen2.5-1.5B-Instruct}
+endpoints:
+  qwen-small:
+    engine: vllm
+    model: qwen05b
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    reclaim: {policy: stop}
+  qwen-dup:                       # same model+runtime, aliased to qwen-small -> must coalesce
+    engine: vllm
+    model: qwen05b
+    public_name: qwen-small
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+  qwen-15b:                       # 2nd distinct model -> exercises the display-GPU limit (F5)
+    engine: vllm
+    model: qwen15b
+    runtime: {max_model_len: 8192, gpu_memory_utilization: 0.3, extra_args: ['--dtype=half']}
+    reclaim: {policy: keep-warm}
+  qwen-ollama:
+    engine: ollama
+    host: local-ollama
+    model: qwen2.5:0.5b
+runtime_hosts:
+  local-ollama:
+    engine: ollama
+    placement: {gpu_indices: [0]}
+    settings: {keep_alive: 5m}
+bundles:
+  pair: [qwen-small, qwen-15b]

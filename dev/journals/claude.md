@@ -919,3 +919,56 @@ separate fix if needed).
 has no leasing file -> unchanged. A user who once leased keeps the (possibly
 empty) leasing compose file, so their day-2 ops point at the leasing project —
 acceptable given leasing is the model; documented in the wrapper docstring.
+
+## 2026-06-17 14:35 -0400
+
+Model: claude-opus-4-8 (Claude Code, 1M context).
+
+User intent: "I thought we had an e2e test in dev — write a set of e2e tests
+under `dev/e2e_tests` (a developer test, not a polished unit test) that
+exercises the new leasing tools, so I can rsync back a report and you can check
+everything is wired up correctly, efficiently, and ergonomically."
+
+What I found: there was no executable e2e test — only `dev/leasing-test-plan.md`,
+a copy-paste runbook. The gap was real.
+
+What I built: `dev/e2e_tests/` — a self-contained bash harness.
+- `lib.sh`: a step/assert DSL (`step` / `run` / `expect_rc|out|re|file*` /
+  `count_out` / `note` / `skip` / `end_step`). Every step appends one JSON
+  record (id, title, verdict, duration, per-assertion results, log path) to
+  `results.jsonl`; the harness never uses `set -e` so one report covers the
+  whole run.
+- `render_report.py` (stdlib only): doubles as the per-step JSON emitter (so the
+  bash side never hand-rolls JSON) and the final assembler — `report.md` with a
+  pass/fail/skip summary, a Correctness/Efficiency/Ergonomics "wiring axes"
+  rollup, failures-first (with log tails), a full per-section table, and the
+  environment capture.
+- `catalog.yaml`: committed (not heredoc'd — that bit us before with editor
+  merges mangling the runbook's `cat <<YAML`). Validated via `Catalog.load` +
+  `resolve_names` (bundle + dup both resolve).
+- `tests/*.sh`: tiered. Non-serving (no `--gpu`): environment, dry-run
+  (acquire→leases→env-file→release→bundle on the null backend), ergonomics
+  (paths/secrets/status/day-2 fallback), negatives (friendly, no traceback).
+  Serving (`--gpu`): single-vllm + real chat, coalescing (one container,
+  demand 2), dedicated/F5, TTL+reclaim, run-wrapper (env inject + exit-code),
+  ollama pull/warmup, concurrency (compose stays schema-valid). `99_cleanup`
+  always runs (downs the project) so a run never leaks containers.
+- `run.sh`: fresh `INFER_STACK_DATA_DIR` per run inside the results dir (so the
+  ledger + rendered compose/litellm/.env travel with the report), `--only`,
+  `--keep-running`, prints the exact `rsync` line.
+
+State of mind / confidence: smoke-ran the non-serving tiers locally against the
+real null backend via the project venv — 16/16 pass, report + JSONL + skip
+records all valid. Confident in the harness mechanics and the dry-run/ergonomics
+assertions (they ran for real). The `--gpu` assertions are written against the
+documented CLI/JSON shapes and the runbook's verified behavior but have NOT been
+executed on hardware yet — that's the point: yardrat runs them and rsyncs the
+report back. Risks: a couple of GPU steps assert on substrings (`"demand": 2`,
+`"ready": true`, `vllm`/`litellm` in `ps`) that depend on exact CLI output; if
+those drift the report will show a clean FAIL with the log tail, which is the
+intended feedback loop, not a silent miss.
+
+Takeaways: (1) a runbook and a harness are different artifacts — the runbook is
+for a human debugging, the harness is for "run it, rsync the verdict"; keep both,
+cross-link them. (2) Put the report emitter and assembler in one stdlib python
+file the bash DSL shells out to — bash stays declarative, JSON stays correct.
