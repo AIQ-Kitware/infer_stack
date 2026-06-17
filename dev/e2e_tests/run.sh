@@ -106,6 +106,60 @@ PY
     echo; echo '== mem/disk =='; free -g 2>/dev/null; df -h "$DATA_DIR" 2>/dev/null
 } > "$RESULTS/environment.txt" 2>&1
 
+# ---- finish handler (runs on normal exit AND on Ctrl-C) ---------------------
+# The data dir lives inside the results dir, so it also holds the multi-GB HF
+# weight cache + compiled kernel caches. Those must NOT be rsync'd back — only
+# the report, logs, and the small leasing artifacts (ledger, compose, litellm
+# config, .env). These excludes drop the heavy dirs; leasing/ is kept.
+RSYNC_EXCLUDES=(
+    "--exclude=.scratch/"
+    "--exclude=infer-stack-data/*-cache/"     # hf-cache, vllm-cache, torch/triton/cuda
+    "--exclude=infer-stack-data/ollama/"
+    "--exclude=infer-stack-data/open-webui/"
+    "--exclude=infer-stack-data/postgres-*/"
+    "--exclude=infer-stack-data/runtime/"
+)
+
+_finished=0
+finish() {
+    [ "$_finished" = 1 ] && return
+    _finished=1
+    echo
+    python3 "$E2E_ROOT/render_report.py" --assemble --results "$RESULTS" \
+        2>/dev/null || echo '(report assembly failed; results.jsonl + logs/ still usable)'
+
+    local exc=''
+    for e in "${RSYNC_EXCLUDES[@]}"; do exc+=" $e"; done
+    local rsync_line="rsync -av${exc} '$HOST:$RESULTS/' './e2e-report-$TS/'"
+    # Drop a ready-to-read pull command next to the report.
+    { echo '#!/usr/bin/env bash'
+      echo '# Pull this report back (excludes the heavy weight/kernel caches).'
+      echo "$rsync_line"
+    } > "$RESULTS/rsync-back.sh" 2>/dev/null || true
+
+    local summary
+    summary="$(python3 -c "
+import json
+recs=[json.loads(l) for l in open('$RESULTS/results.jsonl') if l.strip()]
+recs=[r for r in recs if r.get('kind')=='step']
+p=sum(r['verdict']=='pass' for r in recs)
+f=sum(r['verdict']=='fail' for r in recs)
+s=sum(r['verdict']=='skip' for r in recs)
+print(f'{p} passed, {f} failed, {s} skipped')
+" 2>/dev/null || echo 'run incomplete')"
+
+    echo
+    echo "================================================================"
+    echo "  $summary"
+    echo "  report:  $RESULTS/report.md"
+    echo
+    echo "  rsync back (excludes weight/kernel caches):"
+    echo "    $rsync_line"
+    echo "================================================================"
+}
+trap 'finish' EXIT
+trap 'echo; echo "[interrupted — assembling partial report]"; exit 130' INT TERM
+
 # ---- select + run test scripts ----------------------------------------------
 echo
 echo "infer-stack leasing e2e — $TIERS"
@@ -127,34 +181,6 @@ for f in "$E2E_ROOT"/tests/*.sh; do
     bash "$f"
 done
 
-# ---- assemble the report ----------------------------------------------------
-echo
-python3 "$E2E_ROOT/render_report.py" --assemble --results "$RESULTS"
-
-if [ "$KEEP_DATA" = 0 ] && [ "$GPU" = 0 ]; then
-    : # non-GPU run leaves only a tiny sqlite ledger; harmless, keep it for the report
-fi
-
-# ---- summary + rsync hint ---------------------------------------------------
-SUMMARY="$(python3 - "$RESULTS/results.jsonl" <<'PY'
-import json, sys
-recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-recs = [r for r in recs if r.get('kind') == 'step']
-p = sum(r['verdict'] == 'pass' for r in recs)
-f = sum(r['verdict'] == 'fail' for r in recs)
-s = sum(r['verdict'] == 'skip' for r in recs)
-print(f'{p} passed, {f} failed, {s} skipped')
-sys.exit(1 if f else 0)
-PY
-)"
-RC=$?
-
-echo
-echo "================================================================"
-echo "  $SUMMARY"
-echo "  report:  $RESULTS/report.md"
-echo
-echo "  rsync back with:"
-echo "    rsync -av $HOST:$RESULTS/ ./e2e-report-$TS/"
-echo "================================================================"
-exit $RC
+# Normal completion: the EXIT trap (finish) assembles the report, writes
+# rsync-back.sh, and prints the summary + cache-excluding rsync line.
+exit 0

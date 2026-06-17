@@ -23,7 +23,11 @@
 : "${E2E_SECTION:=misc}"
 
 E2E_LOGDIR="$E2E_RESULTS/logs"
-mkdir -p "$E2E_LOGDIR"
+# Transient per-step files (captured stdout, assertion/note tallies) live in a
+# scratch dir, NOT in logs/, so the rsync'd report's logs/ holds only real
+# .log files. rsync excludes .scratch/ (see run.sh).
+E2E_SCRATCH="$E2E_RESULTS/.scratch"
+mkdir -p "$E2E_LOGDIR" "$E2E_SCRATCH"
 
 # ANSI colors (only when stdout is a tty)
 if [ -t 1 ]; then
@@ -43,9 +47,9 @@ step() {
     CUR_SKIP=''
     CUR_START="$(_now)"
     CUR_LOG="$E2E_LOGDIR/${E2E_SECTION}.${CUR_ID}.log"
-    LAST_OUT_FILE="$E2E_LOGDIR/.${E2E_SECTION}.${CUR_ID}.lastout"
-    CUR_ASSERT_FILE="$E2E_LOGDIR/.${E2E_SECTION}.${CUR_ID}.asserts"
-    CUR_NOTE_FILE="$E2E_LOGDIR/.${E2E_SECTION}.${CUR_ID}.notes"
+    LAST_OUT_FILE="$E2E_SCRATCH/${E2E_SECTION}.${CUR_ID}.lastout"
+    CUR_ASSERT_FILE="$E2E_SCRATCH/${E2E_SECTION}.${CUR_ID}.asserts"
+    CUR_NOTE_FILE="$E2E_SCRATCH/${E2E_SECTION}.${CUR_ID}.notes"
     : > "$CUR_LOG"; : > "$LAST_OUT_FILE"
     : > "$CUR_ASSERT_FILE"; : > "$CUR_NOTE_FILE"
     {
