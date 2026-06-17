@@ -11,7 +11,7 @@ if ! gpu_enabled; then
     skip single-vllm-day2-ps 'GPU serving disabled (run with --gpu)'
     skip single-vllm-secrets 'GPU serving disabled (run with --gpu)'
     skip single-vllm-release 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 ENVF="$E2E_RESULTS/single.env"

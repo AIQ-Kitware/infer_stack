@@ -5,7 +5,7 @@ source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
     skip ttl-expire 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 step ttl-expire 'a 60s TTL lease expires and its reclaim:stop group is reclaimed'

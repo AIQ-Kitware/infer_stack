@@ -7,7 +7,7 @@ source "$E2E_ROOT/lib.sh"
 if ! gpu_enabled; then
     skip concurrency-race 'GPU serving disabled (run with --gpu)'
     skip concurrency-compose-valid 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 step concurrency-race 'two concurrent acquires both land, demand is correct'

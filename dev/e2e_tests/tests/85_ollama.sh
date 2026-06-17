@@ -5,7 +5,7 @@ source "$E2E_ROOT/lib.sh"
 if ! gpu_enabled; then
     skip ollama-acquire 'GPU serving disabled (run with --gpu)'
     skip ollama-chat 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 ENVF="$E2E_RESULTS/ollama.env"

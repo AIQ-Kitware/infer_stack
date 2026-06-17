@@ -9,7 +9,7 @@ if ! gpu_enabled; then
     skip coalesce-demand 'GPU serving disabled (run with --gpu)'
     skip coalesce-one-container 'GPU serving disabled (run with --gpu)'
     skip coalesce-release 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 step coalesce-acquire 'two owners acquire the same underlying model'

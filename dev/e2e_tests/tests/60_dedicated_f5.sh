@@ -7,7 +7,7 @@ source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
     skip placement-dedicated 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 step placement-dedicated 'a 2nd dedicated group on a 1-GPU box cannot place (F5)'

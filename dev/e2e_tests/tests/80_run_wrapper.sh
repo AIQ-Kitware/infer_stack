@@ -6,7 +6,7 @@ source "$E2E_ROOT/lib.sh"
 if ! gpu_enabled; then
     skip run-injects-env 'GPU serving disabled (run with --gpu)'
     skip run-exit-code 'GPU serving disabled (run with --gpu)'
-    return 0
+    exit 0
 fi
 
 step run-injects-env 'run -- <cmd> sees a working OpenAI endpoint, then releases'
