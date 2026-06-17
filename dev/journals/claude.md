@@ -1086,3 +1086,43 @@ Takeaway: a bind-mounted config is not part of a container's compose identity �
 if a sidecar reads its config only at startup, give its service a content-hash
 label so converge restarts it when the content changes. Otherwise "I rewrote the
 file" silently diverges from "the running process sees the file".
+
+## 2026-06-17 17:25 -0400
+
+Model: claude-opus-4-8 (Claude Code, 1M context).
+
+User intent: GPU e2e run (git b030487, with the between-tier reset but before the
+speed commit) — 80_run_wrapper failed; asked me to look. Also asked earlier this
+session to make tiers faster (handled in 2abdd3d) and answered the keep-warm /
+group-id design questions.
+
+Bug found (real, product): `ComposeBackend.converge` always ran `docker compose
+up -d --remove-orphans`, but when the desired set is empty (release the last
+reclaim:stop lease → zero services rendered), `up` errors "no service selected"
+on a services-less file. So release's reconcile crashed; `infer-stack run`
+surfaced it as a non-zero exit even though the chat had already succeeded
+(80_run_wrapper run-injects-env got a valid completion, then died on release).
+
+Why it only showed now: my between-tier reset (b030487) isolated tiers, so for
+the first time a release actually converged to *empty*. Before, a leftover
+keep-warm group always kept ≥1 service and masked it. And only tier 80 catches
+it because `infer-stack run` propagates the release rc — the other tiers swallow
+release errors (`>/dev/null 2>&1; true`), so they passed while silently failing
+to tear down.
+
+Fix: converge tears the project `down` when there are no services, else `up`.
+`down` targets the project, so it works on the empty file and is idempotent. Unit
+test asserts converge([]) issues `down` and never `up`, and observe() is empty.
+215 passed (was 214). CHANGELOG updated.
+
+State of mind: this is the second latent bug the e2e harness surfaced only after
+state isolation (first was litellm-reload; both were masked by leftover state).
+Reinforces that the reset was the right call — it makes each tier a real
+clean-slate test. Confident in the fix; `down`-on-empty is standard compose.
+Remaining unrun-on-GPU after the user pulls (speed + this fix): 90_concurrency
+(was interrupted), and a full green pass. Group-id compat-key work still queued
+behind a green baseline.
+
+Takeaway: "up the union" converge has an edge at the empty union — the teardown
+path is not just "up with fewer services", it's a different verb. Test the
+convergence to zero, not just to N-1.

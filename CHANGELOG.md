@@ -85,6 +85,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* Converging to an empty desired set no longer crashes. Releasing the last
+  `reclaim:stop` lease leaves zero services to render, and `docker compose up -d`
+  errors with "no service selected" on a services-less file — so the release's
+  reconcile raised (and `infer-stack run` surfaced it as a non-zero exit even
+  though the job succeeded). Converge now tears the project `down` when there are
+  no services instead of `up`-ing an empty file. (Latent until deployments were
+  fully isolated; the GPU e2e `80_run_wrapper` tier caught it.)
 * LiteLLM now reloads when its routing config changes. The gateway reads its
   model_list once at startup from a bind-mounted file; converge rewrote that
   file but `docker compose up -d` left the old container running (its service

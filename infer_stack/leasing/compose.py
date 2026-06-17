@@ -519,7 +519,15 @@ class ComposeBackend:
             self._save_sidecar(
                 {'assignments': plan.assignments, 'services': rendered.services}
             )
-            self._compose(['up', '-d', '--remove-orphans'])
+            if rendered.compose.get('services'):
+                self._compose(['up', '-d', '--remove-orphans'])
+            else:
+                # Empty desired set (e.g. the last reclaim:stop lease was
+                # released): `docker compose up` errors with "no service
+                # selected" on a services-less file. Tear the project down
+                # instead — this is the clean "everything off" convergence.
+                # (`down` targets the project, so it works on the empty file.)
+                self._compose(['down', '--remove-orphans'])
         return plan
 
     def observe(self) -> set[str]:

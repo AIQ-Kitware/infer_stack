@@ -211,6 +211,24 @@ def test_converge_removes_dropped_group(tmp_path):
     assert be.observe() == {'a'}
 
 
+def test_converge_to_empty_tears_down_not_up(tmp_path):
+    """Releasing the last group must `down`, not `up` an empty compose file.
+
+    Regression: real `docker compose up -d` errors with "no service selected"
+    on a services-less file, so a release that emptied the desired set crashed
+    reconcile (and `infer-stack run` surfaced it as a non-zero exit).
+    """
+    be = make_backend(tmp_path)
+    be.converge([vllm('a', t=0)])
+    assert be.observe() == {'a'}
+    fake = be.run
+    fake.calls.clear()
+    be.converge([])                                   # last lease released
+    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
+    assert 'down' in verbs and 'up' not in verbs      # tore down, never `up`d
+    assert be.observe() == set()
+
+
 def test_observe_tolerates_unreadable_compose_file(tmp_path):
     # A stale/invalid file makes `docker compose ps` raise; observe must not
     # propagate it (else acquire bricks before converge can overwrite the file).
