@@ -472,13 +472,16 @@ class ConfigShowCLI(_PathOverridesMixin):
         import yaml
 
         from ..paths import load_settings, settings_path
+        from .commands_catalog import _print_yaml
 
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         settings = load_settings()
         print(f'# {settings_path()}')
-        print(yaml.safe_dump(settings, sort_keys=False) if settings
-              else '(no settings yet — `infer-stack config set …`)')
+        if settings:
+            _print_yaml(yaml.safe_dump(settings, sort_keys=False))
+        else:
+            print('(no settings yet — `infer-stack config set …`)')
         return 0
 
 

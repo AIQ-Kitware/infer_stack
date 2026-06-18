@@ -12,6 +12,7 @@ Grammar is noun-verb: ``catalog model add``, ``catalog endpoint rm``, etc.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,27 @@ from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
 
 SECTIONS = ('models', 'endpoints', 'runtime_hosts', 'bundles')
+
+
+def _print_yaml(text: str) -> None:
+    """Print YAML, syntax-highlighted when stdout is a terminal.
+
+    Falls back to a plain ``print`` when piped/redirected so downstream
+    parsers and tests get clean, color-free output.
+    """
+    if not sys.stdout.isatty():
+        print(text, end='')
+        return
+    try:
+        from rich.console import Console
+        from rich.syntax import Syntax
+    except ImportError:
+        print(text, end='')
+        return
+    syntax = Syntax(
+        text.rstrip('\n'), 'yaml', theme='ansi_dark', background_color='default'
+    )
+    Console().print(syntax)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +82,7 @@ def _save_raw(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> Non
     out = {k: v for k, v in data.items() if v or k == 'models'}
     text = yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
     if dry_run:
-        print(text, end='')
+        _print_yaml(text)
         return
     _validate(data)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +120,7 @@ def _show(config, section, name) -> int:
     data = _load_raw(_catalog_path(config))
     if name not in data[section]:
         raise SystemExit(f"{section[:-1]} '{name}' not found")
-    print(yaml.safe_dump({name: data[section][name]}, sort_keys=False), end='')
+    _print_yaml(yaml.safe_dump({name: data[section][name]}, sort_keys=False))
     return 0
 
 
@@ -174,9 +196,9 @@ class CatalogShowCLI(_PathOverridesMixin):
             }
             if not hits:
                 raise SystemExit(f"'{config.name}' not found in any section")
-            print(yaml.safe_dump(hits, sort_keys=False), end='')
+            _print_yaml(yaml.safe_dump(hits, sort_keys=False))
         else:
-            print(yaml.safe_dump(data, sort_keys=False), end='')
+            _print_yaml(yaml.safe_dump(data, sort_keys=False))
         return 0
 
 

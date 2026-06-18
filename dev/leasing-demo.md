@@ -31,6 +31,11 @@ live under your data dir. Persist it once â€” no shell export needed afterward â
 and set Compose as the default backend so you never repeat `--backend`:
 
 ```bash
+# It is a good idea to setup the data-dir beforehand with appropriate permissions
+export INFER_STACK_DATA_DIR=/data/service/docker/infer-stack
+mkdir -p "$INFER_STACK_DATA_DIR"
+chown "$USER" "$INFER_STACK_DATA_DIR"
+
 # Interactive: prompts for the data dir + default backend, shows them, confirms.
 infer-stack config init
 # ...or non-interactively (scripts / CI):

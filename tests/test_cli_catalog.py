@@ -111,6 +111,19 @@ def test_dry_run_does_not_write(tmp_path, capsys):
     assert 'm' not in cat.models                 # but not persisted
 
 
+def test_show_piped_output_is_plain(tmp_path, capsys):
+    # Under capsys stdout is not a tty -> no ANSI escapes leak into pipes.
+    from infer_stack.cli.commands_catalog import CatalogShowCLI
+
+    CatalogInitCLI.main(argv=_opts(tmp_path))
+    ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
+    capsys.readouterr()
+    CatalogShowCLI.main(argv=_opts(tmp_path))
+    out = capsys.readouterr().out
+    assert '\x1b[' not in out                      # color-free when piped
+    assert yaml.safe_load(out)['models']['m']['source'] == 'hf://a'
+
+
 def test_help_tree_lists_groups_and_leaves(capsys):
     from infer_stack.cli.commands_meta import HelpTreeCLI
 
