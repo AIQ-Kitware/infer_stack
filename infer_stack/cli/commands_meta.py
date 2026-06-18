@@ -69,17 +69,31 @@ def _doc_one_line(cls: Any) -> str:
     doc = (getattr(cls, '__doc__', None) or '').strip()
     if not doc:
         doc = (getattr(cls, 'description', '') or '').strip()
-    return doc.splitlines()[0].strip() if doc else ''
+    line = doc.splitlines()[0].strip() if doc else ''
+    return line.replace('``', '').replace('`', '')  # drop rST backticks
 
 
-def _walk_tree(modal: Any, depth: int, lines: list[str]) -> None:
+def _is_group(sub: Any) -> bool:
+    return isinstance(sub, type) and issubclass(sub, scfg.ModalCLI)
+
+
+def _build_tree(modal: Any, node: Any) -> None:
+    """Attach each subcommand of ``modal`` to a rich Tree ``node``."""
+    from rich.text import Text
+
     for name, sub in _iter_subcommands(modal):
-        indent = '  ' * (depth + 1)
-        label = f'{indent}{name}'
+        label = Text()
+        # Groups (submodals) in bold cyan, runnable leaves in green; the
+        # one-line description trails in dim. Built from Text segments (not
+        # markup) so brackets/backticks in docstrings can't break rendering.
+        label.append(name, style='bold cyan' if _is_group(sub) else 'green')
         desc = _doc_one_line(sub)
-        lines.append(f'{label:<32}{desc}'.rstrip())
-        if isinstance(sub, type) and issubclass(sub, scfg.ModalCLI):
-            _walk_tree(sub, depth + 1, lines)
+        if desc:
+            label.append('  ')
+            label.append(desc, style='dim')
+        child = node.add(label)
+        if _is_group(sub):
+            _build_tree(sub, child)
 
 
 class HelpTreeCLI(scfg.DataConfig):
@@ -90,12 +104,15 @@ class HelpTreeCLI(scfg.DataConfig):
     @classmethod
     def main(cls, argv=True, **kwargs):
         cls.cli(argv=argv, data=kwargs)
+        from rich.console import Console
+        from rich.text import Text
+        from rich.tree import Tree
+
         from infer_stack.cli import ManageCLI
 
-        lines: list[str] = []
-        _walk_tree(ManageCLI, 0, lines)
-        print('infer-stack')
-        print('\n'.join(lines))
+        tree = Tree(Text('infer-stack', style='bold'))
+        _build_tree(ManageCLI, tree)
+        Console().print(tree)
         return 0
 
 
