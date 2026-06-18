@@ -171,6 +171,39 @@ def test_missing_catalog_errors(env):
         )
 
 
+def test_secret_set_get_list_roundtrip(tmp_path, monkeypatch):
+    import contextlib
+    import io
+
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import (
+        SecretGetCLI,
+        SecretsCLI,
+        SecretSetCLI,
+    )
+
+    # set works before any serve (creates the managed .env), merges keys
+    SecretSetCLI.main(argv=['HF_TOKEN=hf_demo'])
+    SecretSetCLI.main(argv=['OTHER=x'])
+    env_file = tmp_path / 'leasing' / 'compose' / '.env'
+    text = env_file.read_text()
+    assert 'HF_TOKEN=hf_demo' in text and 'OTHER=x' in text   # both preserved
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        SecretGetCLI.main(argv=['HF_TOKEN'])
+        SecretsCLI.main(argv=['HF_TOKEN'])           # alias
+    assert buf.getvalue().split() == ['hf_demo', 'hf_demo']
+
+
+def test_secret_get_missing_is_friendly(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import SecretGetCLI
+
+    with pytest.raises(SystemExit):
+        SecretGetCLI.main(argv=['NOPE'])             # no .env yet
+
+
 def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
     """--include-display-gpus must flip the compose backend's skip_display."""
     import infer_stack.cli.commands_leasing as mod

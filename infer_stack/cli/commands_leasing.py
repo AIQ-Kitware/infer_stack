@@ -26,7 +26,7 @@ from pathlib import Path
 
 import scriptconfig as scfg
 
-from ..env_utils import parse_env_file
+from ..env_utils import parse_env_file, write_env_file
 from ..leasing import (
     Catalog,
     CatalogError,
@@ -521,40 +521,108 @@ class LeasesCLI(_LeasingCommonMixin):
         return 0
 
 
-class SecretsCLI(_PathOverridesMixin):
-    """Print the compose backend's managed secrets (e.g. the LiteLLM key).
+def _secret_env_path() -> Path:
+    """The managed compose secrets file (.env that docker compose auto-loads)."""
+    return data_root() / 'leasing' / 'compose' / '.env'
+
+
+def _print_secret(config) -> int:
+    env_path = _secret_env_path()
+    if not env_path.exists():
+        raise SystemExit(
+            f'no managed secrets at {env_path}; run an `acquire`/`serve` '
+            'with --backend compose first (or `infer-stack secret set …`)'
+        )
+    env = parse_env_file(env_path)
+    key = getattr(config, 'key', None)
+    if key:
+        if key not in env:
+            raise SystemExit(f'{key!r} not found in {env_path}')
+        print(env[key])
+        return 0
+    for name, value in env.items():
+        print(f'export {name}={shlex.quote(value)}')
+    return 0
+
+
+class SecretGetCLI(_PathOverridesMixin):
+    """Print a managed secret's value (or all as export lines).
 
     infer-stack owns these — generated and persisted. Use
-    ``$(infer-stack secrets LITELLM_MASTER_KEY)`` in scripts, or
-    ``eval "$(infer-stack secrets)"`` to export them all. (Acquiring with
-    ``--env-file`` also writes ``OPENAI_API_KEY`` + ``OPENAI_BASE_URL`` for you.)
+    ``$(infer-stack secret get LITELLM_MASTER_KEY)`` in scripts, or
+    ``eval "$(infer-stack secret list)"`` to export them all.
     """
 
-    __command__ = 'secrets'
+    __command__ = 'get'
+    key = scfg.Value(None, position=1, type=str, help="Variable name; empty = all.")
 
-    key = scfg.Value(
-        None,
-        position=1,
-        type=str,
-        help="Print only this variable's value; empty = all as export lines.",
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        return _print_secret(config)
+
+
+class SecretListCLI(_PathOverridesMixin):
+    """Print all managed secrets as ``export`` lines."""
+
+    __command__ = 'list'
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        config.key = None
+        return _print_secret(config)
+
+
+class SecretSetCLI(_PathOverridesMixin):
+    """Set a managed secret, e.g. ``secret set HF_TOKEN=hf_…``.
+
+    Written to the compose backend's ``.env`` (which docker compose auto-loads),
+    so a gated model's ``HF_TOKEN`` can be set once, before ``serve`` — no manual
+    shell export. Merges non-destructively (the managed LiteLLM key is kept).
+    """
+
+    __command__ = 'set'
+    assignment = scfg.Value(
+        None, position=1, type=str, help='KEY=VALUE (e.g. HF_TOKEN=hf_…).'
     )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        env_path = data_root() / 'leasing' / 'compose' / '.env'
-        if not env_path.exists():
-            raise SystemExit(
-                f'no managed secrets at {env_path}; run an `acquire`/`serve` '
-                'with --backend compose first'
-            )
-        env = parse_env_file(env_path)
-        if config.key:
-            if config.key not in env:
-                raise SystemExit(f'{config.key!r} not found in {env_path}')
-            print(env[config.key])
-            return 0
-        for name, value in env.items():
-            print(f'export {name}={shlex.quote(value)}')
+        if not config.assignment or '=' not in config.assignment:
+            raise SystemExit('secret set: expected KEY=VALUE')
+        key, _, value = config.assignment.partition('=')
+        key = key.strip()
+        if not key:
+            raise SystemExit('secret set: empty key')
+        write_env_file(_secret_env_path(), {key: value})
+        print(f'set {key} ({_secret_env_path()})')
         return 0
+
+
+class SecretModalCLI(scfg.ModalCLI):
+    """Manage the compose backend's managed secrets (LiteLLM key, HF_TOKEN, …)."""
+
+    __command__ = 'secret'
+
+    get = SecretGetCLI
+    set = SecretSetCLI
+    list = SecretListCLI
+
+
+class SecretsCLI(_PathOverridesMixin):
+    """Alias for ``secret get`` (kept for ``$(infer-stack secrets KEY)`` scripts)."""
+
+    __command__ = 'secrets'
+
+    key = scfg.Value(None, position=1, type=str)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        return _print_secret(config)

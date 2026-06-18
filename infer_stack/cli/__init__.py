@@ -57,6 +57,7 @@ from .commands_leasing import (
     ReleaseCLI,
     RenewCLI,
     RunCLI,
+    SecretModalCLI,
     SecretsCLI,
     ServeCLI,
 )
@@ -194,7 +195,8 @@ class ManageCLI(scfg.ModalCLI):
     run = RunCLI
     serve = ServeCLI
     leases = LeasesCLI
-    secrets = SecretsCLI
+    secret = SecretModalCLI  # secret get|set|list
+    secrets = SecretsCLI  # alias for `secret get` (script compatibility)
 
     # Compose day-2-ops wrappers
     logs = LogsCLI
