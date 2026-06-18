@@ -1,0 +1,66 @@
+"""Tests for `infer-stack config …` settings + how they're honored."""
+
+from __future__ import annotations
+
+
+def test_config_set_get_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigGetCLI, ConfigSetCLI
+    from infer_stack.paths import load_settings
+
+    ConfigSetCLI.main(argv=['backend', 'compose'])
+    assert load_settings()['backend'] == 'compose'
+    # get prints it (smoke; value asserted via load_settings)
+    ConfigGetCLI.main(argv=['backend'])
+
+
+def test_data_dir_setting_honored_by_data_root(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    monkeypatch.delenv('INFER_STACK_DATA_DIR', raising=False)
+    from infer_stack.cli.commands_meta import ConfigSetCLI
+    from infer_stack.paths import data_root, set_data_root
+
+    set_data_root(None)  # clear any process override
+    ConfigSetCLI.main(argv=['data_dir', str(tmp_path / 'state')])
+    assert data_root() == tmp_path / 'state'
+
+
+def test_env_data_dir_beats_setting(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigSetCLI
+    from infer_stack.paths import data_root, set_data_root
+
+    set_data_root(None)
+    ConfigSetCLI.main(argv=['data_dir', str(tmp_path / 'from-setting')])
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path / 'from-env'))
+    assert data_root() == tmp_path / 'from-env'   # env wins over setting
+
+
+def test_backend_setting_resolved_by_make_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    import infer_stack.cli.commands_leasing as mod
+    import infer_stack.hardware as hw
+    from infer_stack.cli.commands_leasing import AcquireCLI
+    from infer_stack.cli.commands_meta import ConfigSetCLI
+
+    seen = {}
+
+    class FakeCompose:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(mod, 'ComposeBackend', FakeCompose)
+    monkeypatch.setattr(hw, 'detect_inventory', lambda: {})
+
+    # No persisted backend -> null (dry-run)
+    cfg = AcquireCLI.cli(argv=['e'], strict=False)
+    assert type(mod._make_backend(cfg)).__name__ == 'NullBackend'
+
+    # Persisted backend -> compose, even without --backend
+    ConfigSetCLI.main(argv=['backend', 'compose'])
+    cfg = AcquireCLI.cli(argv=['e'], strict=False)
+    assert isinstance(mod._make_backend(cfg), FakeCompose)
+
+    # Explicit --backend still wins (null overrides the setting)
+    cfg = AcquireCLI.cli(argv=['e', '--backend', 'null'], strict=False)
+    assert type(mod._make_backend(cfg)).__name__ == 'NullBackend'

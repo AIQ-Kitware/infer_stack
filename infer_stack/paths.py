@@ -45,8 +45,43 @@ CONFIG_DIR_ENV = 'INFER_STACK_CONFIG_DIR'
 DATA_DIR_ENV = 'INFER_STACK_DATA_DIR'
 MODEL_PATH_ENV = 'INFER_STACK_MODEL_PATH'
 
+SETTINGS_FILENAME = 'settings.yaml'
+
 _config_root_override: Path | None = None
 _data_root_override: Path | None = None
+
+
+# ---------------------------------------------------------------------------
+# durable user settings (config dir / leasing world): default backend, data dir
+# ---------------------------------------------------------------------------
+
+
+def settings_path() -> Path:
+    """Where the leasing-world user settings live (``config set`` writes here)."""
+    return config_root() / SETTINGS_FILENAME
+
+
+def load_settings() -> dict:
+    """Load ``settings.yaml`` (empty dict if absent)."""
+    path = settings_path()
+    if path.exists():
+        import yaml
+
+        return yaml.safe_load(path.read_text()) or {}
+    return {}
+
+
+def save_settings(settings: dict) -> Path:
+    import yaml
+
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
+
+
+def get_setting(key: str, default=None):
+    return load_settings().get(key, default)
 
 
 def _default_config_root() -> Path:
@@ -72,6 +107,12 @@ def data_root() -> Path:
     env = os.environ.get(DATA_DIR_ENV)
     if env:
         return Path(env).expanduser()
+    # Honor a persisted `config set data_dir <path>` before the XDG default, so
+    # "where my docker-mounted state lives" can live in the durable config
+    # instead of being re-exported every shell.
+    configured = load_settings().get('data_dir')
+    if configured:
+        return Path(configured).expanduser()
     return _default_data_root()
 
 

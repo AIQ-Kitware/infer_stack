@@ -96,7 +96,11 @@ def _parse_gpus(text) -> list[int] | None:
 
 
 def _make_backend(config):
-    name = config.backend
+    from ..paths import get_setting
+
+    # Resolve the backend: explicit --backend wins, else the persisted default
+    # (`config set backend compose`), else the dry-run null backend.
+    name = getattr(config, 'backend', None) or get_setting('backend') or 'null'
     if name in (None, '', 'null', 'dry-run'):
         return NullBackend()
     if name == 'compose':
@@ -240,9 +244,10 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 
 class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
     backend = scfg.Value(
-        'null',
+        None,
         choices=['null', 'compose', 'kubeai'],
-        help='Serving backend. "null" (dry-run) and "compose" are implemented.',
+        help='Serving backend. "null" (dry-run) and "compose" are implemented. '
+        'Defaults to `config set backend …`, else "null".',
     )
     ledger = scfg.Value(
         None, type=str, help='Path to the lease ledger sqlite db.'

@@ -308,9 +308,139 @@ class ConfigPathsCLI(_PathOverridesMixin):
         return 0
 
 
+# ---------------------------------------------------------------------------
+# config settings: durable defaults (backend, data_dir) in settings.yaml
+# ---------------------------------------------------------------------------
+
+# Keys the leasing world actually honors (others are allowed but warned about).
+KNOWN_SETTINGS = {
+    'backend': 'Default serving backend (compose | kubeai | null).',
+    'data_dir': 'Where docker-mounted state lives (overrides the XDG default).',
+}
+
+
+class ConfigInitCLI(_PathOverridesMixin):
+    """Initialize the config dir: write a settings.yaml skeleton if absent."""
+
+    __command__ = 'init'
+    force = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..paths import load_settings, save_settings, settings_path
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        path = settings_path()
+        if path.exists() and not config.force:
+            print(f'settings already exist -> {path}')
+        else:
+            save_settings(load_settings() if path.exists() else {})
+            print(f'wrote settings -> {path}')
+        print('next: `infer-stack catalog init`, then `config set backend compose`')
+        return 0
+
+
+class ConfigSetCLI(_PathOverridesMixin):
+    """Persist a durable default, e.g. ``config set backend compose``."""
+
+    __command__ = 'set'
+    key = scfg.Value(None, position=1, type=str)
+    value = scfg.Value(None, position=2, type=str)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import yaml
+
+        from ..paths import load_settings, save_settings
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        if not config.key or config.value is None:
+            raise SystemExit('config set: KEY and VALUE are required')
+        if config.key not in KNOWN_SETTINGS:
+            print(f"warning: '{config.key}' is not a recognized setting "
+                  f'(known: {", ".join(sorted(KNOWN_SETTINGS))})')
+        settings = load_settings()
+        settings[config.key] = yaml.safe_load(config.value)
+        path = save_settings(settings)
+        print(f"set {config.key} = {settings[config.key]!r}  ({path})")
+        return 0
+
+
+class ConfigGetCLI(_PathOverridesMixin):
+    """Print one setting's value (or all settings)."""
+
+    __command__ = 'get'
+    key = scfg.Value(None, position=1, type=str)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..paths import load_settings
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        settings = load_settings()
+        if config.key:
+            if config.key not in settings:
+                raise SystemExit(f"'{config.key}' is not set")
+            print(settings[config.key])
+        else:
+            for k, v in settings.items():
+                print(f'{k}={v}')
+        return 0
+
+
+class ConfigShowCLI(_PathOverridesMixin):
+    """Show the persisted settings and where they live."""
+
+    __command__ = 'show'
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import yaml
+
+        from ..paths import load_settings, settings_path
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        settings = load_settings()
+        print(f'# {settings_path()}')
+        print(yaml.safe_dump(settings, sort_keys=False) if settings
+              else '(no settings yet — `infer-stack config set …`)')
+        return 0
+
+
+class ConfigEditCLI(_PathOverridesMixin):
+    """Open settings.yaml in $EDITOR."""
+
+    __command__ = 'edit'
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import os
+        import subprocess
+
+        from ..paths import save_settings, settings_path
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        path = settings_path()
+        if not path.exists():
+            save_settings({})
+        subprocess.run([*os.environ.get('EDITOR', 'vi').split(), str(path)],
+                       check=False)
+        return 0
+
+
 class ConfigModalCLI(scfg.ModalCLI):
-    """Inspect infer-stack configuration."""
+    """Inspect + manage infer-stack configuration (paths + durable settings)."""
 
     __command__ = 'config'
 
+    init = ConfigInitCLI
     paths = ConfigPathsCLI
+    show = ConfigShowCLI
+    set = ConfigSetCLI
+    get = ConfigGetCLI
+    edit = ConfigEditCLI
