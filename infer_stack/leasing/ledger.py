@@ -208,6 +208,27 @@ class Ledger:
             if g.state == GroupState.IDLE
         ]
 
+    def evict_idle(self, group_ids: list[str] | None = None) -> list[str]:
+        """Force IDLE groups to STOPPED so the next reconcile tears them down.
+
+        This overrides ``keep-warm``: a released group normally stays resident
+        (IDLE) to avoid cold-start thrash, but evicting it frees its GPU now.
+        ``group_ids=None`` evicts every idle group; a list restricts it (ids not
+        currently idle are skipped). Returns the ids actually evicted.
+        """
+        now = self.clock()
+        wanted = None if group_ids is None else set(group_ids)
+        evicted: list[str] = []
+        with self.store.transaction():
+            for g in self.store.list_groups(now=now):
+                if g.state != GroupState.IDLE:
+                    continue
+                if wanted is not None and g.id not in wanted:
+                    continue
+                self.store.set_group_state(g.id, GroupState.STOPPED, now)
+                evicted.append(g.id)
+        return evicted
+
     def status(self) -> tuple[list[Lease], list[DeploymentGroup]]:
         """Snapshot for ``infer-stack status`` (leases, groups-with-demand)."""
         now = self.clock()

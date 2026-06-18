@@ -119,6 +119,13 @@ idle one down, place the new one). The ledger already distinguishes LIVE vs IDLE
 by demand, so this is a placement/reclaim policy change, not a new state. (The
 e2e harness resets between tiers regardless, so this isn't blocking the suite.)
 
+**Manual eviction landed** (the *explicit* half of this): `infer-stack evict
+[NAME…|--all]` and `release --evict` mark IDLE groups `stopped` so the next
+reconcile tears them down, freeing the GPU on demand. The *automatic*
+yield-under-pressure above (placement evicting an idle group when a live acquire
+can't otherwise place) is still open — `evict_idle` / `Controller.evict` are the
+reusable primitive it should call once the placer detects contention.
+
 ### #2 — DB-backed live model management (retry later)
 
 Bring back `postgres-litellm` and use LiteLLM's admin API (`/model/new`,

@@ -52,6 +52,7 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_leasing import (
     AcquireCLI,
+    EvictCLI,
     LeasesCLI,
     ReleaseCLI,
     RenewCLI,
@@ -197,6 +198,7 @@ class ManageCLI(scfg.ModalCLI):
     # Leasing model (acquire/release/run/serve + status)
     acquire = AcquireCLI
     release = ReleaseCLI
+    evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
     renew = RenewCLI
     run = RunCLI
     serve = ServeCLI

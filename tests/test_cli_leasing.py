@@ -119,6 +119,35 @@ def test_release_all_with_no_leases_is_friendly(env, capsys):
     assert 'no active leases' in capsys.readouterr().out
 
 
+def test_evict_idle_group_by_endpoint(env, capsys):
+    from infer_stack.cli.commands_leasing import EvictCLI
+
+    # keep-warm: releasing leaves the group resident (idle), not stopped.
+    AcquireCLI.main(argv=['qwen-coder', *_base(env)])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    assert _leases_json(env, capsys)['groups'][0]['state'] == 'idle'
+
+    # evict by the served endpoint alias -> the group is stopped (GPU freed).
+    rc = EvictCLI.main(argv=['qwen-coder', '--ledger', env.db])
+    assert rc == 0
+    assert _leases_json(env, capsys)['groups'][0]['state'] == 'stopped'
+
+
+def test_evict_requires_target_or_all(env):
+    from infer_stack.cli.commands_leasing import EvictCLI
+
+    with pytest.raises(SystemExit):
+        EvictCLI.main(argv=['--ledger', env.db])      # neither name nor --all
+
+
+def test_release_evict_tears_down_immediately(env, capsys):
+    # --evict overrides keep-warm: the released group is stopped, not idle.
+    AcquireCLI.main(argv=['qwen-coder', *_base(env)])
+    rc = ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--evict'])
+    assert rc == 0
+    assert _leases_json(env, capsys)['groups'][0]['state'] == 'stopped'
+
+
 def test_serve_is_standing_lease(env, capsys):
     ServeCLI.main(argv=['qwen-coder', *_base(env)])
     data = _leases_json(env, capsys)

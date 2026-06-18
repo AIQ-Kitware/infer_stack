@@ -302,6 +302,25 @@ def test_controller_compose_end_to_end(tmp_path):
     assert backend.observe() == {qwen_gid}
 
 
+def test_evict_tears_down_keep_warm_idle_group(tmp_path):
+    catalog = Catalog.from_dict(CATALOG)
+    ledger = Ledger(SqliteStore(':memory:'))
+    backend = make_backend(tmp_path)
+    ctl = Controller(ledger, backend)
+
+    out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    qwen_gid = out.groups[0].id
+    ctl.release(out.lease.id)
+    assert backend.observe() == {qwen_gid}        # keep-warm stays resident
+
+    ev = ctl.evict(None)                           # force-evict idle groups
+    assert qwen_gid in ev.evicted_group_ids
+    assert backend.observe() == set()             # GPU freed: service gone
+    # ledger records it as stopped, not idle
+    _, groups = ledger.status()
+    assert {g.state for g in groups} == {GroupState.STOPPED}
+
+
 # -- LiteLLM front door ----------------------------------------------------
 
 

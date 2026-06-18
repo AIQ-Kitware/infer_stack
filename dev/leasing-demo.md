@@ -177,6 +177,16 @@ infer-stack release <SESSION_ID>
 # (its container is torn down once no lease protects it).
 ```
 
+A `keep-warm` model stays resident after release (no cold-start next time) — but
+it holds its GPU. To free that GPU now, **evict** it (overrides keep-warm):
+
+```bash
+infer-stack evict chat       # tear down the idle `chat` group now (by alias)
+infer-stack evict --all      # ...or every idle/released model at once
+# or do it in one step at release time:
+infer-stack release <SESSION_ID> --evict
+```
+
 To change the model itself: `infer-stack catalog model add smol17b --source
 hf://other/Model --force` (or edit runtime via `catalog endpoint add chat …
 --force`), release the old lease, and `serve chat` again. Same alias, new model —

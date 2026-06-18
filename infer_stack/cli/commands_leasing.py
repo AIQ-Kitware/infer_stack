@@ -32,6 +32,7 @@ from ..leasing import (
     CatalogError,
     ComposeBackend,
     Controller,
+    GroupState,
     LeaseState,
     Ledger,
     NullBackend,
@@ -416,6 +417,11 @@ class ReleaseCLI(_LeasingCommonMixin):
         False, isflag=True,
         help='Release every active lease (the whole stack idles/tears down).',
     )
+    evict = scfg.Value(
+        False, isflag=True,
+        help='Also evict (tear down) the released group(s) now, even if their '
+        'reclaim policy is keep-warm — frees the GPU immediately.',
+    )
     json = scfg.Value(False, isflag=True)
 
     @classmethod
@@ -429,43 +435,118 @@ class ReleaseCLI(_LeasingCommonMixin):
             controller.ledger.sweep()
             leases, _ = controller.ledger.status()
             sids = [le.id for le in leases if le.state == LeaseState.ACTIVE]
-            outcomes = [(sid, controller.release(sid)) for sid in sids]
-            if config.json:
-                print(json.dumps({
-                    'released': [s for s, _ in outcomes],
-                    'torn_down': sorted({
-                        g for _, o in outcomes for g in o.reconcile.torn_down
-                    }),
-                }, indent=2))
-            elif not outcomes:
-                print('no active leases to release')
-            else:
-                print(f'released {len(outcomes)} lease(s)')
-                for sid, outcome in outcomes:
-                    print(f'  {sid}')
-                    for gid in outcome.reconcile.torn_down:
-                        print(f'    torn down: {gid}')
-            return 0
+            released, torn = [], set()
+            for sid in sids:
+                outcome = controller.release(sid)
+                released.append(sid)
+                torn.update(outcome.reconcile.torn_down)
+            evicted: list[str] = []
+            if config.evict:
+                ev = controller.evict(None)  # every idle group
+                evicted = ev.evicted_group_ids
+                torn.update(ev.reconcile.torn_down)
+            return _emit_release(config, released, sorted(torn), evicted)
 
         sid = _resolve_session(config)
         if not sid:
             raise SystemExit('release: give a session id, --env-file, or --all')
         outcome = controller.release(sid)
-        if config.json:
-            print(
-                json.dumps(
-                    {
-                        'released': sid,
-                        'idled': outcome.idled_group_ids,
-                        'torn_down': outcome.reconcile.torn_down,
-                    },
-                    indent=2,
-                )
-            )
+        torn = set(outcome.reconcile.torn_down)
+        evicted = []
+        if config.evict:
+            ev = controller.evict(outcome.idled_group_ids)
+            evicted = ev.evicted_group_ids
+            torn.update(ev.reconcile.torn_down)
+        return _emit_release(config, [sid], sorted(torn), evicted)
+
+
+def _emit_release(config, released, torn_down, evicted) -> int:
+    if config.json:
+        print(json.dumps({
+            'released': released,
+            'torn_down': torn_down,
+            'evicted': evicted,
+        }, indent=2))
+        return 0
+    if not released:
+        print('no active leases to release')
+    else:
+        print(f'released {len(released)} lease(s)')
+        for sid in released:
+            print(f'  {sid}')
+    for gid in torn_down:
+        print(f'  torn down: {gid}')
+    return 0
+
+
+def _resolve_idle_targets(controller, names: list[str]) -> tuple[list[str], list[str]]:
+    """Map endpoint aliases / group ids to currently-idle group ids.
+
+    Returns ``(target_group_ids, unmatched_names)``.
+    """
+    controller.ledger.sweep()
+    _, groups = controller.ledger.status()
+    idle = [g for g in groups if g.state == GroupState.IDLE]
+    wanted = set(names)
+    targets, matched = [], set()
+    for g in idle:
+        hit = wanted & ({g.id} | set(g.served))
+        if hit:
+            targets.append(g.id)
+            matched |= hit
+    return targets, sorted(wanted - matched)
+
+
+class EvictCLI(_LeasingCommonMixin):
+    """Force-evict released (idle) models now, freeing their GPUs.
+
+    A released ``keep-warm`` model stays resident (idle) to avoid cold-start
+    thrash — handy, but it holds a GPU. ``evict`` tears such groups down now,
+    overriding keep-warm. Target by served endpoint alias or group id, or
+    ``--all`` for every idle group. (Live models — those with an active lease —
+    are never evicted; release them first.)
+    """
+
+    __command__ = 'evict'
+
+    names = scfg.Value(
+        [], nargs='*', position=1, type=str,
+        help='Endpoint alias or group id to evict.',
+    )
+    all = scfg.Value(False, isflag=True, help='Evict every idle group.')
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        names = _collect_names(config.names)
+        if not names and not config.all:
+            raise SystemExit('evict: give an endpoint/group name or --all')
+        if config.all:
+            outcome = controller.evict(None)
         else:
-            print(f'released {sid}')
-            for gid in outcome.reconcile.torn_down:
-                print(f'  torn down: {gid}')
+            targets, missing = _resolve_idle_targets(controller, names)
+            if missing:
+                print(f'no idle group for: {", ".join(missing)}')
+            if not targets:
+                if config.json:
+                    print(json.dumps({'evicted': [], 'torn_down': []}, indent=2))
+                else:
+                    print('nothing to evict')
+                return 0
+            outcome = controller.evict(targets)
+        if config.json:
+            print(json.dumps({
+                'evicted': outcome.evicted_group_ids,
+                'torn_down': outcome.reconcile.torn_down,
+            }, indent=2))
+        elif not outcome.evicted_group_ids:
+            print('nothing to evict')
+        else:
+            print(f'evicted {len(outcome.evicted_group_ids)} group(s)')
+            for gid in outcome.evicted_group_ids:
+                print(f'  {gid}')
         return 0
 
 

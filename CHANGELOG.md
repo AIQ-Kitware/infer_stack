@@ -119,6 +119,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   - `infer-stack release --all` — release every active lease in one shot (the
     whole stack idles/tears down per each lease's reclaim policy). Makes teardown
     a one-liner instead of scraping session ids out of `leases`.
+  - `infer-stack evict [NAME…|--all]` — force-tear-down released (idle) models
+    now, overriding `keep-warm`, to free their GPUs. A keep-warm model normally
+    stays resident after release (no cold-start next time) but holds a GPU; evict
+    drops it. Target by served endpoint alias or group id, or `--all` for every
+    idle group; live models (with an active lease) are never evicted. `release
+    --evict` does the release-then-evict in one step (composes with `--all`).
+    Mechanically: idle groups are marked `stopped`, so the next reconcile
+    converges them away.
   - `infer-stack leases` is rich-formatted on a terminal (lease/group tables
     with state colors); piped/`--json` output is unchanged.
   - Compose changes are now shown before they're applied. On a terminal,

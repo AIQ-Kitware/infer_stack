@@ -57,6 +57,12 @@ class ReleaseOutcome:
     reconcile: ReconcileResult
 
 
+@dataclass
+class EvictOutcome:
+    evicted_group_ids: list[str]
+    reconcile: ReconcileResult
+
+
 class Controller:
     """Ties a :class:`Ledger` to a :class:`Backend`.
 
@@ -219,3 +225,16 @@ class Controller:
         return ReleaseOutcome(
             idled_group_ids=rel.idled_group_ids, reconcile=rec
         )
+
+    def evict(self, group_ids: Iterable[str] | None = None) -> EvictOutcome:
+        """Force-evict idle (released) groups now, overriding keep-warm.
+
+        Marks the matching IDLE groups STOPPED and reconciles, so a keep-warm
+        model that is merely resident gets torn down and its GPU freed.
+        ``group_ids=None`` evicts every idle group.
+        """
+        ids = None if group_ids is None else list(group_ids)
+        self.ledger.sweep()
+        evicted = self.ledger.evict_idle(ids)
+        rec = self.reconcile()
+        return EvictOutcome(evicted_group_ids=evicted, reconcile=rec)
