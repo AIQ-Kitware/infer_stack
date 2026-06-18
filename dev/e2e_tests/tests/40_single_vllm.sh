@@ -16,8 +16,8 @@ fi
 
 ENVF="$E2E_RESULTS/single.env"
 
-step single-vllm-acquire 'acquire qwen-small --backend compose --require-generation'
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+step single-vllm-acquire 'acquire smol-135 --backend compose --require-generation'
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --require-generation --env-file \"$ENVF\" --timeout 1200 --json"
 expect_rc 0
 expect_out '"ready": true'
@@ -30,11 +30,11 @@ expect_rc 0
 expect_re '^sk-'
 end_step
 
-step single-vllm-models 'the gateway lists qwen-small at the descriptor base_url'
+step single-vllm-models 'the gateway lists smol-135 at the descriptor base_url'
 run "set -a; . \"$ENVF\"; set +a; \
      curl -s \"\$OPENAI_BASE_URL/models\" -H \"Authorization: Bearer \$OPENAI_API_KEY\""
 expect_rc 0
-expect_out 'qwen-small'
+expect_out 'smol-135'
 end_step
 
 step single-vllm-chat 'a real chat completion returns content'
@@ -42,7 +42,7 @@ run "set -a; . \"$ENVF\"; set +a; \
      curl -s \"\$OPENAI_BASE_URL/chat/completions\" \
        -H \"Authorization: Bearer \$OPENAI_API_KEY\" \
        -H 'Content-Type: application/json' \
-       -d '{\"model\":\"qwen-small\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":8}'"
+       -d '{\"model\":\"smol-135\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":8}'"
 expect_rc 0
 expect_out '"choices"'
 expect_no_out 'model=None'

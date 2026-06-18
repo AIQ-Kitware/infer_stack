@@ -115,6 +115,14 @@ def assemble(args) -> None:
     n_fail = sum(r['verdict'] == 'fail' for r in recs)
     n_skip = sum(r['verdict'] == 'skip' for r in recs)
     total_dur = sum(r.get('duration', 0) for r in recs)
+    wall = None
+    wf = rdir / 'wall_seconds.txt'
+    if wf.exists():
+        try:
+            secs = int(wf.read_text().strip())
+            wall = f'{secs // 60}m {secs % 60:02d}s'
+        except ValueError:
+            wall = None
 
     L: list[str] = []
     L.append('# infer-stack leasing — e2e report')
@@ -129,8 +137,13 @@ def assemble(args) -> None:
     L.append('')
     verdict = '❌ FAILURES' if n_fail else '✅ all green'
     L.append(f"## Result: {verdict} — "
-             f"{n_pass} passed, {n_fail} failed, {n_skip} skipped "
-             f"({total_dur:.1f}s in steps)")
+             f"{n_pass} passed, {n_fail} failed, {n_skip} skipped")
+    L.append('')
+    if wall:
+        L.append(f"- total wall time: **{wall}**  "
+                 f"({total_dur:.0f}s in step bodies)")
+    else:
+        L.append(f"- time in step bodies: {total_dur:.0f}s")
     L.append('')
 
     # Wiring axes rollup

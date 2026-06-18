@@ -9,7 +9,7 @@ if ! gpu_enabled; then
 fi
 
 step ttl-expire 'a 30s TTL lease expires and its reclaim:stop group is reclaimed'
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --ttl 30s --require-generation --env-file \"$E2E_RESULTS/ttl.env\" --timeout 1200"
 expect_rc 0
 note 'sleeping 40s to cross the soft TTL...'
@@ -17,7 +17,7 @@ run 'sleep 40'
 run 'infer-stack leases --json'
 expect_rc 0
 expect_no_out '"state": "active"'
-note 'lease should be expired/released; qwen-small (reclaim:stop) group reclaimed'
+note 'lease should be expired/released; smol-135 (reclaim:stop) group reclaimed'
 # belt-and-suspenders cleanup
 run "infer-stack release --env-file \"$E2E_RESULTS/ttl.env\" >/dev/null 2>&1; true"
 end_step

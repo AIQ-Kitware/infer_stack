@@ -9,28 +9,28 @@
 # a small max_model_len (less KV alloc / smaller capture). We're validating the
 # leasing plumbing, not model perf, so eager + tiny is the right trade.
 #
-# Endpoint NAMES are kept stable (qwen-*) so the test scripts don't change; the
-# underlying model is SmolLM2. The alias is what clients/tests request.
+# Endpoints are named for the model they serve (smol-135 / smol-360 = SmolLM2
+# 135M / 360M). The alias is what clients/tests request through the gateway.
 models:
   smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
   smol360: {source: hf://HuggingFaceTB/SmolLM2-360M-Instruct}
 endpoints:
-  qwen-small:
+  smol-135:
     engine: vllm
     model: smol135
     runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
     reclaim: {policy: stop}
-  qwen-dup:                       # same model+runtime, aliased to qwen-small -> must coalesce
+  smol-135-dup:                       # same model+runtime, aliased to smol-135 -> must coalesce
     engine: vllm
     model: smol135
-    public_name: qwen-small
+    public_name: smol-135
     runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
-  qwen-15b:                       # 2nd distinct model -> for the both-GPU / display-GPU tiers
+  smol-360:                       # 2nd distinct model -> for the both-GPU / display-GPU tiers
     engine: vllm
     model: smol360
     runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
     reclaim: {policy: keep-warm}
-  qwen-ollama:
+  smol-ollama:
     engine: ollama
     host: local-ollama
     model: smollm2:135m
@@ -40,4 +40,4 @@ runtime_hosts:
     placement: {gpu_indices: [0]}
     settings: {keep_alive: 5m}
 bundles:
-  pair: [qwen-small, qwen-15b]
+  pair: [smol-135, smol-360]

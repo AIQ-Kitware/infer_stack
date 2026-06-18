@@ -1,5 +1,5 @@
 # shellcheck shell=bash source=../lib.sh
-# Coalescing & demand: two leases on the same model (qwen-dup aliases qwen-small)
+# Coalescing & demand: two leases on the same model (smol-135-dup aliases smol-135)
 # must share ONE deployment group (demand 2) and ONE vllm container. This is the
 # efficiency headline — no duplicate model per consumer.
 source "$E2E_ROOT/lib.sh"
@@ -13,10 +13,10 @@ if ! gpu_enabled; then
 fi
 
 step coalesce-acquire 'two owners acquire the same underlying model'
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --owner alice --require-generation --timeout 1200"
 expect_rc 0
-run "infer-stack acquire qwen-dup --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135-dup --backend compose --catalog \"$E2E_CAT\" \
       --owner bob --require-generation --timeout 1200"
 expect_rc 0
 end_step

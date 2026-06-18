@@ -12,10 +12,10 @@ fi
 SIDECAR="$INFER_STACK_DATA_DIR/leasing/compose/leasing-compose-state.json"
 
 step both-gpus-spread 'two distinct models spread across GPU 0 and GPU 1'
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --include-display-gpus --owner g0 --require-generation --timeout 1200"
 expect_rc 0
-run "infer-stack acquire qwen-15b --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
       --include-display-gpus --owner g1 --require-generation --timeout 1200"
 expect_rc 0
 run "python3 -c '
@@ -34,7 +34,7 @@ end_step
 
 step both-gpus-both-routable 'both endpoints answer through the one gateway'
 run "key=\$(infer-stack secrets LITELLM_MASTER_KEY); base=http://127.0.0.1:14042/v1; \
-     for m in qwen-small qwen-15b; do \
+     for m in smol-135 smol-360; do \
        echo \"== \$m ==\"; \
        curl -s \"\$base/chat/completions\" -H \"Authorization: Bearer \$key\" \
          -H 'Content-Type: application/json' \

@@ -11,10 +11,10 @@ if ! gpu_enabled; then
 fi
 
 step placement-dedicated 'a 2nd dedicated group on a 1-GPU box cannot place (F5)'
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --owner a --require-generation --timeout 1200"
 expect_rc 0
-run "infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --owner b --dedicated --require-generation --timeout 45 --json"
 note "dedicated acquire rc=$RC (expected non-zero / not-ready on a 1-GPU box)"
 run 'infer-stack leases --json'

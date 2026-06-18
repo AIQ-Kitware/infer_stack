@@ -5,9 +5,9 @@
 # steps:
 #
 #   step single-vllm 'acquire a vllm model and serve a chat completion'
-#   run  'infer-stack acquire qwen-small --backend compose --catalog "$E2E_CAT"'
+#   run  'infer-stack acquire smol-135 --backend compose --catalog "$E2E_CAT"'
 #   expect_rc 0
-#   expect_out qwen-small
+#   expect_out smol-135
 #   end_step
 #
 # Every step records a structured record (id, title, verdict, duration, the

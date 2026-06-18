@@ -53,10 +53,16 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 TS="$(date +%Y%m%dT%H%M%S)"
+RUN_START="$(date +%s)"
 [ -n "$RESULTS" ] || RESULTS="$E2E_ROOT/results/$TS"
 mkdir -p "$RESULTS"
 [ -n "$DATA_DIR" ] || DATA_DIR="$RESULTS/infer-stack-data"
 mkdir -p "$DATA_DIR"
+# Isolate the config dir too (not just data) so `status`/`paths` reflect the
+# e2e run, not the user's real ~/.config/infer_stack. Catalog is always passed
+# explicitly via --catalog, so an empty config dir is fine.
+CONFIG_DIR="$RESULTS/config"
+mkdir -p "$CONFIG_DIR"
 
 # Exported context every test script + lib.sh relies on.
 export E2E_RESULTS="$RESULTS"
@@ -64,6 +70,7 @@ export E2E_CAT="$CATALOG"
 export E2E_ENABLE_GPU="$GPU"
 export E2E_KEEP_RUNNING="$KEEP_RUNNING"
 export INFER_STACK_DATA_DIR="$DATA_DIR"
+export INFER_STACK_CONFIG_DIR="$CONFIG_DIR"
 
 : > "$RESULTS/results.jsonl"
 
@@ -134,6 +141,8 @@ _finished=0
 finish() {
     [ "$_finished" = 1 ] && return
     _finished=1
+    local elapsed=$(( $(date +%s) - RUN_START ))
+    printf '%d\n' "$elapsed" > "$RESULTS/wall_seconds.txt" 2>/dev/null || true
     echo
     python3 "$E2E_ROOT/render_report.py" --assemble --results "$RESULTS" \
         2>/dev/null || echo '(report assembly failed; results.jsonl + logs/ still usable)'
@@ -149,9 +158,13 @@ s=sum(r['verdict']=='skip' for r in recs)
 print(f'{p} passed, {f} failed, {s} skipped')
 " 2>/dev/null || echo 'run incomplete')"
 
+    local wall
+    wall="$(printf '%dm %02ds' $((elapsed / 60)) $((elapsed % 60)))"
+
     echo
     echo "================================================================"
     echo "  $summary"
+    echo "  total wall time: $wall"
     echo "  report:  $RESULTS/report.md"
     echo
     echo "  rsync back (excludes weight/kernel caches):"
@@ -203,9 +216,11 @@ for f in "$E2E_ROOT"/tests/*.sh; do
     fi
     export E2E_SECTION="${name%.sh}"
     echo "── $E2E_SECTION ──────────────────────────────────────────"
-    # Reset GPU state before each serving tier (not before cleanup, which downs
-    # the stack itself). Keeps tiers isolated on a GPU-constrained box.
-    if [ "$GPU" = 1 ] && [ "$prefix" != '99' ]; then
+    # Reset GPU state before each *serving* tier (prefix >= 40), not the
+    # non-serving ones (01/10/20/30) — those share a ledger the dry-run/status
+    # checks rely on — and not 99_cleanup (it downs the stack itself).
+    if [ "$GPU" = 1 ] && [ "$((10#$prefix))" -ge 40 ] && [ "$prefix" != '99' ]
+    then
         reset_between_tiers
     fi
     bash "$f"

@@ -10,11 +10,11 @@ if ! gpu_enabled; then
 fi
 
 step run-injects-env 'run -- <cmd> sees a working OpenAI endpoint, then releases'
-run "infer-stack run --endpoint qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack run --endpoint smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --require-generation --timeout 1200 -- \
       bash -c 'curl -s \"\$OPENAI_BASE_URL/chat/completions\" \
         -H \"Authorization: Bearer \$OPENAI_API_KEY\" -H \"Content-Type: application/json\" \
-        -d \"{\\\"model\\\":\\\"\$INFER_STACK_ENDPOINT_QWEN_SMALL\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hi\\\"}],\\\"max_tokens\\\":8}\"'"
+        -d \"{\\\"model\\\":\\\"\$INFER_STACK_ENDPOINT_SMOL_135\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hi\\\"}],\\\"max_tokens\\\":8}\"'"
 expect_rc 0
 expect_out '"choices"'
 run 'infer-stack leases --json'
@@ -23,7 +23,7 @@ note 'lease auto-released on child exit'
 end_step
 
 step run-exit-code 'run propagates the child exit code'
-run "infer-stack run --endpoint qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack run --endpoint smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --require-generation --timeout 1200 -- bash -c 'exit 7'"
 expect_rc 7
 end_step

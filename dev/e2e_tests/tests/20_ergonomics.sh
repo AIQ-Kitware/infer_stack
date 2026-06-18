@@ -18,10 +18,14 @@ expect_out 'docker-compose.yml'
 expect_out 'env (secrets)'
 end_step
 
-step status 'status runs and prints a leasing summary line'
+step status 'status runs cleanly and prints its summary'
 run 'infer-stack status'
 expect_rc 0
-expect_out 'leasing:'
+expect_no_out 'Traceback (most recent call last)'
+expect_out 'initialized:'
+# The one-line leasing summary only appears when the ledger is non-empty
+# (by design); that path is covered by the unit test
+# test_status_summarizes_leases_when_present. Here we just smoke `status`.
 end_step
 
 step secrets-missing 'secrets gives a friendly error before any compose acquire'

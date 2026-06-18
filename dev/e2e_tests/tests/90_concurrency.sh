@@ -11,9 +11,9 @@ if ! gpu_enabled; then
 fi
 
 step concurrency-race 'two concurrent acquires both land, demand is correct'
-run "( infer-stack acquire qwen-small --backend compose --catalog \"$E2E_CAT\" \
+run "( infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
         --owner u1 --require-generation --timeout 1200 ) & \
-     ( infer-stack acquire qwen-dup   --backend compose --catalog \"$E2E_CAT\" \
+     ( infer-stack acquire smol-135-dup   --backend compose --catalog \"$E2E_CAT\" \
         --owner u2 --require-generation --timeout 1200 ) & \
      wait"
 expect_rc 0

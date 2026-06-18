@@ -11,14 +11,14 @@ expect_re 'unknown|not found|no such|nope'
 end_step
 
 step kubeai-unimplemented 'kubeai backend reports not-implemented, not a crash'
-run "infer-stack acquire qwen-small --backend kubeai --catalog \"$E2E_CAT\" --no-wait"
+run "infer-stack acquire smol-135 --backend kubeai --catalog \"$E2E_CAT\" --no-wait"
 expect_rc_not 0
 expect_no_out 'Traceback (most recent call last)'
 expect_re 'not implemented|kubeai'
 end_step
 
 step missing-catalog 'a missing catalog path fails friendly'
-run 'infer-stack acquire qwen-small --catalog /no/such/catalog.yaml --no-wait'
+run 'infer-stack acquire smol-135 --catalog /no/such/catalog.yaml --no-wait'
 expect_rc_not 0
 expect_no_out 'Traceback (most recent call last)'
 expect_re 'catalog not found|not found'
