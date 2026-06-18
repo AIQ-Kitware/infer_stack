@@ -99,6 +99,19 @@ def _exists_guard(data, section, name, force, hint='') -> None:
         )
 
 
+def _next_indexed_name(existing, base: str) -> str:
+    """First free ``{base}-{N}`` (N starting at 1) not already in ``existing``.
+
+    Defaulted endpoint names get a numeric suffix so repeated ``endpoint add``
+    for the same model don't collide — they accumulate as ``base-1``, ``base-2``,
+    … and the first is deterministically ``base-1``.
+    """
+    n = 1
+    while f'{base}-{n}' in existing:
+        n += 1
+    return f'{base}-{n}'
+
+
 def _slug_alias(text: str) -> str:
     """Make ``text`` safe to use as an endpoint alias.
 
@@ -113,14 +126,22 @@ def _slug_alias(text: str) -> str:
     return out or text
 
 
-def _rm(config, section, name) -> int:
+def _rm(config, section, names) -> int:
+    names = [names] if isinstance(names, str) else list(names or [])
+    if not names:
+        raise SystemExit(f'{section[:-1]} rm: give at least one name')
     path = _catalog_path(config)
     data = _load_raw(path)
-    if name not in data[section]:
-        raise SystemExit(f"{section[:-1]} '{name}' not found in {path}")
-    del data[section][name]
+    missing = [n for n in names if n not in data[section]]
+    if missing:
+        raise SystemExit(
+            f'{section[:-1]}(s) not found in {path}: {", ".join(missing)}'
+        )
+    for name in names:
+        del data[section][name]
     _save_raw(path, data, dry_run=getattr(config, 'dry_run', False))
-    print(f"removed {section[:-1]} '{name}'")
+    for name in names:
+        print(f"removed {section[:-1]} '{name}'")
     return 0
 
 
@@ -323,14 +344,15 @@ class ModelShowCLI(_PathOverridesMixin):
 
 
 class ModelRmCLI(_CatalogCommon):
-    """Remove a model by name."""
+    """Remove one or more models by name."""
     __command__ = 'rm'
-    name = scfg.Value(None, position=1, type=str)
+    names = scfg.Value([], nargs='+', position=1, type=str,
+                       help='Model name(s) to remove.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        return _rm(config, 'models', config.name)
+        return _rm(config, 'models', config.names)
 
 
 class CatalogModelCLI(scfg.ModalCLI):
@@ -350,17 +372,19 @@ class CatalogModelCLI(scfg.ModalCLI):
 class EndpointAddCLI(_CatalogCommon):
     """Add (or --force overwrite) an endpoint — the served API name.
 
-    ``NAME`` is optional: when omitted it defaults to the ``--model`` (the vLLM
-    model name, or the Ollama tag, slugified). That keeps the served alias —
-    what you ask for and what Open WebUI shows — tied to the model, which is the
-    common case. Give an explicit ``NAME`` when you want a stable alias decoupled
-    from the model (e.g. ``chat`` you can re-point), or a *second* endpoint for a
-    model the default name is already taken by.
+    ``NAME`` is optional: when omitted it defaults to ``{model}-{N}`` (the vLLM
+    model name, or the Ollama tag, slugified, with an auto-incrementing suffix —
+    ``smol135-1``, ``smol135-2``, …). That keeps the served alias — what you ask
+    for and what Open WebUI shows — tied to the model, and a repeated add for one
+    model just gets the next index instead of colliding. Give an explicit
+    ``NAME`` when you want a stable alias decoupled from the model (e.g. ``chat``
+    you can re-point).
     """
 
     __command__ = 'add'
     name = scfg.Value(
-        None, position=1, type=str, help='Endpoint alias (default: --model).'
+        None, position=1, type=str,
+        help='Endpoint alias (default: {model}-N, auto-incrementing).',
     )
     engine = scfg.Value('vllm', choices=['vllm', 'ollama'])
     model = scfg.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
@@ -392,22 +416,22 @@ class EndpointAddCLI(_CatalogCommon):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        name = config.name
-        if not name:
+        path = _catalog_path(config)
+        data = _load_raw(path)
+        if config.name:
+            name = config.name
+            _exists_guard(data, 'endpoints', name, config.force)
+        else:
             if not config.model:
                 raise SystemExit(
                     'endpoint add: give a NAME, or --model to derive the name '
                     'from it'
                 )
-            name = _slug_alias(config.model)
-        path = _catalog_path(config)
-        data = _load_raw(path)
-        hint = (
-            ', or an explicit NAME for a second endpoint on this model'
-            if not config.name
-            else ''
-        )
-        _exists_guard(data, 'endpoints', name, config.force, hint=hint)
+            # Default name = {model}-N, auto-incrementing so repeated adds for
+            # one model accumulate (smol135-1, smol135-2, …) instead of colliding.
+            name = _next_indexed_name(
+                data['endpoints'], _slug_alias(config.model)
+            )
         entry: dict[str, Any] = {'engine': config.engine}
         if config.model:
             entry['model'] = config.model
@@ -460,14 +484,15 @@ class EndpointShowCLI(_PathOverridesMixin):
 
 
 class EndpointRmCLI(_CatalogCommon):
-    """Remove an endpoint by name."""
+    """Remove one or more endpoints by name."""
     __command__ = 'rm'
-    name = scfg.Value(None, position=1, type=str)
+    names = scfg.Value([], nargs='+', position=1, type=str,
+                       help='Endpoint name(s) to remove.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        return _rm(config, 'endpoints', config.name)
+        return _rm(config, 'endpoints', config.names)
 
 
 class CatalogEndpointCLI(scfg.ModalCLI):
@@ -540,14 +565,15 @@ class HostListCLI(_PathOverridesMixin):
 
 
 class HostRmCLI(_CatalogCommon):
-    """Remove a runtime host by name."""
+    """Remove one or more runtime hosts by name."""
     __command__ = 'rm'
-    name = scfg.Value(None, position=1, type=str)
+    names = scfg.Value([], nargs='+', position=1, type=str,
+                       help='Runtime-host name(s) to remove.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        return _rm(config, 'runtime_hosts', config.name)
+        return _rm(config, 'runtime_hosts', config.names)
 
 
 class CatalogHostCLI(scfg.ModalCLI):
@@ -598,14 +624,15 @@ class BundleListCLI(_PathOverridesMixin):
 
 
 class BundleRmCLI(_CatalogCommon):
-    """Remove a bundle by name."""
+    """Remove one or more bundles by name."""
     __command__ = 'rm'
-    name = scfg.Value(None, position=1, type=str)
+    names = scfg.Value([], nargs='+', position=1, type=str,
+                       help='Bundle name(s) to remove.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        return _rm(config, 'bundles', config.name)
+        return _rm(config, 'bundles', config.names)
 
 
 class CatalogBundleCLI(scfg.ModalCLI):

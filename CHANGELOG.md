@@ -142,13 +142,15 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     import path (loguru is ~50ms) and silent for library/test use until the CLI
     enables it, so stdout/JSON output is untouched.
   - `infer-stack catalog endpoint add` — `NAME` is now optional and defaults to
-    the `--model` (the vLLM model name, or the Ollama tag, slugified to a safe
-    alias). So `catalog endpoint add --model smol135` creates the endpoint
-    `smol135`, keeping the served alias (what Open WebUI shows) tied to the
+    `{model}-{N}` (the vLLM model name, or the Ollama tag, slugified, with an
+    auto-incrementing suffix). So `catalog endpoint add --model smol135` creates
+    `smol135-1`, and a repeated add for the same model gets `smol135-2` instead
+    of colliding — keeping the served name (what Open WebUI shows) tied to the
     model. An explicit `NAME` is still there for a stable alias decoupled from
-    the model (e.g. `chat` you can re-point); a default name that would clobber
-    an existing endpoint errors with a hint to pass a `NAME` (no silent
-    overwrite).
+    the model (e.g. `chat` you can re-point with `--force`).
+  - `infer-stack catalog <model|endpoint|host|bundle> rm` now takes **multiple
+    names** (`rm a b c`); removal is atomic — if any name is missing, nothing is
+    removed.
   - `infer-stack env` — read/write the managed compose `.env` (path / `env KEY`
     / `env KEY=VALUE` / `--export`); e.g. `env HF_TOKEN=…` sets a gated model's
     token once before `serve`. (Supersedes the short-lived `secret` modal and

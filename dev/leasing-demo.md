@@ -3,7 +3,7 @@
 A walkthrough, not a test plan. Where `leasing-test-plan.md` pokes at edges,
 this shows the **happy path a real user takes**: set up your config + storage
 once, deploy a chat model as a standing service, talk to it from Open WebUI,
-then switch models around — all through the leasing CLI.
+then run several models side by side — all through the leasing CLI.
 
 Validated against **yardrat**: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
 Quadro RTX 5000 (16 GiB, display-attached). Both Turing (sm_75): **fp16 only**,
@@ -54,20 +54,25 @@ No YAML by hand — the `catalog` editor validates as it writes:
 infer-stack catalog init
 infer-stack catalog model add smol17b --source hf://HuggingFaceTB/SmolLM2-1.7B-Instruct
 infer-stack catalog model add smol135 --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
-# the main endpoint (Turing => --dtype=half), kept warm across releases:
-infer-stack catalog endpoint add chat --engine vllm --model smol17b \
+# Omit the endpoint NAME and it defaults to the model, so what you serve and see
+# in Open WebUI *is* the model (Turing => --dtype=half). The main one is kept warm:
+infer-stack catalog endpoint add --model smol17b \
     --max-model-len 8192 --gpu-mem 0.4 --extra-args='--dtype=half' --reclaim keep-warm
-# a small, fast one that frees its GPU on release:
-infer-stack catalog endpoint add chat-fast --engine vllm --model smol135 \
+# the small one frees its GPU on release:
+infer-stack catalog endpoint add --model smol135 \
     --max-model-len 4096 --gpu-mem 0.2 --extra-args='--dtype=half' --reclaim stop
 infer-stack catalog show
 ```
 
-We name these endpoints (`chat`, `chat-fast`) because the demo re-points them at
-different models later — a stable alias decoupled from the model. When you don't
-need that, **omit the NAME and it defaults to the model**, so the alias you see
-in Open WebUI is the model: `infer-stack catalog endpoint add --model smol135`
-adds an endpoint named `smol135`.
+A defaulted name gets an auto-incrementing `-N` suffix, so this gives two
+endpoints named after their models — **`smol17b-1`** and **`smol135-1`** — which
+is what we use throughout. (Add another `--model smol17b` endpoint and it becomes
+`smol17b-2`, never clobbering the first.) `infer-stack catalog show` lists them.
+
+> Want a stable alias *decoupled* from the model (a `chat` you later re-point at
+> whatever's current)? Name the endpoint explicitly instead:
+> `infer-stack catalog endpoint add chat --model smol17b`. The demo stays
+> model-centric so the name in Open WebUI tells you which model you're talking to.
 
 > Gated model? Set the token once (stored in the managed `.env` that Compose
 > auto-loads), no shell export: `infer-stack env HF_TOKEN=hf_…`.
@@ -89,7 +94,7 @@ automatically when output isn't a terminal (scripts/CI). infer-stack also
 narrates what it's doing (placement, `docker compose up`, readiness) on stderr.
 
 ```bash
-infer-stack serve chat --require-generation --timeout 1200
+infer-stack serve smol17b-1 --require-generation --timeout 1200
 # shows the compose diff, asks to apply (or pass --yes), then:
 #   open webui: http://127.0.0.1:13000
 ```
@@ -107,11 +112,11 @@ infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stac
 ## 3. Talk to it (the stable front door)
 
 The quickest check is the built-in smoke test — it sends a real generation to
-the endpoint *alias* through the gateway and prints latency + the reply:
+the endpoint through the gateway and prints latency + the reply:
 
 ```bash
-infer-stack test chat
-# chat: ok (0.42s) 'ready'
+infer-stack test smol17b-1
+# smol17b-1: ok (0.42s) 'ready'
 ```
 
 Under the hood that is one HTTP call to a single base URL
@@ -124,12 +129,11 @@ curl -s http://127.0.0.1:14042/v1/models \
   -H "Authorization: Bearer $KEY" | python -m json.tool
 curl -s http://127.0.0.1:14042/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"chat","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":16}'
+  -d '{"model":"smol17b-1","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":16}'
 ```
 
-You ask for the **endpoint alias** (`chat`), not the HF model id — the gateway
-routes it. That indirection lets you swap the model behind an alias without
-changing any client.
+You ask for the **endpoint name** (`smol17b-1`, your catalog's short name for the
+model), not the full HF id — the gateway routes it.
 
 ---
 
@@ -138,34 +142,35 @@ changing any client.
 Because `serve` brought Open WebUI up with the stack, just browse to it:
 
 ```bash
-echo "Open WebUI -> http://$(hostname):13000  (model: chat)"
+echo "Open WebUI -> http://$(hostname):13000  (model: smol17b-1)"
 ```
 
-`chat` is in the model picker. Its chat history persists under your data dir
+`smol17b-1` is in the model picker. Its chat history persists under your data dir
 (`$(infer-stack config get data_dir)/open-webui`), so it survives restarts and
 model switches — and crucially the UI container is **not** recreated when you
 add/remove/switch models (only the gateway is), so it never blinks. `WEBUI_AUTH`
 is off for a single-user workstation — don't expose port 13000 publicly.
 
-> Don't want it? `infer-stack serve chat --no-ui` (once) or
+> Don't want it? `infer-stack serve smol17b-1 --no-ui` (once) or
 > `infer-stack config set ui false` (always). Turning it back on re-renders it
 > on the next `serve`/`acquire`.
 
 ---
 
-## 5. Switch models around (the whole point)
+## 5. Run several models at once (the whole point)
 
-The gateway stays put; what's behind it is yours to change. Add the small model
-alongside the main one — Open WebUI's model list updates automatically:
+The gateway stays put; add or drop models freely and Open WebUI's picker
+follows. Bring the small model up alongside the big one — each is addressable by
+its own name:
 
 ```bash
-infer-stack serve chat-fast --require-generation --timeout 600
-infer-stack leases          # two live groups now
-infer-stack test chat-fast  # confirm the new alias serves
+infer-stack serve smol135-1 --require-generation --timeout 600
+infer-stack leases            # two live groups now
+infer-stack test smol135-1    # confirm the new model serves
 ```
 
-Open WebUI picks up the new alias automatically (its model list refreshes from
-the gateway) and the UI container itself is untouched by the switch.
+Both models now show in Open WebUI by name (`smol17b-1`, `smol135-1`); the UI
+container itself is untouched by the change.
 
 Drop a standing service when you're done. A `serve` lease has no env-file, so
 release it by its session id (copy it from `leases`):
@@ -173,7 +178,7 @@ release it by its session id (copy it from `leases`):
 ```bash
 infer-stack leases          # note the session id of the lease to drop
 infer-stack release <SESSION_ID>
-# chat is reclaim:keep-warm (stays resident); chat-fast is reclaim:stop
+# smol17b-1 is reclaim:keep-warm (stays resident); smol135-1 is reclaim:stop
 # (its container is torn down once no lease protects it).
 ```
 
@@ -181,16 +186,17 @@ A `keep-warm` model stays resident after release (no cold-start next time) — b
 it holds its GPU. To free that GPU now, **evict** it (overrides keep-warm):
 
 ```bash
-infer-stack evict chat       # tear down the idle `chat` group now (by alias)
+infer-stack evict smol17b-1  # tear down the idle `smol17b-1` group now (by name)
 infer-stack evict --all      # ...or every idle/released model at once
 # or do it in one step at release time:
 infer-stack release <SESSION_ID> --evict
 ```
 
-To change the model itself: `infer-stack catalog model add smol17b --source
-hf://other/Model --force` (or edit runtime via `catalog endpoint add chat …
---force`), release the old lease, and `serve chat` again. Same alias, new model —
-clients and Open WebUI don't change.
+> Prefer one **stable name that outlives the model behind it** (a `chat` you
+> re-point)? Use an explicit endpoint name and swap its `--model` with `--force`:
+> `infer-stack catalog endpoint add chat --model smol17b`, later
+> `infer-stack catalog endpoint add chat --model smol17b-v2 --force`; clients and
+> Open WebUI keep asking for `chat` while the model behind it changes.
 
 ---
 
@@ -223,11 +229,12 @@ The earlier draft of this demo flagged five ergonomic smells; building the
 - ✅ **Managed Open WebUI** — bundled into the leasing stack and on by default
   (`--no-ui` / `config set ui false` to opt out). Stable across model switches
   (the UI container isn't recreated when routing changes), so it never blinks.
-- ✅ **Concise smoke test** — `infer-stack test chat` instead of hand-rolled
-  `curl`.
+- ✅ **Concise smoke test** — `infer-stack test smol17b-1` instead of
+  hand-rolled `curl`.
 
 Still open (tracked in `dev/leasing-followups.md`):
 
 - **No endpoint-addressed teardown for standing services.** Stopping a `serve`
   means copying a session id out of `infer-stack leases`. Want
-  `infer-stack release --endpoint chat` / `unserve chat`.
+  `infer-stack release --endpoint smol17b-1` / `unserve smol17b-1`. (`evict
+  smol17b-1` already tears the deployment down, but doesn't release the lease.)

@@ -50,14 +50,14 @@ def test_add_model_endpoint_roundtrips_and_validates(tmp_path):
 
 
 def test_endpoint_name_defaults_to_model(tmp_path):
-    # No NAME given -> the endpoint alias defaults to the (vLLM) model name,
-    # so the served alias / Open WebUI label is tied to the model.
+    # No NAME given -> the endpoint alias defaults to `{model}-1`, so the served
+    # alias / Open WebUI label is tied to the model.
     ModelAddCLI.main(argv=['smol135', '--source', 'hf://org/Smol',
                            *_opts(tmp_path)])
     EndpointAddCLI.main(argv=['--model', 'smol135', '--max-model-len', '4096',
                               *_opts(tmp_path)])
     cat = Catalog.load(cat_path(tmp_path))
-    assert cat.endpoints['smol135'].model == 'smol135'
+    assert cat.endpoints['smol135-1'].model == 'smol135'
 
 
 def test_endpoint_default_name_slugs_ollama_tag(tmp_path):
@@ -67,8 +67,8 @@ def test_endpoint_default_name_slugs_ollama_tag(tmp_path):
     EndpointAddCLI.main(argv=['--engine', 'ollama', '--model', 'llama3:8b',
                               '--host', 'gpu0', *_opts(tmp_path)])
     cat = Catalog.load(cat_path(tmp_path))
-    assert 'llama3-8b' in cat.endpoints
-    assert cat.endpoints['llama3-8b'].model == 'llama3:8b'
+    assert 'llama3-8b-1' in cat.endpoints
+    assert cat.endpoints['llama3-8b-1'].model == 'llama3:8b'
 
 
 def test_endpoint_no_name_no_model_errors(tmp_path):
@@ -77,13 +77,13 @@ def test_endpoint_no_name_no_model_errors(tmp_path):
         EndpointAddCLI.main(argv=_opts(tmp_path))   # neither NAME nor --model
 
 
-def test_endpoint_default_name_collision_guarded(tmp_path):
-    # A second default-named endpoint for the same model must not clobber the
-    # first; it errors (the footgun guard) unless --force.
+def test_endpoint_default_name_autoincrements(tmp_path):
+    # Repeated default-named adds for one model accumulate as -1, -2 (no clobber).
     ModelAddCLI.main(argv=['m', '--source', 'hf://org/M', *_opts(tmp_path)])
     EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
-    with pytest.raises(SystemExit):
-        EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+    cat = Catalog.load(cat_path(tmp_path))
+    assert set(cat.endpoints) == {'m-1', 'm-2'}
 
 
 def test_endpoint_referencing_missing_model_is_refused(tmp_path):
@@ -128,6 +128,21 @@ def test_rm_missing_errors_and_rm_removes(tmp_path):
     EndpointRmCLI.main(argv=['e', *_opts(tmp_path)])
     cat = Catalog.load(cat_path(tmp_path))
     assert 'e' not in cat.endpoints
+
+
+def test_rm_multiple_endpoints(tmp_path):
+    ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
+    for nm in ('a', 'b', 'c'):
+        EndpointAddCLI.main(argv=[nm, '--model', 'm', *_opts(tmp_path)])
+    # rm accepts several names at once
+    EndpointRmCLI.main(argv=['a', 'c', *_opts(tmp_path)])
+    cat = Catalog.load(cat_path(tmp_path))
+    assert set(cat.endpoints) == {'b'}
+
+    # one missing name -> nothing removed (atomic)
+    with pytest.raises(SystemExit):
+        EndpointRmCLI.main(argv=['b', 'ghost', *_opts(tmp_path)])
+    assert 'b' in Catalog.load(cat_path(tmp_path)).endpoints
 
 
 def test_bundle_add_and_validate(tmp_path):
