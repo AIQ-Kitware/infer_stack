@@ -186,6 +186,22 @@ infer-stack test smol135-1    # confirm the new model serves
 Both models now show in Open WebUI by name (`smol17b-1`, `smol135-1`); the UI
 container itself is untouched by the change.
 
+**Bring several up in parallel.** `serve` blocks until ready by default; pass
+`--no-wait` to kick a deployment off and return immediately, then `wait` for
+them together (so two models load at once instead of back-to-back):
+
+```bash
+infer-stack serve smol17b-1 --no-wait --yes
+infer-stack serve smol135-1 --no-wait --yes
+infer-stack wait smol17b-1 smol135-1 --require-generation --timeout 1200
+# (bare `infer-stack wait` waits for every live model)
+```
+
+> `--require-generation` is the readiness *criterion* (ready == a real generated
+> token, not just a listed model); `--no-wait` / `wait` are the *blocking*
+> control. They're separate knobs: `serve` already waits unless you say
+> `--no-wait`, and `wait` re-blocks later.
+
 Drop a standing service when you're done. A `serve` lease has no env-file, so
 release it by its session id (copy it from `leases`):
 

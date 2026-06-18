@@ -155,6 +155,25 @@ def test_serve_is_standing_lease(env, capsys):
     assert data['leases'][0]['expires_at'] is None
 
 
+def test_wait_after_parallel_no_wait_serves(env, capsys):
+    from infer_stack.cli.commands_leasing import WaitCLI
+
+    # fan out: kick both off without blocking, then wait for both
+    ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-wait'])
+    ServeCLI.main(argv=['reranker', *_base(env), '--no-wait'])
+    capsys.readouterr()
+    rc = WaitCLI.main(argv=['qwen-coder', 'reranker', '--ledger', env.db])
+    assert rc == 0                                    # null backend: ready now
+    assert 'ready' in capsys.readouterr().out
+
+
+def test_wait_unknown_endpoint_errors(env):
+    from infer_stack.cli.commands_leasing import WaitCLI
+
+    with pytest.raises(SystemExit):
+        WaitCLI.main(argv=['ghost', '--ledger', env.db])   # nothing serving it
+
+
 def test_renew_extends(env):
     envf = env.tmp / 'is.env'
     AcquireCLI.main(

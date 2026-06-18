@@ -550,6 +550,77 @@ class EvictCLI(_LeasingCommonMixin):
         return 0
 
 
+class WaitCLI(_LeasingCommonMixin):
+    """Block until served endpoints are ready — the companion to ``serve
+    --no-wait``.
+
+    Fan out, then wait: ``serve --no-wait smol17b-1`` + ``serve --no-wait
+    smol135-1`` kick both deployments off in parallel (each converges and starts
+    its container without blocking), then ``wait smol17b-1 smol135-1`` blocks
+    until they can actually serve. With no names it waits for every live group.
+
+    ``--require-generation`` makes "ready" mean a real generated token (not just
+    a model that is listed) — the same readiness *criterion* the acquire/serve
+    verbs take; this command is the *blocking* half, distinct from it.
+    """
+
+    __command__ = 'wait'
+
+    names = scfg.Value(
+        [], nargs='*', position=1, type=str,
+        help='Endpoint names to wait for (default: every live group).',
+    )
+    timeout = scfg.Value(600, type=float, help='Overall wait timeout (s).')
+    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        controller.ledger.sweep()
+        _, groups = controller.ledger.status()
+        live = [g for g in groups if g.state == GroupState.LIVE]
+        names = _collect_names(config.names)
+        if names:
+            wanted = set(names)
+            served = {ep for g in live for ep in g.served}
+            missing = sorted(wanted - served)
+            if missing:
+                raise SystemExit(
+                    f'not served by any live group: {", ".join(missing)} '
+                    '(serve it first, or check `infer-stack leases`)'
+                )
+            targets = [g for g in live if wanted & set(g.served)]
+            endpoints = wanted
+        else:
+            targets, endpoints = live, None
+        if not targets:
+            print('nothing to wait for (no live groups)')
+            return 0
+        result = controller.wait_ready(
+            targets,
+            endpoints=endpoints,
+            timeout=float(config.timeout),
+            interval=float(config.interval),
+        )
+        if config.json:
+            print(json.dumps({
+                'ready': result.ready,
+                'pending': [
+                    {'group': gid, 'endpoint': ep}
+                    for gid, ep in result.pending
+                ],
+            }, indent=2))
+        elif result.ready:
+            print('ready')
+        else:
+            print('not ready (timed out)')
+            for gid, ep in result.pending:
+                print(f'  pending: {ep} ({gid})')
+        return 0 if result.ready else 2
+
+
 class RenewCLI(_LeasingCommonMixin):
     """Extend (or make infinite) a lease's protection window."""
 

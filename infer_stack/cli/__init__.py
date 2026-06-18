@@ -59,6 +59,7 @@ from .commands_leasing import (
     RunCLI,
     ServeCLI,
     TestCLI,
+    WaitCLI,
 )
 from .commands_leasing import EnvCLI as LeasingEnvCLI
 from .commands_meta import (
@@ -202,6 +203,7 @@ class ManageCLI(scfg.ModalCLI):
     renew = RenewCLI
     run = RunCLI
     serve = ServeCLI
+    wait = WaitCLI  # block until endpoints are ready (serve --no-wait fan-out)
     leases = LeasesCLI
     test = TestCLI  # smoke-test a served endpoint through the front door
     env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE

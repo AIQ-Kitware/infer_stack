@@ -119,6 +119,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   - `infer-stack release --all` — release every active lease in one shot (the
     whole stack idles/tears down per each lease's reclaim policy). Makes teardown
     a one-liner instead of scraping session ids out of `leases`.
+  - `infer-stack wait [NAME…]` — block until served endpoints are ready, the
+    leasing-native companion to `serve --no-wait` (the old `wait-ready` was
+    legacy/profile-only). Lets you fan out — `serve --no-wait a; serve --no-wait
+    b; wait a b` loads models in parallel instead of back-to-back. No names waits
+    for every live group; `--require-generation`/`--timeout`/`--interval` apply.
+    (Readiness has two orthogonal knobs: `--require-generation` is the
+    *criterion* — a real token vs a listed model — and `--wait`/`--no-wait` +
+    `wait` are the *blocking* control.)
   - `infer-stack evict [NAME…|--all]` — force-tear-down released (idle) models
     now, overriding `keep-warm`, to free their GPUs. A keep-warm model normally
     stays resident after release (no cold-start next time) but holds a GPU; evict
