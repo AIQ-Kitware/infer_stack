@@ -2,7 +2,7 @@
 
 A walkthrough, not a test plan. Where `leasing-test-plan.md` pokes at edges,
 this shows the **happy path a real user takes**: set up your config + storage
-once, deploy a big chat model as a standing service, talk to it from Open WebUI,
+once, deploy a chat model as a standing service, talk to it from Open WebUI,
 then switch models around — all through the leasing CLI.
 
 Validated against **yardrat**: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
@@ -25,14 +25,15 @@ the commands are short.
 
 ### 1a. Choose where docker-mounted state lives
 
-The vLLM containers bind-mount a Hugging Face weight cache; a 14B model is
-~28 GiB on disk. That cache (and Open WebUI's chat history) lives under
-`INFER_STACK_DATA_DIR`. Pick a real, persistent location on a disk with room —
-**not** `/tmp` — and make it the default for every future shell:
+The vLLM containers bind-mount a Hugging Face weight cache (a few GiB for these
+SmolLM2 models; tens of GiB if you later serve a large model). That cache (and
+Open WebUI's chat history) lives under `INFER_STACK_DATA_DIR`. Pick a real,
+persistent location — **not** `/tmp` — and make it the default for every future
+shell:
 
 ```bash
-# Point this at your big disk. $HOME is fine if it has ~40 GiB free;
-# otherwise use something like /data/infer-stack.
+# Point this at a disk with room. $HOME is fine for the demo; use something
+# like /data/infer-stack if you'll serve larger models.
 echo 'export INFER_STACK_DATA_DIR="$HOME/infer-stack"' >> ~/.bashrc
 export INFER_STACK_DATA_DIR="$HOME/infer-stack"
 mkdir -p "$INFER_STACK_DATA_DIR"
@@ -48,25 +49,27 @@ flag. This is the file you edit over time as you add models.
 ```bash
 mkdir -p ~/.config/infer_stack
 cat > ~/.config/infer_stack/catalog.yaml <<'YAML'
-# Your standing model catalog. Turing GPUs => --dtype=half on every vLLM model.
+# Your standing model catalog. Turing GPUs => --dtype=half on every vLLM model;
+# SmolLM2 is ungated and tiny, so the demo runs end-to-end in minutes. Swap the
+# `source` for a bigger model when you're ready — nothing else changes.
 models:
-  qwen14b: {source: hf://Qwen/Qwen2.5-14B-Instruct}   # the "big" model (~28 GiB)
-  qwen05b: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}  # a small, fast model
+  smol17b: {source: hf://HuggingFaceTB/SmolLM2-1.7B-Instruct}   # the main model
+  smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}   # a fast/tiny one
 endpoints:
-  big-chat:
+  chat:
     engine: vllm
-    model: qwen14b
-    runtime:
-      max_model_len: 16384
-      gpu_memory_utilization: 0.9
-      extra_args: ['--dtype=half']
-    reclaim: {policy: keep-warm}      # stay resident across releases
-  fast-chat:
-    engine: vllm
-    model: qwen05b
+    model: smol17b
     runtime:
       max_model_len: 8192
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.4
+      extra_args: ['--dtype=half']
+    reclaim: {policy: keep-warm}      # stay resident across releases
+  chat-fast:
+    engine: vllm
+    model: smol135
+    runtime:
+      max_model_len: 4096
+      gpu_memory_utilization: 0.2
       extra_args: ['--dtype=half']
     reclaim: {policy: stop}
 YAML
@@ -76,16 +79,16 @@ infer-stack paths        # sanity: shows config + leasing artifact locations
 
 ---
 
-## 2. Deploy the big model as a standing service
+## 2. Deploy the model as a standing service
 
 `serve` is an infinite lease (no TTL) — the right verb for "deploy this and keep
 it up". `--require-generation` makes readiness honest (waits for a real token,
-not just the model being listed). The first run downloads ~28 GiB from HF, so
-give it a generous timeout.
+not just the model being listed). The first run downloads the weights from HF
+(a few GiB for SmolLM2-1.7B), so give it a generous timeout.
 
 ```bash
 export INFER_STACK_DATA_DIR="$HOME/infer-stack"
-infer-stack serve big-chat --backend compose --require-generation --timeout 3600
+infer-stack serve chat --backend compose --require-generation --timeout 1200
 ```
 
 Watch it come up from another shell:
@@ -115,10 +118,10 @@ curl -s http://127.0.0.1:14042/v1/models \
   -H "Authorization: Bearer $KEY" | python -m json.tool
 curl -s http://127.0.0.1:14042/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"big-chat","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":16}'
+  -d '{"model":"chat","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":16}'
 ```
 
-You ask for the **endpoint alias** (`big-chat`), not the HF model id — the
+You ask for the **endpoint alias** (`chat`), not the HF model id — the
 gateway routes it. That indirection is what lets you swap the model behind an
 alias without changing any client.
 
@@ -141,10 +144,10 @@ docker run -d --name open-webui --restart unless-stopped \
   -e WEBUI_AUTH=False \
   -v "$INFER_STACK_DATA_DIR/open-webui:/app/backend/data" \
   ghcr.io/open-webui/open-webui:main
-echo "Open WebUI -> http://$(hostname):3000  (model: big-chat)"
+echo "Open WebUI -> http://$(hostname):3000  (model: chat)"
 ```
 
-Browse to `http://<yardrat>:3000`. `big-chat` is in the model picker. (`WEBUI_AUTH=False`
+Browse to `http://<yardrat>:3000`. `chat` is in the model picker. (`WEBUI_AUTH=False`
 skips login for a single-user demo — don't expose that port publicly. The key is
 passed at container start; if you rotate it, `docker rm -f open-webui` and re-run.)
 
@@ -153,12 +156,12 @@ passed at container start; if you rotate it, `docker rm -f open-webui` and re-ru
 ## 5. Switch models around (the whole point)
 
 The gateway stays put; what's behind it is yours to change. Add the small model
-alongside the big one — Open WebUI's model list updates automatically (it reads
+alongside the main one — Open WebUI's model list updates automatically (it reads
 `/v1/models`):
 
 ```bash
 export INFER_STACK_DATA_DIR="$HOME/infer-stack"
-infer-stack serve fast-chat --backend compose --require-generation --timeout 600
+infer-stack serve chat-fast --backend compose --require-generation --timeout 600
 infer-stack leases          # two live groups now; refresh Open WebUI's model list
 ```
 
@@ -169,13 +172,13 @@ env-file, so release it by its session id (copy it from `leases`):
 export INFER_STACK_DATA_DIR="$HOME/infer-stack"
 infer-stack leases          # note the session id of the lease you want gone
 infer-stack release <SESSION_ID>
-# big-chat is reclaim:keep-warm (stays resident); fast-chat is reclaim:stop
+# chat is reclaim:keep-warm (stays resident); chat-fast is reclaim:stop
 # (its container is torn down once no lease protects it).
 ```
 
-To change the big model itself, edit `~/.config/infer_stack/catalog.yaml`
-(e.g. bump `max_model_len`, or point `qwen14b` at a different `source`), release
-the old lease, and `serve big-chat` again. Same alias, new model — clients and
+To change the model itself, edit `~/.config/infer_stack/catalog.yaml`
+(e.g. bump `max_model_len`, or point `smol17b` at a different `source`), release
+the old lease, and `serve chat` again. Same alias, new model — clients and
 Open WebUI don't change.
 
 ---
@@ -207,7 +210,7 @@ that's a smell" check.)
    repeats it constantly. The leasing verbs default to `--backend null`.
    *Proposal:* honor a persisted default (an `INFER_STACK_BACKEND` env var, or a
    `backend:` key in the catalog/user config) so a configured host can just say
-   `infer-stack serve big-chat`.
+   `infer-stack serve chat`.
 
 2. **Storage location is env-only for the leasing path.** Legacy `setup` baked
    `state.*` paths into `config.yaml`; the leasing Compose backend ignores that
@@ -219,8 +222,8 @@ that's a smell" check.)
 
 3. **No endpoint-addressed teardown for standing services.** `serve` has no
    env-file, so stopping it means copying a session id out of `infer-stack
-   leases`. *Proposal:* `infer-stack release --endpoint big-chat` (or
-   `infer-stack unserve big-chat`) to release standing leases by the name you
+   leases`. *Proposal:* `infer-stack release --endpoint chat` (or
+   `infer-stack unserve chat`) to release standing leases by the name you
    served them under.
 
 4. **Open WebUI is unmanaged.** The legacy stack rendered Open WebUI + its
