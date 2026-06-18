@@ -39,6 +39,22 @@ fi
 
 _now() { date +%s.%N; }
 
+# --- heartbeat lifecycle ----------------------------------------------------
+# The per-step progress heartbeat is a backgrounded subshell. In a
+# non-interactive script bash makes async commands IGNORE SIGINT, so a Ctrl-C
+# would otherwise leave the heartbeat looping and printing long after the run.
+# We track its pid and kill it (and its in-flight `sleep` child) on every exit
+# path of this test-script process — normal, error, INT, or TERM.
+_HB_PID=''
+_kill_hb() {
+    [ -n "$_HB_PID" ] || return 0
+    kill "$_HB_PID" $(pgrep -P "$_HB_PID" 2>/dev/null) 2>/dev/null
+    wait "$_HB_PID" 2>/dev/null
+    _HB_PID=''
+}
+trap '_kill_hb' EXIT
+trap '_kill_hb; exit 130' INT TERM
+
 # step <id> <title...>
 step() {
     CUR_ID="$1"; shift
@@ -68,20 +84,20 @@ run() {
     local start end
     printf '\n$ %s\n' "$1" >> "$CUR_LOG"
     start="$(_now)"
+    # Heartbeat also self-terminates if this test-script process dies (kill -0
+    # $$ — in a subshell $$ is the parent shell's pid), covering even SIGKILL or
+    # a missed trap. Belt-and-suspenders with the EXIT/INT/TERM trap above.
     ( while true; do
         sleep 20
+        kill -0 "$$" 2>/dev/null || exit 0
         printf '    %s… still running (%ds)%s\n' "$C_DIM" \
             "$(awk -v a="$start" -v b="$(_now)" 'BEGIN{printf "%d", b-a}')" \
             "$C_RST"
       done ) &
-    local hb=$!
+    _HB_PID=$!
     bash -c "$1" > "$LAST_OUT_FILE" 2>&1
     RC=$?
-    # Kill the heartbeat AND its in-flight `sleep` child (grab the child before
-    # killing the parent, else it gets reparented and lingers up to 20s).
-    local hbkids; hbkids="$(pgrep -P "$hb" 2>/dev/null)"
-    kill "$hb" $hbkids 2>/dev/null
-    wait "$hb" 2>/dev/null
+    _kill_hb
     end="$(_now)"
     DUR="$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')"
     cat "$LAST_OUT_FILE" >> "$CUR_LOG"
