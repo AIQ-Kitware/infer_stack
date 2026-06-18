@@ -693,6 +693,42 @@ class StopCLI(_ComposeWrapperBase):
         return int(proc.returncode)
 
 
+class StackDownCLI(_ComposeWrapperBase):
+    """``docker compose down`` the deployment (leasing stack when present).
+
+    Tears the whole project down. Leasing's reconcile manages teardown
+    automatically on release; this is the manual escape hatch (cf. cleanup).
+    """
+
+    volumes = scfg.Value(
+        False, isflag=True, help='Also remove named volumes (--volumes).'
+    )
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        cmd = _day2_compose_base(config, 'down') + ['down', '--remove-orphans']
+        if config.volumes:
+            cmd.append('--volumes')
+        proc = subprocess.run(cmd)
+        return int(proc.returncode)
+
+
+class StackModalCLI(scfg.ModalCLI):
+    """Day-2 ops on the running deployment (leasing stack when present)."""
+
+    __command__ = 'stack'
+
+    logs = LogsCLI
+    ps = PsCLI
+    restart = RestartCLI
+    pull = PullCLI
+    start = StartCLI
+    stop = StopCLI
+    down = StackDownCLI
+
+
 class OllamaPullCLI(
     _PathOverridesMixin, _BackendOverrideMixin, _ComposeOverrideMixin
 ):

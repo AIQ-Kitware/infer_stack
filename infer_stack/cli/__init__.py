@@ -91,12 +91,9 @@ from .commands_runtime import (
     OllamaPsCLI,
     OllamaPullCLI,
     PsCLI,
-    PullCLI,
     PurgeCLI,
-    RestartCLI,
-    StartCLI,
+    StackModalCLI,
     StatusCLI,
-    StopCLI,
     UpCLI,
 )
 from .commands_smoke import (
@@ -198,13 +195,11 @@ class ManageCLI(scfg.ModalCLI):
     secret = SecretModalCLI  # secret get|set|list
     secrets = SecretsCLI  # alias for `secret get` (script compatibility)
 
-    # Compose day-2-ops wrappers
+    # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
+    # at the top level as the two hottest convenience aliases.
+    stack = StackModalCLI
     logs = LogsCLI
     ps = PsCLI
-    restart = RestartCLI
-    pull = PullCLI
-    start = StartCLI
-    stop = StopCLI
 
 
 def main(argv=None) -> int:
