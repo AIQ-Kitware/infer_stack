@@ -349,6 +349,62 @@ def test_litellm_config_hash_label_tracks_model_list(tmp_path):
     assert label(one) == h_one       # stable for identical input (idempotent)
 
 
+def test_render_open_webui_default_and_stable(tmp_path):
+    """Open WebUI renders with the gateway and is byte-stable across switches."""
+    state = {**STATE, 'open_webui': '/cache/open-webui'}
+    images = {**IMAGES, 'open_webui': 'ghcr.io/open-webui/open-webui:test'}
+
+    def render(groups, assigns):
+        return render_compose(
+            groups, assigns, images=images, ports=PORTS, state=state,
+            litellm=True, ui=True, ui_port=13000,
+            litellm_master_key='sk-x', aux_dir=tmp_path,
+        )
+
+    one = render([vllm('grp-a', served='a')], {'grp-a': [0]})
+    ow = one.compose['services']['open-webui']
+    assert ow['ports'] == ['13000:8080']
+    assert ow['environment']['OPENAI_API_BASE_URL'] == 'http://litellm:4000/v1'
+    assert ow['environment']['OPENAI_API_KEY'] == 'sk-x'
+    assert ow['depends_on'] == ['litellm']
+
+    # Adding a second model recreates litellm (routing changed) but must NOT
+    # touch open-webui — that is what keeps the UI from blinking on a switch.
+    two = render([vllm('grp-a', served='a'), vllm('grp-b', served='b', t=1.0)],
+                 {'grp-a': [0], 'grp-b': [1]})
+    assert two.compose['services']['open-webui'] == ow
+    assert two.compose['services']['litellm'] != one.compose['services']['litellm']
+
+
+def test_render_no_open_webui_when_ui_off(tmp_path):
+    state = {**STATE, 'open_webui': '/cache/open-webui'}
+    images = {**IMAGES, 'open_webui': 'ow:test'}
+    rc = render_compose(
+        [vllm('grp-a', served='a')], {'grp-a': [0]},
+        images=images, ports=PORTS, state=state,
+        litellm=True, ui=False, aux_dir=tmp_path,
+    )
+    assert 'open-webui' not in rc.compose['services']
+
+
+def test_litellm_router_settings_present(tmp_path):
+    rc = render_compose(
+        [vllm('grp-a', served='a')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, aux_dir=tmp_path,
+    )
+    cfg = yaml.safe_load(rc.litellm_config)
+    # transient upstream connection errors during warmup are retried, not 500s
+    assert cfg['router_settings']['num_retries'] >= 1
+
+
+def test_access_includes_ui_url_when_ui_on(tmp_path):
+    be = make_backend(tmp_path, ui=True)
+    assert be.access(['a'])['ui_url'] == 'http://127.0.0.1:13000'
+    be_noui = make_backend(tmp_path, ui=False)
+    assert 'ui_url' not in be_noui.access(['a'])
+
+
 def test_access_reports_litellm_base_url(tmp_path):
     be = make_backend(tmp_path)
     info = be.access(['qwen-coder', 'reranker'])

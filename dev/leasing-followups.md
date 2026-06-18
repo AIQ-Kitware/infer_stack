@@ -145,9 +145,18 @@ the config is static — same hash → no restart).
 See `dev/leasing-demo.md` §"Ergonomic notes". RESOLVED by the CLI reorg
 (`dev/cli-redesign.md`): persisted default backend (`config set backend`),
 durable storage location (`config set data_dir`, honored by `data_root()`), and
-a managed `HF_TOKEN` slot (`secret set HF_TOKEN=…`). STILL OPEN: no
-endpoint-addressed teardown for standing `serve` leases (want `release
---endpoint <name>` / `unserve`); unmanaged Open WebUI (maybe `infer-stack ui`).
+a managed `HF_TOKEN` slot (`secret set HF_TOKEN=…`). ALSO RESOLVED: Open WebUI
+is now managed — bundled into the leasing compose stack, on by default
+(`--no-ui` / `config set ui false`), and rendered stable across model switches
+so it isn't recreated when routing changes (see `infer_stack.leasing.compose
+._open_webui_service`). STILL OPEN: no endpoint-addressed teardown for standing
+`serve` leases (want `release --endpoint <name>` / `unserve`).
+
+Open WebUI sub-follow-ups: it currently runs with `WEBUI_AUTH=False` (single-user
+workstation assumption) — expose an auth/port knob before anyone points it at a
+shared host. And like LiteLLM, the UI's own recreation on key rotation isn't
+specially handled (rare; the baked `OPENAI_API_KEY` changes the spec, so it
+recreates — acceptable).
 
 Also: reclaim:stop deployment groups linger in the ledger as `state=stopped` and
 still show up in `infer-stack leases` / its group list. Decide whether `leases`

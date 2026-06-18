@@ -95,6 +95,26 @@ def _parse_gpus(text) -> list[int] | None:
     return [int(p) for p in str(text).split(',') if p.strip() != '']
 
 
+def _coerce_bool(value, default: bool) -> bool:
+    """Interpret a setting/flag as a bool (None -> default)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _resolve_ui(config) -> bool:
+    """Open WebUI on/off: explicit --ui/--no-ui wins, else `config set ui`,
+    else on by default."""
+    from ..paths import get_setting
+
+    flag = getattr(config, 'ui', None)
+    if flag is not None:
+        return bool(flag)
+    return _coerce_bool(get_setting('ui'), True)
+
+
 def _make_backend(config):
     from ..paths import get_setting
 
@@ -113,6 +133,7 @@ def _make_backend(config):
             skip_display=not bool(
                 getattr(config, 'include_display_gpus', False)
             ),
+            ui=_resolve_ui(config),
             require_generation=bool(getattr(config, 'require_generation', False)),
         )
     raise SystemExit(
@@ -213,6 +234,10 @@ def _emit_acquire(config, controller, outcome) -> int:
             print(f'  ready: {outcome.wait.ready}')
             for gid, endpoint in outcome.wait.pending:
                 print(f'    pending: {endpoint} ({gid})')
+        access = getattr(controller.backend, 'access', None)
+        info = access(list(outcome.lease.endpoints)) if access else None
+        if info and info.get('ui_url'):
+            print(f'  open webui: {info["ui_url"]}')
         if config.env_file:
             print(f'  env-file: {config.env_file}')
     return 2 if not_ready else 0
@@ -257,6 +282,13 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         isflag=True,
         help='Readiness requires a real generation, not just model listing '
         '(compose backend; Ollama always generates to warm the tag).',
+    )
+    ui = scfg.Value(
+        None,
+        isflag=True,
+        help='Render a managed Open WebUI in front of the gateway (compose '
+        'backend). On by default; use --no-ui to skip. Overrides '
+        '`config set ui …`.',
     )
 
 
@@ -614,15 +646,154 @@ class SecretModalCLI(scfg.ModalCLI):
     list = SecretListCLI
 
 
-class SecretsCLI(_PathOverridesMixin):
-    """Alias for ``secret get`` (kept for ``$(infer-stack secrets KEY)`` scripts)."""
+def _front_door(config) -> tuple[str, str | None]:
+    """Resolve the front-door base_url + master key for a smoke test.
 
-    __command__ = 'secrets'
+    Reads them straight from the managed state (front-door port + ``.env``) so
+    `test` is cheap and doesn't need GPU detection or a backend object. An
+    explicit ``--base-url`` overrides the derived URL.
+    """
+    from ..config import DEFAULT_PORTS
 
-    key = scfg.Value(None, position=1, type=str)
+    base_url = getattr(config, 'base_url', None)
+    if not base_url:
+        port = int(getattr(config, 'port', None) or DEFAULT_PORTS['litellm'])
+        base_url = f'http://127.0.0.1:{port}/v1'
+    key = None
+    env_path = _secret_env_path()
+    if env_path.exists():
+        key = parse_env_file(env_path).get('LITELLM_MASTER_KEY')
+    return base_url.rstrip('/'), key
+
+
+class TestCLI(_PathOverridesMixin):
+    """Smoke-test a served endpoint through the front door (a real generation).
+
+    The concise alternative to hand-rolling ``curl``: sends one chat completion
+    to the endpoint *alias* via the LiteLLM gateway, then prints latency and the
+    reply (or an actionable error). Exit code is non-zero on failure, so it is
+    usable in scripts/CI.
+    """
+
+    __command__ = 'test'
+
+    name = scfg.Value(
+        None, position=1, type=str, help='Endpoint alias to test (e.g. chat).'
+    )
+    prompt = scfg.Value(
+        'Reply with the single word: ready.', type=str, help='Prompt to send.'
+    )
+    max_tokens = scfg.Value(32, type=int)
+    timeout = scfg.Value(60, type=float, help='Request timeout (s).')
+    base_url = scfg.Value(
+        None, type=str, help='Override the gateway base URL (…/v1).'
+    )
+    port = scfg.Value(
+        None, type=int, help='Override the gateway port (default: 14042).'
+    )
+    json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import time
+
+        import requests
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        if not config.name:
+            raise SystemExit('test: give an endpoint alias (e.g. `test chat`)')
+        base_url, key = _front_door(config)
+        headers = {'Content-Type': 'application/json'}
+        if key:
+            headers['Authorization'] = f'Bearer {key}'
+        payload = {
+            'model': config.name,
+            'messages': [{'role': 'user', 'content': config.prompt}],
+            'max_tokens': int(config.max_tokens),
+        }
+        t0 = time.monotonic()
+        try:
+            resp = requests.post(
+                f'{base_url}/chat/completions',
+                headers=headers,
+                json=payload,
+                timeout=float(config.timeout),
+            )
+        except requests.exceptions.RequestException as ex:
+            return _test_fail(config, base_url, f'not reachable: {ex}')
+        dt = time.monotonic() - t0
+        if resp.status_code >= 400:
+            body = (resp.text or '').strip()[:300]
+            return _test_fail(
+                config, base_url, f'HTTP {resp.status_code}: {body}'
+            )
+        try:
+            reply = resp.json()['choices'][0]['message']['content']
+        except (ValueError, KeyError, IndexError) as ex:
+            return _test_fail(config, base_url, f'unexpected response: {ex}')
+        reply = (reply or '').strip()
+        if config.json:
+            print(json.dumps(
+                {'endpoint': config.name, 'ok': True,
+                 'seconds': round(dt, 3), 'reply': reply}, indent=2))
+        else:
+            print(f'{config.name}: ok ({dt:.2f}s) {reply!r}')
+        return 0
+
+
+def _test_fail(config, base_url: str, reason: str) -> int:
+    if config.json:
+        print(json.dumps(
+            {'endpoint': config.name, 'ok': False,
+             'base_url': base_url, 'reason': reason}, indent=2))
+    else:
+        print(f'{config.name}: FAILED via {base_url} — {reason}')
+        print('  is it served?  infer-stack leases   |   '
+              'infer-stack serve ' + str(config.name))
+    return 1
+
+
+class EnvCLI(_PathOverridesMixin):
+    """Print the managed env-file path (or a single value / all exports).
+
+    infer-stack keeps managed secrets — the LiteLLM master key, ``HF_TOKEN``,
+    … — in a ``.env`` that docker compose auto-loads. Anyone who can read it
+    already has the secrets, so we don't hide the path: by default this prints
+    it (``source "$(infer-stack env)"`` to load everything). Pass a KEY to print
+    just that value (``$(infer-stack env LITELLM_MASTER_KEY)``), or ``--export``
+    to print every entry as ``export KEY=value`` lines.
+    """
+
+    __command__ = 'env'
+
+    key = scfg.Value(
+        None, position=1, type=str, help='Variable name; print just its value.'
+    )
+    export = scfg.Value(
+        False, isflag=True, help='Print every entry as `export KEY=value`.'
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        return _print_secret(config)
+        env_path = _secret_env_path()
+        if not (config.key or config.export):
+            # Path first and foremost (it may not exist yet — that's fine).
+            print(env_path)
+            return 0
+        if not env_path.exists():
+            raise SystemExit(
+                f'no managed env-file at {env_path}; run an `acquire`/`serve` '
+                'with --backend compose first (or `infer-stack secret set …`)'
+            )
+        env = parse_env_file(env_path)
+        if config.key:
+            if config.key not in env:
+                raise SystemExit(f'{config.key!r} not found in {env_path}')
+            print(env[config.key])
+            return 0
+        for name, value in env.items():
+            print(f'export {name}={shlex.quote(value)}')
+        return 0

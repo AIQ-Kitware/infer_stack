@@ -57,6 +57,37 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* Managed **Open WebUI**, on by default. The Compose backend now renders an
+  `open-webui` service in front of the LiteLLM gateway whenever the front door
+  is up, so `infer-stack serve chat` brings up a working chat UI (default
+  `http://127.0.0.1:13000`) with no hand-run `docker run`. Its spec is
+  independent of which models are live (it talks to the `litellm` service at a
+  fixed URL), so `docker compose up -d` leaves it running across model
+  add/remove/switch — only the gateway is recreated on a routing change, so the
+  UI never blinks (the property the legacy stack worked to preserve). Chat
+  history persists under the data dir. Opt out per-call with `--no-ui` or
+  globally with `infer-stack config set ui false`; `serve`/`acquire` print the
+  UI URL when ready.
+* `infer-stack test <endpoint>` — a leasing-native smoke test. Sends one real
+  chat completion to the endpoint *alias* through the gateway (managed key
+  applied automatically) and prints latency + the reply, or an actionable
+  failure with a non-zero exit. The concise alternative to hand-rolled `curl`
+  (the demo still shows `curl` for the raw form).
+* `infer-stack env` replaces the `secrets` top-level alias. It prints the
+  managed env-file **path** first and foremost (`source "$(infer-stack env)"`),
+  takes a `KEY` to print one value (`$(infer-stack env LITELLM_MASTER_KEY)`),
+  and `--export` to dump every entry as `export` lines — mirroring the legacy
+  `infer-stack env` ergonomic. The env-file is where managed secrets live; the
+  `secret get|set|list` modal is unchanged.
+* `config set ui true|false` — a durable default for the managed Open WebUI
+  (a new recognized setting alongside `backend` / `data_dir`).
+* LiteLLM front-door config now carries `router_settings`
+  (`num_retries`/`timeout`/`cooldown_time`/`allowed_fails`) so the brief window
+  where an upstream vLLM/Ollama is still loading its model is retried and
+  self-heals instead of surfacing as client `500`s / loud
+  `InternalServerError: … Connection error. Received Model Group=…` logs.
+  (LiteLLM doesn't wait for upstream *health* to start, so it forwards early
+  requests to a not-yet-listening upstream during warmup.)
 * `python -m infer_stack` now runs the CLI (a top-level `__main__.py` redirects
   to `infer_stack.cli.main`), matching `python -m infer_stack.cli`.
 * Faster CLI startup. Heavy third-party deps that only matter at *runtime*

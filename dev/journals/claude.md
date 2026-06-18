@@ -1171,3 +1171,63 @@ Takeaway: when reorganizing a CLI built on a modal framework, a registry-walking
 `help tree` + a `legacy` bucket let you move fast without a flag-day — and
 honoring persisted settings (backend/data_dir) in the *resolution* layer (None
 default -> setting -> fallback) avoids the explicit-vs-default ambiguity cleanly.
+
+## 2026-06-18 14:53:48 -0400
+
+Model: claude-opus-4-8 (Claude Code, "fast"/Opus 4.8). Config: default tools,
+running from the aiq-eval-runner superrepo against the infer-stack submodule on
+branch dev/leasing-controller.
+
+User intent (one prompt, four threads): (1) Open WebUI should be on by default
+again — bundled, and crucially NOT torn down when models switch (the legacy
+stack worked to keep the UI from blinking); user judged this easier here than
+the LiteLLM case. (2) Rename `infer-stack secrets` -> `infer-stack env`,
+path-first with optional KEY — secrets live in a readable `.env` so no reason to
+hide the path; mirror the legacy `env` ergonomic. (3) Bring back a concise smoke
+test so the demo doesn't have to curl (but keep curl shown too). (4) Diagnose a
+`litellm-1 InternalServerError: Connection error. Received Model Group=chat`
+seen during the demo.
+
+Diagnosis of (4): startup noise, not a real failure. Compose `depends_on` for
+litellm waits for the upstream to *start*, not be *healthy*, so during vLLM's
+model-load window litellm forwards probe/early requests to a not-yet-listening
+`vllm-…:8000` and logs the connection error; once vLLM is up the same route
+200s (matches the user's trailing log lines). I deliberately did NOT switch
+litellm to `condition: service_healthy` — that would couple every litellm
+recreate (which happens on each routing change) to the slowest upstream's
+health, delaying routing for already-up models. Instead I added
+`router_settings` (num_retries/timeout/cooldown_time/allowed_fails) so the
+warmup window is retried/self-healing rather than surfacing as client 500s.
+
+Design decisions worth recording:
+- Open WebUI stability across switches falls out of making its compose service
+  spec *independent of the model set*: it points at the `litellm` service at a
+  fixed internal URL with the (stable) baked master key, so the rendered dict is
+  byte-identical every converge. `docker compose up -d` then leaves it running
+  while only litellm (config-hash label) is recreated. Verified by a test that
+  asserts `open-webui` is unchanged but `litellm` differs after adding a second
+  model. This is the same lever the config-hash fix used, applied in reverse:
+  put churn in the spec only where you *want* recreation.
+- `ui` resolution mirrors the backend/data_dir pattern: tri-state flag
+  (`--ui/--no-ui` default None) -> `config set ui` -> default True, resolved in
+  `_resolve_ui`. Keeps explicit-vs-default unambiguous.
+- `infer-stack test` reads the front door straight from DEFAULT_PORTS + the
+  managed `.env` rather than building a ComposeBackend, so it's cheap and needs
+  no GPU detection.
+- Name collision caught: `EnvCLI` exists in both commands_runtime (legacy) and
+  now commands_leasing; imported the leasing one `as LeasingEnvCLI` so the
+  legacy modal's `env` keeps resolving to the runtime class.
+
+Risks/uncertainties: WEBUI_AUTH=False is fine for a single-user workstation but
+must gain an auth/port knob before a shared host (noted in followups). The
+managed UI binds host port 13000 by default now on every compose serve — a
+behavior change a user could be surprised by, mitigated by --no-ui/config.
+Tests pass (240, +8) and ruff is clean on touched files; the GPU e2e hasn't been
+re-run against this on yardrat yet — the open-webui service is new on the serving
+path and only validated via the fake-docker render/converge tests.
+
+Takeaway: to make one service in a converged compose project immune to churn
+while another recreates on change, encode "what may change" exclusively in the
+spec (labels/env) of the service you *want* recreated, and keep the stable
+service's spec a pure function of inputs that don't change — recreation is then
+a derived property, not a special case.

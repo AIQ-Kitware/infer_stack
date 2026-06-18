@@ -73,17 +73,19 @@ infer-stack catalog show
 `serve` is an infinite lease (no TTL) — "deploy this and keep it up".
 `--require-generation` makes readiness honest (waits for a real token). The first
 run downloads the weights (a few GiB), so allow time. No `--backend` — it comes
-from your settings.
+from your settings. A managed **Open WebUI comes up alongside the gateway by
+default** (disable with `--no-ui`, or globally `infer-stack config set ui false`).
 
 ```bash
 infer-stack serve chat --require-generation --timeout 1200
+# prints, when ready:  open webui: http://127.0.0.1:13000
 ```
 
 Watch it come up from another shell:
 
 ```bash
 infer-stack leases          # one live group, one standing (manual) lease
-infer-stack stack ps        # the vllm-… + litellm services  (alias: infer-stack ps)
+infer-stack stack ps        # vllm-… + litellm + open-webui  (alias: infer-stack ps)
 infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stack logs -f)
 ```
 
@@ -91,8 +93,17 @@ infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stac
 
 ## 3. Talk to it (the stable front door)
 
-One base URL (`http://127.0.0.1:14042/v1`), and infer-stack owns the API key —
-fetch it inline, never export it by hand:
+The quickest check is the built-in smoke test — it sends a real generation to
+the endpoint *alias* through the gateway and prints latency + the reply:
+
+```bash
+infer-stack test chat
+# chat: ok (0.42s) 'ready'
+```
+
+Under the hood that is one HTTP call to a single base URL
+(`http://127.0.0.1:14042/v1`), with infer-stack owning the API key. You can of
+course do it by hand — fetch the key inline, never export it:
 
 ```bash
 KEY="$(infer-stack secret get LITELLM_MASTER_KEY)"
@@ -109,29 +120,23 @@ changing any client.
 
 ---
 
-## 4. Put Open WebUI in front of it
+## 4. Open WebUI (managed, already running)
 
-The leasing stack serves the OpenAI-compatible gateway; Open WebUI is a separate
-container pointed at it. Its chat history persists under your data dir, so it
-survives restarts and model switches.
+Because `serve` brought Open WebUI up with the stack, just browse to it:
 
 ```bash
-DATA="$(infer-stack config get data_dir)"
-mkdir -p "$DATA/open-webui"
-docker run -d --name open-webui --restart unless-stopped \
-  -p 3000:8080 \
-  --add-host=host.docker.internal:host-gateway \
-  -e OPENAI_API_BASE_URL=http://host.docker.internal:14042/v1 \
-  -e OPENAI_API_KEY="$(infer-stack secret get LITELLM_MASTER_KEY)" \
-  -e WEBUI_AUTH=False \
-  -v "$DATA/open-webui:/app/backend/data" \
-  ghcr.io/open-webui/open-webui:main
-echo "Open WebUI -> http://$(hostname):3000  (model: chat)"
+echo "Open WebUI -> http://$(hostname):13000  (model: chat)"
 ```
 
-Browse to `http://<yardrat>:3000`. `chat` is in the model picker.
-(`WEBUI_AUTH=False` skips login for a single-user demo — don't expose that port
-publicly. If you rotate the key, `docker rm -f open-webui` and re-run.)
+`chat` is in the model picker. Its chat history persists under your data dir
+(`$(infer-stack config get data_dir)/open-webui`), so it survives restarts and
+model switches — and crucially the UI container is **not** recreated when you
+add/remove/switch models (only the gateway is), so it never blinks. `WEBUI_AUTH`
+is off for a single-user workstation — don't expose port 13000 publicly.
+
+> Don't want it? `infer-stack serve chat --no-ui` (once) or
+> `infer-stack config set ui false` (always). Turning it back on re-renders it
+> on the next `serve`/`acquire`.
 
 ---
 
@@ -142,8 +147,12 @@ alongside the main one — Open WebUI's model list updates automatically:
 
 ```bash
 infer-stack serve chat-fast --require-generation --timeout 600
-infer-stack leases          # two live groups now; refresh Open WebUI's model list
+infer-stack leases          # two live groups now
+infer-stack test chat-fast  # confirm the new alias serves
 ```
+
+Open WebUI picks up the new alias automatically (its model list refreshes from
+the gateway) and the UI container itself is untouched by the switch.
 
 Drop a standing service when you're done. A `serve` lease has no env-file, so
 release it by its session id (copy it from `leases`):
@@ -165,9 +174,8 @@ clients and Open WebUI don't change.
 ## 6. Teardown
 
 ```bash
-# stop Open WebUI
-docker rm -f open-webui 2>/dev/null
-# release all standing leases, then down the leasing stack
+# release all standing leases, then down the leasing stack (Open WebUI, the
+# gateway, and the model containers all come down together — it's one project)
 infer-stack leases --json | python -c 'import json,sys;[print(l["id"]) for l in json.load(sys.stdin)["leases"] if l["state"]=="active"]' | xargs -r -n1 infer-stack release
 infer-stack stack down
 # weights cache + chat history under your data dir are kept (re-serving is then
@@ -189,11 +197,14 @@ The earlier draft of this demo flagged five ergonomic smells; building the
   no `~/.bashrc` export.
 - ✅ **Managed `HF_TOKEN`** — `infer-stack secret set HF_TOKEN=…` writes the
   managed `.env` Compose auto-loads, set once before `serve`.
+- ✅ **Managed Open WebUI** — bundled into the leasing stack and on by default
+  (`--no-ui` / `config set ui false` to opt out). Stable across model switches
+  (the UI container isn't recreated when routing changes), so it never blinks.
+- ✅ **Concise smoke test** — `infer-stack test chat` instead of hand-rolled
+  `curl`.
 
 Still open (tracked in `dev/leasing-followups.md`):
 
 - **No endpoint-addressed teardown for standing services.** Stopping a `serve`
   means copying a session id out of `infer-stack leases`. Want
   `infer-stack release --endpoint chat` / `unserve chat`.
-- **Open WebUI is unmanaged** — a hand-run `docker run` (arguably correct
-  separation, but costs the one-command UX). Maybe an `infer-stack ui up`.

@@ -25,7 +25,7 @@ note 'duration is the cold-start serve latency (image assumed pre-pulled)'
 end_step
 
 step single-vllm-secrets 'managed LITELLM_MASTER_KEY is now fetchable'
-run 'infer-stack secrets LITELLM_MASTER_KEY'
+run 'infer-stack env LITELLM_MASTER_KEY'
 expect_rc 0
 expect_re '^sk-'
 end_step

@@ -271,6 +271,51 @@ def _litellm_service(
     }
 
 
+OPEN_WEBUI_SERVICE = 'open-webui'
+OPEN_WEBUI_CONTAINER_PORT = 8080
+
+
+def _open_webui_service(
+    host_port: int,
+    images: dict[str, str],
+    state: dict[str, str],
+    master_key: str | None,
+) -> dict[str, Any]:
+    """A managed Open WebUI pointed at the LiteLLM front door.
+
+    The spec is intentionally independent of which models are live: it talks to
+    the ``litellm`` service over the compose network at a fixed URL, so it is
+    byte-for-byte identical across converges. ``docker compose up -d`` therefore
+    leaves it running when models are added/removed/switched (only LiteLLM is
+    recreated on a routing change), giving the legacy "the UI never blinks"
+    behavior. Chat history persists under the data dir.
+    """
+    key_value = (
+        master_key if master_key is not None else '${' + API_KEY_ENV + ':-sk-local}'
+    )
+    data_path = state.get('open_webui') or str(
+        Path(next(iter(state.values()), '.')).parent / 'open-webui'
+    )
+    return {
+        'image': images['open_webui'],
+        'ports': [f'{host_port}:{OPEN_WEBUI_CONTAINER_PORT}'],
+        'environment': {
+            'OPENAI_API_BASE_URL': (
+                f'http://{LITELLM_SERVICE}:{LITELLM_CONTAINER_PORT}/v1'
+            ),
+            'OPENAI_API_KEY': key_value,
+            # Single-user workstation default; the port shouldn't be exposed
+            # publicly. Tracked as a knob in dev/leasing-followups.md.
+            'WEBUI_AUTH': 'False',
+            'ENABLE_OLLAMA_API': 'False',
+        },
+        'volumes': [f'{data_path}:/app/backend/data'],
+        'depends_on': [LITELLM_SERVICE],
+        'restart': 'unless-stopped',
+        'labels': {ENGINE_LABEL: 'open-webui'},
+    }
+
+
 def render_compose(
     groups: list[DeploymentGroup],
     assignments: dict[str, list[int]],
@@ -281,13 +326,16 @@ def render_compose(
     litellm: bool = False,
     litellm_port: int = 14042,
     litellm_master_key: str | None = None,
+    ui: bool = False,
+    ui_port: int = 13000,
     aux_dir: str | Path | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed groups.
 
     Groups absent from ``assignments`` (placement failures) are skipped. When
     ``litellm`` is set, a front-door service + config is added so every endpoint
-    alias is reachable at one ``base_url``.
+    alias is reachable at one ``base_url``. When ``ui`` is also set, a managed
+    Open WebUI is rendered in front of that gateway.
     """
     services: dict[str, Any] = {}
     service_map: dict[str, str] = {}
@@ -321,6 +369,18 @@ def render_compose(
                 'general_settings': {
                     'master_key': f'os.environ/{API_KEY_ENV}'
                 },
+                # An upstream vLLM/Ollama is unreachable only briefly, while it
+                # loads its model (LiteLLM does not wait for upstream health to
+                # start). Retry transient connection errors and don't park a
+                # model in a long cooldown, so the warmup window is self-healing
+                # instead of surfacing as client 500s ("Connection error.
+                # Received Model Group=…").
+                'router_settings': {
+                    'num_retries': 3,
+                    'timeout': 600,
+                    'cooldown_time': 5,
+                    'allowed_fails': 100,
+                },
             },
             sort_keys=False,
         )
@@ -335,6 +395,10 @@ def render_compose(
             master_key=litellm_master_key,
             config_hash=config_hash,
         )
+        if ui:
+            services[OPEN_WEBUI_SERVICE] = _open_webui_service(
+                ui_port, images, state, litellm_master_key
+            )
     return RenderedCompose(
         compose={'services': services},
         services=service_map,
@@ -401,6 +465,7 @@ class ComposeBackend:
         project: str = LEASING_PROJECT,
         skip_display: bool = True,
         litellm: bool = True,
+        ui: bool = True,
         require_generation: bool = False,
     ):
         self.state_dir = Path(state_dir)
@@ -419,6 +484,7 @@ class ComposeBackend:
         self.project = project
         self.skip_display = skip_display
         self.litellm = litellm
+        self.ui = ui
         self.require_generation = require_generation
         self.last_errors: list[str] = []
         self._pulled: set[str] = set()  # (group:tag) pulled this process
@@ -436,6 +502,10 @@ class ComposeBackend:
         return self.ports.get('litellm', DEFAULT_PORTS['litellm'])
 
     @property
+    def ui_port(self) -> int:
+        return self.ports.get('open_webui', DEFAULT_PORTS['open_webui'])
+
+    @property
     def _env_path(self) -> Path:
         return self.state_dir / '.env'
 
@@ -446,7 +516,7 @@ class ComposeBackend:
         already present (you may pin your own ``sk-`` key there), otherwise
         generated and persisted. The caller doesn't need to invent or export it
         — it is baked into the LiteLLM service, used by the readiness probe, and
-        shipped in the env-file descriptor (``infer-stack secrets`` prints it).
+        shipped in the env-file descriptor (``infer-stack env KEY`` prints it).
         """
         existing = parse_env_file(self._env_path)
         key = ensure_secret(existing, API_KEY_ENV, prefix='sk-')
@@ -509,6 +579,8 @@ class ComposeBackend:
                 litellm=self.litellm,
                 litellm_port=self.litellm_port,
                 litellm_master_key=self.master_key() if self.litellm else None,
+                ui=self.ui,
+                ui_port=self.ui_port,
                 aux_dir=self.state_dir,
             )
             if rendered.litellm_config is not None:
@@ -557,12 +629,15 @@ class ComposeBackend:
         """
         if not self.litellm:
             return None
-        return {
+        info: dict[str, Any] = {
             'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
             'api_key_env': API_KEY_ENV,
             'api_key': self.master_key(),
             'request_names': {ep: ep for ep in endpoints},
         }
+        if self.ui:
+            info['ui_url'] = f'http://127.0.0.1:{self.ui_port}'
+        return info
 
     def _ensure_ollama_tag(
         self, group: DeploymentGroup, endpoint: str

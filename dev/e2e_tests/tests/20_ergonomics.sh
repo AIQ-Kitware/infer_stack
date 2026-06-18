@@ -29,7 +29,7 @@ expect_out 'initialized:'
 end_step
 
 step secrets-missing 'secrets gives a friendly error before any compose acquire'
-run 'infer-stack secrets LITELLM_MASTER_KEY'
+run 'infer-stack env LITELLM_MASTER_KEY'
 expect_rc_not 0
 expect_out 'no managed secrets'
 note 'expected on a fresh data dir; becomes populated after a compose acquire'

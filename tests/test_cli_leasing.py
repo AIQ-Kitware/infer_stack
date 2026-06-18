@@ -177,8 +177,8 @@ def test_secret_set_get_list_roundtrip(tmp_path, monkeypatch):
 
     monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
     from infer_stack.cli.commands_leasing import (
+        EnvCLI,
         SecretGetCLI,
-        SecretsCLI,
         SecretSetCLI,
     )
 
@@ -192,8 +192,24 @@ def test_secret_set_get_list_roundtrip(tmp_path, monkeypatch):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         SecretGetCLI.main(argv=['HF_TOKEN'])
-        SecretsCLI.main(argv=['HF_TOKEN'])           # alias
+        EnvCLI.main(argv=['HF_TOKEN'])               # `env KEY` prints the value
     assert buf.getvalue().split() == ['hf_demo', 'hf_demo']
+
+
+def test_env_prints_path_first(tmp_path, monkeypatch):
+    import contextlib
+    import io
+
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+
+    # `env` with no args prints the .env path even before it exists.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        EnvCLI.main(argv=[])
+    assert buf.getvalue().strip() == str(
+        tmp_path / 'leasing' / 'compose' / '.env'
+    )
 
 
 def test_secret_get_missing_is_friendly(tmp_path, monkeypatch):
@@ -232,3 +248,85 @@ def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
                          strict=False)
     mod._make_backend(cfg)
     assert seen['skip_display'] is True
+
+
+def test_ui_flag_and_setting_resolution(env, monkeypatch):
+    """Open WebUI: default on, --no-ui off, and `config set ui` honored."""
+    import infer_stack.cli.commands_leasing as mod
+    import infer_stack.hardware as hw
+
+    seen = {}
+
+    class FakeCompose:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(mod, 'ComposeBackend', FakeCompose)
+    monkeypatch.setattr(hw, 'detect_inventory', lambda: {})
+
+    def ui_for(argv, setting=None):
+        # _make_backend / _resolve_ui both do `from ..paths import get_setting`.
+        monkeypatch.setattr(
+            'infer_stack.paths.get_setting',
+            lambda k: {'backend': 'compose', 'ui': setting}.get(k),
+        )
+        seen.clear()
+        mod._make_backend(mod.AcquireCLI.cli(argv=argv, strict=False))
+        return seen['ui']
+
+    assert ui_for(['e', '--backend', 'compose']) is True          # default on
+    assert ui_for(['e', '--backend', 'compose', '--no-ui']) is False
+    assert ui_for(['e', '--backend', 'compose'], setting=False) is False  # setting
+    # explicit flag overrides the setting
+    assert ui_for(['e', '--backend', 'compose', '--ui'], setting=False) is True
+
+
+def test_test_command_smokes_endpoint(tmp_path, monkeypatch, capsys):
+    """`infer-stack test <alias>` posts a chat completion and prints the reply."""
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    import requests
+
+    from infer_stack.cli.commands_leasing import SecretSetCLI, TestCLI
+
+    SecretSetCLI.main(argv=['LITELLM_MASTER_KEY=sk-test'])
+    capsys.readouterr()
+
+    captured = {}
+
+    class Resp:
+        status_code = 200
+        text = '{}'
+
+        def json(self):
+            return {'choices': [{'message': {'content': 'ready'}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured['url'] = url
+        captured['auth'] = headers.get('Authorization')
+        captured['model'] = json['model']
+        return Resp()
+
+    monkeypatch.setattr(requests, 'post', fake_post)
+    rc = TestCLI.main(argv=['chat'])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured['url'] == 'http://127.0.0.1:14042/v1/chat/completions'
+    assert captured['auth'] == 'Bearer sk-test'   # managed key applied
+    assert captured['model'] == 'chat'            # asks for the alias
+    assert 'ready' in out
+
+
+def test_test_command_reports_failure(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    import requests
+
+    from infer_stack.cli.commands_leasing import TestCLI
+
+    def boom(*a, **k):
+        raise requests.exceptions.ConnectionError('refused')
+
+    monkeypatch.setattr(requests, 'post', boom)
+    rc = TestCLI.main(argv=['chat'])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert 'FAILED' in out and 'chat' in out

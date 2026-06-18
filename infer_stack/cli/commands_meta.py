@@ -333,6 +333,7 @@ class ConfigPathsCLI(_PathOverridesMixin):
 KNOWN_SETTINGS = {
     'backend': 'Default serving backend (compose | kubeai | null).',
     'data_dir': 'Where docker-mounted state lives (overrides the XDG default).',
+    'ui': 'Render a managed Open WebUI with the compose stack (true | false).',
 }
 
 

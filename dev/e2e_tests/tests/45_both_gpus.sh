@@ -33,7 +33,7 @@ note 'if this fails placement (only GPU 0 used) the display-GPU override regress
 end_step
 
 step both-gpus-both-routable 'both endpoints answer through the one gateway'
-run "key=\$(infer-stack secrets LITELLM_MASTER_KEY); base=http://127.0.0.1:14042/v1; \
+run "key=\$(infer-stack env LITELLM_MASTER_KEY); base=http://127.0.0.1:14042/v1; \
      for m in smol-135 smol-360; do \
        echo \"== \$m ==\"; \
        curl -s \"\$base/chat/completions\" -H \"Authorization: Bearer \$key\" \
