@@ -73,12 +73,18 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   applied automatically) and prints latency + the reply, or an actionable
   failure with a non-zero exit. The concise alternative to hand-rolled `curl`
   (the demo still shows `curl` for the raw form).
-* `infer-stack env` replaces the `secrets` top-level alias. It prints the
-  managed env-file **path** first and foremost (`source "$(infer-stack env)"`),
-  takes a `KEY` to print one value (`$(infer-stack env LITELLM_MASTER_KEY)`),
-  and `--export` to dump every entry as `export` lines — mirroring the legacy
-  `infer-stack env` ergonomic. The env-file is where managed secrets live; the
-  `secret get|set|list` modal is unchanged.
+* `infer-stack env` is now the single verb for the managed env-file, replacing
+  both the `secrets` alias and the `secret get|set|list` modal (removed — the
+  secrets live in a readable `.env`, so a separate "secret" surface earned its
+  keep only by adding `set`, which folds in cleanly):
+  - `infer-stack env` — print the env-file **path** (`source "$(infer-stack
+    env)"` to load everything);
+  - `infer-stack env LITELLM_MASTER_KEY` — print one value;
+  - `infer-stack env HF_TOKEN=hf_…` — set one value (merges non-destructively,
+    so a gated model's token can be set once before `serve`);
+  - `infer-stack env --export` — every entry as `export KEY=value` lines.
+  The argument is a `KEY` to read or `KEY=VALUE` to write — mirroring the legacy
+  `infer-stack env` ergonomic in one command.
 * `config set ui true|false` — a durable default for the managed Open WebUI
   (a new recognized setting alongside `backend` / `data_dir`).
 * LiteLLM front-door config now carries `router_settings`
@@ -110,9 +116,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     are honored (the leasing `--backend` default and `data_root()` consult them),
     so the backend flag and storage location no longer have to be repeated/
     exported.
-  - `infer-stack secret …` — `get/set/list` for the managed compose `.env`;
-    `secret set HF_TOKEN=…` lets a gated model's token be set once before `serve`.
-    `secrets` stays as a top-level alias for `secret get`.
+  - `infer-stack env` — read/write the managed compose `.env` (path / `env KEY`
+    / `env KEY=VALUE` / `--export`); e.g. `env HF_TOKEN=…` sets a gated model's
+    token once before `serve`. (Supersedes the short-lived `secret` modal and
+    `secrets` alias — see the `infer-stack env` entry above.)
   - `infer-stack stack …` — the day-2 compose wrappers (`logs/ps/restart/pull/
     start/stop/down`); `logs`/`ps` remain top-level aliases.
   - `infer-stack legacy …` — the pre-leasing profile/active-profile commands
@@ -134,13 +141,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   artifacts (docker-compose.yml, litellm_config.yaml, the secrets `.env`,
   sidecar). `infer-stack status` now prints a one-line leasing summary (active
   leases / live groups) pointing at `infer-stack leases`.
-* Managed LiteLLM secret + `infer-stack secrets`. The Compose backend now owns
+* Managed LiteLLM secret + `infer-stack env`. The Compose backend now owns
   `LITELLM_MASTER_KEY` (reused from the state dir's `.env` if you pin one, else
   generated via `ensure_secret`), bakes it into the LiteLLM service, uses it for
   the readiness probe, and ships it in the `--env-file` descriptor as
   `OPENAI_API_KEY` — so `source`-ing the env-file fully configures an OpenAI
-  client (no manual `export`). `infer-stack secrets [KEY]` prints the managed
-  secrets (`$(infer-stack secrets LITELLM_MASTER_KEY)`), restoring the legacy
+  client (no manual `export`). `infer-stack env [KEY]` prints the managed
+  secrets (`$(infer-stack env LITELLM_MASTER_KEY)`), restoring the legacy
   `infer-stack env` ergonomic for the leasing model.
 * Ollama pull/warmup readiness in the Compose backend: a daemon serves a tag
   lazily, so `probe_ready` now pulls the endpoint's tag into its daemon

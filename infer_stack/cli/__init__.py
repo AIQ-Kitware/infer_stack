@@ -56,7 +56,6 @@ from .commands_leasing import (
     ReleaseCLI,
     RenewCLI,
     RunCLI,
-    SecretModalCLI,
     ServeCLI,
     TestCLI,
 )
@@ -203,8 +202,7 @@ class ManageCLI(scfg.ModalCLI):
     serve = ServeCLI
     leases = LeasesCLI
     test = TestCLI  # smoke-test a served endpoint through the front door
-    secret = SecretModalCLI  # secret get|set|list
-    env = LeasingEnvCLI  # managed env-file path / value (replaces `secrets`)
+    env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE
 
     # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
     # at the top level as the two hottest convenience aliases.

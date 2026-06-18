@@ -1231,3 +1231,12 @@ while another recreates on change, encode "what may change" exclusively in the
 spec (labels/env) of the service you *want* recreated, and keep the stable
 service's spec a pure function of inputs that don't change — recreation is then
 a derived property, not a special case.
+
+Follow-up same session: user asked whether `secret` is needed at all given
+`env`. It wasn't — `env` already covered get/path/list; `secret` only added
+`set`. Folded `set` into `env` as a `KEY=VALUE` positional (`env KEY` reads,
+`env KEY=VALUE` writes, merging non-destructively), removed the `secret` modal
+and its three classes entirely. One verb, unambiguous by the presence of `=`.
+Reinforces the rename's premise: secrets in a readable `.env` don't warrant a
+separate "secret" surface. Updated demo/CHANGELOG/followups and tests (240 pass,
+ruff clean).

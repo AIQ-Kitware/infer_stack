@@ -558,94 +558,6 @@ def _secret_env_path() -> Path:
     return data_root() / 'leasing' / 'compose' / '.env'
 
 
-def _print_secret(config) -> int:
-    env_path = _secret_env_path()
-    if not env_path.exists():
-        raise SystemExit(
-            f'no managed secrets at {env_path}; run an `acquire`/`serve` '
-            'with --backend compose first (or `infer-stack secret set …`)'
-        )
-    env = parse_env_file(env_path)
-    key = getattr(config, 'key', None)
-    if key:
-        if key not in env:
-            raise SystemExit(f'{key!r} not found in {env_path}')
-        print(env[key])
-        return 0
-    for name, value in env.items():
-        print(f'export {name}={shlex.quote(value)}')
-    return 0
-
-
-class SecretGetCLI(_PathOverridesMixin):
-    """Print a managed secret's value (or all as export lines).
-
-    infer-stack owns these — generated and persisted. Use
-    ``$(infer-stack secret get LITELLM_MASTER_KEY)`` in scripts, or
-    ``eval "$(infer-stack secret list)"`` to export them all.
-    """
-
-    __command__ = 'get'
-    key = scfg.Value(None, position=1, type=str, help="Variable name; empty = all.")
-
-    @classmethod
-    def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        _apply_path_overrides(config)
-        return _print_secret(config)
-
-
-class SecretListCLI(_PathOverridesMixin):
-    """Print all managed secrets as ``export`` lines."""
-
-    __command__ = 'list'
-
-    @classmethod
-    def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        _apply_path_overrides(config)
-        config.key = None
-        return _print_secret(config)
-
-
-class SecretSetCLI(_PathOverridesMixin):
-    """Set a managed secret, e.g. ``secret set HF_TOKEN=hf_…``.
-
-    Written to the compose backend's ``.env`` (which docker compose auto-loads),
-    so a gated model's ``HF_TOKEN`` can be set once, before ``serve`` — no manual
-    shell export. Merges non-destructively (the managed LiteLLM key is kept).
-    """
-
-    __command__ = 'set'
-    assignment = scfg.Value(
-        None, position=1, type=str, help='KEY=VALUE (e.g. HF_TOKEN=hf_…).'
-    )
-
-    @classmethod
-    def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        _apply_path_overrides(config)
-        if not config.assignment or '=' not in config.assignment:
-            raise SystemExit('secret set: expected KEY=VALUE')
-        key, _, value = config.assignment.partition('=')
-        key = key.strip()
-        if not key:
-            raise SystemExit('secret set: empty key')
-        write_env_file(_secret_env_path(), {key: value})
-        print(f'set {key} ({_secret_env_path()})')
-        return 0
-
-
-class SecretModalCLI(scfg.ModalCLI):
-    """Manage the compose backend's managed secrets (LiteLLM key, HF_TOKEN, …)."""
-
-    __command__ = 'secret'
-
-    get = SecretGetCLI
-    set = SecretSetCLI
-    list = SecretListCLI
-
-
 def _front_door(config) -> tuple[str, str | None]:
     """Resolve the front-door base_url + master key for a smoke test.
 
@@ -755,20 +667,28 @@ def _test_fail(config, base_url: str, reason: str) -> int:
 
 
 class EnvCLI(_PathOverridesMixin):
-    """Print the managed env-file path (or a single value / all exports).
+    """The managed env-file: print its path, read a value, or set one.
 
     infer-stack keeps managed secrets — the LiteLLM master key, ``HF_TOKEN``,
     … — in a ``.env`` that docker compose auto-loads. Anyone who can read it
-    already has the secrets, so we don't hide the path: by default this prints
-    it (``source "$(infer-stack env)"`` to load everything). Pass a KEY to print
-    just that value (``$(infer-stack env LITELLM_MASTER_KEY)``), or ``--export``
-    to print every entry as ``export KEY=value`` lines.
+    already has the secrets, so there's nothing to hide behind a separate
+    ``secret`` verb; one ``env`` does it all:
+
+    \b
+      infer-stack env                       # the .env path (source it to load)
+      infer-stack env LITELLM_MASTER_KEY    # print one value
+      infer-stack env HF_TOKEN=hf_…         # set one value (merges, before serve)
+      infer-stack env --export              # every entry as `export KEY=value`
+
+    The argument is a KEY to read, or ``KEY=VALUE`` to write (writes merge
+    non-destructively, so the managed LiteLLM key is preserved).
     """
 
     __command__ = 'env'
 
-    key = scfg.Value(
-        None, position=1, type=str, help='Variable name; print just its value.'
+    arg = scfg.Value(
+        None, position=1, type=str,
+        help='KEY to read its value, or KEY=VALUE to set it. Empty = path.',
     )
     export = scfg.Value(
         False, isflag=True, help='Print every entry as `export KEY=value`.'
@@ -779,20 +699,33 @@ class EnvCLI(_PathOverridesMixin):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
         env_path = _secret_env_path()
-        if not (config.key or config.export):
-            # Path first and foremost (it may not exist yet — that's fine).
+
+        # Write: `env KEY=VALUE`
+        if config.arg and '=' in config.arg:
+            key, _, value = config.arg.partition('=')
+            key = key.strip()
+            if not key:
+                raise SystemExit('env: empty key in KEY=VALUE')
+            write_env_file(env_path, {key: value})
+            print(f'set {key} ({env_path})')
+            return 0
+
+        # Path first and foremost (it may not exist yet — that's fine).
+        if not (config.arg or config.export):
             print(env_path)
             return 0
+
+        # Read: `env KEY` / `env --export`
         if not env_path.exists():
             raise SystemExit(
                 f'no managed env-file at {env_path}; run an `acquire`/`serve` '
-                'with --backend compose first (or `infer-stack secret set …`)'
+                'with --backend compose first (or `infer-stack env KEY=VALUE`)'
             )
         env = parse_env_file(env_path)
-        if config.key:
-            if config.key not in env:
-                raise SystemExit(f'{config.key!r} not found in {env_path}')
-            print(env[config.key])
+        if config.arg:
+            if config.arg not in env:
+                raise SystemExit(f'{config.arg!r} not found in {env_path}')
+            print(env[config.arg])
             return 0
         for name, value in env.items():
             print(f'export {name}={shlex.quote(value)}')

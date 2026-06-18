@@ -64,7 +64,7 @@ infer-stack catalog show
 ```
 
 > Gated model? Set the token once (stored in the managed `.env` that Compose
-> auto-loads), no shell export: `infer-stack secret set HF_TOKEN=hf_…`.
+> auto-loads), no shell export: `infer-stack env HF_TOKEN=hf_…`.
 
 ---
 
@@ -106,7 +106,7 @@ Under the hood that is one HTTP call to a single base URL
 course do it by hand — fetch the key inline, never export it:
 
 ```bash
-KEY="$(infer-stack secret get LITELLM_MASTER_KEY)"
+KEY="$(infer-stack env LITELLM_MASTER_KEY)"
 curl -s http://127.0.0.1:14042/v1/models \
   -H "Authorization: Bearer $KEY" | python -m json.tool
 curl -s http://127.0.0.1:14042/v1/chat/completions \
@@ -195,8 +195,8 @@ The earlier draft of this demo flagged five ergonomic smells; building the
 - ✅ **Storage in durable config** — `infer-stack config set data_dir <path>`;
   `data_root()` honors it (override > `$INFER_STACK_DATA_DIR` > setting > XDG), so
   no `~/.bashrc` export.
-- ✅ **Managed `HF_TOKEN`** — `infer-stack secret set HF_TOKEN=…` writes the
-  managed `.env` Compose auto-loads, set once before `serve`.
+- ✅ **Managed `HF_TOKEN`** — `infer-stack env HF_TOKEN=…` writes the managed
+  `.env` Compose auto-loads, set once before `serve`.
 - ✅ **Managed Open WebUI** — bundled into the leasing stack and on by default
   (`--no-ui` / `config set ui false` to opt out). Stable across model switches
   (the UI container isn't recreated when routing changes), so it never blinks.

@@ -171,29 +171,32 @@ def test_missing_catalog_errors(env):
         )
 
 
-def test_secret_set_get_list_roundtrip(tmp_path, monkeypatch):
+def test_env_set_read_list_roundtrip(tmp_path, monkeypatch):
+    """`env` does it all: set KEY=VALUE, read KEY, --export, path."""
     import contextlib
     import io
 
     monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
-    from infer_stack.cli.commands_leasing import (
-        EnvCLI,
-        SecretGetCLI,
-        SecretSetCLI,
-    )
+    from infer_stack.cli.commands_leasing import EnvCLI
 
-    # set works before any serve (creates the managed .env), merges keys
-    SecretSetCLI.main(argv=['HF_TOKEN=hf_demo'])
-    SecretSetCLI.main(argv=['OTHER=x'])
+    # `env KEY=VALUE` works before any serve (creates the .env), merges keys
+    EnvCLI.main(argv=['HF_TOKEN=hf_demo'])
+    EnvCLI.main(argv=['OTHER=x'])
     env_file = tmp_path / 'leasing' / 'compose' / '.env'
     text = env_file.read_text()
     assert 'HF_TOKEN=hf_demo' in text and 'OTHER=x' in text   # both preserved
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        SecretGetCLI.main(argv=['HF_TOKEN'])
         EnvCLI.main(argv=['HF_TOKEN'])               # `env KEY` prints the value
-    assert buf.getvalue().split() == ['hf_demo', 'hf_demo']
+    assert buf.getvalue().strip() == 'hf_demo'
+
+    # `--export` dumps every entry as shell-sourceable export lines
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        EnvCLI.main(argv=['--export'])
+    out = buf.getvalue()
+    assert 'export HF_TOKEN=hf_demo' in out and 'export OTHER=x' in out
 
 
 def test_env_prints_path_first(tmp_path, monkeypatch):
@@ -212,12 +215,12 @@ def test_env_prints_path_first(tmp_path, monkeypatch):
     )
 
 
-def test_secret_get_missing_is_friendly(tmp_path, monkeypatch):
+def test_env_read_missing_is_friendly(tmp_path, monkeypatch):
     monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
-    from infer_stack.cli.commands_leasing import SecretGetCLI
+    from infer_stack.cli.commands_leasing import EnvCLI
 
     with pytest.raises(SystemExit):
-        SecretGetCLI.main(argv=['NOPE'])             # no .env yet
+        EnvCLI.main(argv=['NOPE'])                    # no .env yet
 
 
 def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
@@ -286,9 +289,9 @@ def test_test_command_smokes_endpoint(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
     import requests
 
-    from infer_stack.cli.commands_leasing import SecretSetCLI, TestCLI
+    from infer_stack.cli.commands_leasing import EnvCLI, TestCLI
 
-    SecretSetCLI.main(argv=['LITELLM_MASTER_KEY=sk-test'])
+    EnvCLI.main(argv=['LITELLM_MASTER_KEY=sk-test'])
     capsys.readouterr()
 
     captured = {}
