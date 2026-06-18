@@ -360,10 +360,10 @@ def _leasing_configured() -> bool:
     return (config_root() / 'catalog.yaml').exists() or settings_path().exists()
 
 
-def _print_status_summary(
+def _status_data(
     cfg: dict[str, Any], *, initialized: bool, leasing_mode: bool
-) -> None:
-    """Print cheap, no-network context about the current stack.
+) -> dict[str, Any]:
+    """Gather cheap, no-network status context once (shared by both renderers).
 
     Everything here comes from config.yaml / catalog.yaml / settings.yaml, the
     on-disk artifacts, and the already-resolved plan.yaml — so it never touches
@@ -373,110 +373,238 @@ def _print_status_summary(
     from ..paths import data_root, settings_path
 
     backend = backend_name(cfg)
-    print('infer-stack status')
-    print()
-    print(f'  backend:        {backend}')
-    print(f'  data dir:       {data_root()}')
-    print(f'  config dir:     {config_root()}')
+    d: dict[str, Any] = {
+        'backend': backend,
+        'data_dir': str(data_root()),
+        'config_dir': str(config_root()),
+        'catalog': None,
+        'settings': None,
+        'initialized': initialized,
+        'config_path': str(config_path()),
+        'leasing_mode': leasing_mode,
+        'active_profile': None,
+        'generated_dir': None,
+        'rendered': None,        # 'yes' | 'yes-stale' | 'no' | None
+        'description': None,
+        'validation': None,      # (text, 'ok'|'warn'|'error')
+        'components': None,
+        'endpoints': [],
+    }
 
-    # Leasing model (the primary world): catalog + durable settings.
     cat_file = config_root() / 'catalog.yaml'
     if cat_file.exists():
-        suffix = ''
+        counts = None
         try:
             from ..leasing import Catalog
 
             cat = Catalog.load(cat_file)
-            suffix = (
-                f'  ({len(cat.models)} model(s), '
-                f'{len(cat.endpoints)} endpoint(s))'
+            counts = (
+                f'{len(cat.models)} model(s), '
+                f'{len(cat.endpoints)} endpoint(s)'
             )
         except Exception:
             pass
-        print(f'  catalog:        {cat_file}{suffix}')
+        d['catalog'] = {'path': str(cat_file), 'counts': counts}
     if settings_path().exists():
-        print(f'  settings:       {settings_path()}')
-
-    # Legacy profile world (config.yaml) — only relevant to pre-leasing users.
-    print(f'  legacy config:  {"yes" if initialized else "no"}  ({config_path()})')
+        d['settings'] = str(settings_path())
 
     if not initialized:
-        if not leasing_mode:
-            print()
-            print('  Nothing set up yet. For the leasing model:')
-            print('    infer-stack config init       # backend + data dir')
-            print('    infer-stack catalog init      # then `catalog model add` …')
-            print('    infer-stack serve <endpoint>')
-            print(
-                '  (Pre-leasing profiles live under `infer-stack legacy setup`.)'
-            )
-        return
+        return d
 
-    print(f'  active profile: {cfg.get("active_profile") or "<unset>"}')
+    d['active_profile'] = cfg.get('active_profile') or '<unset>'
     out_dir = (
         kubeai_generated_dir(cfg) if backend == 'kubeai' else generated_dir(cfg)
     )
+    d['generated_dir'] = str(out_dir)
     rendered_marker = out_dir / (
         'models.yaml' if backend == 'kubeai' else 'docker-compose.yml'
     )
-    print(f'  generated dir:  {out_dir}')
-
     if rendered_marker.exists():
-        stale = render_is_stale(cfg)
-        print(
-            f'  rendered:       yes{"  (stale — run `infer-stack render`)" if stale else ""}'
-        )
+        d['rendered'] = 'yes-stale' if render_is_stale(cfg) else 'yes'
     else:
-        print('  rendered:       no  (run `infer-stack render`)')
+        d['rendered'] = 'no'
 
     # The resolved view comes straight from plan.yaml (cheap file read; no
     # hardware probe or re-resolution).
     plan_file = plan_path(cfg)
     if not plan_file.exists():
-        return
+        return d
     try:
         plan = load_yaml(plan_file) or {}
     except Exception:
-        return
+        return d
     deployment = plan.get('deployment', {}) or {}
     validated = plan.get('validated', {}) or {}
 
-    description = (deployment.get('serving_profile', {}) or {}).get(
+    d['description'] = (deployment.get('serving_profile', {}) or {}).get(
         'description'
     )
-    if description:
-        print(f'  description:    {description}')
-
     if validated:
         errors = validated.get('errors') or []
         warnings = validated.get('warnings') or []
         if errors:
-            vstate = f'{len(errors)} error(s)' + (
+            vtext = f'{len(errors)} error(s)' + (
                 f', {len(warnings)} warning(s)' if warnings else ''
             )
+            d['validation'] = (vtext, 'error')
         elif warnings:
-            vstate = f'ok, {len(warnings)} warning(s)'
+            d['validation'] = (f'ok, {len(warnings)} warning(s)', 'warn')
         else:
-            vstate = 'ok'
-        print(f'  validation:     {vstate}')
+            d['validation'] = ('ok', 'ok')
+    d['components'] = _enabled_components(deployment) or None
+    d['endpoints'] = _access_endpoints(deployment.get('access', {}) or {})
+    return d
 
-    components = _enabled_components(deployment)
-    if components:
-        print(f'  components:     {", ".join(components)}')
 
-    endpoints = _access_endpoints(deployment.get('access', {}) or {})
-    if endpoints:
+_GETTING_STARTED = (
+    ('  Nothing set up yet. For the leasing model:', None),
+    ('    infer-stack config init', '# backend + data dir'),
+    ('    infer-stack catalog init', '# then `catalog model add` …'),
+    ('    infer-stack serve <endpoint>', None),
+    ('  (Pre-leasing profiles live under `infer-stack legacy setup`.)', None),
+)
+# Column where the `#` comments align (longest command + a 2-space gutter).
+_GS_WIDTH = max(len(t) for t, c in _GETTING_STARTED if c) + 2
+
+
+def _print_status_plain(d: dict[str, Any]) -> None:
+    """Plain key/value summary (used when stdout is not a terminal)."""
+    print('infer-stack status')
+    print()
+    print(f'  backend:        {d["backend"]}')
+    print(f'  data dir:       {d["data_dir"]}')
+    print(f'  config dir:     {d["config_dir"]}')
+    if d['catalog']:
+        counts = d['catalog']['counts']
+        suffix = f'  ({counts})' if counts else ''
+        print(f'  catalog:        {d["catalog"]["path"]}{suffix}')
+    if d['settings']:
+        print(f'  settings:       {d["settings"]}')
+    print(
+        f'  legacy config:  {"yes" if d["initialized"] else "no"}  '
+        f'({d["config_path"]})'
+    )
+
+    if not d['initialized']:
+        if not d['leasing_mode']:
+            print()
+            for line, comment in _GETTING_STARTED:
+                print(f'{line:<{_GS_WIDTH}}{comment}' if comment else line)
+        return
+
+    print(f'  active profile: {d["active_profile"]}')
+    print(f'  generated dir:  {d["generated_dir"]}')
+    if d['rendered'] == 'yes':
+        print('  rendered:       yes')
+    elif d['rendered'] == 'yes-stale':
+        print('  rendered:       yes  (stale — run `infer-stack render`)')
+    elif d['rendered'] == 'no':
+        print('  rendered:       no  (run `infer-stack render`)')
+    if d['description']:
+        print(f'  description:    {d["description"]}')
+    if d['validation']:
+        print(f'  validation:     {d["validation"][0]}')
+    if d['components']:
+        print(f'  components:     {", ".join(d["components"])}')
+    if d['endpoints']:
         print('  endpoints:')
-        for name, url in endpoints:
+        for name, url in d['endpoints']:
             print(f'    {name}: {url}')
 
 
-def _print_leasing_summary() -> None:
-    """One-line pointer to the leasing model's state, when a ledger exists.
+def _print_status_rich(d: dict[str, Any], counts, console) -> None:
+    """Styled status summary for an interactive terminal."""
+    from rich.table import Table
+    from rich.text import Text
 
-    Keeps the legacy ``status`` relevant after the leasing redesign: leases live
-    in their own ledger (``infer-stack leases``), not in the active-profile
-    deployment this command otherwise reports on.
+    def cell(value, style=None):
+        # Append (don't set a base style) so column padding stays unstyled.
+        t = Text()
+        t.append(value, style=style)
+        return t
+
+    console.print(Text('infer-stack status', style='bold'))
+    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
+    table.add_column(style='bold', justify='left', no_wrap=True)
+    table.add_column(overflow='fold')
+
+    table.add_row('backend', cell(d['backend'], 'bold cyan'))
+    table.add_row('data dir', cell(d['data_dir'], 'cyan'))
+    table.add_row('config dir', cell(d['config_dir'], 'cyan'))
+    if d['catalog']:
+        val = cell(d['catalog']['path'], 'cyan')
+        if d['catalog']['counts']:
+            val.append(f'  ({d["catalog"]["counts"]})', style='dim')
+        table.add_row('catalog', val)
+    if d['settings']:
+        table.add_row('settings', cell(d['settings'], 'cyan'))
+
+    legacy = cell('yes', 'green') if d['initialized'] else cell('no', 'yellow')
+    legacy.append(f'  ({d["config_path"]})', style='dim')
+    table.add_row('legacy config', legacy)
+
+    if d['initialized']:
+        table.add_row('active profile', cell(d['active_profile'], 'magenta'))
+        table.add_row('generated dir', cell(d['generated_dir'], 'cyan'))
+        if d['rendered'] == 'yes':
+            table.add_row('rendered', cell('yes', 'green'))
+        elif d['rendered'] == 'yes-stale':
+            r = cell('yes', 'green')
+            r.append('  (stale — run `infer-stack render`)', style='yellow')
+            table.add_row('rendered', r)
+        elif d['rendered'] == 'no':
+            r = cell('no', 'yellow')
+            r.append('  (run `infer-stack render`)', style='dim')
+            table.add_row('rendered', r)
+        if d['description']:
+            table.add_row('description', cell(d['description']))
+        if d['validation']:
+            vtext, sev = d['validation']
+            style = {'ok': 'green', 'warn': 'yellow', 'error': 'red'}[sev]
+            table.add_row('validation', cell(vtext, style))
+        if d['components']:
+            table.add_row('components', cell(', '.join(d['components']), 'cyan'))
+    console.print(table)
+
+    if d['initialized'] and d['endpoints']:
+        console.print(Text('  endpoints', style='bold'))
+        for name, url in d['endpoints']:
+            line = Text('    ')
+            line.append(name, style='cyan')
+            line.append(f': {url}')
+            console.print(line)
+
+    if counts is not None:
+        active, live = counts
+        line = Text('leasing  ', style='bold')
+        line.append(
+            f'{active} active lease(s)', style='green' if active else 'dim'
+        )
+        line.append(' · ')
+        line.append(f'{live} live group(s)', style='green' if live else 'dim')
+        line.append('   → infer-stack leases', style='dim')
+        console.print()
+        console.print(line)
+
+    if not d['initialized'] and not d['leasing_mode']:
+        console.print()
+        for text, comment in _GETTING_STARTED:
+            line = Text()
+            is_cmd = text.lstrip().startswith('infer-stack')
+            if comment:
+                line.append(text.ljust(_GS_WIDTH), style='cyan' if is_cmd else None)
+                line.append(comment, style='dim')
+            else:
+                line.append(text, style='cyan' if is_cmd else 'dim')
+            console.print(line)
+
+
+def _leasing_counts():
+    """``(active_leases, live_groups)`` when a non-empty ledger exists, else None.
+
+    Leases live in their own ledger (``infer-stack leases``), not in the
+    active-profile deployment ``status`` otherwise reports on — this keeps the
+    status command relevant after the leasing redesign.
     """
     from ..leasing import (
         GroupState,
@@ -488,12 +616,19 @@ def _print_leasing_summary() -> None:
 
     path = default_ledger_path()
     if not path.exists():
-        return
+        return None
     leases, groups = Ledger(SqliteStore(str(path))).status()
     if not leases and not groups:
-        return
+        return None
     active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)
     live = sum(1 for g in groups if g.state == GroupState.LIVE)
+    return (active, live)
+
+
+def _print_leasing_plain(counts) -> None:
+    if counts is None:
+        return
+    active, live = counts
     print()
     print(
         f'leasing: {active} active lease(s), {live} live group(s) '
@@ -521,10 +656,18 @@ class StatusCLI(
         _apply_path_overrides(config)
         initialized = config_path().exists()
         cfg = config_for_runtime(config, allow_missing=True)
-        _print_status_summary(
+        data = _status_data(
             cfg, initialized=initialized, leasing_mode=_leasing_configured()
         )
-        _print_leasing_summary()
+        counts = _leasing_counts()
+        from rich.console import Console
+
+        console = Console()
+        if console.is_terminal:
+            _print_status_rich(data, counts, console)
+        else:
+            _print_status_plain(data)
+            _print_leasing_plain(counts)
         if not initialized:
             return 0
 

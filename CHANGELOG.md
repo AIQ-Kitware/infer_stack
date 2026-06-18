@@ -164,7 +164,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   one-liner. The setup hint only appears when *nothing* is set up, and then
   points at the leasing getting-started (`config init` / `catalog init` /
   `serve`); the legacy KubeAI status error now references `infer-stack legacy
-  setup` (the command's real path after the CLI reorg).
+  setup` (the command's real path after the CLI reorg). On a terminal the
+  summary is now rich-formatted (bold labels, colored values, a styled leasing
+  line); piped/redirected output stays plain (`Console.is_terminal`), so scripts
+  and tests are unaffected.
 * Converging to an empty desired set no longer crashes. Releasing the last
   `reclaim:stop` lease leaves zero services to render, and `docker compose up -d`
   errors with "no service selected" on a services-less file — so the release's
