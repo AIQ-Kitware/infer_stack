@@ -348,23 +348,71 @@ def _access_endpoints(access: dict[str, Any]) -> list[tuple[str, str]]:
     return out
 
 
-def _print_status_summary(cfg: dict[str, Any], *, initialized: bool) -> None:
+def _leasing_configured() -> bool:
+    """Has the user set up the leasing model (catalog / durable settings)?
+
+    The leasing world doesn't use ``config.yaml``; it uses ``catalog.yaml`` and
+    ``settings.yaml``. Treat either (or any ledger state, reported separately) as
+    "set up" so ``status`` doesn't nag a leasing user to run the legacy setup.
+    """
+    from ..paths import settings_path
+
+    return (config_root() / 'catalog.yaml').exists() or settings_path().exists()
+
+
+def _print_status_summary(
+    cfg: dict[str, Any], *, initialized: bool, leasing_mode: bool
+) -> None:
     """Print cheap, no-network context about the current stack.
 
-    Everything here comes from config.yaml, on-disk artifact existence, and the
-    already-resolved plan.yaml, so it never touches Docker, the network, or
-    hardware detection.
+    Everything here comes from config.yaml / catalog.yaml / settings.yaml, the
+    on-disk artifacts, and the already-resolved plan.yaml — so it never touches
+    Docker, the network, or hardware detection. ``initialized`` is about the
+    *legacy* ``config.yaml`` (profiles); the leasing model is reported above it.
     """
+    from ..paths import data_root, settings_path
+
     backend = backend_name(cfg)
     print('infer-stack status')
     print()
-    print(
-        f'  initialized:    {"yes" if initialized else "no"}  ({config_path()})'
-    )
     print(f'  backend:        {backend}')
-    print(f'  active profile: {cfg.get("active_profile") or "<unset>"}')
+    print(f'  data dir:       {data_root()}')
     print(f'  config dir:     {config_root()}')
 
+    # Leasing model (the primary world): catalog + durable settings.
+    cat_file = config_root() / 'catalog.yaml'
+    if cat_file.exists():
+        suffix = ''
+        try:
+            from ..leasing import Catalog
+
+            cat = Catalog.load(cat_file)
+            suffix = (
+                f'  ({len(cat.models)} model(s), '
+                f'{len(cat.endpoints)} endpoint(s))'
+            )
+        except Exception:
+            pass
+        print(f'  catalog:        {cat_file}{suffix}')
+    if settings_path().exists():
+        print(f'  settings:       {settings_path()}')
+
+    # Legacy profile world (config.yaml) — only relevant to pre-leasing users.
+    print(f'  legacy config:  {"yes" if initialized else "no"}  ({config_path()})')
+
+    if not initialized:
+        if not leasing_mode:
+            print()
+            print('  Nothing set up yet. For the leasing model:')
+            print('    infer-stack config init       # backend + data dir')
+            print('    infer-stack catalog init      # then `catalog model add` …')
+            print('    infer-stack serve <endpoint>')
+            print(
+                '  (Pre-leasing profiles live under `infer-stack legacy setup`.)'
+            )
+        return
+
+    print(f'  active profile: {cfg.get("active_profile") or "<unset>"}')
     out_dir = (
         kubeai_generated_dir(cfg) if backend == 'kubeai' else generated_dir(cfg)
     )
@@ -372,15 +420,6 @@ def _print_status_summary(cfg: dict[str, Any], *, initialized: bool) -> None:
         'models.yaml' if backend == 'kubeai' else 'docker-compose.yml'
     )
     print(f'  generated dir:  {out_dir}')
-
-    if not initialized:
-        print()
-        print(
-            '  Not initialized — run '
-            '`infer-stack setup --backend compose --profile <profile>` '
-            'to create config.yaml.'
-        )
-        return
 
     if rendered_marker.exists():
         stale = render_is_stale(cfg)
@@ -469,10 +508,12 @@ class StatusCLI(
     _PortOverridesMixin,
     _ClusterOverridesMixin,
 ):
-    """Show stack status: where config/artifacts live, the active profile,
-    whether it has been rendered, the resolved components/endpoints, and the
-    live container/cluster state. Leases (the newer model) are summarized too;
-    see ``infer-stack leases`` for detail."""
+    """Show stack status: backend + where config/catalog/settings live, the
+    leasing summary (active leases / live groups; see ``infer-stack leases``),
+    and — for a legacy profile user — the active profile, whether it has been
+    rendered, the resolved components/endpoints, and the live container/cluster
+    state. The leasing model needs no ``config.yaml`` (reported as ``legacy
+    config``)."""
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -480,7 +521,9 @@ class StatusCLI(
         _apply_path_overrides(config)
         initialized = config_path().exists()
         cfg = config_for_runtime(config, allow_missing=True)
-        _print_status_summary(cfg, initialized=initialized)
+        _print_status_summary(
+            cfg, initialized=initialized, leasing_mode=_leasing_configured()
+        )
         _print_leasing_summary()
         if not initialized:
             return 0
@@ -494,7 +537,7 @@ class StatusCLI(
             except CommandError as ex:
                 raise SystemExit(
                     f'Failed to query KubeAI resources in namespace {namespace!r}. Confirm '
-                    f'`infer-stack setup --backend kubeai --namespace {namespace}` '
+                    f'`infer-stack legacy setup --backend kubeai --namespace {namespace}` '
                     'matches the namespace where the KubeAI Helm release is installed.\n'
                     f'Original error: {ex}'
                 ) from ex

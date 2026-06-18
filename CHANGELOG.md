@@ -156,6 +156,15 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   flag opts vLLM readiness into the same real-generation check.
 
 ### Fixed
+* `infer-stack status` is leasing-aware. It no longer tells a leasing user (who
+  has `catalog.yaml` / `settings.yaml`, maybe with active leases) that they are
+  "Not initialized — run `infer-stack setup …`". `config.yaml` is now reported
+  as `legacy config` (it belongs to the pre-leasing profile world), and the
+  summary leads with backend / data dir / catalog / settings + the leasing
+  one-liner. The setup hint only appears when *nothing* is set up, and then
+  points at the leasing getting-started (`config init` / `catalog init` /
+  `serve`); the legacy KubeAI status error now references `infer-stack legacy
+  setup` (the command's real path after the CLI reorg).
 * Converging to an empty desired set no longer crashes. Releasing the last
   `reclaim:stop` lease leaves zero services to render, and `docker compose up -d`
   errors with "no service selected" on a services-less file — so the release's

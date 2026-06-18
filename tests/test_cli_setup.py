@@ -610,14 +610,16 @@ def test_kubeai_status_namespace_error_is_actionable(
     else:
         raise AssertionError('expected StatusCLI.main to raise SystemExit')
     assert "namespace 'default'" in text
-    assert 'setup --backend kubeai --namespace default' in text
+    assert 'legacy setup --backend kubeai --namespace default' in text
 
 
 def test_status_reports_initialization_and_profile(tmp_path: Path) -> None:
-    # Before setup: status reports it is uninitialized and exits cleanly
-    # (no Docker / network / hardware probe required).
+    # Before setup: status reports nothing is set up and exits cleanly
+    # (no Docker / network / hardware probe required). With no catalog/settings
+    # either, it points at the leasing getting-started, not legacy setup.
     pre = run_cli(tmp_path, 'status')
-    assert 'Not initialized' in pre.stdout
+    assert 'Nothing set up yet' in pre.stdout
+    assert 'legacy config:  no' in pre.stdout
 
     # After setup: status reports the active profile and that it is not yet
     # rendered, still without touching Docker.

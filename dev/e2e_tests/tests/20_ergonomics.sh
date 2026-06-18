@@ -18,20 +18,23 @@ expect_out 'docker-compose.yml'
 expect_out 'env (secrets)'
 end_step
 
-step status 'status runs cleanly and prints its summary'
+step status 'status runs cleanly and prints its (leasing-aware) summary'
 run 'infer-stack status'
 expect_rc 0
 expect_no_out 'Traceback (most recent call last)'
-expect_out 'initialized:'
+expect_out 'backend:'
+# Leasing-first: config.yaml is now reported as `legacy config:`, and a user
+# with a catalog/settings is not nagged to run the legacy setup.
+expect_no_out 'Not initialized'
 # The one-line leasing summary only appears when the ledger is non-empty
 # (by design); that path is covered by the unit test
 # test_status_summarizes_leases_when_present. Here we just smoke `status`.
 end_step
 
-step secrets-missing 'secrets gives a friendly error before any compose acquire'
+step env-missing 'env gives a friendly error before any compose acquire'
 run 'infer-stack env LITELLM_MASTER_KEY'
 expect_rc_not 0
-expect_out 'no managed secrets'
+expect_out 'no managed env-file'
 note 'expected on a fresh data dir; becomes populated after a compose acquire'
 end_step
 
