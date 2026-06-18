@@ -31,11 +31,15 @@ live under your data dir. Persist it once — no shell export needed afterward �
 and set Compose as the default backend so you never repeat `--backend`:
 
 ```bash
-# Point this at a disk with room (use /data/infer-stack etc. for big models).
-infer-stack config set data_dir "$HOME/infer-stack"
-infer-stack config set backend compose
+# Interactive: prompts for the data dir + default backend, shows them, confirms.
+infer-stack config init
+# ...or non-interactively (scripts / CI):
+infer-stack config init --yes --data-dir "$HOME/infer-stack" --backend compose
 infer-stack config show
 ```
+
+(Point the data dir at a disk with room — `/data/infer-stack` etc. for large
+models. You can also change either later: `infer-stack config set backend …`.)
 
 ### 1b. Build your catalog (your durable model list)
 

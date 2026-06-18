@@ -65,7 +65,9 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     `init/path/show/validate/edit`) with a validating writer, so models/endpoints
     are added without hand-editing YAML.
   - `infer-stack config …` — `init/paths/show/set/get/edit` over a new durable
-    `settings.yaml`. `config set backend compose` and `config set data_dir <p>`
+    `settings.yaml`. `config init` is an interactive rich prompt (data dir +
+    default backend, with a confirmation) and takes `--yes` (and auto-detects a
+    non-TTY) for non-interactive scripting. `config set backend compose` and `config set data_dir <p>`
     are honored (the leasing `--backend` default and `data_root()` consult them),
     so the backend flag and storage location no longer have to be repeated/
     exported.

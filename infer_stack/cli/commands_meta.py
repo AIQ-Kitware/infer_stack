@@ -337,24 +337,78 @@ KNOWN_SETTINGS = {
 
 
 class ConfigInitCLI(_PathOverridesMixin):
-    """Initialize the config dir: write a settings.yaml skeleton if absent."""
+    """Set up the durable settings (data dir + default backend), interactively.
+
+    Prompts for each setting and shows them for confirmation before writing
+    (like ``aivm``). Use ``--yes`` for non-interactive scripting (accepts the
+    provided flags / current values / defaults without prompting); the same
+    non-interactive path is taken automatically when stdin is not a TTY.
+    """
 
     __command__ = 'init'
-    force = scfg.Value(False, isflag=True)
+    yes = scfg.Value(
+        False, isflag=True, alias=['y'],
+        help='Non-interactive: write without prompting/confirming.',
+    )
+    backend = scfg.Value(
+        None, choices=['compose', 'kubeai', 'null'],
+        help='Preset the default backend (skips that prompt).',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from ..paths import load_settings, save_settings, settings_path
+        import sys
+
+        from ..paths import (
+            data_root,
+            load_settings,
+            save_settings,
+            settings_path,
+        )
 
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
+        settings = load_settings()
         path = settings_path()
-        if path.exists() and not config.force:
-            print(f'settings already exist -> {path}')
-        else:
-            save_settings(load_settings() if path.exists() else {})
-            print(f'wrote settings -> {path}')
-        print('next: `infer-stack catalog init`, then `config set backend compose`')
+
+        # Proposed values: explicit flag > current setting > sensible default.
+        # data_root() already resolves --data-dir override / $env / setting / XDG.
+        data_dir = config.data_dir or settings.get('data_dir') or str(data_root())
+        backend = config.backend or settings.get('backend') or 'compose'
+
+        interactive = (
+            not config.yes and sys.stdin.isatty() and sys.stdout.isatty()
+        )
+        if interactive:
+            from rich.console import Console
+            from rich.prompt import Confirm, Prompt
+            from rich.table import Table
+
+            console = Console()
+            console.print('[bold]infer-stack config init[/]\n')
+            data_dir = Prompt.ask(
+                'Data dir (docker-mounted weight/state)', default=data_dir
+            )
+            backend = Prompt.ask(
+                'Default backend',
+                choices=['compose', 'kubeai', 'null'],
+                default=backend,
+            )
+            table = Table(show_header=True, header_style='bold')
+            table.add_column('setting')
+            table.add_column('value', style='green')
+            table.add_row('data_dir', data_dir)
+            table.add_row('backend', backend)
+            console.print(table)
+            if not Confirm.ask(f'Write these to {path}?', default=True):
+                console.print('[yellow]aborted — nothing written[/]')
+                return 0
+
+        settings['data_dir'] = data_dir
+        settings['backend'] = backend
+        save_settings(settings)
+        print(f'wrote settings -> {path}')
+        print('next: `infer-stack catalog init` to add models/endpoints')
         return 0
 
 

@@ -3,6 +3,20 @@
 from __future__ import annotations
 
 
+def test_config_init_yes_is_noninteractive(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigInitCLI
+    from infer_stack.paths import load_settings, set_data_root
+
+    set_data_root(None)
+    # --yes must not prompt (no tty in tests) and must persist presets
+    ConfigInitCLI.main(argv=['--yes', '--data-dir', str(tmp_path / 's'),
+                             '--backend', 'compose'])
+    settings = load_settings()
+    assert settings['backend'] == 'compose'
+    assert settings['data_dir'] == str(tmp_path / 's')
+
+
 def test_config_set_get_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
     from infer_stack.cli.commands_meta import ConfigGetCLI, ConfigSetCLI
