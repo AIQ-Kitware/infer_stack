@@ -1240,3 +1240,57 @@ and its three classes entirely. One verb, unambiguous by the presence of `=`.
 Reinforces the rename's premise: secrets in a readable `.env` don't warrant a
 separate "secret" surface. Updated demo/CHANGELOG/followups and tests (240 pass,
 ruff clean).
+
+## 2026-06-18 17:31:31 -0400
+
+Model: claude-opus-4-8 (Claude Code, Opus 4.8). Config: default tools, working
+the infer-stack submodule from the aiq-eval-runner superrepo.
+
+User intent (one bundled prompt, five threads): (1) keep leasing-demo current;
+(2) rich-format `infer-stack leases` (and "other CLIs"); (3) `release --all` to
+make teardown concise; (4) restore the lost "show me the compose diff before you
+change it, --yes to skip" approval; (5) add loguru narration (aivm-style) so the
+behind-the-scenes process is legible.
+
+Design decisions worth recording:
+- **loguru off the hot path.** loguru imports at ~50ms — we'd spent real effort
+  getting `infer-stack --help` to ~0.2s, so adding it at module scope would undo
+  that. Solution: a private `_log.py` that is imported only at the leasing
+  *runtime* chokepoint (`_open_controller`) and inside converge/reconcile, never
+  by the help/catalog/config surface. It also `logger.disable('infer_stack')` on
+  import, so library and test use is silent until the CLI calls
+  `configure_logging()`. Narration goes to **stderr** so stdout (JSON,
+  `$(infer-stack env KEY)`) stays clean. Verified loguru count == 0 in the
+  `--help` importtime trace.
+- **Diff-approval lives in the backend's converge, but the policy lives in the
+  CLI.** ComposeBackend gained `assume_yes`; converge renders, computes the
+  changed files vs disk, and (when not assume_yes) calls the existing
+  `diff_prompt.confirm_writes`. The *decision* of when to prompt is the CLI's:
+  only the additive verbs (acquire/serve) prompt, and only on a TTY without
+  `--yes` (`_resolve_assume_yes(interactive=...)`). release/leases/run never
+  prompt — for a teardown, the action is the approval. This keeps `release --all`
+  and the `run` pipeline-node usable non-interactively without hanging.
+- **Decline must not leak ledger state.** acquire = ledger.acquire (creates the
+  lease) → reconcile (converge). If the operator declines, converge raises a
+  neutral `ConvergeAborted` (defined in backend.py, not compose.py, to respect
+  the layer boundary), and controller.acquire rolls the lease back with a
+  *bookkeeping-only* `ledger.release` (not controller.release, which would
+  reconcile again). Tested with a tiny DeclineBackend rather than the real
+  renderer so the test doesn't depend on a fully-populated spec.
+- **release --all** enumerates active leases from the ledger and releases each;
+  the reconciles collapse naturally (each release converges the shrinking union;
+  the last one downs the project).
+
+Risks/uncertainties: the diff prompt fires inside converge, which is reached
+through the controller — fine for the single-shot CLI, but any future caller
+that converges in a loop on a TTY would prompt repeatedly (mitigated: only
+acquire/serve set interactive). loguru is a new hard dependency (added to
+pyproject + uv.lock; clean 2-package diff). The compose diff/approval path is
+unit-tested with a fake docker + monkeypatched confirm; the real interactive
+prompt on GPU hardware hasn't been exercised yet. 250 tests pass, ruff clean.
+
+Takeaway: when adding cross-cutting feedback (logging) or a new dependency to a
+CLI you've tuned for startup latency, gate it behind the runtime entry points
+rather than module scope — "imported only when actually doing work" preserves
+both the fast `--help`/completion path and library silence, and costs only a few
+lazy imports.

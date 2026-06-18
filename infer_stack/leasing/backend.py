@@ -27,6 +27,15 @@ class Readiness:
     detail: str = ''
 
 
+class ConvergeAborted(Exception):
+    """A backend's ``converge`` was declined by the user (diff not approved).
+
+    Raised by an interactive backend when the operator rejects the pending
+    compose changes. The controller rolls back the just-created lease so a
+    declined ``acquire`` doesn't leave dangling ledger state.
+    """
+
+
 @runtime_checkable
 class Backend(Protocol):
     """What the :class:`Controller` needs from a serving backend.

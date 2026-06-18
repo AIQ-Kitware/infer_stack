@@ -183,10 +183,18 @@ class Controller:
         interval: float = 2.0,
     ) -> AcquireOutcome:
         """Create a lease, realize its groups, and (optionally) block on ready."""
+        from .backend import ConvergeAborted
+
         result = self.ledger.acquire(
             owner, requests, ttl_seconds=ttl_seconds
         )
-        rec = self.reconcile()
+        try:
+            rec = self.reconcile()
+        except ConvergeAborted:
+            # The operator declined the compose changes — don't leave the
+            # just-created lease dangling in the ledger.
+            self.ledger.release(result.lease.id)
+            raise
         groups = [self.ledger.get_group(g.id) for g in result.groups]
         groups = [g for g in groups if g is not None]
         wait_result = None

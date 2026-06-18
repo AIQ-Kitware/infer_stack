@@ -82,9 +82,16 @@ run downloads the weights (a few GiB), so allow time. No `--backend` — it come
 from your settings. A managed **Open WebUI comes up alongside the gateway by
 default** (disable with `--no-ui`, or globally `infer-stack config set ui false`).
 
+On a terminal, `serve`/`acquire` **show you the diff** of the compose project
+they're about to change and ask you to confirm (so you see exactly which
+services are added/removed); `--yes` (or `-y`) skips the prompt, and it's skipped
+automatically when output isn't a terminal (scripts/CI). infer-stack also
+narrates what it's doing (placement, `docker compose up`, readiness) on stderr.
+
 ```bash
 infer-stack serve chat --require-generation --timeout 1200
-# prints, when ready:  open webui: http://127.0.0.1:13000
+# shows the compose diff, asks to apply (or pass --yes), then:
+#   open webui: http://127.0.0.1:13000
 ```
 
 Watch it come up from another shell:
@@ -180,9 +187,9 @@ clients and Open WebUI don't change.
 ## 6. Teardown
 
 ```bash
-# release all standing leases, then down the leasing stack (Open WebUI, the
-# gateway, and the model containers all come down together — it's one project)
-infer-stack leases --json | python -c 'import json,sys;[print(l["id"]) for l in json.load(sys.stdin)["leases"] if l["state"]=="active"]' | xargs -r -n1 infer-stack release
+# release every active lease in one shot, then down the leasing stack (Open
+# WebUI, the gateway, and the model containers all come down together)
+infer-stack release --all
 infer-stack stack down
 # weights cache + chat history under your data dir are kept (re-serving is then
 # fast). Delete the data dir to reclaim disk.

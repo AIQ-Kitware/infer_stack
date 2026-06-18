@@ -32,6 +32,7 @@ from ..leasing import (
     CatalogError,
     ComposeBackend,
     Controller,
+    LeaseState,
     Ledger,
     NullBackend,
     Sharing,
@@ -115,7 +116,22 @@ def _resolve_ui(config) -> bool:
     return _coerce_bool(get_setting('ui'), True)
 
 
-def _make_backend(config):
+def _resolve_assume_yes(config, *, interactive: bool) -> bool:
+    """Whether to apply compose changes without the diff prompt.
+
+    Only the additive verbs (acquire/serve) prompt, and only on a real terminal
+    without ``--yes``. Everything else (release/leases/run/non-TTY) auto-applies.
+    """
+    import sys
+
+    if not interactive:
+        return True
+    if getattr(config, 'yes', False):
+        return True
+    return not sys.stdout.isatty()
+
+
+def _make_backend(config, *, interactive: bool = False):
     from ..paths import get_setting
 
     # Resolve the backend: explicit --backend wins, else the persisted default
@@ -135,6 +151,7 @@ def _make_backend(config):
             ),
             ui=_resolve_ui(config),
             require_generation=bool(getattr(config, 'require_generation', False)),
+            assume_yes=_resolve_assume_yes(config, interactive=interactive),
         )
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI yet '
@@ -142,11 +159,14 @@ def _make_backend(config):
     )
 
 
-def _open_controller(config) -> Controller:
+def _open_controller(config, *, interactive: bool = False) -> Controller:
+    from .._log import configure_logging
+
+    configure_logging()  # narrate the leasing verbs (stderr); off the help path
     _apply_path_overrides(config)
     ledger_path = config.ledger or str(default_ledger_path())
     ledger = Ledger(SqliteStore(ledger_path))
-    return Controller(ledger, _make_backend(config))
+    return Controller(ledger, _make_backend(config, interactive=interactive))
 
 
 def _load_catalog(config) -> Catalog:
@@ -244,21 +264,33 @@ def _emit_acquire(config, controller, outcome) -> int:
 
 
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
-    controller = _open_controller(config)
+    from .._log import logger
+    from ..leasing.backend import ConvergeAborted
+
+    controller = _open_controller(config, interactive=True)
     catalog = _load_catalog(config)
     names = _collect_names(config.names)
     if not names:
         raise SystemExit('give at least one endpoint or bundle name')
     sharing = Sharing.DEDICATED if getattr(config, 'dedicated', False) else None
     requests = _resolve(catalog, names, sharing=sharing)
-    outcome = controller.acquire(
-        owner,
-        requests,
-        ttl_seconds=ttl_seconds,
-        wait=bool(config.wait),
-        timeout=float(config.timeout),
-        interval=float(config.interval),
-    )
+    logger.info('Acquiring {} for {}', ', '.join(names), owner)
+    if config.wait:
+        logger.info(
+            'Will wait up to {:.0f}s for readiness (poll {:.0f}s)',
+            float(config.timeout), float(config.interval),
+        )
+    try:
+        outcome = controller.acquire(
+            owner,
+            requests,
+            ttl_seconds=ttl_seconds,
+            wait=bool(config.wait),
+            timeout=float(config.timeout),
+            interval=float(config.interval),
+        )
+    except ConvergeAborted:
+        raise SystemExit('aborted: compose changes not applied (no lease kept)')
     return _emit_acquire(config, controller, outcome)
 
 
@@ -311,6 +343,11 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
     interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
     env_file = scfg.Value(
         None, type=str, help='Write the sourceable endpoint env-file here.'
+    )
+    yes = scfg.Value(
+        False, isflag=True, alias=['y'],
+        help='Apply compose changes without showing the diff / prompting '
+        '(compose backend). Implied when stdout is not a terminal.',
     )
     json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
 
@@ -375,15 +412,44 @@ class ReleaseCLI(_LeasingCommonMixin):
     env_file = scfg.Value(
         None, type=str, help='Read the session id from this env-file.'
     )
+    all = scfg.Value(
+        False, isflag=True,
+        help='Release every active lease (the whole stack idles/tears down).',
+    )
     json = scfg.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
+
+        if config.all:
+            if config.session or config.env_file:
+                raise SystemExit('release: --all takes no session/--env-file')
+            controller.ledger.sweep()
+            leases, _ = controller.ledger.status()
+            sids = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+            outcomes = [(sid, controller.release(sid)) for sid in sids]
+            if config.json:
+                print(json.dumps({
+                    'released': [s for s, _ in outcomes],
+                    'torn_down': sorted({
+                        g for _, o in outcomes for g in o.reconcile.torn_down
+                    }),
+                }, indent=2))
+            elif not outcomes:
+                print('no active leases to release')
+            else:
+                print(f'released {len(outcomes)} lease(s)')
+                for sid, outcome in outcomes:
+                    print(f'  {sid}')
+                    for gid in outcome.reconcile.torn_down:
+                        print(f'    torn down: {gid}')
+            return 0
+
         sid = _resolve_session(config)
         if not sid:
-            raise SystemExit('release: give a session id or --env-file')
+            raise SystemExit('release: give a session id, --env-file, or --all')
         outcome = controller.release(sid)
         if config.json:
             print(
@@ -491,6 +557,80 @@ class RunCLI(_LeasingCommonMixin):
             controller.release(outcome.lease.id)
 
 
+def _lease_ttl(le) -> str:
+    return 'inf' if le.expires_at is None else f'@{le.expires_at:.0f}'
+
+
+def _print_leases_plain(leases, groups) -> None:
+    print('leases:')
+    if not leases:
+        print('  (none)')
+    for le in leases:
+        print(
+            f'  {le.id}  owner={le.owner}  state={le.state}  '
+            f'ttl={_lease_ttl(le)}  endpoints={",".join(le.endpoints) or "-"}'
+        )
+    print('groups:')
+    if not groups:
+        print('  (none)')
+    for g in groups:
+        print(
+            f'  {g.id}  {g.engine}  state={g.state}  demand={g.demand}  '
+            f'served={",".join(sorted(g.served)) or "-"}'
+        )
+
+
+def _print_leases_rich(leases, groups, console) -> None:
+    from rich.table import Table
+    from rich.text import Text
+
+    def state_style(state) -> str:
+        s = str(state).lower()
+        if 'active' in s or 'live' in s:
+            return 'green'
+        if 'stop' in s or 'expir' in s or 'idle' in s:
+            return 'yellow'
+        return 'dim'
+
+    console.print(Text('leases', style='bold'))
+    if not leases:
+        console.print('  [dim](none)[/dim]')
+    else:
+        lt = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0),
+                   header_style='dim')
+        lt.add_column('id', style='cyan', no_wrap=True)
+        lt.add_column('owner')
+        lt.add_column('state')
+        lt.add_column('ttl', style='dim')
+        lt.add_column('endpoints', style='magenta', overflow='fold')
+        for le in leases:
+            lt.add_row(
+                le.id, le.owner,
+                Text(str(le.state), style=state_style(le.state)),
+                _lease_ttl(le), ','.join(le.endpoints) or '-',
+            )
+        console.print(lt)
+
+    console.print(Text('groups', style='bold'))
+    if not groups:
+        console.print('  [dim](none)[/dim]')
+    else:
+        gt = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0),
+                   header_style='dim')
+        gt.add_column('id', style='cyan', no_wrap=True)
+        gt.add_column('engine')
+        gt.add_column('state')
+        gt.add_column('demand', justify='right', style='dim')
+        gt.add_column('served', style='magenta', overflow='fold')
+        for g in groups:
+            gt.add_row(
+                g.id, g.engine,
+                Text(str(g.state), style=state_style(g.state)),
+                str(g.demand), ','.join(sorted(g.served)) or '-',
+            )
+        console.print(gt)
+
+
 class LeasesCLI(_LeasingCommonMixin):
     """Show current leases and deployment groups (the leasing-model status)."""
 
@@ -533,23 +673,13 @@ class LeasesCLI(_LeasingCommonMixin):
                 )
             )
             return 0
-        print('leases:')
-        if not leases:
-            print('  (none)')
-        for le in leases:
-            ttl = 'inf' if le.expires_at is None else f'@{le.expires_at:.0f}'
-            print(
-                f'  {le.id}  owner={le.owner}  state={le.state}  '
-                f'ttl={ttl}  endpoints={",".join(le.endpoints) or "-"}'
-            )
-        print('groups:')
-        if not groups:
-            print('  (none)')
-        for g in groups:
-            print(
-                f'  {g.id}  {g.engine}  state={g.state}  demand={g.demand}  '
-                f'served={",".join(sorted(g.served)) or "-"}'
-            )
+        from rich.console import Console
+
+        console = Console()
+        if console.is_terminal:
+            _print_leases_rich(leases, groups, console)
+        else:
+            _print_leases_plain(leases, groups)
         return 0
 
 

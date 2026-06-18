@@ -405,6 +405,70 @@ def test_access_includes_ui_url_when_ui_on(tmp_path):
     assert 'ui_url' not in be_noui.access(['a'])
 
 
+def test_converge_diff_decline_aborts(tmp_path, monkeypatch):
+    import infer_stack.diff_prompt as dp
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    monkeypatch.setattr(dp, 'confirm_writes', lambda *a, **k: False)
+    be = make_backend(tmp_path, assume_yes=False)
+    with pytest.raises(ConvergeAborted):
+        be.converge([vllm('grp-a', served='a')])
+    # Declined -> nothing written, no `docker compose up`.
+    assert not be.compose_file.exists()
+    assert not any('up' in call for call in be.run.calls)
+
+
+def test_converge_diff_accept_applies(tmp_path, monkeypatch):
+    import infer_stack.diff_prompt as dp
+
+    monkeypatch.setattr(dp, 'confirm_writes', lambda *a, **k: True)
+    be = make_backend(tmp_path, assume_yes=False)
+    be.converge([vllm('grp-a', served='a')])
+    assert be.compose_file.exists()
+    assert any('up' in call for call in be.run.calls)
+
+
+def test_converge_no_change_does_not_prompt(tmp_path, monkeypatch):
+    import infer_stack.diff_prompt as dp
+
+    be = make_backend(tmp_path, assume_yes=False)
+    monkeypatch.setattr(dp, 'confirm_writes', lambda *a, **k: True)
+    be.converge([vllm('grp-a', served='a')])     # first apply
+
+    # An identical desired set renders byte-identical files -> no diff, no prompt.
+    seen = {'n': 0}
+
+    def boom(*a, **k):
+        seen['n'] += 1
+        return True
+
+    monkeypatch.setattr(dp, 'confirm_writes', boom)
+    be.converge([vllm('grp-a', served='a')])
+    assert seen['n'] == 0
+
+
+def test_acquire_rolls_back_lease_on_decline(tmp_path):
+    from infer_stack.leasing import EndpointRequest, LeaseState, vllm_structural
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    class DeclineBackend:
+        def observe(self):
+            return set()
+
+        def converge(self, desired):
+            raise ConvergeAborted('declined')
+
+    led = Ledger(SqliteStore(tmp_path / 'ledger.db'))
+    ctrl = Controller(led, DeclineBackend())
+    with pytest.raises(ConvergeAborted):
+        ctrl.acquire(
+            'me', [EndpointRequest('a', 'vllm', vllm_structural(model_ref='a'))]
+        )
+    # The just-created lease must not linger as active after a decline.
+    leases, _ = led.status()
+    assert not [le for le in leases if le.state == LeaseState.ACTIVE]
+
+
 def test_access_reports_litellm_base_url(tmp_path):
     be = make_backend(tmp_path)
     info = be.access(['qwen-coder', 'reranker'])

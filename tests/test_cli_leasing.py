@@ -103,6 +103,22 @@ def test_release_via_env_file(env, capsys):
     assert data['groups'][0]['demand'] == 0
 
 
+def test_release_all_releases_every_active_lease(env, capsys):
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    rc = ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    assert rc == 0
+    data = _leases_json(env, capsys)
+    assert data['leases']                                  # leases still listed
+    assert all(le['state'] == 'released' for le in data['leases'])
+
+
+def test_release_all_with_no_leases_is_friendly(env, capsys):
+    rc = ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    assert rc == 0
+    assert 'no active leases' in capsys.readouterr().out
+
+
 def test_serve_is_standing_lease(env, capsys):
     ServeCLI.main(argv=['qwen-coder', *_base(env)])
     data = _leases_json(env, capsys)

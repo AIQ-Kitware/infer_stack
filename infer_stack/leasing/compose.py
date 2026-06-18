@@ -467,6 +467,7 @@ class ComposeBackend:
         litellm: bool = True,
         ui: bool = True,
         require_generation: bool = False,
+        assume_yes: bool = True,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -486,6 +487,7 @@ class ComposeBackend:
         self.litellm = litellm
         self.ui = ui
         self.require_generation = require_generation
+        self.assume_yes = assume_yes
         self.last_errors: list[str] = []
         self._pulled: set[str] = set()  # (group:tag) pulled this process
 
@@ -556,10 +558,50 @@ class ComposeBackend:
             fcntl.flock(handle, fcntl.LOCK_UN)
             handle.close()
 
+    def _approve_changes(self, planned: dict[Path, str]) -> None:
+        """Show pending compose/litellm changes and confirm them.
+
+        ``planned`` maps target paths to their new content. When nothing
+        actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
+        non-interactive / ``--yes``), it applies after a one-line log. Otherwise
+        it renders a per-file diff and prompts; a decline raises
+        :class:`ConvergeAborted` so the caller can roll back.
+        """
+        from .._log import logger
+        from .backend import ConvergeAborted
+
+        changed = {
+            p: text
+            for p, text in planned.items()
+            if (p.read_text() if p.exists() else '') != text
+        }
+        if not changed:
+            logger.debug('compose project already up to date')
+            return
+        names = ', '.join(p.name for p in changed)
+        if self.assume_yes:
+            logger.info('Updating compose project ({})', names)
+            return
+        from ..diff_prompt import confirm_writes
+
+        if not confirm_writes(
+            changed,
+            assume_yes=False,
+            title='infer-stack will update the compose project',
+        ):
+            raise ConvergeAborted('compose changes were not approved')
+
     def converge(self, desired: list[DeploymentGroup]):
         """Place, render, and ``docker compose up`` the desired union."""
+        from .._log import logger
+
         desired = list(desired)
         with self._converge_lock():
+            logger.info(
+                'Converging {} group(s): {}',
+                len(desired),
+                ', '.join(sorted(g.id for g in desired)) or '(none)',
+            )
             pinned = self._load_sidecar().get('assignments', {})
             plan = plan_placement(
                 desired,
@@ -570,6 +612,10 @@ class ComposeBackend:
                 skip_display=self.skip_display,
             )
             self.last_errors = plan.errors
+            for gid, gpus in sorted(plan.assignments.items()):
+                logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
+            for err in plan.errors:
+                logger.warning('  placement: {}', err)
             rendered = render_compose(
                 desired,
                 plan.assignments,
@@ -583,17 +629,29 @@ class ComposeBackend:
                 ui_port=self.ui_port,
                 aux_dir=self.state_dir,
             )
+
+            compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
+            planned: dict[Path, str] = {self.compose_file: compose_text}
+            if rendered.litellm_config is not None:
+                planned[self.state_dir / LITELLM_CONFIG_FILENAME] = (
+                    rendered.litellm_config
+                )
+            self._approve_changes(planned)  # may raise ConvergeAborted
+
             if rendered.litellm_config is not None:
                 (self.state_dir / LITELLM_CONFIG_FILENAME).write_text(
                     rendered.litellm_config
                 )
-            self.compose_file.write_text(
-                yaml.safe_dump(rendered.compose, sort_keys=False)
-            )
+            self.compose_file.write_text(compose_text)
             self._save_sidecar(
                 {'assignments': plan.assignments, 'services': rendered.services}
             )
-            if rendered.compose.get('services'):
+            services = rendered.compose.get('services')
+            if services:
+                logger.info(
+                    'docker compose up -d ({} service(s): {})',
+                    len(services), ', '.join(sorted(services)),
+                )
                 self._compose(['up', '-d', '--remove-orphans'])
             else:
                 # Empty desired set (e.g. the last reclaim:stop lease was
@@ -601,6 +659,7 @@ class ComposeBackend:
                 # selected" on a services-less file. Tear the project down
                 # instead — this is the clean "everything off" convergence.
                 # (`down` targets the project, so it works on the empty file.)
+                logger.info('no services desired -> docker compose down')
                 self._compose(['down', '--remove-orphans'])
         return plan
 

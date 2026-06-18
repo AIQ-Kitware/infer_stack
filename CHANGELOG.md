@@ -116,6 +116,23 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     are honored (the leasing `--backend` default and `data_root()` consult them),
     so the backend flag and storage location no longer have to be repeated/
     exported.
+  - `infer-stack release --all` — release every active lease in one shot (the
+    whole stack idles/tears down per each lease's reclaim policy). Makes teardown
+    a one-liner instead of scraping session ids out of `leases`.
+  - `infer-stack leases` is rich-formatted on a terminal (lease/group tables
+    with state colors); piped/`--json` output is unchanged.
+  - Compose changes are now shown before they're applied. On a terminal,
+    `serve`/`acquire` render a diff of the compose project (and LiteLLM routing)
+    they're about to write and ask to confirm — restoring the legacy
+    "see-and-approve render" for the leasing path. `--yes`/`-y` skips the prompt,
+    and it's skipped automatically off a terminal (scripts/CI). Declining rolls
+    back the just-created lease (no dangling ledger state). Teardown verbs
+    (`release`) don't prompt — the action is the approval.
+  - Behind-the-scenes feedback via loguru (like `aivm`): the leasing verbs
+    narrate placement, `docker compose up/down`, and readiness waits to stderr
+    (INFO; `$INFER_STACK_LOG_LEVEL` to change). It's kept off the `--help`
+    import path (loguru is ~50ms) and silent for library/test use until the CLI
+    enables it, so stdout/JSON output is untouched.
   - `infer-stack catalog endpoint add` — `NAME` is now optional and defaults to
     the `--model` (the vLLM model name, or the Ollama tag, slugified to a safe
     alias). So `catalog endpoint add --model smol135` creates the endpoint
