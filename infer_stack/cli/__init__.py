@@ -39,6 +39,7 @@ from ..kubeai_ops import (  # noqa: F401
 # Keep submodules importable as attributes (e.g. ``infer_stack.cli.commands_runtime``)
 # so tests can patch seams where they are actually looked up.
 from . import (  # noqa: F401
+    commands_catalog,
     commands_leasing,
     commands_meta,
     commands_profile,
@@ -49,6 +50,7 @@ from . import (  # noqa: F401
     options,
     probes,
 )
+from .commands_catalog import CatalogModalCLI
 from .commands_leasing import (
     AcquireCLI,
     LeasesCLI,
@@ -61,6 +63,7 @@ from .commands_leasing import (
 from .commands_meta import (
     ConfigModalCLI,
     ConfigPathsCLI,
+    HelpModalCLI,
     VersionCLI,
 )
 from .commands_profile import (
@@ -147,8 +150,12 @@ class ManageCLI(scfg.ModalCLI):
 
     # Meta / introspection
     version_command = VersionCLI
+    help = HelpModalCLI  # `infer-stack help tree` — the whole surface at a glance
     config = ConfigModalCLI
     paths = ConfigPathsCLI  # top-level alias for `config paths`
+
+    # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
+    catalog = CatalogModalCLI
 
     # Config / profile management
     setup = SetupCLI

@@ -46,6 +46,67 @@ class VersionCLI(scfg.DataConfig):
         return 0
 
 
+# ---------------------------------------------------------------------------
+# help tree — the whole command surface at a glance (cf. `aivm help tree`)
+# ---------------------------------------------------------------------------
+
+
+def _iter_subcommands(modal: Any):
+    """(name, cls) for each registered subcommand of a ModalCLI class."""
+    out: dict[str, Any] = {}
+    for attr, val in vars(modal).items():
+        if attr.startswith('_'):
+            continue
+        if isinstance(val, type) and issubclass(
+            val, (scfg.DataConfig, scfg.ModalCLI)
+        ):
+            name = getattr(val, '__command__', None) or attr.replace('_', '-')
+            out[name] = val
+    return sorted(out.items())
+
+
+def _doc_one_line(cls: Any) -> str:
+    doc = (getattr(cls, '__doc__', None) or '').strip()
+    if not doc:
+        doc = (getattr(cls, 'description', '') or '').strip()
+    return doc.splitlines()[0].strip() if doc else ''
+
+
+def _walk_tree(modal: Any, depth: int, lines: list[str]) -> None:
+    for name, sub in _iter_subcommands(modal):
+        indent = '  ' * (depth + 1)
+        label = f'{indent}{name}'
+        desc = _doc_one_line(sub)
+        lines.append(f'{label:<32}{desc}'.rstrip())
+        if isinstance(sub, type) and issubclass(sub, scfg.ModalCLI):
+            _walk_tree(sub, depth + 1, lines)
+
+
+class HelpTreeCLI(scfg.DataConfig):
+    """Print the full nested command tree with one-line descriptions."""
+
+    __command__ = 'tree'
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        cls.cli(argv=argv, data=kwargs)
+        from infer_stack.cli import ManageCLI
+
+        lines: list[str] = []
+        _walk_tree(ManageCLI, 0, lines)
+        print('infer-stack')
+        print('\n'.join(lines))
+        return 0
+
+
+class HelpModalCLI(scfg.ModalCLI):
+    """Help utilities (use ``infer-stack <command> --help`` for per-command help)."""
+
+    __command__ = 'help'
+
+    tree = HelpTreeCLI
+
+
 def _path_status(path: Path) -> str:
     try:
         if path.exists():
