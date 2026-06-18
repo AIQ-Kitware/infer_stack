@@ -69,10 +69,24 @@ endpoints named after their models — **`smol17b-1`** and **`smol135-1`** — w
 is what we use throughout. (Add another `--model smol17b` endpoint and it becomes
 `smol17b-2`, never clobbering the first.) `infer-stack catalog show` lists them.
 
-> Want a stable alias *decoupled* from the model (a `chat` you later re-point at
-> whatever's current)? Name the endpoint explicitly instead:
-> `infer-stack catalog endpoint add chat --model smol17b`. The demo stays
-> model-centric so the name in Open WebUI tells you which model you're talking to.
+**Or name endpoints explicitly.** Give a NAME positional when you want a stable
+alias *decoupled* from the model — e.g. a `chat` you later re-point at a
+different model, so clients and Open WebUI keep asking for `chat` while the model
+behind it changes (see §5). The NAME is just the first argument:
+
+```bash
+# explicit name `chat` -> smol17b (everything after NAME is the same flags)
+infer-stack catalog endpoint add chat --model smol17b \
+    --max-model-len 8192 --gpu-mem 0.4 --extra-args='--dtype=half' --reclaim keep-warm
+# a couple more, to show the pattern:
+infer-stack catalog endpoint add coder    --model smol17b --extra-args='--dtype=half'
+infer-stack catalog endpoint add fast-chat --model smol135 --extra-args='--dtype=half' --reclaim stop
+infer-stack catalog show
+```
+
+Mix freely: model-centric names (`smol17b-1`) tell you *which model* in Open
+WebUI; explicit names (`chat`) give you a stable handle that outlives the model.
+The rest of this demo uses the model-centric ones.
 
 > Gated model? Set the token once (stored in the managed `.env` that Compose
 > auto-loads), no shell export: `infer-stack env HF_TOKEN=hf_…`.
@@ -192,11 +206,11 @@ infer-stack evict --all      # ...or every idle/released model at once
 infer-stack release <SESSION_ID> --evict
 ```
 
-> Prefer one **stable name that outlives the model behind it** (a `chat` you
-> re-point)? Use an explicit endpoint name and swap its `--model` with `--force`:
-> `infer-stack catalog endpoint add chat --model smol17b`, later
-> `infer-stack catalog endpoint add chat --model smol17b-v2 --force`; clients and
-> Open WebUI keep asking for `chat` while the model behind it changes.
+> The explicitly-named `chat` endpoint from §1b is the **stable handle** case:
+> re-point it at a different model in place and clients/Open WebUI never change
+> what they ask for —
+> `infer-stack catalog endpoint add chat --model smol135 --force`, then
+> `infer-stack serve chat`. Same `chat` alias, new model behind it.
 
 ---
 
