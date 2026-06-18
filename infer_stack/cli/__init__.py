@@ -135,27 +135,13 @@ from .probes import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
-class ManageCLI(scfg.ModalCLI):
-    description = (
-        'Render and run vLLM serving profiles through the Compose or KubeAI '
-        'backends. Primary workflow: setup -> render -> up (or deploy).'
-    )
+class LegacyModalCLI(scfg.ModalCLI):
+    """Pre-leasing profile/active-profile commands (held here; promoted out as
+    they gain leasing-native behavior, then this group is removed wholesale)."""
 
-    # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
-    # The ``version`` *subcommand* is registered below under a non-colliding
-    # attribute name; its CLI name comes from ``VersionCLI.__command__``.
-    __version__ = __version__
+    __command__ = 'legacy'
 
-    # Meta / introspection
-    version_command = VersionCLI
-    help = HelpModalCLI  # `infer-stack help tree` — the whole surface at a glance
-    config = ConfigModalCLI
-    paths = ConfigPathsCLI  # top-level alias for `config paths`
-
-    # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
-    catalog = CatalogModalCLI
-
-    # Config / profile management
+    # config / profile management
     setup = SetupCLI
     init = InitCLI
     resolve = ResolveCLI
@@ -169,13 +155,11 @@ class ManageCLI(scfg.ModalCLI):
     describe_profile = DescribeProfileCLI
     verify_profile = VerifyProfileCLI
     kubeai_sync_resource_profiles = KubeaiSyncResourceProfilesCLI
-
-    # Runtime
+    # active-profile runtime lifecycle
     up = UpCLI
     down = DownCLI
     purge = PurgeCLI
     deploy = DeployCLI
-    status = StatusCLI
     env = EnvCLI
     diagnose = DiagnoseCLI
     wait_ready = WaitReadyCLI
@@ -184,6 +168,32 @@ class ManageCLI(scfg.ModalCLI):
     ollama_pull = OllamaPullCLI
     ollama_list = OllamaListCLI
     ollama_ps = OllamaPsCLI
+
+
+class ManageCLI(scfg.ModalCLI):
+    description = (
+        'Lease, serve, and run LLM endpoints. Primary workflow: '
+        'catalog -> acquire/serve/run. Pre-leasing profile commands live under '
+        '`infer-stack legacy`; see `infer-stack help tree`.'
+    )
+
+    # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
+    # The ``version`` *subcommand* is registered below under a non-colliding
+    # attribute name; its CLI name comes from ``VersionCLI.__command__``.
+    __version__ = __version__
+
+    # Meta / introspection
+    version_command = VersionCLI
+    help = HelpModalCLI  # `infer-stack help tree` — the whole surface at a glance
+    config = ConfigModalCLI
+    paths = ConfigPathsCLI  # top-level alias for `config paths`
+    status = StatusCLI
+
+    # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
+    catalog = CatalogModalCLI
+
+    # Pre-leasing profile world (grouped; was ~25 top-level verbs)
+    legacy = LegacyModalCLI
 
     # Leasing model (acquire/release/run/serve + status)
     acquire = AcquireCLI

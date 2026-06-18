@@ -27,9 +27,22 @@ def _anchor_paths(tmp_path: Path, monkeypatch) -> Path:
     return tmp_path
 
 
+# Pre-leasing commands now live under `infer-stack legacy …`; prefix them so the
+# subprocess invocations below keep exercising the same code paths.
+_LEGACY_CMDS = {
+    'setup', 'init', 'resolve', 'validate', 'lock', 'render', 'switch',
+    'list-models', 'list-profiles', 'explain', 'describe-profile',
+    'verify-profile', 'kubeai-sync-resource-profiles', 'up', 'down', 'purge',
+    'deploy', 'env', 'diagnose', 'wait-ready', 'smoke-test', 'benchmark',
+    'ollama-pull', 'ollama-list', 'ollama-ps',
+}
+
+
 def run_cli(
     tmp_path: Path, *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
+    if args and args[0] in _LEGACY_CMDS:
+        args = ('legacy', *args)
     full_env = os.environ.copy()
     # Anchor config + rendered artifacts under tmp_path so tests are
     # independent of the user's ~/.config and ~/.cache directories *and* of any

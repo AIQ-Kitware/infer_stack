@@ -11,9 +11,21 @@ from infer_stack import __version__
 MANAGE_PY = Path(__file__).resolve().parents[1] / 'manage.py'
 
 
+# Pre-leasing commands moved under `infer-stack legacy …`.
+_LEGACY_CMDS = {
+    'setup', 'init', 'resolve', 'validate', 'lock', 'render', 'switch',
+    'list-models', 'list-profiles', 'explain', 'describe-profile',
+    'verify-profile', 'kubeai-sync-resource-profiles', 'up', 'down', 'purge',
+    'deploy', 'env', 'diagnose', 'wait-ready', 'smoke-test', 'benchmark',
+    'ollama-pull', 'ollama-list', 'ollama-ps',
+}
+
+
 def run_cli(
     tmp_path: Path, *args: str, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
+    if args and args[0] in _LEGACY_CMDS:
+        args = ('legacy', *args)
     env = os.environ.copy()
     # Force (not setdefault) so an ambient INFER_STACK_* in the caller's shell
     # can't leak in and point the test at the real config/data dir.
