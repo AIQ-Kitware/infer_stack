@@ -142,10 +142,12 @@ the config is static — same hash → no restart).
 
 ## Other noted smells (lower priority)
 
-See `dev/leasing-demo.md` §"Ergonomic smells" for: no persisted default backend
-(`--backend compose` repeated), storage location being env-only for the leasing
-path, no endpoint-addressed teardown for standing `serve` leases, unmanaged Open
-WebUI, and no managed `HF_TOKEN` slot.
+See `dev/leasing-demo.md` §"Ergonomic notes". RESOLVED by the CLI reorg
+(`dev/cli-redesign.md`): persisted default backend (`config set backend`),
+durable storage location (`config set data_dir`, honored by `data_root()`), and
+a managed `HF_TOKEN` slot (`secret set HF_TOKEN=…`). STILL OPEN: no
+endpoint-addressed teardown for standing `serve` leases (want `release
+--endpoint <name>` / `unserve`); unmanaged Open WebUI (maybe `infer-stack ui`).
 
 Also: reclaim:stop deployment groups linger in the ledger as `state=stopped` and
 still show up in `infer-stack leases` / its group list. Decide whether `leases`

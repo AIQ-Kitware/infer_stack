@@ -57,6 +57,29 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* Reorganized the sprawly flat CLI (~38 top-level verbs) into noun submodals,
+  keeping the leasing hot path at the top level (see `dev/cli-redesign.md`;
+  `infer-stack help tree` prints the whole surface):
+  - `infer-stack catalog …` — a flag-driven editor for the user catalog
+    (`catalog model|endpoint|host|bundle add|list|show|rm`, plus
+    `init/path/show/validate/edit`) with a validating writer, so models/endpoints
+    are added without hand-editing YAML.
+  - `infer-stack config …` — `init/paths/show/set/get/edit` over a new durable
+    `settings.yaml`. `config set backend compose` and `config set data_dir <p>`
+    are honored (the leasing `--backend` default and `data_root()` consult them),
+    so the backend flag and storage location no longer have to be repeated/
+    exported.
+  - `infer-stack secret …` — `get/set/list` for the managed compose `.env`;
+    `secret set HF_TOKEN=…` lets a gated model's token be set once before `serve`.
+    `secrets` stays as a top-level alias for `secret get`.
+  - `infer-stack stack …` — the day-2 compose wrappers (`logs/ps/restart/pull/
+    start/stop/down`); `logs`/`ps` remain top-level aliases.
+  - `infer-stack legacy …` — the pre-leasing profile/active-profile commands
+    (`setup/init/render/switch/resolve/lock/validate/up/down/deploy/…/ollama-*`)
+    grouped into a holding pen, promoted out as they gain leasing-native
+    behavior and removed wholesale once empty.
+  - `infer-stack help tree` — the full nested command tree at a glance
+    (cf. `aivm help tree`).
 * The day-2 compose wrappers (`logs`, `ps`, `restart`, `pull`, `start`, `stop`)
   now target the **leasing** Compose deployment when one exists
   (`data_root/leasing/compose`, project `infer-stack`) — so `infer-stack logs

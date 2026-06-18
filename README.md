@@ -4,6 +4,14 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/infer-stack.svg)](https://pypi.org/project/infer-stack/)
 [![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
 
+> **Heads up — the leasing model is now the primary workflow.** Declare models
+> in a catalog (`infer-stack catalog …`) and `acquire`/`serve`/`run` endpoints
+> on demand; see `dev/leasing-demo.md` and `infer-stack help tree`. The
+> **named stack profiles** documented below (`setup`/`render`/`up`/`switch`/…)
+> are the pre-leasing model and now live under **`infer-stack legacy <command>`**
+> (e.g. `infer-stack legacy render`). This README still describes that legacy
+> flow; a leasing-oriented rewrite is pending.
+
 `infer_stack` manages **named stack profiles** for local and Kubernetes-backed inference.
 
 A stack profile is a small graph made from:

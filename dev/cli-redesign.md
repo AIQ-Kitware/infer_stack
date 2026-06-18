@@ -1,7 +1,14 @@
 # infer-stack CLI redesign — submodals, a catalog editor, and `help tree`
 
-Status: **proposal** (for review before building). Companion to the leasing
-redesign (`dev/leasing-followups.md`, `dev/infer-stack-redesign-critique.md`).
+Status: **implemented** (decisions: noun-verb grammar, full phased reorg).
+Shipped across phases: `catalog` editor + `help tree`; `config` submodal +
+settings store (honors `backend`/`data_dir`); `secret` get/set/list; `stack`
+day-2 group; the pre-leasing profile world grouped under `legacy`. Top-level is
+now the leasing loop + submodals. Companion to the leasing redesign
+(`dev/leasing-followups.md`, `dev/infer-stack-redesign-critique.md`).
+
+The tree and rationale below are kept as the design record; `infer-stack help
+tree` prints the live surface.
 
 ## What we have
 

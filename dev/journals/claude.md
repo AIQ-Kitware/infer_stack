@@ -1126,3 +1126,48 @@ behind a green baseline.
 Takeaway: "up the union" converge has an edge at the empty union — the teardown
 path is not just "up with fewer services", it's a different verb. Test the
 convergence to zero, not just to N-1.
+
+## 2026-06-17 21:40 -0400
+
+Model: claude-opus-4-8 (Claude Code, 1M context).
+
+User intent: the demo must use the smol models; and the sprawly flat CLI (~38
+top-level verbs) should be reorganized into submodals (aivm-like, "but better"),
+with an ergonomic `catalog` editor (no raw YAML), `help tree`, `init`->`config
+init`, and a `legacy` holding pen for anything not carried forward. Decisions
+(via AskUserQuestion): noun-verb grammar; full phased reorg now.
+
+Did it in 6 committed phases (each with tests + green suite):
+1. `catalog` submodal (commands_catalog.py): model/endpoint/host/bundle
+   add|list|show|rm + init/path/show/validate/edit. A validating writer
+   (Catalog.from_dict) refuses to persist a catalog the leasing path would
+   reject. `help tree` walks the modal registry. (Verified scriptconfig 0.9.1
+   does 3-level nesting first.)
+2. `config` submodal + settings.yaml in paths.py (load/save/get_setting, no
+   import cycle). data_root() honors `data_dir`; leasing `--backend` default is
+   now None and resolves explicit > `config set backend` > null. Kills two
+   ergonomic smells.
+3. `secret` get/set/list; `secret set HF_TOKEN=…` writes the managed .env
+   (merge-preserving), set before serve. `secrets` kept as alias.
+4. `stack` day-2 group (+ new `stack down`); logs/ps kept top-level.
+5. `legacy` modal — moved ~25 profile-world verbs under it. Top level is now the
+   leasing loop + submodals. Kept tests working by auto-prefixing `legacy ` in
+   the two subprocess run_cli helpers (one edit each, not per call-site).
+6. Docs: rewrote leasing-demo.md to use catalog/config/secret (no heredoc, no
+   per-block exports), marked the resolved smells; cli-redesign.md ->
+   implemented; followups + CHANGELOG; README banner pointing at leasing +
+   `legacy` prefix (full README rewrite deferred).
+
+State of mind: confident — every phase kept the suite green (215 -> 230) and the
+new code is ruff-clean (the only ruff hits are pre-existing I001 import-order in
+paths.py/options.py that predate me). The catalog validating-writer is the piece
+I'm happiest with: the editor literally cannot write a catalog acquire would
+choke on. Risk/uncertainty: the GPU e2e hasn't run against the reorged CLI yet —
+but the e2e/demo only use top-level verbs that stayed (acquire/serve/run/
+release/leases/secrets/status/logs/ps/paths) so it should be unaffected; worth a
+yardrat pass to confirm. The README is now accurate-by-banner but not rewritten.
+
+Takeaway: when reorganizing a CLI built on a modal framework, a registry-walking
+`help tree` + a `legacy` bucket let you move fast without a flag-day — and
+honoring persisted settings (backend/data_dir) in the *resolution* layer (None
+default -> setting -> fallback) avoids the explicit-vs-default ambiguity cleanly.
