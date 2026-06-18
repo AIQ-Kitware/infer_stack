@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import scriptconfig as scfg
+
 from ..benchmark import run_benchmark
 from ..env_utils import parse_env_file
 from ..kubeai_ops import print_status as kubeai_print_status
 from ..paths import config_root
 from ..profile_runtime import default_base_url
-from pathlib import Path
-from typing import Any
-import json
-import requests
-import scriptconfig as scfg
 
+if TYPE_CHECKING:
+    import requests
+
+from .compose import (
+    _explain_readiness_message,
+    _print_compose_diagnostics,
+    _print_gateway_diagnostics,
+)
 from .context import (
     _apply_path_overrides,
     _as_mapping,
@@ -22,17 +31,6 @@ from .context import (
     plan_path,
     runtime_env_path,
 )
-from .probes import (
-    _default_model_for_deployment,
-    _ready_ollama_probe,
-    _ready_openai_probe,
-    _resolve_smoke_protocol_from_deployment,
-)
-from .compose import (
-    _explain_readiness_message,
-    _print_compose_diagnostics,
-    _print_gateway_diagnostics,
-)
 from .options import (
     _AllowUnsupportedMixin,
     _BackendOverrideMixin,
@@ -42,6 +40,12 @@ from .options import (
     _PortOverridesMixin,
     _ProfileOverrideMixin,
     _SimulateHardwareMixin,
+)
+from .probes import (
+    _default_model_for_deployment,
+    _ready_ollama_probe,
+    _ready_openai_probe,
+    _resolve_smoke_protocol_from_deployment,
 )
 
 # ---------------------------------------------------------------------------
@@ -185,6 +189,7 @@ def _smoke_request(
     failures so ``switch --apply && smoke-test`` is usable immediately after a
     provider container was recreated.
     """
+    import requests
     last_timeout: requests.exceptions.Timeout | None = None
     last_conn: requests.exceptions.ConnectionError | None = None
     for attempt in range(1, max(1, retries) + 1):

@@ -3,12 +3,11 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import requests
-
 
 def run_benchmark(
     base_url: str, api_key: str, model: str, prompts: list[str]
 ) -> dict[str, Any]:
+    import requests
     headers = {'Content-Type': 'application/json'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'

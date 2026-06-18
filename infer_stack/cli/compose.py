@@ -8,10 +8,12 @@ from ..docker_utils import compose_up
 from ..docker_utils import our_published_ports
 from ..env_utils import parse_env_file
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import json
-import requests
 import subprocess
+
+if TYPE_CHECKING:
+    import requests
 
 from .context import (
     generated_dir,
@@ -283,6 +285,7 @@ def _http_probe_summary(
     timeout: float = 8.0,
 ) -> str:
     """Return a concise one-line summary for a diagnostic HTTP probe."""
+    import requests
     try:
         resp = requests.request(
             method, url, headers=headers, json=json_body, timeout=timeout
@@ -495,6 +498,7 @@ def _litellm_refresh_router_live(cfg: dict[str, Any]) -> None:
     auth missing, individual call fails); the caller falls back to the
     full container-recreate path.
     """
+    import requests
     import yaml as _yaml
 
     litellm_port = cfg.get('ports', {}).get('litellm')

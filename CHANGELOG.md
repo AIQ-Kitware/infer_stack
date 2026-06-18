@@ -57,6 +57,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   tag pull/warmup is a remaining readiness follow-up.)
 
 ### Added (continued)
+* `python -m infer_stack` now runs the CLI (a top-level `__main__.py` redirects
+  to `infer_stack.cli.main`), matching `python -m infer_stack.cli`.
+* Faster CLI startup. Heavy third-party deps that only matter at *runtime*
+  (`requests`, `jinja2`, `rich.syntax`/`pygments`) are now imported lazily
+  inside the functions that use them instead of at module import, so a bare
+  `infer-stack --help` / tab-completion no longer pays for the HTTP, templating,
+  and syntax-highlighting stacks (cli import time roughly −30%). The
+  `cli_mod.requests` test seam is preserved via a module `__getattr__`.
 * Reorganized the sprawly flat CLI (~38 top-level verbs) into noun submodals,
   keeping the leasing hot path at the top level (see `dev/cli-redesign.md`;
   `infer-stack help tree` prints the whole surface):

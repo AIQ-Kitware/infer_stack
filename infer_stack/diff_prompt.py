@@ -14,7 +14,6 @@ from typing import Mapping
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.prompt import Confirm
-from rich.syntax import Syntax
 from rich.text import Text
 
 
@@ -49,6 +48,8 @@ def confirm_writes(
     A planned write whose new content matches the existing file is shown as
     "no changes" and never blocks acceptance on its own.
     """
+    from rich.syntax import Syntax
+
     console = console or Console()
 
     panels: list[Panel] = []

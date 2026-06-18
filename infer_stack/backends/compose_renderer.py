@@ -5,7 +5,6 @@ from importlib.resources import files
 from pathlib import Path
 
 import yaml
-from jinja2 import BaseLoader, Environment
 
 from ..config import normalized_output, normalized_state, DEFAULT_PORTS
 from ..diff_prompt import confirm_writes
@@ -188,6 +187,7 @@ def render_compose_artifacts(
     for key, value in existing.items():
         env_values.setdefault(key, value)
 
+    from jinja2 import BaseLoader, Environment
     env = Environment(
         loader=BaseLoader(),
         autoescape=False,

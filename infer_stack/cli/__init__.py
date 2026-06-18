@@ -24,7 +24,6 @@ This package was split out of a single ``cli.py`` module. The layers are:
 
 from __future__ import annotations
 
-import requests  # noqa: F401  (cli_mod.requests is patched in tests)
 import scriptconfig as scfg
 
 from .. import __version__
@@ -210,6 +209,16 @@ class ManageCLI(scfg.ModalCLI):
     stack = StackModalCLI
     logs = LogsCLI
     ps = PsCLI
+
+
+def __getattr__(name: str):
+    # ``requests`` is imported lazily so a bare ``infer-stack --help`` doesn't
+    # pay for it. Tests still patch the seam as ``cli_mod.requests`` — resolving
+    # the attribute imports the (shared) module so the patch is global.
+    if name == 'requests':
+        import requests
+        return requests
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 def main(argv=None) -> int:

@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import requests
 import yaml
 
 from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
@@ -408,7 +407,10 @@ class ComposeBackend:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.inventory = inventory
         self.run = run or _default_docker_run
-        self.http = http or requests
+        if http is None:
+            import requests
+            http = requests
+        self.http = http
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
         self.state = state or default_state_paths()

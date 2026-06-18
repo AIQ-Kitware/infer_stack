@@ -15,8 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
-
 
 def openai_ready(
     *,
@@ -28,13 +26,15 @@ def openai_ready(
     max_tokens: int = 1,
     require_generation: bool = True,
     require_listed: bool = False,
-    http: Any = requests,
+    http: Any = None,
 ) -> tuple[bool, str]:
     """Probe an OpenAI-compatible surface once without exiting.
 
     ``require_listed`` additionally insists the requested ``model`` appears in
     ``/models`` (used by the leasing front door to confirm an alias is routable).
     """
+    import requests
+    http = http if http is not None else requests
     headers = headers or {}
     try:
         models_resp = http.get(f'{base_url}/models', headers=headers, timeout=10)
@@ -93,9 +93,11 @@ def ollama_ready(
     prompt: str = 'Reply with ready.',
     max_tokens: int = 1,
     require_generation: bool = True,
-    http: Any = requests,
+    http: Any = None,
 ) -> tuple[bool, str]:
     """Probe an Ollama-native surface once without exiting."""
+    import requests
+    http = http if http is not None else requests
     try:
         tags_resp = http.get(f'{base_url}/api/tags', timeout=10)
     except requests.exceptions.RequestException as ex:
