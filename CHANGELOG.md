@@ -116,6 +116,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     are honored (the leasing `--backend` default and `data_root()` consult them),
     so the backend flag and storage location no longer have to be repeated/
     exported.
+  - `infer-stack catalog endpoint add` — `NAME` is now optional and defaults to
+    the `--model` (the vLLM model name, or the Ollama tag, slugified to a safe
+    alias). So `catalog endpoint add --model smol135` creates the endpoint
+    `smol135`, keeping the served alias (what Open WebUI shows) tied to the
+    model. An explicit `NAME` is still there for a stable alias decoupled from
+    the model (e.g. `chat` you can re-point); a default name that would clobber
+    an existing endpoint errors with a hint to pass a `NAME` (no silent
+    overwrite).
   - `infer-stack env` — read/write the managed compose `.env` (path / `env KEY`
     / `env KEY=VALUE` / `--export`); e.g. `env HF_TOKEN=…` sets a gated model's
     token once before `serve`. (Supersedes the short-lived `secret` modal and

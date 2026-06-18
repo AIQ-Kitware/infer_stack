@@ -49,6 +49,43 @@ def test_add_model_endpoint_roundtrips_and_validates(tmp_path):
     assert ep.reclaim == 'keep-warm'
 
 
+def test_endpoint_name_defaults_to_model(tmp_path):
+    # No NAME given -> the endpoint alias defaults to the (vLLM) model name,
+    # so the served alias / Open WebUI label is tied to the model.
+    ModelAddCLI.main(argv=['smol135', '--source', 'hf://org/Smol',
+                           *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--model', 'smol135', '--max-model-len', '4096',
+                              *_opts(tmp_path)])
+    cat = Catalog.load(cat_path(tmp_path))
+    assert cat.endpoints['smol135'].model == 'smol135'
+
+
+def test_endpoint_default_name_slugs_ollama_tag(tmp_path):
+    # An Ollama tag (`llama3:8b`) is slugified for the alias but kept as the tag.
+    HostAddCLI.main(argv=['gpu0', '--engine', 'ollama', '--gpu', '0',
+                          *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--engine', 'ollama', '--model', 'llama3:8b',
+                              '--host', 'gpu0', *_opts(tmp_path)])
+    cat = Catalog.load(cat_path(tmp_path))
+    assert 'llama3-8b' in cat.endpoints
+    assert cat.endpoints['llama3-8b'].model == 'llama3:8b'
+
+
+def test_endpoint_no_name_no_model_errors(tmp_path):
+    CatalogInitCLI.main(argv=_opts(tmp_path))
+    with pytest.raises(SystemExit):
+        EndpointAddCLI.main(argv=_opts(tmp_path))   # neither NAME nor --model
+
+
+def test_endpoint_default_name_collision_guarded(tmp_path):
+    # A second default-named endpoint for the same model must not clobber the
+    # first; it errors (the footgun guard) unless --force.
+    ModelAddCLI.main(argv=['m', '--source', 'hf://org/M', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+    with pytest.raises(SystemExit):
+        EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+
+
 def test_endpoint_referencing_missing_model_is_refused(tmp_path):
     CatalogInitCLI.main(argv=_opts(tmp_path))
     with pytest.raises(SystemExit):

@@ -63,6 +63,12 @@ infer-stack catalog endpoint add chat-fast --engine vllm --model smol135 \
 infer-stack catalog show
 ```
 
+We name these endpoints (`chat`, `chat-fast`) because the demo re-points them at
+different models later — a stable alias decoupled from the model. When you don't
+need that, **omit the NAME and it defaults to the model**, so the alias you see
+in Open WebUI is the model: `infer-stack catalog endpoint add --model smol135`
+adds an endpoint named `smol135`.
+
 > Gated model? Set the token once (stored in the managed `.env` that Compose
 > auto-loads), no shell export: `infer-stack env HF_TOKEN=hf_…`.
 

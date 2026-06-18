@@ -91,11 +91,26 @@ def _save_raw(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> Non
     tmp.replace(path)
 
 
-def _exists_guard(data, section, name, force) -> None:
+def _exists_guard(data, section, name, force, hint='') -> None:
     if name in data[section] and not force:
         raise SystemExit(
-            f"{section[:-1]} '{name}' already exists; pass --force to overwrite"
+            f"{section[:-1]} '{name}' already exists; "
+            f'pass --force to overwrite{hint}'
         )
+
+
+def _slug_alias(text: str) -> str:
+    """Make ``text`` safe to use as an endpoint alias.
+
+    An endpoint name doubles as the LiteLLM ``model_name`` (what clients ask for
+    and what Open WebUI shows) and as a CLI-typed token, so keep it shell/URL
+    friendly: collapse model/tag separators (``/``, ``:``) and any other
+    non-``[A-Za-z0-9._-]`` runs to a single ``-``.
+    """
+    import re
+
+    out = re.sub(r'[^A-Za-z0-9._-]+', '-', text).strip('-')
+    return out or text
 
 
 def _rm(config, section, name) -> int:
@@ -333,10 +348,20 @@ class CatalogModelCLI(scfg.ModalCLI):
 
 
 class EndpointAddCLI(_CatalogCommon):
-    """Add (or --force overwrite) an endpoint — the served API name."""
+    """Add (or --force overwrite) an endpoint — the served API name.
+
+    ``NAME`` is optional: when omitted it defaults to the ``--model`` (the vLLM
+    model name, or the Ollama tag, slugified). That keeps the served alias —
+    what you ask for and what Open WebUI shows — tied to the model, which is the
+    common case. Give an explicit ``NAME`` when you want a stable alias decoupled
+    from the model (e.g. ``chat`` you can re-point), or a *second* endpoint for a
+    model the default name is already taken by.
+    """
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
+    name = scfg.Value(
+        None, position=1, type=str, help='Endpoint alias (default: --model).'
+    )
     engine = scfg.Value('vllm', choices=['vllm', 'ollama'])
     model = scfg.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
     host = scfg.Value(None, type=str, help='Runtime host (ollama).')
@@ -367,11 +392,22 @@ class EndpointAddCLI(_CatalogCommon):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        if not config.name:
-            raise SystemExit('endpoint add: NAME is required')
+        name = config.name
+        if not name:
+            if not config.model:
+                raise SystemExit(
+                    'endpoint add: give a NAME, or --model to derive the name '
+                    'from it'
+                )
+            name = _slug_alias(config.model)
         path = _catalog_path(config)
         data = _load_raw(path)
-        _exists_guard(data, 'endpoints', config.name, config.force)
+        hint = (
+            ', or an explicit NAME for a second endpoint on this model'
+            if not config.name
+            else ''
+        )
+        _exists_guard(data, 'endpoints', name, config.force, hint=hint)
         entry: dict[str, Any] = {'engine': config.engine}
         if config.model:
             entry['model'] = config.model
@@ -393,10 +429,11 @@ class EndpointAddCLI(_CatalogCommon):
             entry['runtime'] = runtime
         if config.reclaim:
             entry['reclaim'] = {'policy': config.reclaim}
-        data['endpoints'][config.name] = entry
+        data['endpoints'][name] = entry
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:
-            print(f"added endpoint '{config.name}'")
+            model_note = f' -> {config.model}' if config.model else ''
+            print(f"added endpoint '{name}'{model_note}")
         return 0
 
 
