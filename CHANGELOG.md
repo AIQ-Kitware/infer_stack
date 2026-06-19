@@ -5,6 +5,15 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* TUI live-feedback polish: the **endpoint wizard is labeled and
+  engine-adaptive** — vLLM shows tensor-parallel / **data-parallel** / max-model-len
+  / GPU-mem / max-seqs / prefix-caching / extra-args; Ollama shows host +
+  free-form runtime — so the form is no longer a row of unlabeled inputs. The
+  **API tester moved to its own top-level tab** (more room for the monitor);
+  catalog **Add/Edit/Remove are localized** to the endpoints + models panels
+  (the bottom button stack is gone; Suggest moved to Settings); the vertical
+  splitter drags the **full width range** (not just the middle); and the
+  endpoints↔models drag direction is fixed.
 * TUI **top-level tabs** — the multipane monitor is now a **Dashboard** tab, with
   a new **Settings** tab to edit the durable settings (backend, data dir, Open
   WebUI, reverse proxy, skip-display-GPUs) and save them to `settings.yaml`

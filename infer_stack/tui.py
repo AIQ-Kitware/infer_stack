@@ -196,13 +196,15 @@ class _AddEndpointScreen(ModalScreen):
     CSS = """
     _AddEndpointScreen { align: center middle; }
     #dialog {
-        width: 78; height: auto; padding: 1 2;
-        border: round $accent; background: $surface;
+        width: 78; max-height: 90%; height: auto; padding: 1 2;
+        border: round $accent; background: $surface; overflow-y: auto;
     }
     #dialog .hint { color: $text-muted; margin: 0 0 1 0; }
+    #dialog Label { margin: 1 0 0 0; color: $text-muted; }
     #dialog Input, #dialog Select { margin: 0 0 1 0; }
-    #dialog Horizontal { height: auto; align-horizontal: right; }
-    #dialog Button { margin: 0 0 0 2; }
+    #dialog #buttons { height: auto; align-horizontal: right; margin: 1 0 0 0; }
+    #dialog #buttons Button { margin: 0 0 0 2; }
+    #vllm-opts, #ollama-opts { height: auto; }
     """
 
     def __init__(self, models: list[str], *, name: str | None = None,
@@ -212,14 +214,14 @@ class _AddEndpointScreen(ModalScreen):
         self._edit_name = name
         self._entry = entry or {}
 
-    def _rt(self, key, default=''):
+    def _rt(self, key):
         val = (self._entry.get('runtime') or {}).get(key)
         return '' if val is None else str(val)
 
     def compose(self) -> ComposeResult:
         editing = self._edit_name is not None
-        runtime = self._entry.get('runtime') or {}
-        extra = runtime.get('extra_args') or []
+        rt = self._entry.get('runtime') or {}
+        extra = rt.get('extra_args') or []
         extra_str = ' '.join(extra) if isinstance(extra, list) else str(extra)
         reclaim = (self._entry.get('reclaim') or {}).get('policy', '')
         cur_model = self._entry.get('model')
@@ -228,14 +230,14 @@ class _AddEndpointScreen(ModalScreen):
             yield Label('Edit endpoint' if editing else 'Add an endpoint',
                         classes='title')
             yield Static(
-                'The served name clients/Open WebUI request. Binds a model to an '
+                'The served name clients / Open WebUI request. Pick a model and '
                 'engine; the runtime knobs size it on the GPU(s).', classes='hint',
             )
-            yield Input(
-                value=self._edit_name or '',
-                placeholder='name  (optional — defaults to <model>-N)',
-                id='e-name', disabled=editing,
-            )
+            yield Label('name')
+            yield Input(value=self._edit_name or '',
+                        placeholder='optional — defaults to <model>-N',
+                        id='e-name', disabled=editing)
+            yield Label('model')
             model_opts = [(m, m) for m in self._models]
             if model_opts:
                 yield Select(model_opts, prompt='model…', id='e-model',
@@ -244,31 +246,71 @@ class _AddEndpointScreen(ModalScreen):
             else:
                 yield Input(value=cur_model or '', placeholder='model name',
                             id='e-model-text')
+            yield Label('engine')
+            yield Select([('vllm', 'vllm'), ('ollama', 'ollama')],
+                         value=cur_engine, allow_blank=False, id='e-engine')
+            with Vertical(id='vllm-opts'):
+                yield Label('tensor-parallel size  (GPUs per replica)')
+                yield Input(value=self._rt('tensor_parallel_size'),
+                            placeholder='int, e.g. 2', id='e-tp')
+                yield Label('data-parallel size  (replicas across GPUs)')
+                yield Input(value=self._rt('data_parallel_size'),
+                            placeholder='int, e.g. 2', id='e-dp')
+                yield Label('max model len  (context window, tokens)')
+                yield Input(value=self._rt('max_model_len'),
+                            placeholder='int, e.g. 8192', id='e-mml')
+                yield Label('GPU memory utilization  (0-1, per GPU)')
+                yield Input(value=self._rt('gpu_memory_utilization'),
+                            placeholder='float, e.g. 0.9', id='e-gpu')
+                yield Label('max concurrent sequences')
+                yield Input(value=self._rt('max_num_seqs'),
+                            placeholder='int, optional', id='e-seqs')
+                yield Label('prefix caching')
+                yield Select([('default', ''), ('on', 'on'), ('off', 'off')],
+                             value='on' if rt.get('enable_prefix_caching') else '',
+                             allow_blank=False, id='e-prefix')
+                yield Label('extra vLLM args  (raw flags — dtype etc. go here)')
+                yield Input(value=extra_str,
+                            placeholder='--dtype=half --enforce-eager',
+                            id='e-extra')
+            with Vertical(id='ollama-opts'):
+                yield Label('host  (runtime host name from the catalog)')
+                yield Input(value=self._entry.get('host', ''),
+                            placeholder='e.g. ollama-local', id='e-host')
+                yield Label('extra runtime  (KEY=VALUE, space-separated)')
+                yield Input(value=self._kv_str(rt),
+                            placeholder='num_ctx=8192 keep_alive=5m', id='e-orun')
+            yield Label('reclaim policy  (when idle)')
             yield Select(
-                [('vllm', 'vllm'), ('ollama', 'ollama')],
-                value=cur_engine, allow_blank=False, id='e-engine',
-            )
-            yield Input(value=self._rt('tensor_parallel_size'),
-                        placeholder='tensor-parallel size  (int, optional)',
-                        id='e-tp')
-            yield Input(value=self._rt('max_model_len'),
-                        placeholder='max model len  (int, optional)',
-                        id='e-mml')
-            yield Input(value=self._rt('gpu_memory_utilization'),
-                        placeholder='gpu memory util 0-1  (float, optional)',
-                        id='e-gpu')
-            yield Input(value=extra_str,
-                        placeholder="extra vLLM args  (e.g. --dtype=half "
-                        "--data-parallel-size 2)", id='e-extra')
-            yield Select(
-                [('reclaim: default', ''), ('keep-warm', 'keep-warm'),
-                 ('stop', 'stop'), ('scale-to-zero', 'scale-to-zero')],
+                [('default', ''), ('keep-warm', 'keep-warm'), ('stop', 'stop'),
+                 ('scale-to-zero', 'scale-to-zero')],
                 value=reclaim or '', allow_blank=False, id='e-reclaim',
             )
-            with Horizontal():
+            with Horizontal(id='buttons'):
                 yield Button('Cancel', id='cancel')
                 yield Button('Save' if editing else 'Add endpoint',
                              variant='primary', id='ok')
+
+    def on_mount(self) -> None:
+        self._show_engine(self._entry.get('engine', 'vllm') or 'vllm')
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == 'e-engine':
+            engine = 'vllm' if event.value is Select.NULL else str(event.value)
+            self._show_engine(engine)
+
+    def _show_engine(self, engine: str) -> None:
+        try:
+            self.query_one('#vllm-opts').display = engine == 'vllm'
+            self.query_one('#ollama-opts').display = engine == 'ollama'
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _kv_str(runtime: dict) -> str:
+        return ' '.join(
+            f'{k}={v}' for k, v in (runtime or {}).items() if k != 'extra_args'
+        )
 
     @staticmethod
     def _num(raw: str, cast):
@@ -279,7 +321,6 @@ class _AddEndpointScreen(ModalScreen):
         if event.button.id == 'cancel':
             self.dismiss(None)
             return
-        name = self.query_one('#e-name', Input).value.strip()
         try:
             value = self.query_one('#e-model', Select).value
             model = '' if value is Select.NULL else str(value)
@@ -288,25 +329,38 @@ class _AddEndpointScreen(ModalScreen):
         if not model:
             self.query_one(Label).update('pick (or type) a model')
             return
+        name = self.query_one('#e-name', Input).value.strip()
+        engine = str(self.query_one('#e-engine', Select).value or 'vllm')
+        reclaim = str(self.query_one('#e-reclaim', Select).value or '')
+        result: dict[str, Any] = {
+            'name': self._edit_name or name or None,
+            'model': model, 'engine': engine, 'reclaim': reclaim,
+        }
         try:
-            result = {
-                'name': self._edit_name or name or None,
-                'model': model,
-                'engine': str(self.query_one('#e-engine', Select).value or 'vllm'),
-                'tensor_parallel': self._num(
-                    self.query_one('#e-tp', Input).value, int),
-                'max_model_len': self._num(
-                    self.query_one('#e-mml', Input).value, int),
-                'gpu_mem': self._num(
-                    self.query_one('#e-gpu', Input).value, float),
-                'extra_args': self.query_one('#e-extra', Input).value.strip(),
-                'reclaim': str(self.query_one('#e-reclaim', Select).value or ''),
-            }
+            if engine == 'vllm':
+                result.update({
+                    'tensor_parallel': self._num(self._v('e-tp'), int),
+                    'data_parallel': self._num(self._v('e-dp'), int),
+                    'max_model_len': self._num(self._v('e-mml'), int),
+                    'gpu_mem': self._num(self._v('e-gpu'), float),
+                    'max_num_seqs': self._num(self._v('e-seqs'), int),
+                    'prefix_caching': str(
+                        self.query_one('#e-prefix', Select).value or ''),
+                    'extra_args': self._v('e-extra'),
+                })
+            else:
+                result.update({
+                    'host': self._v('e-host'),
+                    'ollama_runtime': self._v('e-orun'),
+                })
         except ValueError:
             self.query_one(Label).update(
-                'tensor-parallel / max-len must be ints, gpu-mem a float')
+                'parallel sizes / max-len / seqs must be ints, gpu-mem a float')
             return
         self.dismiss(result)
+
+    def _v(self, wid: str) -> str:
+        return self.query_one(f'#{wid}', Input).value
 
 
 class _ConfirmScreen(ModalScreen):
@@ -347,7 +401,7 @@ class InferStackTUI(App):
     Screen { layout: vertical; }
 
     #body { height: 1fr; padding: 0 1; }
-    #sidebar { width: 38; min-width: 26; }
+    #sidebar { width: 38; min-width: 10; }
     #vsplit { width: 1; height: 1fr; background: $panel; }
     #vsplit:hover { background: $accent; }
     #main { width: 1fr; }
@@ -361,8 +415,6 @@ class InferStackTUI(App):
     .desc { height: auto; color: $text-muted; padding: 0 1; }
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
 
-    #catalog-buttons { height: auto; }
-    #catalog-buttons Button { width: 1fr; margin: 1 0 0 0; }
     #endpoint-actions, #lease-actions, #deployment-actions, #model-actions {
         height: auto; margin: 0 0 1 0;
     }
@@ -372,9 +424,10 @@ class InferStackTUI(App):
     }
     /* compact buttons: 1 row, no border box, so action bars don't eat space */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
-    #model-actions Button, #catalog-buttons Button, #api-controls Button {
+    #model-actions Button, #api-controls Button {
         height: 1; border: none; padding: 0 1;
     }
+    #api { padding: 1 2; }
 
     #endpoints, #models, #leases-pane, #deployments-pane, #docker, #system, #api {
         border: round $surface;
@@ -478,7 +531,7 @@ class InferStackTUI(App):
         self._leases_h = 12   # resizable by dragging #lsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
-        self._collapsed = {'docker': False, 'system': True, 'api': True}
+        self._collapsed = {'docker': False, 'system': True}
         self._ready_endpoints: list[str] = []
 
     # -- layout ------------------------------------------------------------
@@ -488,6 +541,8 @@ class InferStackTUI(App):
         with TabbedContent(id='top'):
             with TabPane('Dashboard', id='tab-dashboard'):
                 yield from self._compose_dashboard()
+            with TabPane('API', id='tab-api'):
+                yield from self._compose_api()
             with TabPane('Settings', id='tab-settings'):
                 yield from self._compose_settings()
         yield Static('', id='status')
@@ -504,18 +559,16 @@ class InferStackTUI(App):
                 yield DataTable(id='endpoints', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
-                    yield Button('▶  Serve', id='btn-serve', variant='primary')
+                    yield Button('▶ Serve', id='btn-serve', variant='primary')
+                    yield Button('＋ Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
                 yield _Divider('y', self._drag_models, id='csplit')
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='model-actions'):
-                    yield Button('Remove model', id='btn-remove-model')
-                with Vertical(id='catalog-buttons'):
-                    yield Button('✨  Suggest from my GPUs', id='btn-suggest')
-                    yield Button('＋  Add model', id='btn-add-model')
-                    yield Button('＋  Add endpoint', id='btn-add-endpoint')
+                    yield Button('＋ Add', id='btn-add-model')
+                    yield Button('Remove', id='btn-remove-model')
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):
                 with Vertical(id='tables'):
@@ -578,23 +631,21 @@ class InferStackTUI(App):
                     yield Static('', id='sysinfo')
                     yield DataTable(id='gpus', cursor_type='row',
                                     zebra_stripes=True)
-                with Collapsible(title='api', collapsed=True, id='api'):
-                    yield Static(
-                        'Send a prompt to a model through the LiteLLM gateway. '
-                        'Only models that are up and ready are listed.',
-                        classes='desc',
-                    )
-                    with Horizontal(id='api-controls'):
-                        yield Select([], prompt='model…', id='api-model')
-                        yield Button('Send', id='btn-api-send',
-                                     variant='primary')
-                        yield Button('Test all', id='btn-api-test-all')
-                    yield Input(
-                        placeholder='prompt (default: a short hello)',
-                        id='api-prompt',
-                    )
-                    yield RichLog(id='api-out', highlight=False, markup=False,
-                                  wrap=True, max_lines=500)
+
+    def _compose_api(self) -> ComposeResult:
+        with Vertical(id='api'):
+            yield Static(
+                'Send a prompt to a model through the LiteLLM gateway. Only '
+                'models that are up and ready are listed.', classes='desc',
+            )
+            with Horizontal(id='api-controls'):
+                yield Select([], prompt='model…', id='api-model')
+                yield Button('Send', id='btn-api-send', variant='primary')
+                yield Button('Test all', id='btn-api-test-all')
+            yield Input(placeholder='prompt (default: a short hello)',
+                        id='api-prompt')
+            yield RichLog(id='api-out', highlight=False, markup=False,
+                          wrap=True, max_lines=500)
 
     def _compose_settings(self) -> ComposeResult:
         from .cli.commands_leasing import _coerce_bool
@@ -633,6 +684,11 @@ class InferStackTUI(App):
             with Horizontal(id='settings-actions'):
                 yield Button('Save settings', variant='primary',
                              id='btn-save-settings')
+            yield Static(
+                'Catalog: seed a fits-your-GPUs set of models + endpoints from '
+                'the suggestion pool (merges into your catalog).', classes='desc',
+            )
+            yield Button('✨  Suggest from my GPUs', id='btn-suggest')
 
     def on_mount(self) -> None:
         try:
@@ -714,7 +770,10 @@ class InferStackTUI(App):
         self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
-        self._sidebar_w = max(24, min(100, self._sidebar_w + delta))
+        # Allow the full width range (down to a sliver, up to nearly all of it),
+        # not just the middle — clamp against the actual terminal width.
+        hi = max(20, self.size.width - 12)
+        self._sidebar_w = max(10, min(hi, self._sidebar_w + delta))
         self._apply_sizes()
 
     def _drag_logs(self, delta: int) -> None:
@@ -723,8 +782,9 @@ class InferStackTUI(App):
         self._apply_sizes()
 
     def _drag_models(self, delta: int) -> None:
-        # Divider above the models table; drag down grows it (shrinks endpoints).
-        self._models_h = max(3, min(40, self._models_h + delta))
+        # Divider above the models table (models fixed-height, endpoints flexes):
+        # drag down = bar follows the cursor down = models shorter.
+        self._models_h = max(3, min(40, self._models_h - delta))
         self._apply_sizes()
 
     def _drag_leases(self, delta: int) -> None:
@@ -1181,7 +1241,7 @@ class InferStackTUI(App):
         self.action_refresh()   # fill the newly-shown tab right away
 
     def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
-        for cid in ('docker', 'system', 'api'):
+        for cid in ('docker', 'system'):
             try:
                 self._collapsed[cid] = self.query_one(f'#{cid}', Collapsible).collapsed
             except Exception:  # noqa: BLE001
@@ -1449,20 +1509,37 @@ class InferStackTUI(App):
 
     @staticmethod
     def _endpoint_entry(result: dict) -> dict:
-        """Build a catalog endpoint entry from a wizard result (mirrors the CLI)."""
+        """Build a catalog endpoint entry from a wizard result (mirrors the CLI).
+
+        vLLM and Ollama expose different knobs: vLLM gets the parallelism /
+        context / memory runtime keys (dtype etc. via extra_args), Ollama gets a
+        host plus free-form KEY=VALUE runtime.
+        """
         import shlex
 
         entry: dict[str, Any] = {'engine': result['engine'],
                                  'model': result['model']}
         runtime: dict[str, Any] = {}
-        if result.get('max_model_len') is not None:
-            runtime['max_model_len'] = result['max_model_len']
-        if result.get('gpu_mem') is not None:
-            runtime['gpu_memory_utilization'] = result['gpu_mem']
-        if result.get('tensor_parallel') is not None:
-            runtime['tensor_parallel_size'] = result['tensor_parallel']
-        if result.get('extra_args'):
-            runtime['extra_args'] = shlex.split(result['extra_args'])
+        if result['engine'] == 'vllm':
+            keymap = {
+                'tensor_parallel': 'tensor_parallel_size',
+                'data_parallel': 'data_parallel_size',
+                'max_model_len': 'max_model_len',
+                'max_num_seqs': 'max_num_seqs',
+            }
+            for rk, ck in keymap.items():
+                if result.get(rk) is not None:
+                    runtime[ck] = result[rk]
+            if result.get('gpu_mem') is not None:
+                runtime['gpu_memory_utilization'] = result['gpu_mem']
+            if result.get('prefix_caching') in ('on', 'off'):
+                runtime['enable_prefix_caching'] = result['prefix_caching'] == 'on'
+            if result.get('extra_args'):
+                runtime['extra_args'] = shlex.split(result['extra_args'])
+        else:  # ollama
+            if result.get('host'):
+                entry['host'] = result['host']
+            runtime.update(_parse_kv_str(result.get('ollama_runtime', '')))
         if runtime:
             entry['runtime'] = runtime
         if result.get('reclaim'):
@@ -1718,6 +1795,18 @@ class InferStackTUI(App):
     def _after_mutation(self, message: str) -> None:
         self.call_from_thread(self._status, message)
         self.call_from_thread(self.action_refresh)
+
+
+def _parse_kv_str(text: str) -> dict[str, Any]:
+    """Parse ``KEY=VALUE`` pairs (space-separated); values are YAML-typed."""
+    import yaml
+
+    out: dict[str, Any] = {}
+    for item in (text or '').split():
+        if '=' in item:
+            key, _, val = item.partition('=')
+            out[key.strip()] = yaml.safe_load(val)
+    return out
 
 
 def _fmt_ports(row: dict) -> str:

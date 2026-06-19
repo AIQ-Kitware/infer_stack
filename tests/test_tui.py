@@ -159,15 +159,16 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # docker is a collapsible pane with Logs + Containers tabs; system
-            # and api are now their own (collapsed) panes.
+            # docker is a collapsible pane with Logs/Containers/Control tabs;
+            # system is its own collapsed pane; API is a top-level tab now.
             tabs = app.query_one('#docker-tabs', TabbedContent)
             assert {p.id for p in tabs.query('TabPane')} == {
                 'tab-logs', 'tab-containers', 'tab-control'
             }
             assert app.query_one('#docker', Collapsible)
             assert app.query_one('#system', Collapsible).collapsed
-            assert app.query_one('#api', Collapsible).collapsed
+            top = app.query_one('#top', TabbedContent)
+            assert 'tab-api' in {p.id for p in top.query('TabPane')}
             # the containers ps view carries the docker-ps columns
             ps = app.query_one('#ps', DataTable)
             labels = [str(c.label) for c in ps.columns.values()]
@@ -196,7 +197,7 @@ def test_tui_panes_drag_resize():
             app._drag_leases(2)             # leases|deployments splitter
             assert app._sidebar_w == w0 + 6
             assert app._log_h == h0 - 3     # down = shorter logs
-            assert app._models_h == m0 + 2
+            assert app._models_h == m0 - 2  # drag down = bar down = models shorter
             assert app._leases_h == l0 + 2
 
     _run(scenario)
@@ -370,6 +371,58 @@ def test_tui_endpoint_entry_builds_runtime_from_advanced_params():
     assert entry['runtime']['gpu_memory_utilization'] == 0.4
     assert entry['runtime']['extra_args'] == ['--dtype=half', '--enforce-eager']
     assert entry['reclaim'] == {'policy': 'keep-warm'}
+
+
+def test_tui_endpoint_entry_data_parallel_and_ollama():
+    from infer_stack.tui import InferStackTUI
+
+    v = InferStackTUI._endpoint_entry({
+        'model': 'm', 'engine': 'vllm', 'data_parallel': 2,
+        'prefix_caching': 'on', 'max_num_seqs': 64,
+    })
+    assert v['runtime']['data_parallel_size'] == 2
+    assert v['runtime']['enable_prefix_caching'] is True
+    assert v['runtime']['max_num_seqs'] == 64
+
+    o = InferStackTUI._endpoint_entry({
+        'model': 'qwen', 'engine': 'ollama', 'host': 'oll',
+        'ollama_runtime': 'num_ctx=8192 keep_alive=5m',
+    })
+    assert o['engine'] == 'ollama' and o['host'] == 'oll'
+    assert o['runtime']['num_ctx'] == 8192
+    assert o['runtime']['keep_alive'] == '5m'
+
+
+def test_tui_endpoint_wizard_is_engine_adaptive_and_labeled():
+    from textual.widgets import Label, Select
+
+    from infer_stack.tui import InferStackTUI, _AddEndpointScreen
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = _AddEndpointScreen(['qc'])
+            app.push_screen(screen)
+            await pilot.pause()
+            # vLLM knobs visible by default; ollama hidden
+            assert screen.query_one('#vllm-opts').display is True
+            assert screen.query_one('#ollama-opts').display is False
+            assert screen.query_one('#e-dp')        # data-parallel field exists
+            # fields are labeled (the "blank page" complaint)
+            labels = [str(lbl.render()) for lbl in screen.query(Label)]
+            assert any('tensor-parallel' in x for x in labels)
+            assert any('data-parallel' in x for x in labels)
+            # switching engine swaps the field groups
+            screen.query_one('#e-engine', Select).value = 'ollama'
+            await pilot.pause()
+            assert screen.query_one('#vllm-opts').display is False
+            assert screen.query_one('#ollama-opts').display is True
+
+    _run(scenario)
 
 
 def test_tui_add_endpoint_writes_advanced_params(tmp_path):
