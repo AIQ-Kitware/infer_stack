@@ -202,6 +202,32 @@ def test_tui_endpoint_action_buttons_fit_the_sidebar():
     _run(scenario)
 
 
+def test_tui_expanding_system_pane_polls_gpus():
+    # Regression: the polling gate trusted Collapsible.Toggled (which doesn't
+    # fire on every path), so expanding System never flipped the gate and the
+    # GPU table stayed empty. _sync_pane_state reads the live state instead.
+    from textual.widgets import Collapsible, DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._gpu_rows = lambda: [['0', 'RTX', '15', '5000', '24576', '56']]
+            app.query_one('#system', Collapsible).collapsed = False  # expand
+            app._sync_pane_state()
+            assert app._collapsed['system'] is False
+            assert 'gpus' in app._collect()       # now polled
+            app._refresh_now()
+            assert app.query_one('#gpus', DataTable).row_count == 1
+
+    _run(scenario)
+
+
 def test_tui_monitor_panes_are_collapsible():
     from textual.widgets import Collapsible
 

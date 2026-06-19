@@ -819,8 +819,9 @@ class InferStackTUI(App):
 
     def action_copy_status(self) -> None:
         """Copy the status line (often a URL/command) to the clipboard."""
-        self.copy_to_clipboard(str(self.query_one('#status', Static).render()))
-        self.bell()
+        text = str(self.query_one('#status', Static).render())
+        if not self._copy(text):
+            self._status('copy failed — install wl-copy/xclip, or enable OSC 52')
 
     # -- catalog -----------------------------------------------------------
 
@@ -964,8 +965,22 @@ class InferStackTUI(App):
         self._update_summary(data['leases'], data['deployments'], data['observed'])
         self._sync_log_services()
 
+    def _sync_pane_state(self) -> None:
+        """Read live collapse + active-tab state (UI thread) so the polling gate
+        in ``_collect`` reflects reality — Collapsible.Toggled doesn't fire on
+        every path, so don't depend on it alone."""
+        try:
+            self._collapsed['docker'] = \
+                self.query_one('#docker', Collapsible).collapsed
+            self._collapsed['system'] = \
+                self.query_one('#system', Collapsible).collapsed
+            self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
+        except Exception:  # noqa: BLE001
+            pass
+
     def _refresh_now(self) -> None:
         """Synchronous collect + render (first paint; also what tests rely on)."""
+        self._sync_pane_state()
         self._render(self._collect())
 
     @work(thread=True, exclusive=True, group='refresh')
@@ -974,6 +989,7 @@ class InferStackTUI(App):
         self.call_from_thread(self._render, data)
 
     def action_refresh(self) -> None:
+        self._sync_pane_state()   # capture pane state on the UI thread first
         self._refresh_bg()
 
     def _update_summary(self, leases, deployments, observed) -> None:
@@ -1265,11 +1281,7 @@ class InferStackTUI(App):
         self.action_refresh()   # fill the newly-shown tab right away
 
     def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
-        for cid in ('docker', 'system'):
-            try:
-                self._collapsed[cid] = self.query_one(f'#{cid}', Collapsible).collapsed
-            except Exception:  # noqa: BLE001
-                pass
+        self._sync_pane_state()
         if self._collapsed['docker']:
             self._terminate_logs()
         elif self._log_proc is None:
@@ -1280,6 +1292,28 @@ class InferStackTUI(App):
 
     def _status(self, message: str) -> None:
         self.query_one('#status', Static).update(message)
+
+    def _copy(self, text: str) -> bool:
+        """Copy to the system clipboard. Prefer OS tools (reliable on a desktop:
+        wl-copy / xclip / xsel / pbcopy) since many terminals don't honor the
+        OSC 52 escape Textual uses; fall back to OSC 52."""
+        import shutil
+        import subprocess
+
+        for cmd in (['wl-copy'], ['xclip', '-selection', 'clipboard'],
+                    ['xsel', '--clipboard', '--input'], ['pbcopy']):
+            if shutil.which(cmd[0]):
+                try:
+                    subprocess.run(cmd, input=text.encode(), check=True,
+                                   timeout=5)
+                    return True
+                except Exception:  # noqa: BLE001
+                    continue
+        try:
+            self.copy_to_clipboard(text)   # OSC 52 (terminal must allow it)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _selected(self, table_id: str, ids: list[str]) -> str | None:
         row = self.query_one(f'#{table_id}', DataTable).cursor_row
@@ -1787,8 +1821,9 @@ class InferStackTUI(App):
 
     def action_api_copy_curl(self) -> None:
         text = str(self.query_one('#api-curl', Static).render())
-        self.copy_to_clipboard(text)
-        self._status('copied curl to clipboard')
+        ok = self._copy(text)
+        self._status('copied curl to clipboard' if ok else
+                     'copy failed — install wl-copy/xclip, or enable OSC 52')
 
     def action_open_webui(self) -> None:
         url = self._openwebui_url()
