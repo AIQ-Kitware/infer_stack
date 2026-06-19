@@ -33,10 +33,8 @@ from . import (  # noqa: F401
     commands_leasing,
     commands_meta,
     commands_runtime,
-    compose,
     context,
     options,
-    probes,
 )
 from .commands_catalog import CatalogModalCLI
 from .commands_leasing import (
@@ -65,33 +63,6 @@ from .commands_runtime import (
     PsCLI,
     StackModalCLI,
     StatusCLI,
-)
-from .compose import (  # noqa: F401
-    _compose_has_service,
-    _litellm_delete_missed_config_model,
-)
-from .context import (  # noqa: F401
-    apply_config_overrides,
-    backend_name,
-    build_plan,
-    config_for_runtime,
-    config_path,
-    effective_allow_unsupported,
-    effective_inventory,
-    ensure_renderable,
-    generated_dir,
-    has_runtime_overrides,
-    kubeai_generated_dir,
-    load_config,
-    models_path,
-    plan_path,
-    render_is_stale,
-    runtime_dir_for_config,
-    save_plan,
-)
-from .probes import (  # noqa: F401
-    _default_model_for_deployment,
-    _resolve_smoke_protocol_from_deployment,
 )
 
 # ---------------------------------------------------------------------------

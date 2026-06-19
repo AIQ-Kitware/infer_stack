@@ -19,19 +19,8 @@ from typing import Any
 import scriptconfig as scfg
 
 from .. import __version__
-from ..config import kubeai_local_values_path, normalized_state
-from ..paths import config_root
-from .context import (
-    _apply_path_overrides,
-    _safe_load_config,
-    backend_name,
-    config_path,
-    generated_dir,
-    kubeai_generated_dir,
-    models_path,
-    plan_path,
-    runtime_dir_for_config,
-)
+from ..paths import config_root, data_root, settings_path
+from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
 
 
@@ -155,9 +144,8 @@ def _status_style(status: str) -> str:
     return 'red'  # error:* / permission-denied
 
 
-def _render_plain(groups: dict, backend: str) -> None:
+def _render_plain(groups: dict) -> None:
     print('infer-stack paths')
-    print(f'backend: {backend}')
     for group, entries in groups.items():
         print(f'{group}:')
         for e in entries:
@@ -166,12 +154,11 @@ def _render_plain(groups: dict, backend: str) -> None:
             )
 
 
-def _render_rich(groups: dict, backend: str, console) -> None:
+def _render_rich(groups: dict, console) -> None:
     from rich.table import Table
     from rich.text import Text
 
     console.print('[bold]infer-stack paths[/bold]')
-    console.print(f'backend: [bold cyan]{backend}[/bold cyan]')
     for group, entries in groups.items():
         table = Table(
             title=group,
@@ -223,7 +210,7 @@ class ConfigPathsCLI(_PathOverridesMixin):
     target: Any = scfg.Value(
         'all',
         position=1,
-        help='Path group to show: all, config, data, state, or leasing.',
+        help='Path group to show: all, config, data, or leasing.',
     )
     json: Any = scfg.Value(
         False,
@@ -237,57 +224,26 @@ class ConfigPathsCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
 
         target = str(config.target or 'all').strip().lower()
-        valid = {'all', 'config', 'data', 'state', 'leasing'}
+        valid = {'all', 'config', 'data', 'leasing'}
         if target not in valid:
             raise SystemExit(
                 f'Unknown path group {target!r}. Expected one of: '
                 + ', '.join(sorted(valid))
             )
 
-        # Resolve against the persisted config when present, else defaults,
-        # so paths reflect the user's actual state.* / generated_dir choices.
-        cfg = _safe_load_config()
-        backend = backend_name(cfg)
-
         groups: dict[str, list[dict[str, str]]] = {}
         if target in {'all', 'config'}:
-            entries = [
+            groups['config'] = [
                 _entry('config_root', config_root(), kind='dir'),
-                _entry('config.yaml', config_path(), kind='file'),
-                _entry('models.yaml', models_path(), kind='file'),
-                _entry(
-                    'kubeai_values_local',
-                    kubeai_local_values_path(),
-                    kind='file',
-                ),
+                _entry('settings.yaml', settings_path(), kind='file'),
+                _entry('catalog.yaml', config_root() / 'catalog.yaml',
+                       kind='file'),
             ]
-            groups['config'] = entries
         if target in {'all', 'data'}:
-            entries = [
-                _entry('generated_dir', generated_dir(cfg), kind='dir'),
-                _entry('plan.yaml', plan_path(cfg), kind='file'),
-                _entry(
-                    'runtime_dir', runtime_dir_for_config(cfg), kind='dir'
-                ),
-            ]
-            if backend == 'kubeai':
-                entries.append(
-                    _entry(
-                        'kubeai_generated_dir',
-                        kubeai_generated_dir(cfg),
-                        kind='dir',
-                    )
-                )
-            groups['data'] = entries
-        if target in {'all', 'state'}:
-            state = normalized_state(cfg.get('state'))
-            groups['state'] = [
-                _entry(name, Path(value), kind='dir')
-                for name, value in state.items()
+            groups['data'] = [
+                _entry('data_root', data_root(), kind='dir'),
             ]
         if target in {'all', 'leasing'}:
-            from ..paths import data_root
-
             compose_dir = data_root() / 'leasing' / 'compose'
             groups['leasing'] = [
                 _entry(
@@ -320,9 +276,9 @@ class ConfigPathsCLI(_PathOverridesMixin):
 
         console = Console()
         if console.is_terminal:
-            _render_rich(groups, backend, console)
+            _render_rich(groups, console)
         else:
-            _render_plain(groups, backend)
+            _render_plain(groups)
         return 0
 
 

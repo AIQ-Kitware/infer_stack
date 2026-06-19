@@ -46,20 +46,20 @@ def test_version_prints_package_version(tmp_path: Path) -> None:
     assert 'infer-stack' in out
 
 
-def test_config_paths_reports_config_and_state(tmp_path: Path) -> None:
+def test_config_paths_reports_groups(tmp_path: Path) -> None:
     out = run_cli(tmp_path, 'config', 'paths').stdout
     # Group headers are present.
     assert 'config:' in out
     assert 'data:' in out
-    assert 'state:' in out
+    assert 'leasing:' in out
     # Anchored under tmp_path, and nothing exists yet on a fresh root.
-    assert f'config.yaml (file, missing): {tmp_path / "config.yaml"}' in out
-    assert f'hf_cache (dir, missing): {tmp_path / "hf-cache"}' in out
+    assert f'settings.yaml (file, missing): {tmp_path / "settings.yaml"}' in out
+    assert f'catalog.yaml (file, missing): {tmp_path / "catalog.yaml"}' in out
 
 
 def test_config_paths_json_emits_structured_groups(tmp_path: Path) -> None:
     payload = json.loads(run_cli(tmp_path, 'config', 'paths', '--json').stdout)
-    assert set(payload) == {'config', 'data', 'state', 'leasing'}
+    assert set(payload) == {'config', 'data', 'leasing'}
     entry = payload['config'][0]
     assert set(entry) == {'label', 'kind', 'status', 'path'}
 
@@ -94,18 +94,10 @@ def test_status_summarizes_leases_when_present(tmp_path: Path) -> None:
 
 
 def test_config_paths_target_filters_to_single_group(tmp_path: Path) -> None:
-    out = run_cli(tmp_path, 'config', 'paths', 'state').stdout
-    assert 'state:' in out
+    out = run_cli(tmp_path, 'config', 'paths', 'leasing').stdout
+    assert 'leasing:' in out
     assert 'config:' not in out
     assert 'data:' not in out
-
-
-def test_config_paths_omits_data_root(tmp_path: Path) -> None:
-    # data_root is only a default anchor for relative paths; with absolute
-    # state/output paths it is unused, so it should not be reported.
-    out = run_cli(tmp_path, 'config', 'paths').stdout
-    assert 'data_root' not in out
-    assert 'generated_dir' in out
 
 
 def test_config_paths_rejects_unknown_target(tmp_path: Path) -> None:
@@ -139,7 +131,7 @@ def test_render_rich_colorizes_status() -> None:
     }
     buf = io.StringIO()
     console = Console(file=buf, force_terminal=True, width=100)
-    _render_rich(groups, 'compose', console)
+    _render_rich(groups, console)
     out = buf.getvalue()
     assert 'config.yaml' in out
     assert 'models.yaml' in out

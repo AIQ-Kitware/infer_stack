@@ -1,8 +1,7 @@
 """Low-level readiness probes for OpenAI-compatible and Ollama surfaces.
 
-One implementation of "is this endpoint actually serving", shared by the legacy
-``wait-ready`` / ``switch`` path (``cli.probes`` re-exports these) and the
-leasing Compose backend. Each probe is a pure function over an injected HTTP
+One implementation of "is this endpoint actually serving", used by the leasing
+Compose backend (readiness waits). Each probe is a pure function over an injected HTTP
 client (``http``, defaulting to the ``requests`` module), so it works against a
 real server or a fake in tests, and stays out of the CLI layer that depends on
 it (no upward imports).
