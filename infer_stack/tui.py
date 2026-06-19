@@ -407,6 +407,11 @@ class InferStackTUI(App):
     #api-prompt { margin: 0 0 1 0; }
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+
+    #settings { padding: 1 2; }
+    #settings Label { margin: 1 0 0 0; color: $text-muted; }
+    #settings Input, #settings Select { margin: 0 0 1 0; width: 64; }
+    #settings-actions { height: auto; margin: 1 0 0 0; }
     """
 
     BINDINGS = [
@@ -472,6 +477,15 @@ class InferStackTUI(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        with TabbedContent(id='top'):
+            with TabPane('Dashboard', id='tab-dashboard'):
+                yield from self._compose_dashboard()
+            with TabPane('Settings', id='tab-settings'):
+                yield from self._compose_settings()
+        yield Static('', id='status')
+        yield Footer()
+
+    def _compose_dashboard(self) -> ComposeResult:
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
                 yield Static(
@@ -560,8 +574,44 @@ class InferStackTUI(App):
                     )
                     yield RichLog(id='api-out', highlight=False, markup=False,
                                   wrap=True, max_lines=500)
-        yield Static('', id='status')
-        yield Footer()
+
+    def _compose_settings(self) -> ComposeResult:
+        from .cli.commands_leasing import _coerce_bool
+        from .paths import data_root, get_setting, settings_path
+
+        def onoff(key, default):
+            return 'on' if _coerce_bool(get_setting(key), default) else 'off'
+
+        with Vertical(id='settings'):
+            yield Static(
+                'Durable settings (settings.yaml). Save writes them; backend / '
+                'data-dir / proxy take effect on the next serve.', classes='desc',
+            )
+            yield Static(f'file: {settings_path()}', classes='hint')
+            yield Label('backend')
+            yield Select(
+                [('null (dry-run)', 'null'), ('compose', 'compose'),
+                 ('kubeai', 'kubeai')],
+                value=str(get_setting('backend') or 'null'),
+                allow_blank=False, id='set-backend',
+            )
+            yield Label('data dir  (where weights + state live)')
+            yield Input(value=str(get_setting('data_dir') or data_root()),
+                        id='set-data-dir')
+            yield Label('Open WebUI')
+            yield Select([('on', 'on'), ('off', 'off')], value=onoff('ui', True),
+                         allow_blank=False, id='set-ui')
+            yield Label('reverse proxy  (single-port front door)')
+            yield Select([('off', 'off'), ('on', 'on')],
+                         value=onoff('reverse_proxy', False),
+                         allow_blank=False, id='set-rp')
+            yield Label('skip display GPUs during placement')
+            yield Select([('off', 'off'), ('on', 'on')],
+                         value=onoff('skip_display_gpus', False),
+                         allow_blank=False, id='set-skip')
+            with Horizontal(id='settings-actions'):
+                yield Button('Save settings', variant='primary',
+                             id='btn-save-settings')
 
     def on_mount(self) -> None:
         try:
@@ -1051,10 +1101,11 @@ class InferStackTUI(App):
     def on_tabbed_content_tab_activated(
         self, event: TabbedContent.TabActivated
     ) -> None:
-        try:
-            self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
-        except Exception:  # noqa: BLE001
+        # Only the docker sub-tabs gate polling; the top-level Dashboard/Settings
+        # tabs fire this too — ignore those.
+        if getattr(event.tabbed_content, 'id', None) != 'docker-tabs':
             return
+        self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
         self.action_refresh()   # fill the newly-shown tab right away
 
     def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
@@ -1147,10 +1198,30 @@ class InferStackTUI(App):
             'btn-remove-model': self.action_remove_model,
             'btn-api-send': self.action_api_send,
             'btn-api-test-all': self.action_api_test_all,
+            'btn-save-settings': self._on_save_settings,
         }
         handler = handlers.get(event.button.id or '')
         if handler:
             handler()
+
+    def _on_save_settings(self) -> None:
+        from .paths import load_settings, save_settings
+
+        try:
+            s = load_settings()
+            s['backend'] = str(self.query_one('#set-backend', Select).value)
+            data_dir = self.query_one('#set-data-dir', Input).value.strip()
+            if data_dir:
+                s['data_dir'] = data_dir
+            s['ui'] = self.query_one('#set-ui', Select).value == 'on'
+            s['reverse_proxy'] = self.query_one('#set-rp', Select).value == 'on'
+            s['skip_display_gpus'] = (
+                self.query_one('#set-skip', Select).value == 'on'
+            )
+            path = save_settings(s)
+            self._status(f'saved settings → {path}')
+        except Exception as ex:  # noqa: BLE001
+            self._status(f'save settings failed: {ex}')
 
     def action_release(self) -> None:
         sid = self._selected('leases', self._lease_ids)

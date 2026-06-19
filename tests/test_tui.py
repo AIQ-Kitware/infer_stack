@@ -294,6 +294,61 @@ def test_tui_add_model_wizard_writes_catalog(tmp_path):
     assert on_disk['models']['newmod']['source'] == 'hf://org/NewModel'
 
 
+def test_tui_has_top_level_dashboard_and_settings_tabs():
+    from textual.widgets import TabbedContent
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            top = app.query_one('#top', TabbedContent)
+            ids = {p.id for p in top.query('TabPane')}
+            assert {'tab-dashboard', 'tab-settings'} <= ids
+            # dashboard widgets still resolve (composed via the helper)
+            assert app.query_one('#endpoints')
+            assert app.query_one('#set-backend')   # settings form present
+
+    _run(scenario)
+
+
+def test_tui_settings_save_writes_yaml(tmp_path):
+    import yaml
+    from textual.widgets import Input, Select
+
+    from infer_stack import paths
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    paths.set_config_root(tmp_path)
+    paths.set_data_root(tmp_path)
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#set-backend', Select).value = 'compose'
+            app.query_one('#set-data-dir', Input).value = str(tmp_path / 'data')
+            app.query_one('#set-ui', Select).value = 'off'
+            app._on_save_settings()
+            await pilot.pause()
+
+    try:
+        _run(scenario)
+        saved = yaml.safe_load((tmp_path / 'settings.yaml').read_text())
+        assert saved['backend'] == 'compose'
+        assert saved['data_dir'] == str(tmp_path / 'data')
+        assert saved['ui'] is False
+    finally:
+        paths.set_config_root(None)
+        paths.set_data_root(None)
+
+
 def test_tui_endpoint_entry_builds_runtime_from_advanced_params():
     from infer_stack.tui import InferStackTUI
 

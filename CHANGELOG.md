@@ -5,6 +5,11 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* TUI **top-level tabs** — the multipane monitor is now a **Dashboard** tab, with
+  a new **Settings** tab to edit the durable settings (backend, data dir, Open
+  WebUI, reverse proxy, skip-display-GPUs) and save them to `settings.yaml`
+  without dropping to YAML. Textual's command palette (ctrl+p) exposes every
+  action for search.
 * TUI catalog management — the add-endpoint wizard now exposes the runtime knobs
   that matter for serving (**tensor-parallel size, max model len, GPU memory
   fraction, raw extra vLLM args** — where data-parallel etc. go — and the
