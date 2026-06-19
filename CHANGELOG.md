@@ -189,11 +189,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     most once. Declining an *acquire* rolls back the just-created lease; declining
     a *release/evict* leaves the ledger change recorded but docker untouched —
     `infer-stack apply` then applies it (consistent with the render/apply split).
-  - `config init` now tells you which mode it's in: "initializing a new config
-    from scratch", or "editing the existing config at <path> (or hand-edit it
-    with `infer-stack config edit`)". Re-running edits in place and keeps your
-    other settings (it only re-confirms data dir + backend); the new `--fresh`
-    flag discards the existing config and writes a clean one from defaults.
+  - `config init` now prompts for **every** known setting (data dir, backend,
+    Open WebUI, display-GPU skipping), not just data dir + backend — driven by a
+    single settings registry, so a newly added setting is asked about
+    automatically. It also says which mode it's in ("initializing a new config
+    from scratch" vs "editing the existing config at <path> (or hand-edit it with
+    `infer-stack config edit`)"). Re-running edits in place and preserves any
+    keys it doesn't manage; `--fresh` discards the existing config and resets to
+    defaults.
   - `catalog model show` / `endpoint show` with no NAME now print every entry in
     that section instead of failing with `endpoint 'None' not found`; an unknown
     NAME's error now lists what's available (`… not found (have: e1, e2)`).

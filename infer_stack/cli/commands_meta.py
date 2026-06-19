@@ -12,6 +12,7 @@ deployment:
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -329,16 +330,53 @@ class ConfigPathsCLI(_PathOverridesMixin):
 # config settings: durable defaults (backend, data_dir) in settings.yaml
 # ---------------------------------------------------------------------------
 
-# Keys the leasing world actually honors (others are allowed but warned about).
-KNOWN_SETTINGS = {
-    'backend': 'Default serving backend (compose | kubeai | null).',
-    'data_dir': 'Where docker-mounted state lives (overrides the XDG default).',
-    'ui': 'Render a managed Open WebUI with the compose stack (true | false).',
-    'skip_display_gpus': (
-        'Skip display-attached GPUs during placement (true | false). Off by '
-        'default — every GPU is used; turn on to leave a monitor GPU free.'
+# The settings the leasing world honors. One registry drives `config init`'s
+# prompts, `config set`'s validation, and the help — so adding a setting here is
+# enough for `config init` to ask about it (no separate prompt to wire up).
+@dataclass(frozen=True)
+class _Setting:
+    key: str
+    label: str          # short prompt label shown by `config init`
+    help: str           # one-line description (config set / KNOWN_SETTINGS)
+    kind: str           # 'path' | 'choice' | 'bool'
+    default: object = None
+    choices: tuple = ()
+
+
+_SETTINGS: tuple[_Setting, ...] = (
+    _Setting(
+        'data_dir', 'Data dir (docker-mounted weight/state)',
+        'Where docker-mounted state lives (overrides the XDG default).',
+        'path',
     ),
-}
+    _Setting(
+        'backend', 'Default backend',
+        'Default serving backend (compose | kubeai | null).',
+        'choice', 'compose', ('compose', 'kubeai', 'null'),
+    ),
+    _Setting(
+        'ui', 'Manage an Open WebUI alongside the stack',
+        'Render a managed Open WebUI with the compose stack (true | false).',
+        'bool', True,
+    ),
+    _Setting(
+        'skip_display_gpus', 'Skip display-attached GPUs (leave the monitor GPU free)',
+        'Skip display-attached GPUs during placement (true | false). Off by '
+        'default — every GPU is used; turn on to leave a monitor GPU free.',
+        'bool', False,
+    ),
+)
+
+# Keys the leasing world actually honors (others are allowed but warned about).
+KNOWN_SETTINGS = {s.key: s.help for s in _SETTINGS}
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 class ConfigInitCLI(_PathOverridesMixin):
@@ -399,10 +437,19 @@ class ConfigInitCLI(_PathOverridesMixin):
         # other settings and seed the proposals from the current values.
         base: dict = {} if config.fresh else dict(existing)
         seed: dict = {} if config.fresh else existing
-        # Proposed values: explicit flag > current setting > sensible default.
-        # data_root() already resolves --data-dir override / $env / setting / XDG.
-        data_dir = config.data_dir or seed.get('data_dir') or str(data_root())
-        backend = config.backend or seed.get('backend') or 'compose'
+        # Flags `config init` exposes directly (the rest are prompt/default only).
+        flags = {'data_dir': config.data_dir, 'backend': config.backend}
+
+        def _proposed(s: _Setting):
+            # explicit flag > current setting > sensible default.
+            if flags.get(s.key) is not None:
+                return flags[s.key]
+            if s.key in seed:
+                return seed[s.key]
+            # data_root() resolves --data-dir override / $env / setting / XDG.
+            return str(data_root()) if s.key == 'data_dir' else s.default
+
+        values = {s.key: _proposed(s) for s in _SETTINGS}
 
         interactive = (
             not config.yes and sys.stdin.isatty() and sys.stdout.isatty()
@@ -413,26 +460,31 @@ class ConfigInitCLI(_PathOverridesMixin):
             from rich.table import Table
 
             console = Console()
-            data_dir = Prompt.ask(
-                'Data dir (docker-mounted weight/state)', default=data_dir
-            )
-            backend = Prompt.ask(
-                'Default backend',
-                choices=['compose', 'kubeai', 'null'],
-                default=backend,
-            )
+            for s in _SETTINGS:
+                cur = values[s.key]
+                if s.kind == 'bool':
+                    values[s.key] = Confirm.ask(s.label, default=_as_bool(cur))
+                elif s.kind == 'choice':
+                    values[s.key] = Prompt.ask(
+                        s.label, choices=list(s.choices), default=str(cur)
+                    )
+                else:
+                    values[s.key] = Prompt.ask(s.label, default=str(cur))
             table = Table(show_header=True, header_style='bold')
             table.add_column('setting')
             table.add_column('value', style='green')
-            table.add_row('data_dir', data_dir)
-            table.add_row('backend', backend)
+            for s in _SETTINGS:
+                table.add_row(s.key, str(values[s.key]))
             console.print(table)
             if not Confirm.ask(f'Write these to {path}?', default=True):
                 console.print('[yellow]aborted — nothing written[/]')
                 return 0
 
-        base['data_dir'] = data_dir
-        base['backend'] = backend
+        # Normalize bools so they persist as YAML true/false (not strings).
+        for s in _SETTINGS:
+            if s.kind == 'bool':
+                values[s.key] = _as_bool(values[s.key])
+        base.update(values)
         save_settings(base)
         print(f'wrote settings -> {path}')
         print('next: `infer-stack catalog init` to add models/endpoints')

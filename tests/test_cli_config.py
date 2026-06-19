@@ -31,6 +31,22 @@ def test_config_init_announces_new_then_editing(tmp_path, monkeypatch, capsys):
     assert 'config edit' in out
 
 
+def test_config_init_persists_all_known_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import KNOWN_SETTINGS, ConfigInitCLI
+    from infer_stack.paths import load_settings, set_data_root
+
+    set_data_root(None)
+    ConfigInitCLI.main(argv=['--yes', '--data-dir', str(tmp_path / 's'),
+                             '--backend', 'compose'])
+    settings = load_settings()
+    # init now writes every known setting (incl. ui + skip_display_gpus), so
+    # nothing the system honors is silently missing from a fresh config.
+    assert set(settings) == set(KNOWN_SETTINGS)
+    assert settings['skip_display_gpus'] is False     # default
+    assert settings['ui'] is True                     # default
+
+
 def test_config_init_preserves_other_settings(tmp_path, monkeypatch):
     monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
     from infer_stack.cli.commands_meta import ConfigInitCLI, ConfigSetCLI
@@ -45,18 +61,19 @@ def test_config_init_preserves_other_settings(tmp_path, monkeypatch):
     assert settings['backend'] == 'null'
 
 
-def test_config_init_fresh_discards_other_settings(tmp_path, monkeypatch, capsys):
+def test_config_init_fresh_resets_to_defaults(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
     from infer_stack.cli.commands_meta import ConfigInitCLI, ConfigSetCLI
     from infer_stack.paths import load_settings, set_data_root
 
     set_data_root(None)
     ConfigInitCLI.main(argv=['--yes', '--backend', 'compose'])
-    ConfigSetCLI.main(argv=['ui', 'false'])
+    ConfigSetCLI.main(argv=['ui', 'false'])                   # customize ui
     ConfigInitCLI.main(argv=['--yes', '--fresh', '--backend', 'compose'])
     assert 'starting fresh' in capsys.readouterr().out
     settings = load_settings()
-    assert 'ui' not in settings                               # discarded
+    # --fresh discards the customization and resets to the default (ui defaults on)
+    assert settings['ui'] is True
     assert settings['backend'] == 'compose'
 
 

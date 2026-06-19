@@ -36,7 +36,8 @@ export INFER_STACK_DATA_DIR=/data/service/docker/infer-stack
 mkdir -p "$INFER_STACK_DATA_DIR"
 chown "$USER" "$INFER_STACK_DATA_DIR"
 
-# Interactive: prompts for the data dir + default backend, shows them, confirms.
+# Interactive: prompts for each setting (data dir, backend, Open WebUI,
+# display-GPU skipping), shows them, confirms. Re-run to edit; --fresh to reset.
 infer-stack config init
 # ...or non-interactively (scripts / CI):
 infer-stack config init --yes --data-dir "$HOME/infer-stack" --backend compose
