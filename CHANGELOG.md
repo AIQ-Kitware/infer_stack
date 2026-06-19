@@ -167,14 +167,18 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     now an exact equivalent of `apply` rather than a sibling project the tool
     can no longer see. (`infer-stack stack up` remains the raw "run the on-disk
     file verbatim" hatch, vs `apply` which re-renders from intent.)
-  - Optional Textual TUI (`infer-stack tui`): a live dashboard of the lease +
-    group tables (desired state vs running, GPUs), auto-refreshing, with
-    key-bound controls — `s` serve (pick a catalog endpoint), `d` release the
-    selected lease, `a` release-all, `e` evict the selected group, `r` refresh,
-    `q` quit. Mutations converge off the UI thread so the monitor stays
-    responsive; narration is silenced while the TUI owns the terminal. Opt-in
-    extra — `pip install "infer-stack[tui]"`; without textual the command exits
-    with an install hint. (This also made `SqliteStore` thread-safe —
+  - Optional Textual TUI (`infer-stack tui`): a multi-pane dashboard. A
+    **catalog** pane (left) lists your models + endpoints — select an endpoint
+    and press `s`/Enter to request a lease; **leases** + **groups** panes show
+    the live ledger (desired state vs running, GPUs), auto-refreshing; a **logs**
+    pane tails `docker compose logs -f` and a dropdown points it at a specific
+    service (or all). Controls: `s` serve, `d` release, `a` release-all, `e`
+    evict, `r` refresh, `tab` cycle panes, `q` quit. Mutations converge off the
+    UI thread so the monitor stays responsive; narration is silenced while the
+    TUI owns the terminal. The log source is injectable, so the whole app is
+    exercised headless via Textual's pilot in the tests. Opt-in extra —
+    `pip install "infer-stack[tui]"`; without textual the command exits with an
+    install hint. (This also made `SqliteStore` thread-safe —
     `check_same_thread=False` + a lock serializing write transactions — so the
     same ledger connection is usable from a converge worker thread.)
   - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it

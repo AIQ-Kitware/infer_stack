@@ -1,25 +1,37 @@
 """Optional Textual TUI to monitor and control the leasing stack.
 
-A live view of the lease ledger + deployment groups (the same data as
-``infer-stack leases``: desired *state* vs *running*, and which GPUs each model
-is on), plus key-bound controls to serve a model, release a lease, or evict an
-idle group — without leaving the terminal.
+A multi-pane dashboard:
+
+* **Catalog** (left) — the models + endpoints you can run; select an endpoint and
+  press ``s`` / Enter to request a lease (serve it).
+* **Leases** + **Groups** — the live ledger view (desired *state* vs *running*,
+  and which GPUs each model is on), auto-refreshing.
+* **Logs** — a live ``docker compose logs -f`` tail you can point at a specific
+  service (or all of them).
+* **Status bar** — the result of the last action.
 
 It is opt-in and only imported when ``infer-stack tui`` runs, so the rest of the
-CLI never pays for textual. Launch with :func:`run_tui`; it reuses an already
-built :class:`~infer_stack.leasing.controller.Controller` and
-:class:`~infer_stack.leasing.catalog.Catalog`.
+CLI never pays for textual. The docker log source is injectable
+(``proc_factory``) so the whole app is exercisable headless via Textual's pilot.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import subprocess
+from typing import Any, Callable, Iterable
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
-from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Label,
+    RichLog,
+    Select,
+    Static,
+)
 
 from .cli.commands_leasing import (
     _gpu_label,
@@ -29,44 +41,55 @@ from .cli.commands_leasing import (
 )
 from .leasing import GroupState, LeaseState
 
+ALL_SERVICES = ''  # the Select value meaning "every service"
 
-class ServeModal(ModalScreen[str | None]):
-    """Pick a catalog endpoint to serve (Enter to select, Esc to cancel)."""
 
-    def __init__(self, names: list[str]) -> None:
-        super().__init__()
-        self._names = names
+class _DockerLogProc:
+    """A live ``docker compose logs -f`` process for one (or all) service(s)."""
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id='serve-dialog'):
-            yield Label('Serve which endpoint?  (Enter = select, Esc = cancel)')
-            yield OptionList(*self._names, id='serve-options')
+    def __init__(self, project: str, compose_file: str, service: str | None):
+        cmd = [
+            'docker', 'compose', '-p', project, '-f', compose_file,
+            'logs', '-f', '--tail', '200', '--no-color',
+        ]
+        if service:
+            cmd.append(service)
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
 
-    def on_option_list_option_selected(
-        self, event: OptionList.OptionSelected
-    ) -> None:
-        self.dismiss(str(event.option.prompt))
+    @property
+    def stdout(self) -> Iterable[str]:
+        return self._proc.stdout or iter(())
 
-    def on_key(self, event) -> None:
-        if event.key == 'escape':
-            self.dismiss(None)
+    def terminate(self) -> None:
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            self._proc.kill()
 
 
 class InferStackTUI(App):
-    """Monitor + control the leasing stack."""
+    """Monitor + control the leasing stack across panes."""
 
     TITLE = 'infer-stack'
-    SUB_TITLE = 'leasing monitor'
+    SUB_TITLE = 'leasing dashboard'
 
     CSS = """
+    #body { height: 1fr; }
+    #sidebar { width: 36; border-right: solid $panel; }
+    #main { width: 1fr; }
+    .pane-title { color: $accent; text-style: bold; padding: 0 1; }
+    #endpoints { height: 1fr; }
+    #models { height: 8; }
+    #leases { height: 7; }
+    #groups { height: 9; }
+    #logbar { height: 1; padding: 0 1; }
+    #logsvc { width: 32; }
+    #logs { height: 1fr; border-top: solid $panel; }
     #status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
-    DataTable { height: 1fr; }
-    #serve-dialog {
-        width: 60; height: auto; padding: 1 2;
-        border: round $accent; background: $surface;
-        align: center middle;
-    }
-    #serve-options { height: auto; max-height: 16; }
     """
 
     BINDINGS = [
@@ -75,47 +98,99 @@ class InferStackTUI(App):
         ('a', 'release_all', 'Release all'),
         ('e', 'evict', 'Evict'),
         ('r', 'refresh', 'Refresh'),
+        ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
     ]
 
-    def __init__(self, controller, catalog, *, interval: float = 3.0) -> None:
+    def __init__(
+        self,
+        controller,
+        catalog,
+        *,
+        interval: float = 3.0,
+        proc_factory: Callable[[str | None], Any] | None = None,
+    ) -> None:
         super().__init__()
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
+        self._proc_factory = proc_factory or self._default_proc_factory()
+        self._endpoint_names: list[str] = []
         self._lease_ids: list[str] = []
         self._group_ids: list[str] = []
+        self._service_options: list[str] = []
+        self._log_service: str = ALL_SERVICES
+        self._log_proc: Any = None
+        self._log_lines: list[str] = []  # mirror of the log pane, for tests
 
     # -- layout ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical():
-            yield Label('leases', classes='section')
-            yield DataTable(id='leases', cursor_type='row', zebra_stripes=True)
-            yield Label('groups', classes='section')
-            yield DataTable(id='groups', cursor_type='row', zebra_stripes=True)
+        with Horizontal(id='body'):
+            with Vertical(id='sidebar'):
+                yield Label('catalog · endpoints', classes='pane-title')
+                yield DataTable(id='endpoints', cursor_type='row')
+                yield Label('catalog · models', classes='pane-title')
+                yield DataTable(id='models', cursor_type='row')
+            with Vertical(id='main'):
+                yield Label('leases', classes='pane-title')
+                yield DataTable(id='leases', cursor_type='row')
+                yield Label('groups', classes='pane-title')
+                yield DataTable(id='groups', cursor_type='row')
+                with Horizontal(id='logbar'):
+                    yield Label('logs: ')
+                    yield Select(
+                        [('(all services)', ALL_SERVICES)],
+                        value=ALL_SERVICES, allow_blank=False, id='logsvc',
+                    )
+                yield RichLog(id='logs', highlight=False, markup=False,
+                              max_lines=2000, wrap=False)
         yield Static('', id='status')
         yield Footer()
 
     def on_mount(self) -> None:
-        leases = self.query_one('#leases', DataTable)
-        leases.add_columns('id', 'owner', 'state', 'ttl', 'endpoints')
-        groups = self.query_one('#groups', DataTable)
-        groups.add_columns(
+        self.query_one('#endpoints', DataTable).add_columns(
+            'endpoint', 'model', 'engine', 'reclaim'
+        )
+        self.query_one('#models', DataTable).add_columns('model', 'source')
+        self.query_one('#leases', DataTable).add_columns(
+            'id', 'owner', 'state', 'ttl', 'endpoints'
+        )
+        self.query_one('#groups', DataTable).add_columns(
             'id', 'engine', 'state', 'running', 'gpus', 'demand', 'served'
         )
-        self.set_interval(self.interval, self.action_refresh)
+        self._fill_catalog()
         self.action_refresh()
+        self._restart_logs(self._log_service)
+        self.set_interval(self.interval, self.action_refresh)
+        self.query_one('#endpoints', DataTable).focus()
 
-    # -- data --------------------------------------------------------------
+    def on_unmount(self) -> None:
+        self._terminate_logs()
+
+    # -- catalog -----------------------------------------------------------
+
+    def _fill_catalog(self) -> None:
+        eps = self.query_one('#endpoints', DataTable)
+        eps.clear()
+        self._endpoint_names = []
+        for name in sorted(self.catalog.endpoints):
+            ep = self.catalog.endpoints[name]
+            eps.add_row(
+                name, getattr(ep, 'model', '') or '-',
+                getattr(ep, 'engine', '') or '-',
+                str(getattr(ep, 'reclaim', '') or '-'),
+            )
+            self._endpoint_names.append(name)
+        models = self.query_one('#models', DataTable)
+        models.clear()
+        for name in sorted(self.catalog.models):
+            models.add_row(name, getattr(self.catalog.models[name], 'source', ''))
+
+    # -- monitor -----------------------------------------------------------
 
     def action_refresh(self) -> None:
-        """Re-query the ledger + backend and repopulate the tables.
-
-        Synchronous: the ledger is sqlite (instant) and the backend probe is
-        best-effort, so a monitor refresh is cheap enough to run inline.
-        """
         try:
             self.controller.ledger.sweep()
             leases, groups = self.controller.ledger.status()
@@ -125,6 +200,7 @@ class InferStackTUI(App):
             return
         self._fill_leases(leases)
         self._fill_groups(groups, observed, assignments)
+        self._sync_log_services()
 
     def _fill_leases(self, leases) -> None:
         table = self.query_one('#leases', DataTable)
@@ -159,42 +235,115 @@ class InferStackTUI(App):
         if table.row_count:
             table.move_cursor(row=min(max(row, 0), table.row_count - 1))
 
-    # -- helpers -----------------------------------------------------------
+    # -- logs --------------------------------------------------------------
+
+    def _service_names(self) -> list[str]:
+        """Service names from the on-disk compose file (best-effort)."""
+        backend = self.controller.backend
+        path = getattr(backend, 'compose_file', None)
+        if not path:
+            return []
+        try:
+            from pathlib import Path
+
+            import yaml
+            data = yaml.safe_load(Path(path).read_text()) or {}
+            return sorted((data.get('services') or {}).keys())
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _sync_log_services(self) -> None:
+        names = self._service_names()
+        if names == self._service_options:
+            return
+        self._service_options = names
+        select = self.query_one('#logsvc', Select)
+        options = [('(all services)', ALL_SERVICES)] + [(n, n) for n in names]
+        select.set_options(options)
+        # keep the current selection if it still exists, else fall back to all
+        select.value = (
+            self._log_service if self._log_service in names else ALL_SERVICES
+        )
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != 'logsvc':
+            return
+        service = '' if event.value is Select.BLANK else str(event.value)
+        if service != self._log_service:
+            self._log_service = service
+            self._restart_logs(service)
+
+    def _default_proc_factory(self) -> Callable[[str | None], Any]:
+        def factory(service: str | None):
+            backend = self.controller.backend
+            path = getattr(backend, 'compose_file', None)
+            project = getattr(backend, 'project', 'infer-stack')
+            if not path:
+                return None
+            return _DockerLogProc(str(project), str(path), service)
+
+        return factory
+
+    def _restart_logs(self, service: str) -> None:
+        self._terminate_logs()
+        log = self.query_one('#logs', RichLog)
+        log.clear()
+        self._log_lines = []
+        label = service or 'all services'
+        log.write(f'— following logs: {label} —')
+        self._stream_logs(service or None)
+
+    def _terminate_logs(self) -> None:
+        proc, self._log_proc = self._log_proc, None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @work(thread=True, exclusive=True, group='logs')
+    def _stream_logs(self, service: str | None) -> None:
+        proc = self._proc_factory(service)
+        if proc is None:
+            self.call_from_thread(
+                self._append_log, '(no compose project yet — serve a model)'
+            )
+            return
+        self._log_proc = proc
+        try:
+            for line in proc.stdout:
+                self.call_from_thread(self._append_log, line.rstrip('\n'))
+        except Exception:  # noqa: BLE001 - stream ends when the proc dies
+            pass
+
+    def _append_log(self, line: str) -> None:
+        self._log_lines.append(line)
+        self.query_one('#logs', RichLog).write(line)
+
+    # -- helpers + actions -------------------------------------------------
 
     def _status(self, message: str) -> None:
         self.query_one('#status', Static).update(message)
 
-    def _selected_lease(self) -> str | None:
-        table = self.query_one('#leases', DataTable)
-        row = table.cursor_row
-        if 0 <= row < len(self._lease_ids):
-            return self._lease_ids[row]
-        return None
-
-    def _selected_group(self) -> str | None:
-        table = self.query_one('#groups', DataTable)
-        row = table.cursor_row
-        if 0 <= row < len(self._group_ids):
-            return self._group_ids[row]
-        return None
-
-    # -- actions -----------------------------------------------------------
+    def _selected(self, table_id: str, ids: list[str]) -> str | None:
+        row = self.query_one(f'#{table_id}', DataTable).cursor_row
+        return ids[row] if 0 <= row < len(ids) else None
 
     def action_serve(self) -> None:
-        names = sorted(self.catalog.endpoints)
-        if not names:
-            self._status('catalog has no endpoints to serve')
+        name = self._selected('endpoints', self._endpoint_names)
+        if not name:
+            self._status('select an endpoint in the catalog to serve')
             return
+        self._status(f'serving {name}…')
+        self._do_serve(name)
 
-        def _picked(name: str | None) -> None:
-            if name:
-                self._status(f'serving {name}…')
-                self._do_serve(name)
-
-        self.push_screen(ServeModal(names), _picked)
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # Enter on the endpoints table serves that endpoint.
+        if event.data_table.id == 'endpoints':
+            self.action_serve()
 
     def action_release(self) -> None:
-        sid = self._selected_lease()
+        sid = self._selected('leases', self._lease_ids)
         if not sid:
             self._status('select a lease row to release')
             return
@@ -206,15 +355,15 @@ class InferStackTUI(App):
         self._do_release_all()
 
     def action_evict(self) -> None:
-        gid = self._selected_group()
+        gid = self._selected('groups', self._group_ids)
         if not gid:
             self._status('select a group row to evict')
             return
         self._status(f'evicting {gid}…')
         self._do_evict(gid)
 
-    # Mutations converge the backend (docker up/down, possibly slow), so they
-    # run off the UI thread; results + a refresh are marshalled back on.
+    # Mutations converge the backend (docker up/down, possibly slow) off the UI
+    # thread; results + a refresh are marshalled back on.
 
     @work(thread=True, exclusive=True, group='mutate')
     def _do_serve(self, name: str) -> None:

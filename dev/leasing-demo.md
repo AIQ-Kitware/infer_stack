@@ -164,10 +164,12 @@ infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stac
 (or `→N` for one that's slated but not started yet) — so it's obvious when
 something is still warming up vs truly live.
 
-> **Prefer a live dashboard?** `infer-stack tui` opens a Textual UI with the
-> same lease/group tables auto-refreshing, plus key-bound controls — `s` serve,
-> `d` release, `e` evict, `a` release-all, `q` quit. It's an opt-in extra:
-> `pip install "infer-stack[tui]"`.
+> **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI:
+> a **catalog** pane to pick an endpoint and serve it (`s`/Enter), live
+> **leases** + **groups** tables, and a **logs** pane that tails `docker compose
+> logs -f` (a dropdown points it at one service or all). Controls: `s` serve,
+> `d` release, `e` evict, `a` release-all, `tab` to move between panes, `q` quit.
+> Opt-in extra: `pip install "infer-stack[tui]"`.
 
 ---
 

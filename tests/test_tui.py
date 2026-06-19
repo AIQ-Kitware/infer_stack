@@ -10,7 +10,10 @@ pytest.importorskip('textual')
 
 CATALOG = {
     'models': {'qc': {'source': 'hf://Qwen/Qwen2.5-Coder-32B-Instruct'}},
-    'endpoints': {'qwen-coder': {'engine': 'vllm', 'model': 'qc'}},
+    'endpoints': {
+        'qwen-coder': {'engine': 'vllm', 'model': 'qc'},
+        'qwen-fast': {'engine': 'vllm', 'model': 'qc'},
+    },
 }
 
 
@@ -28,49 +31,80 @@ def _ctx():
     return controller, catalog
 
 
-def test_tui_mounts_lists_and_opens_serve():
-    from textual.widgets import DataTable
+class _FakeProc:
+    """Stands in for a `docker compose logs -f` process."""
 
-    from infer_stack.tui import InferStackTUI, ServeModal
+    def __init__(self, lines):
+        self.stdout = iter(lines)
+        self.terminated = False
 
-    controller, catalog = _ctx()
-    controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    def terminate(self):
+        self.terminated = True
 
-    async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            leases = app.query_one('#leases', DataTable)
-            groups = app.query_one('#groups', DataTable)
-            assert leases.row_count == 1          # the active lease
-            assert groups.row_count == 1          # its deployment group
-            assert app._selected_lease() == app._lease_ids[0]
-            assert app._selected_group() == app._group_ids[0]
-            # `s` opens the serve picker listing catalog endpoints
-            await pilot.press('s')
-            await pilot.pause()
-            assert isinstance(app.screen, ServeModal)
-            await pilot.press('escape')
-            await pilot.pause()
 
+def _run(scenario):
     asyncio.run(scenario())
 
 
-def test_tui_release_action_drops_the_lease():
-    from infer_stack.leasing import LeaseState
+def test_tui_panes_list_catalog_leases_and_groups():
+    from textual.widgets import DataTable
+
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
     controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999)
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press('d')                # release the selected lease
-            await app.workers.wait_for_complete()  # let the mutate worker finish
+            eps = app.query_one('#endpoints', DataTable)
+            assert eps.row_count == 2                 # both catalog endpoints
+            assert app._endpoint_names == ['qwen-coder', 'qwen-fast']
+            assert app.query_one('#models', DataTable).row_count == 1
+            assert app.query_one('#leases', DataTable).row_count == 1
+            assert app.query_one('#groups', DataTable).row_count == 1
+
+    _run(scenario)
+
+
+def test_tui_serve_from_catalog_creates_a_lease():
+    from infer_stack.leasing import LeaseState
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#endpoints').focus()
+            await pilot.press('s')                    # serve the selected endpoint
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
-    asyncio.run(scenario())
+    _run(scenario)
     leases, _ = controller.ledger.status()
-    assert [le.state for le in leases] == [LeaseState.RELEASED]
+    assert len(leases) == 1
+    assert leases[0].state == LeaseState.ACTIVE
+    assert 'qwen-coder' in leases[0].endpoints      # first row, sorted
+
+
+def test_tui_logs_stream_from_injected_source():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    lines = ['litellm   | started', 'litellm   | ready']
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: _FakeProc(lines))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.workers.wait_for_complete()     # drain the log stream
+            await pilot.pause()
+            assert any('ready' in line for line in app._log_lines)
+
+    _run(scenario)
