@@ -43,6 +43,9 @@ optional-dependencies.tests = [
   "pytest>=7.0",
   "pytest-codeblocks>=0.17",
 ]
+optional-dependencies.tui = [
+    "textual>=0.50",
+]
 urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
 scripts.infer-stack = "infer_stack.cli:main"
 

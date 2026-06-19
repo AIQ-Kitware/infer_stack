@@ -60,6 +60,7 @@ from .commands_leasing import (
     RunCLI,
     ServeCLI,
     TestCLI,
+    TuiCLI,
     WaitCLI,
 )
 from .commands_leasing import EnvCLI as LeasingEnvCLI
@@ -230,6 +231,7 @@ class ManageCLI(scfg.ModalCLI):
     apply = ApplyCLI  # bring the desired set up (the trigger for serve --no-apply)
     wait = WaitCLI  # block until endpoints are ready (serve --no-wait fan-out)
     leases = LeasesCLI
+    tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
     test = TestCLI  # smoke-test a served endpoint through the front door
     env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE
 

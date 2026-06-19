@@ -938,6 +938,37 @@ class WaitCLI(_LeasingCommonMixin):
         return 0 if result.ready else 2
 
 
+class TuiCLI(_LeasingCommonMixin):
+    """Launch the Textual TUI: a live monitor of the stack with controls to
+    serve / release / evict models.
+
+    Mostly a monitor — the lease + group tables (desired state vs running, GPUs)
+    refresh live — with key-bound controls: ``s`` serve, ``d`` release, ``a``
+    release-all, ``e`` evict, ``r`` refresh, ``q`` quit. Opt-in extra: install
+    textual with ``pip install "infer-stack[tui]"``.
+    """
+
+    __command__ = 'tui'
+
+    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
+    interval = scfg.Value(3.0, type=float, help='Auto-refresh interval (s).')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        try:
+            from ..tui import run_tui
+        except ImportError as ex:
+            raise SystemExit(
+                'the TUI needs the optional `textual` dependency — install it '
+                'with `pip install "infer-stack[tui]"` (or `pip install textual`). '
+                f'[{ex}]'
+            )
+        controller = _open_controller(config)
+        catalog = _load_catalog(config)
+        return run_tui(controller, catalog, interval=float(config.interval))
+
+
 class RenewCLI(_LeasingCommonMixin):
     """Extend (or make infinite) a lease's protection window."""
 

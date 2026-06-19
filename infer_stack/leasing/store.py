@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -93,9 +94,16 @@ class SqliteStore:
         self.path = str(path)
         if self.path != ':memory:':
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False lets a long-running process (e.g. the TUI) use
+        # this connection from a worker thread for converge-while-monitoring;
+        # ``_lock`` serializes write transactions so two threads can't both
+        # ``BEGIN IMMEDIATE`` on the one connection. sqlite itself is built
+        # serialized, so individual reads across threads are safe.
         self._conn = sqlite3.connect(
-            self.path, isolation_level=None, timeout=busy_timeout_ms / 1000
+            self.path, isolation_level=None, timeout=busy_timeout_ms / 1000,
+            check_same_thread=False,
         )
+        self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
         self._conn.execute('PRAGMA foreign_keys = ON')
         self._conn.execute(f'PRAGMA busy_timeout = {busy_timeout_ms}')
@@ -124,15 +132,18 @@ class SqliteStore:
         """Take the write lock up front and commit/rollback atomically.
 
         ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-group
-        step race-safe across processes.
+        step race-safe across processes. ``_lock`` adds the same guarantee
+        across threads in one process (overlapping ``BEGIN IMMEDIATE`` on a
+        shared connection would otherwise raise).
         """
-        self._conn.execute('BEGIN IMMEDIATE')
-        try:
-            yield self._conn
-            self._conn.execute('COMMIT')
-        except Exception:
-            self._conn.execute('ROLLBACK')
-            raise
+        with self._lock:
+            self._conn.execute('BEGIN IMMEDIATE')
+            try:
+                yield self._conn
+                self._conn.execute('COMMIT')
+            except Exception:
+                self._conn.execute('ROLLBACK')
+                raise
 
     # -- leases ------------------------------------------------------------
 
