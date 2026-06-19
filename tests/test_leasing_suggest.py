@@ -29,6 +29,20 @@ def test_builtin_pool_is_nonempty_and_real():
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
 
 
+def test_derive_runtime_never_sizes_below_pool_default():
+    # Regression: on a big GPU the bare footprint ratio for a small model is well
+    # below the pool's hand-tuned gpu_memory_utilization (sized for its KV cache
+    # at its context). Sizing below it starved the KV cache and vLLM OOM'd at
+    # startup. The computed util must only *raise* the default.
+    pool = builtin_pool()
+    model = pool['smollm2-1.7b']
+    rt = derive_runtime(model, [_gpu(0, 24)])
+    assert rt['gpu_memory_utilization'] >= model.defaults['gpu_memory_utilization']
+    # a smaller GPU may need a bigger slice — the footprint estimate can raise it
+    rt_small = derive_runtime(model, [_gpu(0, 8)])
+    assert rt_small['gpu_memory_utilization'] >= rt['gpu_memory_utilization']
+
+
 def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     # A single 24 GiB RTX 3090: the current-gen models that fit a 24 GiB card
     # should be suggested; the ones needing a bigger/second GPU should not.

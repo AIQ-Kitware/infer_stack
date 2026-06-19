@@ -198,14 +198,22 @@ def derive_runtime(
     if want_len:
         runtime['max_model_len'] = int(want_len)
 
-    # Footprint over the (smallest) host GPU, padded ~30% for the KV cache, then
-    # bounded to a sane [0.2, 0.92] band. Fall back to the pool default when we
-    # cannot size it (no host GPU mem known).
+    # Footprint over the (smallest) host GPU, padded ~30%, then bounded to a sane
+    # band. Crucially this is a *floor-raiser*, never a floor-lowerer: the pool's
+    # own ``gpu_memory_utilization`` default encodes the fraction the model needs
+    # for its context's KV cache, so sizing *below* it (as the bare footprint
+    # ratio can on a big GPU) starves the KV cache and the engine OOMs at
+    # startup. We therefore take the max of the footprint estimate and the pool
+    # default, so the computed value can only *raise* the reservation on a
+    # smaller GPU where the model needs a bigger slice. Fall back to the default
+    # when host GPU mem is unknown.
+    default_util = model.defaults.get('gpu_memory_utilization')
     if host_mem > 0 and model.min_vram_gib_per_replica > 0:
-        util = (model.min_vram_gib_per_replica * 1.3) / host_mem
+        footprint = (model.min_vram_gib_per_replica * 1.3) / host_mem
+        util = footprint if default_util is None else max(footprint, default_util)
         util = max(0.2, min(0.92, round(util, 2)))
     else:
-        util = model.defaults.get('gpu_memory_utilization', 0.9)
+        util = default_util if default_util is not None else 0.9
     runtime['gpu_memory_utilization'] = util
 
     if model.preferred_gpu_count > 1:

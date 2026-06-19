@@ -1787,3 +1787,29 @@ infer_stack/catalog.py, and removed the now-orphaned profile templates
 
 232 tests green throughout; ruff clean. Standing caveat unchanged: the
 on-terminal feel is Jon's to confirm (he is, live).
+
+## 2026-06-19 21:30:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Live-test fixes + the suggest
+sizing bug (Jon green-lit touching suggest.py — the other agent has been idle the
+whole session).
+
+- API tab: added gateway + Open WebUI URLs (ctrl+click / Open button), a List
+  models check (GET /v1/models), a live curl preview + Copy curl, and clipboard
+  via Textual OSC 52 (Copy curl; `y` copies the status line). Caveat surfaced to
+  Jon: OSC 52 needs terminal/tmux `set-clipboard on`.
+- Crash fix: the URL line used Textual `[link=http://...]` markup, which rejects
+  the ':' in the URL and threw MarkupError in get_content_height. Switched to
+  plain text (ctrl+click + button still open it).
+- suggest.py sizing bug (the real one): vLLM OOM'd at startup for smollm2-1.7b
+  because suggest overrode the pool's hand-tuned gpu_memory_utilization (0.4,
+  sized for the 8192 KV cache) with a bare footprint ratio (min_vram*1.3/host =
+  0.22 on a 24 GiB GPU) — below what the KV cache needs. Root insight: the pool
+  default is a *floor* (it encodes the KV requirement); the footprint estimate
+  should only *raise* it on smaller GPUs. Fix = max(footprint, pool_default),
+  still clamped [0.2, 0.92]. smollm2-1.7b now → 0.4. Added a regression test.
+  Note for Jon: existing catalogs already have the bad 0.22 baked in — re-run
+  `catalog suggest --apply --force`, or Edit the endpoint, to pick up 0.4.
+
+236 tests green. The suggest fix only changes future suggestions; the standing
+on-terminal caveat (clipboard/drag under tmux) is Jon's to confirm live.
