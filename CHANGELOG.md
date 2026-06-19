@@ -276,12 +276,15 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   a brief gateway blip on a model add/remove for correctness; keeping LiteLLM up
   across switches (as the legacy stack did) is tracked in
   `dev/leasing-followups.md`.
-* Display-attached GPUs are now usable on demand. The placer still skips them by
-  default (so a workstation's monitor GPU is left alone), but the leasing verbs
-  gained `--include-display-gpus`, wired to the Compose backend's `skip_display`,
-  so a host whose only spare GPU happens to drive a display can place models on
-  it (and spread distinct models across every GPU). Demoed by the `45_both_gpus`
-  e2e tier; see `dev/leasing-demo.md` and `dev/e2e_tests/`.
+* Placement uses **every** GPU by default, including display-attached ones —
+  skipping the monitor's GPU is now opt-in. A single-GPU host (whose only GPU
+  drives the display) would otherwise place nothing at all, so the safe default
+  is "use it". Opt in to leaving a display GPU free with `--skip-display-gpus`
+  (per command) or `infer-stack config set skip_display_gpus true` (persisted).
+  This flips the earlier default — the leasing verbs' `--include-display-gpus`
+  flag is replaced by `--skip-display-gpus`, and `plan_placement`/`ComposeBackend`
+  default `skip_display=False`. Demoed by the `45_both_gpus` e2e tier; see
+  `dev/leasing-demo.md` and `dev/e2e_tests/`.
 * `vllm_args` no longer emits `--disable-log-requests`, which vLLM v0.19.1
   rejects (`unrecognized arguments`) — it crashed vLLM, surfacing as a LiteLLM
   "Connection error". Engine-version-specific flags can go in `extra_args`.
@@ -315,9 +318,8 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   detects that a just-requested group landed unplaced, rolls the lease back
   (matching the diff-declined path) and raises `PlacementError`; the CLI prints
   the planner's reason ("need 1 GPUs but only 0 available") plus how to free a
-  GPU (`leases` → `release`/`evict`) or use a display GPU
-  (`--include-display-gpus`). Found running the `dev/leasing-demo.md` walkthrough
-  on yardrat (two models, one free GPU).
+  GPU (`leases` → `release`/`evict`). Found running the `dev/leasing-demo.md`
+  walkthrough on yardrat (two models, one free GPU).
 
 ### Changed
 * vLLM compose service/container names now lead with the served model:

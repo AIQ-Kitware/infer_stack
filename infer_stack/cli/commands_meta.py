@@ -334,6 +334,10 @@ KNOWN_SETTINGS = {
     'backend': 'Default serving backend (compose | kubeai | null).',
     'data_dir': 'Where docker-mounted state lives (overrides the XDG default).',
     'ui': 'Render a managed Open WebUI with the compose stack (true | false).',
+    'skip_display_gpus': (
+        'Skip display-attached GPUs during placement (true | false). Off by '
+        'default — every GPU is used; turn on to leave a monitor GPU free.'
+    ),
 }
 
 

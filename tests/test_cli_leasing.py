@@ -353,9 +353,11 @@ def test_env_read_missing_is_friendly(tmp_path, monkeypatch):
         EnvCLI.main(argv=['NOPE'])                    # no .env yet
 
 
-def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
-    """--include-display-gpus must flip the compose backend's skip_display."""
+def test_skip_display_gpus_default_off_flag_and_setting(env, monkeypatch):
+    """Display GPUs are used by default; --skip-display-gpus / the setting opt in."""
     import infer_stack.cli.commands_leasing as mod
+    import infer_stack.hardware as hw
+    import infer_stack.paths as paths
 
     seen = {}
 
@@ -363,24 +365,27 @@ def test_include_display_gpus_flag_controls_skip_display(env, monkeypatch):
         def __init__(self, **kw):
             seen.update(kw)
 
-    import infer_stack.hardware as hw
-
     monkeypatch.setattr(mod, 'ComposeBackend', FakeCompose)
-    # _make_backend does `from ..hardware import detect_inventory` lazily.
+    # _make_backend / _resolve_skip_display import these lazily from their home
+    # modules, so patch them there.
     monkeypatch.setattr(hw, 'detect_inventory', lambda: {})
 
-    cfg = AcquireCLI.cli(
-        argv=['qwen-coder', '--backend', 'compose', '--include-display-gpus'],
-        strict=False,
-    )
-    mod._make_backend(cfg)
-    assert seen['skip_display'] is False
+    def skip_display_for(argv, setting=None):
+        seen.clear()
+        monkeypatch.setattr(
+            paths, 'get_setting',
+            lambda k: setting if k == 'skip_display_gpus' else None,
+        )
+        cfg = AcquireCLI.cli(argv=argv, strict=False)
+        mod._make_backend(cfg)
+        return seen['skip_display']
 
-    seen.clear()
-    cfg = AcquireCLI.cli(argv=['qwen-coder', '--backend', 'compose'],
-                         strict=False)
-    mod._make_backend(cfg)
-    assert seen['skip_display'] is True
+    base = ['qwen-coder', '--backend', 'compose']
+    assert skip_display_for(base) is False                       # default: use all
+    assert skip_display_for([*base, '--skip-display-gpus']) is True   # flag opts in
+    assert skip_display_for(base, setting='true') is True        # setting opts in
+    # explicit flag wins over the setting
+    assert skip_display_for([*base, '--no-skip-display-gpus'], setting='true') is False
 
 
 def test_ui_flag_and_setting_resolution(env, monkeypatch):

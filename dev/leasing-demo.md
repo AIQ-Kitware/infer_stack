@@ -219,16 +219,17 @@ The gateway stays put; add or drop models freely and Open WebUI's picker
 follows. Bring the small model up alongside the big one — each is addressable by
 its own name:
 
-> **One model per GPU — and yardrat's second GPU is the display one.** Placement
-> is whole-GPU: each model lands on its own GPU, and `--gpu-mem` is only vLLM's
-> reservation *within* that GPU, not a knob to pack two models onto one. So the
-> first model takes GPU 0; the second needs GPU 1 — which is display-attached and
-> **skipped by default**. Pass `--include-display-gpus` to let the second model
-> use it (otherwise it can't place and `serve` fails fast with "need 1 GPUs but
-> only 0 available"). `infer-stack leases` shows which GPU each model is on.
+> **One model per GPU.** Placement is whole-GPU: each model lands on its own GPU,
+> and `--gpu-mem` is only vLLM's reservation *within* that GPU, not a knob to pack
+> two models onto one. So the first model takes GPU 0 and the second takes GPU 1
+> — including yardrat's display-attached GPU 1, since placement uses **every** GPU
+> by default (so single-GPU hosts work too). Want to keep the monitor's GPU free?
+> `infer-stack config set skip_display_gpus true` (or `--skip-display-gpus` per
+> command) — then a second model has nowhere to go and `serve` fails fast.
+> `infer-stack leases` shows which GPU each model is on.
 
 ```bash
-infer-stack serve smol135-1 --include-display-gpus --require-generation --timeout 600
+infer-stack serve smol135-1 --require-generation --timeout 600
 infer-stack leases            # two live groups now — GPU 0 and GPU 1
 infer-stack test smol135-1    # confirm the new model serves
 ```
@@ -242,9 +243,9 @@ then `wait` for them together (so models load at once instead of back-to-back).
 Here we fan out a SmolLM2 and a Qwen endpoint so both lineages serve side by side:
 
 ```bash
-# two models -> two GPUs, so the second needs the display GPU (see note above)
-infer-stack serve smol17b-1 --no-wait --yes                        # SmolLM2 -> GPU 0
-infer-stack serve qwen15-1  --no-wait --yes --include-display-gpus  # Qwen -> GPU 1
+# two models -> two GPUs (GPU 1 is the display GPU, used by default; see note above)
+infer-stack serve smol17b-1 --no-wait --yes   # SmolLM2 -> GPU 0
+infer-stack serve qwen15-1  --no-wait --yes   # Qwen -> GPU 1
 infer-stack wait smol17b-1 qwen15-1 --require-generation --timeout 1200
 # (bare `infer-stack wait` waits for every live model)
 infer-stack test qwen15-1                       # confirm the Qwen endpoint serves

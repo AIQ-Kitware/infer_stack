@@ -104,15 +104,16 @@ class _AllowedGpusMixin(scfg.DataConfig):
 
 
 class _DisplayGpuMixin(scfg.DataConfig):
-    include_display_gpus = scfg.Value(
-        False,
+    skip_display_gpus = scfg.Value(
+        None,
         isflag=True,
-        alias=['include-display-gpus'],
+        alias=['skip-display-gpus'],
         help=(
-            'Allow placement onto display-attached GPUs. By default the '
-            'placer skips any GPU driving a display (so a desktop stays '
-            'responsive). Set this to use every GPU on a workstation whose '
-            'spare GPU happens to have a monitor plugged in.'
+            'Skip display-attached GPUs during placement, leaving the GPU '
+            'driving a monitor free. OFF by default — placement uses every '
+            'GPU, so single-GPU and workstation hosts work out of the box. '
+            'Opt in per-command with this flag, or persist it with '
+            '`infer-stack config set skip_display_gpus true`.'
         ),
     )
 

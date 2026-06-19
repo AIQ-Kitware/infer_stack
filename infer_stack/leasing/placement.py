@@ -50,12 +50,14 @@ def available_indices(
     *,
     allowed_gpus: list[int] | None = None,
     reserved: list[int] | tuple[int, ...] = (),
-    skip_display: bool = True,
+    skip_display: bool = False,
 ) -> list[int]:
     """The placeable GPU pool, in real-index order.
 
     Reuses the resolver's display-GPU handling, then applies the allow-list and
-    raw-GPU reservations.
+    raw-GPU reservations. ``skip_display`` defaults to *off* — every GPU is
+    placeable, so a single-GPU host (whose only GPU drives the display) works;
+    set it to leave a monitor's GPU free on a multi-GPU workstation.
     """
     indices = _available_gpu_indices(
         inventory, 'auto' if skip_display else False
@@ -101,7 +103,7 @@ def plan_placement(
     allowed_gpus: list[int] | None = None,
     reserved: list[int] | tuple[int, ...] = (),
     pinned: dict[str, list[int]] | None = None,
-    skip_display: bool = True,
+    skip_display: bool = False,
 ) -> GpuPlan:
     """Assign GPUs to every group, or record per-group placement errors.
 

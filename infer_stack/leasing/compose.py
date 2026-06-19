@@ -498,7 +498,7 @@ class ComposeBackend:
         allowed_gpus: list[int] | None = None,
         reserved: list[int] | tuple[int, ...] = (),
         project: str = LEASING_PROJECT,
-        skip_display: bool = True,
+        skip_display: bool = False,
         litellm: bool = True,
         ui: bool = True,
         require_generation: bool = False,

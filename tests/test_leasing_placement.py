@@ -70,8 +70,14 @@ def test_reserved_gpus_are_avoided():
     assert plan.assignments == {'a': [1], 'b': [2]}
 
 
-def test_display_gpu_skipped():
+def test_display_gpu_used_by_default():
+    # default is to use every GPU (so a single-GPU/display host works)
     plan = plan_placement([vllm('a')], inv(display=[0]))
+    assert plan.assignments == {'a': [0]}
+
+
+def test_display_gpu_skipped_when_opted_in():
+    plan = plan_placement([vllm('a')], inv(display=[0]), skip_display=True)
     assert plan.assignments == {'a': [1]}
 
 

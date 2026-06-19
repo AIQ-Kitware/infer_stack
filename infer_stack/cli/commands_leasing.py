@@ -117,6 +117,21 @@ def _resolve_ui(config) -> bool:
     return _coerce_bool(get_setting('ui'), True)
 
 
+def _resolve_skip_display(config) -> bool:
+    """Whether to skip display-attached GPUs during placement.
+
+    Off by default — placement uses every GPU, so a single-GPU host (where the
+    only GPU drives the display) works without ceremony. Opt in with the
+    ``--skip-display-gpus`` flag (wins) or `config set skip_display_gpus true`.
+    """
+    from ..paths import get_setting
+
+    flag = getattr(config, 'skip_display_gpus', None)
+    if flag is not None:
+        return bool(flag)
+    return _coerce_bool(get_setting('skip_display_gpus'), False)
+
+
 def _resolve_assume_yes(config, *, interactive: bool) -> bool:
     """Whether to apply compose changes without the diff prompt.
 
@@ -147,9 +162,7 @@ def _make_backend(config, *, interactive: bool = False):
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
-            skip_display=not bool(
-                getattr(config, 'include_display_gpus', False)
-            ),
+            skip_display=_resolve_skip_display(config),
             ui=_resolve_ui(config),
             require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
@@ -360,8 +373,8 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         ]
         lines.append(
             '  free a GPU first — `infer-stack leases` to see what holds them, '
-            'then `infer-stack release`/`evict`; or `--include-display-gpus` '
-            'to use a display-attached GPU.'
+            'then `infer-stack release`/`evict`. (Every GPU, including any '
+            'display-attached one, is used unless you set --skip-display-gpus.)'
         )
         raise SystemExit('\n'.join(lines))
     return _emit_acquire(config, controller, outcome)
