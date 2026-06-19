@@ -92,6 +92,26 @@ def test_tui_serve_from_catalog_creates_a_lease():
     assert 'qwen-coder' in leases[0].endpoints      # first row, sorted
 
 
+def test_tui_panes_are_keyboard_resizable():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            w0, h0 = app._sidebar_w, app._log_h
+            await pilot.press('right_square_bracket')   # wider sidebar
+            await pilot.press('minus')                  # shorter logs
+            await pilot.pause()
+            assert app._sidebar_w == w0 + 4
+            assert app._log_h == h0 - 2
+
+    _run(scenario)
+
+
 def test_tui_logs_stream_from_injected_source():
     from infer_stack.tui import InferStackTUI
 

@@ -22,12 +22,12 @@ from typing import Any, Callable, Iterable
 
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
-    Label,
     RichLog,
     Select,
     Static,
@@ -77,19 +77,40 @@ class InferStackTUI(App):
     TITLE = 'infer-stack'
     SUB_TITLE = 'leasing dashboard'
 
+    # Calm + roomy: quiet (round $surface) borders that only brighten to $accent
+    # on focus, generous padding, and margins between panes for breathing room.
     CSS = """
-    #body { height: 1fr; }
-    #sidebar { width: 36; border-right: solid $panel; }
+    Screen { layout: vertical; }
+
+    #summary { height: 1; padding: 0 2; color: $text-muted; }
+    #body { height: 1fr; padding: 0 1; }
+    #sidebar { width: 38; min-width: 28; }
     #main { width: 1fr; }
-    .pane-title { color: $accent; text-style: bold; padding: 0 1; }
-    #endpoints { height: 1fr; }
-    #models { height: 8; }
-    #leases { height: 7; }
-    #groups { height: 9; }
-    #logbar { height: 1; padding: 0 1; }
-    #logsvc { width: 32; }
-    #logs { height: 1fr; border-top: solid $panel; }
-    #status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+    #tables { height: 1fr; }
+
+    #endpoints, #models, #leases, #groups, #logbox {
+        border: round $surface;
+        background: $boost;
+        padding: 0 1;
+        margin: 0 0 1 0;
+        border-title-color: $text-muted;
+        border-title-align: left;
+    }
+    #endpoints:focus, #models:focus, #leases:focus, #groups:focus,
+    #logbox:focus-within {
+        border: round $accent;
+        border-title-color: $accent;
+    }
+
+    #endpoints { height: 1fr; min-height: 6; }
+    #models { height: 9; min-height: 5; }
+    #leases { height: 1fr; min-height: 4; }
+    #groups { height: 1fr; min-height: 4; }
+    #logbox { height: 16; min-height: 6; }
+    #logsvc { margin: 0 0 1 0; }
+    #logs { height: 1fr; background: $surface; }
+
+    #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
     """
 
     BINDINGS = [
@@ -100,6 +121,11 @@ class InferStackTUI(App):
         ('r', 'refresh', 'Refresh'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
+        Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
+        Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
+        Binding('minus', 'logs_shorter', 'logs -', show=False),
+        Binding('plus', 'logs_taller', 'logs +', show=False),
+        Binding('equals_sign', 'logs_taller', 'logs +', show=False),
     ]
 
     def __init__(
@@ -122,34 +148,47 @@ class InferStackTUI(App):
         self._log_service: str = ALL_SERVICES
         self._log_proc: Any = None
         self._log_lines: list[str] = []  # mirror of the log pane, for tests
+        self._sidebar_w = 38  # resizable via [ ]
+        self._log_h = 16      # resizable via - +
 
     # -- layout ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(show_clock=True)
+        yield Static('', id='summary')
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
-                yield Label('catalog · endpoints', classes='pane-title')
-                yield DataTable(id='endpoints', cursor_type='row')
-                yield Label('catalog · models', classes='pane-title')
-                yield DataTable(id='models', cursor_type='row')
+                yield DataTable(id='endpoints', cursor_type='row',
+                                zebra_stripes=True)
+                yield DataTable(id='models', cursor_type='row',
+                                zebra_stripes=True)
             with Vertical(id='main'):
-                yield Label('leases', classes='pane-title')
-                yield DataTable(id='leases', cursor_type='row')
-                yield Label('groups', classes='pane-title')
-                yield DataTable(id='groups', cursor_type='row')
-                with Horizontal(id='logbar'):
-                    yield Label('logs: ')
+                with Vertical(id='tables'):
+                    yield DataTable(id='leases', cursor_type='row',
+                                    zebra_stripes=True)
+                    yield DataTable(id='groups', cursor_type='row',
+                                    zebra_stripes=True)
+                with Vertical(id='logbox'):
                     yield Select(
                         [('(all services)', ALL_SERVICES)],
                         value=ALL_SERVICES, allow_blank=False, id='logsvc',
                     )
-                yield RichLog(id='logs', highlight=False, markup=False,
-                              max_lines=2000, wrap=False)
+                    yield RichLog(id='logs', highlight=False, markup=False,
+                                  max_lines=2000, wrap=False)
         yield Static('', id='status')
         yield Footer()
 
     def on_mount(self) -> None:
+        try:
+            self.theme = 'nord'  # a calm, muted palette
+        except Exception:  # noqa: BLE001
+            pass
+        titles = {
+            '#endpoints': 'catalog · endpoints', '#models': 'catalog · models',
+            '#leases': 'leases', '#groups': 'groups', '#logbox': 'logs',
+        }
+        for sel, title in titles.items():
+            self.query_one(sel).border_title = title
         self.query_one('#endpoints', DataTable).add_columns(
             'endpoint', 'model', 'engine', 'reclaim'
         )
@@ -160,14 +199,40 @@ class InferStackTUI(App):
         self.query_one('#groups', DataTable).add_columns(
             'id', 'engine', 'state', 'running', 'gpus', 'demand', 'served'
         )
+        self._apply_sizes()
         self._fill_catalog()
         self.action_refresh()
         self._restart_logs(self._log_service)
         self.set_interval(self.interval, self.action_refresh)
+        self._status(
+            'keys: s serve · d release · e evict · [ ] sidebar · - + logs'
+        )
         self.query_one('#endpoints', DataTable).focus()
 
     def on_unmount(self) -> None:
         self._terminate_logs()
+
+    # -- resizable panes ---------------------------------------------------
+
+    def _apply_sizes(self) -> None:
+        self.query_one('#sidebar').styles.width = self._sidebar_w
+        self.query_one('#logbox').styles.height = self._log_h
+
+    def action_sidebar_narrower(self) -> None:
+        self._sidebar_w = max(26, self._sidebar_w - 4)
+        self._apply_sizes()
+
+    def action_sidebar_wider(self) -> None:
+        self._sidebar_w = min(80, self._sidebar_w + 4)
+        self._apply_sizes()
+
+    def action_logs_shorter(self) -> None:
+        self._log_h = max(6, self._log_h - 2)
+        self._apply_sizes()
+
+    def action_logs_taller(self) -> None:
+        self._log_h = min(40, self._log_h + 2)
+        self._apply_sizes()
 
     # -- catalog -----------------------------------------------------------
 
@@ -200,7 +265,18 @@ class InferStackTUI(App):
             return
         self._fill_leases(leases)
         self._fill_groups(groups, observed, assignments)
+        self._update_summary(leases, groups, observed)
         self._sync_log_services()
+
+    def _update_summary(self, leases, groups, observed) -> None:
+        active = sum(1 for le in leases if str(le.state) == 'active')
+        running = sum(1 for g in groups if g.id in observed)
+        self.query_one('#summary', Static).update(
+            f'models {len(self.catalog.models)}   '
+            f'endpoints {len(self.catalog.endpoints)}   ·   '
+            f'leases {active} active / {len(leases)}   '
+            f'groups {running} running / {len(groups)}'
+        )
 
     def _fill_leases(self, leases) -> None:
         table = self.query_one('#leases', DataTable)
