@@ -189,10 +189,15 @@ def test_tui_panes_drag_resize():
         async with app.run_test() as pilot:
             await pilot.pause()
             w0, h0 = app._sidebar_w, app._log_h
+            m0, l0 = app._models_h, app._leases_h
             app._drag_sidebar(6)            # pull the vertical splitter right
             app._drag_logs(3)               # pull the horizontal splitter down
+            app._drag_models(2)             # catalog endpoints|models splitter
+            app._drag_leases(2)             # leases|deployments splitter
             assert app._sidebar_w == w0 + 6
             assert app._log_h == h0 - 3     # down = shorter logs
+            assert app._models_h == m0 + 2
+            assert app._leases_h == l0 + 2
 
     _run(scenario)
 
@@ -210,6 +215,9 @@ def test_tui_dividers_have_a_grab_area():
             # A 0-size divider can't be grabbed; both must span their cross-axis.
             assert app.query_one('#vsplit').region.height > 1
             assert app.query_one('#hsplit').region.width > 1
+            # the panes the user called out now have splitters too
+            assert app.query_one('#csplit').region.width > 1   # endpoints|models
+            assert app.query_one('#lsplit').region.width > 1   # leases|deploys
 
     _run(scenario)
 

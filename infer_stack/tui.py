@@ -352,8 +352,10 @@ class InferStackTUI(App):
     #vsplit:hover { background: $accent; }
     #main { width: 1fr; }
     #tables { height: 1fr; }
-    #hsplit { width: 1fr; height: 1; background: $panel; margin: 0 0 1 0; }
-    #hsplit:hover { background: $accent; }
+    #hsplit, #lsplit, #csplit {
+        width: 1fr; height: 1; background: $panel; margin: 0 0 1 0;
+    }
+    #hsplit:hover, #lsplit:hover, #csplit:hover { background: $accent; }
 
     /* one-line, per-pane descriptions (replaces the old global intro) */
     .desc { height: auto; color: $text-muted; padding: 0 1; }
@@ -392,8 +394,9 @@ class InferStackTUI(App):
     }
 
     #endpoints { height: 1fr; min-height: 5; }
-    #models { height: 8; min-height: 4; }
-    #leases-pane, #deployments-pane { height: 1fr; min-height: 6; }
+    #models { height: 8; min-height: 4; }   /* height set via _apply_sizes */
+    #leases-pane { min-height: 5; }          /* height set via _apply_sizes */
+    #deployments-pane { height: 1fr; min-height: 6; }
     #leases, #deployments { height: 1fr; }
     #docker-tabs { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
@@ -471,6 +474,8 @@ class InferStackTUI(App):
         self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
         self._log_h = 16      # resizable via - + or dragging #hsplit
+        self._models_h = 8    # resizable by dragging #csplit
+        self._leases_h = 12   # resizable by dragging #lsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
         self._collapsed = {'docker': False, 'system': True, 'api': True}
@@ -502,6 +507,7 @@ class InferStackTUI(App):
                     yield Button('▶  Serve', id='btn-serve', variant='primary')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
+                yield _Divider('y', self._drag_models, id='csplit')
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='model-actions'):
@@ -525,6 +531,7 @@ class InferStackTUI(App):
                             yield Button('Release', id='btn-release')
                             yield Button('Release all', id='btn-release-all')
                             yield Button('Clean up', id='btn-cleanup')
+                    yield _Divider('y', self._drag_leases, id='lsplit')
                     with Vertical(id='deployments-pane'):
                         yield Static(
                             'Running model deployments and the GPUs they hold. '
@@ -703,6 +710,8 @@ class InferStackTUI(App):
     def _apply_sizes(self) -> None:
         self.query_one('#sidebar').styles.width = self._sidebar_w
         self.query_one('#docker-tabs').styles.height = self._log_h
+        self.query_one('#models').styles.height = self._models_h
+        self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
         self._sidebar_w = max(24, min(100, self._sidebar_w + delta))
@@ -711,6 +720,16 @@ class InferStackTUI(App):
     def _drag_logs(self, delta: int) -> None:
         # Dragging the divider down (delta > 0) makes the docker pane shorter.
         self._log_h = max(6, min(60, self._log_h - delta))
+        self._apply_sizes()
+
+    def _drag_models(self, delta: int) -> None:
+        # Divider above the models table; drag down grows it (shrinks endpoints).
+        self._models_h = max(3, min(40, self._models_h + delta))
+        self._apply_sizes()
+
+    def _drag_leases(self, delta: int) -> None:
+        # Divider between leases and deployments; drag down grows leases.
+        self._leases_h = max(4, min(50, self._leases_h + delta))
         self._apply_sizes()
 
     def action_sidebar_narrower(self) -> None:

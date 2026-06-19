@@ -1712,3 +1712,37 @@ one remaining legacy-naming smell; flagged for a focused follow-up.
 Confident: every deletion was import-graph-driven and verified green. Next up is
 the TUI top-level-tabs reorg + catalog management (edit/remove, advanced
 endpoint params) + docker control + model cache, all on the clean base.
+
+## 2026-06-19 16:00:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). TUI feature sweep on the clean,
+post-legacy, final-vocabulary base.
+
+- Advanced endpoint wizard: exposed tensor-parallel / max-model-len / gpu-mem /
+  extra-args / reclaim (mirrors `catalog endpoint add`), plus Edit (blocked while
+  served) and Remove for endpoints + models with a confirm dialog. The
+  validating writer refuses removing a model still referenced by an endpoint.
+- Top-level tabs: wrapped the multipane in a TabbedContent → Dashboard +
+  Settings. Settings reads/writes settings.yaml (backend, data dir, Open WebUI,
+  reverse proxy, skip-display-GPUs). Key trick: extracted the dashboard body into
+  `_compose_dashboard()` and `yield from` it, so the big block kept its exact
+  indentation (no risky re-indent) — verified by the 26 existing tests staying
+  green after the wrap.
+- docker Control tab (compose up/down + compose-file path) driving the captured
+  runner so output lands in Logs. Models table gained quant + a cheap 'cached'
+  flag (existence check vs state.hf_cache/hub — no du).
+- Drag bars: added the two splitters Jon explicitly called out — endpoints|models
+  (#csplit) and leases|deployments (#lsplit) — reusing the fixed-height-neighbor
+  + 1fr-neighbor pattern (a divider that drags one pane's height while the other
+  flexes). All four splitters now grabbable.
+
+Remaining: (1) "every pane collapsible" — docker/system/api collapse;
+leases/deployments/endpoints/models are now drag-resizable instead (collapse +
+fixed-height-divider fight each other; drag covers the space-management need).
+Full per-pane collapse is a further polish. (2) The internal config.py dead-chain
+gut + old top-level catalog.py deletion (no CLI surface) — still deferred.
+
+229 tests green throughout; each TUI feature landed as its own committed,
+test-backed increment. Confidence high on the mechanics; the on-terminal feel
+(tab switching, drag ergonomics under tmux) remains the standing
+unverified-without-a-real-terminal caveat.
