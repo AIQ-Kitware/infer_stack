@@ -222,6 +222,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   - `Ledger.prune()` (+ `SqliteStore.prune()`): delete terminal ledger rows —
     RELEASED/EXPIRED leases and STOPPED groups (and their claims) — for callers
     that want to forget history rather than keep it inspectable.
+  - TUI — made the lease↔deployment (many-to-one) relationship legible: the
+    leases pane gained a **deployment** column (the group id(s) a lease holds —
+    the same id shown in the groups pane, so the join is visible), and the groups
+    pane now shows **leases** (how many hold it) + **held by** (their owners)
+    instead of the opaque "demand". Moving the cursor spells the link out in the
+    status bar ("lease … → deployment …" / "deployment … ← held by N lease(s)").
+    Action-bar buttons are compact (1 row).
   - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it
     (`--reverse-proxy`, or `config set reverse_proxy true`) to front the gateway
     + Open WebUI with one nginx origin — UI at `/`, the OpenAI API at `/v1` — so

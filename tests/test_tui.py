@@ -70,6 +70,40 @@ def test_tui_panes_list_catalog_leases_and_groups():
     _run(scenario)
 
 
+def test_tui_relationship_columns_link_lease_to_deployment():
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    out = controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    gid = out.lease.group_ids[0]
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            leases = app.query_one('#leases', DataTable)
+            groups = app.query_one('#groups', DataTable)
+            assert 'deployment' in [str(c.label) for c in leases.columns.values()]
+            glabels = [str(c.label) for c in groups.columns.values()]
+            assert 'leases' in glabels and 'held by' in glabels
+            # the lease row names the deployment id; the deployment row counts
+            # the lease (1) and shows the owner — the many-to-one join.
+            assert gid in leases.get_row_at(0)
+            assert '1' in groups.get_row_at(0)
+            assert 'alice' in groups.get_row_at(0)
+            # selecting a lease explains the link in the status bar
+            app.query_one('#leases').focus()
+            app.query_one('#leases', DataTable).move_cursor(row=0)
+            await pilot.pause()
+            status = str(app.query_one('#status').render())
+            assert 'deployment' in status
+
+    _run(scenario)
+
+
 def test_tui_serve_from_catalog_creates_a_lease():
     from infer_stack.leasing import LeaseState
     from infer_stack.tui import InferStackTUI

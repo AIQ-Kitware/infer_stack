@@ -276,6 +276,11 @@ class InferStackTUI(App):
     #lease-actions Button, #group-actions Button {
         margin: 0 1 0 0; min-width: 11;
     }
+    /* compact buttons: 1 row, no border box, so action bars don't eat space */
+    #endpoint-actions Button, #lease-actions Button, #group-actions Button,
+    #catalog-buttons Button, #api-controls Button {
+        height: 1; border: none; padding: 0 1;
+    }
 
     #endpoints, #models, #leases-pane, #groups-pane, #docker, #system, #api {
         border: round $surface;
@@ -356,6 +361,8 @@ class InferStackTUI(App):
         self._endpoint_names: list[str] = []
         self._lease_ids: list[str] = []
         self._group_ids: list[str] = []
+        self._last_leases: list[Any] = []   # row-aligned with the leases table
+        self._last_groups: list[Any] = []   # row-aligned with the groups table
         self._service_options: list[str] = []
         self._log_service: str = ALL_SERVICES
         self._log_proc: Any = None
@@ -394,8 +401,9 @@ class InferStackTUI(App):
                 with Vertical(id='tables'):
                     with Vertical(id='leases-pane'):
                         yield Static(
-                            'Active reservations protecting running models. '
-                            'Select one, then Release.', classes='desc',
+                            'Reservations you hold. Each maps to one deployment '
+                            'below (see the deployment column); many leases can '
+                            'share one. Select one → Release.', classes='desc',
                         )
                         yield DataTable(id='leases', cursor_type='row',
                                         zebra_stripes=True)
@@ -405,9 +413,10 @@ class InferStackTUI(App):
                             yield Button('Clean up', id='btn-cleanup')
                     with Vertical(id='groups-pane'):
                         yield Static(
-                            'Model deployments and the GPUs they hold. Evict an '
-                            'idle one to free its GPU; Clean up forgets stopped '
-                            'ones.', classes='desc',
+                            'Running model deployments and the GPUs they hold. '
+                            "The 'leases' column is how many leases hold each. "
+                            'Evict an idle one to free its GPU; Clean up forgets '
+                            'stopped ones.', classes='desc',
                         )
                         yield DataTable(id='groups', cursor_type='row',
                                         zebra_stripes=True)
@@ -474,10 +483,11 @@ class InferStackTUI(App):
         )
         self.query_one('#models', DataTable).add_columns('model', 'source')
         self.query_one('#leases', DataTable).add_columns(
-            'id', 'owner', 'state', 'ttl', 'endpoints'
+            'id', 'owner', 'state', 'ttl', 'endpoints', 'deployment'
         )
         self.query_one('#groups', DataTable).add_columns(
-            'id', 'engine', 'state', 'running', 'gpus', 'demand', 'served'
+            'id', 'engine', 'state', 'running', 'gpus', 'served',
+            'leases', 'held by'
         )
         self.query_one('#ps', DataTable).add_columns(
             'service', 'status (uptime)', 'created', 'container id', 'ports'
@@ -639,8 +649,12 @@ class InferStackTUI(App):
         if 'error' in data:
             self._status(f'refresh error: {data["error"]}')
             return
+        self._last_leases = data['leases']
+        self._last_groups = data['groups']
         self._fill_leases(data['leases'])
-        self._fill_groups(data['groups'], data['observed'], data['assignments'])
+        self._fill_groups(
+            data['groups'], data['observed'], data['assignments'], data['leases']
+        )
         if 'ps' in data:
             self._fill_ps(data['ps'])
         if 'gpus' in data:
@@ -686,24 +700,34 @@ class InferStackTUI(App):
         table.clear()
         self._lease_ids = []
         for le in leases:
+            # The 'deployment' column is the join key: it lists the same group
+            # id(s) shown in the groups pane, so lease -> deployment is visible.
             table.add_row(
                 le.id, le.owner, str(le.state), _lease_ttl(le),
                 ','.join(le.endpoints) or '-',
+                ','.join(le.group_ids) or '-',
             )
             self._lease_ids.append(le.id)
         self._restore_cursor(table, cursor)
 
-    def _fill_groups(self, groups, observed, assignments) -> None:
+    def _fill_groups(self, groups, observed, assignments, leases) -> None:
         table = self.query_one('#groups', DataTable)
         cursor = table.cursor_row
         table.clear()
         self._group_ids = []
+        # owners of the active leases holding each group (the "many" side)
+        owners: dict[str, list[str]] = {}
+        for le in leases:
+            if le.state == LeaseState.ACTIVE:
+                for gid in le.group_ids:
+                    owners.setdefault(gid, []).append(le.owner)
         for g in groups:
             table.add_row(
                 g.id, g.engine, str(g.state),
                 _running_label(g.id, observed),
                 _gpu_label(g.id, observed, assignments),
-                str(g.demand), ','.join(sorted(g.served)) or '-',
+                ','.join(sorted(g.served)) or '-',
+                str(g.demand), ','.join(owners.get(g.id, [])) or '-',
             )
             self._group_ids.append(g.id)
         self._restore_cursor(table, cursor)
@@ -967,6 +991,31 @@ class InferStackTUI(App):
         # Enter on the endpoints table serves that endpoint.
         if event.data_table.id == 'endpoints':
             self.action_serve()
+
+    def on_data_table_row_highlighted(
+        self, event: DataTable.RowHighlighted
+    ) -> None:
+        # Spell out the many-to-one link in the status bar as you move the
+        # cursor: a lease points at one deployment; a deployment is held by many.
+        tid = event.data_table.id
+        row = event.cursor_row
+        if tid == 'leases' and 0 <= row < len(self._last_leases):
+            le = self._last_leases[row]
+            deps = ', '.join(le.group_ids) or '—'
+            held = {g.id: g.demand for g in self._last_groups}
+            n = max((held.get(gid, 0) for gid in le.group_ids), default=0)
+            others = f' (1 of {n} lease(s) on it)' if n > 1 else ''
+            self._status(f'lease {le.id} → deployment {deps}{others}')
+        elif tid == 'groups' and 0 <= row < len(self._last_groups):
+            g = self._last_groups[row]
+            owners = [
+                le.owner for le in self._last_leases
+                if g.id in le.group_ids and le.state == LeaseState.ACTIVE
+            ]
+            who = ', '.join(owners) or '—'
+            self._status(
+                f'deployment {g.id} ← held by {g.demand} lease(s): {who}'
+            )
 
     def on_click(self, event: events.Click) -> None:
         # Ctrl+click a served endpoint -> open it in Open WebUI.
