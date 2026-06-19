@@ -17,6 +17,49 @@ def test_config_init_yes_is_noninteractive(tmp_path, monkeypatch):
     assert settings['data_dir'] == str(tmp_path / 's')
 
 
+def test_config_init_announces_new_then_editing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigInitCLI
+    from infer_stack.paths import set_data_root
+
+    set_data_root(None)
+    ConfigInitCLI.main(argv=['--yes', '--backend', 'compose'])
+    assert 'from scratch' in capsys.readouterr().out          # first run = new
+    ConfigInitCLI.main(argv=['--yes', '--backend', 'compose'])
+    out = capsys.readouterr().out                              # second = editing
+    assert 'editing the existing config' in out
+    assert 'config edit' in out
+
+
+def test_config_init_preserves_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigInitCLI, ConfigSetCLI
+    from infer_stack.paths import load_settings, set_data_root
+
+    set_data_root(None)
+    ConfigInitCLI.main(argv=['--yes', '--backend', 'compose'])
+    ConfigSetCLI.main(argv=['ui', 'false'])                    # an unrelated key
+    ConfigInitCLI.main(argv=['--yes', '--backend', 'null'])    # re-init in place
+    settings = load_settings()
+    assert settings['ui'] is False                            # preserved
+    assert settings['backend'] == 'null'
+
+
+def test_config_init_fresh_discards_other_settings(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigInitCLI, ConfigSetCLI
+    from infer_stack.paths import load_settings, set_data_root
+
+    set_data_root(None)
+    ConfigInitCLI.main(argv=['--yes', '--backend', 'compose'])
+    ConfigSetCLI.main(argv=['ui', 'false'])
+    ConfigInitCLI.main(argv=['--yes', '--fresh', '--backend', 'compose'])
+    assert 'starting fresh' in capsys.readouterr().out
+    settings = load_settings()
+    assert 'ui' not in settings                               # discarded
+    assert settings['backend'] == 'compose'
+
+
 def test_config_set_get_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
     from infer_stack.cli.commands_meta import ConfigGetCLI, ConfigSetCLI

@@ -163,6 +163,29 @@ def test_dry_run_does_not_write(tmp_path, capsys):
     assert 'm' not in cat.models                 # but not persisted
 
 
+def test_endpoint_show_no_name_lists_all(tmp_path, capsys):
+    from infer_stack.cli.commands_catalog import EndpointShowCLI
+
+    ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['e1', '--engine', 'vllm', '--model', 'm',
+                              *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['e2', '--engine', 'vllm', '--model', 'm',
+                              *_opts(tmp_path)])
+    capsys.readouterr()
+    # no NAME -> show every endpoint (not "endpoint 'None' not found")
+    assert EndpointShowCLI.main(argv=_opts(tmp_path)) == 0
+    shown = yaml.safe_load(capsys.readouterr().out)['endpoints']
+    assert set(shown) == {'e1', 'e2'}
+    # a real name still shows just that one
+    capsys.readouterr()
+    EndpointShowCLI.main(argv=['e1', *_opts(tmp_path)])
+    assert set(yaml.safe_load(capsys.readouterr().out)) == {'e1'}
+    # an unknown name errors and lists what's available
+    with pytest.raises(SystemExit) as exc:
+        EndpointShowCLI.main(argv=['ghost', *_opts(tmp_path)])
+    assert 'have: e1, e2' in str(exc.value)
+
+
 def test_show_piped_output_is_plain(tmp_path, capsys):
     # Under capsys stdout is not a tty -> no ANSI escapes leak into pipes.
     from infer_stack.cli.commands_catalog import CatalogShowCLI

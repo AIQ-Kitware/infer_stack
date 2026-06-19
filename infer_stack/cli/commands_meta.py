@@ -342,18 +342,28 @@ KNOWN_SETTINGS = {
 
 
 class ConfigInitCLI(_PathOverridesMixin):
-    """Set up the durable settings (data dir + default backend), interactively.
+    """Set up the durable settings (data dir + default backend).
 
-    Prompts for each setting and shows them for confirmation before writing
-    (like ``aivm``). Use ``--yes`` for non-interactive scripting (accepts the
-    provided flags / current values / defaults without prompting); the same
-    non-interactive path is taken automatically when stdin is not a TTY.
+    Prompts for each setting and shows them for confirmation before writing. Use
+    ``--yes`` for non-interactive scripting (accepts the provided flags /
+    current values / defaults without prompting); the same non-interactive path
+    is taken automatically when stdin is not a TTY.
+
+    Re-running edits the existing config in place — it keeps your other settings
+    and just re-confirms the data dir and backend (or hand-edit the file with
+    ``infer-stack config edit``). Pass ``--fresh`` to discard the existing config
+    and start from defaults.
     """
 
     __command__ = 'init'
     yes = scfg.Value(
         False, isflag=True, alias=['y'],
         help='Non-interactive: write without prompting/confirming.',
+    )
+    fresh = scfg.Value(
+        False, isflag=True,
+        help='Start over: ignore any existing config and write a clean one from '
+        'defaults (discards other persisted settings too).',
     )
     backend = scfg.Value(
         None, choices=['compose', 'kubeai', 'null'],
@@ -373,13 +383,26 @@ class ConfigInitCLI(_PathOverridesMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        settings = load_settings()
         path = settings_path()
+        existing = load_settings()
 
+        # Tell the user, every time, which mode this is (and how else to edit).
+        if config.fresh and existing:
+            print(f'config init: starting fresh — replacing the config at {path}')
+        elif existing:
+            print(f'config init: editing the existing config at {path} '
+                  '(or hand-edit it with `infer-stack config edit`)')
+        else:
+            print(f'config init: initializing a new config from scratch ({path})')
+
+        # On --fresh, ignore the old file entirely (clean slate); otherwise keep
+        # other settings and seed the proposals from the current values.
+        base: dict = {} if config.fresh else dict(existing)
+        seed: dict = {} if config.fresh else existing
         # Proposed values: explicit flag > current setting > sensible default.
         # data_root() already resolves --data-dir override / $env / setting / XDG.
-        data_dir = config.data_dir or settings.get('data_dir') or str(data_root())
-        backend = config.backend or settings.get('backend') or 'compose'
+        data_dir = config.data_dir or seed.get('data_dir') or str(data_root())
+        backend = config.backend or seed.get('backend') or 'compose'
 
         interactive = (
             not config.yes and sys.stdin.isatty() and sys.stdout.isatty()
@@ -390,7 +413,6 @@ class ConfigInitCLI(_PathOverridesMixin):
             from rich.table import Table
 
             console = Console()
-            console.print('[bold]infer-stack config init[/]\n')
             data_dir = Prompt.ask(
                 'Data dir (docker-mounted weight/state)', default=data_dir
             )
@@ -409,9 +431,9 @@ class ConfigInitCLI(_PathOverridesMixin):
                 console.print('[yellow]aborted — nothing written[/]')
                 return 0
 
-        settings['data_dir'] = data_dir
-        settings['backend'] = backend
-        save_settings(settings)
+        base['data_dir'] = data_dir
+        base['backend'] = backend
+        save_settings(base)
         print(f'wrote settings -> {path}')
         print('next: `infer-stack catalog init` to add models/endpoints')
         return 0

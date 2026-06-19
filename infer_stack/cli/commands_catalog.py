@@ -154,9 +154,19 @@ def _list(config, section) -> int:
 
 def _show(config, section, name) -> int:
     data = _load_raw(_catalog_path(config))
-    if name not in data[section]:
-        raise SystemExit(f"{section[:-1]} '{name}' not found")
-    _print_yaml(yaml.safe_dump({name: data[section][name]}, sort_keys=False))
+    entries = data.get(section) or {}
+    # No name -> show every entry in the section (the whole `endpoints:` block),
+    # rather than erroring on a `None` lookup.
+    if name is None:
+        if not entries:
+            print(f'(no {section})')
+            return 0
+        _print_yaml(yaml.safe_dump({section: entries}, sort_keys=False))
+        return 0
+    if name not in entries:
+        have = f" (have: {', '.join(sorted(entries))})" if entries else ''
+        raise SystemExit(f"{section[:-1]} '{name}' not found{have}")
+    _print_yaml(yaml.safe_dump({name: entries[name]}, sort_keys=False))
     return 0
 
 
@@ -332,10 +342,11 @@ class ModelListCLI(_PathOverridesMixin):
 
 
 class ModelShowCLI(_PathOverridesMixin):
-    """Show one model entry."""
+    """Show a model entry, or all of them when no NAME is given."""
     __command__ = 'show'
     catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str)
+    name = scfg.Value(None, position=1, type=str,
+                      help='Model name; omit to show every model.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -472,10 +483,11 @@ class EndpointListCLI(_PathOverridesMixin):
 
 
 class EndpointShowCLI(_PathOverridesMixin):
-    """Show one endpoint entry."""
+    """Show an endpoint entry, or all of them when no NAME is given."""
     __command__ = 'show'
     catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str)
+    name = scfg.Value(None, position=1, type=str,
+                      help='Endpoint name; omit to show every endpoint.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
