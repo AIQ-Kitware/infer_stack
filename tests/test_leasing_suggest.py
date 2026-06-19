@@ -19,10 +19,28 @@ def _gpu(index, mem, name='GPU', display=False):
 def test_builtin_pool_is_nonempty_and_real():
     pool = builtin_pool()
     assert pool, 'the shipped suggestion pool should not be empty'
-    # the speculative legacy fixtures (Qwen3.5/3.6, Gemma4) were dropped
-    assert not any(m.family in {'qwen3.5', 'qwen3.6', 'gemma4'} for m in pool.values())
+    # the current-generation families (real, released 2026) are carried over
+    families = {m.family for m in pool.values()}
+    assert {'qwen3.5', 'qwen3.6', 'gemma4'} <= families
+    # ...with the real Hugging Face ids, not slugs
+    assert pool['qwen3.5-9b'].hf_model_id == 'Qwen/Qwen3.5-9B'
+    assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
+
+
+def test_rtx_3090_suggests_the_current_gen_models_that_fit():
+    # A single 24 GiB RTX 3090: the current-gen models that fit a 24 GiB card
+    # should be suggested; the ones needing a bigger/second GPU should not.
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
+    models = suggest_catalog(inv)['models']
+    fits = {'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
+            'qwen3.6-35b-a3b-fp8', 'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b',
+            'gemma4-31b'}
+    too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
+               'qwen3.6-35b-a3b'}  # 35b-a3b needs 2 GPUs even at 24 GiB each
+    assert fits <= set(models)
+    assert too_big.isdisjoint(models)
 
 
 def test_fits_on_respects_vram_and_gpu_count():
