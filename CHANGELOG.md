@@ -4,6 +4,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Version 0.7.0] - Unreleased
 
+### Added
+* TUI catalog management — the add-endpoint wizard now exposes the runtime knobs
+  that matter for serving (**tensor-parallel size, max model len, GPU memory
+  fraction, raw extra vLLM args** — where data-parallel etc. go — and the
+  **reclaim policy**), mirroring `catalog endpoint add`. You can **edit** an
+  endpoint (blocked while it's actively served) and **remove** an endpoint or
+  model (with a confirm dialog; a model still referenced by an endpoint is
+  refused by the validating writer). CLI parity already exists via
+  `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
+
 ### Removed (breaking)
 * Removed the pre-leasing **profile world** now superseded by catalog + leasing
   (no back-compat — pre-release): the entire `infer-stack legacy …` command

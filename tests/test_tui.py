@@ -294,6 +294,97 @@ def test_tui_add_model_wizard_writes_catalog(tmp_path):
     assert on_disk['models']['newmod']['source'] == 'hf://org/NewModel'
 
 
+def test_tui_endpoint_entry_builds_runtime_from_advanced_params():
+    from infer_stack.tui import InferStackTUI
+
+    entry = InferStackTUI._endpoint_entry({
+        'model': 'qc', 'engine': 'vllm',
+        'tensor_parallel': 2, 'max_model_len': 8192, 'gpu_mem': 0.4,
+        'extra_args': '--dtype=half --enforce-eager', 'reclaim': 'keep-warm',
+    })
+    assert entry['runtime']['tensor_parallel_size'] == 2
+    assert entry['runtime']['max_model_len'] == 8192
+    assert entry['runtime']['gpu_memory_utilization'] == 0.4
+    assert entry['runtime']['extra_args'] == ['--dtype=half', '--enforce-eager']
+    assert entry['reclaim'] == {'policy': 'keep-warm'}
+
+
+def test_tui_add_endpoint_writes_advanced_params(tmp_path):
+    import yaml
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._on_add_endpoint({
+                'name': 'big', 'model': 'qc', 'engine': 'vllm',
+                'tensor_parallel': 2, 'max_model_len': None, 'gpu_mem': None,
+                'extra_args': '', 'reclaim': '',
+            })
+            await pilot.pause()
+
+    _run(scenario)
+    on_disk = yaml.safe_load(catalog_path.read_text())
+    assert on_disk['endpoints']['big']['runtime']['tensor_parallel_size'] == 2
+
+
+def test_tui_edit_blocked_while_served(tmp_path):
+    import yaml
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    controller.acquire('me', catalog.resolve_names(['qwen-coder']))  # serve it
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#endpoints', DataTable).move_cursor(row=0)  # qwen-coder
+            app.action_edit_endpoint()
+            await pilot.pause()
+            assert 'served' in str(app.query_one('#status').render())
+
+    _run(scenario)
+
+
+def test_tui_remove_endpoint_writes_catalog(tmp_path):
+    import yaml
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._do_remove('endpoints', 'qwen-fast')   # confirm bypassed
+            await pilot.pause()
+            assert 'qwen-fast' not in app.catalog.endpoints
+
+    _run(scenario)
+    on_disk = yaml.safe_load(catalog_path.read_text())
+    assert 'qwen-fast' not in on_disk['endpoints']
+
+
 def test_tui_empty_catalog_shows_suggest_hint():
     from textual.widgets import Static
 

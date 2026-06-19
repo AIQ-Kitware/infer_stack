@@ -185,12 +185,18 @@ class _AddModelScreen(ModalScreen):
 
 
 class _AddEndpointScreen(ModalScreen):
-    """Wizard: add an endpoint (the served API name clients ask for)."""
+    """Wizard: add or edit an endpoint (the served API name clients ask for).
+
+    Exposes the runtime knobs that matter for serving — tensor-parallel size,
+    max model length, GPU memory fraction, raw extra vLLM args (where data
+    parallelism etc. go), and the reclaim policy — mirroring
+    ``catalog endpoint add``. Pass ``entry``/``name`` to edit an existing one.
+    """
 
     CSS = """
     _AddEndpointScreen { align: center middle; }
     #dialog {
-        width: 70; height: auto; padding: 1 2;
+        width: 78; height: auto; padding: 1 2;
         border: round $accent; background: $surface;
     }
     #dialog .hint { color: $text-muted; margin: 0 0 1 0; }
@@ -199,34 +205,75 @@ class _AddEndpointScreen(ModalScreen):
     #dialog Button { margin: 0 0 0 2; }
     """
 
-    def __init__(self, models: list[str]):
+    def __init__(self, models: list[str], *, name: str | None = None,
+                 entry: dict | None = None):
         super().__init__()
         self._models = models
+        self._edit_name = name
+        self._entry = entry or {}
+
+    def _rt(self, key, default=''):
+        val = (self._entry.get('runtime') or {}).get(key)
+        return '' if val is None else str(val)
 
     def compose(self) -> ComposeResult:
+        editing = self._edit_name is not None
+        runtime = self._entry.get('runtime') or {}
+        extra = runtime.get('extra_args') or []
+        extra_str = ' '.join(extra) if isinstance(extra, list) else str(extra)
+        reclaim = (self._entry.get('reclaim') or {}).get('policy', '')
+        cur_model = self._entry.get('model')
+        cur_engine = self._entry.get('engine', 'vllm')
         with Vertical(id='dialog'):
-            yield Label('Add an endpoint', classes='title')
+            yield Label('Edit endpoint' if editing else 'Add an endpoint',
+                        classes='title')
             yield Static(
-                'An endpoint is the served name (what Open WebUI shows and what '
-                'clients request). It binds a model to an engine.',
-                classes='hint',
+                'The served name clients/Open WebUI request. Binds a model to an '
+                'engine; the runtime knobs size it on the GPU(s).', classes='hint',
             )
             yield Input(
+                value=self._edit_name or '',
                 placeholder='name  (optional — defaults to <model>-N)',
-                id='e-name',
+                id='e-name', disabled=editing,
             )
             model_opts = [(m, m) for m in self._models]
             if model_opts:
-                yield Select(model_opts, prompt='model…', id='e-model')
+                yield Select(model_opts, prompt='model…', id='e-model',
+                             value=cur_model if cur_model in self._models
+                             else Select.NULL)
             else:
-                yield Input(placeholder='model name', id='e-model-text')
+                yield Input(value=cur_model or '', placeholder='model name',
+                            id='e-model-text')
             yield Select(
                 [('vllm', 'vllm'), ('ollama', 'ollama')],
-                value='vllm', allow_blank=False, id='e-engine',
+                value=cur_engine, allow_blank=False, id='e-engine',
+            )
+            yield Input(value=self._rt('tensor_parallel_size'),
+                        placeholder='tensor-parallel size  (int, optional)',
+                        id='e-tp')
+            yield Input(value=self._rt('max_model_len'),
+                        placeholder='max model len  (int, optional)',
+                        id='e-mml')
+            yield Input(value=self._rt('gpu_memory_utilization'),
+                        placeholder='gpu memory util 0-1  (float, optional)',
+                        id='e-gpu')
+            yield Input(value=extra_str,
+                        placeholder="extra vLLM args  (e.g. --dtype=half "
+                        "--data-parallel-size 2)", id='e-extra')
+            yield Select(
+                [('reclaim: default', ''), ('keep-warm', 'keep-warm'),
+                 ('stop', 'stop'), ('scale-to-zero', 'scale-to-zero')],
+                value=reclaim or '', allow_blank=False, id='e-reclaim',
             )
             with Horizontal():
                 yield Button('Cancel', id='cancel')
-                yield Button('Add endpoint', variant='primary', id='ok')
+                yield Button('Save' if editing else 'Add endpoint',
+                             variant='primary', id='ok')
+
+    @staticmethod
+    def _num(raw: str, cast):
+        raw = raw.strip()
+        return cast(raw) if raw else None
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == 'cancel':
@@ -241,8 +288,53 @@ class _AddEndpointScreen(ModalScreen):
         if not model:
             self.query_one(Label).update('pick (or type) a model')
             return
-        engine = str(self.query_one('#e-engine', Select).value or 'vllm')
-        self.dismiss({'name': name or None, 'model': model, 'engine': engine})
+        try:
+            result = {
+                'name': self._edit_name or name or None,
+                'model': model,
+                'engine': str(self.query_one('#e-engine', Select).value or 'vllm'),
+                'tensor_parallel': self._num(
+                    self.query_one('#e-tp', Input).value, int),
+                'max_model_len': self._num(
+                    self.query_one('#e-mml', Input).value, int),
+                'gpu_mem': self._num(
+                    self.query_one('#e-gpu', Input).value, float),
+                'extra_args': self.query_one('#e-extra', Input).value.strip(),
+                'reclaim': str(self.query_one('#e-reclaim', Select).value or ''),
+            }
+        except ValueError:
+            self.query_one(Label).update(
+                'tensor-parallel / max-len must be ints, gpu-mem a float')
+            return
+        self.dismiss(result)
+
+
+class _ConfirmScreen(ModalScreen):
+    """A small yes/no confirmation for destructive actions."""
+
+    CSS = """
+    _ConfirmScreen { align: center middle; }
+    #dialog {
+        width: 64; height: auto; padding: 1 2;
+        border: round $error; background: $surface;
+    }
+    #dialog Horizontal { height: auto; align-horizontal: right; }
+    #dialog Button { margin: 0 0 0 2; }
+    """
+
+    def __init__(self, message: str):
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='dialog'):
+            yield Label(self._message)
+            with Horizontal():
+                yield Button('Cancel', id='cancel')
+                yield Button('Remove', variant='error', id='ok')
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == 'ok')
 
 
 class InferStackTUI(App):
@@ -269,16 +361,16 @@ class InferStackTUI(App):
 
     #catalog-buttons { height: auto; }
     #catalog-buttons Button { width: 1fr; margin: 1 0 0 0; }
-    #endpoint-actions, #lease-actions, #deployment-actions {
+    #endpoint-actions, #lease-actions, #deployment-actions, #model-actions {
         height: auto; margin: 0 0 1 0;
     }
-    #endpoint-actions Button { width: 1fr; }
+    #endpoint-actions Button, #model-actions Button { width: 1fr; }
     #lease-actions Button, #deployment-actions Button {
         margin: 0 1 0 0; min-width: 11;
     }
     /* compact buttons: 1 row, no border box, so action bars don't eat space */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
-    #catalog-buttons Button, #api-controls Button {
+    #model-actions Button, #catalog-buttons Button, #api-controls Button {
         height: 1; border: none; padding: 0 1;
     }
 
@@ -359,6 +451,7 @@ class InferStackTUI(App):
         self._http = http
         self._proc_factory = proc_factory or self._default_proc_factory()
         self._endpoint_names: list[str] = []
+        self._model_names: list[str] = []
         self._lease_ids: list[str] = []
         self._deployment_ids: list[str] = []
         self._last_leases: list[Any] = []   # row-aligned with the leases table
@@ -390,8 +483,12 @@ class InferStackTUI(App):
                                 zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
                     yield Button('▶  Serve', id='btn-serve', variant='primary')
+                    yield Button('Edit', id='btn-edit-endpoint')
+                    yield Button('Remove', id='btn-remove-endpoint')
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
+                with Horizontal(id='model-actions'):
+                    yield Button('Remove model', id='btn-remove-model')
                 with Vertical(id='catalog-buttons'):
                     yield Button('✨  Suggest from my GPUs', id='btn-suggest')
                     yield Button('＋  Add model', id='btn-add-model')
@@ -578,8 +675,10 @@ class InferStackTUI(App):
             self._endpoint_names.append(name)
         models = self.query_one('#models', DataTable)
         models.clear()
+        self._model_names = []
         for name in sorted(self.catalog.models):
             models.add_row(name, getattr(self.catalog.models[name], 'source', ''))
+            self._model_names.append(name)
         self._update_catalog_help()
 
     def _sync_api_models(self, names: list[str]) -> None:
@@ -1043,6 +1142,9 @@ class InferStackTUI(App):
             'btn-suggest': self.action_suggest,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
+            'btn-edit-endpoint': self.action_edit_endpoint,
+            'btn-remove-endpoint': self.action_remove_endpoint,
+            'btn-remove-model': self.action_remove_model,
             'btn-api-send': self.action_api_send,
             'btn-api-test-all': self.action_api_test_all,
         }
@@ -1143,6 +1245,46 @@ class InferStackTUI(App):
             _AddEndpointScreen(sorted(self.catalog.models)), self._on_add_endpoint
         )
 
+    def action_edit_endpoint(self) -> None:
+        name = self._selected('endpoints', self._endpoint_names)
+        if not name:
+            self._status('select an endpoint to edit')
+            return
+        if not self.catalog_path:
+            self._status('no catalog path — launch the TUI with a catalog to edit')
+            return
+        if name in self._served_endpoints():
+            self._status(f'{name} is actively served — release it before editing')
+            return
+        from .cli.commands_catalog import _load_raw
+        entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
+        self.push_screen(
+            _AddEndpointScreen(sorted(self.catalog.models), name=name, entry=entry),
+            self._on_add_endpoint,
+        )
+
+    @staticmethod
+    def _endpoint_entry(result: dict) -> dict:
+        """Build a catalog endpoint entry from a wizard result (mirrors the CLI)."""
+        import shlex
+
+        entry: dict[str, Any] = {'engine': result['engine'],
+                                 'model': result['model']}
+        runtime: dict[str, Any] = {}
+        if result.get('max_model_len') is not None:
+            runtime['max_model_len'] = result['max_model_len']
+        if result.get('gpu_mem') is not None:
+            runtime['gpu_memory_utilization'] = result['gpu_mem']
+        if result.get('tensor_parallel') is not None:
+            runtime['tensor_parallel_size'] = result['tensor_parallel']
+        if result.get('extra_args'):
+            runtime['extra_args'] = shlex.split(result['extra_args'])
+        if runtime:
+            entry['runtime'] = runtime
+        if result.get('reclaim'):
+            entry['reclaim'] = {'policy': result['reclaim']}
+        return entry
+
     def _on_add_endpoint(self, result: dict | None) -> None:
         if not result:
             return
@@ -1158,11 +1300,46 @@ class InferStackTUI(App):
                 name = _next_indexed_name(
                     data['endpoints'], _slug_alias(result['model'])
                 )
-            entry = {'engine': result['engine'], 'model': result['model']}
-            self._write_catalog('endpoints', name, entry)
-            self._status(f'added endpoint {name} -> {result["model"]}')
+            self._write_catalog('endpoints', name, self._endpoint_entry(result))
+            self._status(f'saved endpoint {name} -> {result["model"]}')
         except Exception as ex:  # noqa: BLE001
-            self._status(f'add endpoint failed: {ex}')
+            self._status(f'save endpoint failed: {ex}')
+            return
+        self._reload_catalog()
+
+    def action_remove_endpoint(self) -> None:
+        name = self._selected('endpoints', self._endpoint_names)
+        if not name or not self.catalog_path:
+            self._status('select an endpoint to remove')
+            return
+        if name in self._served_endpoints():
+            self._status(f'{name} is actively served — release it before removing')
+            return
+        self.push_screen(
+            _ConfirmScreen(f"Remove endpoint '{name}' from the catalog?"),
+            lambda ok: self._do_remove('endpoints', name) if ok else None,
+        )
+
+    def action_remove_model(self) -> None:
+        name = self._selected('models', self._model_names)
+        if not name or not self.catalog_path:
+            self._status('select a model to remove')
+            return
+        self.push_screen(
+            _ConfirmScreen(f"Remove model '{name}'? (endpoints using it will "
+                           'block the write)'),
+            lambda ok: self._do_remove('models', name) if ok else None,
+        )
+
+    def _do_remove(self, section: str, name: str) -> None:
+        try:
+            from .cli.commands_catalog import _load_raw, _save_raw
+            data = _load_raw(self.catalog_path)
+            data[section].pop(name, None)
+            _save_raw(self.catalog_path, data)  # validates cross-refs
+            self._status(f'removed {section[:-1]} {name}')
+        except Exception as ex:  # noqa: BLE001
+            self._status(f'remove failed: {ex}')
             return
         self._reload_catalog()
 
