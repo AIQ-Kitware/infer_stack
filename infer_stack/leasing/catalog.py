@@ -255,6 +255,51 @@ class Catalog:
 
     # -- resolution --------------------------------------------------------
 
+    def _unknown_endpoint_error(self, name: str) -> CatalogError:
+        """A helpful error for a name that isn't an endpoint.
+
+        You serve/acquire *endpoints*, not models — a common slip is to pass a
+        model name (``qwen05``) instead of one of its endpoints (``qwen05-1``).
+        Recognize that case and point at the endpoints that run the model;
+        otherwise fall back to a did-you-mean over the known endpoints/bundles.
+        """
+        if name in self.models:
+            serving = sorted(
+                n for n, ep in self.endpoints.items() if ep.model == name
+            )
+            if serving:
+                return CatalogError(
+                    f"'{name}' is a model, not an endpoint — you serve an "
+                    f"endpoint that runs it. Endpoints for '{name}': "
+                    f"{', '.join(serving)}  (e.g. `infer-stack serve "
+                    f"{serving[0]}`)."
+                )
+            return CatalogError(
+                f"'{name}' is a model with no endpoints yet — add one with "
+                f"`infer-stack catalog endpoint add --model {name}` "
+                f"(it defaults to the endpoint name '{name}-1')."
+            )
+
+        import difflib
+
+        pool = list(self.endpoints) + list(self.bundles)
+        close = difflib.get_close_matches(name, pool, n=3, cutoff=0.6)
+        if close:
+            return CatalogError(
+                f"unknown endpoint '{name}' — did you mean: "
+                f"{', '.join(close)}?"
+            )
+        if self.endpoints:
+            return CatalogError(
+                f"unknown endpoint '{name}'. Available endpoints: "
+                f"{', '.join(sorted(self.endpoints))}  "
+                f"(`infer-stack catalog show` for details)."
+            )
+        return CatalogError(
+            f"unknown endpoint '{name}' — the catalog has no endpoints yet "
+            f"(add one with `infer-stack catalog endpoint add …`)."
+        )
+
     def resolve_endpoint(
         self, name: str, *, sharing: str | None = None
     ) -> EndpointRequest:
@@ -264,7 +309,7 @@ class Catalog:
         ``--dedicated`` flag) when given.
         """
         if name not in self.endpoints:
-            raise CatalogError(f"unknown endpoint '{name}'")
+            raise self._unknown_endpoint_error(name)
         ep = self.endpoints[name]
         share = sharing or ep.sharing
         if ep.engine == VLLM:

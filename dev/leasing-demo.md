@@ -219,9 +219,17 @@ The gateway stays put; add or drop models freely and Open WebUI's picker
 follows. Bring the small model up alongside the big one — each is addressable by
 its own name:
 
+> **One model per GPU — and yardrat's second GPU is the display one.** Placement
+> is whole-GPU: each model lands on its own GPU, and `--gpu-mem` is only vLLM's
+> reservation *within* that GPU, not a knob to pack two models onto one. So the
+> first model takes GPU 0; the second needs GPU 1 — which is display-attached and
+> **skipped by default**. Pass `--include-display-gpus` to let the second model
+> use it (otherwise it can't place and `serve` fails fast with "need 1 GPUs but
+> only 0 available"). `infer-stack leases` shows which GPU each model is on.
+
 ```bash
-infer-stack serve smol135-1 --require-generation --timeout 600
-infer-stack leases            # two live groups now
+infer-stack serve smol135-1 --include-display-gpus --require-generation --timeout 600
+infer-stack leases            # two live groups now — GPU 0 and GPU 1
 infer-stack test smol135-1    # confirm the new model serves
 ```
 
@@ -234,16 +242,18 @@ then `wait` for them together (so models load at once instead of back-to-back).
 Here we fan out a SmolLM2 and a Qwen endpoint so both lineages serve side by side:
 
 ```bash
-infer-stack serve smol17b-1 --no-wait --yes   # SmolLM2 family
-infer-stack serve qwen15-1   --no-wait --yes   # Qwen family
+# two models -> two GPUs, so the second needs the display GPU (see note above)
+infer-stack serve smol17b-1 --no-wait --yes                        # SmolLM2 -> GPU 0
+infer-stack serve qwen15-1  --no-wait --yes --include-display-gpus  # Qwen -> GPU 1
 infer-stack wait smol17b-1 qwen15-1 --require-generation --timeout 1200
 # (bare `infer-stack wait` waits for every live model)
 infer-stack test qwen15-1                       # confirm the Qwen endpoint serves
 ```
 
 Open WebUI's picker now lists both `smol17b-1` and `qwen15-1`, so you can A/B the
-two families from the same UI — pick GPUs and `--gpu-mem` so the resident set
-fits (yardrat's 48 GiB GPU 0 holds these small models comfortably).
+two families from the same UI. `infer-stack leases` shows each on its own GPU
+(GPU 0 and GPU 1); the 16 GiB display GPU holds a small model like `qwen15-1`
+comfortably at `--gpu-mem 0.4`.
 
 > `--require-generation` is the readiness *criterion* (ready == a real generated
 > token, not just a listed model); `--no-wait` / `wait` are the *blocking*
@@ -316,3 +326,9 @@ Still open (tracked in `dev/leasing-followups.md`):
   means copying a session id out of `infer-stack leases`. Want
   `infer-stack release --endpoint smol17b-1` / `unserve smol17b-1`. (`evict
   smol17b-1` already tears the deployment down, but doesn't release the lease.)
+
+
+
+### JON TEST
+
+infer-stack serve qwen05-1

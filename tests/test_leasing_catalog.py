@@ -104,6 +104,33 @@ def test_runtime_difference_splits_compat_key(catalog):
     assert a.compat_key != b.compat_key
 
 
+def test_resolve_model_name_points_at_its_endpoints(catalog):
+    # passing a *model* name (a common slip) lists the endpoints that run it
+    with pytest.raises(CatalogError) as exc:
+        catalog.resolve_endpoint('qwen-coder-32b')
+    msg = str(exc.value)
+    assert 'is a model, not an endpoint' in msg
+    # all three endpoints on that model are suggested
+    for ep in ('qwen-coder', 'qwen-coder-alias', 'verifier-model'):
+        assert ep in msg
+
+
+def test_resolve_model_without_endpoints_suggests_adding_one():
+    cat = Catalog.from_dict({'models': {'solo': {'source': 'hf://x/y'}},
+                             'endpoints': {}})
+    with pytest.raises(CatalogError) as exc:
+        cat.resolve_endpoint('solo')
+    assert 'no endpoints yet' in str(exc.value)
+    assert 'catalog endpoint add --model solo' in str(exc.value)
+
+
+def test_resolve_unknown_name_did_you_mean(catalog):
+    with pytest.raises(CatalogError) as exc:
+        catalog.resolve_endpoint('qwen-codr')       # typo of qwen-coder
+    assert 'did you mean' in str(exc.value)
+    assert 'qwen-coder' in str(exc.value)
+
+
 def test_sharing_override(catalog):
     req = catalog.resolve_endpoint('qwen-coder', sharing=Sharing.DEDICATED)
     assert req.sharing == Sharing.DEDICATED

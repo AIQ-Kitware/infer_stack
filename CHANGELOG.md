@@ -172,6 +172,11 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     `leases` plus a quickstart + mental-model epilog on the top-level
     `infer-stack --help` (catalog → serve/acquire → reconcile; render vs apply;
     desired vs running). The `leases` help now documents each group column.
+  - Friendlier "unknown endpoint" error. You serve/acquire *endpoints*, not
+    models — passing a model name (`serve qwen05`) now says so and lists the
+    endpoints that run it (`Endpoints for 'qwen05': qwen05-1, qwen05-2 …`), or,
+    if the model has none, points at `catalog endpoint add --model`. For a name
+    that's neither, it offers a did-you-mean over the known endpoints/bundles.
   - Compose changes are now shown before they're applied, for **every** verb
     that touches the compose project — `serve`/`acquire` *and* `release`/`evict`/
     `apply`. On a terminal each renders a diff of the compose project (and
