@@ -8,6 +8,7 @@ import yaml
 from infer_stack.cli.commands_catalog import (
     BundleAddCLI,
     CatalogInitCLI,
+    CatalogSuggestCLI,
     EndpointAddCLI,
     EndpointRmCLI,
     HostAddCLI,
@@ -208,3 +209,56 @@ def test_help_tree_lists_groups_and_leaves(capsys):
     assert 'model' in out and 'endpoint' in out
     assert 'acquire' in out                       # top-level leasing verb
     assert 'tree' in out                          # itself, under help
+
+
+# ---------------------------------------------------------------------------
+# catalog suggest — seed from server introspection (simulated for determinism)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_render_only_writes_nothing(tmp_path, capsys):
+    # Default is render: prints a catalog fragment, but creates no file.
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '2x80', *_opts(tmp_path)]
+    )
+    out = capsys.readouterr().out
+    rendered = yaml.safe_load(out)
+    assert 'qwen2.5-72b' in rendered['models']        # 2 GPUs -> the 72B fits
+    assert 'qwen2.5-72b' in rendered['endpoints']
+    assert not (tmp_path / 'catalog.yaml').exists()    # nothing written
+
+
+def test_suggest_apply_merges_and_validates(tmp_path):
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '1x48', '--apply', *_opts(tmp_path)]
+    )
+    cat = Catalog.load(cat_path(tmp_path))            # parses + cross-refs ok
+    assert 'qwen2.5-7b' in cat.endpoints
+    # the largest fitting model is kept warm, the rest stop
+    warm = [n for n, e in cat.endpoints.items() if e.reclaim == 'keep-warm']
+    assert len(warm) == 1
+
+
+def test_suggest_apply_is_additive_and_idempotent(tmp_path):
+    # A hand-added entry survives; re-applying changes nothing without --force.
+    ModelAddCLI.main(argv=['mine', '--source', 'hf://me/Model', *_opts(tmp_path)])
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '1x24', '--apply', *_opts(tmp_path)]
+    )
+    after_first = (tmp_path / 'catalog.yaml').read_text()
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '1x24', '--apply', *_opts(tmp_path)]
+    )
+    assert (tmp_path / 'catalog.yaml').read_text() == after_first
+    cat = Catalog.load(cat_path(tmp_path))
+    assert 'mine' in cat.models                       # hand-added entry preserved
+
+
+def test_suggest_no_fit_writes_nothing(tmp_path, capsys):
+    # A box too small for any pooled model: a friendly note, no file, no crash.
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '1x0', '--apply', *_opts(tmp_path)]
+    )
+    err = capsys.readouterr().err
+    assert 'no pooled model fits' in err
+    assert not (tmp_path / 'catalog.yaml').exists()

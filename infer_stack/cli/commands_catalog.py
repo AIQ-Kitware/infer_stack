@@ -22,7 +22,12 @@ import yaml
 from ..leasing import Catalog, CatalogError
 from ..paths import config_root
 from .context import _apply_path_overrides
-from .options import _PathOverridesMixin
+from .options import (
+    _AllowedGpusMixin,
+    _DisplayGpuMixin,
+    _PathOverridesMixin,
+    _SimulateHardwareMixin,
+)
 
 SECTIONS = ('models', 'endpoints', 'runtime_hosts', 'bundles')
 
@@ -208,6 +213,112 @@ class CatalogInitCLI(_CatalogCommon):
         _save_raw(path, {s: {} for s in SECTIONS}, dry_run=config.dry_run)
         if not config.dry_run:
             print(f'wrote starter catalog -> {path}')
+        return 0
+
+
+class CatalogSuggestCLI(
+    _PathOverridesMixin,
+    _SimulateHardwareMixin,
+    _AllowedGpusMixin,
+    _DisplayGpuMixin,
+):
+    """Seed a catalog from server introspection (the suggestion pool).
+
+    Introspects the GPU inventory and joins it against the curated suggestion
+    pool (``templates/suggestion-pool.yaml``) to derive a concrete, fits-this-box
+    set of models + endpoints — sized ``max_model_len`` / ``gpu_memory_utilization``,
+    ``--dtype=half`` on pre-Ampere GPUs, the largest model kept warm. It mirrors
+    the hand-tuning of the leasing demo, but derived rather than guessed.
+
+    Render then apply (a plan/apply split): by default it *renders* the
+    suggestion as YAML to stdout and writes nothing — so you can review it, pipe
+    it (``> catalog.yaml``), or trim it. Pass ``--apply`` to merge it into your
+    catalog (additive: existing entries are kept unless ``--force``).
+
+    Pure + offline: ``--simulate-hardware 2x80`` suggests for hardware you do not
+    have in front of you.
+
+        infer-stack catalog suggest                      # render only (no write)
+        infer-stack catalog suggest --simulate-hardware 4x48
+        infer-stack catalog suggest --apply              # merge into the catalog
+    """
+
+    __command__ = 'suggest'
+    catalog = scfg.Value(None, type=str, help='Catalog path (default: config dir).')
+    apply = scfg.Value(
+        False, isflag=True,
+        help='Merge the suggestion into the catalog (default: render only).',
+    )
+    force = scfg.Value(
+        False, isflag=True,
+        help='With --apply, overwrite catalog entries that already exist.',
+    )
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..hardware import detect_inventory
+        from ..leasing.suggest import suggest_catalog
+        from .commands_leasing import _resolve_skip_display
+        from .context import effective_inventory
+
+        config = cls.cli(argv=argv, data=kwargs)
+        inventory = effective_inventory(config) or detect_inventory()
+        gpus = inventory.get('gpus') or []
+        skip_display = _resolve_skip_display(config)
+        frag = suggest_catalog(
+            inventory, reserve_display_gpu='auto' if skip_display else False
+        )
+
+        max_mem = max((g.get('memory_gib') or 0 for g in gpus), default=0)
+        n_display = sum(1 for g in gpus if g.get('display_active'))
+        usable = len(gpus) - (n_display if skip_display else 0)
+        hw = (
+            f'{len(gpus)} GPU(s), max {max_mem:g} GiB'
+            + (f', skipping {n_display} display-attached' if skip_display and n_display else '')
+        )
+
+        if not frag['models']:
+            print(
+                f'no pooled model fits the detected hardware ({hw}). '
+                'Pass --simulate-hardware NxM to plan for a bigger box, or add '
+                'models by hand with `catalog model add`.',
+                file=sys.stderr,
+            )
+            return 0
+
+        text = yaml.safe_dump(frag, sort_keys=False, default_flow_style=False)
+
+        if not config.apply:
+            print(
+                f'# suggested for: {hw}  ({usable} usable)\n'
+                f'# {len(frag["models"])} model(s); review, then re-run with '
+                f'--apply to merge (or redirect this to a catalog.yaml).',
+                file=sys.stderr,
+            )
+            _print_yaml(text)
+            return 0
+
+        # --apply: additive merge into the catalog (keep existing entries).
+        path = _catalog_path(config)
+        data = _load_raw(path)
+        added: list[str] = []
+        skipped: list[str] = []
+        for section in ('models', 'endpoints'):
+            for name, value in frag[section].items():
+                if name in data[section] and not config.force:
+                    skipped.append(f'{section[:-1]}:{name}')
+                    continue
+                data[section][name] = value
+                added.append(f'{section[:-1]}:{name}')
+        _save_raw(path, data, dry_run=False)
+        print(f'merged suggestion into {path}  ({hw})')
+        if added:
+            print(f'  added: {", ".join(added)}')
+        if skipped:
+            print(
+                f'  kept existing (pass --force to overwrite): '
+                f'{", ".join(skipped)}'
+            )
         return 0
 
 
@@ -666,6 +777,7 @@ class CatalogModalCLI(scfg.ModalCLI):
     __command__ = 'catalog'
 
     init = CatalogInitCLI
+    suggest = CatalogSuggestCLI
     path = CatalogPathCLI
     show = CatalogShowCLI
     validate = CatalogValidateCLI
