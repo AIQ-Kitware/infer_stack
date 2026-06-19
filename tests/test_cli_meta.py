@@ -57,20 +57,6 @@ def test_config_paths_reports_config_and_state(tmp_path: Path) -> None:
     assert f'hf_cache (dir, missing): {tmp_path / "hf-cache"}' in out
 
 
-def test_config_paths_status_tracks_existence(tmp_path: Path) -> None:
-    run_cli(
-        tmp_path,
-        'setup',
-        '--yes',
-        '--backend',
-        'compose',
-        '--profile',
-        'qwen2-5-7b-instruct-turbo-default',
-    )
-    out = run_cli(tmp_path, 'config', 'paths', 'config').stdout
-    assert f'config.yaml (file, exists): {tmp_path / "config.yaml"}' in out
-
-
 def test_config_paths_json_emits_structured_groups(tmp_path: Path) -> None:
     payload = json.loads(run_cli(tmp_path, 'config', 'paths', '--json').stdout)
     assert set(payload) == {'config', 'data', 'state', 'leasing'}
@@ -104,7 +90,7 @@ def test_status_summarizes_leases_when_present(tmp_path: Path) -> None:
     led = Ledger(SqliteStore(tmp_path / 'leasing' / 'ledger.db'))
     led.acquire('me', [EndpointRequest('m', 'vllm', vllm_structural(model_ref='m'))])
     out = run_cli(tmp_path, 'status').stdout
-    assert 'leasing:' in out and 'active lease' in out
+    assert 'leasing:' in out and '1 active' in out and 'lease(s)' in out
 
 
 def test_config_paths_target_filters_to_single_group(tmp_path: Path) -> None:
@@ -112,20 +98,6 @@ def test_config_paths_target_filters_to_single_group(tmp_path: Path) -> None:
     assert 'state:' in out
     assert 'config:' not in out
     assert 'data:' not in out
-
-
-def test_config_paths_kubeai_includes_generated_dir(tmp_path: Path) -> None:
-    run_cli(
-        tmp_path,
-        'setup',
-        '--yes',
-        '--backend',
-        'kubeai',
-        '--profile',
-        'qwen2-72b-instruct-tp2-balanced',
-    )
-    out = run_cli(tmp_path, 'config', 'paths', 'data').stdout
-    assert 'kubeai_generated_dir' in out
 
 
 def test_config_paths_omits_data_root(tmp_path: Path) -> None:

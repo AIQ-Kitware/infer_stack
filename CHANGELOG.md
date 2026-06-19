@@ -4,6 +4,22 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Version 0.7.0] - Unreleased
 
+### Removed (breaking)
+* Removed the pre-leasing **profile world** now superseded by catalog + leasing
+  (no back-compat — pre-release): the entire `infer-stack legacy …` command
+  group and its modules (`cli/commands_profile`, `cli/commands_smoke`,
+  `renderer`, `benchmark`, `verification`, `contracts`, the active-profile
+  `Up/Down/Purge/Deploy/Env/Ollama*` runtime verbs), plus their tests
+  (~5k LOC). The ollama and kubeai *concepts* are retained (catalog
+  `engine: ollama`, leasing coalescing, `kubeai_ops`/`backends/kubeai_renderer`)
+  for when those backends are implemented. (`resolver`/`validator`/old top-level
+  `catalog.py` + the legacy `context` plan helpers are slated for the next pass.)
+* `infer-stack status` is now a **leasing-native holistic overview** — backend,
+  data/config dirs, catalog (with model/endpoint counts), settings, ledger, and
+  compose-project locations, plus a leasing summary (active leases / live
+  deployments) and "dig deeper" pointers (`leases`, `tui`, `stack ps`, `logs`).
+  It no longer reports on the old active-profile render.
+
 ### Changed (breaking)
 * Renamed the **deployment group concept → "deployment"** throughout (core
   classes, CLI, TUI, docs): `DeploymentGroup` → `Deployment`, `GroupState` →

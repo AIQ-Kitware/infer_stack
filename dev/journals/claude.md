@@ -1640,3 +1640,41 @@ removal (profiles/old hookups, keeping ollama+kubeai concepts), then the TUI
 top-level-tabs reorg + catalog mgmt/edit-remove + advanced endpoint params +
 docker control + model cache info + all-panes-collapsible/drag. Those build on
 the now-final vocabulary, so no rework.
+
+## 2026-06-19 13:30:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Legacy removal, Phase 1, with
+Jon's exception: keep + improve StatusCLI into a holistic `infer-stack status`.
+
+Mapped the import graph first (the only safe way to delete in a web of shared
+modules). Found the pre-leasing profile world is gated behind an explicit
+`legacy` command group whose own docstring said "removed wholesale" — so that
+group + its exclusive modules were the target. Deleted (~5k LOC, no back-compat
+per Jon — pre-release, delete-and-recreate state): the `legacy` group;
+cli/commands_profile, cli/commands_smoke; renderer, benchmark, verification,
+contracts; the active-profile runtime verbs (Up/Down/Purge/Deploy/Env/Ollama*)
++ the _ensure_rendered/RenderCLI hook inside commands_runtime; and 4 legacy test
+files (serving_profiles, ollama_stack_graph, reverse_proxy_ldap, cli_setup) +
+2 legacy tests in test_cli_meta. Suite 319→222 green, and 110s→15s — the deleted
+legacy tests were the slow ones.
+
+Rewrote commands_runtime.py clean: the `stack` day-2 wrappers now target ONLY
+the leasing compose project (dropped the legacy config.yaml fallback +
+config_for_runtime/_compose_base_cmd/_kubeai_stub), and a new holistic StatusCLI
+reports backend, data/config dirs, catalog (+counts), settings, ledger, compose
+locations, a leasing summary (active leases / live deployments, read-only — no
+sweep so status never mutates), and "dig deeper" pointers. Kept the ollama +
+kubeai *concepts* (kubeai_ops.py, backends/kubeai_renderer.py, catalog
+engine:ollama) per Jon, even though currently unwired.
+
+Deliberately deferred (Phase 2): resolver/validator/old top-level catalog.py +
+the legacy plan helpers in cli/context.py (build_plan/resolve/validate/
+load_config/config_for_runtime) and cli/compose.py. These are load-bearing for
+context.py (which kept code imports for _apply_path_overrides/effective_inventory),
+so they need per-function surgery, not deletion — its own careful pass. Also
+Phase 2: ConfigPathsCLI still lists legacy artifacts (config.yaml/models.yaml/
+kubeai_generated_dir); trim once config.py's legacy paths go.
+
+Risk/uncertainty: the new StatusCLI is unverified against a real populated stack
+(only the leases-present unit test). The deferred cluster is where the remaining
+breakage risk lives. Confident the deletion is clean (graph-driven, suite green).

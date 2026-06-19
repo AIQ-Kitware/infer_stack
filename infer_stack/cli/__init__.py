@@ -8,18 +8,16 @@ point. Because every subcommand is a ``DataConfig``, the same class can
 be invoked from the shell (``infer-stack render --profile X``) or from
 Python (``RenderCLI.main(argv=False, profile='X')``).
 
-This package was split out of a single ``cli.py`` module. The layers are:
+The layers are:
 
-* ``context``  — path/config/env/override/plan helpers (no other cli deps).
+* ``context``  — path/config/env/override helpers (no other cli deps).
 * ``probes``   — pure readiness/model-selection helpers over a deployment.
-* ``compose``  — compose + LiteLLM + preflight + diagnostics helpers.
+* ``compose``  — compose + LiteLLM helpers.
 * ``options``  — shared ``DataConfig`` mixins for override flags.
-* ``commands_profile``  — profile/config management subcommands.
-* ``commands_runtime``  — up/down/deploy/status/env + day-2-ops wrappers.
-* ``commands_smoke``    — diagnose/wait/smoke-test/benchmark subcommands.
-
-``infer_stack.cli`` re-exports the previously top-level names so existing
-``from infer_stack.cli import ...`` imports keep working.
+* ``commands_catalog`` — catalog editor (models/endpoints/hosts/bundles).
+* ``commands_leasing`` — acquire/release/serve/run/leases/test + reconcile.
+* ``commands_runtime`` — ``status`` + ``stack`` day-2 compose wrappers.
+* ``commands_meta``    — version/help/config introspection.
 """
 
 from __future__ import annotations
@@ -27,13 +25,6 @@ from __future__ import annotations
 import scriptconfig as scfg
 
 from .. import __version__
-from ..kubeai_ops import (  # noqa: F401
-    CommandError,
-    deploy_rendered_artifacts,
-)
-from ..kubeai_ops import (  # noqa: F401
-    print_status as kubeai_print_status,
-)
 
 # Keep submodules importable as attributes (e.g. ``infer_stack.cli.commands_runtime``)
 # so tests can patch seams where they are actually looked up.
@@ -41,9 +32,7 @@ from . import (  # noqa: F401
     commands_catalog,
     commands_leasing,
     commands_meta,
-    commands_profile,
     commands_runtime,
-    commands_smoke,
     compose,
     context,
     options,
@@ -71,40 +60,11 @@ from .commands_meta import (
     HelpModalCLI,
     VersionCLI,
 )
-from .commands_profile import (
-    DescribeProfileCLI,
-    ExplainCLI,
-    InitCLI,
-    KubeaiSyncResourceProfilesCLI,
-    ListModelsCLI,
-    ListProfilesCLI,
-    LockCLI,
-    RenderCLI,
-    ResolveCLI,
-    SetupCLI,
-    SwitchCLI,
-    ValidateCLI,
-    VerifyProfileCLI,
-)
 from .commands_runtime import (
-    DeployCLI,
-    DownCLI,
-    EnvCLI,
     LogsCLI,
-    OllamaListCLI,
-    OllamaPsCLI,
-    OllamaPullCLI,
     PsCLI,
-    PurgeCLI,
     StackModalCLI,
     StatusCLI,
-    UpCLI,
-)
-from .commands_smoke import (
-    BenchmarkCLI,
-    DiagnoseCLI,
-    SmokeTestCLI,
-    WaitReadyCLI,
 )
 from .compose import (  # noqa: F401
     _compose_has_service,
@@ -139,46 +99,10 @@ from .probes import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
-class LegacyModalCLI(scfg.ModalCLI):
-    """Pre-leasing profile/active-profile commands (held here; promoted out as
-    they gain leasing-native behavior, then this group is removed wholesale)."""
-
-    __command__ = 'legacy'
-
-    # config / profile management
-    setup = SetupCLI
-    init = InitCLI
-    resolve = ResolveCLI
-    validate = ValidateCLI
-    lock = LockCLI
-    render = RenderCLI
-    switch = SwitchCLI
-    list_models = ListModelsCLI
-    list_profiles = ListProfilesCLI
-    explain = ExplainCLI
-    describe_profile = DescribeProfileCLI
-    verify_profile = VerifyProfileCLI
-    kubeai_sync_resource_profiles = KubeaiSyncResourceProfilesCLI
-    # active-profile runtime lifecycle
-    up = UpCLI
-    down = DownCLI
-    purge = PurgeCLI
-    deploy = DeployCLI
-    env = EnvCLI
-    diagnose = DiagnoseCLI
-    wait_ready = WaitReadyCLI
-    smoke_test = SmokeTestCLI
-    benchmark = BenchmarkCLI
-    ollama_pull = OllamaPullCLI
-    ollama_list = OllamaListCLI
-    ollama_ps = OllamaPsCLI
-
-
 class ManageCLI(scfg.ModalCLI):
     description = (
         'Lease, serve, and run LLM endpoints. Primary workflow: '
-        'catalog -> acquire/serve/run. Pre-leasing profile commands live under '
-        '`infer-stack legacy`; see `infer-stack help tree`.'
+        'catalog -> acquire/serve/run. See `infer-stack help tree`.'
     )
 
     __epilog__ = """
@@ -215,9 +139,6 @@ class ManageCLI(scfg.ModalCLI):
 
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI
-
-    # Pre-leasing profile world (grouped; was ~25 top-level verbs)
-    legacy = LegacyModalCLI
 
     # Leasing model (acquire/release/run/serve + status)
     acquire = AcquireCLI
