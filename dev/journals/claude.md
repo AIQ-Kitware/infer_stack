@@ -1478,3 +1478,55 @@ Confident in the drag fix (measured). Still unverified on a real terminal: the
 actual feel of grabbing a 1-cell bar in tmux (motion reporting under tmux can be
 finicky) — if dragging is still flaky on yardrat, the next move is widening the
 hit target or enabling a drag affordance glyph.
+
+## 2026-06-19 01:25:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Third TUI pass. User asks:
+(1) system info à la nvidia-smi/btop; (2) a small API-test tab (send a prompt to
+a model, or test all models); (3) ctrl+click a served endpoint to open it in
+Open WebUI; (4) click-to-collapse panes so hidden data isn't polled; and a
+follow-up: (5) the `ps` view should carry uptime/status, created time, and
+container id like `docker ps`.
+
+Approach: turned the bottom pane into a `Collapsible` wrapping a `TabbedContent`
+with four tabs — Logs, Status·ps, System, API. The collapse is the user's
+"click to collapse," and it does double duty as the polling gate: `_collect()`
+now only fetches the *active* tab's expensive data (`docker compose ps` for the
+ps tab, `nvidia-smi` for System) and nothing when collapsed. `_active_tab` is
+tracked via `TabbedContent.TabActivated` and `_console_collapsed` via
+`Collapsible.Toggled`; both are plain attrs read by the worker thread, set on the
+UI thread — cheap and race-free enough for a monitor. Switching tabs fires a
+refresh so the newly-shown tab fills immediately.
+
+System tab: `nvidia-smi --query-gpu=… --format=csv,noheader,nounits` parsed into
+a table; returns `None` when nvidia-smi is absent so the UI shows a clear "not
+found" row instead of looking broken (this dev box has no GPU — only yardrat
+will populate it). Host line from `/proc/loadavg` + `/proc/meminfo` + cpu_count
+(no psutil dep, which isn't installed). API tab: a model Select (from catalog
+endpoints), a prompt Input, Send / Test-all buttons, and a RichLog; calls go to
+`http://localhost:{litellm_port}/v1/chat/completions` with the backend master
+key. Made the HTTP client injectable (`http=`) so a fake drives it headless —
+otherwise this tab would be untestable without a live gateway. ps columns now:
+service · status(uptime) · created · container-id · ports, pulled from the
+compose-ps JSON (`Status`, `CreatedAt`/`RunningFor`, `ID[:12]`).
+
+Open-in-browser: `action_open` (key `o`) builds `…:{ui_port}/?models={endpoint}`
+and `webbrowser.open`s it; ctrl+click routes through `on_click` →
+`screen.get_widget_at` → walk to `#endpoints`. Over SSH/tmux `webbrowser.open`
+will no-op, so the status line always prints the URL to copy.
+
+Risks/uncertainties: the big one remains *unverified on real hardware* — the
+Open WebUI `?models=` deep-link param depends on the running Open WebUI version
+(it may just land on the home page; acceptable fallback). nvidia-smi parsing
+assumes the standard CSV columns. Collapsible + TabbedContent + my fixed
+`#docker` height composes cleanly in pilot, but I haven't watched it animate on
+a terminal. ctrl+click hit-testing via `get_widget_at` is the part I'm least
+sure survives tmux mouse quirks; the `o` key is the reliable fallback and shares
+all the logic. 16 TUI tests (added: ps-parse, system-no-smi, collapse-gating,
+open-url, injected-http API send), full suite 316 green, ruff clean.
+
+Takeaways: (1) make the collapse state and active-tab the *same* signal that
+gates polling — "don't poll what you can't see" falls out for free instead of
+being a second mechanism. (2) Any pane that hits the network or a subprocess
+needs an injection seam (proc_factory, http) or it's simply not testable
+headless; build it in from the first line, not after.

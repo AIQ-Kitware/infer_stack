@@ -197,6 +197,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     pane instead of bleeding onto the screen. The TUI now requires a one-time
     `config init`, and tolerates a missing/empty catalog (it shows the
     empty-state + Suggest button rather than erroring).
+  - TUI, third pass — the bottom pane became a **collapsible, tabbed console**
+    (click the title, or `c`, to collapse it). Tabs: **Logs**; **Status · ps**
+    (now with the `docker ps`-style status/uptime, created time, and container
+    id, plus service + ports); **System** (live `nvidia-smi` per-GPU
+    util/mem/temp, plus host load/mem/cpu from `/proc`); and an **API** tester
+    that sends a prompt to a served model — or pings *all* of them with a
+    latency report — through the LiteLLM gateway. Only the **visible** tab's
+    data is polled (and nothing when the console is collapsed), so `ps` /
+    nvidia-smi don't run when you can't see them. **Ctrl+click** a served
+    endpoint (or `o`) opens it in Open WebUI (`/?models=<endpoint>`). The HTTP
+    client is injectable for headless tests.
   - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it
     (`--reverse-proxy`, or `config set reverse_proxy true`) to front the gateway
     + Open WebUI with one nginx origin — UI at `/`, the OpenAI API at `/v1` — so

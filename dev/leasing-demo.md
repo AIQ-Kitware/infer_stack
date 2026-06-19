@@ -167,12 +167,16 @@ something is still warming up vs truly live.
 > **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI
 > (run `infer-stack config init` once first):
 > a **catalog** pane to pick an endpoint and serve it (`s`/Enter), live
-> **leases** + **groups** tables, and a **docker** pane with two tabs — a live
-> `logs -f` tail (a dropdown points it at one service or all) and a `ps`
-> snapshot. New here? The catalog buttons (or `g`) **Suggest** a set sized to
-> your GPUs, and `m` / `n` open wizards to add a model / endpoint by hand.
-> Controls: `s` serve, `d` release, `e` evict, `a` release-all, `g` suggest,
-> `m`/`n` add, `tab` to move between panes, `q` quit. Resize panes by dragging
+> **leases** + **groups** tables, and a collapsible **console** with tabs:
+> a live `logs -f` tail (a dropdown points it at one service or all), a `ps`
+> snapshot (status/uptime · created · container id · ports), a **System** tab
+> (`nvidia-smi` GPUs + host CPU/mem), and an **API** tester that sends a prompt
+> to a served model (or pings all of them). Only the visible tab is polled, and
+> collapsing the console (click its title, or `c`) stops it entirely.
+> New here? The catalog buttons (or `g`) **Suggest** a set sized to your GPUs,
+> and `m` / `n` open wizards to add a model / endpoint by hand. Each pane has
+> its own action buttons; `tab` moves between panes, `q` quits. **Ctrl+click**
+> a served endpoint (or `o`) opens it in Open WebUI. Resize panes by dragging
 > the splitter bars (or `[` `]` / `-` `+`). Opt-in extra:
 > `pip install "infer-stack[tui]"`.
 

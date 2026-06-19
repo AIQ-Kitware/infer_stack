@@ -5,24 +5,27 @@ touched infer-stack:
 
 * **Catalog** (left) — the models + endpoints you can run, with buttons to
   auto-suggest a set sized to your GPUs or add one by hand. Pick an endpoint and
-  press ``s`` / Enter to request a lease (serve it).
+  press ``s`` / Enter (or the Serve button) to request a lease. Ctrl+click a
+  served endpoint to open it in Open WebUI.
 * **Leases** + **Groups** (center) — the live ledger view (desired *state* vs
   what is actually *running*, and which GPUs each model is on), auto-refreshing.
-* **Docker** (bottom) — a tabbed pane: a live ``logs -f`` tail you can point at a
-  specific service, and a ``ps`` snapshot of what containers are up.
-* **Status bar** — the result of the last action.
+  Each table has its own action buttons (release / evict).
+* **Console** (bottom) — a collapsible, tabbed pane: live ``logs -f``; a ``ps``
+  snapshot; **System** (nvidia-smi GPUs + host CPU/mem); and an **API** tester
+  that sends prompts to the LiteLLM gateway. Click the title to collapse it.
 
 Design notes that keep it responsive and headless-testable:
 
-* The catalog refresh and ``docker compose ps`` calls run on a worker thread, so
-  shelling out to docker never freezes the UI.
+* Refresh runs on a worker thread, and only the *visible* console tab's data is
+  polled — collapse the console (or sit on another tab) and the expensive
+  ``ps`` / nvidia-smi calls stop.
 * Docker's own progress (``up -d`` / ``down``) is captured and routed into the
   logs pane instead of bleeding onto the full-screen terminal.
-* The docker log source is injectable (``proc_factory``) so the whole app is
-  exercisable via Textual's pilot without docker or a GPU.
+* The docker log source (``proc_factory``) and the HTTP client (``http``) are
+  injectable, so the whole app is exercisable via Textual's pilot without
+  docker, a GPU, or a network.
 
-It is opt-in and only imported when ``infer-stack tui`` runs, so the rest of the
-CLI never pays for textual.
+It is opt-in and only imported when ``infer-stack tui`` runs.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
     Button,
+    Collapsible,
     DataTable,
     Footer,
     Header,
@@ -64,8 +68,7 @@ ALL_SERVICES = ''  # the Select value meaning "every service"
 
 # A calm, dark palette with one warm accent: very-dark-gray canvas, white text,
 # orange highlights. Borders sit quiet on $surface and only warm to $accent
-# (orange) on the focused pane, so the eye is drawn without the whole screen
-# shouting.
+# (orange) on the focused pane.
 INFER_THEME = Theme(
     name='infer-orange',
     primary='#ff8c1a',
@@ -113,8 +116,8 @@ class _Divider(Static):
     """A draggable splitter bar.
 
     Reports incremental drags to ``on_drag(delta)`` — ``delta`` is the pointer's
-    movement along the bar's resize axis since the last event. Keyboard resize
-    bindings remain the primary path; this just lets you grab and pull too.
+    movement along the bar's resize axis since the last event. The bar must span
+    its full cross-axis (see CSS) or there is nothing to grab.
     """
 
     def __init__(self, axis: str, on_drag: Callable[[int], None], **kw: Any):
@@ -282,7 +285,7 @@ class InferStackTUI(App):
         margin: 0 1 0 0; min-width: 12;
     }
 
-    #endpoints, #models, #leases, #groups, #docker {
+    #endpoints, #models, #leases, #groups, #console {
         border: round $surface;
         background: $boost;
         padding: 0 1;
@@ -293,7 +296,7 @@ class InferStackTUI(App):
         border-subtitle-align: right;
     }
     #endpoints:focus, #models:focus, #leases:focus, #groups:focus,
-    #docker:focus-within {
+    #console:focus-within {
         border: round $accent;
         border-title-color: $accent;
     }
@@ -302,10 +305,16 @@ class InferStackTUI(App):
     #models { height: 8; min-height: 4; }
     #leases { height: 1fr; min-height: 4; }
     #groups { height: 1fr; min-height: 4; }
+    #console { height: auto; }
     #docker { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
-    #logs { height: 1fr; background: $surface; }
-    #ps { height: 1fr; background: $surface; }
+    #logs, #ps, #gpus, #api-out { height: 1fr; background: $surface; }
+    #sysinfo { height: auto; color: $text-muted; padding: 0 1; }
+    .hint { height: auto; color: $text-muted; padding: 0 1; }
+    #api-controls { height: auto; margin: 0 0 1 0; }
+    #api-controls Select { width: 1fr; }
+    #api-controls Button { margin: 0 0 0 1; min-width: 10; }
+    #api-prompt { margin: 0 0 1 0; }
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
     """
@@ -324,6 +333,8 @@ class InferStackTUI(App):
         Binding('g', 'suggest', 'Suggest', show=False),
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
+        Binding('o', 'open', 'Open in browser', show=False),
+        Binding('c', 'toggle_console', 'Collapse console', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
@@ -339,12 +350,14 @@ class InferStackTUI(App):
         interval: float = 3.0,
         proc_factory: Callable[[str | None], Any] | None = None,
         catalog_path: str | Path | None = None,
+        http: Any = None,
     ) -> None:
         super().__init__()
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
         self.catalog_path = Path(catalog_path).expanduser() if catalog_path else None
+        self._http = http
         self._proc_factory = proc_factory or self._default_proc_factory()
         self._endpoint_names: list[str] = []
         self._lease_ids: list[str] = []
@@ -353,8 +366,11 @@ class InferStackTUI(App):
         self._log_service: str = ALL_SERVICES
         self._log_proc: Any = None
         self._log_lines: list[str] = []  # mirror of the log pane, for tests
+        self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
         self._log_h = 16      # resizable via - + or dragging #hsplit
+        self._active_tab = 'tab-logs'   # which console tab is visible
+        self._console_collapsed = False
 
     # -- layout ------------------------------------------------------------
 
@@ -362,9 +378,9 @@ class InferStackTUI(App):
         yield Header(show_clock=True)
         yield Static(
             'Request models from the [b]catalog[/b] (left) · watch '
-            '[b]leases[/b] & GPUs (center) · tail [b]docker[/b] (below).  '
-            'Each pane has its own action buttons; drag the bars between panes '
-            'to resize.',
+            '[b]leases[/b] & GPUs (center) · [b]console[/b] below (logs · ps · '
+            'system · api).  Each pane has its own buttons; drag the bars to '
+            'resize; ctrl+click a served endpoint to open it.',
             id='intro', markup=True,
         )
         with Horizontal(id='body'):
@@ -393,17 +409,40 @@ class InferStackTUI(App):
                     with Horizontal(id='group-actions'):
                         yield Button('Evict', id='btn-evict')
                 yield _Divider('y', self._drag_logs, id='hsplit')
-                with TabbedContent(id='docker'):
-                    with TabPane('Logs', id='tab-logs'):
-                        yield Select(
-                            [('(all services)', ALL_SERVICES)],
-                            value=ALL_SERVICES, allow_blank=False, id='logsvc',
-                        )
-                        yield RichLog(id='logs', highlight=False, markup=False,
-                                      max_lines=2000, wrap=False)
-                    with TabPane('Status · ps', id='tab-ps'):
-                        yield DataTable(id='ps', cursor_type='row',
-                                        zebra_stripes=True)
+                with Collapsible(title='console', collapsed=False, id='console'):
+                    with TabbedContent(id='docker'):
+                        with TabPane('Logs', id='tab-logs'):
+                            yield Select(
+                                [('(all services)', ALL_SERVICES)],
+                                value=ALL_SERVICES, allow_blank=False,
+                                id='logsvc',
+                            )
+                            yield RichLog(id='logs', highlight=False,
+                                          markup=False, max_lines=2000,
+                                          wrap=False)
+                        with TabPane('Status · ps', id='tab-ps'):
+                            yield DataTable(id='ps', cursor_type='row',
+                                            zebra_stripes=True)
+                        with TabPane('System', id='tab-system'):
+                            yield Static('', id='sysinfo')
+                            yield DataTable(id='gpus', cursor_type='row',
+                                            zebra_stripes=True)
+                        with TabPane('API', id='tab-api'):
+                            yield Static(
+                                'Send a prompt to a served model through the '
+                                'LiteLLM gateway.', classes='hint',
+                            )
+                            with Horizontal(id='api-controls'):
+                                yield Select([], prompt='model…', id='api-model')
+                                yield Button('Send', id='btn-api-send',
+                                             variant='primary')
+                                yield Button('Test all', id='btn-api-test-all')
+                            yield Input(
+                                placeholder='prompt (default: a short hello)',
+                                id='api-prompt',
+                            )
+                            yield RichLog(id='api-out', highlight=False,
+                                          markup=False, wrap=True, max_lines=500)
         yield Static('', id='status')
         yield Footer()
 
@@ -415,7 +454,7 @@ class InferStackTUI(App):
             pass
         titles = {
             '#endpoints': 'catalog · endpoints', '#models': 'catalog · models',
-            '#leases': 'leases', '#groups': 'groups', '#docker': 'docker',
+            '#leases': 'leases', '#groups': 'groups',
         }
         for sel, title in titles.items():
             self.query_one(sel).border_title = title
@@ -430,7 +469,10 @@ class InferStackTUI(App):
             'id', 'engine', 'state', 'running', 'gpus', 'demand', 'served'
         )
         self.query_one('#ps', DataTable).add_columns(
-            'service', 'state', 'ports'
+            'service', 'status (uptime)', 'created', 'container id', 'ports'
+        )
+        self.query_one('#gpus', DataTable).add_columns(
+            'gpu', 'name', 'util%', 'mem (used/total)', 'temp'
         )
         # Capture docker's own chatter (up/down progress on stderr) into the
         # logs pane instead of letting it bleed onto the full-screen terminal.
@@ -448,14 +490,7 @@ class InferStackTUI(App):
     # -- theming for docker output bleed ----------------------------------
 
     def _install_quiet_docker(self) -> None:
-        """Route ``docker compose`` output to the logs pane, not the terminal.
-
-        ``docker compose up -d`` / ``down`` print their progress to *stderr*,
-        which the default backend runner lets through to the controlling
-        terminal — corrupting the full-screen UI. Wrap the backend runner so
-        every invocation is fully captured; the noisy verbs (up/down) get echoed
-        into the logs pane, while quiet polling (``ps``) is swallowed.
-        """
+        """Route ``docker compose`` output to the logs pane, not the terminal."""
         backend = self.controller.backend
         if not hasattr(backend, 'run'):
             return
@@ -486,7 +521,7 @@ class InferStackTUI(App):
         self._apply_sizes()
 
     def _drag_logs(self, delta: int) -> None:
-        # Dragging the divider down (delta > 0) makes the logs pane shorter.
+        # Dragging the divider down (delta > 0) makes the console shorter.
         self._log_h = max(6, min(60, self._log_h - delta))
         self._apply_sizes()
 
@@ -501,6 +536,10 @@ class InferStackTUI(App):
 
     def action_logs_taller(self) -> None:
         self._drag_logs(-2)
+
+    def action_toggle_console(self) -> None:
+        col = self.query_one('#console', Collapsible)
+        col.collapsed = not col.collapsed
 
     # -- catalog -----------------------------------------------------------
 
@@ -520,7 +559,18 @@ class InferStackTUI(App):
         models.clear()
         for name in sorted(self.catalog.models):
             models.add_row(name, getattr(self.catalog.models[name], 'source', ''))
+        self._sync_api_models()
         self._update_catalog_help()
+
+    def _sync_api_models(self) -> None:
+        names = sorted(self.catalog.endpoints)
+        select = self.query_one('#api-model', Select)
+        current = None if select.value is Select.BLANK else select.value
+        select.set_options([(n, n) for n in names])
+        if current in names:
+            select.value = current
+        elif names:
+            select.value = names[0]
 
     def _update_catalog_help(self) -> None:
         help_ = self.query_one('#catalog-help', Static)
@@ -531,7 +581,8 @@ class InferStackTUI(App):
             )
         else:
             help_.update(
-                'Select an endpoint and press [b]s[/b] (or Enter) to serve it.'
+                'Select an endpoint and press [b]s[/b] (or Serve). '
+                'Ctrl+click a served one to open it in Open WebUI.'
             )
 
     def _reload_catalog(self) -> None:
@@ -548,16 +599,27 @@ class InferStackTUI(App):
     # -- monitor -----------------------------------------------------------
 
     def _collect(self) -> dict[str, Any]:
-        """Gather ledger + observed state. Safe to call off the UI thread."""
+        """Gather ledger + observed state. Safe to call off the UI thread.
+
+        Only the *visible* console tab's expensive data is polled — if the
+        console is collapsed, or a different tab is showing, ``ps`` / nvidia-smi
+        are skipped entirely.
+        """
         try:
             self.controller.ledger.sweep()
             leases, groups = self.controller.ledger.status()
             observed, assignments = _placement_view(self.controller)
-            ps_rows = self._compose_ps_rows()
-            return {
+            data: dict[str, Any] = {
                 'leases': leases, 'groups': groups, 'observed': observed,
-                'assignments': assignments, 'ps': ps_rows,
+                'assignments': assignments,
             }
+            if not self._console_collapsed:
+                if self._active_tab == 'tab-ps':
+                    data['ps'] = self._compose_ps_rows()
+                elif self._active_tab == 'tab-system':
+                    data['gpus'] = self._gpu_rows()
+                    data['sysinfo'] = self._system_line()
+            return data
         except Exception as ex:  # noqa: BLE001 - a monitor must never crash
             return {'error': str(ex)}
 
@@ -567,7 +629,11 @@ class InferStackTUI(App):
             return
         self._fill_leases(data['leases'])
         self._fill_groups(data['groups'], data['observed'], data['assignments'])
-        self._fill_ps(data['ps'])
+        if 'ps' in data:
+            self._fill_ps(data['ps'])
+        if 'gpus' in data:
+            self._fill_gpus(data['gpus'])
+            self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
         self._update_summary(data['leases'], data['groups'], data['observed'])
         self._sync_log_services()
 
@@ -586,9 +652,12 @@ class InferStackTUI(App):
     def _update_summary(self, leases, groups, observed) -> None:
         active = sum(1 for le in leases if str(le.state) == 'active')
         running = sum(1 for g in groups if g.id in observed)
-        self.query_one('#docker', TabbedContent).border_subtitle = (
-            f'{running} running'
-        )
+        try:
+            self.query_one('#console', Collapsible).title = (
+                f'console — {running} running'
+            )
+        except Exception:  # noqa: BLE001
+            pass
         self.query_one('#leases', DataTable).border_subtitle = (
             f'{active} active / {len(leases)}'
         )
@@ -626,15 +695,83 @@ class InferStackTUI(App):
         cursor = table.cursor_row
         table.clear()
         for row in rows:
-            table.add_row(row['service'], row['state'], row['ports'] or '-')
+            table.add_row(
+                row['service'], row['status'], row['created'] or '-',
+                row['id'] or '-', row['ports'] or '-',
+            )
         if not rows:
-            table.add_row('(nothing running)', '-', '-')
+            table.add_row('(nothing running)', '-', '-', '-', '-')
+        self._restore_cursor(table, cursor)
+
+    def _fill_gpus(self, rows) -> None:
+        table = self.query_one('#gpus', DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        if rows is None:
+            table.add_row('—', 'nvidia-smi not found on this host', '-', '-', '-')
+        elif not rows:
+            table.add_row('—', '(no GPUs reported)', '-', '-', '-')
+        else:
+            for r in rows:
+                idx, name, util, used, total, temp = r
+                table.add_row(idx, name, f'{util}%',
+                              f'{used}/{total} MiB', f'{temp}°C')
         self._restore_cursor(table, cursor)
 
     @staticmethod
     def _restore_cursor(table: DataTable, row: int) -> None:
         if table.row_count:
             table.move_cursor(row=min(max(row, 0), table.row_count - 1))
+
+    # -- system info -------------------------------------------------------
+
+    def _gpu_rows(self) -> list[list[str]] | None:
+        """nvidia-smi rows, or ``None`` when nvidia-smi is unavailable."""
+        import shutil
+
+        if not shutil.which('nvidia-smi'):
+            return None
+        try:
+            out = subprocess.run(
+                ['nvidia-smi',
+                 '--query-gpu=index,name,utilization.gpu,memory.used,'
+                 'memory.total,temperature.gpu',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        rows = []
+        for line in out.stdout.splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 6:
+                rows.append(parts[:6])
+        return rows
+
+    def _system_line(self) -> str:
+        """A compact host CPU/mem/load line from /proc (best-effort)."""
+        import os
+
+        bits = []
+        try:
+            la = Path('/proc/loadavg').read_text().split()[:3]
+            bits.append('load ' + ' '.join(la))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mem = {}
+            for line in Path('/proc/meminfo').read_text().splitlines():
+                key, _, val = line.partition(':')
+                mem[key] = val.strip()
+            total = int(mem['MemTotal'].split()[0])      # kB
+            avail = int(mem['MemAvailable'].split()[0])
+            used_g = (total - avail) / 1024 / 1024
+            total_g = total / 1024 / 1024
+            bits.append(f'mem {used_g:.1f}/{total_g:.1f} GiB')
+        except Exception:  # noqa: BLE001
+            pass
+        bits.append(f'cpus {os.cpu_count()}')
+        return '   ·   '.join(bits)
 
     # -- docker ps ---------------------------------------------------------
 
@@ -672,11 +809,18 @@ class InferStackTUI(App):
                         pass
         result = []
         for row in rows:
+            ports = _fmt_ports(row) or str(row.get('Ports') or '')
+            cid = str(row.get('ID') or '')[:12]
+            # `Status` is the docker-ps STATUS column ("Up 3 minutes", "Exited
+            # (0) …") — it carries the uptime. `CreatedAt`/`RunningFor` give the
+            # creation time / age.
+            created = str(row.get('CreatedAt') or row.get('RunningFor') or '')
             result.append({
                 'service': str(row.get('Service') or row.get('Name') or '?'),
-                'state': str(row.get('State') or row.get('Status') or '?'),
-                'ports': str(row.get('Publishers') and _fmt_ports(row) or
-                             row.get('Ports') or ''),
+                'status': str(row.get('Status') or row.get('State') or '?'),
+                'created': created,
+                'id': cid,
+                'ports': ports,
             })
         return sorted(result, key=lambda r: r['service'])
 
@@ -703,7 +847,6 @@ class InferStackTUI(App):
         select = self.query_one('#logsvc', Select)
         options = [('(all services)', ALL_SERVICES)] + [(n, n) for n in names]
         select.set_options(options)
-        # keep the current selection if it still exists, else fall back to all
         select.value = (
             self._log_service if self._log_service in names else ALL_SERVICES
         )
@@ -763,6 +906,28 @@ class InferStackTUI(App):
         self._log_lines.append(line)
         self.query_one('#logs', RichLog).write(line)
 
+    # -- console tab / collapse plumbing -----------------------------------
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        try:
+            self._active_tab = self.query_one('#docker', TabbedContent).active
+        except Exception:  # noqa: BLE001
+            return
+        self.action_refresh()   # fill the newly-shown tab right away
+
+    def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
+        try:
+            self._console_collapsed = self.query_one('#console', Collapsible).collapsed
+        except Exception:  # noqa: BLE001
+            return
+        if self._console_collapsed:
+            self._terminate_logs()
+        else:
+            self._restart_logs(self._log_service)
+            self.action_refresh()
+
     # -- helpers + actions -------------------------------------------------
 
     def _status(self, message: str) -> None:
@@ -785,6 +950,21 @@ class InferStackTUI(App):
         if event.data_table.id == 'endpoints':
             self.action_serve()
 
+    def on_click(self, event: events.Click) -> None:
+        # Ctrl+click a served endpoint -> open it in Open WebUI.
+        if not getattr(event, 'ctrl', False):
+            return
+        try:
+            node, _ = self.screen.get_widget_at(event.screen_x, event.screen_y)
+        except Exception:  # noqa: BLE001
+            return
+        while node is not None:
+            if getattr(node, 'id', None) == 'endpoints':
+                self.action_open()
+                event.stop()
+                return
+            node = getattr(node, 'parent', None)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
             'btn-serve': self.action_serve,
@@ -794,6 +974,8 @@ class InferStackTUI(App):
             'btn-suggest': self.action_suggest,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
+            'btn-api-send': self.action_api_send,
+            'btn-api-test-all': self.action_api_test_all,
         }
         handler = handlers.get(event.button.id or '')
         if handler:
@@ -818,6 +1000,46 @@ class InferStackTUI(App):
             return
         self._status(f'evicting {gid}…')
         self._do_evict(gid)
+
+    # -- open in browser ---------------------------------------------------
+
+    def _ui_url(self, endpoint: str) -> str | None:
+        backend = self.controller.backend
+        port = getattr(backend, 'ui_port', None)
+        if not port:
+            return None
+        return f'http://localhost:{port}/?models={endpoint}'
+
+    def _served_endpoints(self) -> set[str]:
+        try:
+            leases, _ = self.controller.ledger.status()
+        except Exception:  # noqa: BLE001
+            return set()
+        served: set[str] = set()
+        for le in leases:
+            if le.state == LeaseState.ACTIVE:
+                served.update(le.endpoints)
+        return served
+
+    def action_open(self) -> None:
+        name = self._selected('endpoints', self._endpoint_names)
+        if not name:
+            self._status('select an endpoint to open in the browser')
+            return
+        url = self._ui_url(name)
+        if not url:
+            self._status('no Open WebUI URL (compose backend only)')
+            return
+        served = name in self._served_endpoints()
+        opened = False
+        try:
+            import webbrowser
+            opened = webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            opened = False
+        note = '' if served else '  (not served yet — start it first)'
+        tail = '' if opened else '  [copy this URL into your browser]'
+        self._status(f'open {url}{note}{tail}')
 
     # -- catalog editing (suggest + wizards) -------------------------------
 
@@ -909,6 +1131,95 @@ class InferStackTUI(App):
             self._after_mutation(f'suggested catalog merged ({added} new entries)')
         except Exception as ex:  # noqa: BLE001
             self._after_mutation(f'suggest failed: {ex}')
+
+    # -- API tester --------------------------------------------------------
+
+    def _litellm(self) -> tuple[str | None, str | None]:
+        backend = self.controller.backend
+        port = getattr(backend, 'litellm_port', None)
+        if not port:
+            return None, None
+        key = None
+        mk = getattr(backend, 'master_key', None)
+        try:
+            key = mk() if callable(mk) else None
+        except Exception:  # noqa: BLE001
+            key = None
+        return f'http://localhost:{port}', key
+
+    def _http_client(self) -> Any:
+        if self._http is not None:
+            return self._http
+        import requests
+        return requests
+
+    def _api_chat(self, model: str, prompt: str) -> str:
+        base, key = self._litellm()
+        if not base:
+            raise RuntimeError('no LiteLLM gateway (needs the compose backend)')
+        headers = {'Authorization': f'Bearer {key}'} if key else {}
+        resp = self._http_client().post(
+            f'{base}/v1/chat/completions',
+            json={
+                'model': model,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': 128, 'temperature': 0,
+            },
+            headers=headers, timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data['choices'][0]['message']['content']
+
+    def _api_log(self, line: str) -> None:
+        self._api_lines.append(line)
+        self.query_one('#api-out', RichLog).write(line)
+
+    def _selected_api_model(self) -> str | None:
+        value = self.query_one('#api-model', Select).value
+        return None if value is Select.BLANK else str(value)
+
+    def action_api_send(self) -> None:
+        model = self._selected_api_model()
+        if not model:
+            self._status('pick a model in the API tab first')
+            return
+        prompt = (self.query_one('#api-prompt', Input).value.strip()
+                  or 'Say hello in one short sentence.')
+        self._api_log(f'> [{model}] {prompt}')
+        self._do_api_send(model, prompt)
+
+    def action_api_test_all(self) -> None:
+        models = sorted(self.catalog.endpoints)
+        if not models:
+            self._status('no endpoints to test')
+            return
+        self._api_log(f'— testing {len(models)} endpoint(s) —')
+        self._do_api_test_all(models)
+
+    @work(thread=True, group='api')
+    def _do_api_send(self, model: str, prompt: str) -> None:
+        try:
+            out = self._api_chat(model, prompt)
+            self.call_from_thread(self._api_log, f'  [{model}] {out}')
+        except Exception as ex:  # noqa: BLE001
+            self.call_from_thread(self._api_log, f'  [{model}] ERROR: {ex}')
+
+    @work(thread=True, group='api')
+    def _do_api_test_all(self, models: list[str]) -> None:
+        import time
+
+        for model in models:
+            start = time.perf_counter()
+            try:
+                self._api_chat(model, 'Reply with the single word: ok')
+                dt = time.perf_counter() - start
+                self.call_from_thread(
+                    self._api_log, f'  ✓ {model}  ({dt:.1f}s)'
+                )
+            except Exception as ex:  # noqa: BLE001
+                self.call_from_thread(self._api_log, f'  ✗ {model}  {ex}')
+        self.call_from_thread(self._api_log, '— done —')
 
     # Mutations converge the backend (docker up/down, possibly slow) off the UI
     # thread; results + a refresh are marshalled back on.

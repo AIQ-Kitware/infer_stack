@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -125,9 +126,16 @@ def test_tui_has_docker_logs_and_ps_tabs():
         async with app.run_test() as pilot:
             await pilot.pause()
             tabs = app.query_one('#docker', TabbedContent)
-            assert {p.id for p in tabs.query('TabPane')} == {'tab-logs', 'tab-ps'}
-            # the ps table renders (empty -> a placeholder row)
-            assert app.query_one('#ps', DataTable).row_count >= 1
+            assert {p.id for p in tabs.query('TabPane')} == {
+                'tab-logs', 'tab-ps', 'tab-system', 'tab-api'
+            }
+            # the ps table renders (empty -> a placeholder row) with the docker
+            # ps columns the user asked for (status/uptime, created, id).
+            ps = app.query_one('#ps', DataTable)
+            labels = [str(c.label) for c in ps.columns.values()]
+            assert 'status (uptime)' in labels
+            assert 'created' in labels
+            assert 'container id' in labels
 
     _run(scenario)
 
@@ -272,6 +280,139 @@ def test_tui_empty_catalog_shows_suggest_hint():
             assert 'suggest' in help_text.lower()
 
     _run(scenario)
+
+
+def test_tui_ps_rows_parse_status_created_and_id():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    sample = json.dumps([
+        {'Service': 'litellm', 'Status': 'Up 3 minutes', 'State': 'running',
+         'CreatedAt': '2026-06-19 00:00:00 -0400', 'ID': 'abcdef1234567890',
+         'Publishers': [{'PublishedPort': 14042, 'TargetPort': 4000}]},
+    ])
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # stub the backend's compose seam
+            backend = controller.backend
+            import tempfile
+            f = tempfile.NamedTemporaryFile('w', suffix='.yml', delete=False)
+            f.write('services: {}\n')
+            f.close()
+            backend.compose_file = f.name
+            backend.project = 'infer-stack'
+            backend.run = lambda args: sample
+            rows = app._compose_ps_rows()
+            assert rows[0]['status'] == 'Up 3 minutes'
+            assert rows[0]['created'].startswith('2026-06-19')
+            assert rows[0]['id'] == 'abcdef123456'        # truncated to 12
+            assert '14042->4000' in rows[0]['ports']
+
+    _run(scenario)
+
+
+def test_tui_system_tab_renders_without_nvidia_smi():
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._fill_gpus(None)             # nvidia-smi unavailable -> hint row
+            gpus = app.query_one('#gpus', DataTable)
+            assert gpus.row_count == 1
+            assert 'cpus' in app._system_line()
+
+    _run(scenario)
+
+
+def test_tui_collapsed_console_skips_expensive_polling():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._active_tab = 'tab-ps'
+            app._console_collapsed = True
+            assert 'ps' not in app._collect()          # collapsed -> no ps poll
+            app._console_collapsed = False
+            assert 'ps' in app._collect()              # visible -> polled
+            app._active_tab = 'tab-logs'
+            assert 'ps' not in app._collect()          # other tab -> no ps poll
+
+    _run(scenario)
+
+
+def test_tui_open_builds_openwebui_url():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.ui_port = 13000
+            assert app._ui_url('qwen-coder') == (
+                'http://localhost:13000/?models=qwen-coder'
+            )
+
+    _run(scenario)
+
+
+def test_tui_api_tester_sends_via_injected_http():
+    from textual.widgets import Select
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'choices': [{'message': {'content': 'pong'}}]}
+
+    class _HTTP:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            return _Resp()
+
+    http = _HTTP()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None, http=http)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.litellm_port = 14042
+            # models from the catalog populate the API selector
+            assert app.query_one('#api-model', Select).value == 'qwen-coder'
+            app.action_api_send()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any('pong' in line for line in app._api_lines)
+
+    _run(scenario)
+    assert http.calls and http.calls[0][0].endswith('/v1/chat/completions')
 
 
 def test_tui_logs_stream_from_injected_source():
