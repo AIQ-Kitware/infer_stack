@@ -12,8 +12,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `Up/Down/Purge/Deploy/Env/Ollama*` runtime verbs), plus their tests
   (~5k LOC). The ollama and kubeai *concepts* are retained (catalog
   `engine: ollama`, leasing coalescing, `kubeai_ops`/`backends/kubeai_renderer`)
-  for when those backends are implemented. (`resolver`/`validator`/old top-level
-  `catalog.py` + the legacy `context` plan helpers are slated for the next pass.)
+  for when those backends are implemented. Follow-up pass also removed the
+  pre-leasing `resolver`, `validator`, the `cli/compose` + `cli/probes` shims,
+  and the superseded `backends/compose_renderer` (replaced by
+  `leasing/compose`); carved `cli/context` down to `_apply_path_overrides` +
+  `effective_inventory`. (The old top-level `catalog.py` + the now-dead helpers
+  inside `config.py` are an internal-only follow-up — they no longer surface in
+  the CLI.)
 * `infer-stack status` is now a **leasing-native holistic overview** — backend,
   data/config dirs, catalog (with model/endpoint counts), settings, ledger, and
   compose-project locations, plus a leasing summary (active leases / live

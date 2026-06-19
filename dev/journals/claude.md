@@ -1678,3 +1678,37 @@ kubeai_generated_dir); trim once config.py's legacy paths go.
 Risk/uncertainty: the new StatusCLI is unverified against a real populated stack
 (only the leases-present unit test). The deferred cluster is where the remaining
 breakage risk lives. Confident the deletion is clean (graph-driven, suite green).
+
+## 2026-06-19 14:30:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Legacy sweep Phase 2.
+
+2a: deleted resolver.py (1053) + validator.py (314) — imported only by
+cli/context — after carving context down to the two helpers the leasing surface
+actually uses (_apply_path_overrides, effective_inventory). Also deleted the
+cli/compose + cli/probes shims (only the deleted commands used them) and trimmed
+cli/__init__'s context/compose/probes re-exports. Rewrote ConfigPathsCLI to
+report current locations only (config_root, settings.yaml, catalog.yaml,
+data_root, leasing ledger/compose) instead of the old config.yaml/models.yaml/
+generated_dir/state groups; updated its tests. ~2700 LOC.
+
+2b: deleted backends/compose_renderer.py (superseded by leasing/compose) and
+slimmed backends/__init__ to just the kubeai renderer (kept as the kubeai
+concept per Jon). The whole backends package is now unimported except itself —
+kubeai_renderer is deliberately retained for when that backend lands.
+
+Deliberately deferred (internal-only, no CLI surface): the old top-level
+catalog.py and the now-dead helper chain inside config.py (builtin_*_catalog,
+the catalog loader, initial_config/deep_merge/load_yaml/etc. — all 0 external
+callers). config.py stays for normalized_output/normalized_state/
+default_state_paths + DEFAULT_PORTS/PINNED_IMAGES/KUBEAI_GENERATED_SUBDIR; the
+dead chain is interwoven with initial_config and would need careful
+function-boundary excision. Judgment call: at ~7800 LOC removed across Phase 1+2
+with the suite green throughout, the risk of nicking a kept config function for
+a maintainer-internal tidy wasn't worth doing at the tail of a long session.
+The "two catalogs" (top-level catalog.py vs leasing/catalog.py) confusion is the
+one remaining legacy-naming smell; flagged for a focused follow-up.
+
+Confident: every deletion was import-graph-driven and verified green. Next up is
+the TUI top-level-tabs reorg + catalog management (edit/remove, advanced
+endpoint params) + docker control + model cache, all on the clean base.
