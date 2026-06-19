@@ -311,6 +311,13 @@ _SETTINGS: tuple[_Setting, ...] = (
         'choice', 'compose', ('compose', 'kubeai', 'null'),
     ),
     _Setting(
+        'litellm', 'Render the LiteLLM gateway (one OpenAI base_url for all aliases)',
+        'Render the LiteLLM gateway with the compose stack (true | false). On by '
+        'default; turn off for a lean stack where Open WebUI talks to the '
+        'upstreams (e.g. an Ollama daemon) directly.',
+        'bool', True,
+    ),
+    _Setting(
         'ui', 'Manage an Open WebUI alongside the stack',
         'Render a managed Open WebUI with the compose stack (true | false).',
         'bool', True,

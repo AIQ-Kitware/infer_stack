@@ -546,6 +546,62 @@ def test_render_no_open_webui_when_ui_off(tmp_path):
     assert 'open-webui' not in rc.compose['services']
 
 
+def _render_ui(deployments, assigns, tmp_path, **kw):
+    state = {**STATE, 'open_webui': '/cache/open-webui'}
+    images = {**IMAGES, 'open_webui': 'ow:test'}
+    return render_compose(
+        deployments, assigns, images=images, ports=PORTS, state=state,
+        ui=True, ui_port=13000, litellm_master_key='sk-x', aux_dir=tmp_path,
+        **kw,
+    )
+
+
+def test_open_webui_connects_ollama_daemon_directly(tmp_path):
+    """No gateway: the UI talks straight to the Ollama daemon's native API, so
+    you can pull/run models from the UI — a drop-in for hand-run ollama+webui."""
+    rc = _render_ui([ollama('daemon')], {'daemon': [0]}, tmp_path, litellm=False)
+    assert 'litellm' not in rc.compose['services']
+    env = rc.compose['services']['open-webui']['environment']
+    assert env['ENABLE_OLLAMA_API'] == 'True'
+    assert env['OLLAMA_BASE_URL'] == 'http://ollama-daemon:11434'
+    # nothing OpenAI to point at -> that connection is off, not dangling
+    assert env['ENABLE_OPENAI_API'] == 'False'
+    assert 'OPENAI_API_BASE_URL' not in env
+    # the per-model upstream comes and goes, so the UI does not hard-depend on it
+    assert 'depends_on' not in rc.compose['services']['open-webui']
+
+
+def test_open_webui_enables_ollama_api_alongside_litellm(tmp_path):
+    """Gateway on AND an Ollama daemon: chat routes through LiteLLM (one base_url
+    for every alias) while the native Ollama connection still gives the UI its
+    pull/manage panel."""
+    rc = _render_ui([ollama('daemon')], {'daemon': [0]}, tmp_path, litellm=True)
+    env = rc.compose['services']['open-webui']['environment']
+    assert env['OPENAI_API_BASE_URL'] == 'http://litellm:4000/v1'
+    assert env['OPENAI_API_KEY'] == 'sk-x'
+    assert env['ENABLE_OLLAMA_API'] == 'True'
+    assert env['OLLAMA_BASE_URL'] == 'http://ollama-daemon:11434'
+    assert rc.compose['services']['open-webui']['depends_on'] == ['litellm']
+
+
+def test_open_webui_points_at_vllm_v1_without_litellm(tmp_path):
+    """No gateway, a single vLLM upstream: the UI's OpenAI connection points at
+    that process's own /v1."""
+    rc = _render_ui([vllm('grp-a', served='a')], {'grp-a': [0]}, tmp_path,
+                    litellm=False)
+    name = vllm_service_name(vllm('grp-a', served='a'))
+    env = rc.compose['services']['open-webui']['environment']
+    assert env['OPENAI_API_BASE_URL'] == f'http://{name}:8000/v1'
+    assert env['ENABLE_OLLAMA_API'] == 'False'
+
+
+def test_no_open_webui_without_litellm_or_upstreams(tmp_path):
+    """No gateway and nothing to point at -> no standing UI (an empty desired
+    set then has nothing to run and converge tears the project down)."""
+    rc = _render_ui([], {}, tmp_path, litellm=False)
+    assert 'open-webui' not in rc.compose['services']
+
+
 def test_litellm_router_settings_present(tmp_path):
     rc = render_compose(
         [vllm('grp-a', served='a')], {'grp-a': [0]},
@@ -732,8 +788,16 @@ def test_envfile_carries_managed_api_key(tmp_path):
 
 
 def test_access_none_without_litellm(tmp_path):
-    be = make_backend(tmp_path, litellm=False)
+    # No gateway and no UI -> no single access point.
+    be = make_backend(tmp_path, litellm=False, ui=False)
     assert be.access(['x']) is None
+
+
+def test_access_reports_ui_url_without_litellm(tmp_path):
+    # No gateway but a managed UI -> the UI is still a useful access point.
+    be = make_backend(tmp_path, litellm=False, ui=True)
+    info = be.access(['x'])
+    assert info == {'ui_url': 'http://127.0.0.1:13000'}
 
 
 def test_probe_ready_requires_routable_alias(tmp_path):
@@ -755,6 +819,18 @@ def test_ollama_probe_pulls_tag_then_ready(tmp_path):
     r = be.probe_ready(g, 'daemon')
     assert r.ready is True
     # the tag was pulled into the daemon via `docker compose exec ... ollama pull`
+    pulls = [c for c in be.run.calls if 'pull' in c]
+    assert pulls and 'qwen3.5:4b' in pulls[0]
+
+
+def test_ollama_probe_pulls_tag_without_litellm(tmp_path):
+    # A lean --no-litellm Ollama stack must still pull its declared anchor tag;
+    # readiness for that daemon *is* the pull (no gateway to probe).
+    be = make_backend(tmp_path, litellm=False)
+    g = ollama('daemon', tag='qwen3.5:4b')
+    be.converge([g])
+    r = be.probe_ready(g, 'daemon')
+    assert r.ready is True
     pulls = [c for c in be.run.calls if 'pull' in c]
     assert pulls and 'qwen3.5:4b' in pulls[0]
 

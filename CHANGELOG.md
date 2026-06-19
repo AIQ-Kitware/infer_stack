@@ -5,6 +5,20 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **Open WebUI can manage Ollama's own models.** Open WebUI is no longer locked
+  to the LiteLLM gateway with `ENABLE_OLLAMA_API=False`. It now holds two
+  connections: an **OpenAI** connection (the gateway when on, else a single
+  upstream's own `/v1`) for chat, and a **native Ollama** connection pointed
+  straight at any Ollama daemon, so you can pull/run/delete models from the UI
+  and have the daemon load them on demand — a true drop-in for a hand-run
+  `ollama` + Open WebUI stack.
+* **LiteLLM gateway is now optional** — `--litellm` / `--no-litellm` (and
+  `config set litellm`). With it off, Open WebUI (still on by default) talks to
+  the rendered upstreams directly, and `access()` reports the UI URL. Open WebUI
+  also renders without a gateway whenever there is an upstream to point at.
+  Ollama tags are now pulled on `serve` even with the gateway off.
+* New tutorial: `dev/ollama-openwebui-tutorial.md` — stand up a self-managing
+  Ollama + Open WebUI box (GPU-pinned) entirely from the CLI.
 * TUI **API tab** is now a proper console: shows the gateway + Open WebUI URLs
   (ctrl+click to open), **List models** (GET `/v1/models` on the gateway) beside
   Send / Test-all, a live **curl** preview with a **Copy curl** button, and an

@@ -47,6 +47,8 @@ from .placement import plan_placement
 
 LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
 VLLM_HOST_PORT_BASE = 18000
+VLLM_CONTAINER_PORT = 8000
+OLLAMA_CONTAINER_PORT = 11434
 LITELLM_CONTAINER_PORT = 4000
 STATE_FILENAME = 'leasing-compose-state.json'
 COMPOSE_FILENAME = 'docker-compose.yml'
@@ -315,15 +317,32 @@ def _open_webui_service(
     images: dict[str, str],
     state: dict[str, str],
     master_key: str | None,
+    *,
+    openai_urls: list[str] | None = None,
+    ollama_urls: list[str] | None = None,
+    depends_on: list[str] | None = None,
 ) -> dict[str, Any]:
-    """A managed Open WebUI pointed at the LiteLLM front door.
+    """A managed Open WebUI pointed at whatever front door is available.
 
-    The spec is intentionally independent of which models are live: it talks to
-    the ``litellm`` service over the compose network at a fixed URL, so it is
-    byte-for-byte identical across converges. ``docker compose up -d`` therefore
-    leaves it running when models are added/removed/switched (only LiteLLM is
-    recreated on a routing change), giving the legacy "the UI never blinks"
-    behavior. Chat history persists under the data dir.
+    Open WebUI holds two independent kinds of connection, wired here from the
+    rendered services:
+
+    * **OpenAI** (``openai_urls``) — the chat/completions front door. This is the
+      LiteLLM gateway when it is enabled (so every declared endpoint alias is
+      reachable at one URL); with LiteLLM off it falls back to the rendered
+      upstreams' own ``/v1`` (a single vLLM/Ollama service, or several joined as
+      ``OPENAI_API_BASE_URLS``). With nothing to point at, the OpenAI API is
+      disabled rather than left dangling.
+    * **Ollama** (``ollama_urls``) — the *native* Ollama API of any rendered
+      Ollama daemon. This is what lets you pull/run/delete models from the UI
+      and have the daemon load them on demand, independent of LiteLLM — i.e. a
+      true drop-in for a hand-run ``ollama`` + Open WebUI stack.
+
+    The spec is kept as independent of which models are live as it can be: the
+    LiteLLM URL is fixed, and the Ollama daemon's service name is its stable
+    structural id, so adding/removing other models does not rewrite this service
+    and ``docker compose up -d`` leaves the UI running (the legacy "the UI never
+    blinks" behavior). Chat history persists under the data dir.
     """
     key_value = (
         master_key if master_key is not None else '${' + API_KEY_ENV + ':-sk-local}'
@@ -331,24 +350,41 @@ def _open_webui_service(
     data_path = state.get('open_webui') or str(
         Path(next(iter(state.values()), '.')).parent / 'open-webui'
     )
-    return {
+    openai_urls = list(openai_urls or [])
+    ollama_urls = list(ollama_urls or [])
+    env: dict[str, str] = {
+        # Single-user workstation default; the port shouldn't be exposed
+        # publicly. Tracked as a knob in dev/leasing-followups.md.
+        'WEBUI_AUTH': 'False',
+    }
+    if openai_urls:
+        env['ENABLE_OPENAI_API'] = 'True'
+        if len(openai_urls) == 1:
+            env['OPENAI_API_BASE_URL'] = openai_urls[0]
+        else:
+            env['OPENAI_API_BASE_URLS'] = ';'.join(openai_urls)
+        env['OPENAI_API_KEY'] = key_value
+    else:
+        env['ENABLE_OPENAI_API'] = 'False'
+    if ollama_urls:
+        env['ENABLE_OLLAMA_API'] = 'True'
+        if len(ollama_urls) == 1:
+            env['OLLAMA_BASE_URL'] = ollama_urls[0]
+        else:
+            env['OLLAMA_BASE_URLS'] = ';'.join(ollama_urls)
+    else:
+        env['ENABLE_OLLAMA_API'] = 'False'
+    service: dict[str, Any] = {
         'image': images['open_webui'],
         'ports': [f'{host_port}:{OPEN_WEBUI_CONTAINER_PORT}'],
-        'environment': {
-            'OPENAI_API_BASE_URL': (
-                f'http://{LITELLM_SERVICE}:{LITELLM_CONTAINER_PORT}/v1'
-            ),
-            'OPENAI_API_KEY': key_value,
-            # Single-user workstation default; the port shouldn't be exposed
-            # publicly. Tracked as a knob in dev/leasing-followups.md.
-            'WEBUI_AUTH': 'False',
-            'ENABLE_OLLAMA_API': 'False',
-        },
+        'environment': env,
         'volumes': [f'{data_path}:/app/backend/data'],
-        'depends_on': [LITELLM_SERVICE],
         'restart': 'unless-stopped',
         'labels': {ENGINE_LABEL: 'open-webui'},
     }
+    if depends_on:
+        service['depends_on'] = sorted(depends_on)
+    return service
 
 
 def _nginx_conf(*, litellm: bool, ui: bool) -> str:
@@ -469,6 +505,10 @@ def render_compose(
     """
     services: dict[str, Any] = {}
     service_map: dict[str, str] = {}
+    # In-network upstreams Open WebUI can connect to directly when there is no
+    # LiteLLM gateway (or, for Ollama, *in addition* to it — see below).
+    vllm_v1_urls: list[str] = []      # OpenAI /v1 of each vLLM process
+    ollama_native_urls: list[str] = []  # native Ollama API of each daemon
     ordered = sorted(deployments, key=lambda g: (g.created_at, g.id))
     vllm_i = 0
     ollama_i = 0
@@ -481,11 +521,13 @@ def render_compose(
             port = VLLM_HOST_PORT_BASE + vllm_i
             vllm_i += 1
             services[name] = _vllm_service(deployment, gpus, port, images, state)
+            vllm_v1_urls.append(f'http://{name}:{VLLM_CONTAINER_PORT}/v1')
         elif deployment.engine == 'ollama':
             name = f'ollama-{deployment.id}'
             port = ports.get('ollama', DEFAULT_PORTS['ollama']) + ollama_i
             ollama_i += 1
             services[name] = _ollama_service(deployment, gpus, port, images, state)
+            ollama_native_urls.append(f'http://{name}:{OLLAMA_CONTAINER_PORT}')
         else:
             continue
         service_map[name] = deployment.id
@@ -530,10 +572,36 @@ def render_compose(
             master_key=litellm_master_key,
             config_hash=config_hash,
         )
-        if ui:
-            services[OPEN_WEBUI_SERVICE] = _open_webui_service(
-                ui_port, images, state, litellm_master_key
-            )
+
+    # Open WebUI is its own standing front door, rendered whenever ``ui`` is set
+    # — it does NOT require LiteLLM. Its OpenAI connection prefers the gateway
+    # (one URL covers every alias) and falls back to the rendered vLLM upstreams'
+    # own /v1 when there is no gateway. Its native Ollama connection always
+    # points straight at any Ollama daemon, so you can pull/run models from the
+    # UI and have the daemon load them on demand — a true drop-in for a
+    # hand-run ollama + Open WebUI stack. depends_on lists only LiteLLM (the one
+    # service guaranteed present alongside the UI); the per-model upstreams come
+    # and go, so the UI tolerates them being absent rather than hard-depending.
+    # With a gateway the UI is a standing front door (renders even at zero
+    # models). Without one it is only meaningful pointed at a live upstream, so
+    # render it only when there is something to connect to — otherwise an empty
+    # desired set has nothing to run and converge tears the project down.
+    if ui and (litellm or vllm_v1_urls or ollama_native_urls):
+        if litellm:
+            openai_urls = [f'http://{LITELLM_SERVICE}:{LITELLM_CONTAINER_PORT}/v1']
+            ui_depends = [LITELLM_SERVICE]
+        else:
+            openai_urls = list(vllm_v1_urls)
+            ui_depends = []
+        services[OPEN_WEBUI_SERVICE] = _open_webui_service(
+            ui_port,
+            images,
+            state,
+            litellm_master_key,
+            openai_urls=openai_urls,
+            ollama_urls=ollama_native_urls,
+            depends_on=ui_depends,
+        )
 
     # Optional single-port HTTP reverse proxy fronting the gateway (+ UI). Needs
     # the gateway, so it's only rendered alongside litellm.
@@ -893,10 +961,13 @@ class ComposeBackend:
         """Where a client reaches these endpoints, for the env-file descriptor.
 
         With the LiteLLM front door, that is one ``base_url`` and the request
-        model name is the endpoint alias itself. Returns ``None`` (let the CLI
-        fall back) when LiteLLM is off, since there is then no single base URL.
+        model name is the endpoint alias itself. With LiteLLM off there is no
+        single base URL, but a managed Open WebUI (if on) is still a useful
+        access point, so report just its URL rather than ``None``.
         """
         if not self.litellm:
+            if self.ui:
+                return {'ui_url': f'http://127.0.0.1:{self.ui_port}'}
             return None
         info: dict[str, Any] = {
             'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
@@ -946,14 +1017,19 @@ class ComposeBackend:
         """
         if deployment.id not in self.observe():
             return Readiness(False, 'container not running')
-        if not self.litellm:
-            return Readiness(True, 'container running')
         require_generation = self.require_generation
         if deployment.engine == 'ollama':
+            # Pull the declared tag regardless of the gateway — a lean
+            # `--no-litellm` Ollama stack must still make its anchor model
+            # present, and the pull is what readiness means for that daemon.
             error = self._ensure_ollama_tag(deployment, endpoint)
             if error:
                 return Readiness(False, error)
             require_generation = True  # warm the tag so it is resident
+        if not self.litellm:
+            # No gateway to probe for routability; the container is up (and any
+            # Ollama tag has been pulled), so it is as ready as we can confirm.
+            return Readiness(True, 'container running')
         headers = {'Authorization': f'Bearer {self.master_key()}'}
         ok, reason = openai_ready(
             base_url=f'http://127.0.0.1:{self.litellm_port}/v1',

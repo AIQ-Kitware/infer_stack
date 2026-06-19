@@ -117,6 +117,22 @@ def _resolve_ui(config) -> bool:
     return _coerce_bool(get_setting('ui'), True)
 
 
+def _resolve_litellm(config) -> bool:
+    """LiteLLM gateway on/off: explicit --litellm/--no-litellm wins, else
+    `config set litellm`, else on by default.
+
+    With the gateway off there is no single OpenAI ``base_url`` fronting every
+    alias; Open WebUI (if on) then talks to the rendered upstreams directly —
+    handy for a lean ``ollama + Open WebUI`` stack that manages its own models.
+    """
+    from ..paths import get_setting
+
+    flag = getattr(config, 'litellm', None)
+    if flag is not None:
+        return bool(flag)
+    return _coerce_bool(get_setting('litellm'), True)
+
+
 def _resolve_reverse_proxy(config) -> tuple[bool, int, str | None]:
     """Resolve the reverse-proxy front door: (enabled, port, byo_config_path).
 
@@ -186,6 +202,7 @@ def _make_backend(config, *, interactive: bool = False):
             inventory=detect_inventory(),
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
             skip_display=_resolve_skip_display(config),
+            litellm=_resolve_litellm(config),
             ui=_resolve_ui(config),
             reverse_proxy=rp_enabled,
             reverse_proxy_port=rp_port,
@@ -445,6 +462,14 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         isflag=True,
         help='Readiness requires a real generation, not just model listing '
         '(compose backend; Ollama always generates to warm the tag).',
+    )
+    litellm = scfg.Value(
+        None,
+        isflag=True,
+        help='Render the LiteLLM gateway — one OpenAI base_url fronting every '
+        'endpoint alias (compose backend). On by default; use --no-litellm for '
+        'a lean stack where Open WebUI talks to the upstreams (e.g. an Ollama '
+        'daemon) directly. Overrides `config set litellm …`.',
     )
     ui = scfg.Value(
         None,
