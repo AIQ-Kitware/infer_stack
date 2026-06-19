@@ -164,12 +164,17 @@ infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stac
 (or `→N` for one that's slated but not started yet) — so it's obvious when
 something is still warming up vs truly live.
 
-> **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI:
+> **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI
+> (run `infer-stack config init` once first):
 > a **catalog** pane to pick an endpoint and serve it (`s`/Enter), live
-> **leases** + **groups** tables, and a **logs** pane that tails `docker compose
-> logs -f` (a dropdown points it at one service or all). Controls: `s` serve,
-> `d` release, `e` evict, `a` release-all, `tab` to move between panes, `q` quit.
-> Opt-in extra: `pip install "infer-stack[tui]"`.
+> **leases** + **groups** tables, and a **docker** pane with two tabs — a live
+> `logs -f` tail (a dropdown points it at one service or all) and a `ps`
+> snapshot. New here? The catalog buttons (or `g`) **Suggest** a set sized to
+> your GPUs, and `m` / `n` open wizards to add a model / endpoint by hand.
+> Controls: `s` serve, `d` release, `e` evict, `a` release-all, `g` suggest,
+> `m`/`n` add, `tab` to move between panes, `q` quit. Resize panes by dragging
+> the splitter bars (or `[` `]` / `-` `+`). Opt-in extra:
+> `pip install "infer-stack[tui]"`.
 
 ---
 

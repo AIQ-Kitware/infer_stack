@@ -1375,3 +1375,75 @@ first-class equivalent, not a divergent sibling — that property is also what l
 us reason that `apply` hides no state. (3) Idempotency is a property of
 reconcile operations, not of intent-declaring ones; put it where it's natural
 rather than special-casing a refcount.
+
+## 2026-06-19 00:09:12 -0400
+
+Model: claude-opus-4-8 (Claude Code, "fast" Opus). Continuation of the leasing
+TUI work.
+
+User intent (compressed): make the TUI usable by a newcomer and stop it feeling
+janky. Concretely: (1) an orange / white / very-dark-gray theme; (2) "feel
+faster or more responsive"; (3) a real bug — `docker compose` progress was
+overwriting the top-left of the screen for a moment when serving; (4) turn the
+logs pane into a docker *tab* (logs **or** ps); (5) require `config init` before
+launch, and if there are no models offer a button that runs the new `suggest`
+tool to populate the catalog; (6) wizards to add models/endpoints; (7) more
+explanatory text so new users can intuit what's going on; (8) drag-to-resize
+panes.
+
+What I did (all in `infer_stack/tui.py`, `tests/test_tui.py`, plus a small
+`TuiCLI` change in `cli/commands_leasing.py`):
+
+- Theme: registered a custom `textual.theme.Theme` (`infer-orange`) — dark-gray
+  canvas, white text, one warm orange accent that only shows on the focused
+  pane's border. Replaces the borrowed `nord`.
+- Bleed bug: root cause was `_default_docker_run` = `check_output` (captures
+  stdout, lets **stderr** through), and `docker compose up -d`/`down` write all
+  progress to stderr → straight onto the full-screen terminal. Fix lives at the
+  TUI layer (didn't touch the CLI's runner, where stderr-to-terminal is
+  desirable): on mount I wrap `backend.run` with a `capture_output=True` runner
+  that routes the noisy verbs' stderr into the logs pane and swallows `ps`
+  polling. Felt cleaner than changing the shared default.
+- Responsiveness: the periodic refresh used to call `backend.observe()`
+  (`docker compose ps`) **on the UI thread** every 3s — a real freeze. Split
+  into `_collect()` (thread-safe, no widgets) + `_render()` (UI thread);
+  `on_mount` does one synchronous `_refresh_now()` for an instant first paint
+  (and so the headless tests still see data after a single `pause()`), while the
+  interval + `r` + post-mutation refresh go through a `@work(thread=True)`
+  worker. The bleed fix doubles as responsiveness (no terminal corruption).
+- Docker tab: logs pane is now a `TabbedContent` — "Logs" (the existing Select +
+  RichLog, IDs preserved) and "Status · ps" (a DataTable fed by a best-effort
+  compose-ps parse in the collect worker).
+- Onboarding: `TuiCLI` now hard-requires `settings.yaml` (i.e. `config init`)
+  and *tolerates a missing/empty catalog* via a new `_load_catalog_for_tui`
+  (returns an empty Catalog + the path it would write). Empty state shows a
+  help line steering to Suggest/add. Suggest (`g`/button) calls the other
+  agent's now-committed `leasing.suggest.suggest_catalog` + `commands_catalog`
+  load/save helpers (imported, never edited), merges, reloads in place.
+- Wizards: `_AddModelScreen` / `_AddEndpointScreen` ModalScreens with Inputs;
+  results written through `commands_catalog._load_raw/_save_raw` (which validate)
+  and the catalog reloaded. `m` / `n` or sidebar buttons.
+- Drag-resize: a tiny `_Divider(Static)` that captures the mouse and reports
+  axis-delta to a callback (`_drag_sidebar` / `_drag_logs`), alongside the
+  existing `[` `]` / `-` `+` keys. Vertical bar between sidebar/main, horizontal
+  bar between tables/docker.
+
+State of mind / risks: as always, none of this has been *eyeballed on a real
+terminal* — headless pilot proves it composes, tabs, resizes, serves, streams,
+and writes the catalog, but the orange theme's actual feel, the drag ergonomics,
+and (critically) whether the stderr-capture fully kills the corner-bleed are
+only verifiable by running `infer-stack tui` on a GPU host (yardrat). The
+suggest path in particular only runs under real hardware detection. Confident
+about: the threading split (clear win, observe was blocking), the
+backend.run-wrapping approach (localized, reversible), and that I stayed off the
+other agent's files (their suggest CLI is committed at 4ef5147; I only import).
+8 TUI tests + full prior suite (303) green; ruff clean on changed files.
+
+Takeaways: (1) when a full-screen UI drives a subprocess, capture *both* streams
+at the UI boundary — stderr is the usual screen-corrupter, and the fix belongs
+at the UI layer, not in the shared runner where stderr is wanted. (2) Keep a
+synchronous first paint even after moving refresh to a worker: it makes the app
+feel instant *and* keeps headless tests deterministic without `wait_for_complete`
+gymnastics. (3) For a tool newcomers land in, downgrade "missing config" from an
+error to an empty-state-with-a-button — the absent catalog is the start of the
+funnel, not a failure.

@@ -181,6 +181,18 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     install hint. (This also made `SqliteStore` thread-safe —
     `check_same_thread=False` + a lock serializing write transactions — so the
     same ledger connection is usable from a converge worker thread.)
+  - TUI, second pass — made it approachable and snappier for new users:
+    a warm **orange / white / dark-gray theme**; an intro line plus per-pane
+    help text; **add-model / add-endpoint wizards** (`m` / `n`, or the sidebar
+    buttons) and a **Suggest** button (`g`) that seeds a catalog sized to your
+    GPUs via `catalog suggest`; the logs pane became a **docker tab** (live
+    `logs -f` *and* a `ps` snapshot). Panes are **drag-resizable** (grab the
+    splitter bars) in addition to the `[` `]` / `-` `+` keys. Responsiveness:
+    the periodic refresh + `docker compose ps` now run on a worker thread (no UI
+    freeze), and docker's own `up`/`down` progress is captured into the logs
+    pane instead of bleeding onto the screen. The TUI now requires a one-time
+    `config init`, and tolerates a missing/empty catalog (it shows the
+    empty-state + Suggest button rather than erroring).
   - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it
     (`--reverse-proxy`, or `config set reverse_proxy true`) to front the gateway
     + Open WebUI with one nginx origin — UI at `/`, the OpenAI API at `/v1` — so

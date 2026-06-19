@@ -222,6 +222,23 @@ def _load_catalog(config) -> Catalog:
         raise SystemExit(f'invalid catalog {path}: {ex}')
 
 
+def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
+    """Catalog + its path for the TUI, tolerating a missing/empty file.
+
+    The TUI is the place a brand-new user lands, so an absent catalog is not a
+    hard error here: it loads an empty catalog (the dashboard then shows the
+    empty-state with a Suggest button) and returns the path it would write to.
+    """
+    raw = config.catalog or (config_root() / 'catalog.yaml')
+    path = Path(raw).expanduser()
+    if not path.exists():
+        return Catalog.from_dict({'models': {}, 'endpoints': {}}), path
+    try:
+        return Catalog.load(path), path
+    except CatalogError as ex:
+        raise SystemExit(f'invalid catalog {path}: {ex}')
+
+
 def _resolve(catalog, names, *, sharing=None):
     try:
         return catalog.resolve_names(names, sharing=sharing)
@@ -955,6 +972,8 @@ class TuiCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
+        from ..paths import settings_path
+
         config = cls.cli(argv=argv, data=kwargs)
         try:
             from ..tui import run_tui
@@ -964,9 +983,21 @@ class TuiCLI(_LeasingCommonMixin):
                 'with `pip install "infer-stack[tui]"` (or `pip install textual`). '
                 f'[{ex}]'
             )
+        # Require a one-time `config init` first: the TUI assumes a configured
+        # world (backend, data dir, …). Without it the dashboard would launch
+        # against defaults the user never chose.
+        _apply_path_overrides(config)
+        if not settings_path().exists():
+            raise SystemExit(
+                'no settings found — run `infer-stack config init` once before '
+                f'launching the TUI (expected {settings_path()}).'
+            )
         controller = _open_controller(config)
-        catalog = _load_catalog(config)
-        return run_tui(controller, catalog, interval=float(config.interval))
+        catalog, catalog_path = _load_catalog_for_tui(config)
+        return run_tui(
+            controller, catalog,
+            interval=float(config.interval), catalog_path=str(catalog_path),
+        )
 
 
 class RenewCLI(_LeasingCommonMixin):

@@ -112,6 +112,96 @@ def test_tui_panes_are_keyboard_resizable():
     _run(scenario)
 
 
+def test_tui_has_docker_logs_and_ps_tabs():
+    from textual.widgets import DataTable, TabbedContent
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tabs = app.query_one('#docker', TabbedContent)
+            assert {p.id for p in tabs.query('TabPane')} == {'tab-logs', 'tab-ps'}
+            # the ps table renders (empty -> a placeholder row)
+            assert app.query_one('#ps', DataTable).row_count >= 1
+
+    _run(scenario)
+
+
+def test_tui_panes_drag_resize():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            w0, h0 = app._sidebar_w, app._log_h
+            app._drag_sidebar(6)            # pull the vertical splitter right
+            app._drag_logs(3)               # pull the horizontal splitter down
+            assert app._sidebar_w == w0 + 6
+            assert app._log_h == h0 - 3     # down = shorter logs
+
+    _run(scenario)
+
+
+def test_tui_add_model_wizard_writes_catalog(tmp_path):
+    import yaml
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._on_add_model({'name': 'newmod',
+                               'source': 'hf://org/NewModel'})
+            await pilot.pause()
+            assert 'newmod' in app.catalog.models        # reloaded in memory
+
+    _run(scenario)
+    on_disk = yaml.safe_load(catalog_path.read_text())
+    assert on_disk['models']['newmod']['source'] == 'hf://org/NewModel'
+
+
+def test_tui_empty_catalog_shows_suggest_hint():
+    from textual.widgets import Static
+
+    from infer_stack.leasing import (
+        Catalog,
+        Controller,
+        Ledger,
+        NullBackend,
+        SqliteStore,
+    )
+    from infer_stack.tui import InferStackTUI
+
+    controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
+    catalog = Catalog.from_dict({'models': {}, 'endpoints': {}})
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            help_text = str(app.query_one('#catalog-help', Static).render())
+            assert 'suggest' in help_text.lower()
+
+    _run(scenario)
+
+
 def test_tui_logs_stream_from_injected_source():
     from infer_stack.tui import InferStackTUI
 
