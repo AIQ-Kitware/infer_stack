@@ -648,6 +648,17 @@ def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
     assert not any(str(le.state) == 'released' for le in leases)
 
 
+def test_tui_model_cached_label(tmp_path):
+    from infer_stack.tui import InferStackTUI
+
+    hub = tmp_path / 'hub'
+    (hub / 'models--Org--Model').mkdir(parents=True)
+    assert InferStackTUI._cached_label('hf://Org/Model', hub) == 'yes'
+    assert InferStackTUI._cached_label('hf://Org/Other', hub) == 'no'
+    assert InferStackTUI._cached_label('hf://Org/Model', None) == '?'
+    assert InferStackTUI._cached_label('', hub) == '-'
+
+
 def test_tui_compose_control_runs_up(tmp_path):
     from infer_stack.tui import InferStackTUI
 

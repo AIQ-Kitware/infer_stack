@@ -10,6 +10,9 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   WebUI, reverse proxy, skip-display-GPUs) and save them to `settings.yaml`
   without dropping to YAML. Textual's command palette (ctrl+p) exposes every
   action for search.
+* TUI docker pane gained a **Control** tab (compose up/down + the rendered
+  compose-file path), and the models table now shows **quant** + a **cached**
+  flag (a cheap existence check against the HF hub cache — no slow `du`).
 * TUI catalog management — the add-endpoint wizard now exposes the runtime knobs
   that matter for serving (**tensor-parallel size, max model len, GPU memory
   fraction, raw extra vLLM args** — where data-parallel etc. go — and the

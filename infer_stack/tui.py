@@ -642,7 +642,9 @@ class InferStackTUI(App):
         self.query_one('#endpoints', DataTable).add_columns(
             'endpoint', 'model', 'engine', 'reclaim'
         )
-        self.query_one('#models', DataTable).add_columns('model', 'source')
+        self.query_one('#models', DataTable).add_columns(
+            'model', 'source', 'quant', 'cached'
+        )
         self.query_one('#leases', DataTable).add_columns(
             'id', 'owner', 'state', 'ttl', 'endpoints', 'deployment'
         )
@@ -744,10 +746,43 @@ class InferStackTUI(App):
         models = self.query_one('#models', DataTable)
         models.clear()
         self._model_names = []
+        hub = self._hf_hub_dir()
         for name in sorted(self.catalog.models):
-            models.add_row(name, getattr(self.catalog.models[name], 'source', ''))
+            m = self.catalog.models[name]
+            source = getattr(m, 'source', '') or ''
+            quant = getattr(m, 'quantization', None) or '-'
+            models.add_row(name, source, quant, self._cached_label(source, hub))
             self._model_names.append(name)
         self._update_catalog_help()
+
+    @staticmethod
+    def _hf_hub_dir() -> Path | None:
+        """Host Hugging Face hub cache dir (best-effort) for a 'cached?' check."""
+        try:
+            from .config import default_state_paths
+            hf = default_state_paths().get('hf_cache')
+            return Path(hf).expanduser() / 'hub' if hf else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _cached_label(source: str, hub: Path | None) -> str:
+        """'yes'/'no'/'-' whether a model's weights look present (no slow du)."""
+        if not source:
+            return '-'
+        if not source.startswith('hf://'):
+            try:
+                return 'yes' if Path(source).expanduser().exists() else 'no'
+            except Exception:  # noqa: BLE001
+                return '-'
+        if hub is None:
+            return '?'
+        repo = source[len('hf://'):].split('@', 1)[0]
+        try:
+            return 'yes' if (hub / f'models--{repo.replace("/", "--")}').exists() \
+                else 'no'
+        except Exception:  # noqa: BLE001
+            return '-'
 
     def _sync_api_models(self, names: list[str]) -> None:
         """Point the API model selector at the currently-ready endpoints only."""
