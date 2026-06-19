@@ -418,9 +418,11 @@ class InferStackTUI(App):
     #endpoint-actions, #lease-actions, #deployment-actions, #model-actions {
         height: auto; margin: 0 0 1 0;
     }
-    #endpoint-actions Button, #model-actions Button { width: 1fr; }
+    /* width: 1fr + min-width: 0 so several buttons share a narrow sidebar row
+       instead of overflowing it (Button's default min-width is 16). */
+    #endpoint-actions Button, #model-actions Button { width: 1fr; min-width: 0; }
     #lease-actions Button, #deployment-actions Button {
-        margin: 0 1 0 0; min-width: 11;
+        margin: 0 1 0 0; min-width: 8;
     }
     /* compact buttons: 1 row, no border box, so action bars don't eat space */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
@@ -558,15 +560,15 @@ class InferStackTUI(App):
                 yield DataTable(id='endpoints', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
-                    yield Button('▶ Serve', id='btn-serve', variant='primary')
-                    yield Button('＋ Add', id='btn-add-endpoint')
+                    yield Button('Serve', id='btn-serve', variant='primary')
+                    yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
                 yield _Divider('y', self._drag_models, id='csplit')
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='model-actions'):
-                    yield Button('＋ Add', id='btn-add-model')
+                    yield Button('Add', id='btn-add-model')
                     yield Button('Remove', id='btn-remove-model')
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):

@@ -179,6 +179,29 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
     _run(scenario)
 
 
+def test_tui_endpoint_action_buttons_fit_the_sidebar():
+    # Regression: 4 buttons at width:1fr were defeated by Button's default
+    # min-width (16) and overflowed off the narrow sidebar — Edit/Remove only
+    # appeared after widening. They must all fit at the default sidebar width.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            sb = app.query_one('#sidebar').region
+            for bid in ('#btn-serve', '#btn-add-endpoint', '#btn-edit-endpoint',
+                        '#btn-remove-endpoint'):
+                r = app.query_one(bid).region
+                assert r.width > 0 and r.x >= sb.x and \
+                    r.x + r.width <= sb.x + sb.width, f'{bid} overflows sidebar'
+
+    _run(scenario)
+
+
 def test_tui_monitor_panes_are_collapsible():
     from textual.widgets import Collapsible
 
