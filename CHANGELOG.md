@@ -17,8 +17,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   the rendered upstreams directly, and `access()` reports the UI URL. Open WebUI
   also renders without a gateway whenever there is an upstream to point at.
   Ollama tags are now pulled on `serve` even with the gateway off.
-* New tutorial: `dev/ollama-openwebui-tutorial.md` — stand up a self-managing
-  Ollama + Open WebUI box (GPU-pinned) entirely from the CLI.
+* New tutorial: `docs/source/manual/ollama-openwebui-tutorial.md` — stand up a
+  self-managing Ollama + Open WebUI box (GPU-pinned) entirely from the CLI. Adds
+  a `docs/source/manual/` section to the Sphinx docs (the leasing demo moved
+  there too).
 * TUI **API tab** is now a proper console: shows the gateway + Open WebUI URLs
   (ctrl+click to open), **List models** (GET `/v1/models` on the gateway) beside
   Send / Test-all, a live **curl** preview with a **Copy curl** button, and an

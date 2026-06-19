@@ -149,7 +149,7 @@ the config is static — same hash → no restart).
 
 ## Other noted smells (lower priority)
 
-See `dev/leasing-demo.md` §"Ergonomic notes". RESOLVED by the CLI reorg
+See `docs/source/manual/leasing-demo.md` §"Ergonomic notes". RESOLVED by the CLI reorg
 (`dev/cli-redesign.md`): persisted default backend (`config set backend`),
 durable storage location (`config set data_dir`, honored by `data_root()`), and
 a managed `HF_TOKEN` slot (`secret set HF_TOKEN=…`). ALSO RESOLVED: Open WebUI

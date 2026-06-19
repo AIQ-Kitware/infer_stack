@@ -6,7 +6,8 @@
 
 > **Heads up — the leasing model is now the primary workflow.** Declare models
 > in a catalog (`infer-stack catalog …`) and `acquire`/`serve`/`run` endpoints
-> on demand; see `dev/leasing-demo.md` and `infer-stack help tree`. The
+> on demand; see `docs/source/manual/` (the Ollama + Open WebUI tutorial and the
+> leasing demo) and `infer-stack help tree`. The
 > **named stack profiles** documented below (`setup`/`render`/`up`/`switch`/…)
 > are the pre-leasing model and now live under **`infer-stack legacy <command>`**
 > (e.g. `infer-stack legacy render`). This README still describes that legacy
