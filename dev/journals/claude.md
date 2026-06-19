@@ -1294,3 +1294,84 @@ CLI you've tuned for startup latency, gate it behind the runtime entry points
 rather than module scope — "imported only when actually doing work" preserves
 both the fast `--help`/completion path and library silence, and costs only a few
 lazy imports.
+
+## 2026-06-18 20:46:06 -0400
+
+Model: claude-opus-4-8 (Claude Code, Opus 4.8). Config: default tools, working
+the infer-stack submodule from the aiq-eval-runner superrepo, branch
+`dev/leasing-controller`.
+
+User intent (one exploratory session, several threads, mostly driven by running
+the demo on yardrat): (1) add two Qwen models to the demo (cross-family); (2)
+"why didn't `serve qwen05-1` prompt / why is it `live` when nothing's running?";
+(3) "show what's *actually* running + which GPUs"; (4) "separate render from
+execution — set up on-disk state and see what would run before pulling the
+trigger"; (5) expand `--help`; then a verb-shape brainstorm landing on
+declares-refcount / reconciles-idempotent; (6) "do we ALWAYS preview before
+modifying the compose file?" → gate every converge. Committed in two batches:
+`fe90d2e` (1–5) and a follow-up (6).
+
+Design decisions worth recording:
+- **Fail fast on unplaceable requests.** The yardrat hang was: acquire marks the
+  group LIVE in the ledger *before* reconcile, placement silently dropped it (no
+  free GPU → only a WARNING), and `serve` then blocked on readiness for a
+  container that never rendered. Fix: the backend records `last_unplaced`;
+  controller.acquire rolls the lease back and raises `PlacementError` if a
+  *just-requested* group landed unplaced. This also dissolved the "phantom live"
+  display — the bad lease never persists. Key realization: `live` is *desired*
+  (ledger), never *observed*; the two were conflated in `leases`.
+- **leases shows desired vs actual.** Added `running` (backend.observe) and
+  `gpus` (`plan()`, read-only placement; `→N` = slated) columns. Backed by a new
+  `ComposeBackend.plan()` that the converge path now reuses.
+- **Legible names.** vLLM service/container is `vllm-<served-model>-<group-id>`
+  (was `vllm-<group-id>`). The group-id suffix is load-bearing: two desired
+  groups can share a served name (an endpoint re-pointed at a new model), and it
+  keeps `docker ps` ↔ `leases` correlatable. Ollama keeps its id-name (one
+  daemon, many models). One-time container recreate on upgrade (service key
+  changed) — which is exactly what bit the user later (see below).
+- **Render/apply as the separating seam.** `converge(desired, apply=False)`
+  renders the on-disk project without `docker compose up`. Surfaced as a flag on
+  the declare verbs (`serve|acquire --no-apply`, stage) plus lease-free `render`
+  / `apply` reconcile verbs. The crux we reasoned through with the user: `apply`
+  writes *no* infer-stack tracking state — all of it (ledger intent + sidecar
+  placement) is written at declare/stage time — so "drop the tool and `docker
+  compose up` yourself" is a true equivalent. Cemented that by baking a top-level
+  `name: infer-stack` into the rendered compose, so a bare `docker compose -f
+  <file> up` lands in the same project (was the one real gap — default project
+  name would've been the dir name).
+- **Verb shape: declares refcount, reconciles are idempotent.** The user found
+  that `serve --no-apply` then `serve` makes *two* leases (demand 2). We
+  explicitly rejected idempotent serve/acquire (serve *is* `acquire --ttl inf`;
+  a refcount that sometimes doesn't count is the confusing thing). The real fix
+  is structural: a lease-free `apply` means "apply a staged lease" no longer goes
+  through a declare verb, so the refcount only climbs when you genuinely declare.
+  Idempotency belongs on render/apply (pure functions of desired state), not on
+  the refcount verbs.
+- **Gate every converge (supersedes the 2026-06-18 17:31 decision).** That entry
+  said teardown verbs don't prompt ("the action is the approval"). The user's
+  GPU run disproved it: `release --all` silently rewrote the compose file *and
+  recreated a keep-warm model* (the one-time rename migration happened to land on
+  a release). So now `release`/`evict`/`apply` also build `interactive=True` and
+  gate the diff (`--yes` skips). To keep it to one prompt, `release`/`evict` now
+  batch all ledger mutations then converge once (was: per-lease reconcile). New
+  asymmetry: declining an *acquire* rolls back; declining a *release/evict*
+  records the ledger change but leaves docker untouched (`apply` later) — which
+  is the honest plan/apply semantics, not a bug.
+
+Risks/uncertainties: none of this has run against real docker/GPUs since the
+changes (only fake-docker units) — the new gating prompt, the one-time container
+recreate, render/apply, and the `name:` field are unexercised on hardware. The
+batched release changes decline semantics (ledger released even if docker
+declined); defensible but a behavior change. The container rename will recreate
+every running vLLM container once on upgrade (acceptable, noted in CHANGELOG).
+267→ tests pass, ruff clean on changed files (pre-existing I001s elsewhere).
+
+Takeaways: (1) separate *desired* (ledger) from *observed* (backend) in both the
+data model and the UI — conflating them produced both the "phantom live" bug and
+the silent-placement hang; surfacing `running` vs `state` made the system
+honest. (2) When a tool drives another tool, make the generated artifact
+self-sufficient (`name:` in the compose file) so "bypass the tool" is a
+first-class equivalent, not a divergent sibling — that property is also what let
+us reason that `apply` hides no state. (3) Idempotency is a property of
+reconcile operations, not of intent-declaring ones; put it where it's natural
+rather than special-casing a refcount.

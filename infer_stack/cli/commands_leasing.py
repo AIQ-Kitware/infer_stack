@@ -397,6 +397,20 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
     )
 
 
+class _ApprovalMixin(_LeasingCommonMixin):
+    """A verb that converges the compose project and so gates on a diff.
+
+    Any change to the on-disk compose project is shown and confirmed on a
+    terminal; ``--yes`` (or a non-TTY) applies without prompting.
+    """
+
+    yes = scfg.Value(
+        False, isflag=True, alias=['y'],
+        help='Apply compose changes without showing the diff / prompting '
+        '(compose backend). Implied when stdout is not a terminal.',
+    )
+
+
 class _AcquireFlagsMixin(_LeasingCommonMixin):
     catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
     base_url = scfg.Value(
@@ -561,15 +575,16 @@ class RenderCLI(_LeasingCommonMixin):
         return 0
 
 
-class ApplyCLI(_LeasingCommonMixin):
+class ApplyCLI(_ApprovalMixin):
     """Bring the current desired set up to match the ledger (render + up).
 
     Lease-free: ``apply`` creates no lease — it converges whatever is already
     declared (by ``serve``/``acquire``) onto the backend. It is the *trigger*
     for a staged ``serve --no-apply`` and the re-sync button after a manual edit
     or a backend hiccup; idempotent (a second apply with nothing changed is a
-    no-op). The rendered file carries ``name: infer-stack``, so ``docker compose
-    -f <file> up -d`` is an exact equivalent. (``infer-stack stack up`` is the
+    no-op). On a terminal it shows the compose diff and asks (``--yes`` skips).
+    The rendered file carries ``name: infer-stack``, so ``docker compose -f
+    <file> up -d`` is an exact equivalent. (``infer-stack stack up`` is the
     lower-level "run exactly what is on disk" hatch; ``apply`` re-renders from
     intent first.)
     """
@@ -631,8 +646,22 @@ class ApplyCLI(_LeasingCommonMixin):
         return 0
 
 
-class ReleaseCLI(_LeasingCommonMixin):
-    """Release a lease; deployments idle/teardown per their reclaim policy."""
+def _declined_exit() -> SystemExit:
+    return SystemExit(
+        'declined: the ledger change stands but docker was not touched — '
+        'run `infer-stack apply` to apply it.'
+    )
+
+
+class ReleaseCLI(_ApprovalMixin):
+    """Release a lease; deployments idle/teardown per their reclaim policy.
+
+    On a terminal the resulting compose change is shown and confirmed before
+    docker is touched (``--yes`` skips); declining leaves the lease released in
+    the ledger but the containers running — ``infer-stack apply`` then applies
+    it. All the lease's changes converge in a single step, so you are asked at
+    most once.
+    """
 
     __command__ = 'release'
 
@@ -655,38 +684,40 @@ class ReleaseCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
         config = cls.cli(argv=argv, data=kwargs)
-        controller = _open_controller(config)
+        controller = _open_controller(config, interactive=True)
 
         if config.all:
             if config.session or config.env_file:
                 raise SystemExit('release: --all takes no session/--env-file')
             controller.ledger.sweep()
             leases, _ = controller.ledger.status()
-            sids = [le.id for le in leases if le.state == LeaseState.ACTIVE]
-            released, torn = [], set()
-            for sid in sids:
-                outcome = controller.release(sid)
-                released.append(sid)
-                torn.update(outcome.reconcile.torn_down)
+            released = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+            for sid in released:
+                controller.ledger.release(sid)
             evicted: list[str] = []
             if config.evict:
-                ev = controller.evict(None)  # every idle group
-                evicted = ev.evicted_group_ids
-                torn.update(ev.reconcile.torn_down)
-            return _emit_release(config, released, sorted(torn), evicted)
+                evicted = controller.ledger.evict_idle(None)  # every idle group
+        else:
+            sid = _resolve_session(config)
+            if not sid:
+                raise SystemExit(
+                    'release: give a session id, --env-file, or --all'
+                )
+            rel = controller.ledger.release(sid)
+            released = [sid]
+            evicted = []
+            if config.evict:
+                evicted = controller.ledger.evict_idle(rel.idled_group_ids)
 
-        sid = _resolve_session(config)
-        if not sid:
-            raise SystemExit('release: give a session id, --env-file, or --all')
-        outcome = controller.release(sid)
-        torn = set(outcome.reconcile.torn_down)
-        evicted = []
-        if config.evict:
-            ev = controller.evict(outcome.idled_group_ids)
-            evicted = ev.evicted_group_ids
-            torn.update(ev.reconcile.torn_down)
-        return _emit_release(config, [sid], sorted(torn), evicted)
+        # One converge for the whole command -> at most one diff prompt.
+        try:
+            rec = controller.reconcile()
+        except ConvergeAborted:
+            raise _declined_exit()
+        return _emit_release(config, released, sorted(rec.torn_down), evicted)
 
 
 def _emit_release(config, released, torn_down, evicted) -> int:
@@ -726,14 +757,15 @@ def _resolve_idle_targets(controller, names: list[str]) -> tuple[list[str], list
     return targets, sorted(wanted - matched)
 
 
-class EvictCLI(_LeasingCommonMixin):
+class EvictCLI(_ApprovalMixin):
     """Force-evict released (idle) models now, freeing their GPUs.
 
     A released ``keep-warm`` model stays resident (idle) to avoid cold-start
     thrash — handy, but it holds a GPU. ``evict`` tears such groups down now,
     overriding keep-warm. Target by served endpoint alias or group id, or
     ``--all`` for every idle group. (Live models — those with an active lease —
-    are never evicted; release them first.)
+    are never evicted; release them first.) On a terminal the teardown is shown
+    and confirmed before docker is touched (``--yes`` skips).
     """
 
     __command__ = 'evict'
@@ -747,24 +779,30 @@ class EvictCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
         config = cls.cli(argv=argv, data=kwargs)
-        controller = _open_controller(config)
+        controller = _open_controller(config, interactive=True)
         names = _collect_names(config.names)
         if not names and not config.all:
             raise SystemExit('evict: give an endpoint/group name or --all')
-        if config.all:
-            outcome = controller.evict(None)
-        else:
-            targets, missing = _resolve_idle_targets(controller, names)
-            if missing:
-                print(f'no idle group for: {", ".join(missing)}')
-            if not targets:
-                if config.json:
-                    print(json.dumps({'evicted': [], 'torn_down': []}, indent=2))
-                else:
-                    print('nothing to evict')
-                return 0
-            outcome = controller.evict(targets)
+        try:
+            if config.all:
+                outcome = controller.evict(None)
+            else:
+                targets, missing = _resolve_idle_targets(controller, names)
+                if missing:
+                    print(f'no idle group for: {", ".join(missing)}')
+                if not targets:
+                    if config.json:
+                        print(json.dumps(
+                            {'evicted': [], 'torn_down': []}, indent=2))
+                    else:
+                        print('nothing to evict')
+                    return 0
+                outcome = controller.evict(targets)
+        except ConvergeAborted:
+            raise _declined_exit()
         if config.json:
             print(json.dumps({
                 'evicted': outcome.evicted_group_ids,

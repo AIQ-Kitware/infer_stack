@@ -112,11 +112,15 @@ run downloads the weights (a few GiB), so allow time. No `--backend` — it come
 from your settings. A managed **Open WebUI comes up alongside the gateway by
 default** (disable with `--no-ui`, or globally `infer-stack config set ui false`).
 
-On a terminal, `serve`/`acquire` **show you the diff** of the compose project
-they're about to change and ask you to confirm (so you see exactly which
-services are added/removed); `--yes` (or `-y`) skips the prompt, and it's skipped
-automatically when output isn't a terminal (scripts/CI). infer-stack also
-narrates what it's doing (placement, `docker compose up`, readiness) on stderr.
+On a terminal, **every verb that changes the compose project** — `serve`,
+`acquire`, `release`, `evict`, `apply` — **shows you the diff** and asks you to
+confirm before it touches `docker-compose.yml` or runs docker (so you see exactly
+which services are added/removed/recreated); `--yes` (or `-y`) skips the prompt,
+and it's skipped automatically when output isn't a terminal (scripts/CI).
+Declining a `serve`/`acquire` rolls the lease back; declining a `release`/`evict`
+records the change but leaves docker as-is until you `infer-stack apply`.
+infer-stack also narrates what it's doing (placement, `docker compose up`,
+readiness) on stderr.
 
 ```bash
 infer-stack serve smol17b-1 --require-generation --timeout 1200

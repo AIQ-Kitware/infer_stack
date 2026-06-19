@@ -189,6 +189,20 @@ def test_serve_no_apply_stages_without_applying(env, capsys):
     assert _leases_json(env, capsys)['leases'][0]['state'] == 'released'
 
 
+def test_release_evict_apply_accept_yes_flag(env, capsys):
+    # release/evict/apply now gate the compose diff on a TTY; --yes skips it.
+    # (null backend never prompts, so this is the plumbing + batched-release path.)
+    from infer_stack.cli.commands_leasing import ApplyCLI, EvictCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    assert ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--yes']) == 0
+    assert all(le['state'] == 'released'
+               for le in _leases_json(env, capsys)['leases'])
+    assert EvictCLI.main(argv=['--ledger', env.db, '--all', '--yes']) == 0
+    assert ApplyCLI.main(argv=['--ledger', env.db, '--yes']) == 0
+
+
 def test_render_and_apply_are_lease_free(env, capsys):
     from infer_stack.cli.commands_leasing import ApplyCLI, RenderCLI
 

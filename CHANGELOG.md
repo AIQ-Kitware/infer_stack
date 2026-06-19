@@ -172,13 +172,18 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     `leases` plus a quickstart + mental-model epilog on the top-level
     `infer-stack --help` (catalog → serve/acquire → reconcile; render vs apply;
     desired vs running). The `leases` help now documents each group column.
-  - Compose changes are now shown before they're applied. On a terminal,
-    `serve`/`acquire` render a diff of the compose project (and LiteLLM routing)
-    they're about to write and ask to confirm — restoring the legacy
-    "see-and-approve render" for the leasing path. `--yes`/`-y` skips the prompt,
-    and it's skipped automatically off a terminal (scripts/CI). Declining rolls
-    back the just-created lease (no dangling ledger state). Teardown verbs
-    (`release`) don't prompt — the action is the approval.
+  - Compose changes are now shown before they're applied, for **every** verb
+    that touches the compose project — `serve`/`acquire` *and* `release`/`evict`/
+    `apply`. On a terminal each renders a diff of the compose project (and
+    LiteLLM routing) it's about to write and asks to confirm; `--yes`/`-y` skips
+    it, and it's skipped automatically off a terminal (scripts/CI). Nothing
+    mutates `docker-compose.yml` or runs docker without that gate — earlier,
+    `release`/`evict` converged silently, which (with the container rename) could
+    e.g. recreate a keep-warm model during a `release` with no preview. Each
+    command batches its ledger changes into a single converge, so you're asked at
+    most once. Declining an *acquire* rolls back the just-created lease; declining
+    a *release/evict* leaves the ledger change recorded but docker untouched —
+    `infer-stack apply` then applies it (consistent with the render/apply split).
   - Behind-the-scenes feedback via loguru (like `aivm`): the leasing verbs
     narrate placement, `docker compose up/down`, and readiness waits to stderr
     (INFO; `$INFER_STACK_LOG_LEVEL` to change). It's kept off the `--help`
