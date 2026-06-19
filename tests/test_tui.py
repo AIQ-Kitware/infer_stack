@@ -707,6 +707,28 @@ def test_tui_api_tester_sends_via_injected_http():
     assert http.calls and http.calls[0][0].endswith('/v1/chat/completions')
 
 
+def test_tui_api_urls_render_without_markup_error():
+    # Regression: the URLs were rendered with Textual [link=URL] markup, which
+    # rejects the ':' in http:// and crashed on get_content_height.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.litellm_port = 14042
+            controller.backend.ui_port = 13000
+            app._update_api_urls()
+            await pilot.pause()
+            text = str(app.query_one('#api-urls').render())  # must not raise
+            assert '14042' in text and '13000' in text
+
+    _run(scenario)
+
+
 def test_tui_api_list_models_and_curl():
     from infer_stack.tui import InferStackTUI
 

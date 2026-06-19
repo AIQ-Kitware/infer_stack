@@ -646,7 +646,7 @@ class InferStackTUI(App):
                 'are listed. Ctrl+click a URL to open it; buttons copy to your '
                 'clipboard.', classes='desc',
             )
-            yield Static('', id='api-urls', markup=True)
+            yield Static('', id='api-urls', markup=False)
             with Horizontal(id='api-controls'):
                 yield Select([], prompt='model…', id='api-model')
                 yield Button('Send', id='btn-api-send', variant='primary')
@@ -1731,13 +1731,15 @@ class InferStackTUI(App):
                 f"-H 'Content-Type: application/json' -d '{body}'")
 
     def _update_api_urls(self) -> None:
+        # Plain text (no Textual [link] markup — it rejects the ':' in URLs);
+        # ctrl+click this line opens Open WebUI, or use the Open WebUI button.
         base, _ = self._litellm()
         ui = self._openwebui_url()
         parts = []
         if base:
-            parts.append(f'gateway: [link={base}/v1]{base}/v1[/link]')
+            parts.append(f'gateway: {base}/v1')
         if ui:
-            parts.append(f'open webui: [link={ui}]{ui}[/link]')
+            parts.append(f'open webui: {ui}')
         text = '   ·   '.join(parts) or '(serve a model to get a gateway URL)'
         try:
             self.query_one('#api-urls', Static).update(text)
