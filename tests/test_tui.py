@@ -707,6 +707,46 @@ def test_tui_api_tester_sends_via_injected_http():
     assert http.calls and http.calls[0][0].endswith('/v1/chat/completions')
 
 
+def test_tui_api_list_models_and_curl():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'data': [{'id': 'qwen-coder'}, {'id': 'qwen-fast'}]}
+
+    class _HTTP:
+        def get(self, url, headers=None, timeout=None):
+            self.url = url
+            return _Resp()
+
+    http = _HTTP()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None, http=http)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.litellm_port = 14042
+            app._sync_api_models(['qwen-coder'])
+            app._update_api_curl()
+            curl = str(app.query_one('#api-curl').render())
+            assert 'curl' in curl and '/v1/chat/completions' in curl
+            assert 'qwen-coder' in curl
+            app.action_api_copy_curl()           # must not raise
+            app.action_api_list_models()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any('qwen-coder' in line for line in app._api_lines)
+
+    _run(scenario)
+    assert http.url.endswith('/v1/models')
+
+
 def test_tui_api_lists_only_ready_models():
     from textual.widgets import Select
 

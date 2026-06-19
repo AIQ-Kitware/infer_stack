@@ -5,6 +5,11 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* TUI **API tab** is now a proper console: shows the gateway + Open WebUI URLs
+  (ctrl+click to open), **List models** (GET `/v1/models` on the gateway) beside
+  Send / Test-all, a live **curl** preview with a **Copy curl** button, and an
+  **Open WebUI** button. Clipboard support via Textual (OSC 52): Copy-curl, and
+  `y` copies the status line (handy for the open-URL it prints).
 * TUI live-feedback polish: the **endpoint wizard is labeled and
   engine-adaptive** — vLLM shows tensor-parallel / **data-parallel** / max-model-len
   / GPU-mem / max-seqs / prefix-caching / extra-args; Ollama shows host +

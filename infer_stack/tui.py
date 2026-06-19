@@ -463,6 +463,10 @@ class InferStackTUI(App):
     #api-controls Select { width: 1fr; }
     #api-controls Button { margin: 0 0 0 1; min-width: 10; }
     #api-prompt { margin: 0 0 1 0; }
+    #api-urls { height: auto; color: $text-muted; padding: 0 1; margin: 0 0 1 0; }
+    #api-curl { height: auto; color: $text-muted; padding: 0 1; }
+    #api-extra { height: auto; margin: 0 0 1 0; }
+    #api-extra Button { margin: 0 1 0 0; min-width: 12; }
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
 
@@ -491,6 +495,7 @@ class InferStackTUI(App):
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
+        Binding('y', 'copy_status', 'Copy status', show=False),
         Binding('c', 'toggle_docker', 'Collapse docker', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
@@ -637,15 +642,22 @@ class InferStackTUI(App):
     def _compose_api(self) -> ComposeResult:
         with Vertical(id='api'):
             yield Static(
-                'Send a prompt to a model through the LiteLLM gateway. Only '
-                'models that are up and ready are listed.', classes='desc',
+                'Talk to the LiteLLM gateway. Only models that are up and ready '
+                'are listed. Ctrl+click a URL to open it; buttons copy to your '
+                'clipboard.', classes='desc',
             )
+            yield Static('', id='api-urls', markup=True)
             with Horizontal(id='api-controls'):
                 yield Select([], prompt='model…', id='api-model')
                 yield Button('Send', id='btn-api-send', variant='primary')
                 yield Button('Test all', id='btn-api-test-all')
+                yield Button('List models', id='btn-api-list')
             yield Input(placeholder='prompt (default: a short hello)',
                         id='api-prompt')
+            yield Static('', id='api-curl')
+            with Horizontal(id='api-extra'):
+                yield Button('Copy curl', id='btn-api-copy-curl')
+                yield Button('Open WebUI', id='btn-open-webui')
             yield RichLog(id='api-out', highlight=False, markup=False,
                           wrap=True, max_lines=500)
 
@@ -731,6 +743,8 @@ class InferStackTUI(App):
         self._install_quiet_docker()
         self._apply_sizes()
         self._fill_catalog()
+        self._update_api_urls()
+        self._update_api_curl()
         self._refresh_now()           # synchronous first paint (snappy + testable)
         self._restart_logs(self._log_service)
         self.set_interval(self.interval, self.action_refresh)
@@ -802,6 +816,11 @@ class InferStackTUI(App):
     def action_toggle_docker(self) -> None:
         col = self.query_one('#docker', Collapsible)
         col.collapsed = not col.collapsed
+
+    def action_copy_status(self) -> None:
+        """Copy the status line (often a URL/command) to the clipboard."""
+        self.copy_to_clipboard(str(self.query_one('#status', Static).render()))
+        self.bell()
 
     # -- catalog -----------------------------------------------------------
 
@@ -1172,12 +1191,19 @@ class InferStackTUI(App):
         )
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == 'api-model':
+            self._update_api_curl()
+            return
         if event.select.id != 'logsvc':
             return
         service = '' if event.value is Select.NULL else str(event.value)
         if service != self._log_service:
             self._log_service = service
             self._restart_logs(service)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == 'api-prompt':
+            self._update_api_curl()
 
     def _default_proc_factory(self) -> Callable[[str | None], Any]:
         def factory(service: str | None):
@@ -1306,8 +1332,13 @@ class InferStackTUI(App):
         except Exception:  # noqa: BLE001
             return
         while node is not None:
-            if getattr(node, 'id', None) == 'endpoints':
+            nid = getattr(node, 'id', None)
+            if nid == 'endpoints':
                 self.action_open()
+                event.stop()
+                return
+            if nid == 'api-urls':
+                self.action_open_webui()
                 event.stop()
                 return
             node = getattr(node, 'parent', None)
@@ -1328,6 +1359,9 @@ class InferStackTUI(App):
             'btn-remove-model': self.action_remove_model,
             'btn-api-send': self.action_api_send,
             'btn-api-test-all': self.action_api_test_all,
+            'btn-api-list': self.action_api_list_models,
+            'btn-api-copy-curl': self.action_api_copy_curl,
+            'btn-open-webui': self.action_open_webui,
             'btn-save-settings': self._on_save_settings,
             'btn-compose-up': self.action_compose_up,
             'btn-compose-down': self.action_compose_down,
@@ -1421,11 +1455,12 @@ class InferStackTUI(App):
     # -- open in browser ---------------------------------------------------
 
     def _ui_url(self, endpoint: str) -> str | None:
-        backend = self.controller.backend
-        port = getattr(backend, 'ui_port', None)
-        if not port:
-            return None
-        return f'http://localhost:{port}/?models={endpoint}'
+        base = self._openwebui_url()
+        return f'{base}/?models={endpoint}' if base else None
+
+    def _openwebui_url(self) -> str | None:
+        port = getattr(self.controller.backend, 'ui_port', None)
+        return f'http://localhost:{port}' if port else None
 
     def _served_endpoints(self) -> set[str]:
         try:
@@ -1680,6 +1715,44 @@ class InferStackTUI(App):
         data = resp.json()
         return data['choices'][0]['message']['content']
 
+    def _curl_for(self, model: str, prompt: str) -> str:
+        """The equivalent ``curl`` for a chat-completion against the gateway."""
+        import json as _json
+
+        base, key = self._litellm()
+        if not base:
+            return '# serve a model first — no LiteLLM gateway yet'
+        auth = f" -H 'Authorization: Bearer {key}'" if key else ''
+        body = _json.dumps({
+            'model': model or '<model>',
+            'messages': [{'role': 'user', 'content': prompt or 'hello'}],
+        })
+        return (f"curl -s {base}/v1/chat/completions{auth} "
+                f"-H 'Content-Type: application/json' -d '{body}'")
+
+    def _update_api_urls(self) -> None:
+        base, _ = self._litellm()
+        ui = self._openwebui_url()
+        parts = []
+        if base:
+            parts.append(f'gateway: [link={base}/v1]{base}/v1[/link]')
+        if ui:
+            parts.append(f'open webui: [link={ui}]{ui}[/link]')
+        text = '   ·   '.join(parts) or '(serve a model to get a gateway URL)'
+        try:
+            self.query_one('#api-urls', Static).update(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_api_curl(self) -> None:
+        model = self._selected_api_model() or '<model>'
+        try:
+            prompt = self.query_one('#api-prompt', Input).value.strip() or 'hello'
+            self.query_one('#api-curl', Static).update(
+                self._curl_for(model, prompt))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _api_log(self, line: str) -> None:
         self._api_lines.append(line)
         self.query_one('#api-out', RichLog).write(line)
@@ -1706,6 +1779,29 @@ class InferStackTUI(App):
         self._api_log(f'— testing {len(models)} ready model(s) —')
         self._do_api_test_all(models)
 
+    def action_api_list_models(self) -> None:
+        self._api_log('> GET /v1/models  (what the gateway routes)')
+        self._do_api_list()
+
+    def action_api_copy_curl(self) -> None:
+        text = str(self.query_one('#api-curl', Static).render())
+        self.copy_to_clipboard(text)
+        self._status('copied curl to clipboard')
+
+    def action_open_webui(self) -> None:
+        url = self._openwebui_url()
+        if not url:
+            self._status('no Open WebUI URL (compose backend only)')
+            return
+        opened = False
+        try:
+            import webbrowser
+            opened = webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            opened = False
+        self._status(
+            f'open {url}' + ('' if opened else '  [copy into your browser]'))
+
     @work(thread=True, group='api')
     def _do_api_send(self, model: str, prompt: str) -> None:
         try:
@@ -1713,6 +1809,23 @@ class InferStackTUI(App):
             self.call_from_thread(self._api_log, f'  [{model}] {out}')
         except Exception as ex:  # noqa: BLE001
             self.call_from_thread(self._api_log, f'  [{model}] ERROR: {ex}')
+
+    @work(thread=True, group='api')
+    def _do_api_list(self) -> None:
+        base, key = self._litellm()
+        if not base:
+            self.call_from_thread(self._api_log, '  ERROR: no LiteLLM gateway')
+            return
+        try:
+            headers = {'Authorization': f'Bearer {key}'} if key else {}
+            resp = self._http_client().get(
+                f'{base}/v1/models', headers=headers, timeout=30)
+            resp.raise_for_status()
+            ids = [m.get('id') for m in (resp.json().get('data') or [])]
+            self.call_from_thread(
+                self._api_log, f'  routes: {", ".join(ids) or "(none)"}')
+        except Exception as ex:  # noqa: BLE001
+            self.call_from_thread(self._api_log, f'  ERROR: {ex}')
 
     @work(thread=True, group='api')
     def _do_api_test_all(self, models: list[str]) -> None:
