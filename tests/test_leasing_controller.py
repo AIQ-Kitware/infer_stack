@@ -75,7 +75,7 @@ def oreq(endpoint, tag, host='local-ollama'):
 def test_acquire_realizes_and_ready():
     ctl, backend, _ = make_controller(ready=True)
     out = ctl.acquire('alice', [vreq('qwen')])
-    gid = out.groups[0].id
+    gid = out.deployments[0].id
     assert backend.realize_calls == [gid]
     assert backend.observe() == {gid}
     assert out.wait.ready is True
@@ -85,8 +85,8 @@ def test_coalesced_realize_once():
     ctl, backend, _ = make_controller()
     a = ctl.acquire('alice', [vreq('qwen')])
     b = ctl.acquire('bob', [vreq('qwen')])
-    assert a.groups[0].id == b.groups[0].id
-    assert backend.realize_calls == [a.groups[0].id]   # realized only once
+    assert a.deployments[0].id == b.deployments[0].id
+    assert backend.realize_calls == [a.deployments[0].id]   # realized only once
 
 
 def test_release_one_keeps_running():
@@ -96,7 +96,7 @@ def test_release_one_keeps_running():
     out = ctl.release(a.lease.id)
     assert out.reconcile.torn_down == []
     assert backend.teardown_calls == []
-    assert backend.observe() == {a.groups[0].id}
+    assert backend.observe() == {a.deployments[0].id}
 
 
 def test_release_last_keepwarm_stays():
@@ -104,13 +104,13 @@ def test_release_last_keepwarm_stays():
     a = ctl.acquire('alice', [vreq('qwen', reclaim='keep-warm')])
     ctl.release(a.lease.id)
     assert backend.teardown_calls == []
-    assert backend.observe() == {a.groups[0].id}        # kept warm
+    assert backend.observe() == {a.deployments[0].id}        # kept warm
 
 
 def test_release_last_stop_tears_down():
     ctl, backend, _ = make_controller()
     a = ctl.acquire('alice', [vreq('qwen', reclaim='stop')])
-    gid = a.groups[0].id
+    gid = a.deployments[0].id
     out = ctl.release(a.lease.id)
     assert out.reconcile.torn_down == [gid]
     assert backend.teardown_calls == [gid]
@@ -121,7 +121,7 @@ def test_wait_ready_timeout():
     ctl, backend, _ = make_controller(ready=False)
     out = ctl.acquire('alice', [vreq('qwen')], timeout=10, interval=2)
     assert out.wait.ready is False
-    assert out.wait.pending == [(out.groups[0].id, 'qwen')]
+    assert out.wait.pending == [(out.deployments[0].id, 'qwen')]
 
 
 def test_wait_ready_becomes_ready():
@@ -144,12 +144,12 @@ def test_wait_ready_becomes_ready():
     assert state['n'] == 1                               # one poll, then ready
 
 
-def test_ttl_expiry_reaps_stop_group():
+def test_ttl_expiry_reaps_stop_deployment():
     ctl, backend, clock = make_controller()
     a = ctl.acquire(
         'alice', [vreq('qwen', reclaim='stop')], ttl_seconds=10, wait=False
     )
-    gid = a.groups[0].id
+    gid = a.deployments[0].id
     assert backend.observe() == {gid}
     clock.advance(11)
     rec = ctl.reconcile()                                # sweep -> idle -> stop
@@ -162,7 +162,7 @@ def test_ttl_expiry_keepwarm_survives():
     a = ctl.acquire(
         'alice', [vreq('qwen', reclaim='keep-warm')], ttl_seconds=10, wait=False
     )
-    gid = a.groups[0].id
+    gid = a.deployments[0].id
     clock.advance(11)
     rec = ctl.reconcile()
     assert rec.torn_down == []
@@ -172,13 +172,13 @@ def test_ttl_expiry_keepwarm_survives():
 def test_wait_scoped_to_requested_endpoints():
     ctl, backend, _ = make_controller(ready=True)
     a = ctl.acquire('alice', [oreq('qwen-small', 'qwen3.5:4b')])
-    gid = a.groups[0].id
+    gid = a.deployments[0].id
     # one tag on the daemon is unhealthy, but the next caller only needs the other
-    backend.set_ready(False, group_id=gid, endpoint='qwen-small')
+    backend.set_ready(False, deployment_id=gid, endpoint='qwen-small')
     b = ctl.acquire(
         'bob', [oreq('smollm', 'smollm2:135m')], timeout=10, interval=2
     )
-    assert b.groups[0].id == gid                         # same daemon
+    assert b.deployments[0].id == gid                         # same daemon
     assert b.wait.ready is True                          # only waited for smollm
 
 
@@ -201,8 +201,8 @@ def test_controller_with_catalog():
     catalog = Catalog.from_dict(CATALOG)
     ctl, backend, _ = make_controller(ready=True)
     out = ctl.acquire('alice', catalog.resolve_names(['both']))
-    # e1/e2 are the same deployment identity -> one realized group, both served
-    assert len(out.groups) == 1
-    assert backend.realize_calls == [out.groups[0].id]
-    assert set(out.groups[0].served) == {'e1', 'e2'}
+    # e1/e2 are the same deployment identity -> one realized deployment, both served
+    assert len(out.deployments) == 1
+    assert backend.realize_calls == [out.deployments[0].id]
+    assert set(out.deployments[0].served) == {'e1', 'e2'}
     assert out.wait.ready is True

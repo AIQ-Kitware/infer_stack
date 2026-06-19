@@ -13,7 +13,7 @@ Three record kinds, in three layers:
   catalog/resolver layer builds these; the ledger consumes them and never needs
   to know engine-specific details beyond what is packed in here.
 * :class:`Lease` — who wants a set of endpoints, with a soft TTL.
-* :class:`DeploymentGroup` — compatible requests coalesced into one realizable
+* :class:`Deployment` — compatible requests coalesced into one realizable
   backend deployment. ``demand`` is the number of *protecting* leases pointing
   at it.
 
@@ -22,7 +22,7 @@ one model for vLLM (one process per model), one daemon for Ollama (one daemon
 serves many tags). Both are expressed uniformly through the
 :func:`compatibility_key`: for vLLM the structural fields describe the model +
 runtime; for Ollama they describe the *daemon* config, so many tag endpoints
-coalesce onto one group.
+coalesce onto one deployment.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ class LeaseState:
     RELEASED = 'released'
 
 
-class GroupState:
-    """Lifecycle states for a :class:`DeploymentGroup`.
+class DeploymentState:
+    """Lifecycle states for a :class:`Deployment`.
 
     ``LIVE``/``IDLE`` are driven by the ledger from demand. ``RECLAIMING``/
     ``STOPPED`` are owned by the (future) reconciler/backend and are reserved
@@ -177,7 +177,7 @@ def ollama_structural(
 
     The model *tag* is intentionally absent — it is per-endpoint detail, not
     part of the daemon's identity — so several tag endpoints sharing a host
-    config coalesce onto a single daemon group.
+    config coalesce onto a single daemon deployment.
     """
     return {
         'engine': 'ollama',
@@ -235,7 +235,7 @@ class EndpointRequest:
         spec: opaque host-realization payload the backend uses to start the
             process/daemon (shared across coalesced requests).
         served: opaque per-endpoint payload (e.g. the Ollama tag) merged into
-            the group's served map under ``endpoint``.
+            the deployment's served map under ``endpoint``.
         host: Ollama daemon name; ``None`` for auto-synthesized vLLM hosts.
     """
 
@@ -257,7 +257,7 @@ class EndpointRequest:
 class Lease:
     """Who wants a set of endpoints, with a soft TTL.
 
-    A lease *protects* its deployment groups while it is ``ACTIVE`` and not past
+    A lease *protects* its deployment deployments while it is ``ACTIVE`` and not past
     its TTL. Protection is what ``demand`` counts.
     """
 
@@ -269,7 +269,7 @@ class Lease:
     expires_at: float | None
     heartbeat_at: float
     endpoints: list[str] = field(default_factory=list)
-    group_ids: list[str] = field(default_factory=list)
+    deployment_ids: list[str] = field(default_factory=list)
 
     def is_protecting(self, now: float) -> bool:
         """True if this lease still protects its allocations at ``now``."""
@@ -279,7 +279,7 @@ class Lease:
 
 
 @dataclass
-class DeploymentGroup:
+class Deployment:
     """Compatible requests coalesced into one realizable deployment.
 
     ``served`` maps endpoint name -> per-endpoint payload; for vLLM it has one

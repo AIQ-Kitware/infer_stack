@@ -174,21 +174,21 @@ def test_catalog_to_ledger_coalesces(catalog):
     ledger = Ledger(SqliteStore(':memory:'))
     a = ledger.acquire('alice', catalog.resolve_names(['qwen-coder']))
     b = ledger.acquire('bob', catalog.resolve_names(['qwen-coder-alias']))
-    # alias resolves to the same deployment identity -> one group, demand 2
-    assert a.groups[0].id == b.groups[0].id
-    assert ledger.get_group(a.groups[0].id).demand == 2
+    # alias resolves to the same deployment identity -> one deployment, demand 2
+    assert a.deployments[0].id == b.deployments[0].id
+    assert ledger.get_deployment(a.deployments[0].id).demand == 2
 
 
 def test_catalog_ollama_bundle_one_daemon(catalog):
     ledger = Ledger(SqliteStore(':memory:'))
     res = ledger.acquire('alice', catalog.resolve_names(['local-small-models']))
-    # two tags, one daemon -> a single group serving both endpoints
-    assert len(res.groups) == 1
-    group = ledger.get_group(res.groups[0].id)
-    assert set(group.served) == {'qwen-small', 'smollm'}
+    # two tags, one daemon -> a single deployment serving both endpoints
+    assert len(res.deployments) == 1
+    deployment = ledger.get_deployment(res.deployments[0].id)
+    assert set(deployment.served) == {'qwen-small', 'smollm'}
 
 
 def test_catalog_bundle_distinct_models(catalog):
     ledger = Ledger(SqliteStore(':memory:'))
     res = ledger.acquire('alice', catalog.resolve_names(['draft-and-verify']))
-    assert len({g.id for g in res.groups}) == 2
+    assert len({g.id for g in res.deployments}) == 2

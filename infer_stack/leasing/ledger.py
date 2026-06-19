@@ -3,16 +3,16 @@
 This is the backend-agnostic heart of the controller. It owns the *invariants*:
 
 * **Coalescing.** Two requests for the same compatible deployment share one
-  :class:`~infer_stack.leasing.models.DeploymentGroup` (demand reference-counted)
+  :class:`~infer_stack.leasing.models.Deployment` (demand reference-counted)
   unless one asks for ``dedicated``. Compatibility is structural identity
   (:func:`~infer_stack.leasing.models.compatibility_key`) plus capacity
   subsumption (:func:`~infer_stack.leasing.models.capacity_satisfies`).
-* **Soft TTL.** A lease protects its groups while ACTIVE and not past its TTL.
-  Expiry does not kill anything; it merely stops protecting, so the group can be
+* **Soft TTL.** A lease protects its deployments while ACTIVE and not past its TTL.
+  Expiry does not kill anything; it merely stops protecting, so the deployment can be
   reclaimed once nothing else needs it. TTL is the crash-recovery backstop for
   leases whose explicit ``release`` never ran.
-* **Demand-driven group state.** A group is LIVE while demand > 0 and IDLE when
-  it reaches 0. Actually tearing an IDLE group down is a reconciler/backend
+* **Demand-driven deployment state.** A deployment is LIVE while demand > 0 and IDLE when
+  it reaches 0. Actually tearing an IDLE deployment down is a reconciler/backend
   concern (per reclaim policy); the ledger only computes the candidates.
 
 It does **not** talk to docker, GPUs, or KubeAI — that is the reconciler/backend
@@ -29,9 +29,9 @@ from typing import Callable
 
 from ..paths import data_root
 from .models import (
-    DeploymentGroup,
+    Deployment,
+    DeploymentState,
     EndpointRequest,
-    GroupState,
     Lease,
     LeaseState,
     Sharing,
@@ -49,23 +49,23 @@ def default_ledger_path() -> Path:
 class AcquireResult:
     """What :meth:`Ledger.acquire` returns to the reconciler.
 
-    ``groups`` are the deployments the caller must ensure are realized and ready
+    ``deployments`` are the deployments the caller must ensure are realized and ready
     before handing the lease's env-file to the job.
     """
 
     lease: Lease
-    groups: list[DeploymentGroup] = field(default_factory=list)
+    deployments: list[Deployment] = field(default_factory=list)
 
 
 @dataclass
 class ReleaseResult:
-    idled_group_ids: list[str] = field(default_factory=list)
+    idled_deployment_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
 class SweepResult:
     expired_lease_ids: list[str] = field(default_factory=list)
-    idled_group_ids: list[str] = field(default_factory=list)
+    idled_deployment_ids: list[str] = field(default_factory=list)
 
 
 class Ledger:
@@ -86,15 +86,15 @@ class Ledger:
         ...     capacity={'max_model_len': 32768})
         >>> a = led.acquire('alice', [req])
         >>> b = led.acquire('bob', [req])            # same model -> coalesces
-        >>> a.groups[0].id == b.groups[0].id
+        >>> a.deployments[0].id == b.deployments[0].id
         True
-        >>> led.get_group(a.groups[0].id).demand     # two protecting leases
+        >>> led.get_deployment(a.deployments[0].id).demand     # two protecting leases
         2
         >>> _ = led.release(a.lease.id)
-        >>> led.get_group(a.groups[0].id).demand
+        >>> led.get_deployment(a.deployments[0].id).demand
         1
         >>> res = led.release(b.lease.id)            # last one out -> idle
-        >>> res.idled_group_ids == [a.groups[0].id]
+        >>> res.idled_deployment_ids == [a.deployments[0].id]
         True
     """
 
@@ -122,7 +122,7 @@ class Ledger:
         *,
         ttl_seconds: float | None = None,
     ) -> AcquireResult:
-        """Create a lease and coalesce its endpoints onto deployment groups.
+        """Create a lease and coalesce its endpoints onto deployment deployments.
 
         ``ttl_seconds=None`` is an infinite (standing) lease — the shape the
         legacy ``switch <profile>`` maps onto.
@@ -130,7 +130,7 @@ class Ledger:
         now = self.clock()
         lease_id = self.id_factory('lease')
         expires_at = None if ttl_seconds is None else now + ttl_seconds
-        group_ids: list[str] = []
+        deployment_ids: list[str] = []
         with self.store.transaction():
             self.store.insert_lease(
                 lease_id=lease_id,
@@ -141,20 +141,20 @@ class Ledger:
                 heartbeat_at=now,
             )
             for req in requests:
-                group = self._find_or_create_group(req, now)
+                deployment = self._find_or_create_deployment(req, now)
                 self.store.insert_claim(
-                    lease_id=lease_id, endpoint=req.endpoint, group_id=group.id
+                    lease_id=lease_id, endpoint=req.endpoint, deployment_id=deployment.id
                 )
-                group_ids.append(group.id)
+                deployment_ids.append(deployment.id)
         lease = self.store.get_lease(lease_id)
-        groups = [
-            self.store.get_group(gid, now=now)
-            for gid in dict.fromkeys(group_ids)
+        deployments = [
+            self.store.get_deployment(gid, now=now)
+            for gid in dict.fromkeys(deployment_ids)
         ]
-        return AcquireResult(lease=lease, groups=[g for g in groups if g])
+        return AcquireResult(lease=lease, deployments=[g for g in deployments if g])
 
     def release(self, lease_id: str) -> ReleaseResult:
-        """Mark a lease released and idle any group whose demand hits zero."""
+        """Mark a lease released and idle any deployment whose demand hits zero."""
         now = self.clock()
         idled: list[str] = []
         with self.store.transaction():
@@ -162,8 +162,8 @@ class Ledger:
             if lease is None or lease.state == LeaseState.RELEASED:
                 return ReleaseResult()
             self.store.set_lease_state(lease_id, LeaseState.RELEASED)
-            idled = self._idle_groups(lease.group_ids, now)
-        return ReleaseResult(idled_group_ids=idled)
+            idled = self._idle_deployments(lease.deployment_ids, now)
+        return ReleaseResult(idled_deployment_ids=idled)
 
     def renew(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None:
         """Extend (or make infinite) a lease's protection window."""
@@ -181,7 +181,7 @@ class Ledger:
         return self.store.get_lease(lease_id)
 
     def sweep(self) -> SweepResult:
-        """Materialize TTL expiry and recompute idle groups.
+        """Materialize TTL expiry and recompute idle deployments.
 
         Safe to call periodically. Expiring a lease is the crash backstop: a job
         that died without ``release`` stops protecting once its TTL elapses.
@@ -195,89 +195,89 @@ class Ledger:
             for lease in due:
                 self.store.set_lease_state(lease.id, LeaseState.EXPIRED)
                 expired.append(lease.id)
-                affected.extend(lease.group_ids)
-            idled = self._idle_groups(affected, now)
-        return SweepResult(expired_lease_ids=expired, idled_group_ids=idled)
+                affected.extend(lease.deployment_ids)
+            idled = self._idle_deployments(affected, now)
+        return SweepResult(expired_lease_ids=expired, idled_deployment_ids=idled)
 
-    def reclaimable_groups(self) -> list[DeploymentGroup]:
-        """IDLE groups the reconciler may tear down per reclaim policy."""
+    def reclaimable_deployments(self) -> list[Deployment]:
+        """IDLE deployments the reconciler may tear down per reclaim policy."""
         now = self.clock()
         return [
             g
-            for g in self.store.list_groups(now=now)
-            if g.state == GroupState.IDLE
+            for g in self.store.list_deployments(now=now)
+            if g.state == DeploymentState.IDLE
         ]
 
-    def evict_idle(self, group_ids: list[str] | None = None) -> list[str]:
-        """Force IDLE groups to STOPPED so the next reconcile tears them down.
+    def evict_idle(self, deployment_ids: list[str] | None = None) -> list[str]:
+        """Force IDLE deployments to STOPPED so the next reconcile tears them down.
 
-        This overrides ``keep-warm``: a released group normally stays resident
+        This overrides ``keep-warm``: a released deployment normally stays resident
         (IDLE) to avoid cold-start thrash, but evicting it frees its GPU now.
-        ``group_ids=None`` evicts every idle group; a list restricts it (ids not
+        ``deployment_ids=None`` evicts every idle deployment; a list restricts it (ids not
         currently idle are skipped). Returns the ids actually evicted.
         """
         now = self.clock()
-        wanted = None if group_ids is None else set(group_ids)
+        wanted = None if deployment_ids is None else set(deployment_ids)
         evicted: list[str] = []
         with self.store.transaction():
-            for g in self.store.list_groups(now=now):
-                if g.state != GroupState.IDLE:
+            for g in self.store.list_deployments(now=now):
+                if g.state != DeploymentState.IDLE:
                     continue
                 if wanted is not None and g.id not in wanted:
                     continue
-                self.store.set_group_state(g.id, GroupState.STOPPED, now)
+                self.store.set_deployment_state(g.id, DeploymentState.STOPPED, now)
                 evicted.append(g.id)
         return evicted
 
     def prune(self) -> tuple[int, int]:
-        """Forget terminal entries: released/expired leases + stopped groups.
+        """Forget terminal entries: released/expired leases + stopped deployments.
 
-        Sweep/evict leave a tail of RELEASED/EXPIRED leases and STOPPED groups
+        Sweep/evict leave a tail of RELEASED/EXPIRED leases and STOPPED deployments
         in the ledger so history stays inspectable; this clears that tail once
-        you no longer care. Returns ``(n_leases, n_groups)`` removed.
+        you no longer care. Returns ``(n_leases, n_deployments)`` removed.
         """
         return self.store.prune(
             lease_states=(LeaseState.RELEASED, LeaseState.EXPIRED),
-            group_states=(GroupState.STOPPED,),
+            deployment_states=(DeploymentState.STOPPED,),
         )
 
-    def status(self) -> tuple[list[Lease], list[DeploymentGroup]]:
-        """Snapshot for ``infer-stack status`` (leases, groups-with-demand)."""
+    def status(self) -> tuple[list[Lease], list[Deployment]]:
+        """Snapshot for ``infer-stack status`` (leases, deployments-with-demand)."""
         now = self.clock()
-        return self.store.list_leases(), self.store.list_groups(now=now)
+        return self.store.list_leases(), self.store.list_deployments(now=now)
 
     def get_lease(self, lease_id: str) -> Lease | None:
         return self.store.get_lease(lease_id)
 
-    def get_group(self, group_id: str) -> DeploymentGroup | None:
-        return self.store.get_group(group_id, now=self.clock())
+    def get_deployment(self, deployment_id: str) -> Deployment | None:
+        return self.store.get_deployment(deployment_id, now=self.clock())
 
     # -- internals ---------------------------------------------------------
 
-    def _find_or_create_group(
+    def _find_or_create_deployment(
         self, req: EndpointRequest, now: float
-    ) -> DeploymentGroup:
+    ) -> Deployment:
         if req.sharing == Sharing.DEDICATED:
-            return self._create_group(req, now)
-        candidates = self.store.groups_by_compat(
+            return self._create_deployment(req, now)
+        candidates = self.store.deployments_by_compat(
             req.compat_key,
             sharing=Sharing.SHARED,
-            states=(GroupState.LIVE, GroupState.IDLE),
+            states=(DeploymentState.LIVE, DeploymentState.IDLE),
         )
-        for group in candidates:
-            if capacity_satisfies(group.capacity, req.capacity):
-                if group.state == GroupState.IDLE:
-                    self.store.set_group_state(
-                        group.id, GroupState.LIVE, now
+        for deployment in candidates:
+            if capacity_satisfies(deployment.capacity, req.capacity):
+                if deployment.state == DeploymentState.IDLE:
+                    self.store.set_deployment_state(
+                        deployment.id, DeploymentState.LIVE, now
                     )
-                self._merge_served(group, req, now)
-                return self.store.get_group(group.id) or group
-        return self._create_group(req, now)
+                self._merge_served(deployment, req, now)
+                return self.store.get_deployment(deployment.id) or deployment
+        return self._create_deployment(req, now)
 
-    def _create_group(
+    def _create_deployment(
         self, req: EndpointRequest, now: float
-    ) -> DeploymentGroup:
-        group = DeploymentGroup(
+    ) -> Deployment:
+        deployment = Deployment(
             id=self.id_factory('grp'),
             compat_key=req.compat_key,
             engine=req.engine,
@@ -285,29 +285,29 @@ class Ledger:
             capacity=dict(req.capacity),
             spec=dict(req.spec),
             served={req.endpoint: dict(req.served)},
-            state=GroupState.LIVE,
+            state=DeploymentState.LIVE,
             created_at=now,
             updated_at=now,
         )
-        self.store.insert_group(group)
-        return group
+        self.store.insert_deployment(deployment)
+        return deployment
 
     def _merge_served(
-        self, group: DeploymentGroup, req: EndpointRequest, now: float
+        self, deployment: Deployment, req: EndpointRequest, now: float
     ) -> None:
-        """Add an endpoint (e.g. a new Ollama tag) to a coalesced group."""
-        served = dict(group.served)
+        """Add an endpoint (e.g. a new Ollama tag) to a coalesced deployment."""
+        served = dict(deployment.served)
         if served.get(req.endpoint) != req.served:
             served[req.endpoint] = dict(req.served)
-            self.store.update_group_served(group.id, served, now)
+            self.store.update_deployment_served(deployment.id, served, now)
 
-    def _idle_groups(self, group_ids: list[str], now: float) -> list[str]:
+    def _idle_deployments(self, deployment_ids: list[str], now: float) -> list[str]:
         idled: list[str] = []
-        for gid in dict.fromkeys(group_ids):
-            group = self.store.get_group(gid)
-            if group is None or group.state != GroupState.LIVE:
+        for gid in dict.fromkeys(deployment_ids):
+            deployment = self.store.get_deployment(gid)
+            if deployment is None or deployment.state != DeploymentState.LIVE:
                 continue
             if self.store.demand(gid, now) == 0:
-                self.store.set_group_state(gid, GroupState.IDLE, now)
+                self.store.set_deployment_state(gid, DeploymentState.IDLE, now)
                 idled.append(gid)
         return idled

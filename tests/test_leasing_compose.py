@@ -25,7 +25,7 @@ from infer_stack.leasing import (
     render_compose,
 )
 from infer_stack.leasing.compose import vllm_service_name
-from infer_stack.leasing.models import DeploymentGroup, GroupState
+from infer_stack.leasing.models import Deployment, DeploymentState
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
 IMAGES = {
@@ -37,9 +37,9 @@ PORTS = {'ollama': 11434}
 
 
 def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm', t=0.0):
-    # endpoint (public alias) is the group id; served_model_name is the upstream
+    # endpoint (public alias) is the deployment id; served_model_name is the upstream
     served_name = served or gid
-    return DeploymentGroup(
+    return Deployment(
         gid, 'ck-' + gid, 'vllm', 'shared-compatible', {},
         {
             'engine': 'vllm',
@@ -49,15 +49,15 @@ def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep
             'reclaim': reclaim,
         },
         {gid: {'served_model_name': served_name}},
-        GroupState.LIVE, t, t,
+        DeploymentState.LIVE, t, t,
     )
 
 
 def ollama(gid, *, tag='m:1b', t=0.0):
-    return DeploymentGroup(
+    return Deployment(
         gid, 'ck-' + gid, 'ollama', 'shared-compatible', {},
         {'engine': 'ollama', 'gpu_indices': [], 'settings': {'keep_alive': '2m'}},
-        {gid: {'model': tag}}, GroupState.LIVE, t, t,
+        {gid: {'model': tag}}, DeploymentState.LIVE, t, t,
     )
 
 
@@ -122,14 +122,14 @@ class FakeHttp:
 
 
 def test_render_vllm_service():
-    group = vllm('grp-a', hf='Qwen/Q', served='qwen', tp=2)
+    deployment = vllm('grp-a', hf='Qwen/Q', served='qwen', tp=2)
     rc = render_compose(
-        [group],
+        [deployment],
         {'grp-a': [0, 1]},
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    # service name leads with the served model, suffixed by the group id
-    name = vllm_service_name(group)
+    # service name leads with the served model, suffixed by the deployment id
+    name = vllm_service_name(deployment)
     assert name == 'vllm-qwen-grp-a'
     svc = rc.compose['services'][name]
     assert svc['image'] == 'vllm/vllm-openai:test'
@@ -141,7 +141,7 @@ def test_render_vllm_service():
     assert devs['device_ids'] == ['0', '1']
     # Compose schema: capabilities is a list of *strings* (not [["gpu"]]).
     assert devs['capabilities'] == ['gpu']
-    assert svc['labels']['infer-stack.group'] == 'grp-a'
+    assert svc['labels']['infer-stack.deployment'] == 'grp-a'
     assert rc.services == {name: 'grp-a'}
 
 
@@ -168,7 +168,7 @@ def test_render_ollama_service():
     assert svc['ports'] == ['11434:11434']
 
 
-def test_render_skips_unplaced_groups():
+def test_render_skips_unplaced_deployments():
     a, b = vllm('a', served='aa'), vllm('b', served='bb')
     rc = render_compose(
         [a, b], {'a': [0]},  # b not placed
@@ -197,7 +197,7 @@ def test_vllm_service_name_is_model_led_and_dns_safe():
 
     g = vllm('grp-098ed1', hf='Qwen/Qwen2.5-0.5B-Instruct', served='Qwen2.5-0.5B')
     name = vllm_service_name(g)
-    # leads with the served model (slugified), suffixed by the full group id so
+    # leads with the served model (slugified), suffixed by the full deployment id so
     # it is unique and correlates with `infer-stack leases`
     assert name == 'vllm-qwen2-5-0-5b-grp-098ed1'
     # usable as a compose service *and* an on-network DNS host (LiteLLM routes
@@ -238,7 +238,7 @@ def test_converge_is_idempotent_and_pins(tmp_path):
     assert be.observe() == {'a', 'b'}
 
 
-def test_converge_removes_dropped_group(tmp_path):
+def test_converge_removes_dropped_deployment(tmp_path):
     be = make_backend(tmp_path)
     be.converge([vllm('a', t=0), vllm('b', t=1)])
     assert be.observe() == {'a', 'b'}
@@ -261,7 +261,7 @@ def test_converge_to_empty_keeps_the_front_door(tmp_path):
     be.converge([])                        # last model released
     verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
     assert 'up' in verbs and 'down' not in verbs   # front door stays up
-    # no model groups running, but the compose project still has the gateway/UI
+    # no model deployments running, but the compose project still has the gateway/UI
     assert be.observe() == set()
     compose = yaml.safe_load(be.compose_file.read_text())
     assert set(compose['services']) == {'litellm', 'open-webui'}
@@ -370,7 +370,7 @@ def test_probe_ready_tracks_running(tmp_path):
     assert be.probe_ready(g, 'a').ready is True
 
 
-def test_placement_error_skips_group(tmp_path):
+def test_placement_error_skips_deployment(tmp_path):
     be = make_backend(tmp_path, spec='2x80')
     plan = be.converge([vllm('big', tp=4)])        # needs 4, only 2
     assert not plan.ok
@@ -425,37 +425,37 @@ def test_controller_compose_end_to_end(tmp_path):
 
     out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder', 'reranker']))
     assert out.wait.ready is True
-    assert set(backend.observe()) == set(g.id for g in out.groups)
+    assert set(backend.observe()) == set(g.id for g in out.deployments)
     # two vLLM services + the LiteLLM front door
     compose = yaml.safe_load(backend.compose_file.read_text())
-    group_services = [s for s in compose['services'] if s.startswith('vllm-')]
-    assert len(group_services) == 2
+    deployment_services = [s for s in compose['services'] if s.startswith('vllm-')]
+    assert len(deployment_services) == 2
     assert 'litellm' in compose['services']
 
     # release the lease: reranker is stop-policy -> torn down; qwen keep-warm stays
-    qwen_gid = next(g.id for g in out.groups
+    qwen_gid = next(g.id for g in out.deployments
                     if 'qwen-coder' in g.served)
     ctl.release(out.lease.id)
     assert backend.observe() == {qwen_gid}
 
 
-def test_evict_tears_down_keep_warm_idle_group(tmp_path):
+def test_evict_tears_down_keep_warm_idle_deployment(tmp_path):
     catalog = Catalog.from_dict(CATALOG)
     ledger = Ledger(SqliteStore(':memory:'))
     backend = make_backend(tmp_path)
     ctl = Controller(ledger, backend)
 
     out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']))
-    qwen_gid = out.groups[0].id
+    qwen_gid = out.deployments[0].id
     ctl.release(out.lease.id)
     assert backend.observe() == {qwen_gid}        # keep-warm stays resident
 
-    ev = ctl.evict(None)                           # force-evict idle groups
-    assert qwen_gid in ev.evicted_group_ids
+    ev = ctl.evict(None)                           # force-evict idle deployments
+    assert qwen_gid in ev.evicted_deployment_ids
     assert backend.observe() == set()             # GPU freed: service gone
     # ledger records it as stopped, not idle
-    _, groups = ledger.status()
-    assert {g.state for g in groups} == {GroupState.STOPPED}
+    _, deployments = ledger.status()
+    assert {g.state for g in deployments} == {DeploymentState.STOPPED}
 
 
 # -- LiteLLM front door ----------------------------------------------------
@@ -483,22 +483,22 @@ def test_render_litellm_front_door(tmp_path):
 def test_litellm_config_hash_label_tracks_model_list(tmp_path):
     """The litellm service must change when its routing config changes.
 
-    Regression: a second alias coalesced onto a live group rewrote the config
+    Regression: a second alias coalesced onto a live deployment rewrote the config
     file, but `docker compose up -d` left the old litellm container running
     (spec unchanged), so the new alias never became routable. Stamping the
     config hash onto a label makes converge recreate litellm on a config change.
     """
     from infer_stack.leasing.compose import CONFIG_HASH_LABEL
 
-    def label(group):
+    def label(deployment):
         rc = render_compose(
-            [group], {group.id: [0]}, images=IMAGES, ports=PORTS, state=STATE,
+            [deployment], {deployment.id: [0]}, images=IMAGES, ports=PORTS, state=STATE,
             litellm=True, litellm_port=14042, aux_dir=tmp_path,
         )
         return rc.compose['services']['litellm']['labels'][CONFIG_HASH_LABEL]
 
     one = vllm('grp-a', served='qwen-served')
-    # same group serving two aliases (the coalesced case)
+    # same deployment serving two aliases (the coalesced case)
     two = vllm('grp-a', served='qwen-served')
     two.served['extra-alias'] = {'served_model_name': 'qwen-served'}
 
@@ -513,9 +513,9 @@ def test_render_open_webui_default_and_stable(tmp_path):
     state = {**STATE, 'open_webui': '/cache/open-webui'}
     images = {**IMAGES, 'open_webui': 'ghcr.io/open-webui/open-webui:test'}
 
-    def render(groups, assigns):
+    def render(deployments, assigns):
         return render_compose(
-            groups, assigns, images=images, ports=PORTS, state=state,
+            deployments, assigns, images=images, ports=PORTS, state=state,
             litellm=True, ui=True, ui_port=13000,
             litellm_master_key='sk-x', aux_dir=tmp_path,
         )
@@ -628,11 +628,11 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
     assert not [le for le in leases if le.state == LeaseState.ACTIVE]
 
 
-def test_acquire_rolls_back_when_group_cannot_be_placed(tmp_path):
-    """A serve whose group can't be placed must fail fast, not hang on ready.
+def test_acquire_rolls_back_when_deployment_cannot_be_placed(tmp_path):
+    """A serve whose deployment can't be placed must fail fast, not hang on ready.
 
     Regression: with the only GPU already held, `serve <other>` left the new
-    group LIVE in the ledger (so `leases` showed a phantom "live" group) and
+    deployment LIVE in the ledger (so `leases` showed a phantom "live" deployment) and
     then blocked forever waiting on a container placement skipped. Acquire now
     rolls the lease back and raises PlacementError.
     """
@@ -646,18 +646,18 @@ def test_acquire_rolls_back_when_group_cannot_be_placed(tmp_path):
 
     first = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']))
     assert first.wait.ready                            # claims the only GPU
-    qwen_gid = first.groups[0].id
+    qwen_gid = first.deployments[0].id
 
     with pytest.raises(PlacementError) as ei:
         ctl.acquire('bob', catalog.resolve_names(['reranker']))
     assert ei.value.reasons                            # carries the planner reason
 
-    leases, groups = ledger.status()
+    leases, deployments = ledger.status()
     # the rolled-back request leaves no second active lease, and the reranker
-    # never lingers as a LIVE group with no container behind it
+    # never lingers as a LIVE deployment with no container behind it
     assert [le.owner for le in leases if le.state == LeaseState.ACTIVE] == ['alice']
-    live_served = {ep for g in groups
-                   if g.state == GroupState.LIVE for ep in g.served}
+    live_served = {ep for g in deployments
+                   if g.state == DeploymentState.LIVE for ep in g.served}
     assert 'reranker' not in live_served
     assert backend.observe() == {qwen_gid}             # only qwen is running
 
@@ -682,7 +682,7 @@ def test_controller_acquire_render_only_stages(tmp_path):
 
     # applying (the default) brings up exactly what was staged
     ctl.reconcile()
-    assert backend.observe() == {out.groups[0].id}
+    assert backend.observe() == {out.deployments[0].id}
 
 
 def test_access_reports_litellm_base_url(tmp_path):
@@ -720,9 +720,9 @@ def test_envfile_carries_managed_api_key(tmp_path):
     info = be.access(['qwen-coder'])
     lease = Lease('sess-x', 'me', 'active', 0.0, None, None, 0.0,
                   endpoints=['qwen-coder'])
-    g = DeploymentGroup('g', 'ck', 'vllm', 'shared-compatible', {}, {},
+    g = Deployment('g', 'ck', 'vllm', 'shared-compatible', {}, {},
                         {'qwen-coder': {'served_model_name': 'qwen-coder'}},
-                        GroupState.LIVE, 0.0, 0.0)
+                        DeploymentState.LIVE, 0.0, 0.0)
     d = build_descriptor(lease, [g], base_url=info['base_url'],
                          api_key_env=info['api_key_env'], api_key=info['api_key'],
                          request_names=info['request_names'])
@@ -820,10 +820,10 @@ requires_compose = pytest.mark.skipif(
 )
 
 
-def _render(groups, *, litellm, tmp_path):
-    plan = plan_placement(groups, simulate_inventory('2x48'))
+def _render(deployments, *, litellm, tmp_path):
+    plan = plan_placement(deployments, simulate_inventory('2x48'))
     return render_compose(
-        groups, plan.assignments,
+        deployments, plan.assignments,
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=litellm, litellm_port=14042, aux_dir=tmp_path,
     )
@@ -831,7 +831,7 @@ def _render(groups, *, litellm, tmp_path):
 
 @requires_compose
 @pytest.mark.parametrize(
-    'name, groups, litellm',
+    'name, deployments, litellm',
     [
         ('vllm-single', [vllm('grp-v', served='qwen')], True),
         ('vllm-tp2', [vllm('grp-v', served='qwen', tp=2)], True),
@@ -841,8 +841,8 @@ def _render(groups, *, litellm, tmp_path):
         ('no-litellm', [vllm('grp-v', served='qwen')], False),
     ],
 )
-def test_rendered_compose_passes_docker_schema(name, groups, litellm, tmp_path):
-    rc = _render(groups, litellm=litellm, tmp_path=tmp_path)
+def test_rendered_compose_passes_docker_schema(name, deployments, litellm, tmp_path):
+    rc = _render(deployments, litellm=litellm, tmp_path=tmp_path)
     if rc.litellm_config is not None:
         (tmp_path / 'litellm_config.yaml').write_text(rc.litellm_config)
     compose_file = tmp_path / 'docker-compose.yml'

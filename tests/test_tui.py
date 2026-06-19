@@ -47,7 +47,7 @@ def _run(scenario):
     asyncio.run(scenario())
 
 
-def test_tui_panes_list_catalog_leases_and_groups():
+def test_tui_panes_list_catalog_leases_and_deployments():
     from textual.widgets import DataTable
 
     from infer_stack.tui import InferStackTUI
@@ -65,7 +65,7 @@ def test_tui_panes_list_catalog_leases_and_groups():
             assert app._endpoint_names == ['qwen-coder', 'qwen-fast']
             assert app.query_one('#models', DataTable).row_count == 1
             assert app.query_one('#leases', DataTable).row_count == 1
-            assert app.query_one('#groups', DataTable).row_count == 1
+            assert app.query_one('#deployments', DataTable).row_count == 1
 
     _run(scenario)
 
@@ -77,7 +77,7 @@ def test_tui_relationship_columns_link_lease_to_deployment():
 
     controller, catalog = _ctx()
     out = controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
-    gid = out.lease.group_ids[0]
+    gid = out.lease.deployment_ids[0]
 
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
@@ -85,15 +85,15 @@ def test_tui_relationship_columns_link_lease_to_deployment():
         async with app.run_test() as pilot:
             await pilot.pause()
             leases = app.query_one('#leases', DataTable)
-            groups = app.query_one('#groups', DataTable)
+            deployments = app.query_one('#deployments', DataTable)
             assert 'deployment' in [str(c.label) for c in leases.columns.values()]
-            glabels = [str(c.label) for c in groups.columns.values()]
+            glabels = [str(c.label) for c in deployments.columns.values()]
             assert 'leases' in glabels and 'held by' in glabels
             # the lease row names the deployment id; the deployment row counts
             # the lease (1) and shows the owner — the many-to-one join.
             assert gid in leases.get_row_at(0)
-            assert '1' in groups.get_row_at(0)
-            assert 'alice' in groups.get_row_at(0)
+            assert '1' in deployments.get_row_at(0)
+            assert 'alice' in deployments.get_row_at(0)
             # selecting a lease explains the link in the status bar
             app.query_one('#leases').focus()
             app.query_one('#leases', DataTable).move_cursor(row=0)

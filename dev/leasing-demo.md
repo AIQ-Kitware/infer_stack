@@ -154,12 +154,12 @@ currently declared, without starting anything.
 Watch it come up from another shell:
 
 ```bash
-infer-stack leases          # leases + groups: state (desired) vs running, and GPUs
+infer-stack leases          # leases + deployments: state (desired) vs running, and GPUs
 infer-stack stack ps        # vllm-… + litellm + open-webui  (alias: infer-stack ps)
 infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stack logs -f)
 ```
 
-`leases` now shows the **groups** table with both what the ledger *wants*
+`leases` now shows the **deployments** table with both what the ledger *wants*
 (`state`) and what's *actually up* (`running`), plus the GPUs each model is on
 (or `→N` for one that's slated but not started yet) — so it's obvious when
 something is still warming up vs truly live.
@@ -167,7 +167,7 @@ something is still warming up vs truly live.
 > **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI
 > (run `infer-stack config init` once first):
 > a **catalog** pane to pick an endpoint and serve it (`s`/Enter), live
-> **leases** + **groups** tables, and three collapsible panes below: **docker**
+> **leases** + **deployments** tables, and three collapsible panes below: **docker**
 > (a `logs -f` tail + a **Containers** `docker ps` view: status/uptime · created
 > · container id · ports), **system** (`nvidia-smi` GPUs + host CPU/mem), and
 > **api** (send a prompt to a *ready* model — only running models are listed).
@@ -258,7 +258,7 @@ its own name:
 
 ```bash
 infer-stack serve smol135-1 --require-generation --timeout 600
-infer-stack leases            # two live groups now — GPU 0 and GPU 1
+infer-stack leases            # two live deployments now — GPU 0 and GPU 1
 infer-stack test smol135-1    # confirm the new model serves
 ```
 
@@ -303,7 +303,7 @@ A `keep-warm` model stays resident after release (no cold-start next time) — b
 it holds its GPU. To free that GPU now, **evict** it (overrides keep-warm):
 
 ```bash
-infer-stack evict smol17b-1  # tear down the idle `smol17b-1` group now (by name)
+infer-stack evict smol17b-1  # tear down the idle `smol17b-1` deployment now (by name)
 infer-stack evict --all      # ...or every idle/released model at once
 # or do it in one step at release time:
 infer-stack release <SESSION_ID> --evict

@@ -1,13 +1,13 @@
 """Focused Compose backend for the leasing model.
 
 Renders a docker-compose project straight from the live set of
-:class:`DeploymentGroup` s — not the legacy resolved-deployment schema — using
+:class:`Deployment` s — not the legacy resolved-deployment schema — using
 the placement planner for GPU assignment and reusing ``profile_runtime.vllm_args``
 for the vLLM CLI flags. It *converges the whole union* on every reconcile:
 render the file, then ``docker compose up -d --remove-orphans``. Adding or
-removing a group re-renders and converges; pinned placement (persisted in a
+removing a deployment re-renders and converges; pinned placement (persisted in a
 sidecar) keeps already-running models on their GPUs, and ``--remove-orphans``
-tears down services whose group is gone.
+tears down services whose deployment is gone.
 
 A **LiteLLM front door** (default on) gives one stable ``base_url`` and routes
 each endpoint *alias* to its upstream vLLM/Ollama service, so a client always
@@ -42,7 +42,7 @@ from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import vllm_args
 from .backend import Readiness
-from .models import DeploymentGroup
+from .models import Deployment
 from .placement import plan_placement
 
 LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
@@ -62,7 +62,7 @@ VLLM_DEFAULTS = {
     'max_num_seqs': 256,
 }
 
-GROUP_LABEL = 'infer-stack.group'
+DEPLOYMENT_LABEL = 'infer-stack.deployment'
 ENGINE_LABEL = 'infer-stack.engine'
 
 
@@ -72,30 +72,30 @@ def _dns_slug(text: str) -> str:
     return out or 'model'
 
 
-def vllm_service_name(group: DeploymentGroup) -> str:
-    """Compose service name for a vLLM group: ``vllm-<model>-<group-id>``.
+def vllm_service_name(deployment: Deployment) -> str:
+    """Compose service name for a vLLM deployment: ``vllm-<model>-<deployment-id>``.
 
-    A vLLM group is exactly one model in one container (possibly across several
+    A vLLM deployment is exactly one model in one container (possibly across several
     GPUs), so we lead the service name with the served model name — the alias
     the user chose, also vLLM's ``--served-model-name`` and the Open WebUI label
     — to make ``docker ps`` / ``nvidia-smi`` legible *without* infer-stack. The
-    full group id is kept as a suffix so the name is unique (two desired groups
+    full deployment id is kept as a suffix so the name is unique (two desired deployments
     can share a served name, e.g. an endpoint re-pointed at a new model) and so
     it correlates 1:1 with the ``id`` column of ``infer-stack leases``.
 
     The service name is also the on-network DNS host LiteLLM routes to, so
     :func:`_litellm_model_list` must derive the upstream from this same helper.
     """
-    served = group.spec.get('served_model_name') or (
-        sorted(group.served)[0] if group.served else group.id
+    served = deployment.spec.get('served_model_name') or (
+        sorted(deployment.served)[0] if deployment.served else deployment.id
     )
-    return f'vllm-{_dns_slug(served)}-{group.id}'
+    return f'vllm-{_dns_slug(served)}-{deployment.id}'
 
 
 @dataclass
 class RenderedCompose:
     compose: dict[str, Any]
-    services: dict[str, str] = field(default_factory=dict)  # service -> group id
+    services: dict[str, str] = field(default_factory=dict)  # service -> deployment id
     litellm_config: str | None = None
     nginx_config: str | None = None
 
@@ -116,11 +116,11 @@ def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
     }
 
 
-def _vllm_service_dict(group: DeploymentGroup) -> dict[str, Any]:
-    """Build the dict ``vllm_args`` consumes from a group's runtime spec."""
-    runtime = group.spec.get('runtime', {}) or {}
-    served = group.spec.get('served_model_name') or (
-        sorted(group.served)[0] if group.served else group.id
+def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
+    """Build the dict ``vllm_args`` consumes from a deployment's runtime spec."""
+    runtime = deployment.spec.get('runtime', {}) or {}
+    served = deployment.spec.get('served_model_name') or (
+        sorted(deployment.served)[0] if deployment.served else deployment.id
     )
     return {
         'served_model_name': served,
@@ -142,15 +142,15 @@ def _vllm_service_dict(group: DeploymentGroup) -> dict[str, Any]:
 
 
 def _vllm_service(
-    group: DeploymentGroup,
+    deployment: Deployment,
     gpus: list[int],
     host_port: int,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
-    svc = _vllm_service_dict(group)
+    svc = _vllm_service_dict(deployment)
     command = [
-        group.spec['hf_model_id'],
+        deployment.spec['hf_model_id'],
         '--host',
         '0.0.0.0',
         '--port',
@@ -164,7 +164,7 @@ def _vllm_service(
         'environment': {'HF_TOKEN': '${HF_TOKEN:-}'},
         'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
         'restart': 'unless-stopped',
-        'labels': {GROUP_LABEL: group.id, ENGINE_LABEL: 'vllm'},
+        'labels': {DEPLOYMENT_LABEL: deployment.id, ENGINE_LABEL: 'vllm'},
         'healthcheck': {
             'test': ['CMD', 'curl', '-f', 'http://localhost:8000/health'],
             'interval': '30s',
@@ -179,13 +179,13 @@ def _vllm_service(
 
 
 def _ollama_service(
-    group: DeploymentGroup,
+    deployment: Deployment,
     gpus: list[int],
     host_port: int,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
-    settings = group.spec.get('settings', {}) or {}
+    settings = deployment.spec.get('settings', {}) or {}
     env: dict[str, str] = {}
     if settings.get('keep_alive'):
         env['OLLAMA_KEEP_ALIVE'] = str(settings['keep_alive'])
@@ -198,12 +198,12 @@ def _ollama_service(
     if gpus:
         env['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in gpus)
     service: dict[str, Any] = {
-        'image': group.spec.get('image') or images['ollama'],
+        'image': deployment.spec.get('image') or images['ollama'],
         'ports': [f'{host_port}:11434'],
         'environment': env,
         'volumes': [f'{state["ollama"]}:/root/.ollama'],
         'restart': 'unless-stopped',
-        'labels': {GROUP_LABEL: group.id, ENGINE_LABEL: 'ollama'},
+        'labels': {DEPLOYMENT_LABEL: deployment.id, ENGINE_LABEL: 'ollama'},
         'healthcheck': {
             'test': ['CMD', 'ollama', 'list'],
             'interval': '30s',
@@ -217,17 +217,17 @@ def _ollama_service(
 
 
 def _litellm_model_list(
-    groups: list[DeploymentGroup], assignments: dict[str, list[int]]
+    deployments: list[Deployment], assignments: dict[str, list[int]]
 ) -> list[dict[str, Any]]:
     """One LiteLLM ``model_list`` entry per served endpoint alias."""
     entries: list[dict[str, Any]] = []
-    for group in sorted(groups, key=lambda g: (g.created_at, g.id)):
-        if group.id not in assignments:
+    for deployment in sorted(deployments, key=lambda g: (g.created_at, g.id)):
+        if deployment.id not in assignments:
             continue
-        if group.engine == 'vllm':
-            served = group.spec.get('served_model_name') or group.id
-            api_base = f'http://{vllm_service_name(group)}:8000/v1'
-            for endpoint in sorted(group.served):
+        if deployment.engine == 'vllm':
+            served = deployment.spec.get('served_model_name') or deployment.id
+            api_base = f'http://{vllm_service_name(deployment)}:8000/v1'
+            for endpoint in sorted(deployment.served):
                 entries.append(
                     {
                         'model_name': endpoint,
@@ -238,9 +238,9 @@ def _litellm_model_list(
                         },
                     }
                 )
-        elif group.engine == 'ollama':
-            api_base = f'http://ollama-{group.id}:11434'
-            for endpoint, payload in sorted(group.served.items()):
+        elif deployment.engine == 'ollama':
+            api_base = f'http://ollama-{deployment.id}:11434'
+            for endpoint, payload in sorted(deployment.served.items()):
                 tag = payload.get('model', endpoint)
                 entries.append(
                     {
@@ -280,7 +280,7 @@ def _litellm_service(
         # routes) running. Stamping the config hash onto a label makes the spec
         # change exactly when the config does, so converge recreates LiteLLM and
         # it picks up new/removed aliases. Without this, coalescing a second
-        # alias onto a live group never becomes routable (readiness times out).
+        # alias onto a live deployment never becomes routable (readiness times out).
         labels[CONFIG_HASH_LABEL] = config_hash
     service: dict[str, Any] = {
         'image': images['litellm'],
@@ -436,7 +436,7 @@ def _nginx_service(
 
 
 def render_compose(
-    groups: list[DeploymentGroup],
+    deployments: list[Deployment],
     assignments: dict[str, list[int]],
     *,
     images: dict[str, str],
@@ -453,9 +453,9 @@ def render_compose(
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
 ) -> RenderedCompose:
-    """Render a compose project for the placed groups.
+    """Render a compose project for the placed deployments.
 
-    Groups absent from ``assignments`` (placement failures) are skipped. When
+    Deployments absent from ``assignments`` (placement failures) are skipped. When
     ``litellm`` is set, a front-door service + config is added so every endpoint
     alias is reachable at one ``base_url``. When ``ui`` is also set, a managed
     Open WebUI is rendered in front of that gateway.
@@ -469,26 +469,26 @@ def render_compose(
     """
     services: dict[str, Any] = {}
     service_map: dict[str, str] = {}
-    ordered = sorted(groups, key=lambda g: (g.created_at, g.id))
+    ordered = sorted(deployments, key=lambda g: (g.created_at, g.id))
     vllm_i = 0
     ollama_i = 0
-    for group in ordered:
-        if group.id not in assignments:
+    for deployment in ordered:
+        if deployment.id not in assignments:
             continue
-        gpus = assignments[group.id]
-        if group.engine == 'vllm':
-            name = vllm_service_name(group)
+        gpus = assignments[deployment.id]
+        if deployment.engine == 'vllm':
+            name = vllm_service_name(deployment)
             port = VLLM_HOST_PORT_BASE + vllm_i
             vllm_i += 1
-            services[name] = _vllm_service(group, gpus, port, images, state)
-        elif group.engine == 'ollama':
-            name = f'ollama-{group.id}'
+            services[name] = _vllm_service(deployment, gpus, port, images, state)
+        elif deployment.engine == 'ollama':
+            name = f'ollama-{deployment.id}'
             port = ports.get('ollama', DEFAULT_PORTS['ollama']) + ollama_i
             ollama_i += 1
-            services[name] = _ollama_service(group, gpus, port, images, state)
+            services[name] = _ollama_service(deployment, gpus, port, images, state)
         else:
             continue
-        service_map[name] = group.id
+        service_map[name] = deployment.id
 
     litellm_config = None
     # The front door (gateway + UI) is rendered whenever it's enabled, even with
@@ -497,7 +497,7 @@ def render_compose(
     # WebUI picker) up instead of tearing the whole stack down; only an explicit
     # `stack down` removes it. With no models the model_list is simply empty.
     if litellm:
-        entries = _litellm_model_list(groups, assignments)
+        entries = _litellm_model_list(deployments, assignments)
         litellm_config = yaml.safe_dump(
             {
                 'model_list': entries,
@@ -509,7 +509,7 @@ def render_compose(
                 # start). Retry transient connection errors and don't park a
                 # model in a long cooldown, so the warmup window is self-healing
                 # instead of surfacing as client 500s ("Connection error.
-                # Received Model Group=…").
+                # Received Model Deployment=…").
                 'router_settings': {
                     'num_retries': 3,
                     'timeout': 600,
@@ -652,9 +652,9 @@ class ComposeBackend:
         self.require_generation = require_generation
         self.assume_yes = assume_yes
         self.last_errors: list[str] = []
-        self.last_unplaced: set[str] = set()  # desired group ids placement skipped
-        self.last_assignments: dict[str, list[int]] = {}  # group id -> GPU ids
-        self._pulled: set[str] = set()  # (group:tag) pulled this process
+        self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
+        self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
+        self._pulled: set[str] = set()  # (deployment:tag) pulled this process
 
     @property
     def compose_file(self) -> Path:
@@ -756,11 +756,11 @@ class ComposeBackend:
         ):
             raise ConvergeAborted('compose changes were not approved')
 
-    def plan(self, desired: list[DeploymentGroup]):
+    def plan(self, desired: list[Deployment]):
         """Compute GPU placement for ``desired`` without writing or applying.
 
         Read-only and side-effect free: it honors the persisted pins, so the
-        result reflects where groups are (for running ones) or *would* be (for
+        result reflects where deployments are (for running ones) or *would* be (for
         not-yet-started ones) placed. ``leases`` uses it to show actual/slated
         GPUs; ``converge`` uses it as the first step of render.
         """
@@ -774,7 +774,7 @@ class ComposeBackend:
             skip_display=self.skip_display,
         )
 
-    def converge(self, desired: list[DeploymentGroup], *, apply: bool = True):
+    def converge(self, desired: list[Deployment], *, apply: bool = True):
         """Place + render the desired union, then optionally apply it.
 
         The work splits into *render* (decide placement, write the
@@ -790,7 +790,7 @@ class ComposeBackend:
         desired = list(desired)
         with self._converge_lock():
             logger.info(
-                'Converging {} group(s): {}',
+                'Converging {} deployment(s): {}',
                 len(desired),
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
@@ -912,7 +912,7 @@ class ComposeBackend:
         return info
 
     def _ensure_ollama_tag(
-        self, group: DeploymentGroup, endpoint: str
+        self, deployment: Deployment, endpoint: str
     ) -> str | None:
         """Pull the endpoint's Ollama tag into its daemon (idempotent).
 
@@ -920,21 +920,21 @@ class ComposeBackend:
         can serve. Returns an error reason if the pull failed (retry next poll),
         else ``None``.
         """
-        tag = (group.served.get(endpoint) or {}).get('model')
+        tag = (deployment.served.get(endpoint) or {}).get('model')
         if not tag:
             return None
-        key = f'{group.id}:{tag}'
+        key = f'{deployment.id}:{tag}'
         if key in self._pulled:
             return None
         try:
-            self._compose(['exec', '-T', f'ollama-{group.id}', 'ollama', 'pull', tag])
+            self._compose(['exec', '-T', f'ollama-{deployment.id}', 'ollama', 'pull', tag])
         except Exception as ex:  # noqa: BLE001 - readiness is retryable
             return f'pulling {tag}: {ex}'
         self._pulled.add(key)
         return None
 
     def probe_ready(
-        self, group: DeploymentGroup, endpoint: str
+        self, deployment: Deployment, endpoint: str
     ) -> Readiness:
         """Ready == container running and (with LiteLLM) the alias is routable.
 
@@ -944,13 +944,13 @@ class ComposeBackend:
         is pulled first and a generation is forced, so readiness means the tag is
         actually loaded and serving (not just lazily configured).
         """
-        if group.id not in self.observe():
+        if deployment.id not in self.observe():
             return Readiness(False, 'container not running')
         if not self.litellm:
             return Readiness(True, 'container running')
         require_generation = self.require_generation
-        if group.engine == 'ollama':
-            error = self._ensure_ollama_tag(group, endpoint)
+        if deployment.engine == 'ollama':
+            error = self._ensure_ollama_tag(deployment, endpoint)
             if error:
                 return Readiness(False, error)
             require_generation = True  # warm the tag so it is resident

@@ -1,27 +1,27 @@
-"""Tests for single-host GPU placement over the union of groups."""
+"""Tests for single-host GPU placement over the union of deployments."""
 
 from __future__ import annotations
 
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import plan_placement
-from infer_stack.leasing.models import DeploymentGroup, GroupState
+from infer_stack.leasing.models import Deployment, DeploymentState
 
 
 def vllm(gid, *, tp=1, dp=1, gpu_indices=None, t=0.0):
     runtime = {'tensor_parallel_size': tp, 'data_parallel_size': dp}
     if gpu_indices is not None:
         runtime['gpu_indices'] = gpu_indices
-    return DeploymentGroup(
+    return Deployment(
         gid, 'ck-' + gid, 'vllm', 'shared-compatible', {},
-        {'engine': 'vllm', 'runtime': runtime}, {}, GroupState.LIVE, t, t,
+        {'engine': 'vllm', 'runtime': runtime}, {}, DeploymentState.LIVE, t, t,
     )
 
 
 def ollama(gid, *, gpu_indices=(), t=0.0):
-    return DeploymentGroup(
+    return Deployment(
         gid, 'ck-' + gid, 'ollama', 'shared-compatible', {},
         {'engine': 'ollama', 'gpu_indices': list(gpu_indices)}, {},
-        GroupState.LIVE, t, t,
+        DeploymentState.LIVE, t, t,
     )
 
 
@@ -109,7 +109,7 @@ def test_explicit_out_of_pool_errors():
     assert any('not in pool' in e for e in plan.errors)
 
 
-def test_pinned_groups_stay_put_when_new_arrives():
+def test_pinned_deployments_stay_put_when_new_arrives():
     # 'a' already runs on [0,1]; adding 'b' must not reshuffle 'a'
     plan = plan_placement(
         [vllm('a', tp=2, t=0), vllm('b', t=1)], inv(), pinned={'a': [0, 1]}
@@ -124,7 +124,7 @@ def test_invalid_pin_is_replaced():
 
 
 def test_placement_is_deterministic_by_created_at():
-    groups = [vllm('z', t=1), vllm('a', t=0)]
-    plan = plan_placement(groups, inv())
+    deployments = [vllm('z', t=1), vllm('a', t=0)]
+    plan = plan_placement(deployments, inv())
     # earlier created_at ('a', t=0) takes gpu 0 regardless of list order
     assert plan.assignments == {'a': [0], 'z': [1]}

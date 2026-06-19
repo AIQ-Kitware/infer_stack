@@ -1607,3 +1607,36 @@ collapsible + drag bars everywhere) plus the big mechanical group rename. Bigges
 judgment call ahead is the reorg: top-level tabs change the whole compose() tree,
 so I want to land the group rename first (so new UI is built on final vocabulary)
 unless Jon prefers to see the reorg sooner.
+
+## 2026-06-19 12:50:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Jon's directive: clean break,
+no back-compat (pre-release, no users), delete-and-recreate the ledger DB rather
+than migrate, and rip out superseded legacy later — but PRESERVE the ollama +
+kubeai conceptual paths and any reusable logic. Names must agree everywhere; flag
+any place a presentation name should legitimately differ from a backend name (I
+found none in the leasing surface).
+
+Did the group→deployment deep rename. Approach that kept it safe despite 558
+sites: first proved the concept is isolated — `CacheGroupSpec`/`cache_groups`
+(KV-cache, experimental/), `_is_group` (CLI command-group, commands_meta), and
+regex `.group()` all live OUTSIDE the 12 leasing-concept files — so I scoped an
+ordered sed (DeploymentGroup→Deployment, GroupState→DeploymentState,
+group_id(s)→deployment_id(s), groups→deployments, group→deployment,
+Group→Deployment) to exactly those 12 src + 6 test files, plus the SQLite table
+`groups`→`deployments`. Two traps caught by the test suite: (1) the all-caps
+`GROUP_LABEL` constant (my rules were case-specific) and (2) the rename clobbered
+Textual's `@work(..., group='logs')` worker-group kwarg → `deployment='logs'`,
+which `work()` rejects — reverted those 10 decorators. Also `ruff --fix infer_stack/
+tests/` over-reached and autofixed ~13 unrelated files' pre-existing lint; I
+`git checkout`'d everything outside scope to keep the diff focused. test_cli_leasing
++ docs + CHANGELOG updated to the new vocabulary (protecting the LiteLLM "Model
+Group=" error quote and the "grouped into a holding pen" verb). 319 tests green.
+
+State of mind: confident — the rename is mechanical and twice-verified green, the
+DB table rename is fine since we're nuking state. Deliberately did NOT keep the
+SQLite table name (Jon: no migration, delete the DB). Remaining: legacy-code
+removal (profiles/old hookups, keeping ollama+kubeai concepts), then the TUI
+top-level-tabs reorg + catalog mgmt/edit-remove + advanced endpoint params +
+docker control + model cache info + all-panes-collapsible/drag. Those build on
+the now-final vocabulary, so no rework.

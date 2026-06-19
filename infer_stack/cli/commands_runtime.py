@@ -581,7 +581,7 @@ def _print_status_rich(d: dict[str, Any], counts, console) -> None:
             f'{active} active lease(s)', style='green' if active else 'dim'
         )
         line.append(' · ')
-        line.append(f'{live} live group(s)', style='green' if live else 'dim')
+        line.append(f'{live} live deployment(s)', style='green' if live else 'dim')
         line.append('   → infer-stack leases', style='dim')
         console.print()
         console.print(line)
@@ -600,14 +600,14 @@ def _print_status_rich(d: dict[str, Any], counts, console) -> None:
 
 
 def _leasing_counts():
-    """``(active_leases, live_groups)`` when a non-empty ledger exists, else None.
+    """``(active_leases, live_deployments)`` when a non-empty ledger exists, else None.
 
     Leases live in their own ledger (``infer-stack leases``), not in the
     active-profile deployment ``status`` otherwise reports on — this keeps the
     status command relevant after the leasing redesign.
     """
     from ..leasing import (
-        GroupState,
+        DeploymentState,
         LeaseState,
         Ledger,
         SqliteStore,
@@ -617,11 +617,11 @@ def _leasing_counts():
     path = default_ledger_path()
     if not path.exists():
         return None
-    leases, groups = Ledger(SqliteStore(str(path))).status()
-    if not leases and not groups:
+    leases, deployments = Ledger(SqliteStore(str(path))).status()
+    if not leases and not deployments:
         return None
     active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)
-    live = sum(1 for g in groups if g.state == GroupState.LIVE)
+    live = sum(1 for g in deployments if g.state == DeploymentState.LIVE)
     return (active, live)
 
 
@@ -631,7 +631,7 @@ def _print_leasing_plain(counts) -> None:
     active, live = counts
     print()
     print(
-        f'leasing: {active} active lease(s), {live} live group(s) '
+        f'leasing: {active} active lease(s), {live} live deployment(s) '
         '(see `infer-stack leases`)'
     )
 
@@ -644,7 +644,7 @@ class StatusCLI(
     _ClusterOverridesMixin,
 ):
     """Show stack status: backend + where config/catalog/settings live, the
-    leasing summary (active leases / live groups; see ``infer-stack leases``),
+    leasing summary (active leases / live deployments; see ``infer-stack leases``),
     and — for a legacy profile user — the active profile, whether it has been
     rendered, the resolved components/endpoints, and the live container/cluster
     state. The leasing model needs no ``config.yaml`` (reported as ``legacy

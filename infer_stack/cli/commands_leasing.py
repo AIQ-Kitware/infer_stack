@@ -8,7 +8,7 @@ the models it needs, block until ready, and release after:
     infer-stack run --endpoint qwen-coder -- python my_node.py
     infer-stack release --env-file is.env
     infer-stack serve qwen-coder        # standing service (no TTL)
-    infer-stack leases                  # status of leases + deployment groups
+    infer-stack leases                  # status of leases + deployment deployments
 
 Until the Compose/KubeAI backends land, the default ``--backend null`` is a
 dry-run: the ledger does all the real bookkeeping (coalescing, demand, TTL) but
@@ -32,7 +32,7 @@ from ..leasing import (
     CatalogError,
     ComposeBackend,
     Controller,
-    GroupState,
+    DeploymentState,
     LeaseState,
     Ledger,
     NullBackend,
@@ -253,7 +253,7 @@ def _resolve_lease(config) -> str | None:
     return sid
 
 
-def _descriptor_for(controller, lease, groups, config):
+def _descriptor_for(controller, lease, deployments, config):
     """Build the descriptor, preferring backend-supplied access (real base_url)."""
     base_url = config.base_url
     api_key_env = config.api_key_env
@@ -268,7 +268,7 @@ def _descriptor_for(controller, lease, groups, config):
         request_names = info.get('request_names')
     return build_descriptor(
         lease,
-        groups,
+        deployments,
         base_url=base_url,
         api_key_env=api_key_env,
         api_key=api_key,
@@ -282,7 +282,7 @@ def _compose_file_path(controller) -> str | None:
 
 
 def _gpu_where(gpus) -> str:
-    """Human label for a group's GPU assignment (or its absence)."""
+    """Human label for a deployment's GPU assignment (or its absence)."""
     if gpus is None:
         return 'unplaced'
     if not gpus:
@@ -293,7 +293,7 @@ def _gpu_where(gpus) -> str:
 def _emit_staged(config, controller, outcome) -> int:
     """Output for a ``--no-apply`` acquire: what was written + what would run."""
     descriptor = _descriptor_for(
-        controller, outcome.lease, outcome.groups, config
+        controller, outcome.lease, outcome.deployments, config
     )
     if config.env_file:
         Path(config.env_file).expanduser().write_text(render_env_file(descriptor))
@@ -306,14 +306,14 @@ def _emit_staged(config, controller, outcome) -> int:
             'descriptor': descriptor,
             'compose_file': _compose_file_path(controller),
             'placement': [
-                {'group': g.id, 'served': sorted(g.served),
+                {'deployment': g.id, 'served': sorted(g.served),
                  'gpus': assignments.get(g.id)}
-                for g in outcome.groups
+                for g in outcome.deployments
             ],
         }, indent=2))
         return 0
     print(f'staged {outcome.lease.id} (owner={outcome.lease.owner}) — not applied')
-    for g in outcome.groups:
+    for g in outcome.deployments:
         eps = ', '.join(sorted(g.served)) or g.id
         print(f'  {eps}: {_gpu_where(assignments.get(g.id))}  ({g.id})')
     path = _compose_file_path(controller)
@@ -333,7 +333,7 @@ def _emit_acquire(config, controller, outcome) -> int:
     if not outcome.applied:
         return _emit_staged(config, controller, outcome)
     descriptor = _descriptor_for(
-        controller, outcome.lease, outcome.groups, config
+        controller, outcome.lease, outcome.deployments, config
     )
     if config.env_file:
         Path(config.env_file).expanduser().write_text(
@@ -414,7 +414,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     except PlacementError as ex:
         lines = ['could not place every requested endpoint (no lease kept):']
         lines += [f'  {r}' for r in ex.reasons] or [
-            f'  {", ".join(ex.group_ids)}'
+            f'  {", ".join(ex.deployment_ids)}'
         ]
         lines.append(
             '  free a GPU first — `infer-stack leases` to see what holds them, '
@@ -678,8 +678,8 @@ class ApplyCLI(_ApprovalMixin):
         result = None
         if config.wait:
             controller.ledger.sweep()
-            _, groups = controller.ledger.status()
-            live = [g for g in groups if g.state == GroupState.LIVE]
+            _, deployments = controller.ledger.status()
+            live = [g for g in deployments if g.state == DeploymentState.LIVE]
             if live:
                 result = controller.wait_ready(
                     live,
@@ -744,7 +744,7 @@ class ReleaseCLI(_ApprovalMixin):
     )
     evict = scfg.Value(
         False, isflag=True,
-        help='Also evict (tear down) the released group(s) now, even if their '
+        help='Also evict (tear down) the released deployment(s) now, even if their '
         'reclaim policy is keep-warm — frees the GPU immediately.',
     )
     json = scfg.Value(False, isflag=True)
@@ -766,7 +766,7 @@ class ReleaseCLI(_ApprovalMixin):
                 controller.ledger.release(sid)
             evicted: list[str] = []
             if config.evict:
-                evicted = controller.ledger.evict_idle(None)  # every idle group
+                evicted = controller.ledger.evict_idle(None)  # every idle deployment
         else:
             sid = _resolve_lease(config)
             if not sid:
@@ -777,7 +777,7 @@ class ReleaseCLI(_ApprovalMixin):
             released = [sid]
             evicted = []
             if config.evict:
-                evicted = controller.ledger.evict_idle(rel.idled_group_ids)
+                evicted = controller.ledger.evict_idle(rel.idled_deployment_ids)
 
         # One converge for the whole command -> at most one diff prompt.
         try:
@@ -807,13 +807,13 @@ def _emit_release(config, released, torn_down, evicted) -> int:
 
 
 def _resolve_idle_targets(controller, names: list[str]) -> tuple[list[str], list[str]]:
-    """Map endpoint aliases / group ids to currently-idle group ids.
+    """Map endpoint aliases / deployment ids to currently-idle deployment ids.
 
-    Returns ``(target_group_ids, unmatched_names)``.
+    Returns ``(target_deployment_ids, unmatched_names)``.
     """
     controller.ledger.sweep()
-    _, groups = controller.ledger.status()
-    idle = [g for g in groups if g.state == GroupState.IDLE]
+    _, deployments = controller.ledger.status()
+    idle = [g for g in deployments if g.state == DeploymentState.IDLE]
     wanted = set(names)
     targets, matched = [], set()
     for g in idle:
@@ -828,9 +828,9 @@ class EvictCLI(_ApprovalMixin):
     """Force-evict released (idle) models now, freeing their GPUs.
 
     A released ``keep-warm`` model stays resident (idle) to avoid cold-start
-    thrash — handy, but it holds a GPU. ``evict`` tears such groups down now,
-    overriding keep-warm. Target by served endpoint alias or group id, or
-    ``--all`` for every idle group. (Live models — those with an active lease —
+    thrash — handy, but it holds a GPU. ``evict`` tears such deployments down now,
+    overriding keep-warm. Target by served endpoint alias or deployment id, or
+    ``--all`` for every idle deployment. (Live models — those with an active lease —
     are never evicted; release them first.) On a terminal the teardown is shown
     and confirmed before docker is touched (``--yes`` skips).
     """
@@ -839,9 +839,9 @@ class EvictCLI(_ApprovalMixin):
 
     names = scfg.Value(
         [], nargs='*', position=1, type=str,
-        help='Endpoint alias or group id to evict.',
+        help='Endpoint alias or deployment id to evict.',
     )
-    all = scfg.Value(False, isflag=True, help='Evict every idle group.')
+    all = scfg.Value(False, isflag=True, help='Evict every idle deployment.')
     json = scfg.Value(False, isflag=True)
 
     @classmethod
@@ -852,14 +852,14 @@ class EvictCLI(_ApprovalMixin):
         controller = _open_controller(config, interactive=True)
         names = _collect_names(config.names)
         if not names and not config.all:
-            raise SystemExit('evict: give an endpoint/group name or --all')
+            raise SystemExit('evict: give an endpoint/deployment name or --all')
         try:
             if config.all:
                 outcome = controller.evict(None)
             else:
                 targets, missing = _resolve_idle_targets(controller, names)
                 if missing:
-                    print(f'no idle group for: {", ".join(missing)}')
+                    print(f'no idle deployment for: {", ".join(missing)}')
                 if not targets:
                     if config.json:
                         print(json.dumps(
@@ -872,14 +872,14 @@ class EvictCLI(_ApprovalMixin):
             raise _declined_exit()
         if config.json:
             print(json.dumps({
-                'evicted': outcome.evicted_group_ids,
+                'evicted': outcome.evicted_deployment_ids,
                 'torn_down': outcome.reconcile.torn_down,
             }, indent=2))
-        elif not outcome.evicted_group_ids:
+        elif not outcome.evicted_deployment_ids:
             print('nothing to evict')
         else:
-            print(f'evicted {len(outcome.evicted_group_ids)} group(s)')
-            for gid in outcome.evicted_group_ids:
+            print(f'evicted {len(outcome.evicted_deployment_ids)} deployment(s)')
+            for gid in outcome.evicted_deployment_ids:
                 print(f'  {gid}')
         return 0
 
@@ -891,7 +891,7 @@ class WaitCLI(_LeasingCommonMixin):
     Fan out, then wait: ``serve --no-wait smol17b-1`` + ``serve --no-wait
     smol135-1`` kick both deployments off in parallel (each converges and starts
     its container without blocking), then ``wait smol17b-1 smol135-1`` blocks
-    until they can actually serve. With no names it waits for every live group.
+    until they can actually serve. With no names it waits for every live deployment.
 
     ``--require-generation`` makes "ready" mean a real generated token (not just
     a model that is listed) — the same readiness *criterion* the acquire/serve
@@ -902,7 +902,7 @@ class WaitCLI(_LeasingCommonMixin):
 
     names = scfg.Value(
         [], nargs='*', position=1, type=str,
-        help='Endpoint names to wait for (default: every live group).',
+        help='Endpoint names to wait for (default: every live deployment).',
     )
     timeout = scfg.Value(600, type=float, help='Overall wait timeout (s).')
     interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
@@ -913,8 +913,8 @@ class WaitCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
         controller.ledger.sweep()
-        _, groups = controller.ledger.status()
-        live = [g for g in groups if g.state == GroupState.LIVE]
+        _, deployments = controller.ledger.status()
+        live = [g for g in deployments if g.state == DeploymentState.LIVE]
         names = _collect_names(config.names)
         if names:
             wanted = set(names)
@@ -922,7 +922,7 @@ class WaitCLI(_LeasingCommonMixin):
             missing = sorted(wanted - served)
             if missing:
                 raise SystemExit(
-                    f'not served by any live group: {", ".join(missing)} '
+                    f'not served by any live deployment: {", ".join(missing)} '
                     '(serve it first, or check `infer-stack leases`)'
                 )
             targets = [g for g in live if wanted & set(g.served)]
@@ -930,7 +930,7 @@ class WaitCLI(_LeasingCommonMixin):
         else:
             targets, endpoints = live, None
         if not targets:
-            print('nothing to wait for (no live groups)')
+            print('nothing to wait for (no live deployments)')
             return 0
         result = controller.wait_ready(
             targets,
@@ -942,7 +942,7 @@ class WaitCLI(_LeasingCommonMixin):
             print(json.dumps({
                 'ready': result.ready,
                 'pending': [
-                    {'group': gid, 'endpoint': ep}
+                    {'deployment': gid, 'endpoint': ep}
                     for gid, ep in result.pending
                 ],
             }, indent=2))
@@ -959,7 +959,7 @@ class TuiCLI(_LeasingCommonMixin):
     """Launch the Textual TUI: a live monitor of the stack with controls to
     serve / release / evict models.
 
-    Mostly a monitor — the lease + group tables (desired state vs running, GPUs)
+    Mostly a monitor — the lease + deployment tables (desired state vs running, GPUs)
     refresh live — with key-bound controls: ``s`` serve, ``d`` release, ``a``
     release-all, ``e`` evict, ``r`` refresh, ``q`` quit. Opt-in extra: install
     textual with ``pip install "infer-stack[tui]"``.
@@ -1077,7 +1077,7 @@ class RunCLI(_LeasingCommonMixin):
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )
         descriptor = _descriptor_for(
-            controller, outcome.lease, outcome.groups, config
+            controller, outcome.lease, outcome.deployments, config
         )
         env = dict(os.environ)
         env.update(descriptor_env(descriptor))
@@ -1093,10 +1093,10 @@ def _lease_ttl(le) -> str:
 
 
 def _placement_view(controller):
-    """Best-effort (observed running gids, group id -> GPU indices).
+    """Best-effort (observed running gids, deployment id -> GPU indices).
 
     Reads what the backend *actually* has running (``observe``) and where each
-    desired group is/would be placed (``plan``). Both are guarded so a dry-run
+    desired deployment is/would be placed (``plan``). Both are guarded so a dry-run
     (``NullBackend``) or a docker-less host degrades to "unknown" rather than
     erroring — ``leases`` must always render.
     """
@@ -1110,7 +1110,7 @@ def _placement_view(controller):
     plan = getattr(backend, 'plan', None)
     if plan is not None:
         try:
-            assignments = dict(plan(controller.desired_groups()).assignments)
+            assignments = dict(plan(controller.desired_deployments()).assignments)
         except Exception:  # noqa: BLE001
             pass
     return observed, assignments
@@ -1121,7 +1121,7 @@ def _running_label(gid, observed) -> str:
 
 
 def _gpu_label(gid, observed, assignments) -> str:
-    """Where a group is (running) or is slated to be (desired, not yet up)."""
+    """Where a deployment is (running) or is slated to be (desired, not yet up)."""
     gpus = assignments.get(gid)
     if gpus is None:
         return '-'
@@ -1129,7 +1129,7 @@ def _gpu_label(gid, observed, assignments) -> str:
     return where if gid in observed else f'→{where}'  # → = slated, not yet up
 
 
-def _print_leases_plain(leases, groups, observed, assignments) -> None:
+def _print_leases_plain(leases, deployments, observed, assignments) -> None:
     print('leases:')
     if not leases:
         print('  (none)')
@@ -1138,10 +1138,10 @@ def _print_leases_plain(leases, groups, observed, assignments) -> None:
             f'  {le.id}  owner={le.owner}  state={le.state}  '
             f'ttl={_lease_ttl(le)}  endpoints={",".join(le.endpoints) or "-"}'
         )
-    print('groups:')
-    if not groups:
+    print('deployments:')
+    if not deployments:
         print('  (none)')
-    for g in groups:
+    for g in deployments:
         print(
             f'  {g.id}  {g.engine}  state={g.state}  '
             f'running={_running_label(g.id, observed)}  '
@@ -1150,7 +1150,7 @@ def _print_leases_plain(leases, groups, observed, assignments) -> None:
         )
 
 
-def _print_leases_rich(leases, groups, observed, assignments, console) -> None:
+def _print_leases_rich(leases, deployments, observed, assignments, console) -> None:
     from rich.table import Table
     from rich.text import Text
 
@@ -1181,8 +1181,8 @@ def _print_leases_rich(leases, groups, observed, assignments, console) -> None:
             )
         console.print(lt)
 
-    console.print(Text('groups', style='bold'))
-    if not groups:
+    console.print(Text('deployments', style='bold'))
+    if not deployments:
         console.print('  [dim](none)[/dim]')
     else:
         gt = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0),
@@ -1194,7 +1194,7 @@ def _print_leases_rich(leases, groups, observed, assignments, console) -> None:
         gt.add_column('gpus')            # on / →slated
         gt.add_column('demand', justify='right', style='dim')
         gt.add_column('served', style='magenta', overflow='fold')
-        for g in groups:
+        for g in deployments:
             running = g.id in observed
             gpus = _gpu_label(g.id, observed, assignments)
             gt.add_row(
@@ -1209,12 +1209,12 @@ def _print_leases_rich(leases, groups, observed, assignments, console) -> None:
 
 
 class LeasesCLI(_LeasingCommonMixin):
-    """Show current leases and deployment groups (the leasing-model status).
+    """Show current leases and deployment deployments (the leasing-model status).
 
     Two tables. **leases** are who asked for what (id, owner, state, ttl,
-    endpoints). **groups** are the actual deployments behind them — one group is
+    endpoints). **deployments** are the actual deployments behind them — one deployment is
     one model in one container (it may serve several endpoint aliases). For each
-    group:
+    deployment:
 
     \b
       state    what the ledger *wants* — live / idle / stopped
@@ -1233,7 +1233,7 @@ class LeasesCLI(_LeasingCommonMixin):
     __epilog__ = """
     Examples:
         infer-stack leases          # the two tables (rich on a terminal)
-        infer-stack leases --json   # JSON (adds running + gpus per group)
+        infer-stack leases --json   # JSON (adds running + gpus per deployment)
     """
 
     json = scfg.Value(False, isflag=True)
@@ -1243,7 +1243,7 @@ class LeasesCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
         controller.ledger.sweep()  # materialize TTL expiry for an accurate view
-        leases, groups = controller.ledger.status()
+        leases, deployments = controller.ledger.status()
         observed, assignments = _placement_view(controller)
         if config.json:
             print(
@@ -1259,7 +1259,7 @@ class LeasesCLI(_LeasingCommonMixin):
                             }
                             for le in leases
                         ],
-                        'groups': [
+                        'deployments': [
                             {
                                 'id': g.id,
                                 'engine': g.engine,
@@ -1269,7 +1269,7 @@ class LeasesCLI(_LeasingCommonMixin):
                                 'demand': g.demand,
                                 'served': sorted(g.served),
                             }
-                            for g in groups
+                            for g in deployments
                         ],
                     },
                     indent=2,
@@ -1280,9 +1280,9 @@ class LeasesCLI(_LeasingCommonMixin):
 
         console = Console()
         if console.is_terminal:
-            _print_leases_rich(leases, groups, observed, assignments, console)
+            _print_leases_rich(leases, deployments, observed, assignments, console)
         else:
-            _print_leases_plain(leases, groups, observed, assignments)
+            _print_leases_plain(leases, deployments, observed, assignments)
         return 0
 
 

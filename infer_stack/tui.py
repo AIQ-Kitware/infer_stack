@@ -8,7 +8,7 @@ polled while hidden:
 * **Catalog** (left) — the models + endpoints you can run; Serve the selected
   endpoint, Suggest a set sized to your GPUs, or add one by hand. Ctrl+click a
   served endpoint to open it in Open WebUI.
-* **Leases** + **Groups** (center) — the live ledger (desired *state* vs what's
+* **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
 * **docker** — a collapsible pane with **Logs** and **Containers** (the
   ``docker ps`` view: status/uptime, created, id, ports) tabs.
@@ -56,7 +56,7 @@ from .cli.commands_leasing import (
     _placement_view,
     _running_label,
 )
-from .leasing import GroupState, LeaseState
+from .leasing import DeploymentState, LeaseState
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
 DEFAULT_THEME = 'textual-dark'
@@ -269,20 +269,20 @@ class InferStackTUI(App):
 
     #catalog-buttons { height: auto; }
     #catalog-buttons Button { width: 1fr; margin: 1 0 0 0; }
-    #endpoint-actions, #lease-actions, #group-actions {
+    #endpoint-actions, #lease-actions, #deployment-actions {
         height: auto; margin: 0 0 1 0;
     }
     #endpoint-actions Button { width: 1fr; }
-    #lease-actions Button, #group-actions Button {
+    #lease-actions Button, #deployment-actions Button {
         margin: 0 1 0 0; min-width: 11;
     }
     /* compact buttons: 1 row, no border box, so action bars don't eat space */
-    #endpoint-actions Button, #lease-actions Button, #group-actions Button,
+    #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
     #catalog-buttons Button, #api-controls Button {
         height: 1; border: none; padding: 0 1;
     }
 
-    #endpoints, #models, #leases-pane, #groups-pane, #docker, #system, #api {
+    #endpoints, #models, #leases-pane, #deployments-pane, #docker, #system, #api {
         border: round $surface;
         background: $boost;
         padding: 0 1;
@@ -293,7 +293,7 @@ class InferStackTUI(App):
         border-subtitle-align: right;
     }
     #endpoints:focus, #models:focus, #leases-pane:focus-within,
-    #groups-pane:focus-within, #docker:focus-within, #system:focus-within,
+    #deployments-pane:focus-within, #docker:focus-within, #system:focus-within,
     #api:focus-within {
         border: round $accent;
         border-title-color: $accent;
@@ -301,8 +301,8 @@ class InferStackTUI(App):
 
     #endpoints { height: 1fr; min-height: 5; }
     #models { height: 8; min-height: 4; }
-    #leases-pane, #groups-pane { height: 1fr; min-height: 6; }
-    #leases, #groups { height: 1fr; }
+    #leases-pane, #deployments-pane { height: 1fr; min-height: 6; }
+    #leases, #deployments { height: 1fr; }
     #docker-tabs { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
@@ -360,9 +360,9 @@ class InferStackTUI(App):
         self._proc_factory = proc_factory or self._default_proc_factory()
         self._endpoint_names: list[str] = []
         self._lease_ids: list[str] = []
-        self._group_ids: list[str] = []
+        self._deployment_ids: list[str] = []
         self._last_leases: list[Any] = []   # row-aligned with the leases table
-        self._last_groups: list[Any] = []   # row-aligned with the groups table
+        self._last_deployments: list[Any] = []   # row-aligned with the deployments table
         self._service_options: list[str] = []
         self._log_service: str = ALL_SERVICES
         self._log_proc: Any = None
@@ -411,18 +411,18 @@ class InferStackTUI(App):
                             yield Button('Release', id='btn-release')
                             yield Button('Release all', id='btn-release-all')
                             yield Button('Clean up', id='btn-cleanup')
-                    with Vertical(id='groups-pane'):
+                    with Vertical(id='deployments-pane'):
                         yield Static(
                             'Running model deployments and the GPUs they hold. '
                             "The 'leases' column is how many leases hold each. "
                             'Evict an idle one to free its GPU; Clean up forgets '
                             'stopped ones.', classes='desc',
                         )
-                        yield DataTable(id='groups', cursor_type='row',
+                        yield DataTable(id='deployments', cursor_type='row',
                                         zebra_stripes=True)
-                        with Horizontal(id='group-actions'):
+                        with Horizontal(id='deployment-actions'):
                             yield Button('Evict', id='btn-evict')
-                            yield Button('Clean up', id='btn-cleanup-groups')
+                            yield Button('Clean up', id='btn-cleanup-deployments')
                 yield _Divider('y', self._drag_logs, id='hsplit')
                 with Collapsible(title='docker', collapsed=False, id='docker'):
                     with TabbedContent(id='docker-tabs'):
@@ -474,7 +474,7 @@ class InferStackTUI(App):
             pass
         titles = {
             '#endpoints': 'catalog · endpoints', '#models': 'catalog · models',
-            '#leases-pane': 'leases', '#groups-pane': 'groups',
+            '#leases-pane': 'leases', '#deployments-pane': 'deployments',
         }
         for sel, title in titles.items():
             self.query_one(sel).border_title = title
@@ -485,7 +485,7 @@ class InferStackTUI(App):
         self.query_one('#leases', DataTable).add_columns(
             'id', 'owner', 'state', 'ttl', 'endpoints', 'deployment'
         )
-        self.query_one('#groups', DataTable).add_columns(
+        self.query_one('#deployments', DataTable).add_columns(
             'id', 'engine', 'state', 'running', 'gpus', 'served',
             'leases', 'held by'
         )
@@ -630,10 +630,10 @@ class InferStackTUI(App):
         """
         try:
             self.controller.ledger.sweep()
-            leases, groups = self.controller.ledger.status()
+            leases, deployments = self.controller.ledger.status()
             observed, assignments = _placement_view(self.controller)
             data: dict[str, Any] = {
-                'leases': leases, 'groups': groups, 'observed': observed,
+                'leases': leases, 'deployments': deployments, 'observed': observed,
                 'assignments': assignments,
             }
             if not self._collapsed['docker'] and self._active_tab == 'tab-containers':
@@ -650,23 +650,23 @@ class InferStackTUI(App):
             self._status(f'refresh error: {data["error"]}')
             return
         self._last_leases = data['leases']
-        self._last_groups = data['groups']
+        self._last_deployments = data['deployments']
         self._fill_leases(data['leases'])
-        self._fill_groups(
-            data['groups'], data['observed'], data['assignments'], data['leases']
+        self._fill_deployments(
+            data['deployments'], data['observed'], data['assignments'], data['leases']
         )
         if 'ps' in data:
             self._fill_ps(data['ps'])
         if 'gpus' in data:
             self._fill_gpus(data['gpus'])
             self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
-        # Ready = endpoints served by a group that is actually running.
+        # Ready = endpoints served by a deployment that is actually running.
         ready: set[str] = set()
-        for g in data['groups']:
+        for g in data['deployments']:
             if g.id in data['observed']:
                 ready.update(g.served)
         self._sync_api_models(sorted(ready))
-        self._update_summary(data['leases'], data['groups'], data['observed'])
+        self._update_summary(data['leases'], data['deployments'], data['observed'])
         self._sync_log_services()
 
     def _refresh_now(self) -> None:
@@ -681,9 +681,9 @@ class InferStackTUI(App):
     def action_refresh(self) -> None:
         self._refresh_bg()
 
-    def _update_summary(self, leases, groups, observed) -> None:
+    def _update_summary(self, leases, deployments, observed) -> None:
         active = sum(1 for le in leases if str(le.state) == 'active')
-        running = sum(1 for g in groups if g.id in observed)
+        running = sum(1 for g in deployments if g.id in observed)
         try:
             self.query_one('#docker', Collapsible).title = (
                 f'docker — {running} running'
@@ -700,28 +700,28 @@ class InferStackTUI(App):
         table.clear()
         self._lease_ids = []
         for le in leases:
-            # The 'deployment' column is the join key: it lists the same group
-            # id(s) shown in the groups pane, so lease -> deployment is visible.
+            # The 'deployment' column is the join key: it lists the same deployment
+            # id(s) shown in the deployments pane, so lease -> deployment is visible.
             table.add_row(
                 le.id, le.owner, str(le.state), _lease_ttl(le),
                 ','.join(le.endpoints) or '-',
-                ','.join(le.group_ids) or '-',
+                ','.join(le.deployment_ids) or '-',
             )
             self._lease_ids.append(le.id)
         self._restore_cursor(table, cursor)
 
-    def _fill_groups(self, groups, observed, assignments, leases) -> None:
-        table = self.query_one('#groups', DataTable)
+    def _fill_deployments(self, deployments, observed, assignments, leases) -> None:
+        table = self.query_one('#deployments', DataTable)
         cursor = table.cursor_row
         table.clear()
-        self._group_ids = []
-        # owners of the active leases holding each group (the "many" side)
+        self._deployment_ids = []
+        # owners of the active leases holding each deployment (the "many" side)
         owners: dict[str, list[str]] = {}
         for le in leases:
             if le.state == LeaseState.ACTIVE:
-                for gid in le.group_ids:
+                for gid in le.deployment_ids:
                     owners.setdefault(gid, []).append(le.owner)
-        for g in groups:
+        for g in deployments:
             table.add_row(
                 g.id, g.engine, str(g.state),
                 _running_label(g.id, observed),
@@ -729,7 +729,7 @@ class InferStackTUI(App):
                 ','.join(sorted(g.served)) or '-',
                 str(g.demand), ','.join(owners.get(g.id, [])) or '-',
             )
-            self._group_ids.append(g.id)
+            self._deployment_ids.append(g.id)
         self._restore_cursor(table, cursor)
 
     def _fill_ps(self, rows) -> None:
@@ -1001,16 +1001,16 @@ class InferStackTUI(App):
         row = event.cursor_row
         if tid == 'leases' and 0 <= row < len(self._last_leases):
             le = self._last_leases[row]
-            deps = ', '.join(le.group_ids) or '—'
-            held = {g.id: g.demand for g in self._last_groups}
-            n = max((held.get(gid, 0) for gid in le.group_ids), default=0)
+            deps = ', '.join(le.deployment_ids) or '—'
+            held = {g.id: g.demand for g in self._last_deployments}
+            n = max((held.get(gid, 0) for gid in le.deployment_ids), default=0)
             others = f' (1 of {n} lease(s) on it)' if n > 1 else ''
             self._status(f'lease {le.id} → deployment {deps}{others}')
-        elif tid == 'groups' and 0 <= row < len(self._last_groups):
-            g = self._last_groups[row]
+        elif tid == 'deployments' and 0 <= row < len(self._last_deployments):
+            g = self._last_deployments[row]
             owners = [
                 le.owner for le in self._last_leases
-                if g.id in le.group_ids and le.state == LeaseState.ACTIVE
+                if g.id in le.deployment_ids and le.state == LeaseState.ACTIVE
             ]
             who = ', '.join(owners) or '—'
             self._status(
@@ -1039,7 +1039,7 @@ class InferStackTUI(App):
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
             'btn-cleanup': self.action_cleanup,
-            'btn-cleanup-groups': self.action_cleanup,
+            'btn-cleanup-deployments': self.action_cleanup,
             'btn-suggest': self.action_suggest,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
@@ -1063,15 +1063,15 @@ class InferStackTUI(App):
         self._do_release_all()
 
     def action_evict(self) -> None:
-        gid = self._selected('groups', self._group_ids)
+        gid = self._selected('deployments', self._deployment_ids)
         if not gid:
-            self._status('select a group row to evict')
+            self._status('select a deployment row to evict')
             return
         self._status(f'evicting {gid}…')
         self._do_evict(gid)
 
     def action_cleanup(self) -> None:
-        self._status('cleaning up released/expired leases + stopped groups…')
+        self._status('cleaning up released/expired leases + stopped deployments…')
         self._do_cleanup()
 
     # -- open in browser ---------------------------------------------------
@@ -1334,8 +1334,8 @@ class InferStackTUI(App):
     def _do_evict(self, gid: str) -> None:
         try:
             self.controller.ledger.sweep()
-            group = self.controller.ledger.get_group(gid)
-            if group is None or group.state != GroupState.IDLE:
+            deployment = self.controller.ledger.get_deployment(gid)
+            if deployment is None or deployment.state != DeploymentState.IDLE:
                 msg = f'{gid} is not idle — release it first'
             else:
                 self.controller.evict([gid])
@@ -1347,9 +1347,9 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_cleanup(self) -> None:
         try:
-            n_leases, n_groups = self.controller.ledger.prune()
+            n_leases, n_deployments = self.controller.ledger.prune()
             msg = (f'cleaned up {n_leases} released/expired lease(s) + '
-                   f'{n_groups} stopped group(s)')
+                   f'{n_deployments} stopped deployment(s)')
         except Exception as ex:  # noqa: BLE001
             msg = f'cleanup failed: {ex}'
         self._after_mutation(msg)

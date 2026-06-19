@@ -1,13 +1,13 @@
 """Backend protocol: the seam between the ledger and real serving.
 
-The ledger decides *what should be running* (desired deployment groups); a
+The ledger decides *what should be running* (desired deployment deployments); a
 backend makes it so. The :class:`Controller` reconciles between them through the
 four methods below. Keeping this surface tiny is deliberate — it is the only
 thing a new backend (Compose, KubeAI, ...) must implement, and it is where the
 redesign draws the line between "infer-stack coordinates" and "the backend /
 KubeAI / k8s schedules".
 
-All four methods MUST be idempotent: the reconciler may ``realize`` a group that
+All four methods MUST be idempotent: the reconciler may ``realize`` a deployment that
 is already up, or ``teardown`` one that is already gone.
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .models import DeploymentGroup
+from .models import Deployment
 
 
 @dataclass
@@ -37,21 +37,21 @@ class ConvergeAborted(Exception):
 
 
 class PlacementError(Exception):
-    """An ``acquire``/``serve`` requested a group the backend could not place.
+    """An ``acquire``/``serve`` requested a deployment the backend could not place.
 
     Raised by the controller when reconcile leaves one of the just-requested
-    groups unplaced (e.g. no free GPU). Like :class:`ConvergeAborted`, the
+    deployments unplaced (e.g. no free GPU). Like :class:`ConvergeAborted`, the
     controller rolls back the just-created lease before raising, so a request
-    that cannot be satisfied does not linger as a phantom ``live`` group with no
-    container behind it. ``reasons`` carries the planner's per-group messages.
+    that cannot be satisfied does not linger as a phantom ``live`` deployment with no
+    container behind it. ``reasons`` carries the planner's per-deployment messages.
     """
 
-    def __init__(self, group_ids, reasons):
-        self.group_ids = list(group_ids)
+    def __init__(self, deployment_ids, reasons):
+        self.deployment_ids = list(deployment_ids)
         self.reasons = list(reasons)
         super().__init__(
             '; '.join(self.reasons)
-            or f'could not place: {", ".join(self.group_ids)}'
+            or f'could not place: {", ".join(self.deployment_ids)}'
         )
 
 
@@ -63,22 +63,22 @@ class Backend(Protocol):
     later ``ComposeBackend`` / ``KubeAIBackend``.
     """
 
-    def realize(self, group: DeploymentGroup) -> None:
-        """Ensure a deployment for ``group`` exists and is converging."""
+    def realize(self, deployment: Deployment) -> None:
+        """Ensure a deployment for ``deployment`` exists and is converging."""
         ...
 
-    def teardown(self, group: DeploymentGroup) -> None:
-        """Ensure ``group``'s deployment is stopped/removed."""
+    def teardown(self, deployment: Deployment) -> None:
+        """Ensure ``deployment``'s deployment is stopped/removed."""
         ...
 
     def observe(self) -> set[str]:
-        """Return the set of group ids currently realized in the backend."""
+        """Return the set of deployment ids currently realized in the backend."""
         ...
 
     def probe_ready(
-        self, group: DeploymentGroup, endpoint: str
+        self, deployment: Deployment, endpoint: str
     ) -> Readiness:
-        """Report whether one served ``endpoint`` of ``group`` is ready."""
+        """Report whether one served ``endpoint`` of ``deployment`` is ready."""
         ...
 
 
@@ -90,10 +90,10 @@ class MemoryBackend:
     ``--dry-run`` backend.
 
     Example:
-        >>> from infer_stack.leasing.models import DeploymentGroup, GroupState
+        >>> from infer_stack.leasing.models import Deployment, DeploymentState
         >>> b = MemoryBackend(ready=True)
-        >>> g = DeploymentGroup('grp-1', 'ck', 'vllm', 'shared-compatible',
-        ...     {}, {}, {'qwen': {}}, GroupState.LIVE, 0.0, 0.0)
+        >>> g = Deployment('grp-1', 'ck', 'vllm', 'shared-compatible',
+        ...     {}, {}, {'qwen': {}}, DeploymentState.LIVE, 0.0, 0.0)
         >>> b.realize(g); sorted(b.observe())
         ['grp-1']
         >>> b.probe_ready(g, 'qwen').ready
@@ -104,69 +104,69 @@ class MemoryBackend:
 
     def __init__(self, *, ready: bool = True):
         self.ready_default = ready
-        self.realized: dict[str, DeploymentGroup] = {}
+        self.realized: dict[str, Deployment] = {}
         self.ready_overrides: dict[object, bool] = {}
         self.realize_calls: list[str] = []
         self.teardown_calls: list[str] = []
 
-    def realize(self, group: DeploymentGroup) -> None:
-        self.realized[group.id] = group
-        self.realize_calls.append(group.id)
+    def realize(self, deployment: Deployment) -> None:
+        self.realized[deployment.id] = deployment
+        self.realize_calls.append(deployment.id)
 
-    def teardown(self, group: DeploymentGroup) -> None:
-        self.realized.pop(group.id, None)
-        self.teardown_calls.append(group.id)
+    def teardown(self, deployment: Deployment) -> None:
+        self.realized.pop(deployment.id, None)
+        self.teardown_calls.append(deployment.id)
 
     def observe(self) -> set[str]:
         return set(self.realized)
 
     def probe_ready(
-        self, group: DeploymentGroup, endpoint: str
+        self, deployment: Deployment, endpoint: str
     ) -> Readiness:
-        if group.id not in self.realized:
+        if deployment.id not in self.realized:
             return Readiness(False, 'not realized')
-        ready = self.ready_overrides.get((group.id, endpoint))
+        ready = self.ready_overrides.get((deployment.id, endpoint))
         if ready is None:
-            ready = self.ready_overrides.get(group.id, self.ready_default)
+            ready = self.ready_overrides.get(deployment.id, self.ready_default)
         return Readiness(bool(ready), 'ok' if ready else 'warming up')
 
     def set_ready(
         self,
         ready: bool,
         *,
-        group_id: str | None = None,
+        deployment_id: str | None = None,
         endpoint: str | None = None,
     ) -> None:
-        """Override readiness globally, per group, or per (group, endpoint)."""
-        if group_id is None:
+        """Override readiness globally, per deployment, or per (deployment, endpoint)."""
+        if deployment_id is None:
             self.ready_default = ready
         elif endpoint is None:
-            self.ready_overrides[group_id] = ready
+            self.ready_overrides[deployment_id] = ready
         else:
-            self.ready_overrides[(group_id, endpoint)] = ready
+            self.ready_overrides[(deployment_id, endpoint)] = ready
 
 
 class NullBackend:
     """A no-op backend that serves nothing — for ``--dry-run`` and ``leases``.
 
     It never starts a process. ``observe`` returns the empty set, so the
-    controller treats every desired group as freshly realized (a no-op) and
+    controller treats every desired deployment as freshly realized (a no-op) and
     never tears anything down; readiness is immediate. Because it keeps no
     in-memory state, behaviour stays coherent across separate CLI invocations:
     the persistent ledger is the only source of truth. Use this to exercise
     acquire/release/run plumbing before the Compose backend exists.
     """
 
-    def realize(self, group: DeploymentGroup) -> None:
+    def realize(self, deployment: Deployment) -> None:
         pass
 
-    def teardown(self, group: DeploymentGroup) -> None:
+    def teardown(self, deployment: Deployment) -> None:
         pass
 
     def observe(self) -> set[str]:
         return set()
 
     def probe_ready(
-        self, group: DeploymentGroup, endpoint: str
+        self, deployment: Deployment, endpoint: str
     ) -> Readiness:
         return Readiness(True, 'dry-run')

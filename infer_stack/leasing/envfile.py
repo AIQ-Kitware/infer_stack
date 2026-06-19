@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .models import DeploymentGroup, Lease
+from .models import Deployment, Lease
 
 LEASE_ENV = 'INFER_STACK_LEASE_ID'
 
@@ -39,7 +39,7 @@ def _endpoint_var(endpoint: str) -> str:
 
 def build_descriptor(
     lease: Lease,
-    groups: list[DeploymentGroup],
+    deployments: list[Deployment],
     *,
     base_url: str,
     api_key_env: str = 'LITELLM_MASTER_KEY',
@@ -50,13 +50,13 @@ def build_descriptor(
     """Build the endpoint descriptor for one lease.
 
     Only the endpoints this lease actually requested are included (a coalesced
-    group may serve more). ``request_names`` overrides the model name a client
+    deployment may serve more). ``request_names`` overrides the model name a client
     must request per endpoint — e.g. behind a LiteLLM front door the client asks
     for the endpoint *alias*, not the upstream served name.
     """
     endpoints: dict[str, str] = {}
-    for group in groups:
-        for endpoint, payload in group.served.items():
+    for deployment in deployments:
+        for endpoint, payload in deployment.served.items():
             if endpoint in lease.endpoints:
                 if request_names and endpoint in request_names:
                     endpoints[endpoint] = request_names[endpoint]
@@ -105,12 +105,12 @@ def render_env_file(descriptor: dict[str, Any]) -> str:
     """Render the descriptor as a sourceable shell env-file.
 
     Example:
-        >>> from infer_stack.leasing.models import Lease, DeploymentGroup, GroupState
+        >>> from infer_stack.leasing.models import Lease, Deployment, DeploymentState
         >>> lease = Lease('lease-1', 'me', 'active', 0.0, None, None, 0.0,
         ...     endpoints=['qwen-coder'])
-        >>> grp = DeploymentGroup('g1', 'ck', 'vllm', 'shared-compatible', {},
+        >>> grp = Deployment('g1', 'ck', 'vllm', 'shared-compatible', {},
         ...     {}, {'qwen-coder': {'served_model_name': 'qwen-coder'}},
-        ...     GroupState.LIVE, 0.0, 0.0)
+        ...     DeploymentState.LIVE, 0.0, 0.0)
         >>> d = build_descriptor(lease, [grp], base_url='http://h:1/v1')
         >>> print(render_env_file(d), end='')
         export INFER_STACK_LEASE_ID=lease-1

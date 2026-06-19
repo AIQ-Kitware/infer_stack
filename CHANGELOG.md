@@ -5,6 +5,14 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Changed (breaking)
+* Renamed the **deployment group concept → "deployment"** throughout (core
+  classes, CLI, TUI, docs): `DeploymentGroup` → `Deployment`, `GroupState` →
+  `DeploymentState`, `group_id(s)` → `deployment_id(s)`, ledger methods
+  (`get_group` → `get_deployment`, `list_groups` → `list_deployments`, …), the
+  `leases --json` key `groups` → `deployments`, and the SQLite `groups` table →
+  `deployments` (+ `claims.group_id` → `claims.deployment_id`). No DB migration —
+  delete any existing ledger DB and it will be recreated. Mental model: "many
+  leases → one deployment."
 * Renamed the lease identifier **`session_id` → `lease_id`** everywhere (the
   object is a `Lease`; the dual vocabulary was confusing). This is a hard rename:
   the env-file key is now `INFER_STACK_LEASE_ID` (was `INFER_STACK_SESSION_ID`),
@@ -19,7 +27,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `infer_stack.leasing` subpackage with a backend-agnostic, sqlite-backed lease
   ledger: `acquire`/`release`/`renew` bookkeeping, demand reference-counting,
   same-model coalescing (with capacity subsumption), per-daemon coalescing for
-  Ollama, soft-TTL expiry, and idle-group reclaim computation. This is the core
+  Ollama, soft-TTL expiry, and idle-deployment reclaim computation. This is the core
   that later phases (reconciler, backend protocol, `acquire`/`run` CLI) build on.
 * Serving catalog parser (`infer_stack.leasing.catalog`): the new declarative
   `models` / `endpoints` / `runtime_hosts` / `bundles` schema (replacing
@@ -30,7 +38,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `.controller`): a 4-method `Backend` seam (`realize`/`teardown`/`observe`/
   `probe_ready`), a `MemoryBackend` for tests/dry-runs, and a `Controller` that
   reconciles the ledger's desired state onto a backend (LIVE + keep-warm-idle
-  groups), enforces TTL on every reconcile, scopes readiness waits to the
+  deployments), enforces TTL on every reconcile, scopes readiness waits to the
   endpoints a lease requested, and exposes thin `acquire`/`release`. The Compose
   and KubeAI backends will implement the same protocol.
 * Leasing CLI verbs: `infer-stack acquire` / `release` / `renew` / `run` /
@@ -41,19 +49,19 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   Compose/KubeAI backends land, `--backend null` (default) exercises the whole
   surface without serving anything real.
 * Single-host GPU placement planner (`infer_stack.leasing.placement`): assigns
-  GPUs across the whole live set of deployment groups (reusing the resolver's
+  GPUs across the whole live set of deployment deployments (reusing the resolver's
   `_first_fit`), honoring `allowed_gpus`, `reserved` GPUs (for Phase-2 raw-GPU
   reservations), display-GPU skipping, and `pinned` assignments so adding or
-  removing a group does not reshuffle already-running models. This is the placer
+  removing a deployment does not reshuffle already-running models. This is the placer
   the Compose backend will use; multi-node/bin-packing stay out of scope.
 * Compose backend (`infer_stack.leasing.compose`): a focused renderer that turns
-  the live set of deployment groups directly into a docker-compose project
+  the live set of deployment deployments directly into a docker-compose project
   (reusing `profile_runtime.vllm_args`), and a `ComposeBackend` that converges
   the whole union on each reconcile (`docker compose up -d --remove-orphans`),
   persisting GPU assignments so reconciles don't reshuffle running models.
   Docker is invoked through an injected `run` seam (unit-tested against a fake;
   real docker/GPU path validated on a host). The controller now prefers a
-  backend's `converge(desired)` over per-group realize/teardown. `infer-stack
+  backend's `converge(desired)` over per-deployment realize/teardown. `infer-stack
   ... --backend compose` is wired up.
 * Compose LiteLLM front door + readiness + converge lock: the Compose backend
   now renders a LiteLLM gateway (default on) that routes each endpoint alias to
@@ -132,24 +140,24 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     leasing-native companion to `serve --no-wait` (the old `wait-ready` was
     legacy/profile-only). Lets you fan out — `serve --no-wait a; serve --no-wait
     b; wait a b` loads models in parallel instead of back-to-back. No names waits
-    for every live group; `--require-generation`/`--timeout`/`--interval` apply.
+    for every live deployment; `--require-generation`/`--timeout`/`--interval` apply.
     (Readiness has two orthogonal knobs: `--require-generation` is the
     *criterion* — a real token vs a listed model — and `--wait`/`--no-wait` +
     `wait` are the *blocking* control.)
   - `infer-stack evict [NAME…|--all]` — force-tear-down released (idle) models
     now, overriding `keep-warm`, to free their GPUs. A keep-warm model normally
     stays resident after release (no cold-start next time) but holds a GPU; evict
-    drops it. Target by served endpoint alias or group id, or `--all` for every
-    idle group; live models (with an active lease) are never evicted. `release
+    drops it. Target by served endpoint alias or deployment id, or `--all` for every
+    idle deployment; live models (with an active lease) are never evicted. `release
     --evict` does the release-then-evict in one step (composes with `--all`).
-    Mechanically: idle groups are marked `stopped`, so the next reconcile
+    Mechanically: idle deployments are marked `stopped`, so the next reconcile
     converges them away.
-  - `infer-stack leases` is rich-formatted on a terminal (lease/group tables
+  - `infer-stack leases` is rich-formatted on a terminal (lease/deployment tables
     with state colors); piped/`--json` output is unchanged.
   - `infer-stack leases` now shows **actual vs desired**, not just the ledger's
-    intent. Each group gains a `running` column (from `backend.observe()` — what
+    intent. Each deployment gains a `running` column (from `backend.observe()` — what
     docker actually has up) and a `gpus` column (which GPU indices it is on, or
-    `→N` *slated* for a desired-but-not-yet-started group). So a `state=live` /
+    `→N` *slated* for a desired-but-not-yet-started deployment). So a `state=live` /
     `running=—` row reads as "wanted, not up yet" (starting, staged, or
     unplaceable) instead of looking like a phantom. Both fields are in `--json`.
     Best-effort: a dry-run/docker-less host degrades to "unknown" rather than
@@ -178,7 +186,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     file verbatim" hatch, vs `apply` which re-renders from intent.)
   - Optional Textual TUI (`infer-stack tui`): a multi-pane dashboard. A
     **catalog** pane (left) lists your models + endpoints — select an endpoint
-    and press `s`/Enter to request a lease; **leases** + **groups** panes show
+    and press `s`/Enter to request a lease; **leases** + **deployments** panes show
     the live ledger (desired state vs running, GPUs), auto-refreshing; a **logs**
     pane tails `docker compose logs -f` and a dropdown points it at a specific
     service (or all). Controls: `s` serve, `d` release, `a` release-all, `e`
@@ -197,7 +205,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     GPUs via `catalog suggest`; the logs pane became a **docker tab** (live
     `logs -f` *and* a `ps` snapshot). Actions are now **scoped to the pane they
     act on** — Serve sits under the catalog, Release/Release-all under the
-    leases table, Evict under the groups table — so the global footer keeps only
+    leases table, Evict under the deployments table — so the global footer keeps only
     truly-global controls (Refresh / Next-pane / Quit); the keys still work.
     Panes are **drag-resizable** (grab the full-height/width splitter bars) in
     addition to the `[` `]` / `-` `+` keys. Responsiveness:
@@ -223,17 +231,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     **Containers**; **System** and **API** are promoted to their own collapsed
     panes (so they're only polled when you expand them). The **API** model
     picker now lists *only models that are up and ready* (served by a running
-    group), not every catalog entry. New **Clean up** action (`x`, or the button
-    under leases/groups) forgets released/expired leases and stopped groups —
+    deployment), not every catalog entry. New **Clean up** action (`x`, or the button
+    under leases/deployments) forgets released/expired leases and stopped deployments —
     backed by a new `Ledger.prune()` / `SqliteStore.prune()`. Default theme is
     now the stock **textual-dark** (the orange theme stays available from the
     command palette).
   - `Ledger.prune()` (+ `SqliteStore.prune()`): delete terminal ledger rows —
-    RELEASED/EXPIRED leases and STOPPED groups (and their claims) — for callers
+    RELEASED/EXPIRED leases and STOPPED deployments (and their claims) — for callers
     that want to forget history rather than keep it inspectable.
   - TUI — made the lease↔deployment (many-to-one) relationship legible: the
-    leases pane gained a **deployment** column (the group id(s) a lease holds —
-    the same id shown in the groups pane, so the join is visible), and the groups
+    leases pane gained a **deployment** column (the deployment id(s) a lease holds —
+    the same id shown in the deployments pane, so the join is visible), and the deployments
     pane now shows **leases** (how many hold it) + **held by** (their owners)
     instead of the opaque "demand". Moving the cursor spells the link out in the
     status bar ("lease … → deployment …" / "deployment … ← held by N lease(s)").
@@ -265,7 +273,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     argparse description) and added `__epilog__` examples to `serve` and
     `leases` plus a quickstart + mental-model epilog on the top-level
     `infer-stack --help` (catalog → serve/acquire → reconcile; render vs apply;
-    desired vs running). The `leases` help now documents each group column.
+    desired vs running). The `leases` help now documents each deployment column.
   - Friendlier "unknown endpoint" error. You serve/acquire *endpoints*, not
     models — passing a model name (`serve qwen05`) now says so and lists the
     endpoints that run it (`Endpoints for 'qwen05': qwen05-1, qwen05-2 …`), or,
@@ -330,10 +338,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   that the leasing model names per-daemon.)
 * Keep the legacy meta commands relevant post-refactor: `infer-stack config
   paths` (also exposed top-level as `infer-stack paths`) gained a `leasing`
-  group showing the lease ledger, the compose state dir, and its rendered
+  deployment showing the lease ledger, the compose state dir, and its rendered
   artifacts (docker-compose.yml, litellm_config.yaml, the secrets `.env`,
   sidecar). `infer-stack status` now prints a one-line leasing summary (active
-  leases / live groups) pointing at `infer-stack leases`.
+  leases / live deployments) pointing at `infer-stack leases`.
 * Managed LiteLLM secret + `infer-stack env`. The Compose backend now owns
   `LITELLM_MASTER_KEY` (reused from the state dir's `.env` if you pin one, else
   generated via `ensure_secret`), bakes it into the LiteLLM service, uses it for
@@ -372,7 +380,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   model_list once at startup from a bind-mounted file; converge rewrote that
   file but `docker compose up -d` left the old container running (its service
   spec was unchanged), so a newly added/removed alias never became routable. In
-  practice: coalescing a second alias onto a live group (e.g. an endpoint with a
+  practice: coalescing a second alias onto a live deployment (e.g. an endpoint with a
   `public_name`) added it to the rendered config but the running gateway never
   picked it up, so that lease's readiness probe timed out. The LiteLLM service
   now carries a `infer-stack.config-hash` label derived from the config content,
@@ -416,11 +424,11 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   instead of hanging on readiness forever. Previously, if every GPU was already
   taken (e.g. one model already serving on the only free GPU), serving a second
   model placed *nothing* for it — placement was a silent `WARNING` — yet the
-  ledger had already marked the new group `LIVE`, so `infer-stack leases` showed
-  a phantom "live" group with no container behind it, the compose diff was empty
+  ledger had already marked the new deployment `LIVE`, so `infer-stack leases` showed
+  a phantom "live" deployment with no container behind it, the compose diff was empty
   (nothing to approve, hence no prompt), and `serve` blocked on a readiness
   probe for a container that would never start until Ctrl-C. The controller now
-  detects that a just-requested group landed unplaced, rolls the lease back
+  detects that a just-requested deployment landed unplaced, rolls the lease back
   (matching the diff-declined path) and raises `PlacementError`; the CLI prints
   the planner's reason ("need 1 GPUs but only 0 available") plus how to free a
   GPU (`leases` → `release`/`evict`). Found running the `dev/leasing-demo.md`
@@ -428,16 +436,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 * vLLM compose service/container names now lead with the served model:
-  `vllm-<model>-<group-id>` (e.g. `infer-stack-vllm-qwen05-1-grp-098e…`) instead
-  of the opaque `vllm-grp-098e…`. A vLLM group is exactly one model in one
+  `vllm-<model>-<deployment-id>` (e.g. `infer-stack-vllm-qwen05-1-grp-098e…`) instead
+  of the opaque `vllm-grp-098e…`. A vLLM deployment is exactly one model in one
   container, so `docker ps` / `nvidia-smi` are now legible *without* infer-stack
   — a stated goal: you can drop the tool and the running stack still makes sense.
-  The full group id is kept as a suffix so the name stays unique (two desired
-  groups can share a served name when an endpoint is re-pointed at a new model)
+  The full deployment id is kept as a suffix so the name stays unique (two desired
+  deployments can share a served name when an endpoint is re-pointed at a new model)
   and correlates 1:1 with the `id` column of `infer-stack leases`. The name is
   also LiteLLM's on-network upstream host, so it is slugified to a DNS-safe
   `[a-z0-9-]` label and derived from one helper used by both the service key and
-  the routing config. Ollama daemons keep their group-id name (one daemon can
+  the routing config. Ollama daemons keep their deployment-id name (one daemon can
   host several models, so a model-led name would mislead). Upgrading recreates
   already-running vLLM containers once (the service key changes).
 * Consolidate shared machinery so the legacy and leasing code paths reuse one

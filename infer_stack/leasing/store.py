@@ -18,7 +18,7 @@ Concurrency model:
   writer waits rather than failing immediately.
 * The coalescing critical section uses ``BEGIN IMMEDIATE`` (via
   :meth:`transaction`) to take the write lock *before* reading, so two
-  concurrent ``acquire`` calls cannot both decide "no group exists" and create
+  concurrent ``acquire`` calls cannot both decide "no deployment exists" and create
   duplicates.
 """
 
@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import DeploymentGroup, Lease, LeaseState
+from .models import Deployment, Lease, LeaseState
 
 SCHEMA_VERSION = 1
 
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS leases (
     metadata TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE TABLE IF NOT EXISTS groups (
+CREATE TABLE IF NOT EXISTS deployments (
     id TEXT PRIMARY KEY,
     compat_key TEXT NOT NULL,
     engine TEXT NOT NULL,
@@ -69,13 +69,13 @@ CREATE TABLE IF NOT EXISTS claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lease_id TEXT NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
     endpoint TEXT NOT NULL,
-    group_id TEXT NOT NULL REFERENCES groups(id),
+    deployment_id TEXT NOT NULL REFERENCES deployments(id),
     kind TEXT NOT NULL DEFAULT 'endpoint'
 );
 
 CREATE INDEX IF NOT EXISTS idx_claims_lease ON claims(lease_id);
-CREATE INDEX IF NOT EXISTS idx_claims_group ON claims(group_id);
-CREATE INDEX IF NOT EXISTS idx_groups_compat ON groups(compat_key);
+CREATE INDEX IF NOT EXISTS idx_claims_deployment ON claims(deployment_id);
+CREATE INDEX IF NOT EXISTS idx_deployments_compat ON deployments(compat_key);
 """
 
 
@@ -131,7 +131,7 @@ class SqliteStore:
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Take the write lock up front and commit/rollback atomically.
 
-        ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-group
+        ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
         step race-safe across processes. ``_lock`` adds the same guarantee
         across threads in one process (overlapping ``BEGIN IMMEDIATE`` on a
         shared connection would otherwise raise).
@@ -223,15 +223,15 @@ class SqliteStore:
         self,
         *,
         lease_states: tuple[str, ...] = (),
-        group_states: tuple[str, ...] = (),
+        deployment_states: tuple[str, ...] = (),
     ) -> tuple[int, int]:
-        """Delete terminal leases/groups (and their claims) from the ledger.
+        """Delete terminal leases/deployments (and their claims) from the ledger.
 
-        Claims are removed first so the ``groups.id`` foreign key can't block a
-        group deletion; deleting leases also cascades their claims. Returns
-        ``(n_leases_deleted, n_groups_deleted)``.
+        Claims are removed first so the ``deployments.id`` foreign key can't block a
+        deployment deletion; deleting leases also cascades their claims. Returns
+        ``(n_leases_deleted, n_deployments_deleted)``.
         """
-        n_leases = n_groups = 0
+        n_leases = n_deployments = 0
         with self.transaction() as conn:
             if lease_states:
                 lq = ','.join('?' for _ in lease_states)
@@ -240,24 +240,24 @@ class SqliteStore:
                     f'(SELECT id FROM leases WHERE state IN ({lq}))',
                     lease_states,
                 )
-            if group_states:
-                gq = ','.join('?' for _ in group_states)
+            if deployment_states:
+                gq = ','.join('?' for _ in deployment_states)
                 conn.execute(
-                    f'DELETE FROM claims WHERE group_id IN '
-                    f'(SELECT id FROM groups WHERE state IN ({gq}))',
-                    group_states,
+                    f'DELETE FROM claims WHERE deployment_id IN '
+                    f'(SELECT id FROM deployments WHERE state IN ({gq}))',
+                    deployment_states,
                 )
             if lease_states:
                 lq = ','.join('?' for _ in lease_states)
                 n_leases = conn.execute(
                     f'DELETE FROM leases WHERE state IN ({lq})', lease_states
                 ).rowcount
-            if group_states:
-                gq = ','.join('?' for _ in group_states)
-                n_groups = conn.execute(
-                    f'DELETE FROM groups WHERE state IN ({gq})', group_states
+            if deployment_states:
+                gq = ','.join('?' for _ in deployment_states)
+                n_deployments = conn.execute(
+                    f'DELETE FROM deployments WHERE state IN ({gq})', deployment_states
                 ).rowcount
-        return n_leases, n_groups
+        return n_leases, n_deployments
 
     def active_leases_past(self, now: float) -> list[Lease]:
         """Active leases whose TTL has elapsed (candidates for expiry)."""
@@ -270,7 +270,7 @@ class SqliteStore:
 
     def _row_to_lease(self, row: sqlite3.Row) -> Lease:
         claims = self._conn.execute(
-            'SELECT endpoint, group_id FROM claims WHERE lease_id = ?'
+            'SELECT endpoint, deployment_id FROM claims WHERE lease_id = ?'
             ' ORDER BY id',
             (row['id'],),
         ).fetchall()
@@ -283,96 +283,96 @@ class SqliteStore:
             expires_at=row['expires_at'],
             heartbeat_at=row['heartbeat_at'],
             endpoints=[c['endpoint'] for c in claims],
-            group_ids=list(dict.fromkeys(c['group_id'] for c in claims)),
+            deployment_ids=list(dict.fromkeys(c['deployment_id'] for c in claims)),
         )
 
     # -- claims ------------------------------------------------------------
 
     def insert_claim(
-        self, *, lease_id: str, endpoint: str, group_id: str, kind: str = 'endpoint'
+        self, *, lease_id: str, endpoint: str, deployment_id: str, kind: str = 'endpoint'
     ) -> None:
         self._conn.execute(
-            'INSERT INTO claims(lease_id, endpoint, group_id, kind)'
+            'INSERT INTO claims(lease_id, endpoint, deployment_id, kind)'
             ' VALUES(?, ?, ?, ?)',
-            (lease_id, endpoint, group_id, kind),
+            (lease_id, endpoint, deployment_id, kind),
         )
 
-    # -- groups ------------------------------------------------------------
+    # -- deployments ------------------------------------------------------------
 
-    def insert_group(self, group: DeploymentGroup) -> None:
+    def insert_deployment(self, deployment: Deployment) -> None:
         self._conn.execute(
-            'INSERT INTO groups(id, compat_key, engine, sharing, capacity,'
+            'INSERT INTO deployments(id, compat_key, engine, sharing, capacity,'
             ' spec, served, state, created_at, updated_at)'
             ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
-                group.id,
-                group.compat_key,
-                group.engine,
-                group.sharing,
-                _dumps(group.capacity),
-                _dumps(group.spec),
-                _dumps(group.served),
-                group.state,
-                group.created_at,
-                group.updated_at,
+                deployment.id,
+                deployment.compat_key,
+                deployment.engine,
+                deployment.sharing,
+                _dumps(deployment.capacity),
+                _dumps(deployment.spec),
+                _dumps(deployment.served),
+                deployment.state,
+                deployment.created_at,
+                deployment.updated_at,
             ),
         )
 
-    def set_group_state(self, group_id: str, state: str, updated_at: float) -> None:
+    def set_deployment_state(self, deployment_id: str, state: str, updated_at: float) -> None:
         self._conn.execute(
-            'UPDATE groups SET state = ?, updated_at = ? WHERE id = ?',
-            (state, updated_at, group_id),
+            'UPDATE deployments SET state = ?, updated_at = ? WHERE id = ?',
+            (state, updated_at, deployment_id),
         )
 
-    def update_group_served(
-        self, group_id: str, served: dict[str, Any], updated_at: float
+    def update_deployment_served(
+        self, deployment_id: str, served: dict[str, Any], updated_at: float
     ) -> None:
         self._conn.execute(
-            'UPDATE groups SET served = ?, updated_at = ? WHERE id = ?',
-            (_dumps(served), updated_at, group_id),
+            'UPDATE deployments SET served = ?, updated_at = ? WHERE id = ?',
+            (_dumps(served), updated_at, deployment_id),
         )
 
-    def get_group(self, group_id: str, *, now: float | None = None) -> DeploymentGroup | None:
+    def get_deployment(self, deployment_id: str, *, now: float | None = None) -> Deployment | None:
         row = self._conn.execute(
-            'SELECT * FROM groups WHERE id = ?', (group_id,)
+            'SELECT * FROM deployments WHERE id = ?', (deployment_id,)
         ).fetchone()
         if row is None:
             return None
-        group = self._row_to_group(row)
+        deployment = self._row_to_deployment(row)
         if now is not None:
-            group.demand = self.demand(group_id, now)
-        return group
+            deployment.demand = self.demand(deployment_id, now)
+        return deployment
 
-    def groups_by_compat(
+    def deployments_by_compat(
         self, compat_key: str, *, sharing: str, states: tuple[str, ...]
-    ) -> list[DeploymentGroup]:
+    ) -> list[Deployment]:
         placeholders = ','.join('?' for _ in states)
         rows = self._conn.execute(
-            'SELECT * FROM groups WHERE compat_key = ? AND sharing = ?'
+            'SELECT * FROM deployments WHERE compat_key = ? AND sharing = ?'
             f' AND state IN ({placeholders}) ORDER BY created_at',
             (compat_key, sharing, *states),
         ).fetchall()
-        return [self._row_to_group(r) for r in rows]
+        return [self._row_to_deployment(r) for r in rows]
 
-    def list_groups(self, *, now: float) -> list[DeploymentGroup]:
+    def list_deployments(self, *, now: float) -> list[Deployment]:
         rows = self._conn.execute(
-            'SELECT * FROM groups ORDER BY created_at'
+            'SELECT * FROM deployments ORDER BY created_at'
         ).fetchall()
-        groups = [self._row_to_group(r) for r in rows]
-        for group in groups:
-            group.demand = self.demand(group.id, now)
-        return groups
+        deployments = [self._row_to_deployment(r) for r in rows]
+        for deployment in deployments:
+            deployment.demand = self.demand(deployment.id, now)
+        return deployments
 
-    def groups_for_lease(self, lease_id: str) -> list[DeploymentGroup]:
+    def deployments_for_lease(self, lease_id: str) -> list[Deployment]:
         rows = self._conn.execute(
-            'SELECT DISTINCT g.* FROM groups g JOIN claims c'
-            ' ON c.group_id = g.id WHERE c.lease_id = ?',
+            'SELECT DISTINCT g.* FROM deployments g JOIN claims c'
+            ' ON c.deployment_id = g.id WHERE c.lease_id = ?',
             (lease_id,),
         ).fetchall()
-        return [self._row_to_group(r) for r in rows]
+        return [self._row_to_deployment(r) for r in rows]
 
-    def demand(self, group_id: str, now: float) -> int:
-        """Number of *protecting* leases referencing ``group_id``.
+    def demand(self, deployment_id: str, now: float) -> int:
+        """Number of *protecting* leases referencing ``deployment_id``.
 
         A lease protects iff it is ACTIVE and not past its TTL, matching
         :meth:`infer_stack.leasing.models.Lease.is_protecting`.
@@ -380,14 +380,14 @@ class SqliteStore:
         row = self._conn.execute(
             'SELECT COUNT(DISTINCT c.lease_id) AS n FROM claims c'
             ' JOIN leases l ON c.lease_id = l.id'
-            ' WHERE c.group_id = ? AND l.state = ?'
+            ' WHERE c.deployment_id = ? AND l.state = ?'
             ' AND (l.expires_at IS NULL OR l.expires_at > ?)',
-            (group_id, LeaseState.ACTIVE, now),
+            (deployment_id, LeaseState.ACTIVE, now),
         ).fetchone()
         return int(row['n'])
 
-    def _row_to_group(self, row: sqlite3.Row) -> DeploymentGroup:
-        return DeploymentGroup(
+    def _row_to_deployment(self, row: sqlite3.Row) -> Deployment:
+        return Deployment(
             id=row['id'],
             compat_key=row['compat_key'],
             engine=row['engine'],

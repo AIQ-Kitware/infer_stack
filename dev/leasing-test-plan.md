@@ -142,7 +142,7 @@ infer-stack leases --json
 cat /tmp/is.env
 infer-stack release --env-file /tmp/is.env
 ```
-Expect: JSON with a lease id, one active lease / one live group (demand 1),
+Expect: JSON with a lease id, one active lease / one live deployment (demand 1),
 env-file with `INFER_STACK_ENDPOINT_QWEN_SMALL=qwen-small`, clean release. No
 containers (null backend).
 
@@ -187,7 +187,7 @@ export CAT=~/infer-stack-test/catalog.yaml
 export C="$INFER_STACK_DATA_DIR/leasing/compose"
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner alice --require-generation --timeout 1200
 infer-stack acquire qwen-dup   --backend compose --catalog "$CAT" --owner bob   --require-generation --timeout 1200
-infer-stack leases --json     # ONE group, demand 2; two leases
+infer-stack leases --json     # ONE deployment, demand 2; two leases
 infer-stack ps   # exactly one vllm-… service
 ```
 Cleanup:
@@ -206,11 +206,11 @@ export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner a --require-generation --timeout 1200
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --owner b --dedicated --require-generation --timeout 300
-infer-stack leases --json     # two groups requested...
+infer-stack leases --json     # two deployments requested...
 ```
-Expected on yardrat: the dedicated 2nd group **can't place** (only GPU 0 free →
+Expected on yardrat: the dedicated 2nd deployment **can't place** (only GPU 0 free →
 placement error, no container) so its acquire times out. Confirm via `leases`
-(group with demand 1 but not running) and the compose `ps`. This is F5.
+(deployment with demand 1 but not running) and the compose `ps`. This is F5.
 
 ---
 
@@ -221,7 +221,7 @@ export INFER_STACK_DATA_DIR=~/infer-stack-test/data
 export CAT=~/infer-stack-test/catalog.yaml
 infer-stack acquire qwen-small --backend compose --catalog "$CAT" --ttl 90s --require-generation --env-file /tmp/is.env --timeout 1200
 sleep 100
-infer-stack leases            # lease EXPIRED; qwen-small is reclaim:stop -> group reclaimed
+infer-stack leases            # lease EXPIRED; qwen-small is reclaim:stop -> deployment reclaimed
 ```
 Repeat with `qwen-15b` (reclaim: keep-warm) to confirm it stays running after
 TTL expiry.

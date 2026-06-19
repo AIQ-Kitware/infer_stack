@@ -73,15 +73,15 @@ def test_acquire_coalesces_demand(env, capsys):
     AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'bob'])
     data = _leases_json(env, capsys)
     assert len(data['leases']) == 2
-    assert len(data['groups']) == 1
-    assert data['groups'][0]['demand'] == 2
+    assert len(data['deployments']) == 1
+    assert data['deployments'][0]['demand'] == 2
 
 
-def test_dedicated_makes_separate_group(env, capsys):
+def test_dedicated_makes_separate_deployment(env, capsys):
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
     AcquireCLI.main(argv=['qwen-coder', '--dedicated', *_base(env)])
     data = _leases_json(env, capsys)
-    assert len(data['groups']) == 2
+    assert len(data['deployments']) == 2
 
 
 def test_bundle_acquire_expands(env, capsys):
@@ -98,9 +98,9 @@ def test_release_via_env_file(env, capsys):
     assert rc == 0
     data = _leases_json(env, capsys)
     assert data['leases'][0]['state'] == 'released'
-    # default reclaim is keep-warm, so the group is idle but not torn down
-    assert data['groups'][0]['state'] == 'idle'
-    assert data['groups'][0]['demand'] == 0
+    # default reclaim is keep-warm, so the deployment is idle but not torn down
+    assert data['deployments'][0]['state'] == 'idle'
+    assert data['deployments'][0]['demand'] == 0
 
 
 def test_release_all_releases_every_active_lease(env, capsys):
@@ -119,18 +119,18 @@ def test_release_all_with_no_leases_is_friendly(env, capsys):
     assert 'no active leases' in capsys.readouterr().out
 
 
-def test_evict_idle_group_by_endpoint(env, capsys):
+def test_evict_idle_deployment_by_endpoint(env, capsys):
     from infer_stack.cli.commands_leasing import EvictCLI
 
-    # keep-warm: releasing leaves the group resident (idle), not stopped.
+    # keep-warm: releasing leaves the deployment resident (idle), not stopped.
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
     ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
-    assert _leases_json(env, capsys)['groups'][0]['state'] == 'idle'
+    assert _leases_json(env, capsys)['deployments'][0]['state'] == 'idle'
 
-    # evict by the served endpoint alias -> the group is stopped (GPU freed).
+    # evict by the served endpoint alias -> the deployment is stopped (GPU freed).
     rc = EvictCLI.main(argv=['qwen-coder', '--ledger', env.db])
     assert rc == 0
-    assert _leases_json(env, capsys)['groups'][0]['state'] == 'stopped'
+    assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
 def test_evict_requires_target_or_all(env):
@@ -141,11 +141,11 @@ def test_evict_requires_target_or_all(env):
 
 
 def test_release_evict_tears_down_immediately(env, capsys):
-    # --evict overrides keep-warm: the released group is stopped, not idle.
+    # --evict overrides keep-warm: the released deployment is stopped, not idle.
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
     rc = ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--evict'])
     assert rc == 0
-    assert _leases_json(env, capsys)['groups'][0]['state'] == 'stopped'
+    assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
 def test_serve_is_standing_lease(env, capsys):
@@ -240,11 +240,11 @@ def test_render_and_apply_are_lease_free(env, capsys):
 
 
 def test_leases_reports_running_and_gpus(env, capsys):
-    # NullBackend serves nothing, so a leased group is desired-live but not
+    # NullBackend serves nothing, so a leased deployment is desired-live but not
     # actually running and has no GPU assignment — the view must say so.
     ServeCLI.main(argv=['qwen-coder', *_base(env)])
     data = _leases_json(env, capsys)
-    g = data['groups'][0]
+    g = data['deployments'][0]
     assert g['state'] == 'live'        # desired (ledger)
     assert g['running'] is False       # actual (backend.observe)
     assert g['gpus'] is None           # no placement on the dry-run backend
