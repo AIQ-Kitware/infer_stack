@@ -163,7 +163,7 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
             # and api are now their own (collapsed) panes.
             tabs = app.query_one('#docker-tabs', TabbedContent)
             assert {p.id for p in tabs.query('TabPane')} == {
-                'tab-logs', 'tab-containers'
+                'tab-logs', 'tab-containers', 'tab-control'
             }
             assert app.query_one('#docker', Collapsible)
             assert app.query_one('#system', Collapsible).collapsed
@@ -646,6 +646,31 @@ def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
     _run(scenario)
     leases, _ = controller.ledger.status()
     assert not any(str(le.state) == 'released' for le in leases)
+
+
+def test_tui_compose_control_runs_up(tmp_path):
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    compose_file = tmp_path / 'docker-compose.yml'
+    compose_file.write_text('services: {}\n')
+    calls = []
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            backend = controller.backend
+            backend.compose_file = compose_file
+            backend.project = 'infer-stack'
+            backend.run = lambda args: calls.append(args) or ''
+            app.action_compose_up()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    assert calls and calls[0][:2] == ['docker', 'compose'] and 'up' in calls[0]
 
 
 def test_tui_logs_stream_from_injected_source():

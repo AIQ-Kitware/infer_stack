@@ -412,6 +412,9 @@ class InferStackTUI(App):
     #settings Label { margin: 1 0 0 0; color: $text-muted; }
     #settings Input, #settings Select { margin: 0 0 1 0; width: 64; }
     #settings-actions { height: auto; margin: 1 0 0 0; }
+    #compose-path { height: auto; color: $text-muted; padding: 0 1; margin: 0 0 1 0; }
+    #compose-actions { height: auto; }
+    #compose-actions Button { margin: 0 1 0 0; }
     """
 
     BINDINGS = [
@@ -549,6 +552,17 @@ class InferStackTUI(App):
                         with TabPane('Containers', id='tab-containers'):
                             yield DataTable(id='ps', cursor_type='row',
                                             zebra_stripes=True)
+                        with TabPane('Control', id='tab-control'):
+                            yield Static(
+                                'Bring the rendered compose project up or down. '
+                                'Output appears in the Logs tab.', classes='hint',
+                            )
+                            yield Static('', id='compose-path')
+                            with Horizontal(id='compose-actions'):
+                                yield Button('Compose up', id='btn-compose-up',
+                                             variant='primary')
+                                yield Button('Compose down',
+                                             id='btn-compose-down')
                 with Collapsible(title='system', collapsed=True, id='system'):
                     yield Static(
                         'Live GPU utilization (nvidia-smi) and host CPU/memory.',
@@ -641,6 +655,10 @@ class InferStackTUI(App):
         )
         self.query_one('#gpus', DataTable).add_columns(
             'gpu', 'name', 'util%', 'mem (used/total)', 'temp'
+        )
+        compose_file = getattr(self.controller.backend, 'compose_file', None)
+        self.query_one('#compose-path', Static).update(
+            f'compose file: {compose_file or "(not rendered yet)"}'
         )
         # Capture docker's own chatter (up/down progress on stderr) into the
         # logs pane instead of letting it bleed onto the full-screen terminal.
@@ -1199,6 +1217,8 @@ class InferStackTUI(App):
             'btn-api-send': self.action_api_send,
             'btn-api-test-all': self.action_api_test_all,
             'btn-save-settings': self._on_save_settings,
+            'btn-compose-up': self.action_compose_up,
+            'btn-compose-down': self.action_compose_down,
         }
         handler = handlers.get(event.button.id or '')
         if handler:
@@ -1246,6 +1266,45 @@ class InferStackTUI(App):
     def action_cleanup(self) -> None:
         self._status('cleaning up released/expired leases + stopped deployments…')
         self._do_cleanup()
+
+    # -- docker compose control -------------------------------------------
+
+    def _compose_target(self) -> tuple[Any, str, str] | None:
+        """(run, project, compose_file) for the leasing project, or None."""
+        backend = self.controller.backend
+        path = getattr(backend, 'compose_file', None)
+        run = getattr(backend, 'run', None)
+        if not path or not run or not Path(path).exists():
+            return None
+        return run, str(getattr(backend, 'project', 'infer-stack')), str(path)
+
+    def action_compose_up(self) -> None:
+        if self._compose_target() is None:
+            self._status('nothing rendered yet — serve a model first')
+            return
+        self._status('docker compose up… (output in the Logs tab)')
+        self._do_compose(['up', '-d', '--remove-orphans'], 'up')
+
+    def action_compose_down(self) -> None:
+        if self._compose_target() is None:
+            self._status('nothing rendered yet — nothing to bring down')
+            return
+        self._status('docker compose down…')
+        self._do_compose(['down', '--remove-orphans'], 'down')
+
+    @work(thread=True, exclusive=True, group='mutate')
+    def _do_compose(self, args: list[str], label: str) -> None:
+        target = self._compose_target()
+        if target is None:
+            self._after_mutation('nothing rendered yet')
+            return
+        run, project, path = target
+        try:
+            run(['docker', 'compose', '-p', project, '-f', path, *args])
+            msg = f'compose {label} done'
+        except Exception as ex:  # noqa: BLE001
+            msg = f'compose {label} failed: {ex}'
+        self._after_mutation(msg)
 
     # -- open in browser ---------------------------------------------------
 
