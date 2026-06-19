@@ -167,6 +167,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     now an exact equivalent of `apply` rather than a sibling project the tool
     can no longer see. (`infer-stack stack up` remains the raw "run the on-disk
     file verbatim" hatch, vs `apply` which re-renders from intent.)
+  - The front door (LiteLLM gateway + Open WebUI) is now a standing service,
+    decoupled from model count. It was rendered only alongside ≥1 model, so
+    `release --all`/`evict --all` left an empty desired set and `converge` downed
+    the *whole* project — taking the CPU-only gateway/UI with it (the UI blinked,
+    and `evict`, whose job is freeing GPUs, tore down the front door as a side
+    effect). Now the gateway/UI render whenever enabled (empty `model_list` when
+    no models), so `release`/`evict` only stop model containers (freeing GPUs)
+    and the front door stays up — Open WebUI never blinks, even to zero models,
+    and reconnects as you serve again. `infer-stack stack down` is the way to
+    take the whole stack (gateway + UI included) down. The empty-set→`down`
+    converge path now only triggers with the gateway off (`litellm=False`).
   - Better `--help`. Expanded the leasing verbs' docstrings (rendered as the
     argparse description) and added `__epilog__` examples to `serve` and
     `leases` plus a quickstart + mental-model epilog on the top-level

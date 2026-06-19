@@ -246,22 +246,50 @@ def test_converge_removes_dropped_group(tmp_path):
     assert be.observe() == {'a'}
 
 
-def test_converge_to_empty_tears_down_not_up(tmp_path):
-    """Releasing the last group must `down`, not `up` an empty compose file.
+def test_converge_to_empty_keeps_the_front_door(tmp_path):
+    """Releasing the last model leaves the gateway + UI up (an empty front door).
 
-    Regression: real `docker compose up -d` errors with "no service selected"
-    on a services-less file, so a release that emptied the desired set crashed
-    reconcile (and `infer-stack run` surfaced it as a non-zero exit).
+    The front door is a standing entry point, not a per-model service: zero
+    models -> empty model_list, but litellm/open-webui keep running. Only
+    `stack down` takes everything off.
     """
-    be = make_backend(tmp_path)
+    be = make_backend(tmp_path)            # litellm + ui on by default
     be.converge([vllm('a', t=0)])
     assert be.observe() == {'a'}
     fake = be.run
     fake.calls.clear()
-    be.converge([])                                   # last lease released
+    be.converge([])                        # last model released
     verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
-    assert 'down' in verbs and 'up' not in verbs      # tore down, never `up`d
+    assert 'up' in verbs and 'down' not in verbs   # front door stays up
+    # no model groups running, but the compose project still has the gateway/UI
     assert be.observe() == set()
+    compose = yaml.safe_load(be.compose_file.read_text())
+    assert set(compose['services']) == {'litellm', 'open-webui'}
+
+
+def test_converge_to_empty_downs_when_gateway_off(tmp_path):
+    """With no gateway (litellm=False), an empty desired set has nothing to run,
+    so converge `down`s rather than `up`-ing a services-less file."""
+    be = make_backend(tmp_path, litellm=False)
+    be.converge([vllm('a', t=0)])
+    fake = be.run
+    fake.calls.clear()
+    be.converge([])
+    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
+    assert 'down' in verbs and 'up' not in verbs
+
+
+def test_render_gateway_with_zero_models(tmp_path):
+    state = {**STATE, 'open_webui': '/cache/open-webui'}
+    images = {**IMAGES, 'open_webui': 'ghcr.io/open-webui/open-webui:test'}
+    rc = render_compose(
+        [], {}, images=images, ports=PORTS, state=state,
+        litellm=True, ui=True, aux_dir=tmp_path,
+    )
+    # gateway + UI render even with no models; the model_list is just empty
+    assert set(rc.compose['services']) == {'litellm', 'open-webui'}
+    assert yaml.safe_load(rc.litellm_config)['model_list'] == []
+    assert 'depends_on' not in rc.compose['services']['litellm']
 
 
 def test_observe_tolerates_unreadable_compose_file(tmp_path):

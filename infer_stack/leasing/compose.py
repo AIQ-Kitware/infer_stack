@@ -281,7 +281,7 @@ def _litellm_service(
         # it picks up new/removed aliases. Without this, coalescing a second
         # alias onto a live group never becomes routable (readiness times out).
         labels[CONFIG_HASH_LABEL] = config_hash
-    return {
+    service: dict[str, Any] = {
         'image': images['litellm'],
         'command': [
             '--config',
@@ -292,10 +292,13 @@ def _litellm_service(
         'ports': [f'{host_port}:{LITELLM_CONTAINER_PORT}'],
         'volumes': [f'{aux_dir}/{LITELLM_CONFIG_FILENAME}:/etc/litellm/config.yaml:ro'],
         'environment': {API_KEY_ENV: key_value},
-        'depends_on': sorted(service_names),
         'restart': 'unless-stopped',
         'labels': labels,
     }
+    # Only wait on upstreams when there are any (zero models -> empty gateway).
+    if service_names:
+        service['depends_on'] = sorted(service_names)
+    return service
 
 
 OPEN_WEBUI_SERVICE = 'open-webui'
@@ -396,7 +399,12 @@ def render_compose(
         service_map[name] = group.id
 
     litellm_config = None
-    if litellm and service_map:
+    # The front door (gateway + UI) is rendered whenever it's enabled, even with
+    # zero models — it's a standing entry point, not a per-model service. So
+    # releasing/evicting every model leaves an empty gateway (and an empty Open
+    # WebUI picker) up instead of tearing the whole stack down; only an explicit
+    # `stack down` removes it. With no models the model_list is simply empty.
+    if litellm:
         entries = _litellm_model_list(groups, assignments)
         litellm_config = yaml.safe_dump(
             {
@@ -722,11 +730,14 @@ class ComposeBackend:
                 )
                 self._compose(['up', '-d', '--remove-orphans'])
             else:
-                # Empty desired set (e.g. the last reclaim:stop lease was
-                # released): `docker compose up` errors with "no service
-                # selected" on a services-less file. Tear the project down
-                # instead — this is the clean "everything off" convergence.
-                # (`down` targets the project, so it works on the empty file.)
+                # Nothing at all to run — only reachable with the gateway off
+                # (litellm=False) and zero models, since the front door otherwise
+                # keeps the project non-empty. `docker compose up` errors with
+                # "no service selected" on a services-less file, so tear the
+                # project down instead (`down` works on the empty file). With the
+                # gateway on, releasing every model lands in the `up` branch above
+                # and leaves the front door standing; `stack down` is the way to
+                # take everything off.
                 logger.info('no services desired -> docker compose down')
                 self._compose(['down', '--remove-orphans'])
         return plan

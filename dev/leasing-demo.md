@@ -282,6 +282,11 @@ infer-stack evict --all      # ...or every idle/released model at once
 infer-stack release <SESSION_ID> --evict
 ```
 
+`release`/`evict` only tear down **models** (freeing GPUs). The front door — the
+gateway and Open WebUI — stays up even when zero models are served, so the UI
+never blinks and reconnects as you serve again. To take the *whole* stack
+(gateway + UI included) down, use `infer-stack stack down` (see §6).
+
 > The explicitly-named `chat` endpoint from §1b is the **stable handle** case:
 > re-point it at a different model in place and clients/Open WebUI never change
 > what they ask for —
@@ -293,8 +298,9 @@ infer-stack release <SESSION_ID> --evict
 ## 6. Teardown
 
 ```bash
-# release every active lease in one shot, then down the leasing stack (Open
-# WebUI, the gateway, and the model containers all come down together)
+# release frees the models/GPUs but leaves the front door (gateway + Open WebUI)
+# up; `stack down` is what takes the whole project — gateway, UI, everything —
+# down for a clean slate.
 infer-stack release --all
 infer-stack stack down
 # weights cache + chat history under your data dir are kept (re-serving is then
@@ -318,7 +324,9 @@ The earlier draft of this demo flagged five ergonomic smells; building the
   `.env` Compose auto-loads, set once before `serve`.
 - ✅ **Managed Open WebUI** — bundled into the leasing stack and on by default
   (`--no-ui` / `config set ui false` to opt out). Stable across model switches
-  (the UI container isn't recreated when routing changes), so it never blinks.
+  *and* down to zero models — the gateway + UI are a standing front door that
+  `release`/`evict` leave running (only `stack down` removes them), so it never
+  blinks and reconnects as you serve again.
 - ✅ **Concise smoke test** — `infer-stack test smol17b-1` instead of
   hand-rolled `curl`.
 
