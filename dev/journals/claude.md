@@ -1746,3 +1746,44 @@ gut + old top-level catalog.py deletion (no CLI surface) — still deferred.
 test-backed increment. Confidence high on the mechanics; the on-terminal feel
 (tab switching, drag ergonomics under tmux) remains the standing
 unverified-without-a-real-terminal caveat.
+
+## 2026-06-19 18:30:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Live-testing feedback round +
+the two deferred remainders. Jon is eyeballing each change.
+
+TUI fixes from live testing:
+- Endpoint wizard was an unlabeled blank form in edit mode (prefilled inputs hide
+  placeholders). Rebuilt it: a Label per field, and engine-adaptive groups — vLLM
+  shows tensor-parallel / data-parallel / max-model-len / gpu-mem / max-seqs /
+  prefix-caching / extra-args; Ollama shows host + free-form KEY=VALUE runtime.
+  Mapped to the canonical leasing runtime keys (verified against
+  leasing/compose._service_dict), so no CLI change needed — data-parallel etc.
+  were always reachable via runtime keys / --runtime / --extra-args; the wizard
+  just surfaces them.
+- API tester promoted to a top-level tab (frees the monitor column). Catalog
+  Add/Edit/Remove localized to the endpoints + models panels; the bottom button
+  stack removed; Suggest moved to Settings.
+- Fixed the endpoints|models drag inversion (fixed-pane-below ⇒ subtract delta).
+- Vertical splitter now drags the full width range (clamped to terminal width),
+  not just the middle (min-width was 26; lowered to 10, clamp uses self.size).
+
+Per-pane collapse: made leases + deployments Collapsibles (docker/system already
+were). Discovered + documented a real Textual constraint via a scratch:
+setting an explicit height defeats Collapsible's collapse (height wins), and
+clearing to None didn't restore shrink — so collapse and a fixed-height drag bar
+can't share a pane. Chose collapse for the four monitor panes (dropped the
+leases|deployments lsplit) and kept drag for the catalog (endpoints|models
+csplit), since you act on the catalog constantly and want it sized, not hidden.
+
+config.py gut + old catalog.py deletion (the last "two catalogs" smell): traced
+the call graph — the builtin_*_catalog → file/overlay/merge → normalized_catalogs
+chain + initial_config were all dead externally (only normalized_output/
+normalized_state/default_state_paths + the port/image constants are used, by
+leasing/compose + kubeai_renderer). Excised the chain (kept deep_merge, used by
+normalized_cluster), dropped the `from .catalog import normalize_*`, deleted
+infer_stack/catalog.py, and removed the now-orphaned profile templates
+(default-*.yaml + the legacy .j2 renderer templates; kept suggestion-pool.yaml).
+
+232 tests green throughout; ruff clean. Standing caveat unchanged: the
+on-terminal feel is Jon's to confirm (he is, live).
