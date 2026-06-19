@@ -279,6 +279,58 @@ def test_converge_to_empty_downs_when_gateway_off(tmp_path):
     assert 'down' in verbs and 'up' not in verbs
 
 
+def test_render_reverse_proxy(tmp_path):
+    images = {**IMAGES, 'open_webui': 'owui:test', 'nginx': 'nginx:test'}
+    rc = render_compose(
+        [vllm('grp-a', served='chat')], {'grp-a': [0]},
+        images=images, ports=PORTS, state=STATE,
+        litellm=True, ui=True, reverse_proxy=True, reverse_proxy_port=8080,
+        aux_dir=tmp_path,
+    )
+    svc = rc.compose['services']['reverse-proxy']
+    assert svc['image'] == 'nginx:test'
+    assert svc['ports'] == ['8080:80']
+    assert svc['depends_on'] == ['litellm', 'open-webui']
+    # generated conf path-routes /v1 -> gateway, / -> UI
+    conf = rc.nginx_config
+    assert 'location /v1/' in conf and 'litellm:4000' in conf
+    assert 'location /' in conf and 'open-webui:8080' in conf
+    assert 'connection_upgrade' in conf            # websockets for the UI
+
+
+def test_render_reverse_proxy_byo_config(tmp_path):
+    images = {**IMAGES, 'open_webui': 'owui:test', 'nginx': 'nginx:test'}
+    rc = render_compose(
+        [vllm('grp-a', served='chat')], {'grp-a': [0]},
+        images=images, ports=PORTS, state=STATE,
+        litellm=True, ui=True, reverse_proxy=True,
+        reverse_proxy_config='/etc/my/nginx.conf', aux_dir=tmp_path,
+    )
+    svc = rc.compose['services']['reverse-proxy']
+    # BYO: mount the operator's file verbatim, generate nothing
+    assert svc['volumes'] == ['/etc/my/nginx.conf:/etc/nginx/conf.d/default.conf:ro']
+    assert rc.nginx_config is None
+
+
+def test_reverse_proxy_needs_the_gateway(tmp_path):
+    images = {**IMAGES, 'nginx': 'nginx:test'}
+    rc = render_compose(
+        [vllm('grp-a', served='chat')], {'grp-a': [0]},
+        images=images, ports=PORTS, state=STATE,
+        litellm=False, reverse_proxy=True, aux_dir=tmp_path,
+    )
+    assert 'reverse-proxy' not in rc.compose['services']   # no gateway -> no proxy
+
+
+def test_converge_writes_nginx_conf_and_access_reports_proxy(tmp_path):
+    be = make_backend(tmp_path, reverse_proxy=True, reverse_proxy_port=8080)
+    be.converge([vllm('a', served='aa')])
+    assert (tmp_path / 'nginx.conf').exists()
+    assert 'reverse-proxy' in yaml.safe_load(be.compose_file.read_text())['services']
+    info = be.access(['aa'])
+    assert info['proxy_url'] == 'http://127.0.0.1:8080'
+
+
 def test_render_gateway_with_zero_models(tmp_path):
     state = {**STATE, 'open_webui': '/cache/open-webui'}
     images = {**IMAGES, 'open_webui': 'ghcr.io/open-webui/open-webui:test'}

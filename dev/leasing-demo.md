@@ -192,6 +192,18 @@ curl -s http://127.0.0.1:14042/v1/chat/completions \
 You ask for the **endpoint name** (`smol17b-1`, your catalog's short name for the
 model), not the full HF id — the gateway routes it.
 
+> **One port instead of two?** Turn on the reverse proxy and you hit a single
+> origin — the UI at `/` and the API at `/v1` — so there's nothing to remember:
+> ```bash
+> infer-stack serve smol17b-1 --reverse-proxy        # or: config set reverse_proxy true
+> # then:  http://localhost/        -> Open WebUI
+> #        http://localhost/v1      -> the OpenAI API  (test still hits :14042 directly)
+> ```
+> It's plain HTTP — no TLS or auth — so it's for localhost / a trusted network,
+> not public exposure. Set the port or mount your own `nginx.conf` via the
+> `reverse_proxy` setting (`config edit`): `{enabled: true, port: 8080,
+> config_path: /my/nginx.conf}`.
+
 ---
 
 ## 4. Open WebUI (managed, already running)

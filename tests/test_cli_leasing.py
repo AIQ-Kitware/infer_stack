@@ -203,6 +203,29 @@ def test_release_evict_apply_accept_yes_flag(env, capsys):
     assert ApplyCLI.main(argv=['--ledger', env.db, '--yes']) == 0
 
 
+def test_reverse_proxy_resolution_flag_bool_block(monkeypatch):
+    import infer_stack.cli.commands_leasing as mod
+    import infer_stack.paths as paths
+
+    def resolve(argv, setting=None):
+        monkeypatch.setattr(
+            paths, 'get_setting',
+            lambda k: setting if k == 'reverse_proxy' else None,
+        )
+        cfg = AcquireCLI.cli(argv=argv, strict=False)
+        return mod._resolve_reverse_proxy(cfg)
+
+    base = ['qwen-coder']
+    assert resolve(base) == (False, 80, None)                  # default off
+    assert resolve([*base, '--reverse-proxy']) == (True, 80, None)   # flag
+    assert resolve(base, setting=True) == (True, 80, None)     # bool setting
+    # a block carries port + BYO config; flag still overrides enabled
+    block = {'enabled': True, 'port': 8080, 'config_path': '/etc/n.conf'}
+    assert resolve(base, setting=block) == (True, 8080, '/etc/n.conf')
+    assert resolve([*base, '--no-reverse-proxy'], setting=block) == (
+        False, 8080, '/etc/n.conf')
+
+
 def test_render_and_apply_are_lease_free(env, capsys):
     from infer_stack.cli.commands_leasing import ApplyCLI, RenderCLI
 

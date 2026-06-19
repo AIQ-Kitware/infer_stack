@@ -167,6 +167,18 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     now an exact equivalent of `apply` rather than a sibling project the tool
     can no longer see. (`infer-stack stack up` remains the raw "run the on-disk
     file verbatim" hatch, vs `apply` which re-renders from intent.)
+  - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it
+    (`--reverse-proxy`, or `config set reverse_proxy true`) to front the gateway
+    + Open WebUI with one nginx origin — UI at `/`, the OpenAI API at `/v1` — so
+    there's one port to hit instead of remembering 13000 (UI) and 14042 (API).
+    Plain HTTP, no TLS/auth (localhost / trusted networks only); the value is
+    ergonomics, not security. The generated conf handles Open WebUI's websockets
+    + large uploads; a `{enabled, port, config_path}` block (via `config edit`)
+    sets the port or mounts a bring-your-own `nginx.conf`. Needs the gateway, so
+    it's rendered only alongside litellm; `access()` reports the unified
+    `proxy_url`. (TLS/LDAP — the legacy `frontends.reverse_proxy` features — and a
+    remote control surface are deliberately *not* included here, since those
+    require the auth this plain proxy can't provide.)
   - The front door (LiteLLM gateway + Open WebUI) is now a standing service,
     decoupled from model count. It was rendered only alongside ≥1 model, so
     `release --all`/`evict --all` left an empty desired set and `converge` downed

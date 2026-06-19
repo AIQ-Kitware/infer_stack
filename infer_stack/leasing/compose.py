@@ -97,6 +97,7 @@ class RenderedCompose:
     compose: dict[str, Any]
     services: dict[str, str] = field(default_factory=dict)  # service -> group id
     litellm_config: str | None = None
+    nginx_config: str | None = None
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -304,6 +305,10 @@ def _litellm_service(
 OPEN_WEBUI_SERVICE = 'open-webui'
 OPEN_WEBUI_CONTAINER_PORT = 8080
 
+NGINX_SERVICE = 'reverse-proxy'
+NGINX_CONTAINER_PORT = 80
+NGINX_CONFIG_FILENAME = 'nginx.conf'
+
 
 def _open_webui_service(
     host_port: int,
@@ -346,6 +351,90 @@ def _open_webui_service(
     }
 
 
+def _nginx_conf(*, litellm: bool, ui: bool) -> str:
+    """A minimal HTTP reverse-proxy conf: one origin, path-routed.
+
+    ``/v1/`` -> the LiteLLM gateway (the OpenAI API), ``/`` -> Open WebUI (or the
+    gateway when there's no UI). Plain HTTP — no TLS, no auth — so the value is
+    "one port, nothing to remember", not security. The ``map`` is valid here
+    because a ``conf.d/*.conf`` file is included in nginx's ``http`` context.
+    """
+    api = f'http://{LITELLM_SERVICE}:{LITELLM_CONTAINER_PORT}'
+    locations = ''
+    if litellm:
+        locations += (
+            '    location /v1/ {\n'
+            f'        proxy_pass {api}/v1/;\n'
+            '        proxy_set_header Host $host;\n'
+            '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+            '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+            '        proxy_read_timeout 600s;\n'
+            '    }\n'
+        )
+    # `/` serves the UI when present, else the gateway (so hitting the host root
+    # still lands somewhere useful). Upgrade headers keep Open WebUI's websockets
+    # working; client_max_body_size 0 allows large uploads.
+    if ui:
+        root = f'http://{OPEN_WEBUI_SERVICE}:{OPEN_WEBUI_CONTAINER_PORT}'
+    elif litellm:
+        root = api
+    else:
+        root = ''
+    if root:
+        locations += (
+            '    location / {\n'
+            f'        proxy_pass {root};\n'
+            '        proxy_http_version 1.1;\n'
+            '        proxy_set_header Upgrade $http_upgrade;\n'
+            '        proxy_set_header Connection $connection_upgrade;\n'
+            '        proxy_set_header Host $host;\n'
+            '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+            '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+            '    }\n'
+        )
+    return (
+        'map $http_upgrade $connection_upgrade {\n'
+        '    default upgrade;\n'
+        "    ''      close;\n"
+        '}\n\n'
+        'server {\n'
+        f'    listen {NGINX_CONTAINER_PORT};\n'
+        '    server_name _;\n'
+        '    client_max_body_size 0;\n'
+        f'{locations}'
+        '}\n'
+    )
+
+
+def _nginx_service(
+    host_port: int,
+    images: dict[str, str],
+    *,
+    aux_dir: str,
+    depends_on: list[str],
+    config_path: str | None = None,
+    config_hash: str | None = None,
+) -> dict[str, Any]:
+    # BYO config (config_path) is mounted verbatim; otherwise the generated
+    # nginx.conf in the state dir is used.
+    mount = config_path or f'{aux_dir}/{NGINX_CONFIG_FILENAME}'
+    labels = {ENGINE_LABEL: 'nginx'}
+    if config_hash is not None:
+        # Same trick as LiteLLM: the conf is bind-mounted, so stamp its hash on a
+        # label to force a recreate when the routing changes.
+        labels[CONFIG_HASH_LABEL] = config_hash
+    service: dict[str, Any] = {
+        'image': images['nginx'],
+        'ports': [f'{host_port}:{NGINX_CONTAINER_PORT}'],
+        'volumes': [f'{mount}:/etc/nginx/conf.d/default.conf:ro'],
+        'restart': 'unless-stopped',
+        'labels': labels,
+    }
+    if depends_on:
+        service['depends_on'] = sorted(depends_on)
+    return service
+
+
 def render_compose(
     groups: list[DeploymentGroup],
     assignments: dict[str, list[int]],
@@ -358,6 +447,9 @@ def render_compose(
     litellm_master_key: str | None = None,
     ui: bool = False,
     ui_port: int = 13000,
+    reverse_proxy: bool = False,
+    reverse_proxy_port: int = 80,
+    reverse_proxy_config: str | None = None,
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
 ) -> RenderedCompose:
@@ -442,10 +534,32 @@ def render_compose(
             services[OPEN_WEBUI_SERVICE] = _open_webui_service(
                 ui_port, images, state, litellm_master_key
             )
+
+    # Optional single-port HTTP reverse proxy fronting the gateway (+ UI). Needs
+    # the gateway, so it's only rendered alongside litellm.
+    nginx_config = None
+    if reverse_proxy and litellm:
+        depends = [LITELLM_SERVICE] + ([OPEN_WEBUI_SERVICE] if ui else [])
+        if reverse_proxy_config:
+            services[NGINX_SERVICE] = _nginx_service(
+                reverse_proxy_port, images, aux_dir=str(aux_dir or '.'),
+                depends_on=depends, config_path=reverse_proxy_config,
+            )
+        else:
+            nginx_config = _nginx_conf(litellm=litellm, ui=ui)
+            services[NGINX_SERVICE] = _nginx_service(
+                reverse_proxy_port, images, aux_dir=str(aux_dir or '.'),
+                depends_on=depends,
+                config_hash=hashlib.sha256(
+                    nginx_config.encode('utf-8')
+                ).hexdigest()[:12],
+            )
+
     return RenderedCompose(
         compose={'name': project, 'services': services},
         services=service_map,
         litellm_config=litellm_config,
+        nginx_config=nginx_config,
     )
 
 
@@ -509,6 +623,9 @@ class ComposeBackend:
         skip_display: bool = False,
         litellm: bool = True,
         ui: bool = True,
+        reverse_proxy: bool = False,
+        reverse_proxy_port: int = 80,
+        reverse_proxy_config: str | None = None,
         require_generation: bool = False,
         assume_yes: bool = True,
     ):
@@ -529,6 +646,9 @@ class ComposeBackend:
         self.skip_display = skip_display
         self.litellm = litellm
         self.ui = ui
+        self.reverse_proxy = reverse_proxy
+        self.reverse_proxy_port = reverse_proxy_port
+        self.reverse_proxy_config = reverse_proxy_config
         self.require_generation = require_generation
         self.assume_yes = assume_yes
         self.last_errors: list[str] = []
@@ -695,6 +815,9 @@ class ComposeBackend:
                 litellm_master_key=self.master_key() if self.litellm else None,
                 ui=self.ui,
                 ui_port=self.ui_port,
+                reverse_proxy=self.reverse_proxy,
+                reverse_proxy_port=self.reverse_proxy_port,
+                reverse_proxy_config=self.reverse_proxy_config,
                 aux_dir=self.state_dir,
                 project=self.project,
             )
@@ -705,11 +828,19 @@ class ComposeBackend:
                 planned[self.state_dir / LITELLM_CONFIG_FILENAME] = (
                     rendered.litellm_config
                 )
+            if rendered.nginx_config is not None:
+                planned[self.state_dir / NGINX_CONFIG_FILENAME] = (
+                    rendered.nginx_config
+                )
             self._approve_changes(planned)  # may raise ConvergeAborted
 
             if rendered.litellm_config is not None:
                 (self.state_dir / LITELLM_CONFIG_FILENAME).write_text(
                     rendered.litellm_config
+                )
+            if rendered.nginx_config is not None:
+                (self.state_dir / NGINX_CONFIG_FILENAME).write_text(
+                    rendered.nginx_config
                 )
             self.compose_file.write_text(compose_text)
             self._save_sidecar(
@@ -775,6 +906,9 @@ class ComposeBackend:
         }
         if self.ui:
             info['ui_url'] = f'http://127.0.0.1:{self.ui_port}'
+        if self.reverse_proxy:
+            # The unified front door: one origin, UI at / and the API at /v1.
+            info['proxy_url'] = f'http://127.0.0.1:{self.reverse_proxy_port}'
         return info
 
     def _ensure_ollama_tag(

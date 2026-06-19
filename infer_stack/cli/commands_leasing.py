@@ -117,6 +117,28 @@ def _resolve_ui(config) -> bool:
     return _coerce_bool(get_setting('ui'), True)
 
 
+def _resolve_reverse_proxy(config) -> tuple[bool, int, str | None]:
+    """Resolve the reverse-proxy front door: (enabled, port, byo_config_path).
+
+    The ``reverse_proxy`` setting may be a bool (enable with defaults) or a
+    ``{enabled, port, config_path}`` block (via `config edit`); the
+    ``--reverse-proxy`` flag overrides the enabled bit.
+    """
+    from ..paths import get_setting
+
+    raw = get_setting('reverse_proxy')
+    block = raw if isinstance(raw, dict) else {}
+    flag = getattr(config, 'reverse_proxy', None)
+    if flag is not None:
+        enabled = bool(flag)
+    elif isinstance(raw, dict):
+        enabled = _coerce_bool(block.get('enabled'), False)
+    else:
+        enabled = _coerce_bool(raw, False)
+    port = int(block.get('port') or 80)
+    return enabled, port, block.get('config_path')
+
+
 def _resolve_skip_display(config) -> bool:
     """Whether to skip display-attached GPUs during placement.
 
@@ -158,12 +180,16 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'compose':
         from ..hardware import detect_inventory
 
+        rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
         return ComposeBackend(
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
             skip_display=_resolve_skip_display(config),
             ui=_resolve_ui(config),
+            reverse_proxy=rp_enabled,
+            reverse_proxy_port=rp_port,
+            reverse_proxy_config=rp_config,
             require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
         )
@@ -327,6 +353,8 @@ def _emit_acquire(config, controller, outcome) -> int:
         info = access(list(outcome.lease.endpoints)) if access else None
         if info and info.get('ui_url'):
             print(f'  open webui: {info["ui_url"]}')
+        if info and info.get('proxy_url'):
+            print(f'  front door: {info["proxy_url"]}  (UI: /   API: /v1)')
         if config.env_file:
             print(f'  env-file: {config.env_file}')
     return 2 if not_ready else 0
@@ -407,6 +435,15 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         help='Render a managed Open WebUI in front of the gateway (compose '
         'backend). On by default; use --no-ui to skip. Overrides '
         '`config set ui …`.',
+    )
+    reverse_proxy = scfg.Value(
+        None,
+        isflag=True,
+        alias=['reverse-proxy'],
+        help='Front the gateway + UI with a single-port HTTP reverse proxy, so '
+        'you hit one origin (UI at /, API at /v1) — off by default, no TLS/auth '
+        '(localhost / trusted networks only). Port + bring-your-own nginx.conf '
+        'live in the `reverse_proxy` setting (`config set` / `config edit`).',
     )
 
 

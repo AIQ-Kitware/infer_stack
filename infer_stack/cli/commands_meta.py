@@ -365,6 +365,13 @@ _SETTINGS: tuple[_Setting, ...] = (
         'default — every GPU is used; turn on to leave a monitor GPU free.',
         'bool', False,
     ),
+    _Setting(
+        'reverse_proxy', 'Front the stack with a single-port HTTP reverse proxy',
+        'Front the gateway + UI with one HTTP reverse proxy — UI at /, API at '
+        '/v1 (true | false, or a {enabled, port, config_path} block via '
+        '`config edit`). No TLS/auth — localhost / trusted networks only.',
+        'bool', False,
+    ),
 )
 
 # Keys the leasing world actually honors (others are allowed but warned about).
