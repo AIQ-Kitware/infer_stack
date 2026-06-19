@@ -219,6 +219,46 @@ class SqliteStore:
             ).fetchall()
         return [self._row_to_lease(r) for r in rows]
 
+    def prune(
+        self,
+        *,
+        lease_states: tuple[str, ...] = (),
+        group_states: tuple[str, ...] = (),
+    ) -> tuple[int, int]:
+        """Delete terminal leases/groups (and their claims) from the ledger.
+
+        Claims are removed first so the ``groups.id`` foreign key can't block a
+        group deletion; deleting leases also cascades their claims. Returns
+        ``(n_leases_deleted, n_groups_deleted)``.
+        """
+        n_leases = n_groups = 0
+        with self.transaction() as conn:
+            if lease_states:
+                lq = ','.join('?' for _ in lease_states)
+                conn.execute(
+                    f'DELETE FROM claims WHERE lease_id IN '
+                    f'(SELECT id FROM leases WHERE state IN ({lq}))',
+                    lease_states,
+                )
+            if group_states:
+                gq = ','.join('?' for _ in group_states)
+                conn.execute(
+                    f'DELETE FROM claims WHERE group_id IN '
+                    f'(SELECT id FROM groups WHERE state IN ({gq}))',
+                    group_states,
+                )
+            if lease_states:
+                lq = ','.join('?' for _ in lease_states)
+                n_leases = conn.execute(
+                    f'DELETE FROM leases WHERE state IN ({lq})', lease_states
+                ).rowcount
+            if group_states:
+                gq = ','.join('?' for _ in group_states)
+                n_groups = conn.execute(
+                    f'DELETE FROM groups WHERE state IN ({gq})', group_states
+                ).rowcount
+        return n_leases, n_groups
+
     def active_leases_past(self, now: float) -> list[Lease]:
         """Active leases whose TTL has elapsed (candidates for expiry)."""
         rows = self._conn.execute(

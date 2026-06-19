@@ -208,6 +208,20 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     nvidia-smi don't run when you can't see them. **Ctrl+click** a served
     endpoint (or `o`) opens it in Open WebUI (`/?models=<endpoint>`). The HTTP
     client is injectable for headless tests.
+  - TUI, fourth pass — pane-local clarity + housekeeping. The describe-everything
+    intro line is gone; each pane carries its own one-line description. The
+    bottom **console** is renamed **docker** and its **Status** tab is now
+    **Containers**; **System** and **API** are promoted to their own collapsed
+    panes (so they're only polled when you expand them). The **API** model
+    picker now lists *only models that are up and ready* (served by a running
+    group), not every catalog entry. New **Clean up** action (`x`, or the button
+    under leases/groups) forgets released/expired leases and stopped groups —
+    backed by a new `Ledger.prune()` / `SqliteStore.prune()`. Default theme is
+    now the stock **textual-dark** (the orange theme stays available from the
+    command palette).
+  - `Ledger.prune()` (+ `SqliteStore.prune()`): delete terminal ledger rows —
+    RELEASED/EXPIRED leases and STOPPED groups (and their claims) — for callers
+    that want to forget history rather than keep it inspectable.
   - Optional single-port HTTP reverse proxy (`reverse_proxy`). Enable it
     (`--reverse-proxy`, or `config set reverse_proxy true`) to front the gateway
     + Open WebUI with one nginx origin — UI at `/`, the OpenAI API at `/v1` — so

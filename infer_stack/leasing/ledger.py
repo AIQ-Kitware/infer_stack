@@ -229,6 +229,18 @@ class Ledger:
                 evicted.append(g.id)
         return evicted
 
+    def prune(self) -> tuple[int, int]:
+        """Forget terminal entries: released/expired leases + stopped groups.
+
+        Sweep/evict leave a tail of RELEASED/EXPIRED leases and STOPPED groups
+        in the ledger so history stays inspectable; this clears that tail once
+        you no longer care. Returns ``(n_leases, n_groups)`` removed.
+        """
+        return self.store.prune(
+            lease_states=(LeaseState.RELEASED, LeaseState.EXPIRED),
+            group_states=(GroupState.STOPPED,),
+        )
+
     def status(self) -> tuple[list[Lease], list[DeploymentGroup]]:
         """Snapshot for ``infer-stack status`` (leases, groups-with-demand)."""
         now = self.clock()

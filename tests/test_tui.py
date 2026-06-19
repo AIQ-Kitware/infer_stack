@@ -113,8 +113,8 @@ def test_tui_panes_are_keyboard_resizable():
     _run(scenario)
 
 
-def test_tui_has_docker_logs_and_ps_tabs():
-    from textual.widgets import DataTable, TabbedContent
+def test_tui_docker_pane_has_logs_and_containers_tabs():
+    from textual.widgets import Collapsible, DataTable, TabbedContent
 
     from infer_stack.tui import InferStackTUI
 
@@ -125,12 +125,16 @@ def test_tui_has_docker_logs_and_ps_tabs():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            tabs = app.query_one('#docker', TabbedContent)
+            # docker is a collapsible pane with Logs + Containers tabs; system
+            # and api are now their own (collapsed) panes.
+            tabs = app.query_one('#docker-tabs', TabbedContent)
             assert {p.id for p in tabs.query('TabPane')} == {
-                'tab-logs', 'tab-ps', 'tab-system', 'tab-api'
+                'tab-logs', 'tab-containers'
             }
-            # the ps table renders (empty -> a placeholder row) with the docker
-            # ps columns the user asked for (status/uptime, created, id).
+            assert app.query_one('#docker', Collapsible)
+            assert app.query_one('#system', Collapsible).collapsed
+            assert app.query_one('#api', Collapsible).collapsed
+            # the containers ps view carries the docker-ps columns
             ps = app.query_one('#ps', DataTable)
             labels = [str(c.label) for c in ps.columns.values()]
             assert 'status (uptime)' in labels
@@ -345,13 +349,17 @@ def test_tui_collapsed_console_skips_expensive_polling():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._active_tab = 'tab-ps'
-            app._console_collapsed = True
+            app._active_tab = 'tab-containers'
+            app._collapsed['docker'] = True
             assert 'ps' not in app._collect()          # collapsed -> no ps poll
-            app._console_collapsed = False
+            app._collapsed['docker'] = False
             assert 'ps' in app._collect()              # visible -> polled
             app._active_tab = 'tab-logs'
             assert 'ps' not in app._collect()          # other tab -> no ps poll
+            app._collapsed['system'] = True
+            assert 'gpus' not in app._collect()        # system collapsed
+            app._collapsed['system'] = False
+            assert 'gpus' in app._collect()            # system expanded -> polled
 
     _run(scenario)
 
@@ -404,7 +412,8 @@ def test_tui_api_tester_sends_via_injected_http():
         async with app.run_test() as pilot:
             await pilot.pause()
             controller.backend.litellm_port = 14042
-            # models from the catalog populate the API selector
+            # only ready (running) models are offered; simulate one being ready
+            app._sync_api_models(['qwen-coder'])
             assert app.query_one('#api-model', Select).value == 'qwen-coder'
             app.action_api_send()
             await app.workers.wait_for_complete()
@@ -413,6 +422,50 @@ def test_tui_api_tester_sends_via_injected_http():
 
     _run(scenario)
     assert http.calls and http.calls[0][0].endswith('/v1/chat/completions')
+
+
+def test_tui_api_lists_only_ready_models():
+    from textual.widgets import Select
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # NullBackend observes nothing running -> no ready models listed,
+            # even though the catalog has endpoints.
+            assert app._ready_endpoints == []
+            assert app.query_one('#api-model', Select).value is Select.NULL
+
+    _run(scenario)
+
+
+def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    # an active lease, then released -> it becomes a RELEASED tail entry
+    out = controller.acquire('bob', catalog.resolve_names(['qwen-coder']))
+    controller.release(out.lease.id)
+    leases, _ = controller.ledger.status()
+    assert any(str(le.state) == 'released' for le in leases)
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_cleanup()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert not any(str(le.state) == 'released' for le in leases)
 
 
 def test_tui_logs_stream_from_injected_source():

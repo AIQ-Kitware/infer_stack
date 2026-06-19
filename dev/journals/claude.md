@@ -1530,3 +1530,46 @@ gates polling — "don't poll what you can't see" falls out for free instead of
 being a second mechanism. (2) Any pane that hits the network or a subprocess
 needs an injection seam (proc_factory, http) or it's simply not testable
 headless; build it in from the first line, not after.
+
+## 2026-06-19 02:40:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Fourth TUI pass + a leasing-core
+addition. User asks: (1) API tab should list only up-and-ready models;
+(2) a way to clean up old released/evicted entries; (3) drop the global intro,
+make descriptions pane-local; (4) rename console→docker, the ps tab→"containers";
+(5) promote System and API to their own panes; and a late one: (6) default theme
+to stock "textual dark".
+
+Core add: `SqliteStore.prune(lease_states, group_states)` + `Ledger.prune()`
+(deletes RELEASED/EXPIRED leases and STOPPED groups, claims first to dodge the
+groups FK). This is the first ledger *deletion* path — sweep/evict only ever
+transitioned state, leaving a growing tail. Kept it explicit (prune, not
+auto-gc) so history stays inspectable until you choose to forget it; the TUI's
+Clean-up button is the first caller.
+
+"Ready" models: I define ready = endpoints served by a group that is *observed
+running* (g.id in the observe() set), computed in `_render` and pushed to the API
+selector. Cheap (reuses the placement view the groups table already needs) and
+matches the "running" column the user sees. Not a true vLLM readiness probe —
+documented as such; a container can be Up but still loading. Good enough for "let
+me poke a model that's actually there," and avoids per-refresh HTTP.
+
+Layout: System and API became their own `Collapsible` panes, collapsed by
+default — which doubles as the polling gate (`_collapsed` dict + `_active_tab`):
+nvidia-smi only runs when System is expanded, `docker ps` only when docker's
+Containers tab is visible. leases/groups got wrapped in bordered Verticals so
+each can hold a description + table + its own buttons.
+
+Sharp edge found + fixed: in Textual 8.2.7 the Select no-selection sentinel is
+`Select.NULL`, and `Select.BLANK` is literally `False` — so my `value is
+Select.BLANK` checks were always False (a latent bug, dormant only because the
+other Selects always carry a real value). Swapped all four to `Select.NULL`.
+Lesson candidate: don't assume a framework sentinel's name across versions —
+verify with a one-liner. 18 TUI tests (added: docker/containers tabs, ready-only
+API list, collapse-gates-system, cleanup-prunes-released), full suite 318 green,
+ruff clean.
+
+Uncertainties: same standing one — unverified on real hardware (System/API/ps
+need a live GPU + gateway). The ready-model definition may surprise someone who
+expects a just-served-but-still-loading model to be immediately queryable; the
+status line + "only ready models listed" desc set that expectation.
