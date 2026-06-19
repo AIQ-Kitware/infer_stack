@@ -20,7 +20,7 @@ from typing import Any
 
 from .models import DeploymentGroup, Lease
 
-SESSION_ENV = 'INFER_STACK_SESSION_ID'
+LEASE_ENV = 'INFER_STACK_LEASE_ID'
 
 
 def _request_model_name(payload: dict[str, Any], endpoint: str) -> str:
@@ -67,7 +67,7 @@ def build_descriptor(
     descriptor: dict[str, Any] = {
         'schema_version': 1,
         'kind': 'infer-stack-endpoint',
-        'session_id': lease.id,
+        'lease_id': lease.id,
         'base_url': base_url,
         'api_key_env': api_key_env,
         'protocol': 'openai',
@@ -83,7 +83,7 @@ def build_descriptor(
 
 def descriptor_env(descriptor: dict[str, Any]) -> dict[str, str]:
     """Flatten a descriptor into the env vars a job should see."""
-    env: dict[str, str] = {SESSION_ENV: descriptor['session_id']}
+    env: dict[str, str] = {LEASE_ENV: descriptor['lease_id']}
     if descriptor.get('base_url'):
         env['OPENAI_BASE_URL'] = descriptor['base_url']
     if descriptor.get('api_key'):
@@ -106,14 +106,14 @@ def render_env_file(descriptor: dict[str, Any]) -> str:
 
     Example:
         >>> from infer_stack.leasing.models import Lease, DeploymentGroup, GroupState
-        >>> lease = Lease('sess-1', 'me', 'active', 0.0, None, None, 0.0,
+        >>> lease = Lease('lease-1', 'me', 'active', 0.0, None, None, 0.0,
         ...     endpoints=['qwen-coder'])
         >>> grp = DeploymentGroup('g1', 'ck', 'vllm', 'shared-compatible', {},
         ...     {}, {'qwen-coder': {'served_model_name': 'qwen-coder'}},
         ...     GroupState.LIVE, 0.0, 0.0)
         >>> d = build_descriptor(lease, [grp], base_url='http://h:1/v1')
         >>> print(render_env_file(d), end='')
-        export INFER_STACK_SESSION_ID=sess-1
+        export INFER_STACK_LEASE_ID=lease-1
         export OPENAI_BASE_URL=http://h:1/v1
         export INFER_STACK_API_KEY_ENV=LITELLM_MASTER_KEY
         export INFER_STACK_ENDPOINT_QWEN_CODER=qwen-coder
@@ -125,13 +125,13 @@ def render_env_file(descriptor: dict[str, Any]) -> str:
     )
 
 
-def read_session_id(env_file: str | Path) -> str | None:
-    """Recover the session id from a previously written env-file."""
-    prefix = f'export {SESSION_ENV}='
+def read_lease_id(env_file: str | Path) -> str | None:
+    """Recover the lease id from a previously written env-file."""
+    prefix = f'export {LEASE_ENV}='
     for line in Path(env_file).expanduser().read_text().splitlines():
         line = line.strip()
         if line.startswith(prefix):
             return line[len(prefix):].strip().strip('"').strip("'")
-        if line.startswith(f'{SESSION_ENV}='):
+        if line.startswith(f'{LEASE_ENV}='):
             return line.split('=', 1)[1].strip().strip('"').strip("'")
     return None

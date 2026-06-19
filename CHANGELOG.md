@@ -4,6 +4,15 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Version 0.7.0] - Unreleased
 
+### Changed (breaking)
+* Renamed the lease identifier **`session_id` → `lease_id`** everywhere (the
+  object is a `Lease`; the dual vocabulary was confusing). This is a hard rename:
+  the env-file key is now `INFER_STACK_LEASE_ID` (was `INFER_STACK_SESSION_ID`),
+  the `release`/`renew` positional/flag is `--lease` (was `--session`), JSON
+  output uses `lease_id`, `read_session_id()` → `read_lease_id()`, and generated
+  lease ids are prefixed `lease-` (was `sess-`). Update any scripts that sourced
+  the old env var or parsed `session_id`.
+
 ### Added
 * Begin the leasing/controller redesign (see
   `dev/infer-stack-redesign-critique.md` in the aiq-eval-runner repo). New

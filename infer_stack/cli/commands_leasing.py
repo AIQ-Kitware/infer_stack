@@ -43,7 +43,7 @@ from ..leasing import (
 from ..leasing.envfile import (
     build_descriptor,
     descriptor_env,
-    read_session_id,
+    read_lease_id,
     render_env_file,
 )
 from ..paths import config_root, data_root
@@ -246,10 +246,10 @@ def _resolve(catalog, names, *, sharing=None):
         raise SystemExit(str(ex))
 
 
-def _resolve_session(config) -> str | None:
-    sid = getattr(config, 'session', None)
+def _resolve_lease(config) -> str | None:
+    sid = getattr(config, 'lease', None)
     if not sid and getattr(config, 'env_file', None):
-        sid = read_session_id(config.env_file)
+        sid = read_lease_id(config.env_file)
     return sid
 
 
@@ -300,7 +300,7 @@ def _emit_staged(config, controller, outcome) -> int:
     assignments = outcome.reconcile.assignments
     if config.json:
         print(json.dumps({
-            'session_id': outcome.lease.id,
+            'lease_id': outcome.lease.id,
             'owner': outcome.lease.owner,
             'applied': False,
             'descriptor': descriptor,
@@ -344,7 +344,7 @@ def _emit_acquire(config, controller, outcome) -> int:
         print(
             json.dumps(
                 {
-                    'session_id': outcome.lease.id,
+                    'lease_id': outcome.lease.id,
                     'owner': outcome.lease.owner,
                     'descriptor': descriptor,
                     'realized': outcome.reconcile.realized,
@@ -527,7 +527,7 @@ class AcquireCLI(_AcquireFlagsMixin):
     protects its models while held, and once it expires (or is released) nothing
     else needs them they can be reclaimed. This is the programmatic seam — write
     a sourceable endpoint env-file with ``--env-file`` and release by that file
-    or session id when done. (For a one-shot "acquire, run a command, release",
+    or lease id when done. (For a one-shot "acquire, run a command, release",
     use ``infer-stack run`` instead.)
     """
 
@@ -732,11 +732,11 @@ class ReleaseCLI(_ApprovalMixin):
 
     __command__ = 'release'
 
-    session = scfg.Value(
-        None, position=1, type=str, help='Session id (or use --env-file).'
+    lease = scfg.Value(
+        None, position=1, type=str, help='Lease id (or use --env-file).'
     )
     env_file = scfg.Value(
-        None, type=str, help='Read the session id from this env-file.'
+        None, type=str, help='Read the lease id from this env-file.'
     )
     all = scfg.Value(
         False, isflag=True,
@@ -757,8 +757,8 @@ class ReleaseCLI(_ApprovalMixin):
         controller = _open_controller(config, interactive=True)
 
         if config.all:
-            if config.session or config.env_file:
-                raise SystemExit('release: --all takes no session/--env-file')
+            if config.lease or config.env_file:
+                raise SystemExit('release: --all takes no lease/--env-file')
             controller.ledger.sweep()
             leases, _ = controller.ledger.status()
             released = [le.id for le in leases if le.state == LeaseState.ACTIVE]
@@ -768,10 +768,10 @@ class ReleaseCLI(_ApprovalMixin):
             if config.evict:
                 evicted = controller.ledger.evict_idle(None)  # every idle group
         else:
-            sid = _resolve_session(config)
+            sid = _resolve_lease(config)
             if not sid:
                 raise SystemExit(
-                    'release: give a session id, --env-file, or --all'
+                    'release: give a lease id, --env-file, or --all'
                 )
             rel = controller.ledger.release(sid)
             released = [sid]
@@ -1005,7 +1005,7 @@ class RenewCLI(_LeasingCommonMixin):
 
     __command__ = 'renew'
 
-    session = scfg.Value(None, position=1, type=str, help='Session id.')
+    lease = scfg.Value(None, position=1, type=str, help='Lease id.')
     env_file = scfg.Value(None, type=str)
     ttl = scfg.Value(None, type=str, help='New soft TTL (e.g. 2h); empty=infinite.')
 
@@ -1013,9 +1013,9 @@ class RenewCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        sid = _resolve_session(config)
+        sid = _resolve_lease(config)
         if not sid:
-            raise SystemExit('renew: give a session id or --env-file')
+            raise SystemExit('renew: give a lease id or --env-file')
         lease = controller.ledger.renew(
             sid, ttl_seconds=_parse_duration(config.ttl)
         )

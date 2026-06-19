@@ -62,7 +62,7 @@ def test_acquire_writes_env_file(env):
     )
     assert rc == 0
     text = envf.read_text()
-    assert 'INFER_STACK_SESSION_ID=sess-' in text
+    assert 'INFER_STACK_LEASE_ID=lease-' in text
     assert 'OPENAI_BASE_URL=http://x:1/v1' in text
     assert 'INFER_STACK_ENDPOINT_QWEN_CODER=qwen-coder' in text
     assert 'INFER_STACK_API_KEY_ENV=LITELLM_MASTER_KEY' in text
@@ -180,7 +180,7 @@ def test_serve_no_apply_stages_without_applying(env, capsys):
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
     assert data['applied'] is False                   # staged, not brought up
-    assert data['session_id'].startswith('sess-')
+    assert data['lease_id'].startswith('lease-')
     # the lease is recorded (staged intent), so it shows up in `leases`...
     ls = _leases_json(env, capsys)
     assert ls['leases'][0]['state'] == 'active'

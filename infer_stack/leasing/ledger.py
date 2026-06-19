@@ -128,7 +128,7 @@ class Ledger:
         legacy ``switch <profile>`` maps onto.
         """
         now = self.clock()
-        lease_id = self.id_factory('sess')
+        lease_id = self.id_factory('lease')
         expires_at = None if ttl_seconds is None else now + ttl_seconds
         group_ids: list[str] = []
         with self.store.transaction():

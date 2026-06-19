@@ -142,7 +142,7 @@ infer-stack leases --json
 cat /tmp/is.env
 infer-stack release --env-file /tmp/is.env
 ```
-Expect: JSON with a session id, one active lease / one live group (demand 1),
+Expect: JSON with a lease id, one active lease / one live group (demand 1),
 env-file with `INFER_STACK_ENDPOINT_QWEN_SMALL=qwen-small`, clean release. No
 containers (null backend).
 

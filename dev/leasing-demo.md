@@ -290,10 +290,10 @@ comfortably at `--gpu-mem 0.4`.
 > `--no-wait`, and `wait` re-blocks later.
 
 Drop a standing service when you're done. A `serve` lease has no env-file, so
-release it by its session id (copy it from `leases`):
+release it by its lease id (copy it from `leases`):
 
 ```bash
-infer-stack leases          # note the session id of the lease to drop
+infer-stack leases          # note the lease id of the lease to drop
 infer-stack release <SESSION_ID>
 # smol17b-1 is reclaim:keep-warm (stays resident); smol135-1 is reclaim:stop
 # (its container is torn down once no lease protects it).
@@ -360,7 +360,7 @@ The earlier draft of this demo flagged five ergonomic smells; building the
 Still open (tracked in `dev/leasing-followups.md`):
 
 - **No endpoint-addressed teardown for standing services.** Stopping a `serve`
-  means copying a session id out of `infer-stack leases`. Want
+  means copying a lease id out of `infer-stack leases`. Want
   `infer-stack release --endpoint smol17b-1` / `unserve smol17b-1`. (`evict
   smol17b-1` already tears the deployment down, but doesn't release the lease.)
 
