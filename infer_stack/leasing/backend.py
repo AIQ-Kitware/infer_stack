@@ -36,6 +36,25 @@ class ConvergeAborted(Exception):
     """
 
 
+class PlacementError(Exception):
+    """An ``acquire``/``serve`` requested a group the backend could not place.
+
+    Raised by the controller when reconcile leaves one of the just-requested
+    groups unplaced (e.g. no free GPU). Like :class:`ConvergeAborted`, the
+    controller rolls back the just-created lease before raising, so a request
+    that cannot be satisfied does not linger as a phantom ``live`` group with no
+    container behind it. ``reasons`` carries the planner's per-group messages.
+    """
+
+    def __init__(self, group_ids, reasons):
+        self.group_ids = list(group_ids)
+        self.reasons = list(reasons)
+        super().__init__(
+            '; '.join(self.reasons)
+            or f'could not place: {", ".join(self.group_ids)}'
+        )
+
+
 @runtime_checkable
 class Backend(Protocol):
     """What the :class:`Controller` needs from a serving backend.

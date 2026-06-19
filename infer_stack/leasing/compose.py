@@ -30,6 +30,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -63,6 +64,32 @@ VLLM_DEFAULTS = {
 
 GROUP_LABEL = 'infer-stack.group'
 ENGINE_LABEL = 'infer-stack.engine'
+
+
+def _dns_slug(text: str) -> str:
+    """A lowercase ``[a-z0-9-]`` label safe as a compose service/DNS name."""
+    out = re.sub(r'[^a-z0-9]+', '-', str(text).lower()).strip('-')
+    return out or 'model'
+
+
+def vllm_service_name(group: DeploymentGroup) -> str:
+    """Compose service name for a vLLM group: ``vllm-<model>-<group-id>``.
+
+    A vLLM group is exactly one model in one container (possibly across several
+    GPUs), so we lead the service name with the served model name — the alias
+    the user chose, also vLLM's ``--served-model-name`` and the Open WebUI label
+    — to make ``docker ps`` / ``nvidia-smi`` legible *without* infer-stack. The
+    full group id is kept as a suffix so the name is unique (two desired groups
+    can share a served name, e.g. an endpoint re-pointed at a new model) and so
+    it correlates 1:1 with the ``id`` column of ``infer-stack leases``.
+
+    The service name is also the on-network DNS host LiteLLM routes to, so
+    :func:`_litellm_model_list` must derive the upstream from this same helper.
+    """
+    served = group.spec.get('served_model_name') or (
+        sorted(group.served)[0] if group.served else group.id
+    )
+    return f'vllm-{_dns_slug(served)}-{group.id}'
 
 
 @dataclass
@@ -198,7 +225,7 @@ def _litellm_model_list(
             continue
         if group.engine == 'vllm':
             served = group.spec.get('served_model_name') or group.id
-            api_base = f'http://vllm-{group.id}:8000/v1'
+            api_base = f'http://{vllm_service_name(group)}:8000/v1'
             for endpoint in sorted(group.served):
                 entries.append(
                     {
@@ -329,6 +356,7 @@ def render_compose(
     ui: bool = False,
     ui_port: int = 13000,
     aux_dir: str | Path | None = None,
+    project: str = LEASING_PROJECT,
 ) -> RenderedCompose:
     """Render a compose project for the placed groups.
 
@@ -336,6 +364,13 @@ def render_compose(
     ``litellm`` is set, a front-door service + config is added so every endpoint
     alias is reachable at one ``base_url``. When ``ui`` is also set, a managed
     Open WebUI is rendered in front of that gateway.
+
+    The project name is baked into the file as a top-level ``name:`` so a plain
+    ``docker compose -f docker-compose.yml up`` (infer-stack not involved) lands
+    in the *same* project — same container names, same network — as
+    ``infer-stack``'s own ``-p`` invocations. That makes "drop the tool and run
+    docker yourself" a true equivalent of ``apply`` rather than a sibling
+    project the tool can no longer see.
     """
     services: dict[str, Any] = {}
     service_map: dict[str, str] = {}
@@ -347,7 +382,7 @@ def render_compose(
             continue
         gpus = assignments[group.id]
         if group.engine == 'vllm':
-            name = f'vllm-{group.id}'
+            name = vllm_service_name(group)
             port = VLLM_HOST_PORT_BASE + vllm_i
             vllm_i += 1
             services[name] = _vllm_service(group, gpus, port, images, state)
@@ -400,7 +435,7 @@ def render_compose(
                 ui_port, images, state, litellm_master_key
             )
     return RenderedCompose(
-        compose={'services': services},
+        compose={'name': project, 'services': services},
         services=service_map,
         litellm_config=litellm_config,
     )
@@ -489,6 +524,8 @@ class ComposeBackend:
         self.require_generation = require_generation
         self.assume_yes = assume_yes
         self.last_errors: list[str] = []
+        self.last_unplaced: set[str] = set()  # desired group ids placement skipped
+        self.last_assignments: dict[str, list[int]] = {}  # group id -> GPU ids
         self._pulled: set[str] = set()  # (group:tag) pulled this process
 
     @property
@@ -591,8 +628,35 @@ class ComposeBackend:
         ):
             raise ConvergeAborted('compose changes were not approved')
 
-    def converge(self, desired: list[DeploymentGroup]):
-        """Place, render, and ``docker compose up`` the desired union."""
+    def plan(self, desired: list[DeploymentGroup]):
+        """Compute GPU placement for ``desired`` without writing or applying.
+
+        Read-only and side-effect free: it honors the persisted pins, so the
+        result reflects where groups are (for running ones) or *would* be (for
+        not-yet-started ones) placed. ``leases`` uses it to show actual/slated
+        GPUs; ``converge`` uses it as the first step of render.
+        """
+        pinned = self._load_sidecar().get('assignments', {})
+        return plan_placement(
+            list(desired),
+            self.inventory,
+            allowed_gpus=self.allowed_gpus,
+            reserved=self.reserved,
+            pinned=pinned,
+            skip_display=self.skip_display,
+        )
+
+    def converge(self, desired: list[DeploymentGroup], *, apply: bool = True):
+        """Place + render the desired union, then optionally apply it.
+
+        The work splits into *render* (decide placement, write the
+        ``docker-compose.yml`` / LiteLLM config / placement sidecar to the state
+        dir) and *apply* (``docker compose up -d`` / ``down``). With
+        ``apply=False`` only the render half runs, so the on-disk project shows
+        exactly what *would* execute — inspect it, or bring it up yourself
+        (``infer-stack apply``). Either way the placement plan is returned and
+        ``last_errors`` / ``last_unplaced`` / ``last_assignments`` are updated.
+        """
         from .._log import logger
 
         desired = list(desired)
@@ -602,16 +666,12 @@ class ComposeBackend:
                 len(desired),
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            pinned = self._load_sidecar().get('assignments', {})
-            plan = plan_placement(
-                desired,
-                self.inventory,
-                allowed_gpus=self.allowed_gpus,
-                reserved=self.reserved,
-                pinned=pinned,
-                skip_display=self.skip_display,
-            )
+            plan = self.plan(desired)
             self.last_errors = plan.errors
+            self.last_unplaced = {
+                g.id for g in desired if g.id not in plan.assignments
+            }
+            self.last_assignments = dict(plan.assignments)
             for gid, gpus in sorted(plan.assignments.items()):
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
             for err in plan.errors:
@@ -628,6 +688,7 @@ class ComposeBackend:
                 ui=self.ui,
                 ui_port=self.ui_port,
                 aux_dir=self.state_dir,
+                project=self.project,
             )
 
             compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
@@ -647,6 +708,13 @@ class ComposeBackend:
                 {'assignments': plan.assignments, 'services': rendered.services}
             )
             services = rendered.compose.get('services')
+            if not apply:
+                logger.info(
+                    'rendered {} service(s) to {} (not applied; '
+                    '`infer-stack apply` to bring it up)',
+                    len(services or {}), self.compose_file,
+                )
+                return plan
             if services:
                 logger.info(
                     'docker compose up -d ({} service(s): {})',

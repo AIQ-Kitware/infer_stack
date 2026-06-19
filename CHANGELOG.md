@@ -137,6 +137,41 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     converges them away.
   - `infer-stack leases` is rich-formatted on a terminal (lease/group tables
     with state colors); piped/`--json` output is unchanged.
+  - `infer-stack leases` now shows **actual vs desired**, not just the ledger's
+    intent. Each group gains a `running` column (from `backend.observe()` — what
+    docker actually has up) and a `gpus` column (which GPU indices it is on, or
+    `→N` *slated* for a desired-but-not-yet-started group). So a `state=live` /
+    `running=—` row reads as "wanted, not up yet" (starting, staged, or
+    unplaceable) instead of looking like a phantom. Both fields are in `--json`.
+    Best-effort: a dry-run/docker-less host degrades to "unknown" rather than
+    erroring.
+  - Render and apply are now separate verbs, with `serve`/`acquire` as the
+    combined "declare + render + apply + wait". `infer-stack render` writes the
+    on-disk compose project (+ GPU placement) for the current desired set
+    **without** `docker compose up`; `infer-stack apply` brings the desired set
+    up (idempotent; re-renders from intent first). Both are **lease-free** — the
+    duplicate-lease trap from staging-then-re-serving is gone because applying a
+    staged lease no longer goes through a declare verb (so the refcount only
+    climbs when you genuinely declare again). Declares refcount
+    (`acquire`/`serve`); reconciles are idempotent (`render`/`apply`).
+    `serve|acquire --no-apply` *stages*: declare the lease + render, skip the up
+    (and the wait + diff prompt); `release` discards it. Placement still runs at
+    render time, so an unplaceable request fails fast either way. Fits the
+    existing ledger→controller→backend split: `converge(desired, apply=False)`
+    is the render half, `ComposeBackend.plan()` exposes read-only placement (also
+    what `leases`' `gpus` column uses).
+  - The rendered compose carries a top-level `name: infer-stack`, so a plain
+    `docker compose -f docker-compose.yml up -d` (infer-stack not involved)
+    lands in the *same* project — same container names, same network — as the
+    tool's own `-p` invocations. "Drop infer-stack and run docker yourself" is
+    now an exact equivalent of `apply` rather than a sibling project the tool
+    can no longer see. (`infer-stack stack up` remains the raw "run the on-disk
+    file verbatim" hatch, vs `apply` which re-renders from intent.)
+  - Better `--help`. Expanded the leasing verbs' docstrings (rendered as the
+    argparse description) and added `__epilog__` examples to `serve` and
+    `leases` plus a quickstart + mental-model epilog on the top-level
+    `infer-stack --help` (catalog → serve/acquire → reconcile; render vs apply;
+    desired vs running). The `leases` help now documents each group column.
   - Compose changes are now shown before they're applied. On a terminal,
     `serve`/`acquire` render a diff of the compose project (and LiteLLM routing)
     they're about to write and ask to confirm — restoring the legacy
@@ -259,8 +294,35 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   a test that runs `docker compose config -q` on the rendered project (skipped
   where docker compose is unavailable) — it validates the artifact's schema, not
   just the dict we build.
+* `acquire`/`serve` now fail fast when a requested model can't be placed,
+  instead of hanging on readiness forever. Previously, if every GPU was already
+  taken (e.g. one model already serving on the only free GPU), serving a second
+  model placed *nothing* for it — placement was a silent `WARNING` — yet the
+  ledger had already marked the new group `LIVE`, so `infer-stack leases` showed
+  a phantom "live" group with no container behind it, the compose diff was empty
+  (nothing to approve, hence no prompt), and `serve` blocked on a readiness
+  probe for a container that would never start until Ctrl-C. The controller now
+  detects that a just-requested group landed unplaced, rolls the lease back
+  (matching the diff-declined path) and raises `PlacementError`; the CLI prints
+  the planner's reason ("need 1 GPUs but only 0 available") plus how to free a
+  GPU (`leases` → `release`/`evict`) or use a display GPU
+  (`--include-display-gpus`). Found running the `dev/leasing-demo.md` walkthrough
+  on yardrat (two models, one free GPU).
 
 ### Changed
+* vLLM compose service/container names now lead with the served model:
+  `vllm-<model>-<group-id>` (e.g. `infer-stack-vllm-qwen05-1-grp-098e…`) instead
+  of the opaque `vllm-grp-098e…`. A vLLM group is exactly one model in one
+  container, so `docker ps` / `nvidia-smi` are now legible *without* infer-stack
+  — a stated goal: you can drop the tool and the running stack still makes sense.
+  The full group id is kept as a suffix so the name stays unique (two desired
+  groups can share a served name when an endpoint is re-pointed at a new model)
+  and correlates 1:1 with the `id` column of `infer-stack leases`. The name is
+  also LiteLLM's on-network upstream host, so it is slugified to a DNS-safe
+  `[a-z0-9-]` label and derived from one helper used by both the service key and
+  the routing config. Ollama daemons keep their group-id name (one daemon can
+  host several models, so a model-led name would mislead). Upgrading recreates
+  already-running vLLM containers once (the service key changes).
 * Consolidate shared machinery so the legacy and leasing code paths reuse one
   implementation instead of duplicating it:
   - GPU-pool placement primitives (`available_gpu_indices` / `first_fit` /

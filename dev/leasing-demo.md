@@ -26,8 +26,8 @@ Run `infer-stack help tree` any time to see the whole command surface.
 ### 1a. Choose where docker-mounted state lives, and the default backend
 
 The vLLM containers bind-mount a Hugging Face weight cache (a few GiB for these
-SmolLM2 models; tens of GiB for a large model). That cache + Open WebUI history
-live under your data dir. Persist it once — no shell export needed afterward —
+small SmolLM2 / Qwen models; tens of GiB for a large model). That cache + Open
+WebUI history live under your data dir. Persist it once — no shell export needed afterward —
 and set Compose as the default backend so you never repeat `--backend`:
 
 ```bash
@@ -52,8 +52,13 @@ No YAML by hand — the `catalog` editor validates as it writes:
 
 ```bash
 infer-stack catalog init
+# Two from the SmolLM2 family...
 infer-stack catalog model add smol17b --source hf://HuggingFaceTB/SmolLM2-1.7B-Instruct
 infer-stack catalog model add smol135 --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
+# ...and two from the Qwen family, so the catalog spans more than one model
+# lineage and you can run them side by side (see §5):
+infer-stack catalog model add qwen15 --source hf://Qwen/Qwen2.5-1.5B-Instruct
+infer-stack catalog model add qwen05 --source hf://Qwen/Qwen2.5-0.5B-Instruct
 # Omit the endpoint NAME and it defaults to the model, so what you serve and see
 # in Open WebUI *is* the model (Turing => --dtype=half). The main one is kept warm:
 infer-stack catalog endpoint add --model smol17b \
@@ -61,13 +66,19 @@ infer-stack catalog endpoint add --model smol17b \
 # the small one frees its GPU on release:
 infer-stack catalog endpoint add --model smol135 \
     --max-model-len 4096 --gpu-mem 0.2 --extra-args='--dtype=half' --reclaim stop
+# the two Qwen endpoints, both reclaim:stop (they free their GPU on release):
+infer-stack catalog endpoint add --model qwen15 \
+    --max-model-len 8192 --gpu-mem 0.4 --extra-args='--dtype=half' --reclaim stop
+infer-stack catalog endpoint add --model qwen05 \
+    --max-model-len 4096 --gpu-mem 0.2 --extra-args='--dtype=half' --reclaim stop
 infer-stack catalog show
 ```
 
-A defaulted name gets an auto-incrementing `-N` suffix, so this gives two
-endpoints named after their models — **`smol17b-1`** and **`smol135-1`** — which
-is what we use throughout. (Add another `--model smol17b` endpoint and it becomes
-`smol17b-2`, never clobbering the first.) `infer-stack catalog show` lists them.
+A defaulted name gets an auto-incrementing `-N` suffix, so this gives four
+endpoints named after their models — **`smol17b-1`** / **`smol135-1`** (SmolLM2)
+and **`qwen15-1`** / **`qwen05-1`** (Qwen) — which is what we use throughout. (Add
+another `--model smol17b` endpoint and it becomes `smol17b-2`, never clobbering
+the first.) `infer-stack catalog show` lists them.
 
 **Or name endpoints explicitly.** Give a NAME positional when you want a stable
 alias *decoupled* from the model — e.g. a `chat` you later re-point at a
@@ -113,13 +124,40 @@ infer-stack serve smol17b-1 --require-generation --timeout 1200
 #   open webui: http://127.0.0.1:13000
 ```
 
+**Prefer to look before you leap?** `serve` does two things — *render* the
+on-disk compose project, then *apply* it (`docker compose up`). They're separate
+verbs: `serve … --no-apply` stages (declares the lease + writes the compose file
++ computes GPU placement, but starts nothing), and `infer-stack apply` is the
+trigger. So you can read exactly what would run before committing:
+
+```bash
+infer-stack serve smol17b-1 --no-apply      # stage: writes the project, no `up`
+#   smol17b-1: GPU 0  (grp-…)
+#   compose: …/leasing/compose/docker-compose.yml
+cat "$(infer-stack config get data_dir)"/leasing/compose/docker-compose.yml  # inspect
+infer-stack apply                           # bring the staged set up (the trigger)
+infer-stack wait smol17b-1 --require-generation   # then block until ready
+# (change your mind instead? `infer-stack release --all` discards the staged lease.)
+```
+
+The compose file carries `name: infer-stack`, so if you'd rather drop the tool
+entirely, `docker compose -f <that file> up -d` brings up the **same** project —
+identical container names and network to what `infer-stack apply` would do.
+`infer-stack render` (lease-free) just re-writes that file for whatever's
+currently declared, without starting anything.
+
 Watch it come up from another shell:
 
 ```bash
-infer-stack leases          # one live group, one standing (manual) lease
+infer-stack leases          # leases + groups: state (desired) vs running, and GPUs
 infer-stack stack ps        # vllm-… + litellm + open-webui  (alias: infer-stack ps)
 infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stack logs -f)
 ```
+
+`leases` now shows the **groups** table with both what the ledger *wants*
+(`state`) and what's *actually up* (`running`), plus the GPUs each model is on
+(or `→N` for one that's slated but not started yet) — so it's obvious when
+something is still warming up vs truly live.
 
 ---
 
@@ -186,16 +224,22 @@ infer-stack test smol135-1    # confirm the new model serves
 Both models now show in Open WebUI by name (`smol17b-1`, `smol135-1`); the UI
 container itself is untouched by the change.
 
-**Bring several up in parallel.** `serve` blocks until ready by default; pass
-`--no-wait` to kick a deployment off and return immediately, then `wait` for
-them together (so two models load at once instead of back-to-back):
+**Bring several up in parallel — across families.** `serve` blocks until ready
+by default; pass `--no-wait` to kick a deployment off and return immediately,
+then `wait` for them together (so models load at once instead of back-to-back).
+Here we fan out a SmolLM2 and a Qwen endpoint so both lineages serve side by side:
 
 ```bash
-infer-stack serve smol17b-1 --no-wait --yes
-infer-stack serve smol135-1 --no-wait --yes
-infer-stack wait smol17b-1 smol135-1 --require-generation --timeout 1200
+infer-stack serve smol17b-1 --no-wait --yes   # SmolLM2 family
+infer-stack serve qwen15-1   --no-wait --yes   # Qwen family
+infer-stack wait smol17b-1 qwen15-1 --require-generation --timeout 1200
 # (bare `infer-stack wait` waits for every live model)
+infer-stack test qwen15-1                       # confirm the Qwen endpoint serves
 ```
+
+Open WebUI's picker now lists both `smol17b-1` and `qwen15-1`, so you can A/B the
+two families from the same UI — pick GPUs and `--gpu-mem` so the resident set
+fits (yardrat's 48 GiB GPU 0 holds these small models comfortably).
 
 > `--require-generation` is the readiness *criterion* (ready == a real generated
 > token, not just a listed model); `--no-wait` / `wait` are the *blocking*

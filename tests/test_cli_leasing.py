@@ -174,6 +174,58 @@ def test_wait_unknown_endpoint_errors(env):
         WaitCLI.main(argv=['ghost', '--ledger', env.db])   # nothing serving it
 
 
+def test_serve_no_apply_stages_without_applying(env, capsys):
+    capsys.readouterr()
+    rc = ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-apply', '--json'])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data['applied'] is False                   # staged, not brought up
+    assert data['session_id'].startswith('sess-')
+    # the lease is recorded (staged intent), so it shows up in `leases`...
+    ls = _leases_json(env, capsys)
+    assert ls['leases'][0]['state'] == 'active'
+    # ...and can be discarded
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    assert _leases_json(env, capsys)['leases'][0]['state'] == 'released'
+
+
+def test_render_and_apply_are_lease_free(env, capsys):
+    from infer_stack.cli.commands_leasing import ApplyCLI, RenderCLI
+
+    # declare intent without applying, then the lease-free verbs operate on it
+    ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-apply'])
+    before = len(_leases_json(env, capsys)['leases'])
+    assert RenderCLI.main(argv=['--ledger', env.db]) == 0   # render: no `up`
+    assert ApplyCLI.main(argv=['--ledger', env.db]) == 0    # apply: brings up
+    after = _leases_json(env, capsys)
+    # neither render nor apply minted a lease — still exactly one
+    assert len(after['leases']) == before == 1
+
+
+def test_leases_reports_running_and_gpus(env, capsys):
+    # NullBackend serves nothing, so a leased group is desired-live but not
+    # actually running and has no GPU assignment — the view must say so.
+    ServeCLI.main(argv=['qwen-coder', *_base(env)])
+    data = _leases_json(env, capsys)
+    g = data['groups'][0]
+    assert g['state'] == 'live'        # desired (ledger)
+    assert g['running'] is False       # actual (backend.observe)
+    assert g['gpus'] is None           # no placement on the dry-run backend
+
+
+def test_leases_gpu_and_running_labels():
+    from infer_stack.cli.commands_leasing import _gpu_label, _running_label
+
+    observed = {'g1'}
+    assignments = {'g1': [0, 1], 'g2': [2], 'g3': []}
+    assert _running_label('g1', observed) == 'running'
+    assert _running_label('g2', observed) == '—'
+    assert _gpu_label('g1', observed, assignments) == '0,1'   # on these GPUs
+    assert _gpu_label('g2', observed, assignments) == '→2'    # slated, not up
+    assert _gpu_label('g3', observed, assignments) == '→cpu'  # cpu, slated
+    assert _gpu_label('gX', observed, assignments) == '-'     # unknown
+
+
 def test_renew_extends(env):
     envf = env.tmp / 'is.env'
     AcquireCLI.main(

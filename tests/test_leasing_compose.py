@@ -24,6 +24,7 @@ from infer_stack.leasing import (
     plan_placement,
     render_compose,
 )
+from infer_stack.leasing.compose import vllm_service_name
 from infer_stack.leasing.models import DeploymentGroup, GroupState
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
@@ -121,12 +122,16 @@ class FakeHttp:
 
 
 def test_render_vllm_service():
+    group = vllm('grp-a', hf='Qwen/Q', served='qwen', tp=2)
     rc = render_compose(
-        [vllm('grp-a', hf='Qwen/Q', served='qwen', tp=2)],
+        [group],
         {'grp-a': [0, 1]},
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    svc = rc.compose['services']['vllm-grp-a']
+    # service name leads with the served model, suffixed by the group id
+    name = vllm_service_name(group)
+    assert name == 'vllm-qwen-grp-a'
+    svc = rc.compose['services'][name]
     assert svc['image'] == 'vllm/vllm-openai:test'
     assert svc['command'][0] == 'Qwen/Q'
     assert '--tensor-parallel-size=2' in svc['command']
@@ -137,17 +142,18 @@ def test_render_vllm_service():
     # Compose schema: capabilities is a list of *strings* (not [["gpu"]]).
     assert devs['capabilities'] == ['gpu']
     assert svc['labels']['infer-stack.group'] == 'grp-a'
-    assert rc.services == {'vllm-grp-a': 'grp-a'}
+    assert rc.services == {name: 'grp-a'}
 
 
 def test_render_two_vllm_distinct_ports():
+    a, b = vllm('a', served='aa', t=0), vllm('b', served='bb', t=1)
     rc = render_compose(
-        [vllm('a', t=0), vllm('b', t=1)],
+        [a, b],
         {'a': [0], 'b': [1]},
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    assert rc.compose['services']['vllm-a']['ports'] == ['18000:8000']
-    assert rc.compose['services']['vllm-b']['ports'] == ['18001:8000']
+    assert rc.compose['services'][vllm_service_name(a)]['ports'] == ['18000:8000']
+    assert rc.compose['services'][vllm_service_name(b)]['ports'] == ['18001:8000']
 
 
 def test_render_ollama_service():
@@ -163,11 +169,40 @@ def test_render_ollama_service():
 
 
 def test_render_skips_unplaced_groups():
+    a, b = vllm('a', served='aa'), vllm('b', served='bb')
     rc = render_compose(
-        [vllm('a'), vllm('b')], {'a': [0]},  # b not placed
+        [a, b], {'a': [0]},  # b not placed
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    assert set(rc.compose['services']) == {'vllm-a'}
+    assert set(rc.compose['services']) == {vllm_service_name(a)}
+
+
+def test_render_bakes_project_name():
+    # a top-level `name:` makes a plain `docker compose -f file up` (no -p) land
+    # in the same project infer-stack uses, so the manual path == apply.
+    rc = render_compose(
+        [vllm('grp-a', served='qwen')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert rc.compose['name'] == 'infer-stack'   # default project
+    rc2 = render_compose(
+        [vllm('grp-a', served='qwen')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE, project='custom-proj',
+    )
+    assert rc2.compose['name'] == 'custom-proj'
+
+
+def test_vllm_service_name_is_model_led_and_dns_safe():
+    import re as _re
+
+    g = vllm('grp-098ed1', hf='Qwen/Qwen2.5-0.5B-Instruct', served='Qwen2.5-0.5B')
+    name = vllm_service_name(g)
+    # leads with the served model (slugified), suffixed by the full group id so
+    # it is unique and correlates with `infer-stack leases`
+    assert name == 'vllm-qwen2-5-0-5b-grp-098ed1'
+    # usable as a compose service *and* an on-network DNS host (LiteLLM routes
+    # to it), so it must be lowercase [a-z0-9-]
+    assert _re.fullmatch(r'[a-z0-9-]+', name)
 
 
 # -- ComposeBackend converge/observe --------------------------------------
@@ -263,6 +298,28 @@ def test_placement_error_skips_group(tmp_path):
     assert be.observe() == set()
 
 
+def test_plan_is_read_only(tmp_path):
+    be = make_backend(tmp_path)
+    p = be.plan([vllm('a', served='aa'), vllm('b', served='bb')])
+    assert p.assignments == {'a': [0], 'b': [1]}    # placement computed
+    assert not be.compose_file.exists()             # but nothing written
+    assert be.run.calls == []                       # and docker never invoked
+
+
+def test_converge_render_only_writes_without_applying(tmp_path):
+    be = make_backend(tmp_path)
+    plan = be.converge([vllm('a', served='aa')], apply=False)
+    assert be.compose_file.exists()                 # on-disk project rendered
+    assert plan.assignments == {'a': [0]}
+    assert be.last_assignments == {'a': [0]}
+    # neither `up` nor `down` ran — only render happened
+    verbs = [c[c.index('-f') + 2] for c in be.run.calls if '-f' in c]
+    assert 'up' not in verbs and 'down' not in verbs
+    # ...and applying afterwards (default) brings exactly that file up
+    be.converge([vllm('a', served='aa')], apply=True)
+    assert be.observe() == {'a'}
+
+
 # -- controller + ledger + catalog integration ----------------------------
 
 
@@ -337,7 +394,10 @@ def test_render_litellm_front_door(tmp_path):
     entry = cfg['model_list'][0]
     assert entry['model_name'] == 'grp-a'                  # alias = endpoint
     assert entry['litellm_params']['model'] == 'openai/qwen-served'
-    assert entry['litellm_params']['api_base'] == 'http://vllm-grp-a:8000/v1'
+    # api_base host == the vLLM service name, so LiteLLM routes over the network
+    assert entry['litellm_params']['api_base'] == (
+        'http://vllm-qwen-served-grp-a:8000/v1'
+    )
 
 
 def test_litellm_config_hash_label_tracks_model_list(tmp_path):
@@ -486,6 +546,63 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
     # The just-created lease must not linger as active after a decline.
     leases, _ = led.status()
     assert not [le for le in leases if le.state == LeaseState.ACTIVE]
+
+
+def test_acquire_rolls_back_when_group_cannot_be_placed(tmp_path):
+    """A serve whose group can't be placed must fail fast, not hang on ready.
+
+    Regression: with the only GPU already held, `serve <other>` left the new
+    group LIVE in the ledger (so `leases` showed a phantom "live" group) and
+    then blocked forever waiting on a container placement skipped. Acquire now
+    rolls the lease back and raises PlacementError.
+    """
+    from infer_stack.leasing import LeaseState
+    from infer_stack.leasing.backend import PlacementError
+
+    catalog = Catalog.from_dict(CATALOG)
+    ledger = Ledger(SqliteStore(tmp_path / 'ledger.db'))
+    backend = make_backend(tmp_path, spec='1x80')      # exactly one GPU
+    ctl = Controller(ledger, backend)
+
+    first = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    assert first.wait.ready                            # claims the only GPU
+    qwen_gid = first.groups[0].id
+
+    with pytest.raises(PlacementError) as ei:
+        ctl.acquire('bob', catalog.resolve_names(['reranker']))
+    assert ei.value.reasons                            # carries the planner reason
+
+    leases, groups = ledger.status()
+    # the rolled-back request leaves no second active lease, and the reranker
+    # never lingers as a LIVE group with no container behind it
+    assert [le.owner for le in leases if le.state == LeaseState.ACTIVE] == ['alice']
+    live_served = {ep for g in groups
+                   if g.state == GroupState.LIVE for ep in g.served}
+    assert 'reranker' not in live_served
+    assert backend.observe() == {qwen_gid}             # only qwen is running
+
+
+def test_controller_acquire_render_only_stages(tmp_path):
+    """`serve --render-only` records intent + writes on-disk state, no `up`."""
+    from infer_stack.leasing import LeaseState
+
+    catalog = Catalog.from_dict(CATALOG)
+    ledger = Ledger(SqliteStore(':memory:'))
+    backend = make_backend(tmp_path)
+    ctl = Controller(ledger, backend)
+
+    out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']), apply=False)
+    assert out.applied is False
+    assert out.wait is None                       # never blocked on readiness
+    assert backend.compose_file.exists()          # on-disk project written
+    assert backend.observe() == set()             # but nothing brought up
+    assert out.reconcile.assignments              # placement was computed
+    leases, _ = ledger.status()
+    assert [le.state for le in leases] == [LeaseState.ACTIVE]   # staged intent
+
+    # applying (the default) brings up exactly what was staged
+    ctl.reconcile()
+    assert backend.observe() == {out.groups[0].id}
 
 
 def test_access_reports_litellm_base_url(tmp_path):

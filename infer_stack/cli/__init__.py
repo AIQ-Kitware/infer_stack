@@ -52,6 +52,7 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_leasing import (
     AcquireCLI,
+    ApplyCLI,
     EvictCLI,
     LeasesCLI,
     ReleaseCLI,
@@ -62,6 +63,7 @@ from .commands_leasing import (
     WaitCLI,
 )
 from .commands_leasing import EnvCLI as LeasingEnvCLI
+from .commands_leasing import RenderCLI as LeasingRenderCLI
 from .commands_meta import (
     ConfigModalCLI,
     ConfigPathsCLI,
@@ -178,6 +180,26 @@ class ManageCLI(scfg.ModalCLI):
         '`infer-stack legacy`; see `infer-stack help tree`.'
     )
 
+    __epilog__ = """
+    Quickstart:
+        infer-stack config init                 # storage + default backend
+        infer-stack catalog init                # start a model catalog
+        infer-stack catalog model add smol135 \\
+            --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
+        infer-stack catalog endpoint add --model smol135   # -> smol135-1
+        infer-stack serve smol135-1             # render + bring up + wait
+        infer-stack leases                      # what is desired vs running
+        infer-stack test smol135-1              # one real generation
+        infer-stack release --all               # tear it back down
+
+    Mental model:
+        catalog (what can run) -> serve/acquire (declare intent, a lease)
+        -> the controller reconciles a compose project (gateway + models +
+        Open WebUI) onto your GPUs. `serve --no-apply` writes that project
+        without starting it (then `apply`); `leases` shows desired vs actual.
+        Run `infer-stack help tree` for the whole command surface.
+    """
+
     # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
     # The ``version`` *subcommand* is registered below under a non-colliding
     # attribute name; its CLI name comes from ``VersionCLI.__command__``.
@@ -203,6 +225,9 @@ class ManageCLI(scfg.ModalCLI):
     renew = RenewCLI
     run = RunCLI
     serve = ServeCLI
+    # Reconcile primitives (lease-free): render desired -> disk, apply disk -> up
+    render = LeasingRenderCLI  # write the compose project for desired, no `up`
+    apply = ApplyCLI  # bring the desired set up (the trigger for serve --no-apply)
     wait = WaitCLI  # block until endpoints are ready (serve --no-wait fan-out)
     leases = LeasesCLI
     test = TestCLI  # smoke-test a served endpoint through the front door

@@ -220,7 +220,62 @@ def _descriptor_for(controller, lease, groups, config):
     )
 
 
+def _compose_file_path(controller) -> str | None:
+    path = getattr(controller.backend, 'compose_file', None)
+    return str(path) if path else None
+
+
+def _gpu_where(gpus) -> str:
+    """Human label for a group's GPU assignment (or its absence)."""
+    if gpus is None:
+        return 'unplaced'
+    if not gpus:
+        return 'cpu'
+    return 'GPU ' + ','.join(str(i) for i in gpus)
+
+
+def _emit_staged(config, controller, outcome) -> int:
+    """Output for a ``--no-apply`` acquire: what was written + what would run."""
+    descriptor = _descriptor_for(
+        controller, outcome.lease, outcome.groups, config
+    )
+    if config.env_file:
+        Path(config.env_file).expanduser().write_text(render_env_file(descriptor))
+    assignments = outcome.reconcile.assignments
+    if config.json:
+        print(json.dumps({
+            'session_id': outcome.lease.id,
+            'owner': outcome.lease.owner,
+            'applied': False,
+            'descriptor': descriptor,
+            'compose_file': _compose_file_path(controller),
+            'placement': [
+                {'group': g.id, 'served': sorted(g.served),
+                 'gpus': assignments.get(g.id)}
+                for g in outcome.groups
+            ],
+        }, indent=2))
+        return 0
+    print(f'staged {outcome.lease.id} (owner={outcome.lease.owner}) — not applied')
+    for g in outcome.groups:
+        eps = ', '.join(sorted(g.served)) or g.id
+        print(f'  {eps}: {_gpu_where(assignments.get(g.id))}  ({g.id})')
+    path = _compose_file_path(controller)
+    if path:
+        print(f'  compose: {path}')
+    print('  apply:   infer-stack apply           # bring the staged set up')
+    if path:
+        # The file carries `name: infer-stack`, so plain docker works too.
+        print(f'  ...or:   docker compose -f {path} up -d')
+    print(f'  discard: infer-stack release {outcome.lease.id}')
+    if config.env_file:
+        print(f'  env-file: {config.env_file}')
+    return 0
+
+
 def _emit_acquire(config, controller, outcome) -> int:
+    if not outcome.applied:
+        return _emit_staged(config, controller, outcome)
     descriptor = _descriptor_for(
         controller, outcome.lease, outcome.groups, config
     )
@@ -266,9 +321,12 @@ def _emit_acquire(config, controller, outcome) -> int:
 
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     from .._log import logger
-    from ..leasing.backend import ConvergeAborted
+    from ..leasing.backend import ConvergeAborted, PlacementError
 
-    controller = _open_controller(config, interactive=True)
+    render_only = not bool(getattr(config, 'apply', True))
+    # Staging (--no-apply) is non-destructive (no docker up), so don't gate it
+    # behind the diff prompt — the rendered file *is* the thing you asked to see.
+    controller = _open_controller(config, interactive=not render_only)
     catalog = _load_catalog(config)
     names = _collect_names(config.names)
     if not names:
@@ -276,7 +334,9 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     sharing = Sharing.DEDICATED if getattr(config, 'dedicated', False) else None
     requests = _resolve(catalog, names, sharing=sharing)
     logger.info('Acquiring {} for {}', ', '.join(names), owner)
-    if config.wait:
+    if render_only:
+        logger.info('Render-only: staging the compose project without applying')
+    elif config.wait:
         logger.info(
             'Will wait up to {:.0f}s for readiness (poll {:.0f}s)',
             float(config.timeout), float(config.interval),
@@ -289,9 +349,21 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
             wait=bool(config.wait),
             timeout=float(config.timeout),
             interval=float(config.interval),
+            apply=not render_only,
         )
     except ConvergeAborted:
         raise SystemExit('aborted: compose changes not applied (no lease kept)')
+    except PlacementError as ex:
+        lines = ['could not place every requested endpoint (no lease kept):']
+        lines += [f'  {r}' for r in ex.reasons] or [
+            f'  {", ".join(ex.group_ids)}'
+        ]
+        lines.append(
+            '  free a GPU first — `infer-stack leases` to see what holds them, '
+            'then `infer-stack release`/`evict`; or `--include-display-gpus` '
+            'to use a display-attached GPU.'
+        )
+        raise SystemExit('\n'.join(lines))
     return _emit_acquire(config, controller, outcome)
 
 
@@ -340,6 +412,15 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
     wait = scfg.Value(
         True, isflag=True, help='Block until ready (use --no-wait to skip).'
     )
+    apply = scfg.Value(
+        True,
+        isflag=True,
+        help='Apply the render (docker compose up). Use --no-apply to *stage* '
+        'only: declare the lease and write the on-disk compose project + '
+        'placement WITHOUT starting it, then `infer-stack apply` to bring it up '
+        '(compose backend). --no-apply implies no readiness wait and no diff '
+        'prompt; `release` discards a staged lease.',
+    )
     timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
     interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
     env_file = scfg.Value(
@@ -359,7 +440,15 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
 
 
 class AcquireCLI(_AcquireFlagsMixin):
-    """Acquire a lease on one or more endpoints/bundles and block until ready."""
+    """Acquire a lease on one or more endpoints/bundles and block until ready.
+
+    Like ``serve`` but with a soft ``--ttl`` (default infinite): the lease
+    protects its models while held, and once it expires (or is released) nothing
+    else needs them they can be reclaimed. This is the programmatic seam — write
+    a sourceable endpoint env-file with ``--env-file`` and release by that file
+    or session id when done. (For a one-shot "acquire, run a command, release",
+    use ``infer-stack run`` instead.)
+    """
 
     __command__ = 'acquire'
 
@@ -387,9 +476,42 @@ class AcquireCLI(_AcquireFlagsMixin):
 
 
 class ServeCLI(_AcquireFlagsMixin):
-    """Stand up endpoints as a standing service (an infinite ``manual`` lease)."""
+    """Stand up endpoints as a standing service (an infinite ``manual`` lease).
+
+    ``serve NAME…`` is the everyday verb. It acquires an infinite (no-TTL) lease
+    on each endpoint or bundle, renders the compose project (the LiteLLM gateway
+    + one container per model + a managed Open WebUI), brings it up, and blocks
+    until every endpoint is ready. Run it again with more names to add models
+    side by side — the gateway and UI stay put. Placement, ``docker compose``,
+    and readiness are narrated on stderr.
+
+    The work is render (write the on-disk compose project) then apply (``docker
+    compose up``). ``--no-apply`` does just the render so you can see what
+    would run before pulling the trigger (then ``infer-stack apply``).
+    ``--no-wait`` applies but returns immediately so several models load in
+    parallel (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a
+    terminal you are shown the compose diff and asked before applying; ``--yes``
+    skips that prompt (and it is skipped automatically off a TTY).
+    """
 
     __command__ = 'serve'
+    __epilog__ = """
+    Examples:
+        # serve one model: render + up + wait until it can generate
+        infer-stack serve qwen05-1 --require-generation
+
+        # stage only: write the compose project but don't start it, then apply
+        infer-stack serve qwen05-1 --no-apply
+        infer-stack apply
+
+        # fan out: start several without blocking, then wait together
+        infer-stack serve smol17b-1 --no-wait --yes
+        infer-stack serve qwen15-1  --no-wait --yes
+        infer-stack wait  smol17b-1 qwen15-1 --require-generation
+
+        # see what is actually running and on which GPUs
+        infer-stack leases
+    """
 
     names = scfg.Value(
         [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
@@ -400,6 +522,113 @@ class ServeCLI(_AcquireFlagsMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         return _do_acquire(config, owner=config.owner, ttl_seconds=None)
+
+
+class RenderCLI(_LeasingCommonMixin):
+    """Write the on-disk compose project for the current desired set — no up.
+
+    Lease-free and idempotent: ``render`` re-materializes the manifest (compose
+    file + gateway config + GPU placement) from whatever is *already* declared,
+    WITHOUT starting anything — to inspect what would run, or refresh a file you
+    touched by hand. It creates no lease; to stage a *new* endpoint use ``serve
+    --no-apply`` (which declares it too). Apply with ``infer-stack apply``.
+    """
+
+    __command__ = 'render'
+
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=False)
+        rec = controller.reconcile(apply=False)
+        path = _compose_file_path(controller)
+        if config.json:
+            print(json.dumps({
+                'applied': False,
+                'compose_file': path,
+                'placement': rec.assignments,
+                'unplaced': rec.unplaced,
+            }, indent=2))
+            return 0
+        print(f'rendered desired set -> {path or "(backend has no on-disk project)"}')
+        for gid, gpus in sorted(rec.assignments.items()):
+            print(f'  {gid}: {_gpu_where(gpus)}')
+        for err in rec.placement_errors:
+            print(f'  ! {err}')
+        print('  apply:   infer-stack apply')
+        return 0
+
+
+class ApplyCLI(_LeasingCommonMixin):
+    """Bring the current desired set up to match the ledger (render + up).
+
+    Lease-free: ``apply`` creates no lease — it converges whatever is already
+    declared (by ``serve``/``acquire``) onto the backend. It is the *trigger*
+    for a staged ``serve --no-apply`` and the re-sync button after a manual edit
+    or a backend hiccup; idempotent (a second apply with nothing changed is a
+    no-op). The rendered file carries ``name: infer-stack``, so ``docker compose
+    -f <file> up -d`` is an exact equivalent. (``infer-stack stack up`` is the
+    lower-level "run exactly what is on disk" hatch; ``apply`` re-renders from
+    intent first.)
+    """
+
+    __command__ = 'apply'
+
+    wait = scfg.Value(
+        False, isflag=True, help='Also block until ready after bringing it up.'
+    )
+    timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
+    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        try:
+            rec = controller.reconcile(apply=True)
+        except ConvergeAborted:
+            raise SystemExit('aborted: compose changes not applied')
+        result = None
+        if config.wait:
+            controller.ledger.sweep()
+            _, groups = controller.ledger.status()
+            live = [g for g in groups if g.state == GroupState.LIVE]
+            if live:
+                result = controller.wait_ready(
+                    live,
+                    timeout=float(config.timeout),
+                    interval=float(config.interval),
+                )
+        if config.json:
+            print(json.dumps({
+                'applied': True,
+                'realized': rec.realized,
+                'torn_down': rec.torn_down,
+                'placement': rec.assignments,
+                'unplaced': rec.unplaced,
+                'ready': None if result is None else result.ready,
+            }, indent=2))
+            return 0 if (result is None or result.ready) else 2
+        print(
+            f'applied: {len(rec.realized)} started, {len(rec.torn_down)} stopped'
+        )
+        for gid in rec.realized:
+            print(f'  + {gid}')
+        for gid in rec.torn_down:
+            print(f'  - {gid}')
+        for err in rec.placement_errors:
+            print(f'  ! {err}')
+        if result is not None and not result.ready:
+            print('  not ready (timed out)')
+            for gid, ep in result.pending:
+                print(f'    pending: {ep} ({gid})')
+            return 2
+        return 0
 
 
 class ReleaseCLI(_LeasingCommonMixin):
@@ -713,7 +942,44 @@ def _lease_ttl(le) -> str:
     return 'inf' if le.expires_at is None else f'@{le.expires_at:.0f}'
 
 
-def _print_leases_plain(leases, groups) -> None:
+def _placement_view(controller):
+    """Best-effort (observed running gids, group id -> GPU indices).
+
+    Reads what the backend *actually* has running (``observe``) and where each
+    desired group is/would be placed (``plan``). Both are guarded so a dry-run
+    (``NullBackend``) or a docker-less host degrades to "unknown" rather than
+    erroring — ``leases`` must always render.
+    """
+    backend = controller.backend
+    observed: set[str] = set()
+    try:
+        observed = set(backend.observe())
+    except Exception:  # noqa: BLE001 - status must never crash
+        pass
+    assignments: dict[str, list[int]] = {}
+    plan = getattr(backend, 'plan', None)
+    if plan is not None:
+        try:
+            assignments = dict(plan(controller.desired_groups()).assignments)
+        except Exception:  # noqa: BLE001
+            pass
+    return observed, assignments
+
+
+def _running_label(gid, observed) -> str:
+    return 'running' if gid in observed else '—'
+
+
+def _gpu_label(gid, observed, assignments) -> str:
+    """Where a group is (running) or is slated to be (desired, not yet up)."""
+    gpus = assignments.get(gid)
+    if gpus is None:
+        return '-'
+    where = ','.join(str(i) for i in gpus) if gpus else 'cpu'
+    return where if gid in observed else f'→{where}'  # → = slated, not yet up
+
+
+def _print_leases_plain(leases, groups, observed, assignments) -> None:
     print('leases:')
     if not leases:
         print('  (none)')
@@ -727,12 +993,14 @@ def _print_leases_plain(leases, groups) -> None:
         print('  (none)')
     for g in groups:
         print(
-            f'  {g.id}  {g.engine}  state={g.state}  demand={g.demand}  '
-            f'served={",".join(sorted(g.served)) or "-"}'
+            f'  {g.id}  {g.engine}  state={g.state}  '
+            f'running={_running_label(g.id, observed)}  '
+            f'gpus={_gpu_label(g.id, observed, assignments)}  '
+            f'demand={g.demand}  served={",".join(sorted(g.served)) or "-"}'
         )
 
 
-def _print_leases_rich(leases, groups, console) -> None:
+def _print_leases_rich(leases, groups, observed, assignments, console) -> None:
     from rich.table import Table
     from rich.text import Text
 
@@ -771,22 +1039,52 @@ def _print_leases_rich(leases, groups, console) -> None:
                    header_style='dim')
         gt.add_column('id', style='cyan', no_wrap=True)
         gt.add_column('engine')
-        gt.add_column('state')
+        gt.add_column('state')           # desired (ledger)
+        gt.add_column('running')         # actual (backend.observe)
+        gt.add_column('gpus')            # on / →slated
         gt.add_column('demand', justify='right', style='dim')
         gt.add_column('served', style='magenta', overflow='fold')
         for g in groups:
+            running = g.id in observed
+            gpus = _gpu_label(g.id, observed, assignments)
             gt.add_row(
                 g.id, g.engine,
                 Text(str(g.state), style=state_style(g.state)),
+                Text('running' if running else '—',
+                     style='green' if running else 'dim'),
+                Text(gpus, style='cyan' if running else 'yellow'),
                 str(g.demand), ','.join(sorted(g.served)) or '-',
             )
         console.print(gt)
 
 
 class LeasesCLI(_LeasingCommonMixin):
-    """Show current leases and deployment groups (the leasing-model status)."""
+    """Show current leases and deployment groups (the leasing-model status).
+
+    Two tables. **leases** are who asked for what (id, owner, state, ttl,
+    endpoints). **groups** are the actual deployments behind them — one group is
+    one model in one container (it may serve several endpoint aliases). For each
+    group:
+
+    \b
+      state    what the ledger *wants* — live / idle / stopped
+      running  what the backend *actually* has up right now
+      gpus     the GPU indices it is on; a ``→`` prefix means slated (desired
+               but not yet started), ``-`` means no placement info
+      demand   how many active leases are protecting it
+      served   the endpoint aliases routed to it
+
+    A row that is ``state=live`` but ``running=—`` is desired-but-not-up: either
+    still starting, staged via ``serve --no-apply`` (run ``apply`` to bring it
+    up), or unplaceable (no free GPU — see ``serve``'s error / ``evict``).
+    """
 
     __command__ = 'leases'
+    __epilog__ = """
+    Examples:
+        infer-stack leases          # the two tables (rich on a terminal)
+        infer-stack leases --json   # JSON (adds running + gpus per group)
+    """
 
     json = scfg.Value(False, isflag=True)
 
@@ -796,6 +1094,7 @@ class LeasesCLI(_LeasingCommonMixin):
         controller = _open_controller(config)
         controller.ledger.sweep()  # materialize TTL expiry for an accurate view
         leases, groups = controller.ledger.status()
+        observed, assignments = _placement_view(controller)
         if config.json:
             print(
                 json.dumps(
@@ -814,7 +1113,9 @@ class LeasesCLI(_LeasingCommonMixin):
                             {
                                 'id': g.id,
                                 'engine': g.engine,
-                                'state': g.state,
+                                'state': g.state,  # desired (ledger)
+                                'running': g.id in observed,  # actual (backend)
+                                'gpus': assignments.get(g.id),
                                 'demand': g.demand,
                                 'served': sorted(g.served),
                             }
@@ -829,9 +1130,9 @@ class LeasesCLI(_LeasingCommonMixin):
 
         console = Console()
         if console.is_terminal:
-            _print_leases_rich(leases, groups, console)
+            _print_leases_rich(leases, groups, observed, assignments, console)
         else:
-            _print_leases_plain(leases, groups)
+            _print_leases_plain(leases, groups, observed, assignments)
         return 0
 
 

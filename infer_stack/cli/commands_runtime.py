@@ -901,11 +901,33 @@ class StackDownCLI(_ComposeWrapperBase):
         return int(proc.returncode)
 
 
+class StackUpCLI(_ComposeWrapperBase):
+    """``docker compose up -d`` exactly what is on disk — the raw escape hatch.
+
+    Brings up the on-disk compose file as-is, without touching the ledger or
+    re-rendering. Prefer ``infer-stack apply``, which re-renders from intent
+    first (so it reflects the current desired set) and is the normal trigger for
+    a staged ``serve --no-apply``. Reach for ``stack up`` only when you want to
+    run a *hand-edited* compose file verbatim. (Normal ``serve``/``acquire``
+    render *and* apply in one step.)
+    """
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        cmd = _day2_compose_base(config, 'up') + ['up', '-d', '--remove-orphans']
+        cmd.extend(config.services or [])
+        proc = subprocess.run(cmd)
+        return int(proc.returncode)
+
+
 class StackModalCLI(scfg.ModalCLI):
     """Day-2 ops on the running deployment (leasing stack when present)."""
 
     __command__ = 'stack'
 
+    up = StackUpCLI
     logs = LogsCLI
     ps = PsCLI
     restart = RestartCLI

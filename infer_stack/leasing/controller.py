@@ -35,6 +35,14 @@ KEEP_WARM = 'keep-warm'
 class ReconcileResult:
     realized: list[str] = field(default_factory=list)
     torn_down: list[str] = field(default_factory=list)
+    # Desired groups the backend could not place (e.g. no free GPU) plus the
+    # planner's per-group reasons; empty for backends without placement.
+    unplaced: list[str] = field(default_factory=list)
+    placement_errors: list[str] = field(default_factory=list)
+    # group id -> GPU indices it is on / slated for (placement backends only).
+    assignments: dict[str, list[int]] = field(default_factory=dict)
+    # False when reconcile only rendered the on-disk state (no docker up/down).
+    applied: bool = True
 
 
 @dataclass
@@ -49,6 +57,7 @@ class AcquireOutcome:
     groups: list[DeploymentGroup]
     reconcile: ReconcileResult
     wait: WaitResult | None = None
+    applied: bool = True  # False for a --no-apply (staged, not brought up) acquire
 
 
 @dataclass
@@ -104,22 +113,40 @@ class Controller:
                     desired.append(group)
         return desired
 
-    def reconcile(self) -> ReconcileResult:
+    def reconcile(self, *, apply: bool = True) -> ReconcileResult:
         """Converge the backend to the ledger's desired state.
 
         A backend may implement a single ``converge(desired)`` (whole-union
         convergence — e.g. Compose renders one file and ``up``s it); otherwise
         the per-group ``realize``/``teardown`` loop is used.
+
+        ``apply=False`` asks a converge-style backend to render the on-disk
+        project *without* bringing it up — the "see what would execute" / staged
+        path. Backends without that capability ignore it (render and apply are
+        inseparable for them).
         """
         self.ledger.sweep()
         desired = self.desired_groups()
         if hasattr(self.backend, 'converge'):
             before = set(self.backend.observe())
-            self.backend.converge(desired)
+            # Only pass apply= when staging, so backends/fakes with the older
+            # ``converge(desired)`` signature keep working on the default path.
+            if apply:
+                self.backend.converge(desired)
+            else:
+                self.backend.converge(desired, apply=False)
             after = set(self.backend.observe())
             return ReconcileResult(
                 realized=sorted(after - before),
                 torn_down=sorted(before - after),
+                unplaced=sorted(getattr(self.backend, 'last_unplaced', ()) or ()),
+                placement_errors=list(
+                    getattr(self.backend, 'last_errors', ()) or ()
+                ),
+                assignments=dict(
+                    getattr(self.backend, 'last_assignments', {}) or {}
+                ),
+                applied=apply,
             )
         desired_ids = {g.id for g in desired}
         actual = self.backend.observe()
@@ -187,24 +214,44 @@ class Controller:
         wait: bool = True,
         timeout: float = 300.0,
         interval: float = 2.0,
+        apply: bool = True,
     ) -> AcquireOutcome:
-        """Create a lease, realize its groups, and (optionally) block on ready."""
-        from .backend import ConvergeAborted
+        """Create a lease, realize its groups, and (optionally) block on ready.
+
+        ``apply=False`` stages the lease and renders the on-disk project without
+        bringing it up (and skips the readiness wait, since nothing is running).
+        Placement is still computed, so an unplaceable request still fails fast.
+        """
+        from .backend import ConvergeAborted, PlacementError
 
         result = self.ledger.acquire(
             owner, requests, ttl_seconds=ttl_seconds
         )
         try:
-            rec = self.reconcile()
+            rec = self.reconcile(apply=apply)
         except ConvergeAborted:
             # The operator declined the compose changes — don't leave the
             # just-created lease dangling in the ledger.
             self.ledger.release(result.lease.id)
             raise
+        # If a group this lease just requested could not be placed (e.g. no free
+        # GPU), don't block forever waiting on a container that will never come
+        # up — roll the lease back and report the planner's reason, so the group
+        # never lingers as a phantom ``live`` with nothing behind it.
+        requested = {g.id for g in result.groups}
+        unplaced = requested & set(rec.unplaced)
+        if unplaced:
+            self.ledger.release(result.lease.id)
+            reasons = [
+                e
+                for e in rec.placement_errors
+                if any(e.startswith(gid) for gid in unplaced)
+            ]
+            raise PlacementError(sorted(unplaced), reasons)
         groups = [self.ledger.get_group(g.id) for g in result.groups]
         groups = [g for g in groups if g is not None]
         wait_result = None
-        if wait:
+        if wait and apply:  # nothing to wait on when we only staged the render
             wait_result = self.wait_ready(
                 groups,
                 endpoints=set(result.lease.endpoints),
@@ -216,6 +263,7 @@ class Controller:
             groups=groups,
             reconcile=rec,
             wait=wait_result,
+            applied=apply,
         )
 
     def release(self, lease_id: str) -> ReleaseOutcome:
