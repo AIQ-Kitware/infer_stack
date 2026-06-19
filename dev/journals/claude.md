@@ -1573,3 +1573,37 @@ Uncertainties: same standing one — unverified on real hardware (System/API/ps
 need a live GPU + gateway). The ready-model definition may surprise someone who
 expects a just-served-but-still-loading model to be immediately queryable; the
 status line + "only ready models listed" desc set that expectation.
+
+## 2026-06-19 12:30:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Large multi-request turn; Jon
+explicitly OK'd staging. Locked four design decisions via a question prompt
+(saved to agent memory): group→deployment, session_id→lease_id (HARD), TUI
+top-level tabs (Dashboard/Settings/Catalog) + command palette, keep both
+monitors; and the standing rule that the CLI must be a superset of TUI features.
+
+Shipped two commits:
+1. (08353d3) Made the lease↔deployment many-to-one legible — the thing Jon most
+   wanted to "click." Leases pane gained a `deployment` column (the literal group
+   id, matching the deployments pane's id column, so the join is eyeball-able);
+   deployments pane shows `leases` (count) + `held by` (owners) instead of the
+   opaque `demand`. Cursor movement narrates the link in the status bar. Buttons
+   compacted to 1 row.
+2. (0ab64db) session_id→lease_id hard rename: env key INFER_STACK_LEASE_ID,
+   --lease flag, JSON lease_id, read_lease_id(), id prefix lease-. Verified no
+   parent-repo consumers before breaking it. 319 tests green.
+
+Deliberately deferred the group→deployment rename: 558 code sites + a SQLite
+`groups` table is too big to do safely alongside features. It's its own next
+pass. Open sub-decision I'll default on unless redirected: keep the SQLite table
+named `groups` (purely internal, avoids a ledger-DB migration) while renaming all
+Python symbols + user-facing strings to deployment — i.e. rename the concept
+everywhere a human sees it, leave one hidden DB identifier alone.
+
+State of mind: good progress, low regression risk so far (rename was contained,
+full suite green twice). The remaining work is mostly additive TUI (tabs,
+settings, catalog mgmt, edit/remove, docker control, model cache info, all-panes
+collapsible + drag bars everywhere) plus the big mechanical group rename. Biggest
+judgment call ahead is the reorg: top-level tabs change the whole compose() tree,
+so I want to land the group rename first (so new UI is built on final vocabulary)
+unless Jon prefers to see the reorg sooner.
