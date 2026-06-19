@@ -260,16 +260,27 @@ class InferStackTUI(App):
     #body { height: 1fr; padding: 0 1; }
 
     #sidebar { width: 38; min-width: 26; }
-    #vsplit { width: 1; background: $surface; }
+    /* Full cross-axis size so there's a real bar to grab (a 0-height Static
+       collapses to a single un-grabbable cell). */
+    #vsplit { width: 1; height: 1fr; background: $panel; }
     #vsplit:hover { background: $accent; }
     #main { width: 1fr; }
     #tables { height: 1fr; }
-    #hsplit { height: 1; background: $surface; margin: 0 0 1 0; }
+    #hsplit { width: 1fr; height: 1; background: $panel; margin: 0 0 1 0; }
     #hsplit:hover { background: $accent; }
 
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
     #catalog-buttons { height: auto; }
     #catalog-buttons Button { width: 1fr; margin: 1 0 0 0; }
+
+    /* Per-pane action bars: buttons scoped to the pane they act on. */
+    #endpoint-actions, #lease-actions, #group-actions {
+        height: auto; margin: 0 0 1 0;
+    }
+    #endpoint-actions Button { width: 1fr; }
+    #lease-actions Button, #group-actions Button {
+        margin: 0 1 0 0; min-width: 12;
+    }
 
     #endpoints, #models, #leases, #groups, #docker {
         border: round $surface;
@@ -300,16 +311,19 @@ class InferStackTUI(App):
     """
 
     BINDINGS = [
-        ('s', 'serve', 'Serve'),
-        ('d', 'release', 'Release'),
-        ('e', 'evict', 'Evict'),
-        ('g', 'suggest', 'Suggest'),
-        ('m', 'add_model', 'Add model'),
-        ('n', 'add_endpoint', 'Add endpoint'),
+        # Truly global controls stay in the footer.
         ('r', 'refresh', 'Refresh'),
-        ('a', 'release_all', 'Release all'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
+        # Pane-scoped actions: keys still work for power users, but they live as
+        # buttons under the pane they act on rather than in the global menu.
+        Binding('s', 'serve', 'Serve', show=False),
+        Binding('d', 'release', 'Release', show=False),
+        Binding('e', 'evict', 'Evict', show=False),
+        Binding('a', 'release_all', 'Release all', show=False),
+        Binding('g', 'suggest', 'Suggest', show=False),
+        Binding('m', 'add_model', 'Add model', show=False),
+        Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
@@ -349,8 +363,8 @@ class InferStackTUI(App):
         yield Static(
             'Request models from the [b]catalog[/b] (left) · watch '
             '[b]leases[/b] & GPUs (center) · tail [b]docker[/b] (below).  '
-            'Keys: [b]s[/b] serve · [b]d[/b] release · [b]e[/b] evict · '
-            '[b]g[/b] suggest · [b]m[/b]/[b]n[/b] add.',
+            'Each pane has its own action buttons; drag the bars between panes '
+            'to resize.',
             id='intro', markup=True,
         )
         with Horizontal(id='body'):
@@ -358,6 +372,8 @@ class InferStackTUI(App):
                 yield Static('', id='catalog-help')
                 yield DataTable(id='endpoints', cursor_type='row',
                                 zebra_stripes=True)
+                with Horizontal(id='endpoint-actions'):
+                    yield Button('▶  Serve', id='btn-serve', variant='primary')
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
                 with Vertical(id='catalog-buttons'):
@@ -369,8 +385,13 @@ class InferStackTUI(App):
                 with Vertical(id='tables'):
                     yield DataTable(id='leases', cursor_type='row',
                                     zebra_stripes=True)
+                    with Horizontal(id='lease-actions'):
+                        yield Button('Release', id='btn-release')
+                        yield Button('Release all', id='btn-release-all')
                     yield DataTable(id='groups', cursor_type='row',
                                     zebra_stripes=True)
+                    with Horizontal(id='group-actions'):
+                        yield Button('Evict', id='btn-evict')
                 yield _Divider('y', self._drag_logs, id='hsplit')
                 with TabbedContent(id='docker'):
                     with TabPane('Logs', id='tab-logs'):
@@ -765,12 +786,18 @@ class InferStackTUI(App):
             self.action_serve()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == 'btn-suggest':
-            self.action_suggest()
-        elif event.button.id == 'btn-add-model':
-            self.action_add_model()
-        elif event.button.id == 'btn-add-endpoint':
-            self.action_add_endpoint()
+        handlers = {
+            'btn-serve': self.action_serve,
+            'btn-release': self.action_release,
+            'btn-release-all': self.action_release_all,
+            'btn-evict': self.action_evict,
+            'btn-suggest': self.action_suggest,
+            'btn-add-model': self.action_add_model,
+            'btn-add-endpoint': self.action_add_endpoint,
+        }
+        handler = handlers.get(event.button.id or '')
+        if handler:
+            handler()
 
     def action_release(self) -> None:
         sid = self._selected('leases', self._lease_ids)

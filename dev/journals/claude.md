@@ -1447,3 +1447,34 @@ feel instant *and* keeps headless tests deterministic without `wait_for_complete
 gymnastics. (3) For a tool newcomers land in, downgrade "missing config" from an
 error to an empty-state-with-a-button — the absent catalog is the start of the
 funnel, not a failure.
+
+## 2026-06-19 00:40:00 -0400
+
+Model: claude-opus-4-8 (Claude Code, fast Opus). Same TUI session, two follow-up
+fixes from the user: (1) drag-to-resize still didn't work; (2) the global bottom
+menu listed pane-specific actions (serve/release/evict) that don't apply
+everywhere — wanted them scoped to their panes, keeping only truly-global items
+global.
+
+Drag root cause (found by a headless harness, not guessing): the `_Divider`
+`Static` had no explicit cross-axis size, so `Region` was `width=1,height=1` — a
+1×1 dot. The drag *logic* was fine (posting a captured `MouseMove(delta_x=5)`
+moved the width 38→43 in the harness), there was simply nothing to grab. Fix:
+`#vsplit { height: 1fr }` and `#hsplit { width: 1fr }` so each bar spans its
+cross axis (verified: vsplit now 1×36, hsplit 79×1). Lesson worth keeping: when
+a Textual mouse interaction "doesn't fire," check the widget's `region` first —
+an auto-sized helper widget can collapse to an un-hittable cell even though its
+handlers are correct.
+
+Scoped actions: moved s/d/e/a/g/m/n bindings to `show=False` (keys still work)
+and added per-pane Buttons — Serve under `#endpoints`, Release/Release-all under
+`#leases`, Evict under `#groups`, plus the existing catalog buttons. Footer now
+shows only Refresh / Next-pane / Quit. `on_button_pressed` became an id→action
+map. Intro line updated to point at the per-pane buttons + drag bars.
+
+Tests: added grab-area, real-drag (mouse_down + posted MouseMove + mouse_up →
+width changes), and scoped-button-serve cases. 11 TUI tests green, ruff clean.
+Confident in the drag fix (measured). Still unverified on a real terminal: the
+actual feel of grabbing a 1-cell bar in tmux (motion reporting under tmux can be
+finicky) — if dragging is still flaky on yardrat, the next move is widening the
+hit target or enabling a drag affordance glyph.

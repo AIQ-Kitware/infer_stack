@@ -151,6 +151,78 @@ def test_tui_panes_drag_resize():
     _run(scenario)
 
 
+def test_tui_dividers_have_a_grab_area():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            # A 0-size divider can't be grabbed; both must span their cross-axis.
+            assert app.query_one('#vsplit').region.height > 1
+            assert app.query_one('#hsplit').region.width > 1
+
+    _run(scenario)
+
+
+def test_tui_drag_resizes_sidebar():
+    from textual import events
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            div = app.query_one('#vsplit')
+            w0 = app._sidebar_w
+            await pilot.mouse_down('#vsplit')
+            assert app.mouse_captured is div          # the bar grabbed the mouse
+            div.post_message(events.MouseMove(
+                widget=div, x=0, y=0, delta_x=5, delta_y=0, button=0,
+                shift=False, meta=False, ctrl=False,
+                screen_x=div.region.x + 5, screen_y=div.region.y,
+            ))
+            await pilot.pause()
+            await pilot.mouse_up('#vsplit')
+            assert app._sidebar_w == w0 + 5
+
+    _run(scenario)
+
+
+def test_tui_pane_scoped_action_buttons():
+    from textual.widgets import Button
+
+    from infer_stack.leasing import LeaseState
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Serve lives under the catalog; release/evict under their tables.
+            assert app.query_one('#btn-serve', Button)
+            assert app.query_one('#btn-release', Button)
+            assert app.query_one('#btn-evict', Button)
+            app.query_one('#endpoints').move_cursor(row=0)
+            await pilot.click('#btn-serve')
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert len(leases) == 1 and leases[0].state == LeaseState.ACTIVE
+
+
 def test_tui_add_model_wizard_writes_catalog(tmp_path):
     import yaml
 

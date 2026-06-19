@@ -186,8 +186,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
     help text; **add-model / add-endpoint wizards** (`m` / `n`, or the sidebar
     buttons) and a **Suggest** button (`g`) that seeds a catalog sized to your
     GPUs via `catalog suggest`; the logs pane became a **docker tab** (live
-    `logs -f` *and* a `ps` snapshot). Panes are **drag-resizable** (grab the
-    splitter bars) in addition to the `[` `]` / `-` `+` keys. Responsiveness:
+    `logs -f` *and* a `ps` snapshot). Actions are now **scoped to the pane they
+    act on** — Serve sits under the catalog, Release/Release-all under the
+    leases table, Evict under the groups table — so the global footer keeps only
+    truly-global controls (Refresh / Next-pane / Quit); the keys still work.
+    Panes are **drag-resizable** (grab the full-height/width splitter bars) in
+    addition to the `[` `]` / `-` `+` keys. Responsiveness:
     the periodic refresh + `docker compose ps` now run on a worker thread (no UI
     freeze), and docker's own `up`/`down` progress is captured into the logs
     pane instead of bleeding onto the screen. The TUI now requires a one-time
