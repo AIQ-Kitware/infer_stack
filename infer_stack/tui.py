@@ -405,11 +405,11 @@ class InferStackTUI(App):
     #vsplit { width: 1; height: 1fr; background: $panel; }
     #vsplit:hover { background: $accent; }
     #main { width: 1fr; }
-    #tables { height: 1fr; }
-    #hsplit, #lsplit, #csplit {
+    #tables { height: 1fr; overflow-y: auto; }
+    #hsplit, #csplit {
         width: 1fr; height: 1; background: $panel; margin: 0 0 1 0;
     }
-    #hsplit:hover, #lsplit:hover, #csplit:hover { background: $accent; }
+    #hsplit:hover, #csplit:hover { background: $accent; }
 
     /* one-line, per-pane descriptions (replaces the old global intro) */
     .desc { height: auto; color: $text-muted; padding: 0 1; }
@@ -448,9 +448,9 @@ class InferStackTUI(App):
 
     #endpoints { height: 1fr; min-height: 5; }
     #models { height: 8; min-height: 4; }   /* height set via _apply_sizes */
-    #leases-pane { min-height: 5; }          /* height set via _apply_sizes */
-    #deployments-pane { height: 1fr; min-height: 6; }
-    #leases, #deployments { height: 1fr; }
+    /* leases/deployments are collapsible panes; bound their tables so the
+       column sizes sanely and #tables scrolls when both are expanded. */
+    #leases, #deployments { height: 10; min-height: 3; }
     #docker-tabs { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
@@ -528,7 +528,6 @@ class InferStackTUI(App):
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
         self._log_h = 16      # resizable via - + or dragging #hsplit
         self._models_h = 8    # resizable by dragging #csplit
-        self._leases_h = 12   # resizable by dragging #lsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
         self._collapsed = {'docker': False, 'system': True}
@@ -572,7 +571,8 @@ class InferStackTUI(App):
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):
                 with Vertical(id='tables'):
-                    with Vertical(id='leases-pane'):
+                    with Collapsible(title='leases', collapsed=False,
+                                     id='leases-pane'):
                         yield Static(
                             'Reservations you hold. Each maps to one deployment '
                             'below (see the deployment column); many leases can '
@@ -584,8 +584,8 @@ class InferStackTUI(App):
                             yield Button('Release', id='btn-release')
                             yield Button('Release all', id='btn-release-all')
                             yield Button('Clean up', id='btn-cleanup')
-                    yield _Divider('y', self._drag_leases, id='lsplit')
-                    with Vertical(id='deployments-pane'):
+                    with Collapsible(title='deployments', collapsed=False,
+                                     id='deployments-pane'):
                         yield Static(
                             'Running model deployments and the GPUs they hold. '
                             "The 'leases' column is how many leases hold each. "
@@ -698,7 +698,6 @@ class InferStackTUI(App):
             pass
         titles = {
             '#endpoints': 'catalog · endpoints', '#models': 'catalog · models',
-            '#leases-pane': 'leases', '#deployments-pane': 'deployments',
         }
         for sel, title in titles.items():
             self.query_one(sel).border_title = title
@@ -767,7 +766,6 @@ class InferStackTUI(App):
         self.query_one('#sidebar').styles.width = self._sidebar_w
         self.query_one('#docker-tabs').styles.height = self._log_h
         self.query_one('#models').styles.height = self._models_h
-        self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
         # Allow the full width range (down to a sliver, up to nearly all of it),
@@ -785,11 +783,6 @@ class InferStackTUI(App):
         # Divider above the models table (models fixed-height, endpoints flexes):
         # drag down = bar follows the cursor down = models shorter.
         self._models_h = max(3, min(40, self._models_h - delta))
-        self._apply_sizes()
-
-    def _drag_leases(self, delta: int) -> None:
-        # Divider between leases and deployments; drag down grows leases.
-        self._leases_h = max(4, min(50, self._leases_h + delta))
         self._apply_sizes()
 
     def action_sidebar_narrower(self) -> None:
@@ -969,11 +962,14 @@ class InferStackTUI(App):
             self.query_one('#docker', Collapsible).title = (
                 f'docker — {running} running'
             )
+            self.query_one('#leases-pane', Collapsible).title = (
+                f'leases — {active} active / {len(leases)}'
+            )
+            self.query_one('#deployments-pane', Collapsible).title = (
+                f'deployments — {running} running / {len(deployments)}'
+            )
         except Exception:  # noqa: BLE001
             pass
-        self.query_one('#leases-pane', Vertical).border_subtitle = (
-            f'{active} active / {len(leases)}'
-        )
 
     def _fill_leases(self, leases) -> None:
         table = self.query_one('#leases', DataTable)
