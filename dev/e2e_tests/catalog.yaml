@@ -34,10 +34,18 @@ endpoints:
     engine: ollama
     host: local-ollama
     model: smollm2:135m
+  smol-ollama-gpu1:                   # same tag, daemon pinned to GPU 1 (display)
+    engine: ollama                    # -> exercises explicit GPU pinning on the
+    host: ollama-gpu1                 #    2nd GPU (needs --include-display-gpus)
+    model: smollm2:135m
 runtime_hosts:
   local-ollama:
     engine: ollama
     placement: {gpu_indices: [0]}
     settings: {keep_alive: 5m}
+  ollama-gpu1:                        # pins the daemon to GPU 1 — the device
+    engine: ollama                    # reservation must put it there (and NOT a
+    placement: {gpu_indices: [1]}     # host-index CUDA_VISIBLE_DEVICES, which
+    settings: {keep_alive: 5m}        # would CPU-fallback — see 88_gpu_pinning)
 bundles:
   pair: [smol-135, smol-360]

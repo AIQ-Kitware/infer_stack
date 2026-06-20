@@ -47,7 +47,9 @@ placer — that's finding F5, which test `60_dedicated_f5` deliberately probes).
 | `60_dedicated_f5` | yes | a dedicated group needs its own GPU; placement on a busy box |
 | `70_ttl_reclaim` | yes | short TTL expires; reclaim:stop group reclaimed |
 | `80_run_wrapper` | yes | `run -- <cmd>` injects env, releases on exit, propagates exit code |
-| `85_ollama` | yes | ollama daemon lazy pull/warmup + chat through the gateway |
+| `85_ollama` | yes | ollama daemon lazy pull/warmup + chat through the gateway; Open WebUI gets both the gateway (OpenAI) and the daemon (native Ollama) connections |
+| `86_ollama_lean` | yes | `--no-litellm`: no gateway, Open WebUI wired straight at the daemon's native API, tag still pulled, chat hits the daemon directly, `status` shows the UI URL |
+| `88_gpu_pinning` | yes | pin an ollama daemon to **GPU 1** (`--include-display-gpus`): device-reservation `device_ids=[1]`, no host-index `CUDA_VISIBLE_DEVICES`, and it runs ON the GPU (not a CPU fallback) |
 | `90_concurrency` | yes | two racing acquires; file lock keeps the compose file valid |
 | `99_cleanup` | always | release stragglers + `down` the project (never leak containers) |
 

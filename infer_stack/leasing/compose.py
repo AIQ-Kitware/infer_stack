@@ -197,8 +197,13 @@ def _ollama_service(
         env['OLLAMA_MAX_LOADED_MODELS'] = str(settings['max_loaded_models'])
     if settings.get('context_length') is not None:
         env['OLLAMA_CONTEXT_LENGTH'] = str(settings['context_length'])
-    if gpus:
-        env['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in gpus)
+    # GPU pinning is done by the device reservation below (``device_ids``), which
+    # exposes *only* those physical GPUs to the container — and the NVIDIA
+    # runtime renumbers them to 0..n-1 inside it. So we must NOT also set
+    # ``CUDA_VISIBLE_DEVICES`` to the host indices: pinning to host GPU 1 would
+    # leave the container seeing one GPU as device 0 while CUDA_VISIBLE_DEVICES=1
+    # points at nothing, and ollama silently falls back to CPU. vLLM relies on
+    # the reservation alone; ollama does the same.
     service: dict[str, Any] = {
         'image': deployment.spec.get('image') or images['ollama'],
         'ports': [f'{host_port}:11434'],

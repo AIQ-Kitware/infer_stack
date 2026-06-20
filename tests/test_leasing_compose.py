@@ -164,8 +164,15 @@ def test_render_ollama_service():
     svc = rc.compose['services']['ollama-daemon']
     assert svc['image'] == 'ollama/ollama:test'
     assert svc['environment']['OLLAMA_KEEP_ALIVE'] == '2m'
-    assert svc['environment']['CUDA_VISIBLE_DEVICES'] == '1'
     assert svc['ports'] == ['11434:11434']
+    # GPU pinning is via the device reservation, which renumbers the reserved
+    # GPU to 0 inside the container. Setting CUDA_VISIBLE_DEVICES to the *host*
+    # index (1) would point at a non-existent in-container device -> CPU
+    # fallback. So it must pin by device_ids and NOT set the host-index env var.
+    assert svc['deploy']['resources']['reservations']['devices'][0][
+        'device_ids'
+    ] == ['1']
+    assert 'CUDA_VISIBLE_DEVICES' not in svc['environment']
 
 
 def test_render_skips_unplaced_deployments():

@@ -52,6 +52,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   refused by the validating writer). CLI parity already exists via
   `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
 
+### Fixed
+* **Ollama GPU pinning to a non-zero GPU** silently fell back to CPU. The docker
+  device reservation (`device_ids`) already exposes only the pinned GPU and the
+  NVIDIA runtime renumbers it to `0` inside the container, but the service also
+  set `CUDA_VISIBLE_DEVICES` to the *host* index — so pinning to GPU 1 left the
+  container looking for device `1` that wasn't there. Now pinned by the
+  reservation alone (like vLLM). New e2e tier `88_gpu_pinning` exercises this on
+  a real 2nd GPU; new tier `86_ollama_lean` covers the `--no-litellm` stack, and
+  `85_ollama` now asserts the dual Open WebUI connection wiring.
+
 ### Removed (breaking)
 * Removed the pre-leasing **profile world** now superseded by catalog + leasing
   (no back-compat — pre-release): the entire `infer-stack legacy …` command
