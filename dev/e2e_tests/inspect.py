@@ -24,7 +24,11 @@ def main() -> None:
     print('has litellm:', 'litellm' in svcs)
     print('has open-webui:', 'open-webui' in svcs)
 
-    ow = (svcs.get('open-webui') or {}).get('environment', {}) or {}
+    ow_svc = svcs.get('open-webui') or {}
+    ow_ports = ow_svc.get('ports') or []
+    if ow_ports:
+        print('open-webui host_port:', str(ow_ports[0]).split(':')[0])
+    ow = ow_svc.get('environment', {}) or {}
     for k in (
         'ENABLE_OPENAI_API',
         'OPENAI_API_BASE_URL',

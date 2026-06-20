@@ -1,7 +1,8 @@
 # shellcheck shell=bash source=../lib.sh
-# Both GPUs at once. On yardrat GPU 1 is display-attached and skipped by default
-# (finding F5); --include-display-gpus opts it back in. Two distinct models then
-# land on two distinct GPUs. Proves the display-GPU override + multi-GPU spread.
+# Both GPUs at once. Placement uses every GPU by default — including yardrat's
+# display-attached GPU 1 — so two distinct models land on two distinct GPUs with
+# no extra flag (`config set skip_display_gpus true` would exclude the display
+# GPU). Proves the multi-GPU spread.
 source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
@@ -13,10 +14,10 @@ SIDECAR="$INFER_STACK_DATA_DIR/leasing/compose/leasing-compose-state.json"
 
 step both-gpus-spread 'two distinct models spread across GPU 0 and GPU 1'
 run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
-      --include-display-gpus --owner g0 --require-generation --timeout 1200"
+      --owner g0 --require-generation --timeout 1200"
 expect_rc 0
 run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
-      --include-display-gpus --owner g1 --require-generation --timeout 1200"
+      --owner g1 --require-generation --timeout 1200"
 expect_rc 0
 run "python3 -c '
 import json, sys

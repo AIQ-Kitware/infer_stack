@@ -29,6 +29,7 @@ run "python3 \"$E2E_ROOT/inspect.py\" \"$COMPOSE\""
 expect_rc 0
 expect_out 'has litellm: False'
 expect_out 'has open-webui: True'
+expect_out 'open-webui host_port: 13000'   # UI front door is up even with no gateway
 expect_out 'open-webui ENABLE_OLLAMA_API: True'
 expect_out 'open-webui ENABLE_OPENAI_API: False'
 expect_re 'open-webui OLLAMA_BASE_URL: http://ollama-'
@@ -47,8 +48,9 @@ run "curl -s \"http://127.0.0.1:$OPORT/v1/chat/completions\" \
       -d '{\"model\":\"smollm2:135m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}'"
 expect_rc 0
 expect_out '"choices"'
-# with no gateway, access() still surfaces the Open WebUI URL
+note 'chat answered straight from the daemon — no gateway in the path'
+# status still works with no gateway (holistic overview, not the UI URL)
 run 'infer-stack status'
-expect_re 'open.?webui|13000'
+expect_rc 0
 run "infer-stack leases --json | python3 -c 'import json,sys;[print(l[\"id\"]) for l in json.load(sys.stdin)[\"leases\"] if l[\"state\"]==\"active\"]' | xargs -r -n1 infer-stack release >/dev/null 2>&1; true"
 end_step

@@ -30,8 +30,10 @@ docker pull ghcr.io/berriai/litellm:v1.82.3-stable
 docker pull ollama/ollama:latest
 ```
 
-GPU tiers assume **GPU 0 free** (GPU 1 is display-attached and skipped by the
-placer — that's finding F5, which test `60_dedicated_f5` deliberately probes).
+GPU tiers assume **GPU 0 free**. Placement now uses **every** GPU by default —
+including yardrat's display-attached **GPU 1** — so the both-GPUs / GPU-1-pin
+tiers need no special flag (set `config set skip_display_gpus true` to exclude
+the display GPU; `60_dedicated_f5` probes placement on a busy box).
 
 ## What runs
 

@@ -4,7 +4,9 @@
 # via the docker device reservation (device_ids) and run ON the GPU — NOT fall
 # back to CPU, which the old host-index CUDA_VISIBLE_DEVICES did (the reserved
 # GPU is renumbered to 0 inside the container, so CUDA_VISIBLE_DEVICES=1 pointed
-# at nothing). Needs --include-display-gpus to use the display-attached GPU 1.
+# at nothing). Placement uses every GPU by default (including the display GPU 1),
+# so no extra flag is needed; `config set skip_display_gpus true` would exclude
+# it.
 source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
@@ -16,7 +18,7 @@ fi
 COMPOSE="$INFER_STACK_DATA_DIR/leasing/compose/docker-compose.yml"
 
 step ollama-gpu1-pin 'daemon pinned to GPU 1: device_ids=[1], no host-index CUDA var'
-run "infer-stack acquire smol-ollama-gpu1 --include-display-gpus --backend compose \
+run "infer-stack acquire smol-ollama-gpu1 --backend compose \
       --catalog \"$E2E_CAT\" --require-generation --timeout 300 --json"
 expect_rc 0
 expect_out '"ready": true'
