@@ -128,9 +128,10 @@ def test_render_vllm_service():
         {'grp-a': [0, 1]},
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    # service name leads with the served model, suffixed by the deployment id
+    # service name is deterministic from the served model (no deployment-id
+    # suffix) so the gateway's static route table addresses it stably
     name = vllm_service_name(deployment)
-    assert name == 'vllm-qwen-grp-a'
+    assert name == 'vllm-qwen'
     svc = rc.compose['services'][name]
     assert svc['image'] == 'vllm/vllm-openai:test'
     assert svc['command'][0] == 'Qwen/Q'
@@ -204,9 +205,10 @@ def test_vllm_service_name_is_model_led_and_dns_safe():
 
     g = vllm('grp-098ed1', hf='Qwen/Qwen2.5-0.5B-Instruct', served='Qwen2.5-0.5B')
     name = vllm_service_name(g)
-    # leads with the served model (slugified), suffixed by the full deployment id so
-    # it is unique and correlates with `infer-stack leases`
-    assert name == 'vllm-qwen2-5-0-5b-grp-098ed1'
+    # deterministic from the served model (slugified), with NO deployment-id
+    # suffix, so a catalog endpoint and its live deployment resolve to the same
+    # on-network DNS host (what makes the gateway's static route table work)
+    assert name == 'vllm-qwen2-5-0-5b'
     # usable as a compose service *and* an on-network DNS host (LiteLLM routes
     # to it), so it must be lowercase [a-z0-9-]
     assert _re.fullmatch(r'[a-z0-9-]+', name)
@@ -481,10 +483,88 @@ def test_render_litellm_front_door(tmp_path):
     entry = cfg['model_list'][0]
     assert entry['model_name'] == 'grp-a'                  # alias = endpoint
     assert entry['litellm_params']['model'] == 'openai/qwen-served'
-    # api_base host == the vLLM service name, so LiteLLM routes over the network
+    # api_base host == the (deterministic) vLLM service name, so LiteLLM routes
+    # over the network. This legacy per-deployment path (no catalog) keeps the
+    # served-name-derived host; see the catalog-superset tests for no-blip.
     assert entry['litellm_params']['api_base'] == (
-        'http://vllm-qwen-served-grp-a:8000/v1'
+        'http://vllm-qwen-served:8000/v1'
     )
+
+
+def _two_endpoint_catalog():
+    from infer_stack.leasing.catalog import Catalog
+
+    return Catalog.from_dict(
+        {
+            'models': {
+                'ma': {'source': 'hf://org/a'},
+                'mb': {'source': 'hf://org/b'},
+            },
+            'endpoints': {
+                'alpha': {'engine': 'vllm', 'model': 'ma'},
+                'beta': {'engine': 'vllm', 'model': 'mb'},
+            },
+        }
+    )
+
+
+def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
+    """The no-blip property at the rendering level: with a catalog, the LiteLLM
+    config + service spec do NOT change when the live model set changes, so
+    `docker compose up` would not recreate the gateway (no blip)."""
+    cat = _two_endpoint_catalog()
+    # alpha live, then beta live -- two different desired sets, same catalog.
+    rc_a = render_compose(
+        [vllm('grp-a', served='alpha')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
+    )
+    rc_b = render_compose(
+        [vllm('grp-b', served='beta')], {'grp-b': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
+    )
+
+    # 1. Gateway config is identical regardless of which model is live.
+    assert rc_a.litellm_config == rc_b.litellm_config
+
+    # 2. It routes BOTH catalog endpoints (a superset), to deterministic hosts
+    #    that match the live vLLM service names.
+    cfg = yaml.safe_load(rc_a.litellm_config)
+    routes = {
+        e['model_name']: e['litellm_params']['api_base']
+        for e in cfg['model_list']
+    }
+    assert routes == {
+        'alpha': 'http://vllm-alpha:8000/v1',
+        'beta': 'http://vllm-beta:8000/v1',
+    }
+
+    # 3. The litellm SERVICE SPEC is byte-identical across the two renders (same
+    #    config_hash label, and no per-model depends_on) -> `docker compose up`
+    #    leaves the gateway container running. This is the no-blip guarantee.
+    assert rc_a.compose['services']['litellm'] == rc_b.compose['services']['litellm']
+    assert 'depends_on' not in rc_a.compose['services']['litellm']
+
+    # 4. The live upstream uses exactly the host its route points at.
+    assert 'vllm-alpha' in rc_a.compose['services']
+    assert 'vllm-beta' in rc_b.compose['services']
+
+
+def test_litellm_legacy_config_churns_without_catalog(tmp_path):
+    """Contrast: without a catalog, the config is per-live-deployment, so it
+    DOES change when the model set changes (the old, blip-causing behavior)."""
+    rc_a = render_compose(
+        [vllm('grp-a', served='alpha')], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, aux_dir=tmp_path,
+    )
+    rc_b = render_compose(
+        [vllm('grp-b', served='beta')], {'grp-b': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, aux_dir=tmp_path,
+    )
+    assert rc_a.litellm_config != rc_b.litellm_config
 
 
 def test_litellm_config_hash_label_tracks_model_list(tmp_path):

@@ -72,6 +72,14 @@ class EvictOutcome:
     reconcile: ReconcileResult
 
 
+@dataclass
+class GcOutcome:
+    expired_lease_ids: list[str]
+    idled_deployment_ids: list[str]
+    evicted_deployment_ids: list[str]
+    reconcile: ReconcileResult
+
+
 class Controller:
     """Ties a :class:`Ledger` to a :class:`Backend`.
 
@@ -215,12 +223,30 @@ class Controller:
         timeout: float = 300.0,
         interval: float = 2.0,
         apply: bool = True,
+        wait_for_placement: bool = False,
+        placement_timeout: float | None = None,
+        placement_interval: float | None = None,
     ) -> AcquireOutcome:
         """Create a lease, realize its deployments, and (optionally) block on ready.
 
         ``apply=False`` stages the lease and renders the on-disk project without
         bringing it up (and skips the readiness wait, since nothing is running).
         Placement is still computed, so an unplaceable request still fails fast.
+
+        ``wait_for_placement`` turns acquire into an *admission queue*: instead of
+        failing fast when every GPU is busy, it polls until a deployment frees one.
+        Each retry ``reconcile``s, which first ``sweep``s the ledger — so a crashed
+        job's TTL-expired lease is reclaimed while we wait, and the freed GPU lets
+        the queued request through. It is bounded by ``placement_timeout`` (default:
+        ``timeout``); a request that can never fit (one exceeding total capacity)
+        simply waits out the timeout and then fails. Default off, so interactive
+        ``acquire``/``serve`` keep their fail-fast behavior; the pipeline opts in.
+
+        .. note::
+            Queueing is plain (no reservation): a multi-GPU request can be starved
+            by a steady stream of single-GPU ones, since each freed GPU is up for
+            grabs. Head-of-line GPU reservation is a follow-up; for the small-fleet
+            case (few GPUs, rare multi-GPU jobs) plain queueing is sufficient.
         """
         from .backend import ConvergeAborted, PlacementError
 
@@ -235,11 +261,21 @@ class Controller:
             self.ledger.release(result.lease.id)
             raise
         # If a deployment this lease just requested could not be placed (e.g. no free
-        # GPU), don't block forever waiting on a container that will never come
-        # up — roll the lease back and report the planner's reason, so the deployment
-        # never lingers as a phantom ``live`` with nothing behind it.
+        # GPU), either queue for one (wait_for_placement) or — the default — roll the
+        # lease back and report the planner's reason, so the deployment never lingers
+        # as a phantom ``live`` with nothing behind it.
         requested = {g.id for g in result.deployments}
         unplaced = requested & set(rec.unplaced)
+        if unplaced and wait_for_placement and apply:
+            p_timeout = timeout if placement_timeout is None else placement_timeout
+            p_interval = (
+                interval if placement_interval is None else placement_interval
+            )
+            deadline = self.clock() + p_timeout
+            while unplaced and self.clock() < deadline:
+                self.sleep(p_interval)
+                rec = self.reconcile(apply=apply)
+                unplaced = requested & set(rec.unplaced)
         if unplaced:
             self.ledger.release(result.lease.id)
             reasons = [
@@ -286,3 +322,26 @@ class Controller:
         evicted = self.ledger.evict_idle(ids)
         rec = self.reconcile()
         return EvictOutcome(evicted_deployment_ids=evicted, reconcile=rec)
+
+    def gc(self, *, evict_idle: bool = False) -> GcOutcome:
+        """Reclaim TTL-expired leases and converge — the standalone leak backstop.
+
+        Sweeps the ledger (a TTL-expired lease stops protecting its deployments),
+        then reconciles so ``stop``-policy deployments left with no demand are torn
+        down and their GPUs freed. This is what a blocking ``acquire`` does
+        implicitly on each retry; as a standalone verb it cleans up after a
+        hard-killed job — whose ``teardown``/``release`` never ran — on a schedule
+        or as a final pipeline step. ``evict_idle`` additionally tears down idle
+        *keep-warm* deployments (like ``evict --all``); without it, healthy
+        keep-warm models are left resident and only leaked/expired demand is
+        reclaimed.
+        """
+        swept = self.ledger.sweep()
+        evicted = self.ledger.evict_idle(None) if evict_idle else []
+        rec = self.reconcile()
+        return GcOutcome(
+            expired_lease_ids=list(swept.expired_lease_ids),
+            idled_deployment_ids=list(swept.idled_deployment_ids),
+            evicted_deployment_ids=list(evicted),
+            reconcile=rec,
+        )

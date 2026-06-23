@@ -5,6 +5,39 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **`infer-stack gc` — reclaim leaked leases and free their GPUs.** Sweeps
+  TTL-expired leases (a hard-killed job — SIGKILL/OOM/reboot — never runs its
+  `release`, so its lease lingers until TTL) and reconciles, tearing down any
+  `stop`-policy deployment left with no demand. Run it periodically (cron) or as
+  a final pipeline step; a blocking `acquire --queue` already does this
+  implicitly while it waits. `--evict` also tears down idle keep-warm
+  deployments (like `evict --all`). Backed by `Controller.gc(evict_idle=...)`.
+* **Admission queue for `acquire` / `run` (`--queue`).** Instead of failing fast
+  when every GPU is busy, `acquire`/`run --queue` (and
+  `Controller.acquire(wait_for_placement=True)`) poll until a deployment frees a
+  GPU, bounded by `--timeout`. Each retry sweeps the ledger first, so a crashed
+  job's TTL-expired lease is reclaimed while waiting and its GPU lets the queued
+  request through — queueing and leak-recovery are the same mechanism. Default
+  off, so interactive use keeps its fail-fast "no GPU" error; batch/pipeline
+  fan-out opts in. Queueing is currently plain (no head-of-line reservation), so
+  a multi-GPU request can be starved by a stream of single-GPU ones — fine for
+  the small-fleet case; reservation is a follow-up.
+* **LiteLLM gateway no longer blips when the model set changes (static superset
+  route table).** When the backend has the catalog, the gateway is rendered with
+  one route per *catalog* endpoint addressing a *deterministic* upstream host
+  (`vllm-<served>` / `ollama-<host>`, no deployment-id suffix), so its config —
+  and therefore its container — is untouched as models are acquired/released:
+  `docker compose up` leaves the gateway running instead of recreating it. The
+  `config_hash` still recreates it when the *catalog itself* changes (new/removed
+  endpoints), which is correct. vLLM/Ollama service names are now deterministic
+  from the served name/host (`observe` still correlates containers via the
+  `infer-stack.deployment` label, so reconcile is unaffected). The per-model
+  `depends_on` on the gateway is dropped (the `router_settings` already make the
+  upstream-warmup window self-healing). Without a catalog the legacy
+  per-deployment config is used (and still churns). Caveat: two simultaneously
+  *desired* deployments sharing a served name (an endpoint re-pointed at a new
+  model while the old is live) would collide on the deterministic name — an
+  interactive case unsupported under the static gateway.
 * **Open WebUI can manage Ollama's own models.** Open WebUI is no longer locked
   to the LiteLLM gateway with `ENABLE_OLLAMA_API=False`. It now holds two
   connections: an **OpenAI** connection (the gateway when on, else a single

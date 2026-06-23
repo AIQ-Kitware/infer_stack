@@ -197,6 +197,15 @@ def _make_backend(config, *, interactive: bool = False):
         from ..hardware import detect_inventory
 
         rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
+        # Best-effort catalog so the LiteLLM gateway gets a static superset route
+        # table (one route per catalog endpoint) and is never recreated as models
+        # come/go. Loaded on EVERY converge — including release/gc, which don't
+        # take a catalog arg — so no-blip holds across acquire AND release; for
+        # that the catalog must be discoverable (default path or always --catalog).
+        try:
+            catalog = _load_catalog(config)
+        except SystemExit:
+            catalog = None  # no catalog -> legacy per-deployment gateway config
         return ComposeBackend(
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
@@ -209,6 +218,7 @@ def _make_backend(config, *, interactive: bool = False):
             reverse_proxy_config=rp_config,
             require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            catalog=catalog,
         )
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI yet '
@@ -425,6 +435,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
             timeout=float(config.timeout),
             interval=float(config.interval),
             apply=not render_only,
+            wait_for_placement=bool(getattr(config, 'queue', False)),
         )
     except ConvergeAborted:
         raise SystemExit('aborted: compose changes not applied (no lease kept)')
@@ -517,6 +528,14 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
     )
     wait = scfg.Value(
         True, isflag=True, help='Block until ready (use --no-wait to skip).'
+    )
+    queue = scfg.Value(
+        False, isflag=True,
+        help='Admission queue: if every GPU is busy, WAIT for one to free '
+        '(up to --timeout) instead of failing fast. Each retry sweeps the '
+        'ledger, so a crashed job\'s TTL-expired lease is reclaimed while '
+        'waiting. Intended for batch/pipeline fan-out; interactive use '
+        'defaults off (fail fast with a clear "no GPU" error).',
     )
     apply = scfg.Value(
         True,
@@ -897,6 +916,59 @@ class EvictCLI(_ApprovalMixin):
         return 0
 
 
+class GcCLI(_ApprovalMixin):
+    """Reclaim leaked leases and free their GPUs — sweep TTL-expired leases, converge.
+
+    A job that is hard-killed (SIGKILL / OOM / reboot) never runs its ``release``,
+    so its lease lingers until its TTL elapses. ``gc`` sweeps those expired leases
+    and reconciles, tearing down any ``stop``-policy deployment left with no demand
+    and freeing its GPU. Run it periodically (cron) or as a final pipeline step; a
+    blocking ``acquire`` (``--queue``) already does this implicitly while it waits.
+    ``--evict`` additionally tears down idle *keep-warm* deployments (like ``evict
+    --all``). On a terminal the teardown is shown and confirmed (``--yes`` skips).
+    """
+
+    __command__ = 'gc'
+
+    evict = scfg.Value(
+        False, isflag=True,
+        help='Also tear down idle keep-warm deployments (like `evict --all`), '
+        'not just leaked/expired demand.',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        try:
+            outcome = controller.gc(evict_idle=bool(config.evict))
+        except ConvergeAborted:
+            raise _declined_exit()
+        if config.json:
+            print(json.dumps({
+                'expired_leases': outcome.expired_lease_ids,
+                'idled': outcome.idled_deployment_ids,
+                'evicted': outcome.evicted_deployment_ids,
+                'torn_down': outcome.reconcile.torn_down,
+            }, indent=2))
+        else:
+            n_exp = len(outcome.expired_lease_ids)
+            torn = outcome.reconcile.torn_down
+            if not n_exp and not torn and not outcome.evicted_deployment_ids:
+                print('gc: nothing to reclaim')
+            else:
+                print(
+                    f'gc: reclaimed {n_exp} expired lease(s), '
+                    f'tore down {len(torn)} deployment(s)'
+                )
+                for gid in torn:
+                    print(f'  {gid}')
+        return 0
+
+
 class WaitCLI(_LeasingCommonMixin):
     """Block until served endpoints are ready — the companion to ``acquire
     --no-wait``.
@@ -1060,6 +1132,12 @@ class RunCLI(_LeasingCommonMixin):
     ttl = scfg.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
     timeout = scfg.Value(600, type=float)
     interval = scfg.Value(5, type=float)
+    queue = scfg.Value(
+        False, isflag=True,
+        help='Admission queue: wait (up to --timeout) for a GPU to free '
+        'instead of failing fast when the fleet is full. Recommended for '
+        'pipeline fan-out, where many jobs contend for a few GPUs.',
+    )
     command = scfg.Value(
         [], nargs='*', position=1, type=str, help='Command to run (after --).'
     )
@@ -1083,6 +1161,7 @@ class RunCLI(_LeasingCommonMixin):
             wait=True,
             timeout=float(config.timeout),
             interval=float(config.interval),
+            wait_for_placement=bool(getattr(config, 'queue', False)),
         )
         if outcome.wait is not None and not outcome.wait.ready:
             controller.release(outcome.lease.id)
