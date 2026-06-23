@@ -197,6 +197,15 @@ def _make_backend(config, *, interactive: bool = False):
         from ..hardware import detect_inventory
 
         rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
+        # Best-effort catalog so the LiteLLM gateway gets a static superset route
+        # table (one route per catalog endpoint) and is never recreated as models
+        # come/go. Loaded on EVERY converge — including release/gc, which don't
+        # take a catalog arg — so no-blip holds across acquire AND release; for
+        # that the catalog must be discoverable (default path or always --catalog).
+        try:
+            catalog = _load_catalog(config)
+        except SystemExit:
+            catalog = None  # no catalog -> legacy per-deployment gateway config
         return ComposeBackend(
             state_dir=data_root() / 'leasing' / 'compose',
             inventory=detect_inventory(),
@@ -209,6 +218,7 @@ def _make_backend(config, *, interactive: bool = False):
             reverse_proxy_config=rp_config,
             require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            catalog=catalog,
         )
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI yet '
