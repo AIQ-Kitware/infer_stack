@@ -425,6 +425,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
             timeout=float(config.timeout),
             interval=float(config.interval),
             apply=not render_only,
+            wait_for_placement=bool(getattr(config, 'queue', False)),
         )
     except ConvergeAborted:
         raise SystemExit('aborted: compose changes not applied (no lease kept)')
@@ -517,6 +518,14 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
     )
     wait = scfg.Value(
         True, isflag=True, help='Block until ready (use --no-wait to skip).'
+    )
+    queue = scfg.Value(
+        False, isflag=True,
+        help='Admission queue: if every GPU is busy, WAIT for one to free '
+        '(up to --timeout) instead of failing fast. Each retry sweeps the '
+        'ledger, so a crashed job\'s TTL-expired lease is reclaimed while '
+        'waiting. Intended for batch/pipeline fan-out; interactive use '
+        'defaults off (fail fast with a clear "no GPU" error).',
     )
     apply = scfg.Value(
         True,
@@ -1060,6 +1069,12 @@ class RunCLI(_LeasingCommonMixin):
     ttl = scfg.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
     timeout = scfg.Value(600, type=float)
     interval = scfg.Value(5, type=float)
+    queue = scfg.Value(
+        False, isflag=True,
+        help='Admission queue: wait (up to --timeout) for a GPU to free '
+        'instead of failing fast when the fleet is full. Recommended for '
+        'pipeline fan-out, where many jobs contend for a few GPUs.',
+    )
     command = scfg.Value(
         [], nargs='*', position=1, type=str, help='Command to run (after --).'
     )
@@ -1083,6 +1098,7 @@ class RunCLI(_LeasingCommonMixin):
             wait=True,
             timeout=float(config.timeout),
             interval=float(config.interval),
+            wait_for_placement=bool(getattr(config, 'queue', False)),
         )
         if outcome.wait is not None and not outcome.wait.ready:
             controller.release(outcome.lease.id)

@@ -5,6 +5,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **Admission queue for `acquire` / `run` (`--queue`).** Instead of failing fast
+  when every GPU is busy, `acquire`/`run --queue` (and
+  `Controller.acquire(wait_for_placement=True)`) poll until a deployment frees a
+  GPU, bounded by `--timeout`. Each retry sweeps the ledger first, so a crashed
+  job's TTL-expired lease is reclaimed while waiting and its GPU lets the queued
+  request through — queueing and leak-recovery are the same mechanism. Default
+  off, so interactive use keeps its fail-fast "no GPU" error; batch/pipeline
+  fan-out opts in. Queueing is currently plain (no head-of-line reservation), so
+  a multi-GPU request can be starved by a stream of single-GPU ones — fine for
+  the small-fleet case; reservation is a follow-up.
 * **Open WebUI can manage Ollama's own models.** Open WebUI is no longer locked
   to the LiteLLM gateway with `ENABLE_OLLAMA_API=False`. It now holds two
   connections: an **OpenAI** connection (the gateway when on, else a single
