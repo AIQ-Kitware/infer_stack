@@ -5,6 +5,22 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **LiteLLM gateway no longer blips when the model set changes (static superset
+  route table).** When the backend has the catalog, the gateway is rendered with
+  one route per *catalog* endpoint addressing a *deterministic* upstream host
+  (`vllm-<served>` / `ollama-<host>`, no deployment-id suffix), so its config —
+  and therefore its container — is untouched as models are acquired/released:
+  `docker compose up` leaves the gateway running instead of recreating it. The
+  `config_hash` still recreates it when the *catalog itself* changes (new/removed
+  endpoints), which is correct. vLLM/Ollama service names are now deterministic
+  from the served name/host (`observe` still correlates containers via the
+  `infer-stack.deployment` label, so reconcile is unaffected). The per-model
+  `depends_on` on the gateway is dropped (the `router_settings` already make the
+  upstream-warmup window self-healing). Without a catalog the legacy
+  per-deployment config is used (and still churns). Caveat: two simultaneously
+  *desired* deployments sharing a served name (an endpoint re-pointed at a new
+  model while the old is live) would collide on the deterministic name — an
+  interactive case unsupported under the static gateway.
 * **Open WebUI can manage Ollama's own models.** Open WebUI is no longer locked
   to the LiteLLM gateway with `ENABLE_OLLAMA_API=False`. It now holds two
   connections: an **OpenAI** connection (the gateway when on, else a single

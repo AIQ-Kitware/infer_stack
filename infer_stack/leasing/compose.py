@@ -74,24 +74,51 @@ def _dns_slug(text: str) -> str:
     return out or 'model'
 
 
+def vllm_service_name_for(served: str) -> str:
+    """Deterministic compose/DNS service name for a vLLM upstream: ``vllm-<served>``.
+
+    Derived purely from the served model name (vLLM's ``--served-model-name``,
+    the Open WebUI label, the alias the user chose), so it is identical whether
+    computed from a live :class:`Deployment` or from a catalog endpoint. That
+    stability is what lets the LiteLLM gateway carry a *static* route table (one
+    per catalog endpoint) whose upstream hosts match the containers when they
+    come up — so adding/removing models does not rewrite the gateway's config and
+    the gateway is never recreated (no "blip"); see :func:`_litellm_model_list`.
+    """
+    return f'vllm-{_dns_slug(served)}'
+
+
 def vllm_service_name(deployment: Deployment) -> str:
-    """Compose service name for a vLLM deployment: ``vllm-<model>-<deployment-id>``.
+    """Compose service name for a vLLM deployment (see :func:`vllm_service_name_for`).
 
-    A vLLM deployment is exactly one model in one container (possibly across several
-    GPUs), so we lead the service name with the served model name — the alias
-    the user chose, also vLLM's ``--served-model-name`` and the Open WebUI label
-    — to make ``docker ps`` / ``nvidia-smi`` legible *without* infer-stack. The
-    full deployment id is kept as a suffix so the name is unique (two desired deployments
-    can share a served name, e.g. an endpoint re-pointed at a new model) and so
-    it correlates 1:1 with the ``id`` column of ``infer-stack leases``.
-
-    The service name is also the on-network DNS host LiteLLM routes to, so
-    :func:`_litellm_model_list` must derive the upstream from this same helper.
+    Deterministic from the served model name only — *no* deployment-id suffix —
+    so it matches the gateway's pre-rendered route for that endpoint. Trade-off:
+    two *simultaneously desired* deployments that share a served name (an endpoint
+    re-pointed at a new model while the old one is still live) would collide on
+    this name; that interactive case is unsupported under the static-gateway
+    model (the catalog endpoint is the unit). ``observe`` correlates a running
+    container back to its deployment id via the ``infer-stack.deployment`` label,
+    not this name, so the dropped suffix does not affect reconcile bookkeeping.
     """
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
     )
-    return f'vllm-{_dns_slug(served)}-{deployment.id}'
+    return vllm_service_name_for(served)
+
+
+def ollama_service_name_for(host: str) -> str:
+    """Deterministic service name for an Ollama daemon: ``ollama-<host>``.
+
+    One daemon per host (Ollama coalesces tags onto it), so the host is the
+    stable key — matching :func:`vllm_service_name_for`'s role for vLLM so the
+    gateway's static route table addresses it regardless of which tags are live.
+    """
+    return f'ollama-{_dns_slug(host)}'
+
+
+def ollama_service_name(deployment: Deployment) -> str:
+    host = deployment.spec.get('host') or deployment.id
+    return ollama_service_name_for(host)
 
 
 @dataclass
@@ -246,7 +273,7 @@ def _litellm_model_list(
                     }
                 )
         elif deployment.engine == 'ollama':
-            api_base = f'http://ollama-{deployment.id}:11434'
+            api_base = f'http://{ollama_service_name(deployment)}:{OLLAMA_CONTAINER_PORT}'
             for endpoint, payload in sorted(deployment.served.items()):
                 tag = payload.get('model', endpoint)
                 entries.append(
@@ -258,6 +285,58 @@ def _litellm_model_list(
                         },
                     }
                 )
+    return entries
+
+
+def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
+    """A *static superset* ``model_list``: one route per catalog endpoint.
+
+    Unlike :func:`_litellm_model_list` (which routes only the currently-placed
+    deployments), this routes *every* catalog endpoint to its deterministic
+    upstream host (:func:`vllm_service_name_for` / :func:`ollama_service_name_for`).
+    The resulting config therefore depends only on the catalog, not on which
+    models happen to be up — so acquiring/releasing a model leaves the gateway's
+    config (and its container) untouched (no blip). A route whose upstream is not
+    currently running simply errors/cools-down until it comes up; the
+    ``router_settings`` below make that warmup self-healing. ``/v1/models`` lists
+    the whole catalog (some upstreams down) rather than only the live set.
+    """
+    entries: list[dict[str, Any]] = []
+    for name in sorted(getattr(catalog, 'endpoints', {})):
+        try:
+            req = catalog.resolve_endpoint(name)
+        except Exception:  # noqa: BLE001 - a bad endpoint must not break the gateway
+            continue
+        if req.engine == 'vllm':
+            served = req.served.get('served_model_name') or name
+            api_base = (
+                f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1'
+            )
+            entries.append(
+                {
+                    'model_name': name,
+                    'litellm_params': {
+                        'model': f'openai/{served}',
+                        'api_base': api_base,
+                        'api_key': 'EMPTY',
+                    },
+                }
+            )
+        elif req.engine == 'ollama':
+            host = req.spec.get('host') or req.host
+            tag = req.served.get('model') or name
+            api_base = (
+                f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
+            )
+            entries.append(
+                {
+                    'model_name': name,
+                    'litellm_params': {
+                        'model': f'ollama/{tag}',
+                        'api_base': api_base,
+                    },
+                }
+            )
     return entries
 
 
@@ -493,6 +572,7 @@ def render_compose(
     reverse_proxy_config: str | None = None,
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
+    catalog: Any = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
 
@@ -528,7 +608,7 @@ def render_compose(
             services[name] = _vllm_service(deployment, gpus, port, images, state)
             vllm_v1_urls.append(f'http://{name}:{VLLM_CONTAINER_PORT}/v1')
         elif deployment.engine == 'ollama':
-            name = f'ollama-{deployment.id}'
+            name = ollama_service_name(deployment)
             port = ports.get('ollama', DEFAULT_PORTS['ollama']) + ollama_i
             ollama_i += 1
             services[name] = _ollama_service(deployment, gpus, port, images, state)
@@ -544,7 +624,21 @@ def render_compose(
     # WebUI picker) up instead of tearing the whole stack down; only an explicit
     # `stack down` removes it. With no models the model_list is simply empty.
     if litellm:
-        entries = _litellm_model_list(deployments, assignments)
+        # Prefer a STATIC superset route table from the catalog: one route per
+        # catalog endpoint, addressing a deterministic upstream host. That config
+        # depends only on the catalog, not on which models are placed — so
+        # acquiring/releasing a model leaves the LiteLLM config (hence its
+        # container) untouched and the gateway is not recreated ("no blip"). The
+        # config_hash still changes if the *catalog* changes, correctly
+        # recreating the gateway to pick up new/removed endpoints. Without a
+        # catalog (legacy / tests) fall back to routing only the placed
+        # deployments, which does churn per model change.
+        if catalog is not None:
+            entries = _litellm_model_list_from_catalog(catalog)
+            litellm_depends: list[str] = []  # no per-model depends_on -> no churn
+        else:
+            entries = _litellm_model_list(deployments, assignments)
+            litellm_depends = list(service_map)
         litellm_config = yaml.safe_dump(
             {
                 'model_list': entries,
@@ -570,7 +664,7 @@ def render_compose(
             litellm_config.encode('utf-8')
         ).hexdigest()[:12]
         services[LITELLM_SERVICE] = _litellm_service(
-            list(service_map),
+            litellm_depends,
             litellm_port,
             images,
             str(aux_dir or '.'),
@@ -701,6 +795,7 @@ class ComposeBackend:
         reverse_proxy_config: str | None = None,
         require_generation: bool = False,
         assume_yes: bool = True,
+        catalog: Any = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -724,6 +819,10 @@ class ComposeBackend:
         self.reverse_proxy_config = reverse_proxy_config
         self.require_generation = require_generation
         self.assume_yes = assume_yes
+        # Optional catalog: when present, the LiteLLM gateway is rendered with a
+        # static superset route table (one route per catalog endpoint) so the
+        # gateway is never recreated as models come and go. See render_compose.
+        self.catalog = catalog
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
@@ -893,6 +992,7 @@ class ComposeBackend:
                 reverse_proxy_config=self.reverse_proxy_config,
                 aux_dir=self.state_dir,
                 project=self.project,
+                catalog=self.catalog,
             )
 
             compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
