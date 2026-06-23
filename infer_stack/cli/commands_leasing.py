@@ -906,6 +906,59 @@ class EvictCLI(_ApprovalMixin):
         return 0
 
 
+class GcCLI(_ApprovalMixin):
+    """Reclaim leaked leases and free their GPUs — sweep TTL-expired leases, converge.
+
+    A job that is hard-killed (SIGKILL / OOM / reboot) never runs its ``release``,
+    so its lease lingers until its TTL elapses. ``gc`` sweeps those expired leases
+    and reconciles, tearing down any ``stop``-policy deployment left with no demand
+    and freeing its GPU. Run it periodically (cron) or as a final pipeline step; a
+    blocking ``acquire`` (``--queue``) already does this implicitly while it waits.
+    ``--evict`` additionally tears down idle *keep-warm* deployments (like ``evict
+    --all``). On a terminal the teardown is shown and confirmed (``--yes`` skips).
+    """
+
+    __command__ = 'gc'
+
+    evict = scfg.Value(
+        False, isflag=True,
+        help='Also tear down idle keep-warm deployments (like `evict --all`), '
+        'not just leaked/expired demand.',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        try:
+            outcome = controller.gc(evict_idle=bool(config.evict))
+        except ConvergeAborted:
+            raise _declined_exit()
+        if config.json:
+            print(json.dumps({
+                'expired_leases': outcome.expired_lease_ids,
+                'idled': outcome.idled_deployment_ids,
+                'evicted': outcome.evicted_deployment_ids,
+                'torn_down': outcome.reconcile.torn_down,
+            }, indent=2))
+        else:
+            n_exp = len(outcome.expired_lease_ids)
+            torn = outcome.reconcile.torn_down
+            if not n_exp and not torn and not outcome.evicted_deployment_ids:
+                print('gc: nothing to reclaim')
+            else:
+                print(
+                    f'gc: reclaimed {n_exp} expired lease(s), '
+                    f'tore down {len(torn)} deployment(s)'
+                )
+                for gid in torn:
+                    print(f'  {gid}')
+        return 0
+
+
 class WaitCLI(_LeasingCommonMixin):
     """Block until served endpoints are ready — the companion to ``acquire
     --no-wait``.

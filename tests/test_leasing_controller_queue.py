@@ -159,8 +159,59 @@ def test_acquire_queue_times_out_when_never_freed():
     assert all(lease.owner != 'bob' or lease.state != 'active' for lease in leases)
 
 
+def test_gc_reclaims_expired_lease_and_frees_gpu():
+    """A hard-killed job's lease is reclaimed by gc once its TTL elapses; a
+    stop-policy deployment with no remaining demand is torn down."""
+
+    def sleep(clock, ledger):
+        return lambda dt: clock.advance(dt)
+
+    ctl, backend, clock, ledger = _make(budget=4, sleep=sleep)
+    a = ctl.acquire('alice', [vreq('A', reclaim='stop')], ttl_seconds=100)
+    gid = a.deployments[0].id
+    assert gid in backend.observe()
+
+    # Simulate a hard kill: the job dies, never releases. Before TTL, gc is a
+    # no-op (the lease still protects the deployment).
+    clock.advance(50)
+    out = ctl.gc()
+    assert out.expired_lease_ids == []
+    assert gid in backend.observe()
+
+    # After the TTL elapses, gc sweeps the leaked lease and tears the deployment down.
+    clock.advance(100)
+    out = ctl.gc()
+    assert a.lease.id in out.expired_lease_ids
+    assert gid in out.reconcile.torn_down
+    assert backend.observe() == set()
+
+
+def test_gc_leaves_keepwarm_unless_evict():
+    """gc reclaims leaked demand but leaves a healthy idle keep-warm model
+    resident; gc --evict tears it down too."""
+
+    def sleep(clock, ledger):
+        return lambda dt: clock.advance(dt)
+
+    ctl, backend, clock, ledger = _make(budget=4, sleep=sleep)
+    a = ctl.acquire('alice', [vreq('A', reclaim='keep-warm')])
+    gid = a.deployments[0].id
+    ctl.release(a.lease.id)  # graceful release -> idle, but keep-warm stays resident
+    assert gid in backend.observe()
+
+    out = ctl.gc()  # plain gc must not disturb a healthy keep-warm idle model
+    assert gid in backend.observe()
+    assert out.reconcile.torn_down == []
+
+    out = ctl.gc(evict_idle=True)  # --evict tears down idle keep-warm too
+    assert gid in out.evicted_deployment_ids
+    assert backend.observe() == set()
+
+
 if __name__ == '__main__':
     test_unplaced_fails_fast_by_default()
     test_acquire_queues_until_a_gpu_frees()
     test_acquire_queue_times_out_when_never_freed()
-    print('All controller admission-queue tests passed.')
+    test_gc_reclaims_expired_lease_and_frees_gpu()
+    test_gc_leaves_keepwarm_unless_evict()
+    print('All controller admission-queue + gc tests passed.')

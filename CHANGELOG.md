@@ -5,6 +5,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **`infer-stack gc` — reclaim leaked leases and free their GPUs.** Sweeps
+  TTL-expired leases (a hard-killed job — SIGKILL/OOM/reboot — never runs its
+  `release`, so its lease lingers until TTL) and reconciles, tearing down any
+  `stop`-policy deployment left with no demand. Run it periodically (cron) or as
+  a final pipeline step; a blocking `acquire --queue` already does this
+  implicitly while it waits. `--evict` also tears down idle keep-warm
+  deployments (like `evict --all`). Backed by `Controller.gc(evict_idle=...)`.
 * **Admission queue for `acquire` / `run` (`--queue`).** Instead of failing fast
   when every GPU is busy, `acquire`/`run --queue` (and
   `Controller.acquire(wait_for_placement=True)`) poll until a deployment frees a

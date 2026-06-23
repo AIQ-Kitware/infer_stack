@@ -72,6 +72,14 @@ class EvictOutcome:
     reconcile: ReconcileResult
 
 
+@dataclass
+class GcOutcome:
+    expired_lease_ids: list[str]
+    idled_deployment_ids: list[str]
+    evicted_deployment_ids: list[str]
+    reconcile: ReconcileResult
+
+
 class Controller:
     """Ties a :class:`Ledger` to a :class:`Backend`.
 
@@ -314,3 +322,26 @@ class Controller:
         evicted = self.ledger.evict_idle(ids)
         rec = self.reconcile()
         return EvictOutcome(evicted_deployment_ids=evicted, reconcile=rec)
+
+    def gc(self, *, evict_idle: bool = False) -> GcOutcome:
+        """Reclaim TTL-expired leases and converge — the standalone leak backstop.
+
+        Sweeps the ledger (a TTL-expired lease stops protecting its deployments),
+        then reconciles so ``stop``-policy deployments left with no demand are torn
+        down and their GPUs freed. This is what a blocking ``acquire`` does
+        implicitly on each retry; as a standalone verb it cleans up after a
+        hard-killed job — whose ``teardown``/``release`` never ran — on a schedule
+        or as a final pipeline step. ``evict_idle`` additionally tears down idle
+        *keep-warm* deployments (like ``evict --all``); without it, healthy
+        keep-warm models are left resident and only leaked/expired demand is
+        reclaimed.
+        """
+        swept = self.ledger.sweep()
+        evicted = self.ledger.evict_idle(None) if evict_idle else []
+        rec = self.reconcile()
+        return GcOutcome(
+            expired_lease_ids=list(swept.expired_lease_ids),
+            idled_deployment_ids=list(swept.idled_deployment_ids),
+            evicted_deployment_ids=list(evicted),
+            reconcile=rec,
+        )

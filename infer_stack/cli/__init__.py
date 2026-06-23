@@ -41,6 +41,7 @@ from .commands_leasing import (
     AcquireCLI,
     ApplyCLI,
     EvictCLI,
+    GcCLI,
     LeasesCLI,
     ReleaseCLI,
     RenewCLI,
@@ -114,6 +115,7 @@ class ManageCLI(scfg.ModalCLI):
     acquire = AcquireCLI  # stand up endpoints: lease + up + wait (--ttl for soft TTL)
     release = ReleaseCLI
     evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
+    gc = GcCLI  # reclaim TTL-expired (leaked) leases + free their GPUs
     renew = RenewCLI
     run = RunCLI
     # Reconcile primitives (lease-free): render desired -> disk, apply disk -> up
