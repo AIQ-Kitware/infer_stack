@@ -32,6 +32,7 @@ dynamic = [
 ]
 dependencies = [
   "jinja2>=3.1",
+  "loguru>=0.7",
   "pyyaml>=6.0",
   "requests>=2.31",
   "rich>=13.0",
@@ -41,6 +42,9 @@ dependencies = [
 optional-dependencies.tests = [
   "pytest>=7.0",
   "pytest-codeblocks>=0.17",
+]
+optional-dependencies.tui = [
+    "textual>=0.50",
 ]
 urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
 scripts.infer-stack = "infer_stack.cli:main"

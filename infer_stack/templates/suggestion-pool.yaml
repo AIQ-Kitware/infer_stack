@@ -1,0 +1,377 @@
+# suggestion-pool.yaml — the curated pool of "useful models" the leasing
+# controller draws on when it seeds a catalog from server introspection.
+#
+# This is the intrinsic, *hardware-independent* model registry: each entry
+# states facts that are true on any box (footprint, min per-GPU VRAM, preferred
+# GPU count, context window, sane vLLM defaults). `infer_stack.leasing.suggest`
+# JOINS this pool against the detected GPU inventory to derive a concrete,
+# fits-this-server catalog ("seeding is a pure function
+# inventory × registry → catalog").
+#
+# Entries are lifted from the legacy `default-vllm-models.yaml`, spanning the
+# current-generation families (Qwen3.5 / Qwen3.6 / Gemma 4 — all real, released
+# Feb-Apr 2026) down through the prior-gen instruct workhorses (Qwen2.5, Llama 3,
+# Mistral) and a couple of tiny smoke-test models, plus the two SmolLM2/Qwen2.5
+# models the leasing demo serves so the demo's set is reproducible. Big entries
+# are kept even where they need more than one GPU — the pool is hardware-blind,
+# and `suggest` filters per box. served_model_name is normalized to a clean slug
+# (the legacy Together-style `org/model-turbo` aliases are dropped).
+#
+# This file is a *suggestion source*, never a live catalog — nothing here has a
+# lifecycle. The legacy `default-vllm-models.yaml` is left untouched as the
+# legacy compiler's fixture.
+
+vllm_models:
+
+  # -- tiny: smoke-test / CI models, fit on any GPU ----------------------
+  gpt2:
+    hf_model_id: openai-community/gpt2
+    served_model_name: gpt2
+    family: gpt2
+    modalities: [text]
+    memory_class_gib: 1
+    min_vram_gib_per_replica: 1
+    preferred_gpu_count: 1
+    context_window: 1024
+    defaults:
+      max_model_len: 1024
+      gpu_memory_utilization: 0.3
+  pythia-410m:
+    hf_model_id: EleutherAI/pythia-410m
+    served_model_name: pythia-410m
+    family: pythia
+    modalities: [text]
+    memory_class_gib: 2
+    min_vram_gib_per_replica: 2
+    preferred_gpu_count: 1
+    context_window: 2048
+    defaults:
+      max_model_len: 2048
+      gpu_memory_utilization: 0.3
+  smollm2-135m:
+    hf_model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+    served_model_name: smollm2-135m
+    family: smollm2
+    modalities: [text]
+    memory_class_gib: 1
+    min_vram_gib_per_replica: 1
+    preferred_gpu_count: 1
+    context_window: 8192
+    defaults:
+      max_model_len: 8192
+      gpu_memory_utilization: 0.3
+      enable_prefix_caching: true
+
+  # -- small instruct: comfortable on a single small/mid GPU -------------
+  smollm2-1.7b:
+    hf_model_id: HuggingFaceTB/SmolLM2-1.7B-Instruct
+    served_model_name: smollm2-1.7b
+    family: smollm2
+    modalities: [text]
+    memory_class_gib: 4
+    min_vram_gib_per_replica: 4
+    preferred_gpu_count: 1
+    context_window: 8192
+    defaults:
+      max_model_len: 8192
+      gpu_memory_utilization: 0.4
+      enable_prefix_caching: true
+  qwen2.5-0.5b:
+    hf_model_id: Qwen/Qwen2.5-0.5B-Instruct
+    served_model_name: qwen2.5-0.5b
+    family: qwen2.5
+    modalities: [text]
+    memory_class_gib: 2
+    min_vram_gib_per_replica: 2
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.4
+      enable_prefix_caching: true
+  qwen2.5-1.5b:
+    hf_model_id: Qwen/Qwen2.5-1.5B-Instruct
+    served_model_name: qwen2.5-1.5b
+    family: qwen2.5
+    modalities: [text]
+    memory_class_gib: 4
+    min_vram_gib_per_replica: 4
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.4
+      enable_prefix_caching: true
+
+  # -- mid instruct: a single 16-24 GiB GPU ------------------------------
+  qwen2.5-7b:
+    hf_model_id: Qwen/Qwen2.5-7B-Instruct
+    served_model_name: qwen2.5-7b
+    family: qwen2.5
+    modalities: [text]
+    memory_class_gib: 16
+    min_vram_gib_per_replica: 16
+    preferred_gpu_count: 1
+    context_window: 131072
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  mistral-7b-instruct:
+    hf_model_id: mistralai/Mistral-7B-Instruct-v0.3
+    served_model_name: mistral-7b-instruct
+    family: mistral
+    modalities: [text]
+    memory_class_gib: 16
+    min_vram_gib_per_replica: 16
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  llama3-8b-instruct:
+    hf_model_id: meta-llama/Meta-Llama-3-8B-Instruct
+    served_model_name: llama3-8b-instruct
+    family: llama3
+    modalities: [text]
+    memory_class_gib: 18
+    min_vram_gib_per_replica: 18
+    preferred_gpu_count: 1
+    context_window: 8192
+    defaults:
+      max_model_len: 8192
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  llama3.1-8b-instruct:
+    hf_model_id: meta-llama/Meta-Llama-3.1-8B-Instruct
+    served_model_name: llama3.1-8b-instruct
+    family: llama3.1
+    modalities: [text]
+    memory_class_gib: 18
+    min_vram_gib_per_replica: 18
+    preferred_gpu_count: 1
+    context_window: 131072
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+
+  # -- large: needs a big GPU, or tensor-parallel across two --------------
+  gpt-oss-20b:
+    hf_model_id: openai/gpt-oss-20b
+    served_model_name: gpt-oss-20b
+    family: gpt-oss
+    modalities: [text]
+    memory_class_gib: 40
+    min_vram_gib_per_replica: 40
+    preferred_gpu_count: 1
+    context_window: 131072
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen2.5-72b:
+    hf_model_id: Qwen/Qwen2.5-72B-Instruct
+    served_model_name: qwen2.5-72b
+    family: qwen2.5
+    modalities: [text]
+    memory_class_gib: 144
+    min_vram_gib_per_replica: 72
+    preferred_gpu_count: 2
+    context_window: 131072
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+
+  # -- Qwen3.5 (current gen, reasoning) ----------------------------------
+  # 0.8B-9B fit a single 24 GiB GPU; 27B+ need a 48 GiB card or more.
+  qwen3.5-0.8b:
+    hf_model_id: Qwen/Qwen3.5-0.8B
+    served_model_name: qwen3.5-0.8b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 4
+    min_vram_gib_per_replica: 4
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-2b:
+    hf_model_id: Qwen/Qwen3.5-2B
+    served_model_name: qwen3.5-2b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 8
+    min_vram_gib_per_replica: 8
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-4b:
+    hf_model_id: Qwen/Qwen3.5-4B
+    served_model_name: qwen3.5-4b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 12
+    min_vram_gib_per_replica: 12
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-9b:
+    hf_model_id: Qwen/Qwen3.5-9B
+    served_model_name: qwen3.5-9b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 20
+    min_vram_gib_per_replica: 20
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-27b:
+    hf_model_id: Qwen/Qwen3.5-27B
+    served_model_name: qwen3.5-27b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 48
+    min_vram_gib_per_replica: 48
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-35b-a3b:
+    hf_model_id: Qwen/Qwen3.5-35B-A3B
+    served_model_name: qwen3.5-35b-a3b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 48
+    min_vram_gib_per_replica: 48
+    preferred_gpu_count: 1
+    context_window: 32768
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-122b-a10b:
+    hf_model_id: Qwen/Qwen3.5-122B-A10B
+    served_model_name: qwen3.5-122b-a10b
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 80
+    min_vram_gib_per_replica: 80
+    preferred_gpu_count: 2
+    context_window: 131072
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  qwen3.5-122b-a10b-fp8:
+    hf_model_id: Qwen/Qwen3.5-122B-A10B-FP8
+    served_model_name: qwen3.5-122b-a10b-fp8
+    family: qwen3.5
+    modalities: [text]
+    memory_class_gib: 80
+    min_vram_gib_per_replica: 80
+    preferred_gpu_count: 2
+    context_window: 262144
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+
+  # -- Qwen3.6 (current gen, reasoning, MoE) -----------------------------
+  # The FP8 build squeezes onto one 24 GiB GPU; the bf16 build wants two.
+  qwen3.6-35b-a3b:
+    hf_model_id: Qwen/Qwen3.6-35B-A3B
+    served_model_name: qwen3.6-35b-a3b
+    family: qwen3.6
+    modalities: [text]
+    memory_class_gib: 80
+    min_vram_gib_per_replica: 24
+    preferred_gpu_count: 2
+    context_window: 262144
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: false
+  qwen3.6-35b-a3b-fp8:
+    hf_model_id: Qwen/Qwen3.6-35B-A3B-FP8
+    served_model_name: qwen3.6-35b-a3b-fp8
+    family: qwen3.6
+    modalities: [text]
+    memory_class_gib: 40
+    min_vram_gib_per_replica: 24
+    preferred_gpu_count: 1
+    context_window: 262144
+    defaults:
+      max_model_len: 32768
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: false
+
+  # -- Gemma 4 (current gen, multimodal, reasoning) ----------------------
+  # All four fit a single 24 GiB GPU.
+  gemma4-e2b:
+    hf_model_id: google/gemma-4-E2B-it
+    served_model_name: gemma4-e2b
+    family: gemma4
+    modalities: [text, image, audio]
+    memory_class_gib: 8
+    min_vram_gib_per_replica: 8
+    preferred_gpu_count: 1
+    context_window: 131072
+    defaults:
+      max_model_len: 65536
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  gemma4-e4b:
+    hf_model_id: google/gemma-4-E4B-it
+    served_model_name: gemma4-e4b
+    family: gemma4
+    modalities: [text, image, audio]
+    memory_class_gib: 10
+    min_vram_gib_per_replica: 10
+    preferred_gpu_count: 1
+    context_window: 131072
+    defaults:
+      max_model_len: 65536
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  gemma4-26b:
+    hf_model_id: google/gemma-4-26B-A4B-it
+    served_model_name: gemma4-26b
+    family: gemma4
+    modalities: [text, image]
+    memory_class_gib: 20
+    min_vram_gib_per_replica: 20
+    preferred_gpu_count: 1
+    context_window: 262144
+    defaults:
+      max_model_len: 65536
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true
+  gemma4-31b:
+    hf_model_id: google/gemma-4-31B-it
+    served_model_name: gemma4-31b
+    family: gemma4
+    modalities: [text, image]
+    memory_class_gib: 22
+    min_vram_gib_per_replica: 22
+    preferred_gpu_count: 1
+    context_window: 262144
+    defaults:
+      max_model_len: 65536
+      gpu_memory_utilization: 0.9
+      enable_prefix_caching: true

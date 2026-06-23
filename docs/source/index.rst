@@ -14,7 +14,14 @@ Welcome to infer-stack's documentation!
    :show-inheritance:
 
 .. toctree::
+   :maxdepth: 2
+   :caption: User Manual
+
+   manual/index
+
+.. toctree::
    :maxdepth: 5
+   :caption: API Reference
 
    auto/modules
 

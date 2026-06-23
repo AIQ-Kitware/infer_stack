@@ -12,7 +12,6 @@ def vllm_args(service: dict[str, Any]) -> list[str]:
         f'--gpu-memory-utilization={service["gpu_memory_utilization"]}',
         f'--max-num-batched-tokens={service["max_num_batched_tokens"]}',
         f'--max-num-seqs={service["max_num_seqs"]}',
-        '--disable-log-requests',
     ]
     if service.get('enable_prefix_caching'):
         args.append('--enable-prefix-caching')

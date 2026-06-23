@@ -1,0 +1,51 @@
+# Catalog for the leasing e2e harness, tailored to yardrat:
+#   GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1 Quadro RTX 5000 (16 GiB,
+#   display-attached -> skipped unless --include-display-gpus). Both Turing
+#   (sm_75): fp16 only, no bf16/FP8, so every vLLM endpoint pins `--dtype=half`.
+#
+# SPEED: these are the smallest sane ungated chat models (SmolLM2 135M/360M) and
+# every vLLM endpoint runs with `--enforce-eager` (skip torch.compile + CUDA
+# graph capture, which dominate vLLM startup and are model-size-independent) and
+# a small max_model_len (less KV alloc / smaller capture). We're validating the
+# leasing plumbing, not model perf, so eager + tiny is the right trade.
+#
+# Endpoints are named for the model they serve (smol-135 / smol-360 = SmolLM2
+# 135M / 360M). The alias is what clients/tests request through the gateway.
+models:
+  smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
+  smol360: {source: hf://HuggingFaceTB/SmolLM2-360M-Instruct}
+endpoints:
+  smol-135:
+    engine: vllm
+    model: smol135
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
+    reclaim: {policy: stop}
+  smol-135-dup:                       # same model+runtime, aliased to smol-135 -> must coalesce
+    engine: vllm
+    model: smol135
+    public_name: smol-135
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
+  smol-360:                       # 2nd distinct model -> for the both-GPU / display-GPU tiers
+    engine: vllm
+    model: smol360
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
+    reclaim: {policy: keep-warm}
+  smol-ollama:
+    engine: ollama
+    host: local-ollama
+    model: smollm2:135m
+  smol-ollama-gpu1:                   # same tag, daemon pinned to GPU 1 (display)
+    engine: ollama                    # -> exercises explicit GPU pinning on the
+    host: ollama-gpu1                 #    2nd GPU (needs --include-display-gpus)
+    model: smollm2:135m
+runtime_hosts:
+  local-ollama:
+    engine: ollama
+    placement: {gpu_indices: [0]}
+    settings: {keep_alive: 5m}
+  ollama-gpu1:                        # pins the daemon to GPU 1 — the device
+    engine: ollama                    # reservation must put it there (and NOT a
+    placement: {gpu_indices: [1]}     # host-index CUDA_VISIBLE_DEVICES, which
+    settings: {keep_alive: 5m}        # would CPU-fallback — see 88_gpu_pinning)
+bundles:
+  pair: [smol-135, smol-360]

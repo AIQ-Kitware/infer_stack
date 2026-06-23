@@ -20,3 +20,6 @@ generated/kubeai/*
 !examples/single-node/
 !examples/single-node/config.yaml
 !examples/single-node/models.yaml
+
+# rsync target for e2e harness reports (developer artifacts, not source)
+e2e-report-*/

@@ -103,6 +103,21 @@ class _AllowedGpusMixin(scfg.DataConfig):
     )
 
 
+class _DisplayGpuMixin(scfg.DataConfig):
+    skip_display_gpus = scfg.Value(
+        None,
+        isflag=True,
+        alias=['skip-display-gpus'],
+        help=(
+            'Skip display-attached GPUs during placement, leaving the GPU '
+            'driving a monitor free. OFF by default — placement uses every '
+            'GPU, so single-GPU and workstation hosts work out of the box. '
+            'Opt in per-command with this flag, or persist it with '
+            '`infer-stack config set skip_display_gpus true`.'
+        ),
+    )
+
+
 class _PlanOverridesCLI(
     _PathOverridesMixin,
     _ProfileOverrideMixin,
