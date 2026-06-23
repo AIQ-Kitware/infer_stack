@@ -25,7 +25,7 @@ tree` prints the live surface.
   wait-ready smoke-test benchmark ollama-pull ollama-list ollama-ps`
 
 Problems:
-- **Sprawl** — 38 flat verbs; the hot path (acquire/serve/run) is buried among
+- **Sprawl** — 38 flat verbs; the hot path (acquire/run) is buried among
   legacy profile machinery.
 - **No ergonomic catalog editing** — adding a model/endpoint means hand-editing
   `~/.config/infer_stack/catalog.yaml`. (The demo literally `cat >` a heredoc.)
@@ -40,7 +40,7 @@ feasible with the framework we already use.
 ## Principles
 
 1. **Hot paths stay at the top level.** The kwdagger/AIQ pipeline-node loop —
-   `acquire`, `run`, `serve`, `release`, `leases`, `status` — and the two most
+   `acquire`, `run`, `release`, `leases`, `status` — and the two most
    common day-2 verbs (`logs`, `ps`) remain one token deep.
 2. **Everything else is grouped into noun submodals** (`catalog`, `config`,
    `secret`, `stack`) so the surface reads as a small set of areas.

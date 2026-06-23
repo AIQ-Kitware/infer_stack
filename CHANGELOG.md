@@ -16,7 +16,7 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `config set litellm`). With it off, Open WebUI (still on by default) talks to
   the rendered upstreams directly, and `access()` reports the UI URL. Open WebUI
   also renders without a gateway whenever there is an upstream to point at.
-  Ollama tags are now pulled on `serve` even with the gateway off.
+  Ollama tags are now pulled on `acquire` even with the gateway off.
 * New tutorial: `docs/source/manual/ollama-openwebui-tutorial.md` — stand up a
   self-managing Ollama + Open WebUI box (GPU-pinned) entirely from the CLI. Adds
   a `docs/source/manual/` section to the Sphinx docs (the leasing demo moved
@@ -63,6 +63,16 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `85_ollama` now asserts the dual Open WebUI connection wiring.
 
 ### Removed (breaking)
+* **Collapsed `serve` into `acquire` (no compatibility alias).** `serve` was a
+  thin preset of `acquire` (an infinite, `manual`-owned lease) that routed
+  through the identical code path; the two verbs differed only by an owner label
+  and which flags they exposed. There is now a single verb: `infer-stack acquire`
+  — with no `--ttl` it is an infinite (standing-service) lease, and `--ttl 2h`
+  makes it a time-boxed reservation. `acquire` now carries the everyday-`serve`
+  help (render→apply→wait, `--no-apply`/`--no-wait`/`--no-ui`). Migration:
+  `serve X` → `acquire X`; the default lease owner is now `$USER` (was `manual`
+  for `serve`) — pass `--owner manual` to keep the old label. The TUI's "Serve"
+  control is unchanged (it calls the controller directly, not the CLI verb).
 * Removed the pre-leasing **profile world** now superseded by catalog + leasing
   (no back-compat — pre-release): the entire `infer-stack legacy …` command
   group and its modules (`cli/commands_profile`, `cli/commands_smoke`,

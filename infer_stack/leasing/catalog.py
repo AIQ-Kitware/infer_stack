@@ -258,7 +258,7 @@ class Catalog:
     def _unknown_endpoint_error(self, name: str) -> CatalogError:
         """A helpful error for a name that isn't an endpoint.
 
-        You serve/acquire *endpoints*, not models — a common slip is to pass a
+        You acquire *endpoints*, not models — a common slip is to pass a
         model name (``qwen05``) instead of one of its endpoints (``qwen05-1``).
         Recognize that case and point at the endpoints that run the model;
         otherwise fall back to a did-you-mean over the known endpoints/bundles.
@@ -269,9 +269,9 @@ class Catalog:
             )
             if serving:
                 return CatalogError(
-                    f"'{name}' is a model, not an endpoint — you serve an "
+                    f"'{name}' is a model, not an endpoint — you bring up an "
                     f"endpoint that runs it. Endpoints for '{name}': "
-                    f"{', '.join(serving)}  (e.g. `infer-stack serve "
+                    f"{', '.join(serving)}  (e.g. `infer-stack acquire "
                     f"{serving[0]}`)."
                 )
             return CatalogError(

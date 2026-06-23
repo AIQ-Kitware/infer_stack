@@ -15,7 +15,7 @@ from infer_stack.cli.commands_leasing import (
     ReleaseCLI,
     RenewCLI,
     RunCLI,
-    ServeCLI,
+    _default_owner,
 )
 
 CATALOG = {
@@ -148,19 +148,20 @@ def test_release_evict_tears_down_immediately(env, capsys):
     assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
-def test_serve_is_standing_lease(env, capsys):
-    ServeCLI.main(argv=['qwen-coder', *_base(env)])
+def test_acquire_without_ttl_is_standing_lease(env, capsys):
+    # No --ttl -> an infinite (standing-service) lease owned by the caller.
+    AcquireCLI.main(argv=['qwen-coder', *_base(env)])
     data = _leases_json(env, capsys)
-    assert data['leases'][0]['owner'] == 'manual'
+    assert data['leases'][0]['owner'] == _default_owner()
     assert data['leases'][0]['expires_at'] is None
 
 
-def test_wait_after_parallel_no_wait_serves(env, capsys):
+def test_wait_after_parallel_no_wait_acquire(env, capsys):
     from infer_stack.cli.commands_leasing import WaitCLI
 
     # fan out: kick both off without blocking, then wait for both
-    ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-wait'])
-    ServeCLI.main(argv=['reranker', *_base(env), '--no-wait'])
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--no-wait'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--no-wait'])
     capsys.readouterr()
     rc = WaitCLI.main(argv=['qwen-coder', 'reranker', '--ledger', env.db])
     assert rc == 0                                    # null backend: ready now
@@ -174,9 +175,9 @@ def test_wait_unknown_endpoint_errors(env):
         WaitCLI.main(argv=['ghost', '--ledger', env.db])   # nothing serving it
 
 
-def test_serve_no_apply_stages_without_applying(env, capsys):
+def test_acquire_no_apply_stages_without_applying(env, capsys):
     capsys.readouterr()
-    rc = ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-apply', '--json'])
+    rc = AcquireCLI.main(argv=['qwen-coder', *_base(env), '--no-apply', '--json'])
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
     assert data['applied'] is False                   # staged, not brought up
@@ -230,7 +231,7 @@ def test_render_and_apply_are_lease_free(env, capsys):
     from infer_stack.cli.commands_leasing import ApplyCLI, RenderCLI
 
     # declare intent without applying, then the lease-free verbs operate on it
-    ServeCLI.main(argv=['qwen-coder', *_base(env), '--no-apply'])
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--no-apply'])
     before = len(_leases_json(env, capsys)['leases'])
     assert RenderCLI.main(argv=['--ledger', env.db]) == 0   # render: no `up`
     assert ApplyCLI.main(argv=['--ledger', env.db]) == 0    # apply: brings up
@@ -242,7 +243,7 @@ def test_render_and_apply_are_lease_free(env, capsys):
 def test_leases_reports_running_and_gpus(env, capsys):
     # NullBackend serves nothing, so a leased deployment is desired-live but not
     # actually running and has no GPU assignment — the view must say so.
-    ServeCLI.main(argv=['qwen-coder', *_base(env)])
+    AcquireCLI.main(argv=['qwen-coder', *_base(env)])
     data = _leases_json(env, capsys)
     g = data['deployments'][0]
     assert g['state'] == 'live'        # desired (ledger)

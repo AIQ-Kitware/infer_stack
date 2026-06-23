@@ -78,7 +78,7 @@ step() {
 
 # run '<shell command string>'   — executes via `bash -c`, captures combined
 # output to the step log and to LAST_OUT_FILE, records RC and the duration.
-# A heartbeat prints elapsed seconds every 20s so a long acquire/serve doesn't
+# A heartbeat prints elapsed seconds every 20s so a long acquire doesn't
 # look hung (it writes to the console, not to the captured output).
 run() {
     local start end

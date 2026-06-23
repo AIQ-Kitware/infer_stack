@@ -5,7 +5,7 @@ touched infer-stack. Each pane carries its own one-line description, its own
 action buttons, and (for the heavy ones) collapses with a click so it isn't
 polled while hidden:
 
-* **Catalog** (left) — the models + endpoints you can run; Serve the selected
+* **Catalog** (left) — the models + endpoints you can run; Acquire the selected
   endpoint, Suggest a set sized to your GPUs, or add one by hand. Ctrl+click a
   served endpoint to open it in Open WebUI.
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
@@ -424,10 +424,17 @@ class InferStackTUI(App):
     #lease-actions Button, #deployment-actions Button {
         margin: 0 1 0 0; min-width: 8;
     }
-    /* compact buttons: 1 row, no border box, so action bars don't eat space */
+    /* compact buttons: 1 row, no border box, so action bars don't eat space.
+       text-wrap: nowrap is load-bearing, not cosmetic: the endpoint/model
+       buttons above are min-width: 0, so in a narrow sidebar their content box
+       can shrink to ~2 cells. Textual's Button carries line-pad: 1, and its
+       wrapping path folds the label at (width - line_pad*2). At width 2 that is
+       0, and rich's chop_cells does range(0, n, 0) -> ValueError, crashing the
+       render. nowrap skips that fold path entirely. (We can't just set
+       line-pad: 0 -- Textual's integer CSS parser rejects 0.) */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
     #model-actions Button, #api-controls Button {
-        height: 1; border: none; padding: 0 1;
+        height: 1; border: none; padding: 0 1; text-wrap: nowrap;
     }
     #api { padding: 1 2; }
 
@@ -486,7 +493,7 @@ class InferStackTUI(App):
         ('q', 'quit', 'Quit'),
         # Pane-scoped actions: keys still work, but they live as buttons under
         # the pane they act on rather than in the global menu.
-        Binding('s', 'serve', 'Serve', show=False),
+        Binding('s', 'acquire', 'Acquire', show=False),
         Binding('d', 'release', 'Release', show=False),
         Binding('e', 'evict', 'Evict', show=False),
         Binding('a', 'release_all', 'Release all', show=False),
@@ -558,14 +565,14 @@ class InferStackTUI(App):
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
                 yield Static(
-                    'Models & endpoints you can run. Serve one, or Suggest a '
+                    'Models & endpoints you can run. Acquire one, or Suggest a '
                     'set sized to your GPUs.', classes='desc',
                 )
                 yield Static('', id='catalog-help')
                 yield DataTable(id='endpoints', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
-                    yield Button('Serve', id='btn-serve', variant='primary')
+                    yield Button('Acquire', id='btn-acquire', variant='primary')
                     yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
@@ -671,7 +678,7 @@ class InferStackTUI(App):
         with Vertical(id='settings'):
             yield Static(
                 'Durable settings (settings.yaml). Save writes them; backend / '
-                'data-dir / proxy take effect on the next serve.', classes='desc',
+                'data-dir / proxy take effect on the next acquire.', classes='desc',
             )
             yield Static(f'file: {settings_path()}', classes='hint')
             yield Label('backend')
@@ -900,7 +907,7 @@ class InferStackTUI(App):
             )
         else:
             help_.update(
-                'Select an endpoint and Serve it. Ctrl+click a served one to '
+                'Select an endpoint and Acquire it. Ctrl+click a served one to '
                 'open it in Open WebUI.'
             )
 
@@ -1254,7 +1261,7 @@ class InferStackTUI(App):
         proc = self._proc_factory(service)
         if proc is None:
             self.call_from_thread(
-                self._append_log, '(no compose project yet — serve a model)'
+                self._append_log, '(no compose project yet — acquire a model)'
             )
             return
         self._log_proc = proc
@@ -1319,18 +1326,18 @@ class InferStackTUI(App):
         row = self.query_one(f'#{table_id}', DataTable).cursor_row
         return ids[row] if 0 <= row < len(ids) else None
 
-    def action_serve(self) -> None:
+    def action_acquire(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
-            self._status('select an endpoint in the catalog to serve')
+            self._status('select an endpoint in the catalog to acquire')
             return
-        self._status(f'serving {name}… (docker output appears in the logs pane)')
-        self._do_serve(name)
+        self._status(f'acquiring {name}… (docker output appears in the logs pane)')
+        self._do_acquire(name)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # Enter on the endpoints table serves that endpoint.
+        # Enter on the endpoints table acquires that endpoint.
         if event.data_table.id == 'endpoints':
-            self.action_serve()
+            self.action_acquire()
 
     def on_data_table_row_highlighted(
         self, event: DataTable.RowHighlighted
@@ -1379,7 +1386,7 @@ class InferStackTUI(App):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
-            'btn-serve': self.action_serve,
+            'btn-acquire': self.action_acquire,
             'btn-release': self.action_release,
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
@@ -1460,7 +1467,7 @@ class InferStackTUI(App):
 
     def action_compose_up(self) -> None:
         if self._compose_target() is None:
-            self._status('nothing rendered yet — serve a model first')
+            self._status('nothing rendered yet — acquire a model first')
             return
         self._status('docker compose up… (output in the Logs tab)')
         self._do_compose(['up', '-d', '--remove-orphans'], 'up')
@@ -1755,7 +1762,7 @@ class InferStackTUI(App):
 
         base, key = self._litellm()
         if not base:
-            return '# serve a model first — no LiteLLM gateway yet'
+            return '# acquire a model first — no LiteLLM gateway yet'
         auth = f" -H 'Authorization: Bearer {key}'" if key else ''
         body = _json.dumps({
             'model': model or '<model>',
@@ -1774,7 +1781,7 @@ class InferStackTUI(App):
             parts.append(f'gateway: {base}/v1')
         if ui:
             parts.append(f'open webui: {ui}')
-        text = '   ·   '.join(parts) or '(serve a model to get a gateway URL)'
+        text = '   ·   '.join(parts) or '(acquire a model to get a gateway URL)'
         try:
             self.query_one('#api-urls', Static).update(text)
         except Exception:  # noqa: BLE001
@@ -1800,7 +1807,7 @@ class InferStackTUI(App):
     def action_api_send(self) -> None:
         model = self._selected_api_model()
         if not model:
-            self._status('no ready models to query (serve one first)')
+            self._status('no ready models to query (acquire one first)')
             return
         prompt = (self.query_one('#api-prompt', Input).value.strip()
                   or 'Say hello in one short sentence.')
@@ -1810,7 +1817,7 @@ class InferStackTUI(App):
     def action_api_test_all(self) -> None:
         models = list(self._ready_endpoints)
         if not models:
-            self._status('no ready models to test (serve one first)')
+            self._status('no ready models to test (acquire one first)')
             return
         self._api_log(f'— testing {len(models)} ready model(s) —')
         self._do_api_test_all(models)
@@ -1882,15 +1889,15 @@ class InferStackTUI(App):
     # thread; results + a refresh are marshalled back on.
 
     @work(thread=True, exclusive=True, group='mutate')
-    def _do_serve(self, name: str) -> None:
+    def _do_acquire(self, name: str) -> None:
         try:
             requests = self.catalog.resolve_names([name])
             self.controller.acquire(
                 'manual', requests, ttl_seconds=None, wait=False, apply=True
             )
-            msg = f'serving {name}'
+            msg = f'acquiring {name}'
         except Exception as ex:  # noqa: BLE001
-            msg = f'serve {name} failed: {ex}'
+            msg = f'acquire {name} failed: {ex}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')

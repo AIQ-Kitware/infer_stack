@@ -692,9 +692,9 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
 
 
 def test_acquire_rolls_back_when_deployment_cannot_be_placed(tmp_path):
-    """A serve whose deployment can't be placed must fail fast, not hang on ready.
+    """An acquire whose deployment can't be placed must fail fast, not hang on ready.
 
-    Regression: with the only GPU already held, `serve <other>` left the new
+    Regression: with the only GPU already held, `acquire <other>` left the new
     deployment LIVE in the ledger (so `leases` showed a phantom "live" deployment) and
     then blocked forever waiting on a container placement skipped. Acquire now
     rolls the lease back and raises PlacementError.
@@ -726,7 +726,7 @@ def test_acquire_rolls_back_when_deployment_cannot_be_placed(tmp_path):
 
 
 def test_controller_acquire_render_only_stages(tmp_path):
-    """`serve --render-only` records intent + writes on-disk state, no `up`."""
+    """`acquire --no-apply` records intent + writes on-disk state, no `up`."""
     from infer_stack.leasing import LeaseState
 
     catalog = Catalog.from_dict(CATALOG)

@@ -25,7 +25,7 @@ infer-stack catalog host add local-ollama --engine ollama --gpu 0 1 --keep_alive
 infer-stack catalog endpoint add chat --engine ollama --host local-ollama --model llama3.2:3b
 
 # 3. bring it up
-infer-stack serve chat
+infer-stack acquire chat
 
 # 4. open http://localhost:13000  -> pull any other model from the UI
 ```
@@ -36,7 +36,7 @@ That's the whole thing. The rest of this doc explains each piece and the knobs.
 
 ## What gets stood up
 
-`infer-stack serve chat` renders a docker-compose project and brings it up. With
+`infer-stack acquire chat` renders a docker-compose project and brings it up. With
 `litellm` off you get exactly two services:
 
 | service        | what it is                                  | port            |
@@ -72,7 +72,7 @@ infer-stack config set litellm false
 ```
 
 This is the persistent default; you can also decide per-invocation with
-`serve … --no-litellm` / `--litellm`.
+`acquire … --no-litellm` / `--litellm`.
 
 ### 2. Declare the Ollama daemon
 
@@ -95,7 +95,7 @@ Other optional knobs: `--num_parallel`, `--max_loaded_models`,
 
 ### 3. Declare one anchor model
 
-`serve` needs at least one endpoint to start the daemon. Declare a small default
+`acquire` needs at least one endpoint to start the daemon. Declare a small default
 — it gets pulled automatically so the box is useful the moment it's up:
 
 ```bash
@@ -116,7 +116,7 @@ infer-stack catalog show
 ### 4. Bring it up
 
 ```bash
-infer-stack serve chat
+infer-stack acquire chat
 ```
 
 This places the daemon on your GPUs, writes the compose project, runs
@@ -144,7 +144,7 @@ infer-stack stack down    # stop everything
 ```
 
 To change the daemon's GPUs or keep-alive later, re-run `catalog host add
-local-ollama … --force` and `infer-stack serve chat` again — the daemon (and its
+local-ollama … --force` and `infer-stack acquire chat` again — the daemon (and its
 on-disk models) is recreated with the new pinning; Open WebUI stays up.
 
 ---
@@ -157,7 +157,7 @@ Leave `litellm` on (the default). You then also get an OpenAI-compatible gateway
 
 ```bash
 infer-stack config set litellm true     # or just don't turn it off
-infer-stack serve chat
+infer-stack acquire chat
 infer-stack env                          # prints base_url + API key for clients
 ```
 

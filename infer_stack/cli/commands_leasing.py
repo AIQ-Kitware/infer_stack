@@ -7,7 +7,7 @@ the models it needs, block until ready, and release after:
     infer-stack acquire qwen-coder reranker --ttl 2h --env-file is.env
     infer-stack run --endpoint qwen-coder -- python my_node.py
     infer-stack release --env-file is.env
-    infer-stack serve qwen-coder        # standing service (no TTL)
+    infer-stack acquire qwen-coder      # standing service (no --ttl)
     infer-stack leases                  # status of leases + deployment deployments
 
 Until the Compose/KubeAI backends land, the default ``--backend null`` is a
@@ -173,7 +173,7 @@ def _resolve_skip_display(config) -> bool:
 def _resolve_assume_yes(config, *, interactive: bool) -> bool:
     """Whether to apply compose changes without the diff prompt.
 
-    Only the additive verbs (acquire/serve) prompt, and only on a real terminal
+    Only the additive verb (``acquire``) prompts, and only on a real terminal
     without ``--yes``. Everything else (release/leases/run/non-TTY) auto-applies.
     """
     import sys
@@ -546,17 +546,54 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
 
 
 class AcquireCLI(_AcquireFlagsMixin):
-    """Acquire a lease on one or more endpoints/bundles and block until ready.
+    """Acquire a lease on one or more endpoints/bundles, bring them up, wait.
 
-    Like ``serve`` but with a soft ``--ttl`` (default infinite): the lease
-    protects its models while held, and once it expires (or is released) nothing
-    else needs them they can be reclaimed. This is the programmatic seam — write
-    a sourceable endpoint env-file with ``--env-file`` and release by that file
-    or lease id when done. (For a one-shot "acquire, run a command, release",
-    use ``infer-stack run`` instead.)
+    ``acquire NAME…`` is the everyday verb. It takes a lease on each endpoint or
+    bundle, renders the compose project (the LiteLLM gateway + one container per
+    model + a managed Open WebUI), brings it up, and blocks until every endpoint
+    is ready. Run it again with more names to add models side by side — the
+    gateway and UI stay put. Placement, ``docker compose``, and readiness are
+    narrated on stderr.
+
+    With no ``--ttl`` the lease is infinite — a standing service you tear down
+    explicitly (``release`` / ``evict``). Pass ``--ttl`` (e.g. ``2h``, ``30m``)
+    for a soft, time-boxed reservation: the lease protects its models while
+    held, and once it expires (or is released) and nothing else needs them they
+    can be reclaimed. This is also the programmatic seam — write a sourceable
+    endpoint env-file with ``--env-file`` and release by that file or lease id
+    when done. (For a one-shot "acquire, run a command, release", use
+    ``infer-stack run`` instead.)
+
+    The work is render (write the on-disk compose project) then apply (``docker
+    compose up``). ``--no-apply`` does just the render so you can see what
+    would run before pulling the trigger (then ``infer-stack apply``).
+    ``--no-wait`` applies but returns immediately so several models load in
+    parallel (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a
+    terminal you are shown the compose diff and asked before applying; ``--yes``
+    skips that prompt (and it is skipped automatically off a TTY).
     """
 
     __command__ = 'acquire'
+    __epilog__ = """
+    Examples:
+        # stand up one model: render + up + wait until it can generate
+        infer-stack acquire qwen05-1 --require-generation
+
+        # a time-boxed reservation with a sourceable env-file, released by id
+        infer-stack acquire qwen-coder --ttl 2h --env-file is.env
+
+        # stage only: write the compose project but don't start it, then apply
+        infer-stack acquire qwen05-1 --no-apply
+        infer-stack apply
+
+        # fan out: start several without blocking, then wait together
+        infer-stack acquire smol17b-1 --no-wait --yes
+        infer-stack acquire qwen15-1  --no-wait --yes
+        infer-stack wait    smol17b-1 qwen15-1 --require-generation
+
+        # see what is actually running and on which GPUs
+        infer-stack leases
+    """
 
     names = scfg.Value(
         [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
@@ -581,62 +618,13 @@ class AcquireCLI(_AcquireFlagsMixin):
         )
 
 
-class ServeCLI(_AcquireFlagsMixin):
-    """Stand up endpoints as a standing service (an infinite ``manual`` lease).
-
-    ``serve NAME…`` is the everyday verb. It acquires an infinite (no-TTL) lease
-    on each endpoint or bundle, renders the compose project (the LiteLLM gateway
-    + one container per model + a managed Open WebUI), brings it up, and blocks
-    until every endpoint is ready. Run it again with more names to add models
-    side by side — the gateway and UI stay put. Placement, ``docker compose``,
-    and readiness are narrated on stderr.
-
-    The work is render (write the on-disk compose project) then apply (``docker
-    compose up``). ``--no-apply`` does just the render so you can see what
-    would run before pulling the trigger (then ``infer-stack apply``).
-    ``--no-wait`` applies but returns immediately so several models load in
-    parallel (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a
-    terminal you are shown the compose diff and asked before applying; ``--yes``
-    skips that prompt (and it is skipped automatically off a TTY).
-    """
-
-    __command__ = 'serve'
-    __epilog__ = """
-    Examples:
-        # serve one model: render + up + wait until it can generate
-        infer-stack serve qwen05-1 --require-generation
-
-        # stage only: write the compose project but don't start it, then apply
-        infer-stack serve qwen05-1 --no-apply
-        infer-stack apply
-
-        # fan out: start several without blocking, then wait together
-        infer-stack serve smol17b-1 --no-wait --yes
-        infer-stack serve qwen15-1  --no-wait --yes
-        infer-stack wait  smol17b-1 qwen15-1 --require-generation
-
-        # see what is actually running and on which GPUs
-        infer-stack leases
-    """
-
-    names = scfg.Value(
-        [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
-    )
-    owner = scfg.Value('manual', type=str, help='Lease owner.')
-
-    @classmethod
-    def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        return _do_acquire(config, owner=config.owner, ttl_seconds=None)
-
-
 class RenderCLI(_LeasingCommonMixin):
     """Write the on-disk compose project for the current desired set — no up.
 
     Lease-free and idempotent: ``render`` re-materializes the manifest (compose
     file + gateway config + GPU placement) from whatever is *already* declared,
     WITHOUT starting anything — to inspect what would run, or refresh a file you
-    touched by hand. It creates no lease; to stage a *new* endpoint use ``serve
+    touched by hand. It creates no lease; to stage a *new* endpoint use ``acquire
     --no-apply`` (which declares it too). Apply with ``infer-stack apply``.
     """
 
@@ -671,8 +659,8 @@ class ApplyCLI(_ApprovalMixin):
     """Bring the current desired set up to match the ledger (render + up).
 
     Lease-free: ``apply`` creates no lease — it converges whatever is already
-    declared (by ``serve``/``acquire``) onto the backend. It is the *trigger*
-    for a staged ``serve --no-apply`` and the re-sync button after a manual edit
+    declared (by ``acquire``) onto the backend. It is the *trigger*
+    for a staged ``acquire --no-apply`` and the re-sync button after a manual edit
     or a backend hiccup; idempotent (a second apply with nothing changed is a
     no-op). On a terminal it shows the compose diff and asks (``--yes`` skips).
     The rendered file carries ``name: infer-stack``, so ``docker compose -f
@@ -910,17 +898,17 @@ class EvictCLI(_ApprovalMixin):
 
 
 class WaitCLI(_LeasingCommonMixin):
-    """Block until served endpoints are ready — the companion to ``serve
+    """Block until served endpoints are ready — the companion to ``acquire
     --no-wait``.
 
-    Fan out, then wait: ``serve --no-wait smol17b-1`` + ``serve --no-wait
+    Fan out, then wait: ``acquire --no-wait smol17b-1`` + ``acquire --no-wait
     smol135-1`` kick both deployments off in parallel (each converges and starts
     its container without blocking), then ``wait smol17b-1 smol135-1`` blocks
     until they can actually serve. With no names it waits for every live deployment.
 
     ``--require-generation`` makes "ready" mean a real generated token (not just
-    a model that is listed) — the same readiness *criterion* the acquire/serve
-    verbs take; this command is the *blocking* half, distinct from it.
+    a model that is listed) — the same readiness *criterion* the ``acquire``
+    verb takes; this command is the *blocking* half, distinct from it.
     """
 
     __command__ = 'wait'
@@ -948,7 +936,7 @@ class WaitCLI(_LeasingCommonMixin):
             if missing:
                 raise SystemExit(
                     f'not served by any live deployment: {", ".join(missing)} '
-                    '(serve it first, or check `infer-stack leases`)'
+                    '(acquire it first, or check `infer-stack leases`)'
                 )
             targets = [g for g in live if wanted & set(g.served)]
             endpoints = wanted
@@ -1250,8 +1238,8 @@ class LeasesCLI(_LeasingCommonMixin):
       served   the endpoint aliases routed to it
 
     A row that is ``state=live`` but ``running=—`` is desired-but-not-up: either
-    still starting, staged via ``serve --no-apply`` (run ``apply`` to bring it
-    up), or unplaceable (no free GPU — see ``serve``'s error / ``evict``).
+    still starting, staged via ``acquire --no-apply`` (run ``apply`` to bring it
+    up), or unplaceable (no free GPU — see ``acquire``'s error / ``evict``).
     """
 
     __command__ = 'leases'
@@ -1420,7 +1408,7 @@ def _test_fail(config, base_url: str, reason: str) -> int:
     else:
         print(f'{config.name}: FAILED via {base_url} — {reason}')
         print('  is it served?  infer-stack leases   |   '
-              'infer-stack serve ' + str(config.name))
+              'infer-stack acquire ' + str(config.name))
     return 1
 
 
@@ -1435,7 +1423,7 @@ class EnvCLI(_PathOverridesMixin):
     \b
       infer-stack env                       # the .env path (source it to load)
       infer-stack env LITELLM_MASTER_KEY    # print one value
-      infer-stack env HF_TOKEN=hf_…         # set one value (merges, before serve)
+      infer-stack env HF_TOKEN=hf_…         # set one value (merges, before acquire)
       infer-stack env --export              # every entry as `export KEY=value`
 
     The argument is a KEY to read, or ``KEY=VALUE`` to write (writes merge
@@ -1476,7 +1464,7 @@ class EnvCLI(_PathOverridesMixin):
         # Read: `env KEY` / `env --export`
         if not env_path.exists():
             raise SystemExit(
-                f'no managed env-file at {env_path}; run an `acquire`/`serve` '
+                f'no managed env-file at {env_path}; run an `acquire` '
                 'with --backend compose first (or `infer-stack env KEY=VALUE`)'
             )
         env = parse_env_file(env_path)

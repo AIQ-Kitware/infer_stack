@@ -15,7 +15,7 @@ The layers are:
 * ``compose``  — compose + LiteLLM helpers.
 * ``options``  — shared ``DataConfig`` mixins for override flags.
 * ``commands_catalog`` — catalog editor (models/endpoints/hosts/bundles).
-* ``commands_leasing`` — acquire/release/serve/run/leases/test + reconcile.
+* ``commands_leasing`` — acquire/release/run/leases/test + reconcile.
 * ``commands_runtime`` — ``status`` + ``stack`` day-2 compose wrappers.
 * ``commands_meta``    — version/help/config introspection.
 """
@@ -45,7 +45,6 @@ from .commands_leasing import (
     ReleaseCLI,
     RenewCLI,
     RunCLI,
-    ServeCLI,
     TestCLI,
     TuiCLI,
     WaitCLI,
@@ -72,8 +71,8 @@ from .commands_runtime import (
 
 class ManageCLI(scfg.ModalCLI):
     description = (
-        'Lease, serve, and run LLM endpoints. Primary workflow: '
-        'catalog -> acquire/serve/run. See `infer-stack help tree`.'
+        'Lease, acquire, and run LLM endpoints. Primary workflow: '
+        'catalog -> acquire/run. See `infer-stack help tree`.'
     )
 
     __epilog__ = """
@@ -83,17 +82,17 @@ class ManageCLI(scfg.ModalCLI):
         infer-stack catalog model add smol135 \\
             --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
         infer-stack catalog endpoint add --model smol135   # -> smol135-1
-        infer-stack serve smol135-1             # render + bring up + wait
+        infer-stack acquire smol135-1           # render + bring up + wait
         infer-stack leases                      # what is desired vs running
         infer-stack test smol135-1              # one real generation
         infer-stack release --all               # tear it back down
 
     Mental model:
-        catalog (what can run) -> serve/acquire (declare intent, a lease)
-        -> the controller reconciles a compose project (gateway + models +
-        Open WebUI) onto your GPUs. `serve --no-apply` writes that project
-        without starting it (then `apply`); `leases` shows desired vs actual.
-        Run `infer-stack help tree` for the whole command surface.
+        catalog (what can run) -> acquire (declare intent, a lease; --ttl for a
+        soft TTL) -> the controller reconciles a compose project (gateway +
+        models + Open WebUI) onto your GPUs. `acquire --no-apply` writes that
+        project without starting it (then `apply`); `leases` shows desired vs
+        actual. Run `infer-stack help tree` for the whole command surface.
     """
 
     # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
@@ -111,17 +110,16 @@ class ManageCLI(scfg.ModalCLI):
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI
 
-    # Leasing model (acquire/release/run/serve + status)
-    acquire = AcquireCLI
+    # Leasing model (acquire/release/run + status)
+    acquire = AcquireCLI  # stand up endpoints: lease + up + wait (--ttl for soft TTL)
     release = ReleaseCLI
     evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
     renew = RenewCLI
     run = RunCLI
-    serve = ServeCLI
     # Reconcile primitives (lease-free): render desired -> disk, apply disk -> up
     render = LeasingRenderCLI  # write the compose project for desired, no `up`
-    apply = ApplyCLI  # bring the desired set up (the trigger for serve --no-apply)
-    wait = WaitCLI  # block until endpoints are ready (serve --no-wait fan-out)
+    apply = ApplyCLI  # bring the desired set up (the trigger for acquire --no-apply)
+    wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
     test = TestCLI  # smoke-test a served endpoint through the front door

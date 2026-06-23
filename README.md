@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
 
 > **Heads up — the leasing model is now the primary workflow.** Declare models
-> in a catalog (`infer-stack catalog …`) and `acquire`/`serve`/`run` endpoints
+> in a catalog (`infer-stack catalog …`) and `acquire`/`run` endpoints
 > on demand; see `docs/source/manual/` (the Ollama + Open WebUI tutorial and the
 > leasing demo) and `infer-stack help tree`. The
 > **named stack profiles** documented below (`setup`/`render`/`up`/`switch`/…)

@@ -2,7 +2,7 @@
 
 The catalog (``config_root()/catalog.yaml`` by default) is the durable list of
 models / endpoints / runtime-hosts / bundles the leasing verbs (``acquire`` /
-``serve`` / ``run``) read. Hand-editing YAML is the current workflow; this
+``run``) read. Hand-editing YAML is the current workflow; this
 submodal adds a flag-driven editor with a validating writer, so a bad edit is
 rejected before it can land (the same :class:`~infer_stack.leasing.catalog.Catalog`
 parser the leasing path uses).

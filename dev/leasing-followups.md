@@ -157,7 +157,7 @@ is now managed — bundled into the leasing compose stack, on by default
 (`--no-ui` / `config set ui false`), and rendered stable across model switches
 so it isn't recreated when routing changes (see `infer_stack.leasing.compose
 ._open_webui_service`). STILL OPEN: no endpoint-addressed teardown for standing
-`serve` leases (want `release --endpoint <name>` / `unserve`).
+`acquire` leases (want `release --endpoint <name>`).
 
 Open WebUI sub-follow-ups: it currently runs with `WEBUI_AUTH=False` (single-user
 workstation assumption) — expose an auth/port knob before anyone points it at a

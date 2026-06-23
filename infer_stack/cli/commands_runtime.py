@@ -2,7 +2,7 @@
 
 The ``stack`` wrappers (``logs`` / ``ps`` / ``up`` / ``down`` / …) target the
 leasing Compose deployment — the project rendered under the data dir by
-``serve`` / ``acquire`` / ``apply``. ``status`` is the one-glance overview: where
+``acquire`` / ``apply``. ``status`` is the one-glance overview: where
 everything lives, the active backend, and a leasing summary (active leases / live
 deployments), with pointers to dig deeper.
 """
@@ -35,7 +35,7 @@ def _day2_compose_base(config, command: str) -> list[str]:
 
     Targets the leasing Compose deployment (no ``config.yaml`` needed). Raises a
     helpful error when nothing has been deployed yet — the file is written by
-    ``serve`` / ``acquire`` / ``apply``.
+    ``acquire`` / ``apply``.
     """
     from ..leasing.compose import LEASING_PROJECT
 
@@ -44,7 +44,7 @@ def _day2_compose_base(config, command: str) -> list[str]:
     if not compose_file.exists():
         raise SystemExit(
             f'nothing deployed yet (no {compose_file}). '
-            'Serve a model first, e.g. `infer-stack serve <endpoint>`.'
+            'Bring a model up first, e.g. `infer-stack acquire <endpoint>`.'
         )
     return [
         'docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file)
@@ -131,7 +131,7 @@ _DIG_DEEPER = (
 _GETTING_STARTED = (
     ('infer-stack config init', 'storage + default backend'),
     ('infer-stack catalog suggest --apply', 'a catalog sized to your GPUs'),
-    ('infer-stack serve <endpoint>', 'bring a model up'),
+    ('infer-stack acquire <endpoint>', 'bring a model up'),
 )
 
 

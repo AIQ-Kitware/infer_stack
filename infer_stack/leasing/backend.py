@@ -37,7 +37,7 @@ class ConvergeAborted(Exception):
 
 
 class PlacementError(Exception):
-    """An ``acquire``/``serve`` requested a deployment the backend could not place.
+    """An ``acquire`` requested a deployment the backend could not place.
 
     Raised by the controller when reconcile leaves one of the just-requested
     deployments unplaced (e.g. no free GPU). Like :class:`ConvergeAborted`, the

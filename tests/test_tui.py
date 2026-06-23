@@ -104,7 +104,7 @@ def test_tui_relationship_columns_link_lease_to_deployment():
     _run(scenario)
 
 
-def test_tui_serve_from_catalog_creates_a_lease():
+def test_tui_acquire_from_catalog_creates_a_lease():
     from infer_stack.leasing import LeaseState
     from infer_stack.tui import InferStackTUI
 
@@ -116,7 +116,7 @@ def test_tui_serve_from_catalog_creates_a_lease():
         async with app.run_test() as pilot:
             await pilot.pause()
             app.query_one('#endpoints').focus()
-            await pilot.press('s')                    # serve the selected endpoint
+            await pilot.press('s')                    # acquire the selected endpoint
             await app.workers.wait_for_complete()
             await pilot.pause()
 
@@ -193,11 +193,39 @@ def test_tui_endpoint_action_buttons_fit_the_sidebar():
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             sb = app.query_one('#sidebar').region
-            for bid in ('#btn-serve', '#btn-add-endpoint', '#btn-edit-endpoint',
+            for bid in ('#btn-acquire', '#btn-add-endpoint', '#btn-edit-endpoint',
                         '#btn-remove-endpoint'):
                 r = app.query_one(bid).region
                 assert r.width > 0 and r.x >= sb.x and \
                     r.x + r.width <= sb.x + sb.width, f'{bid} overflows sidebar'
+
+    _run(scenario)
+
+
+def test_tui_renders_when_action_buttons_are_squeezed_narrow():
+    # Regression: the min-width:0 action buttons can shrink until their content
+    # box is ~2 cells. Textual's Button carries line-pad:1 and folds the label
+    # at (width - line_pad*2); at width 2 that is 0 and rich's chop_cells does
+    # range(0, n, 0) -> ValueError, crashing the whole render. text-wrap:nowrap
+    # on the compact buttons skips that fold path. Sweep the sidebar across the
+    # crash zone (region width ~4 / content ~2) and force a real composite.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            sidebar = app.query_one('#sidebar')
+            for width in range(10, 25):
+                app._sidebar_w = width
+                sidebar.styles.width = width
+                await pilot.pause()
+                # export_screenshot drives the full StylesCache render path that
+                # raised in the field; it must not blow up at any narrow width.
+                app.export_screenshot()
 
     _run(scenario)
 
@@ -332,12 +360,12 @@ def test_tui_pane_scoped_action_buttons():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Serve lives under the catalog; release/evict under their tables.
-            assert app.query_one('#btn-serve', Button)
+            # Acquire lives under the catalog; release/evict under their tables.
+            assert app.query_one('#btn-acquire', Button)
             assert app.query_one('#btn-release', Button)
             assert app.query_one('#btn-evict', Button)
             app.query_one('#endpoints').move_cursor(row=0)
-            await pilot.click('#btn-serve')
+            await pilot.click('#btn-acquire')
             await app.workers.wait_for_complete()
             await pilot.pause()
 
