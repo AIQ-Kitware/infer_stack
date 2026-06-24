@@ -14,6 +14,7 @@
 models:
   smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
   smol360: {source: hf://HuggingFaceTB/SmolLM2-360M-Instruct}
+  qwen500: {source: hf://Qwen/Qwen2.5-0.5B-Instruct}   # 3rd DISTINCT model, for the no-blip swap tier
 endpoints:
   smol-135:
     engine: vllm
@@ -30,6 +31,11 @@ endpoints:
     model: smol360
     runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
     reclaim: {policy: keep-warm}
+  qwen-500:                       # 3rd distinct model -> the "new model up" in the no-blip swap tier (93)
+    engine: vllm
+    model: qwen500
+    runtime: {max_model_len: 2048, gpu_memory_utilization: 0.2, extra_args: ['--dtype=half', '--enforce-eager']}
+    reclaim: {policy: stop}
   smol-ollama:
     engine: ollama
     host: local-ollama

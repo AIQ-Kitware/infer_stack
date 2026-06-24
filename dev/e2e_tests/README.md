@@ -30,6 +30,10 @@ docker pull ghcr.io/berriai/litellm:v1.82.3-stable
 docker pull ollama/ollama:latest
 ```
 
+Model weights download lazily on first `acquire` (not pre-pulled): SmolLM2 135M
+/ 360M, plus Qwen2.5-0.5B for the `noblip` swap tier (~1 GB, a 3rd distinct
+model). The `noblip` group also needs **2 GPUs** (it skips otherwise).
+
 GPU tiers assume **GPU 0 free**. Placement now uses **every** GPU by default —
 including yardrat's display-attached **GPU 1** — so the both-GPUs / GPU-1-pin
 tiers need no special flag (set `config set skip_display_gpus true` to exclude
@@ -55,9 +59,33 @@ the display GPU; `60_dedicated_f5` probes placement on a busy box).
 | `90_concurrency` | yes | two racing acquires; file lock keeps the compose file valid |
 | `91_queue` | yes | `acquire --queue`: a second dedicated group queues behind a busy GPU and lands when it frees; a no-free-GPU queue times out and rolls back (no phantom lease). Pins to GPU 0 via `--allowed-gpus 0` for deterministic contention |
 | `92_gc` | yes | `infer-stack gc`: a leaked (TTL-expired, never-released) lease is a no-op before TTL, reclaimed + its stop-policy group torn down after; plain `gc` leaves an idle keep-warm model, `gc --evict` tears it down |
+| `93_noblip_swap` | yes (2 GPUs) | LiteLLM no-blip across a model swap: two models on two GPUs, a process hammers one continuously while the other is released and a third model is brought up on the freed GPU — asserts **zero** failed requests and an unchanged litellm container id. Skips if `<2` GPUs |
 | `99_cleanup` | always | release stragglers + `down` the project (never leak containers) |
 
-Run a subset: `./run.sh --gpu --only '40 50'`. `99_cleanup` always runs.
+### Running logical groups
+
+Tiers are bucketed into groups so you can iterate on one area without running
+everything (run-all is still the default — just `./run.sh --gpu`):
+
+```bash
+./run.sh --list-groups            # show the groups and their tiers
+./run.sh --gpu --group vllm       # only the core vLLM serving group
+./run.sh --gpu --group 'queue noblip'   # two groups at once
+./run.sh --gpu --skip-group ollama      # everything EXCEPT ollama
+./run.sh --gpu --only '40 50'     # ad-hoc by prefix (still supported)
+```
+
+| group | tiers | what |
+| --- | --- | --- |
+| `smoke` | 10 20 30 | fast, no-GPU: dry-run, ergonomics, negative cases |
+| `vllm` | 40 45 50 60 70 80 90 | core vLLM serving, placement, concurrency |
+| `ollama` | 85 86 88 | ollama daemon pull/warmup, lean, GPU pinning |
+| `queue` | 91 92 | admission queue (`--queue`) + `gc` reclaim |
+| `noblip` | 93 | LiteLLM no-blip across a model swap (needs 2 GPUs) |
+
+`01_environment` and `99_cleanup` always run (the bookends). GPU groups need
+`--gpu`; without it their tiers just record skips. Adding a tier? Put its prefix
+in the right group in `expand_group()` in `run.sh`.
 
 GPU tiers are isolated: before each serving tier the runner tears down the
 `infer-stack` compose project **and wipes the ledger**, so a leftover group from
@@ -102,6 +130,9 @@ with their log tails so a single file tells you what broke and where.
 | --- | --- |
 | `--gpu` | enable the serving tiers |
 | `--only '40 50'` | run only those numeric prefixes (+ cleanup) |
+| `--group NAME` | run a logical group (e.g. `vllm`); space-separate for several |
+| `--skip-group NAME` | run everything except a group (e.g. `ollama`) |
+| `--list-groups` | print the groups and their tiers, then exit |
 | `--keep-running` | don't `down` the compose stack at the end |
 | `--keep-data` | (no-op placeholder; data dir is always kept inside results) |
 | `--data-dir DIR` | use an explicit `INFER_STACK_DATA_DIR` |
