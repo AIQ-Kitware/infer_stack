@@ -54,6 +54,28 @@ def _leases_json(env, capsys):
     return json.loads(capsys.readouterr().out)
 
 
+def test_load_catalog_without_flag_uses_default_path(tmp_path, monkeypatch):
+    """Regression: release/gc/evict have no --catalog flag, so converging their
+    compose backend must fall back to the DEFAULT-path catalog via getattr —
+    `config.catalog` raised AttributeError and crashed `gc --backend compose`."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.cli.commands_leasing import GcCLI, _load_catalog
+    from infer_stack.leasing.catalog import Catalog
+
+    cfg = GcCLI.cli(argv=['--backend', 'compose'], strict=False)
+    assert not hasattr(cfg, 'catalog') or cfg.catalog is None
+
+    # Default-path catalog present -> loaded (proves no AttributeError + fallback).
+    (tmp_path / 'catalog.yaml').write_text(yaml.safe_dump(CATALOG))
+    monkeypatch.setattr(cl, 'config_root', lambda: tmp_path)
+    assert isinstance(_load_catalog(cfg), Catalog)
+
+    # No default-path catalog -> SystemExit (caught by _make_backend), NOT AttributeError.
+    monkeypatch.setattr(cl, 'config_root', lambda: tmp_path / 'nope')
+    with pytest.raises(SystemExit):
+        _load_catalog(cfg)
+
+
 def test_acquire_writes_env_file(env):
     envf = env.tmp / 'is.env'
     rc = AcquireCLI.main(

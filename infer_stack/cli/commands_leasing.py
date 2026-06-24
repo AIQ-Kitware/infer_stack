@@ -237,7 +237,11 @@ def _open_controller(config, *, interactive: bool = False) -> Controller:
 
 
 def _load_catalog(config) -> Catalog:
-    raw = config.catalog or (config_root() / 'catalog.yaml')
+    # Commands that converge the compose backend but take no --catalog flag
+    # (release, gc, evict) still need a catalog for the static superset gateway;
+    # they fall back to the default path. getattr (not config.catalog) so a CLI
+    # without the option doesn't AttributeError — it just uses the default path.
+    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
     path = Path(raw).expanduser()
     if not path.exists():
         raise SystemExit(
