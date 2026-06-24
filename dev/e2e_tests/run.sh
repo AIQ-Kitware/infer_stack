@@ -9,6 +9,9 @@
 #   ./run.sh                  # non-serving tiers only (no GPU/docker pulls)
 #   ./run.sh --gpu            # + the real serving tiers (vLLM/Ollama on GPU 0)
 #   ./run.sh --gpu --only '40 50'   # just single-vllm + coalescing
+#   ./run.sh --gpu --group vllm     # a logical group (see --list-groups)
+#   ./run.sh --gpu --skip-group ollama   # everything except the ollama group
+#   ./run.sh --list-groups          # show the groups and exit
 #   ./run.sh --gpu --keep-running   # leave the compose stack up afterward
 #
 # Tiers WITHOUT --gpu: environment, dry-run (null backend), ergonomics,
@@ -28,12 +31,43 @@ RESULTS=''
 DATA_DIR=''
 CATALOG="$E2E_ROOT/catalog.yaml"
 
+# Logical groups -> the tier prefixes they contain. Run a group with
+# `--group NAME`, skip one with `--skip-group NAME`, list them with
+# `--list-groups`. `01_environment` and `99_cleanup` always run (the bookends).
+# Adding a tier? Drop its prefix into the right group below.
+GROUP_NAMES='smoke vllm ollama queue noblip'
+ALWAYS_PREFIXES="01 99"           # environment gate + cleanup: always run
+GROUP_SEL=''                      # accumulated --group prefixes
+SKIP_SEL=''                       # accumulated --skip-group prefixes
+
 usage() { sed -n '2,30p' "$E2E_ROOT/run.sh"; exit "${1:-0}"; }
+
+expand_group() {  # group name -> its tier prefixes (errors on unknown name)
+    case "$1" in
+        smoke)  echo '10 20 30' ;;            # fast, no-GPU: dry-run, ergonomics, negative
+        vllm)   echo '40 45 50 60 70 80 90' ;; # core vLLM serving + placement + concurrency
+        ollama) echo '85 86 88' ;;            # ollama daemon: pull/warmup, lean, GPU pinning
+        queue)  echo '91 92' ;;               # admission queue (--queue) + gc reclaim
+        noblip) echo '93' ;;                  # LiteLLM no-blip across a model swap (2 GPUs)
+        *) echo "unknown group: $1 (see --list-groups)" >&2; exit 2 ;;
+    esac
+}
+
+list_groups() {
+    echo 'e2e test groups (run with --group / skip with --skip-group):'
+    local g
+    for g in $GROUP_NAMES; do printf '  %-8s %s\n' "$g" "$(expand_group "$g")"; done
+    echo "  (always)  $ALWAYS_PREFIXES   # 01_environment + 99_cleanup"
+    exit 0
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --gpu) GPU=1 ;;
         --only) ONLY="$2"; shift ;;
+        --group) for g in $2; do p="$(expand_group "$g")" || exit 2; GROUP_SEL="$GROUP_SEL $p"; done; shift ;;
+        --skip-group) for g in $2; do p="$(expand_group "$g")" || exit 2; SKIP_SEL="$SKIP_SEL $p"; done; shift ;;
+        --list-groups) list_groups ;;
         --results) RESULTS="$2"; shift ;;
         --data-dir) DATA_DIR="$2"; shift ;;
         --catalog) CATALOG="$2"; shift ;;
@@ -204,16 +238,22 @@ echo "rsync back (run any time for partial results; also in $RESULTS/rsync-back.
 echo "  $RSYNC_LINE"
 echo
 
+# --only prefixes and --group names both contribute to the include set; when
+# either is given only matching tiers run. --skip-group removes tiers. The
+# always-run bookends (01_environment + 99_cleanup) override both, so we never
+# skip the env gate or leak containers.
+INCLUDE="$ONLY $GROUP_SEL"
 for f in "$E2E_ROOT"/tests/*.sh; do
     name="$(basename "$f")"
     prefix="${name%%_*}"
-    if [ -n "$ONLY" ]; then
-        # 99_cleanup always runs so we never leak containers
-        case " $ONLY " in
-            *" $prefix "*) ;;
-            *) [ "$prefix" = '99' ] || continue ;;
-        esac
+    run_this=1
+    if [ -n "${INCLUDE// /}" ]; then
+        run_this=0
+        case " $INCLUDE " in *" $prefix "*) run_this=1 ;; esac
     fi
+    case " $SKIP_SEL " in *" $prefix "*) run_this=0 ;; esac
+    case " $ALWAYS_PREFIXES " in *" $prefix "*) run_this=1 ;; esac
+    [ "$run_this" = 1 ] || continue
     export E2E_SECTION="${name%.sh}"
     echo "── $E2E_SECTION ──────────────────────────────────────────"
     # Reset GPU state before each *serving* tier (prefix >= 40), not the

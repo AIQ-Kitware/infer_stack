@@ -351,10 +351,13 @@ def _litellm_service(
     master_key: str | None = None,
     config_hash: str | None = None,
 ) -> dict[str, Any]:
-    # Bake the managed key in literally (not ${...}) so the container and the
-    # readiness probe always agree regardless of the caller's shell env.
+    # Reference the managed key via ${...} rather than baking the literal secret
+    # into the compose YAML. Its value lives in the sidecar .env next to the
+    # compose file (written by master_key()), which `docker compose --env-file`
+    # loads for interpolation — so the container and the readiness probe (which
+    # reads the same .env) still agree regardless of the caller's shell env.
     key_value = (
-        master_key
+        '${' + API_KEY_ENV + '}'
         if master_key is not None
         else '${' + API_KEY_ENV + ':-sk-local}'
     )
@@ -428,8 +431,12 @@ def _open_webui_service(
     and ``docker compose up -d`` leaves the UI running (the legacy "the UI never
     blinks" behavior). Chat history persists under the data dir.
     """
+    # Reference the managed key via ${...} (resolved from the sidecar .env, see
+    # _litellm_service) instead of inlining the secret into the compose YAML.
     key_value = (
-        master_key if master_key is not None else '${' + API_KEY_ENV + ':-sk-local}'
+        '${' + API_KEY_ENV + '}'
+        if master_key is not None
+        else '${' + API_KEY_ENV + ':-sk-local}'
     )
     data_path = state.get('open_webui') or str(
         Path(next(iter(state.values()), '.')).parent / 'open-webui'
@@ -872,17 +879,17 @@ class ComposeBackend:
         self._state_file.write_text(json.dumps(data, indent=2))
 
     def _compose(self, args: list[str]) -> str:
-        return self.run(
-            [
-                'docker',
-                'compose',
-                '-p',
-                self.project,
-                '-f',
-                str(self.compose_file),
-                *args,
-            ]
-        )
+        cmd = ['docker', 'compose']
+        # Resolve ${LITELLM_MASTER_KEY} (and any other managed secret) from the
+        # sidecar .env beside the compose file, so secrets stay out of the YAML.
+        # docker compose's default .env discovery keys off the *current working
+        # directory* (wherever infer-stack was invoked), not the state dir, so we
+        # point it explicitly. Only when present: a litellm-less stack never
+        # writes one, and a missing --env-file path is a hard error.
+        if self._env_path.exists():
+            cmd += ['--env-file', str(self._env_path)]
+        cmd += ['-p', self.project, '-f', str(self.compose_file)]
+        return self.run([*cmd, *args])
 
     @contextlib.contextmanager
     def _converge_lock(self):
@@ -1103,7 +1110,13 @@ class ComposeBackend:
         if key in self._pulled:
             return None
         try:
-            self._compose(['exec', '-T', f'ollama-{deployment.id}', 'ollama', 'pull', tag])
+            # Exec into the daemon by the SAME name it is rendered/observed under
+            # (ollama-<host>), not ollama-<deployment.id> — a host runs one daemon
+            # that coalesces tags, so the service is keyed by host. Using the
+            # deployment id targets a non-existent service ("is not running") and
+            # the tag is never pulled, so --require-generation times out.
+            service = ollama_service_name(deployment)
+            self._compose(['exec', '-T', service, 'ollama', 'pull', tag])
         except Exception as ex:  # noqa: BLE001 - readiness is retryable
             return f'pulling {tag}: {ex}'
         self._pulled.add(key)
