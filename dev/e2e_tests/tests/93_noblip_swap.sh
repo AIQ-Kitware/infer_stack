@@ -7,6 +7,12 @@
 # stream to A must see ZERO failed requests, and the litellm container id must be
 # unchanged across the swap.
 #
+#   A = smol-135  (queried continuously, held the whole time)
+#   B = qwen-500  (released mid-stream; reclaim:stop, so its GPU actually frees —
+#                  a keep-warm model would linger and C couldn't place)
+#   C = smol-360  (the new model brought up on the freed GPU; --queue absorbs any
+#                  teardown latency between B going down and the GPU coming free)
+#
 # Key prerequisite this also guards: the catalog-less `release` converge must
 # still render the static superset, or it falls back to per-deployment routing
 # and the gateway churns (a real blip). `release` has no --catalog flag, so it
@@ -44,15 +50,15 @@ run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --owner noblip-a --require-generation --env-file \"$AENV\" --timeout 1200 --json"
 expect_rc 0
 expect_out '"ready": true'
-run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
+run "infer-stack acquire qwen-500 --backend compose --catalog \"$E2E_CAT\" \
       --owner noblip-b --require-generation --env-file \"$BENV\" --timeout 1200 --json"
 expect_rc 0
 expect_out '"ready": true'
 run "set -a; . \"$AENV\"; set +a; \
      curl -s \"\$OPENAI_BASE_URL/models\" -H \"Authorization: Bearer \$OPENAI_API_KEY\""
 expect_out 'smol-135'
-expect_out 'smol-360'
-note 'A (smol-135) and B (smol-360) are live on separate GPUs'
+expect_out 'qwen-500'
+note 'A (smol-135) and B (qwen-500) are live on separate GPUs'
 end_step
 
 step noblip-stream-uninterrupted 'querying A is uninterrupted while B is swapped for C'
@@ -77,12 +83,15 @@ run "( set -a; . \"$AENV\"; set +a; total=0; failed=0; \
 expect_rc 0
 note 'poller is streaming requests to A; now swapping B -> C underneath it'
 run 'sleep 5'   # let a few baseline requests land before the swap
-# Swap: release B (frees its GPU), bring C up on the freed GPU. The release has
-# no --catalog and relies on the default-path catalog placed above.
+# Swap: release B (reclaim:stop -> its GPU frees), bring C up on the freed GPU.
+# The release has no --catalog and relies on the default-path catalog placed
+# above. C uses --queue so it waits out any lag between B's teardown and the GPU
+# actually coming free, instead of failing fast with a transient "no GPU".
 run "infer-stack release --env-file \"$BENV\""
 expect_rc 0
-run "infer-stack acquire qwen-500 --backend compose --catalog \"$E2E_CAT\" \
-      --owner noblip-c --require-generation --env-file \"$CENV\" --timeout 1200 --json"
+run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
+      --owner noblip-c --require-generation --queue --env-file \"$CENV\" \
+      --timeout 600 --interval 5 --json"
 expect_rc 0
 expect_out '"ready": true'
 note 'stop the poller and collect its tally'
@@ -95,10 +104,12 @@ note "litellm container after swap: ${LITELLM_AFTER:-<none>}"
 run "[ -n \"$LITELLM_BEFORE\" ] && [ \"$LITELLM_BEFORE\" = \"$LITELLM_AFTER\" ] \
        && echo 'gateway container unchanged across swap'"
 expect_out 'gateway container unchanged across swap'
-# C is up and A is still routable through the same gateway.
+# C is up and A is still routable through the same gateway. (The gateway lists
+# the full superset, so the meaningful liveness proof is C's ready:true above
+# plus the zero-failure stream to A; this just confirms the gateway answers.)
 run "set -a; . \"$AENV\"; set +a; \
      curl -s \"\$OPENAI_BASE_URL/models\" -H \"Authorization: Bearer \$OPENAI_API_KEY\""
-expect_out 'qwen-500'
+expect_out 'smol-360'
 expect_out 'smol-135'
 end_step
 
