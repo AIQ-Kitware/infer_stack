@@ -511,6 +511,13 @@ class _ApprovalMixin(_LeasingCommonMixin):
     terminal; ``--yes`` (or a non-TTY) applies without prompting.
     """
 
+    catalog = scfg.Value(
+        None, type=str,
+        help='Path to catalog.yaml. release/gc/evict reconcile the gateway too, '
+        'so pass the same catalog as acquire to keep the static superset route '
+        'table (no gateway blip); omitted, it falls back to the default-path '
+        'catalog, else legacy per-deployment routing.',
+    )
     yes = scfg.Value(
         False, isflag=True, alias=['y'],
         help='Apply compose changes without showing the diff / prompting '

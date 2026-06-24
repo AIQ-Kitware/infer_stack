@@ -76,6 +76,24 @@ def test_load_catalog_without_flag_uses_default_path(tmp_path, monkeypatch):
         _load_catalog(cfg)
 
 
+def test_release_gc_evict_accept_catalog_flag(tmp_path):
+    """release/gc/evict take --catalog so pipelines can pass the superset
+    explicitly (keeps the no-blip gateway without relying on the default path)."""
+    from infer_stack.cli.commands_leasing import (
+        EvictCLI, GcCLI, ReleaseCLI, _load_catalog,
+    )
+    from infer_stack.leasing.catalog import Catalog
+
+    cat_path = tmp_path / 'catalog.yaml'
+    cat_path.write_text(yaml.safe_dump(CATALOG))
+    for cls in (GcCLI, ReleaseCLI, EvictCLI):
+        cfg = cls.cli(
+            argv=['--backend', 'compose', '--catalog', str(cat_path)],
+            strict=False,
+        )
+        assert isinstance(_load_catalog(cfg), Catalog), cls.__name__
+
+
 def test_acquire_writes_env_file(env):
     envf = env.tmp / 'is.env'
     rc = AcquireCLI.main(
