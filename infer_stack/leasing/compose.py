@@ -824,6 +824,8 @@ class ComposeBackend:
         self.reverse_proxy = reverse_proxy
         self.reverse_proxy_port = reverse_proxy_port
         self.reverse_proxy_config = reverse_proxy_config
+        # Retained for API/CLI compatibility but no longer consulted: probe_ready
+        # always verifies a real generation now (the only trustworthy readiness).
         self.require_generation = require_generation
         self.assume_yes = assume_yes
         # Optional catalog: when present, the LiteLLM gateway is rendered with a
@@ -1122,39 +1124,77 @@ class ComposeBackend:
         self._pulled.add(key)
         return None
 
+    def _published_v1_url(self, deployment: Deployment) -> str | None:
+        """Host-reachable ``/v1`` of a deployment, from its published port.
+
+        Used to probe a vLLM upstream directly when there is no gateway. Reads
+        the rendered compose so it matches whatever port was actually published.
+        """
+        try:
+            doc = yaml.safe_load(self.compose_file.read_text()) or {}
+        except FileNotFoundError:
+            return None
+        for svc in (doc.get('services') or {}).values():
+            if (svc.get('labels') or {}).get(DEPLOYMENT_LABEL) != deployment.id:
+                continue
+            for mapping in svc.get('ports') or []:
+                host = str(mapping).split(':')[0]
+                if host:
+                    return f'http://127.0.0.1:{host}/v1'
+        return None
+
     def probe_ready(
         self, deployment: Deployment, endpoint: str
     ) -> Readiness:
-        """Ready == container running and (with LiteLLM) the alias is routable.
+        """Ready == the model actually served a (protocol-aware) request.
 
-        Delegates the HTTP check to the shared :func:`infer_stack.probe.openai_ready`
-        — ``require_listed`` confirms the alias is advertised by the gateway, and
-        ``require_generation`` additionally runs a tiny chat. For Ollama the tag
-        is pulled first and a generation is forced, so readiness means the tag is
-        actually loaded and serving (not just lazily configured).
+        A real generation is the only trustworthy signal. A container can be
+        ``running`` — even Docker-``healthy`` (the vLLM healthcheck has a long
+        ``start_period`` grace) — and the gateway advertises every alias from its
+        *static superset* route table, all long before vLLM has loaded the model
+        and can serve. So we gate on the container existing, then require a
+        successful generation, using the endpoint's protocol (a completions-only
+        model never answers a chat probe). The probe goes through the gateway when
+        present, else straight to the vLLM upstream's own published ``/v1``.
         """
         if deployment.id not in self.observe():
             return Readiness(False, 'container not running')
-        require_generation = self.require_generation
+        served = deployment.served.get(endpoint) or {}
+        protocol = served.get('protocol') or 'chat'
         if deployment.engine == 'ollama':
-            # Pull the declared tag regardless of the gateway — a lean
-            # `--no-litellm` Ollama stack must still make its anchor model
-            # present, and the pull is what readiness means for that daemon.
+            # An Ollama daemon loads tags lazily; make the declared tag present
+            # first (this also confirms the daemon is up).
             error = self._ensure_ollama_tag(deployment, endpoint)
             if error:
                 return Readiness(False, error)
-            require_generation = True  # warm the tag so it is resident
-        if not self.litellm:
-            # No gateway to probe for routability; the container is up (and any
-            # Ollama tag has been pulled), so it is as ready as we can confirm.
-            return Readiness(True, 'container running')
-        headers = {'Authorization': f'Bearer {self.master_key()}'}
+            protocol = 'chat'  # Ollama's OpenAI surface is chat
+        if self.litellm:
+            # The alias must be routable (require_listed) AND actually serve
+            # (require_generation) — listing alone is trivially true here.
+            ok, reason = openai_ready(
+                base_url=f'http://127.0.0.1:{self.litellm_port}/v1',
+                headers={'Authorization': f'Bearer {self.master_key()}'},
+                model=endpoint,
+                protocol=protocol,
+                require_listed=True,
+                require_generation=True,
+                http=self.http,
+            )
+            return Readiness(ok, reason)
+        # No gateway: probe the engine's own published API. Ollama loads on first
+        # request, so the pull above is the readiness we can confirm for it; a
+        # vLLM upstream we probe directly with a real generation.
+        if deployment.engine == 'ollama':
+            return Readiness(True, 'ollama tag pulled')
+        base = self._published_v1_url(deployment)
+        if base is None:
+            return Readiness(False, 'vLLM upstream has no published port yet')
         ok, reason = openai_ready(
-            base_url=f'http://127.0.0.1:{self.litellm_port}/v1',
-            headers=headers,
-            model=endpoint,
-            require_listed=True,
-            require_generation=require_generation,
+            base_url=base,
+            model=served.get('served_model_name') or endpoint,
+            protocol=protocol,
+            require_listed=False,
+            require_generation=True,
             http=self.http,
         )
         return Readiness(ok, reason)

@@ -475,8 +475,9 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
     require_generation = scfg.Value(
         False,
         isflag=True,
-        help='Readiness requires a real generation, not just model listing '
-        '(compose backend; Ollama always generates to warm the tag).',
+        help='Deprecated/no-op: readiness now ALWAYS verifies a real generation '
+        '(a listed alias or a running container is not proof the model serves). '
+        'Accepted for compatibility.',
     )
     litellm = scfg.Value(
         None,
