@@ -1110,7 +1110,13 @@ class ComposeBackend:
         if key in self._pulled:
             return None
         try:
-            self._compose(['exec', '-T', f'ollama-{deployment.id}', 'ollama', 'pull', tag])
+            # Exec into the daemon by the SAME name it is rendered/observed under
+            # (ollama-<host>), not ollama-<deployment.id> — a host runs one daemon
+            # that coalesces tags, so the service is keyed by host. Using the
+            # deployment id targets a non-existent service ("is not running") and
+            # the tag is never pulled, so --require-generation times out.
+            service = ollama_service_name(deployment)
+            self._compose(['exec', '-T', service, 'ollama', 'pull', tag])
         except Exception as ex:  # noqa: BLE001 - readiness is retryable
             return f'pulling {tag}: {ex}'
         self._pulled.add(key)

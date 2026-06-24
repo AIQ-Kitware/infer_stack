@@ -551,6 +551,59 @@ def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
     assert 'vllm-beta' in rc_b.compose['services']
 
 
+def _three_endpoint_catalog():
+    from infer_stack.leasing.catalog import Catalog
+
+    return Catalog.from_dict(
+        {
+            'models': {
+                'mc': {'source': 'hf://org/c'},
+                'ma': {'source': 'hf://org/a'},
+                'mb': {'source': 'hf://org/b'},
+            },
+            'endpoints': {
+                'cee': {'engine': 'vllm', 'model': 'mc'},
+                'alpha': {'engine': 'vllm', 'model': 'ma'},
+                'beta': {'engine': 'vllm', 'model': 'mb'},
+            },
+        }
+    )
+
+
+def test_untouched_model_stable_when_another_swaps_gpu(tmp_path):
+    """No-blip for the concurrent-pipeline case: when one process releases its
+    GPU and another acquires it for a DIFFERENT model, every *untouched* service
+    must be byte-identical so `docker compose up -d` recreates only the swapped
+    one. Models that nobody touched stay resident while others go up/down.
+
+    Models C (untouched) + A are live; then A is released and B takes its freed
+    GPU. C stays pinned on its own GPU (placement rule 1: pinned deployments keep
+    their GPUs), so no reshuffle.
+    """
+    cat = _three_endpoint_catalog()
+    rc1 = render_compose(
+        [vllm('grp-c', served='cee'), vllm('grp-a', served='alpha')],
+        {'grp-c': [2], 'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
+    )
+    rc2 = render_compose(
+        [vllm('grp-c', served='cee'), vllm('grp-b', served='beta')],
+        {'grp-c': [2], 'grp-b': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
+    )
+    s1, s2 = rc1.compose['services'], rc2.compose['services']
+
+    # The untouched model's service is byte-identical (same GPU, same spec) ->
+    # not recreated. This is the property the concurrent pipelines depend on.
+    assert s1['vllm-cee'] == s2['vllm-cee']
+    # The standing front door (gateway) is byte-identical too -> no gateway blip.
+    assert s1['litellm'] == s2['litellm']
+    # Only the swapped model's service differs between the two states.
+    assert set(s1) ^ set(s2) == {'vllm-alpha', 'vllm-beta'}
+
+
 def test_litellm_legacy_config_churns_without_catalog(tmp_path):
     """Contrast: without a catalog, the config is per-live-deployment, so it
     DOES change when the model set changes (the old, blip-causing behavior)."""
@@ -964,6 +1017,35 @@ def test_ollama_not_ready_when_pull_fails(tmp_path):
     r = be.probe_ready(g, 'daemon')
     assert r.ready is False
     assert 'pulling' in r.detail
+
+
+def test_ollama_pull_uses_host_service_name_not_deployment_id(tmp_path):
+    """Regression: the tag pull must exec into the daemon by the SAME name it is
+    rendered/observed under — ``ollama-<host>`` — not ``ollama-<deployment.id>``.
+
+    A catalog Ollama endpoint carries a ``host`` distinct from the generated
+    deployment id, so the daemon renders as e.g. ``ollama-local-ollama`` while the
+    pull was exec'ing into ``ollama-grp-...`` — a service that "is not running" —
+    so the tag was never pulled and ``--require-generation`` timed out. The shared
+    ``ollama()`` helper hid this because it sets no host (id == host).
+    """
+    from infer_stack.leasing.compose import ollama_service_name
+
+    g = Deployment(
+        'grp-xyz', 'ck', 'ollama', 'shared-compatible', {},
+        {'engine': 'ollama', 'host': 'local-ollama', 'gpu_indices': [],
+         'settings': {'keep_alive': '2m'}},
+        {'smol-ollama': {'model': 'smollm2:135m'}},
+        DeploymentState.LIVE, 0.0, 0.0,
+    )
+    be = make_backend(tmp_path)
+    be.converge([g])
+    assert ollama_service_name(g) == 'ollama-local-ollama'   # host-derived name
+    be.probe_ready(g, 'smol-ollama')
+    pulls = [c for c in be.run.calls if 'exec' in c and 'pull' in c]
+    assert pulls, 'a tag pull should have been attempted'
+    assert 'ollama-local-ollama' in pulls[0]      # the rendered/observed service
+    assert 'ollama-grp-xyz' not in pulls[0]       # NOT the deployment-id name
 
 
 # -- docker compose schema validation --------------------------------------
