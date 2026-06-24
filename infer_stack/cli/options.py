@@ -96,9 +96,8 @@ class _AllowedGpusMixin(scfg.DataConfig):
         help=(
             'Restrict placement to a comma-separated list of GPU indices '
             "(e.g. '1' or '1,3'). Real indices are preserved — the rendered "
-            'compose stack pins device_ids to exactly those GPUs. May also '
-            'be set via INFER_STACK_ALLOWED_GPUS. Useful for integration '
-            'tests on machines where some GPUs are tied up.'
+            'compose stack pins device_ids to exactly those GPUs. Useful for '
+            'integration tests on machines where some GPUs are tied up.'
         ),
     )
 
