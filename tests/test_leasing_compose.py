@@ -611,7 +611,8 @@ def test_render_open_webui_default_and_stable(tmp_path):
     ow = one.compose['services']['open-webui']
     assert ow['ports'] == ['13000:8080']
     assert ow['environment']['OPENAI_API_BASE_URL'] == 'http://litellm:4000/v1'
-    assert ow['environment']['OPENAI_API_KEY'] == 'sk-x'
+    # The secret is referenced, not inlined — its value lives in the sidecar .env.
+    assert ow['environment']['OPENAI_API_KEY'] == '${LITELLM_MASTER_KEY}'
     assert ow['depends_on'] == ['litellm']
 
     # Adding a second model recreates litellm (routing changed) but must NOT
@@ -665,7 +666,7 @@ def test_open_webui_enables_ollama_api_alongside_litellm(tmp_path):
     rc = _render_ui([ollama('daemon')], {'daemon': [0]}, tmp_path, litellm=True)
     env = rc.compose['services']['open-webui']['environment']
     assert env['OPENAI_API_BASE_URL'] == 'http://litellm:4000/v1'
-    assert env['OPENAI_API_KEY'] == 'sk-x'
+    assert env['OPENAI_API_KEY'] == '${LITELLM_MASTER_KEY}'
     assert env['ENABLE_OLLAMA_API'] == 'True'
     assert env['OLLAMA_BASE_URL'] == 'http://ollama-daemon:11434'
     assert rc.compose['services']['open-webui']['depends_on'] == ['litellm']
@@ -847,12 +848,24 @@ def test_master_key_managed_stable_and_persisted(tmp_path):
     assert make_backend(tmp_path).master_key() == k1
 
 
-def test_converge_bakes_master_key_into_litellm(tmp_path):
+def test_converge_references_master_key_via_env_not_baked(tmp_path):
     be = make_backend(tmp_path)
     be.converge([vllm('a')])
-    compose = yaml.safe_load(be.compose_file.read_text())
-    baked = compose['services']['litellm']['environment']['LITELLM_MASTER_KEY']
-    assert baked == be.master_key() and baked.startswith('sk-')
+    raw = be.compose_file.read_text()
+    key = be.master_key()
+    assert key.startswith('sk-')
+    # The compose YAML references the var, it does NOT contain the secret value.
+    compose = yaml.safe_load(raw)
+    assert (
+        compose['services']['litellm']['environment']['LITELLM_MASTER_KEY']
+        == '${LITELLM_MASTER_KEY}'
+    )
+    assert key not in raw
+    # The value lives in the sidecar .env next to the compose file, which
+    # `docker compose --env-file` loads for interpolation.
+    env_path = be.compose_file.parent / '.env'
+    assert env_path.exists()
+    assert f'LITELLM_MASTER_KEY={key}' in env_path.read_text()
 
 
 def test_envfile_carries_managed_api_key(tmp_path):

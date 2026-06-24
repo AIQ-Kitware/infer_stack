@@ -53,6 +53,8 @@ the display GPU; `60_dedicated_f5` probes placement on a busy box).
 | `86_ollama_lean` | yes | `--no-litellm`: no gateway, Open WebUI wired straight at the daemon's native API, tag still pulled, chat hits the daemon directly, `status` shows the UI URL |
 | `88_gpu_pinning` | yes | pin an ollama daemon to **GPU 1** (`--include-display-gpus`): device-reservation `device_ids=[1]`, no host-index `CUDA_VISIBLE_DEVICES`, and it runs ON the GPU (not a CPU fallback) |
 | `90_concurrency` | yes | two racing acquires; file lock keeps the compose file valid |
+| `91_queue` | yes | `acquire --queue`: a second dedicated group queues behind a busy GPU and lands when it frees; a no-free-GPU queue times out and rolls back (no phantom lease). Pins to GPU 0 via `--allowed-gpus 0` for deterministic contention |
+| `92_gc` | yes | `infer-stack gc`: a leaked (TTL-expired, never-released) lease is a no-op before TTL, reclaimed + its stop-policy group torn down after; plain `gc` leaves an idle keep-warm model, `gc --evict` tears it down |
 | `99_cleanup` | always | release stragglers + `down` the project (never leak containers) |
 
 Run a subset: `./run.sh --gpu --only '40 50'`. `99_cleanup` always runs.
