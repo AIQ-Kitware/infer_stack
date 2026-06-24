@@ -9,14 +9,14 @@ step acquire-nowait 'acquire smol-135 (null backend, --no-wait, JSON)'
 run "infer-stack acquire smol-135 --catalog \"$E2E_CAT\" \
       --env-file \"$ENVF\" --no-wait --json"
 expect_rc 0
-expect_out '"session_id"'
+expect_out '"lease_id"'
 expect_out 'smol-135'
 end_step
 
 step envfile 'env-file is sourceable and carries the endpoint contract'
 run "cat \"$ENVF\""
 expect_rc 0
-expect_file_has "$ENVF" 'export INFER_STACK_SESSION_ID='
+expect_file_has "$ENVF" 'export INFER_STACK_LEASE_ID='
 expect_file_has "$ENVF" 'INFER_STACK_ENDPOINT_SMOL_135=smol-135'
 expect_file_has "$ENVF" 'INFER_STACK_MODELS=smol-135'
 end_step
