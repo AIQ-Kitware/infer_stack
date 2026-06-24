@@ -53,12 +53,15 @@ run "( infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
 expect_rc 0
 note 'B is queued in the background; letting it confirm it cannot place yet'
 run 'sleep 20'
-# B must still be waiting: its rc file should not exist yet, and only A is active.
+# B must still be waiting: its acquire hasn't returned (no rc file yet). A queued
+# acquire creates its lease up front and THEN polls for placement, so B's lease
+# is already 'active' (its deployment just isn't placed) — hence TWO active
+# leases now: A (holding the GPU) and B (queued behind it).
 run "test ! -f \"$BRC\" && echo 'B still waiting'"
 expect_out 'B still waiting'
 run 'infer-stack leases --json'
-count_out '"state": "active"' 1
-note 'A active, B requested-but-waiting (queued behind the busy GPU)'
+count_out '"state": "active"' 2
+note 'A active + B active-but-unplaced (queued behind the busy GPU)'
 # Free the GPU: releasing A tears down its reclaim:stop group; B's next reconcile
 # (every --interval seconds) then places it on the freed GPU.
 run "infer-stack release --env-file \"$AENV\""
