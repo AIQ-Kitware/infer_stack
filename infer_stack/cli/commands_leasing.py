@@ -237,7 +237,11 @@ def _open_controller(config, *, interactive: bool = False) -> Controller:
 
 
 def _load_catalog(config) -> Catalog:
-    raw = config.catalog or (config_root() / 'catalog.yaml')
+    # `catalog` is declared only on the verbs that take a --catalog arg
+    # (acquire/run/tui); converge verbs that don't (release/evict/gc) still load
+    # it for no-blip, so fall back to the default path when the field is absent
+    # rather than raising AttributeError off a bare `config.catalog`.
+    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
     path = Path(raw).expanduser()
     if not path.exists():
         raise SystemExit(
@@ -256,7 +260,7 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
     hard error here: it loads an empty catalog (the dashboard then shows the
     empty-state with a Suggest button) and returns the path it would write to.
     """
-    raw = config.catalog or (config_root() / 'catalog.yaml')
+    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
     path = Path(raw).expanduser()
     if not path.exists():
         return Catalog.from_dict({'models': {}, 'endpoints': {}}), path
