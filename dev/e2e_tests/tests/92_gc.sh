@@ -5,6 +5,11 @@
 # TTL elapses; gc sweeps expired leases and tears down any stop-policy deployment
 # left with no demand. Plain gc leaves a healthy idle keep-warm model resident;
 # `--evict` drops idle keep-warm too (like `evict --all`).
+#
+# Acquires use --no-wait: gc's behaviour is driven by ledger state (lease TTL +
+# reclaim policy), not model readiness, so we don't pay (or race) a cold start —
+# in particular the short TTL below must not be consumed by a slow model load.
+# `gc` takes no --catalog (it reconciles existing demand, not new endpoints).
 source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
@@ -17,15 +22,14 @@ fi
 GCENV="$E2E_RESULTS/gc.env"
 KWENV="$E2E_RESULTS/gc-keepwarm.env"
 
-# A "leaked" lease: acquire with a short TTL and never release (simulating a
-# hard-killed job). gc must be a no-op until the TTL elapses.
+# A "leaked" lease: acquire with a short TTL and never release (a hard-killed
+# job). gc must be a no-op until the TTL elapses.
 step gc-noop-before-ttl 'gc does nothing while a short-TTL lease still protects its group'
 run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
-      --owner crashed --ttl 120s --require-generation \
+      --owner crashed --ttl 90s --no-wait \
       --env-file \"$GCENV\" --timeout 1200 --json"
 expect_rc 0
-expect_out '"ready": true'
-run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
+run "infer-stack gc --backend compose --yes"
 expect_rc 0
 expect_out 'nothing to reclaim'
 run 'infer-stack leases --json'
@@ -34,9 +38,9 @@ note 'before the TTL, the lease protects its group: gc correctly reclaims nothin
 end_step
 
 step gc-reclaims-after-ttl 'after the TTL elapses gc reclaims the leaked lease and frees the GPU'
-note 'sleeping 130s to cross the 120s soft TTL...'
-run 'sleep 130'
-run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
+note 'sleeping 100s to cross the 90s soft TTL...'
+run 'sleep 100'
+run "infer-stack gc --backend compose --yes"
 expect_rc 0
 expect_out 'gc: reclaimed'
 expect_no_out 'nothing to reclaim'
@@ -45,23 +49,22 @@ expect_no_out '"state": "active"'
 note 'gc swept the expired lease and tore down the orphaned stop-policy group'
 end_step
 
-# Keep-warm survives a plain gc (it is a healthy idle model, not leaked demand);
-# only `--evict` tears it down.
+# Keep-warm survives a plain gc (a healthy idle model, not leaked demand); only
+# `--evict` tears it down.
 step gc-keepwarm-survives 'plain gc leaves an idle keep-warm model; --evict tears it down'
 run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
-      --owner kw --require-generation --env-file \"$KWENV\" --timeout 1200 --json"
+      --owner kw --no-wait --env-file \"$KWENV\" --timeout 1200 --json"
 expect_rc 0
-expect_out '"ready": true'
 # Graceful release -> idle, but smol-360 is reclaim:keep-warm so it stays resident.
 run "infer-stack release --env-file \"$KWENV\""
 expect_rc 0
 # Plain gc must NOT disturb a healthy idle keep-warm model.
-run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
+run "infer-stack gc --backend compose --yes"
 expect_rc 0
 expect_out 'nothing to reclaim'
 note 'plain gc left the idle keep-warm group resident'
 # --evict tears down idle keep-warm too.
-run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --evict --yes"
+run "infer-stack gc --backend compose --evict --yes"
 expect_rc 0
 expect_out 'gc: reclaimed'
 expect_no_out 'nothing to reclaim'
