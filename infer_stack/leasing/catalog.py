@@ -23,6 +23,9 @@ Schema (all sections optional except as referenced)::
         runtime: {tensor_parallel_size: 1, max_model_len: 32768}
         sharing: {mode: shared-compatible}
         reclaim: {policy: keep-warm}
+        protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
+                              # surface the readiness probe (and clients) use; a
+                              # completions-only model needs protocol: completions
       qwen-small:
         engine: ollama
         host: local-ollama
@@ -107,6 +110,10 @@ class EndpointSpec:
     sharing: str = Sharing.SHARED
     reclaim: str = DEFAULT_RECLAIM
     served_name: str | None = None
+    # OpenAI surface the readiness probe (and clients) should use: 'chat' hits
+    # /chat/completions, 'completions' hits /completions. A completions-only
+    # model never answers a chat probe, so this must match how it is served.
+    protocol: str = 'chat'
 
 
 def _parse_sharing(value: Any) -> str:
@@ -127,6 +134,16 @@ def _parse_reclaim(value: Any) -> str:
     if isinstance(value, dict):
         return value.get('policy', DEFAULT_RECLAIM)
     raise CatalogError(f'invalid reclaim spec: {value!r}')
+
+
+def _parse_protocol(value: Any) -> str:
+    if value is None:
+        return 'chat'
+    if value in ('chat', 'completions'):
+        return value
+    raise CatalogError(
+        f"invalid protocol {value!r} (use 'chat' or 'completions')"
+    )
 
 
 @dataclass
@@ -189,6 +206,7 @@ class Catalog:
                 sharing=_parse_sharing(spec.get('sharing')),
                 reclaim=_parse_reclaim(spec.get('reclaim')),
                 served_name=spec.get('public_name') or spec.get('served_name'),
+                protocol=_parse_protocol(spec.get('protocol')),
             )
         bundles = {
             name: list(members or [])
@@ -369,6 +387,7 @@ class Catalog:
         served = {
             'served_model_name': served_name,
             'hf_model_id': model.hf_model_id,
+            'protocol': ep.protocol,
         }
         return EndpointRequest(
             endpoint=ep.name,

@@ -475,8 +475,9 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
     require_generation = scfg.Value(
         False,
         isflag=True,
-        help='Readiness requires a real generation, not just model listing '
-        '(compose backend; Ollama always generates to warm the tag).',
+        help='Deprecated/no-op: readiness now ALWAYS verifies a real generation '
+        '(a listed alias or a running container is not proof the model serves). '
+        'Accepted for compatibility.',
     )
     litellm = scfg.Value(
         None,
@@ -511,6 +512,13 @@ class _ApprovalMixin(_LeasingCommonMixin):
     terminal; ``--yes`` (or a non-TTY) applies without prompting.
     """
 
+    catalog = scfg.Value(
+        None, type=str,
+        help='Path to catalog.yaml. release/gc/evict reconcile the gateway too, '
+        'so pass the same catalog as acquire to keep the static superset route '
+        'table (no gateway blip); omitted, it falls back to the default-path '
+        'catalog, else legacy per-deployment routing.',
+    )
     yes = scfg.Value(
         False, isflag=True, alias=['y'],
         help='Apply compose changes without showing the diff / prompting '

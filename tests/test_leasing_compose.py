@@ -36,7 +36,8 @@ IMAGES = {
 PORTS = {'ollama': 11434}
 
 
-def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm', t=0.0):
+def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm',
+         protocol='chat', t=0.0):
     # endpoint (public alias) is the deployment id; served_model_name is the upstream
     served_name = served or gid
     return Deployment(
@@ -48,7 +49,7 @@ def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep
             'runtime': {'tensor_parallel_size': tp, 'max_model_len': max_len},
             'reclaim': reclaim,
         },
-        {gid: {'served_model_name': served_name}},
+        {gid: {'served_model_name': served_name, 'protocol': protocol}},
         DeploymentState.LIVE, t, t,
     )
 
@@ -1046,6 +1047,102 @@ def test_ollama_pull_uses_host_service_name_not_deployment_id(tmp_path):
     assert pulls, 'a tag pull should have been attempted'
     assert 'ollama-local-ollama' in pulls[0]      # the rendered/observed service
     assert 'ollama-grp-xyz' not in pulls[0]       # NOT the deployment-id name
+
+
+# -- protocol-aware, generation-gated readiness ----------------------------
+
+
+class RecordingHttp:
+    """A requests-like fake that advertises a fixed model set, records every
+    GET/POST URL, and returns a configurable status for generation POSTs."""
+
+    def __init__(self, models, post_status=200):
+        self.models = list(models)
+        self.post_status = post_status
+        self.get_urls: list[str] = []
+        self.post_urls: list[str] = []
+
+    def get(self, url, **kw):
+        self.get_urls.append(url)
+        if url.endswith('/models'):
+            return FakeResp(200, {'data': [{'id': m} for m in self.models]})
+        return FakeResp(404, {'detail': 'not found'})
+
+    def post(self, url, **kw):
+        self.post_urls.append(url)
+        payload = (
+            {'choices': [{'message': {'content': 'ok'}}]}
+            if self.post_status < 400 else {'error': 'not ready'}
+        )
+        return FakeResp(self.post_status, payload)
+
+
+def _backend_with_http(tmp_path, http, **kw):
+    return ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+        run=FakeDocker(), http=http, images=IMAGES, ports=PORTS, state=STATE, **kw,
+    )
+
+
+def test_probe_uses_completions_endpoint_for_completions_protocol(tmp_path):
+    """A completions-only model must be probed at /completions, not the chat
+    endpoint it never answers (which would block readiness forever)."""
+    http = RecordingHttp(models=['e'])
+    be = _backend_with_http(tmp_path, http)
+    g = vllm('e', protocol='completions')
+    be.converge([g])
+    assert be.probe_ready(g, 'e').ready is True
+    assert http.post_urls[-1].endswith('/v1/completions')
+
+
+def test_probe_uses_chat_endpoint_by_default(tmp_path):
+    http = RecordingHttp(models=['e'])
+    be = _backend_with_http(tmp_path, http)
+    g = vllm('e')  # default protocol chat
+    be.converge([g])
+    assert be.probe_ready(g, 'e').ready is True
+    assert http.post_urls[-1].endswith('/v1/chat/completions')
+
+
+def test_probe_not_ready_until_generation_succeeds(tmp_path):
+    """The static superset gateway advertises the alias from the start, so a
+    listed alias is NOT proof of readiness — only a successful generation is.
+    A model whose generation 503s must report NOT ready."""
+    http = RecordingHttp(models=['e'], post_status=503)
+    be = _backend_with_http(tmp_path, http)
+    g = vllm('e')
+    be.converge([g])
+    r = be.probe_ready(g, 'e')
+    assert r.ready is False               # listed, but not serving -> not ready
+    assert http.post_urls                  # we did attempt the generation
+
+
+def test_probe_without_gateway_hits_published_upstream(tmp_path):
+    """No gateway: readiness probes the vLLM upstream's own published /v1 with a
+    real generation, not just 'container running'."""
+    http = RecordingHttp(models=['srv'])
+    be = _backend_with_http(tmp_path, http, litellm=False)
+    g = vllm('e', served='srv')
+    be.converge([g])
+    assert be.probe_ready(g, 'e').ready is True
+    # probed the host-published upstream port, and asked for the served name
+    assert any('127.0.0.1:18000/v1' in u for u in http.get_urls + http.post_urls)
+
+
+def test_catalog_parses_endpoint_protocol(tmp_path):
+    from infer_stack.leasing.catalog import Catalog, CatalogError
+
+    base = {'models': {'m': {'source': 'hf://org/m'}}}
+    cat = Catalog.from_dict({**base, 'endpoints': {
+        'chatty': {'engine': 'vllm', 'model': 'm'},
+        'compl': {'engine': 'vllm', 'model': 'm', 'protocol': 'completions'},
+    }})
+    assert cat.resolve_endpoint('chatty').served['protocol'] == 'chat'
+    assert cat.resolve_endpoint('compl').served['protocol'] == 'completions'
+    with pytest.raises(CatalogError):
+        Catalog.from_dict({**base, 'endpoints': {
+            'bad': {'engine': 'vllm', 'model': 'm', 'protocol': 'embeddings'},
+        }})
 
 
 # -- docker compose schema validation --------------------------------------

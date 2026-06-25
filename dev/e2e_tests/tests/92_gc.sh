@@ -9,7 +9,8 @@
 # Acquires use --no-wait: gc's behaviour is driven by ledger state (lease TTL +
 # reclaim policy), not model readiness, so we don't pay (or race) a cold start —
 # in particular the short TTL below must not be consumed by a slow model load.
-# `gc` takes no --catalog (it reconciles existing demand, not new endpoints).
+# gc reconciles the gateway too, so we pass --catalog (as pipelines should) to
+# keep the static superset route table.
 source "$E2E_ROOT/lib.sh"
 
 if ! gpu_enabled; then
@@ -29,7 +30,7 @@ run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
       --owner crashed --ttl 90s --no-wait \
       --env-file \"$GCENV\" --timeout 1200 --json"
 expect_rc 0
-run "infer-stack gc --backend compose --yes"
+run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
 expect_rc 0
 expect_out 'nothing to reclaim'
 run 'infer-stack leases --json'
@@ -40,7 +41,7 @@ end_step
 step gc-reclaims-after-ttl 'after the TTL elapses gc reclaims the leaked lease and frees the GPU'
 note 'sleeping 100s to cross the 90s soft TTL...'
 run 'sleep 100'
-run "infer-stack gc --backend compose --yes"
+run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
 expect_rc 0
 expect_out 'gc: reclaimed'
 expect_no_out 'nothing to reclaim'
@@ -56,15 +57,15 @@ run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
       --owner kw --no-wait --env-file \"$KWENV\" --timeout 1200 --json"
 expect_rc 0
 # Graceful release -> idle, but smol-360 is reclaim:keep-warm so it stays resident.
-run "infer-stack release --env-file \"$KWENV\""
+run "infer-stack release --backend compose --catalog \"$E2E_CAT\" --env-file \"$KWENV\""
 expect_rc 0
 # Plain gc must NOT disturb a healthy idle keep-warm model.
-run "infer-stack gc --backend compose --yes"
+run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --yes"
 expect_rc 0
 expect_out 'nothing to reclaim'
 note 'plain gc left the idle keep-warm group resident'
 # --evict tears down idle keep-warm too.
-run "infer-stack gc --backend compose --evict --yes"
+run "infer-stack gc --backend compose --catalog \"$E2E_CAT\" --evict --yes"
 expect_rc 0
 expect_out 'gc: reclaimed'
 expect_no_out 'nothing to reclaim'

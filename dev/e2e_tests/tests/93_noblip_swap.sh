@@ -13,11 +13,11 @@
 #   C = smol-360  (the new model brought up on the freed GPU; --queue absorbs any
 #                  teardown latency between B going down and the GPU coming free)
 #
-# Key prerequisite this also guards: the catalog-less `release` converge must
-# still render the static superset, or it falls back to per-deployment routing
-# and the gateway churns (a real blip). `release` has no --catalog flag, so it
-# reads the DEFAULT path (config_root/catalog.yaml) — which we populate below.
-# This mirrors a correctly configured deployment.
+# Key prerequisite this also guards: the `release` converge must render the same
+# static superset as acquire, or it falls back to per-deployment routing and the
+# gateway churns (a real blip). We pass --catalog to release for that (release/gc
+# accept it now); a deployment that omits it must instead keep the catalog on the
+# default path (config_root/catalog.yaml).
 source "$E2E_ROOT/lib.sh"
 
 AENV="$E2E_RESULTS/noblip-a.env"
@@ -40,10 +40,6 @@ if [ "${NGPU:-0}" -lt 2 ]; then
     skip noblip-cleanup "needs 2 GPUs, found ${NGPU:-0}"
     exit 0
 fi
-
-# Make the catalog discoverable on EVERY converge, including the no-`--catalog`
-# release, so the gateway is rendered from the static superset throughout.
-cp "$E2E_CAT" "$INFER_STACK_CONFIG_DIR/catalog.yaml"
 
 step noblip-two-models-up 'two distinct models on two GPUs, both routable through the gateway'
 run "infer-stack acquire smol-135 --backend compose --catalog \"$E2E_CAT\" \
@@ -84,10 +80,10 @@ expect_rc 0
 note 'poller is streaming requests to A; now swapping B -> C underneath it'
 run 'sleep 5'   # let a few baseline requests land before the swap
 # Swap: release B (reclaim:stop -> its GPU frees), bring C up on the freed GPU.
-# The release has no --catalog and relies on the default-path catalog placed
-# above. C uses --queue so it waits out any lag between B's teardown and the GPU
-# actually coming free, instead of failing fast with a transient "no GPU".
-run "infer-stack release --env-file \"$BENV\""
+# Pass --catalog to the release so its reconcile renders the same static superset
+# (no gateway blip). C uses --queue so it waits out any lag between B's teardown
+# and the GPU actually coming free, instead of failing fast with a transient "no GPU".
+run "infer-stack release --backend compose --catalog \"$E2E_CAT\" --env-file \"$BENV\""
 expect_rc 0
 run "infer-stack acquire smol-360 --backend compose --catalog \"$E2E_CAT\" \
       --owner noblip-c --require-generation --queue --env-file \"$CENV\" \
@@ -114,11 +110,9 @@ expect_out 'smol-135'
 end_step
 
 step noblip-cleanup 'release the no-blip tier holders'
-run "infer-stack release --env-file \"$AENV\" >/dev/null 2>&1; true"
-run "infer-stack release --env-file \"$CENV\" >/dev/null 2>&1; true"
+run "infer-stack release --backend compose --catalog \"$E2E_CAT\" --env-file \"$AENV\" >/dev/null 2>&1; true"
+run "infer-stack release --backend compose --catalog \"$E2E_CAT\" --env-file \"$CENV\" >/dev/null 2>&1; true"
 run "infer-stack leases --json | python3 -c 'import json,sys;[print(l[\"id\"]) for l in json.load(sys.stdin)[\"leases\"] if l[\"state\"]==\"active\"]' | xargs -r -n1 infer-stack release >/dev/null 2>&1; true"
 run 'infer-stack leases --json'
 expect_no_out '"state": "active"'
-# Drop the default-path catalog we added so later runs aren't surprised by it.
-run "rm -f \"$INFER_STACK_CONFIG_DIR/catalog.yaml\"; true"
 end_step
