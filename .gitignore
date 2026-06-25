@@ -10,6 +10,7 @@ models.yaml
 state/
 venv/
 *.egg-info
+build/
 
 generated/*
 !generated/.gitignore
