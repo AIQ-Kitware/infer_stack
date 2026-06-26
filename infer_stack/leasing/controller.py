@@ -20,8 +20,11 @@ its TTL elapses.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable
 
 from .backend import Backend
@@ -29,6 +32,8 @@ from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease
 
 KEEP_WARM = 'keep-warm'
+
+LOCK_FILENAME = '.leasing.lock'
 
 
 @dataclass
@@ -105,6 +110,48 @@ class Controller:
         self.clock = clock or ledger.clock
         self.sleep = sleep
         self.reclaim_default = reclaim_default
+        self._lock_path = self._resolve_lock_path()
+
+    # -- cross-process lock ------------------------------------------------
+
+    def _resolve_lock_path(self) -> Path | None:
+        """Where the global mutate lock lives: beside the shared ledger db.
+
+        ``None`` for an in-memory ledger (tests/fakes) — there is no shared
+        state to guard, so the lock degrades to a no-op.
+        """
+        path = getattr(getattr(self.ledger, 'store', None), 'path', None)
+        if path and path != ':memory:':
+            return Path(path).expanduser().parent / LOCK_FILENAME
+        return None
+
+    @contextlib.contextmanager
+    def _global_lock(self):
+        """Serialize the state-mutating read-modify-write across processes.
+
+        ``reconcile`` reads the ledger's *desired* set then ``converge``s the
+        backend (render the compose project + ``docker compose up``). Two CLIs
+        doing this at once each compute desired from the ledger, then race their
+        renders/applies — diffing against a target the other just moved ("last
+        render wins", stale-diff prompts). An exclusive advisory lock on a file
+        beside the ledger makes that whole section single-writer.
+
+        Held only for the mutation, **not** the readiness wait or the
+        between-retries sleep of the admission queue, so queued waiters still
+        coexist. Always taken before the backend's own ``converge`` lock (a
+        different file), so the nesting order is consistent and deadlock-free.
+        """
+        if self._lock_path is None:
+            yield
+            return
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self._lock_path, 'w')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
 
     # -- reconcile ---------------------------------------------------------
 
@@ -132,46 +179,52 @@ class Controller:
         project *without* bringing it up — the "see what would execute" / staged
         path. Backends without that capability ignore it (render and apply are
         inseparable for them).
+
+        The entire desired-read + converge is held under :meth:`_global_lock` so
+        concurrent CLIs cannot diff/apply against each other's stale target.
         """
-        self.ledger.sweep()
-        desired = self.desired_deployments()
-        if hasattr(self.backend, 'converge'):
-            before = set(self.backend.observe())
-            # Only pass apply= when staging, so backends/fakes with the older
-            # ``converge(desired)`` signature keep working on the default path.
-            if apply:
-                self.backend.converge(desired)
-            else:
-                self.backend.converge(desired, apply=False)
-            after = set(self.backend.observe())
-            return ReconcileResult(
-                realized=sorted(after - before),
-                torn_down=sorted(before - after),
-                unplaced=sorted(getattr(self.backend, 'last_unplaced', ()) or ()),
-                placement_errors=list(
-                    getattr(self.backend, 'last_errors', ()) or ()
-                ),
-                assignments=dict(
-                    getattr(self.backend, 'last_assignments', {}) or {}
-                ),
-                applied=apply,
-            )
-        desired_ids = {g.id for g in desired}
-        actual = self.backend.observe()
-        result = ReconcileResult()
-        for deployment in desired:
-            if deployment.id not in actual:
-                self.backend.realize(deployment)
-                result.realized.append(deployment.id)
-        stale = actual - desired_ids
-        if stale:
-            by_id = {g.id: g for g in self.ledger.status()[1]}
-            for gid in stale:
-                deployment = by_id.get(gid)
-                if deployment is not None:
-                    self.backend.teardown(deployment)
-                result.torn_down.append(gid)
-        return result
+        with self._global_lock():
+            self.ledger.sweep()
+            desired = self.desired_deployments()
+            if hasattr(self.backend, 'converge'):
+                before = set(self.backend.observe())
+                # Only pass apply= when staging, so backends/fakes with the older
+                # ``converge(desired)`` signature keep working on the default path.
+                if apply:
+                    self.backend.converge(desired)
+                else:
+                    self.backend.converge(desired, apply=False)
+                after = set(self.backend.observe())
+                return ReconcileResult(
+                    realized=sorted(after - before),
+                    torn_down=sorted(before - after),
+                    unplaced=sorted(
+                        getattr(self.backend, 'last_unplaced', ()) or ()
+                    ),
+                    placement_errors=list(
+                        getattr(self.backend, 'last_errors', ()) or ()
+                    ),
+                    assignments=dict(
+                        getattr(self.backend, 'last_assignments', {}) or {}
+                    ),
+                    applied=apply,
+                )
+            desired_ids = {g.id for g in desired}
+            actual = self.backend.observe()
+            result = ReconcileResult()
+            for deployment in desired:
+                if deployment.id not in actual:
+                    self.backend.realize(deployment)
+                    result.realized.append(deployment.id)
+            stale = actual - desired_ids
+            if stale:
+                by_id = {g.id: g for g in self.ledger.status()[1]}
+                for gid in stale:
+                    deployment = by_id.get(gid)
+                    if deployment is not None:
+                        self.backend.teardown(deployment)
+                    result.torn_down.append(gid)
+            return result
 
     # -- readiness ---------------------------------------------------------
 
