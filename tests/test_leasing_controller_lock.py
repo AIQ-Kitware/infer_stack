@@ -80,6 +80,26 @@ def test_in_memory_ledger_has_no_lock():
     ctl.reconcile()
 
 
+def test_lock_falls_back_when_ledger_dir_unwritable(tmp_path):
+    """If the lock file can't be created beside the ledger (e.g. a read-only
+    service data dir), fall back to a writable temp path rather than crash."""
+    ctl = Controller(
+        Ledger(SqliteStore(str(tmp_path / 'ledger.db'))), OverlapBackend()
+    )
+    # Force the primary lock path to be uncreatable (its parent is a regular
+    # file), independent of the test user's privileges -> exercises the fallback.
+    blocker = tmp_path / 'not-a-dir'
+    blocker.write_text('x')
+    ctl._lock_path = blocker / 'sub' / '.leasing.lock'
+
+    handle = ctl._open_lock_handle()
+    assert handle is not None, 'expected a fallback lock handle, got None'
+    handle.close()
+
+    with ctl._global_lock():  # must not raise
+        pass
+
+
 class SharedOverlapBackend:
     """Like OverlapBackend but records overlap into a shared counter, so two
     *separate* controllers' converges can be compared."""

@@ -131,6 +131,37 @@ class Controller:
             return Path(path).expanduser().parent / LOCK_FILENAME
         return None
 
+    def _open_lock_handle(self):
+        """Open an ``flock``-able handle for the cross-process lock.
+
+        Normally the lock file sits beside the ledger. If that directory is not
+        writable for a *new* file (e.g. a service-owned shared data dir that this
+        user can read but not write), fall back to a host-shared temp path keyed
+        by the ledger location, so same-host processes still serialize on a
+        consistent file. If even that fails, return ``None`` and the caller
+        proceeds with only the in-process lock. Opened append-mode (never
+        truncated): the file is a pure ``flock`` token, its content is unused.
+        """
+        import hashlib
+        import tempfile
+        import warnings
+
+        assert self._lock_path is not None
+        digest = hashlib.sha1(str(self._lock_path).encode()).hexdigest()[:16]
+        fallback = Path(tempfile.gettempdir()) / f'infer-stack-{digest}.lock'
+        for path in (self._lock_path, fallback):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                return open(path, 'a')
+            except OSError:
+                continue
+        warnings.warn(
+            'infer-stack: could not open a cross-process lock file (tried '
+            f'{self._lock_path} and {fallback}); proceeding with in-process '
+            'locking only — concurrent CLIs on this host may race.'
+        )
+        return None
+
     @contextlib.contextmanager
     def _global_lock(self):
         """Serialize the whole state-mutating critical section, single-writer.
@@ -159,15 +190,15 @@ class Controller:
         self._tlock.acquire()
         try:
             if self._flock_depth == 0:
-                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-                self._flock_handle = open(self._lock_path, 'w')
-                fcntl.flock(self._flock_handle, fcntl.LOCK_EX)
+                self._flock_handle = self._open_lock_handle()
+                if self._flock_handle is not None:
+                    fcntl.flock(self._flock_handle, fcntl.LOCK_EX)
             self._flock_depth += 1
             try:
                 yield
             finally:
                 self._flock_depth -= 1
-                if self._flock_depth == 0:
+                if self._flock_depth == 0 and self._flock_handle is not None:
                     try:
                         fcntl.flock(self._flock_handle, fcntl.LOCK_UN)
                     finally:
