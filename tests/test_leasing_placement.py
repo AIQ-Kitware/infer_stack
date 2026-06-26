@@ -128,3 +128,34 @@ def test_placement_is_deterministic_by_created_at():
     plan = plan_placement(deployments, inv())
     # earlier created_at ('a', t=0) takes gpu 0 regardless of list order
     assert plan.assignments == {'a': [0], 'z': [1]}
+
+
+def test_pin_outside_allowed_gpus_is_honored():
+    # Slurm shared-stack case: job A's acquire restricts allowed_gpus to its own
+    # GPU, but job B's already-running model (pinned on another GPU) must stay
+    # put — not be deferred and reshuffled onto A's GPU.
+    a = vllm('a', t=0.0)   # the new acquire (job A), allowed only GPU 0
+    b = vllm('b', t=1.0)   # job B, already running on GPU 1
+    plan = plan_placement(
+        [a, b], inv('4x80'), allowed_gpus=[0], pinned={'b': [1]},
+    )
+    assert plan.ok, plan.errors
+    assert plan.assignments['b'] == [1]   # pin honored despite being outside allow-list
+    assert plan.assignments['a'] == [0]   # new deployment lands on its allowed GPU
+
+
+def test_multi_gpu_pin_outside_allowed_is_honored():
+    a = vllm('a', t=0.0)
+    big = vllm('big', tp=2, t=1.0)   # 2-GPU job already running on [2, 3]
+    plan = plan_placement(
+        [a, big], inv('4x80'), allowed_gpus=[0], pinned={'big': [2, 3]},
+    )
+    assert plan.ok, plan.errors
+    assert plan.assignments['big'] == [2, 3]
+    assert plan.assignments['a'] == [0]
+
+
+def test_new_deployment_restricted_to_allowed_gpus():
+    # A fresh (unpinned) deployment may only land inside allowed_gpus.
+    plan = plan_placement([vllm('a')], inv('4x80'), allowed_gpus=[2])
+    assert plan.assignments == {'a': [2]}

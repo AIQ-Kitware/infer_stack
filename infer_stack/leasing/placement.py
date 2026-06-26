@@ -120,6 +120,15 @@ def plan_placement(
         {'a': [0, 1], 'b': [2]}
     """
     pinned = pinned or {}
+    # New placements (steps 2-3) are restricted to ``allowed_gpus``. But an
+    # already-placed (pinned) deployment keeps its GPU as long as that GPU
+    # physically exists and isn't otherwise taken — *even if it falls outside this
+    # call's allowed_gpus*. In Slurm mode each job's ``acquire`` passes only its
+    # own ``$SLURM_JOB_GPUS`` as ``allowed_gpus`` against the shared stack, so
+    # other jobs' running models sit on GPUs outside this call's allow-list;
+    # validating pins against ``allowed_gpus`` would wrongly defer + reshuffle
+    # them. Pin-validity therefore uses the full pool; ``allowed_gpus`` gates only
+    # where *new* deployments may land.
     pool = available_indices(
         inventory,
         allowed_gpus=allowed_gpus,
@@ -127,12 +136,20 @@ def plan_placement(
         skip_display=skip_display,
     )
     pool_set = set(pool)
+    pin_pool_set = set(
+        available_indices(
+            inventory,
+            allowed_gpus=None,
+            reserved=reserved,
+            skip_display=skip_display,
+        )
+    )
     used: set[int] = set()
     plan = GpuPlan()
 
     ordered = _sorted(deployments)
 
-    # 1) pinned deployments that are still fully placeable keep their GPUs.
+    # 1) pinned deployments that are still physically placeable keep their GPUs.
     deferred: list[Deployment] = []
     for deployment in ordered:
         want = pinned.get(deployment.id)
@@ -140,7 +157,7 @@ def plan_placement(
             deferred.append(deployment)
             continue
         want = [int(i) for i in want]
-        if all(i in pool_set for i in want) and not (used & set(want)):
+        if all(i in pin_pool_set for i in want) and not (used & set(want)):
             plan.assignments[deployment.id] = want
             used.update(want)
         else:
