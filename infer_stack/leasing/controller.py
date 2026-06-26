@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,6 +112,11 @@ class Controller:
         self.sleep = sleep
         self.reclaim_default = reclaim_default
         self._lock_path = self._resolve_lock_path()
+        # Intra-process serialization (reentrant for nested acquire->reconcile in
+        # one thread; blocks other threads, e.g. the TUI's converge-while-monitor).
+        self._tlock = threading.RLock()
+        self._flock_handle = None
+        self._flock_depth = 0
 
     # -- cross-process lock ------------------------------------------------
 
@@ -127,31 +133,48 @@ class Controller:
 
     @contextlib.contextmanager
     def _global_lock(self):
-        """Serialize the state-mutating read-modify-write across processes.
+        """Serialize the whole state-mutating critical section, single-writer.
 
-        ``reconcile`` reads the ledger's *desired* set then ``converge``s the
-        backend (render the compose project + ``docker compose up``). Two CLIs
-        doing this at once each compute desired from the ledger, then race their
-        renders/applies — diffing against a target the other just moved ("last
-        render wins", stale-diff prompts). An exclusive advisory lock on a file
-        beside the ledger makes that whole section single-writer.
+        Every verb that mutates shared state — ``acquire``/``release``/``gc``/
+        ``evict`` — does a read-modify-write: a sqlite ledger write (``BEGIN
+        IMMEDIATE``) **then** ``reconcile`` (render the compose project +
+        ``docker compose up``). Without one lock over the *entire* sequence, two
+        CLIs race: their ledger writes collide (sqlite ``database is locked``
+        once one holds the write past the busy-timeout during a slow converge),
+        and their renders diff against a target the other just moved. So the
+        second caller must **block here before it touches sqlite**, not fail.
 
-        Held only for the mutation, **not** the readiness wait or the
-        between-retries sleep of the admission queue, so queued waiters still
-        coexist. Always taken before the backend's own ``converge`` lock (a
-        different file), so the nesting order is consistent and deadlock-free.
+        Reentrant within a thread (nested ``acquire``->``reconcile`` is one
+        flock), serialized across threads via ``_tlock``, and across processes
+        via an exclusive ``flock`` on a file beside the ledger. Taken before the
+        backend's own ``converge`` lock (a different file) so ordering is
+        consistent and deadlock-free.
+
+        NOT held during the readiness wait or the admission-queue sleep, so
+        queued waiters and ``leases``/``status`` readers (WAL, lock-free) coexist.
         """
         if self._lock_path is None:
             yield
             return
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self._lock_path, 'w')
+        self._tlock.acquire()
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            yield
+            if self._flock_depth == 0:
+                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+                self._flock_handle = open(self._lock_path, 'w')
+                fcntl.flock(self._flock_handle, fcntl.LOCK_EX)
+            self._flock_depth += 1
+            try:
+                yield
+            finally:
+                self._flock_depth -= 1
+                if self._flock_depth == 0:
+                    try:
+                        fcntl.flock(self._flock_handle, fcntl.LOCK_UN)
+                    finally:
+                        self._flock_handle.close()
+                        self._flock_handle = None
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-            handle.close()
+            self._tlock.release()
 
     # -- reconcile ---------------------------------------------------------
 
@@ -303,22 +326,26 @@ class Controller:
         """
         from .backend import ConvergeAborted, PlacementError
 
-        result = self.ledger.acquire(
-            owner, requests, ttl_seconds=ttl_seconds
-        )
-        try:
-            rec = self.reconcile(apply=apply)
-        except ConvergeAborted:
-            # The operator declined the compose changes — don't leave the
-            # just-created lease dangling in the ledger.
-            self.ledger.release(result.lease.id)
-            raise
-        # If a deployment this lease just requested could not be placed (e.g. no free
-        # GPU), either queue for one (wait_for_placement) or — the default — roll the
-        # lease back and report the planner's reason, so the deployment never lingers
-        # as a phantom ``live`` with nothing behind it.
-        requested = {g.id for g in result.deployments}
-        unplaced = requested & set(rec.unplaced)
+        # Mutation (ledger write + first reconcile) under one lock, so a second
+        # caller blocks here before touching sqlite rather than racing BEGIN
+        # IMMEDIATE. The readiness wait and the admission-queue sleep stay OUTSIDE.
+        with self._global_lock():
+            result = self.ledger.acquire(
+                owner, requests, ttl_seconds=ttl_seconds
+            )
+            try:
+                rec = self.reconcile(apply=apply)
+            except ConvergeAborted:
+                # The operator declined the compose changes — don't leave the
+                # just-created lease dangling in the ledger.
+                self.ledger.release(result.lease.id)
+                raise
+            # If a deployment this lease just requested could not be placed (e.g. no
+            # free GPU), either queue for one (wait_for_placement) or — the default —
+            # roll the lease back and report the planner's reason, so the deployment
+            # never lingers as a phantom ``live`` with nothing behind it.
+            requested = {g.id for g in result.deployments}
+            unplaced = requested & set(rec.unplaced)
         if unplaced and wait_for_placement and apply:
             p_timeout = timeout if placement_timeout is None else placement_timeout
             p_interval = (
@@ -330,7 +357,8 @@ class Controller:
                 rec = self.reconcile(apply=apply)
                 unplaced = requested & set(rec.unplaced)
         if unplaced:
-            self.ledger.release(result.lease.id)
+            with self._global_lock():
+                self.ledger.release(result.lease.id)
             reasons = [
                 e
                 for e in rec.placement_errors
@@ -357,8 +385,9 @@ class Controller:
 
     def release(self, lease_id: str) -> ReleaseOutcome:
         """Release a lease and converge (tearing down per reclaim policy)."""
-        rel = self.ledger.release(lease_id)
-        rec = self.reconcile()
+        with self._global_lock():
+            rel = self.ledger.release(lease_id)
+            rec = self.reconcile()
         return ReleaseOutcome(
             idled_deployment_ids=rel.idled_deployment_ids, reconcile=rec
         )
@@ -371,9 +400,10 @@ class Controller:
         ``deployment_ids=None`` evicts every idle deployment.
         """
         ids = None if deployment_ids is None else list(deployment_ids)
-        self.ledger.sweep()
-        evicted = self.ledger.evict_idle(ids)
-        rec = self.reconcile()
+        with self._global_lock():
+            self.ledger.sweep()
+            evicted = self.ledger.evict_idle(ids)
+            rec = self.reconcile()
         return EvictOutcome(evicted_deployment_ids=evicted, reconcile=rec)
 
     def gc(self, *, evict_idle: bool = False) -> GcOutcome:
@@ -389,9 +419,10 @@ class Controller:
         keep-warm models are left resident and only leaked/expired demand is
         reclaimed.
         """
-        swept = self.ledger.sweep()
-        evicted = self.ledger.evict_idle(None) if evict_idle else []
-        rec = self.reconcile()
+        with self._global_lock():
+            swept = self.ledger.sweep()
+            evicted = self.ledger.evict_idle(None) if evict_idle else []
+            rec = self.reconcile()
         return GcOutcome(
             expired_lease_ids=list(swept.expired_lease_ids),
             idled_deployment_ids=list(swept.idled_deployment_ids),

@@ -12,7 +12,13 @@ from __future__ import annotations
 import threading
 import time
 
-from infer_stack.leasing import Controller, Ledger, SqliteStore
+from infer_stack.leasing import (
+    Controller,
+    EndpointRequest,
+    Ledger,
+    SqliteStore,
+    vllm_structural,
+)
 
 
 class OverlapBackend:
@@ -72,3 +78,79 @@ def test_in_memory_ledger_has_no_lock():
     assert ctl._lock_path is None
     # reconcile must still work (no-op lock context)
     ctl.reconcile()
+
+
+class SharedOverlapBackend:
+    """Like OverlapBackend but records overlap into a shared counter, so two
+    *separate* controllers' converges can be compared."""
+
+    def __init__(self, shared: dict, guard: threading.Lock) -> None:
+        self.shared = shared
+        self.guard = guard
+        self.last_unplaced: tuple = ()
+        self.last_errors: tuple = ()
+        self.last_assignments: dict = {}
+        self._ids: set = set()
+
+    def converge(self, desired, *, apply: bool = True) -> None:
+        with self.guard:
+            self.shared['active'] += 1
+            self.shared['max'] = max(self.shared['max'], self.shared['active'])
+        time.sleep(0.1)
+        with self.guard:
+            self.shared['active'] -= 1
+        self._ids = {g.id for g in desired}
+
+    def observe(self) -> set:
+        return set(self._ids)
+
+    def probe_ready(self, deployment, endpoint):
+        from infer_stack.leasing.backend import Readiness
+
+        return Readiness(True, 'fake')
+
+
+def _vreq(endpoint):
+    return EndpointRequest(
+        endpoint=endpoint,
+        engine='vllm',
+        structural=vllm_structural(model_ref=endpoint),
+        capacity={'max_model_len': 2048},
+        served={'served_model_name': endpoint},
+    )
+
+
+def test_acquire_serialized_across_separate_controllers(tmp_path):
+    """The cross-process case: two controllers with their OWN sqlite connection
+    and OWN flock fd on the same ledger. The whole acquire (ledger write +
+    reconcile) is single-writer, so they serialize and neither races BEGIN
+    IMMEDIATE into a `database is locked`.
+    """
+    db = str(tmp_path / 'ledger.db')
+    shared = {'active': 0, 'max': 0}
+    guard = threading.Lock()
+    barrier = threading.Barrier(2)
+    results: dict = {}
+    errors: list = []
+
+    def worker(i):
+        ctl = Controller(Ledger(SqliteStore(db)), SharedOverlapBackend(shared, guard))
+        try:
+            barrier.wait()
+            out = ctl.acquire(f'owner{i}', [_vreq(f'm{i}')], wait=False)
+            results[i] = out.lease.id
+        except Exception as e:  # noqa: BLE001 - record for the assertion
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f'acquire raced instead of blocking: {errors}'
+    assert set(results) == {0, 1} and all(results.values()), results
+    assert shared['max'] == 1, (
+        f"two controllers' acquires overlapped (max={shared['max']}); the lock "
+        'did not serialize the full ledger-write + reconcile across processes'
+    )
