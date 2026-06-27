@@ -5,6 +5,22 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **Coalesced apply: one `docker compose up` serves a whole batch of concurrent
+  acquires.** The controller's critical section is split into a fast RENDER lock
+  (ledger write + placement + compose-file render) and a separate APPLY lock
+  around the slow `docker compose up`, so a second caller can render while the
+  first is still applying (acquires no longer serialize end-to-end behind each
+  other's bring-up). A monotonic generation in the ledger (`desired_gen` bumped
+  by each mutation, `applied_gen` published after a successful apply) lets the
+  apply lock double as a coalescing wait-queue: an acquirer whose generation is
+  already covered skips its own apply, so N concurrent acquires need far fewer
+  than N applies. The snapshot is a guaranteed-covered floor (taken before the
+  `up`), so a render landing mid-apply is re-applied next, never dropped; crash
+  during apply is safe (the flock auto-releases and `up` is idempotent). Backed
+  by `Controller._render` / `_ensure_applied` / `_apply_lock` and the new
+  `ComposeBackend.apply()`. `infer-stack apply` uses the new
+  `Controller.apply_now()` (force) so it still heals drift when nothing changed.
+
 * **`infer-stack gc` — reclaim leaked leases and free their GPUs.** Sweeps
   TTL-expired leases (a hard-killed job — SIGKILL/OOM/reboot — never runs its
   `release`, so its lease lingers until TTL) and reconciles, tearing down any
@@ -86,6 +102,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
 
 ### Fixed
+* **`database is locked` when several processes open a fresh ledger at once.**
+  Switching the journal to WAL (and creating the schema) on first open needs a
+  brief exclusive lock that sqlite returns immediately as "locked" rather than
+  honoring `busy_timeout` — so a batch of pipeline jobs all running
+  `infer-stack acquire` against a brand-new ledger could race and crash in
+  `SqliteStore.__init__`. These DDL steps now retry on a transient lock.
 * **Ollama GPU pinning to a non-zero GPU** silently fell back to CPU. The docker
   device reservation (`device_ids`) already exposes only the pinned GPU and the
   NVIDIA runtime renumbers it to `0` inside the container, but the service also

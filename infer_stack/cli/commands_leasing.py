@@ -716,7 +716,11 @@ class ApplyCLI(_ApprovalMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
         try:
-            rec = controller.reconcile(apply=True)
+            # apply_now() FORCES the docker up even if the generation has not
+            # advanced -- this is the "re-sync after a manual edit / backend
+            # hiccup" button, so it must heal drift (the coalesced reconcile path
+            # would skip an up when desired == applied).
+            rec = controller.apply_now()
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
         result = None

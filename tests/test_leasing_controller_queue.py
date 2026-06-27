@@ -54,7 +54,9 @@ class BudgetBackend:
 
     def __init__(self, budget: int):
         self.budget = budget
-        self.realized: dict[str, object] = {}
+        self.realized: dict[str, object] = {}  # what is "running" (post-apply)
+        self._placed: dict[str, object] = {}   # what the last render decided to run
+        self.apply_calls = 0
         self.last_unplaced: list[str] = []
         self.last_errors: list[str] = []
         self.last_assignments: dict[str, list[int]] = {}
@@ -62,11 +64,19 @@ class BudgetBackend:
     def converge(self, desired, apply: bool = True) -> None:
         placed = list(desired)[: self.budget]
         unplaced = list(desired)[self.budget :]
+        # Render always records the placed set; bringing it "up" is apply()'s job
+        # (the render/apply split). Legacy apply=True still realizes in one shot.
+        self._placed = {g.id: g for g in placed}
         if apply:
-            self.realized = {g.id: g for g in placed}
+            self.realized = dict(self._placed)
         self.last_assignments = {g.id: [i] for i, g in enumerate(placed)}
         self.last_unplaced = [g.id for g in unplaced]
         self.last_errors = [f'{g.id}: no free GPU' for g in unplaced]
+
+    def apply(self) -> None:
+        """Bring the last-rendered set 'up' (idempotent)."""
+        self.apply_calls += 1
+        self.realized = dict(self._placed)
 
     def observe(self) -> set[str]:
         return set(self.realized)

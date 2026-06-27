@@ -30,6 +30,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -878,13 +879,27 @@ class ComposeBackend:
             write_env_file(self._env_path, {API_KEY_ENV: key})
         return key
 
+    @staticmethod
+    def _atomic_write(path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically (temp + ``os.replace``).
+
+        The render half (``converge(apply=False)``) and the apply half
+        (:meth:`apply`) run under *different* locks so a render can proceed while
+        another process applies. A reader (``apply`` / ``docker compose``) must
+        therefore never see a half-written file — ``os.replace`` swaps it in one
+        atomic step, so every read sees either the old or the new file whole.
+        """
+        tmp = path.with_name(f'{path.name}.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
     def _load_sidecar(self) -> dict[str, Any]:
         if self._state_file.exists():
             return json.loads(self._state_file.read_text())
         return {}
 
     def _save_sidecar(self, data: dict[str, Any]) -> None:
-        self._state_file.write_text(json.dumps(data, indent=2))
+        self._atomic_write(self._state_file, json.dumps(data, indent=2))
 
     def _compose(self, args: list[str]) -> str:
         cmd = ['docker', 'compose']
@@ -1023,14 +1038,15 @@ class ComposeBackend:
             self._approve_changes(planned)  # may raise ConvergeAborted
 
             if rendered.litellm_config is not None:
-                (self.state_dir / LITELLM_CONFIG_FILENAME).write_text(
-                    rendered.litellm_config
+                self._atomic_write(
+                    self.state_dir / LITELLM_CONFIG_FILENAME,
+                    rendered.litellm_config,
                 )
             if rendered.nginx_config is not None:
-                (self.state_dir / NGINX_CONFIG_FILENAME).write_text(
-                    rendered.nginx_config
+                self._atomic_write(
+                    self.state_dir / NGINX_CONFIG_FILENAME, rendered.nginx_config
                 )
-            self.compose_file.write_text(compose_text)
+            self._atomic_write(self.compose_file, compose_text)
             self._save_sidecar(
                 {'assignments': plan.assignments, 'services': rendered.services}
             )
@@ -1042,24 +1058,48 @@ class ComposeBackend:
                     len(services or {}), self.compose_file,
                 )
                 return plan
-            if services:
-                logger.info(
-                    'docker compose up -d ({} service(s): {})',
-                    len(services), ', '.join(sorted(services)),
-                )
-                self._compose(['up', '-d', '--remove-orphans'])
-            else:
-                # Nothing at all to run — only reachable with the gateway off
-                # (litellm=False) and zero models, since the front door otherwise
-                # keeps the project non-empty. `docker compose up` errors with
-                # "no service selected" on a services-less file, so tear the
-                # project down instead (`down` works on the empty file). With the
-                # gateway on, releasing every model lands in the `up` branch above
-                # and leaves the front door standing; `stack down` is the way to
-                # take everything off.
-                logger.info('no services desired -> docker compose down')
-                self._compose(['down', '--remove-orphans'])
+        # Apply OUTSIDE the converge (render) lock: the controller coalesces and
+        # serializes applies via its own apply-lock, so re-taking the render lock
+        # here would needlessly serialize renders against this slow `up`.
+        self.apply()
         return plan
+
+    def apply(self) -> None:
+        """Bring the already-rendered compose project up (``docker compose up -d``).
+
+        Reads the on-disk compose file last written by :meth:`converge` (render)
+        and applies it — it does NOT re-render. Deliberately does **not** take the
+        converge (render) lock: the controller serializes and coalesces applies
+        via its apply-lock + the ledger generation, and taking the render lock
+        here would re-serialize renders against this slow step (the whole point of
+        the split). Idempotent — a no-op when reality already matches the file,
+        which is what makes coalescing safe (a redundant apply costs ~nothing).
+        """
+        from .._log import logger
+
+        if not self.compose_file.exists():
+            return
+        try:
+            doc = yaml.safe_load(self.compose_file.read_text()) or {}
+        except Exception:  # noqa: BLE001 - a torn/old file must not brick apply
+            return
+        services = doc.get('services') or {}
+        if services:
+            logger.info(
+                'docker compose up -d ({} service(s): {})',
+                len(services), ', '.join(sorted(services)),
+            )
+            self._compose(['up', '-d', '--remove-orphans'])
+        else:
+            # Nothing at all to run — only reachable with the gateway off
+            # (litellm=False) and zero models, since the front door otherwise
+            # keeps the project non-empty. `docker compose up` errors with "no
+            # service selected" on a services-less file, so tear the project down
+            # instead (`down` works on the empty file). With the gateway on,
+            # releasing every model lands in the `up` branch above and leaves the
+            # front door standing; `stack down` is the way to take everything off.
+            logger.info('no services desired -> docker compose down')
+            self._compose(['down', '--remove-orphans'])
 
     def observe(self) -> set[str]:
         if not self.compose_file.exists():

@@ -1813,3 +1813,55 @@ whole session).
 
 236 tests green. The suggest fix only changes future suggestions; the standing
 on-terminal caveat (clipboard/drag under tmux) is Jon's to confirm live.
+
+## 2026-06-26 22:13:37 -0400
+
+Model: claude-opus-4-8[1m] (Claude Code, fast Opus). Jon asked to implement two
+things we'd designed in conversation for the leasing controller: (A) split the
+single mutate-lock into a fast render lock + a separate apply lock, and (B)
+coalesce the slow `docker compose up` across concurrent acquires. Motivation:
+under the shared-stack model every `acquire` serialized end-to-end behind the
+previous one's bring-up (the global flock wrapped render AND `docker compose up`),
+and concurrent slurm jobs each ran their own redundant `up`.
+
+Design (now in code + CHANGELOG): a monotonic generation pair in the ledger
+`meta` table — `desired_gen` bumped inside the same `BEGIN IMMEDIATE` as each
+desired-set change (acquire always; release/evict/sweep when they actually idle
+something), `applied_gen` published after a successful apply. The render lock
+(the old `_global_lock`, kept reentrant for acquire->render nesting) guards
+ledger-write + placement + compose-file render only. The new `_apply_lock` (a
+second flock, `.apply.lock`) serializes `docker compose up` and doubles as the
+coalescing wait-queue: `_ensure_applied(g_target)` loops `while applied_gen <
+g_target`, takes the apply lock, re-checks (someone may have covered it), else
+snapshots `g = desired_gen` BEFORE the up and publishes that floor after. Floor-
+before-up is the key correctness point — a render landing mid-apply leaves
+applied_gen < its g_target so it re-applies, never silently dropped. `apply()`
+deliberately does NOT take the converge lock (that would re-serialize renders
+against the slow up); compose-file writes are now atomic (`os.replace`) so a
+concurrent render can't be half-read by an apply. `infer-stack apply` routes to
+a new `apply_now()` (force) so the manual re-sync still heals drift when the
+generation hasn't moved.
+
+Reflections / what I'm confident vs not: confident the mechanism is correct —
+the coalescing proof is a *deterministic* test (`_ensure_applied` with the gen
+pre-advanced: exactly one apply; the apply-lock serializes so late winners
+re-read applied_gen and break). I burned real time on test flakiness that turned
+out to be a *genuine product bug*, not test noise: concurrent first-open of a
+fresh ledger raced on `PRAGMA journal_mode=WAL`, which sqlite returns as
+"database is locked" instead of honoring busy_timeout — exactly the batch-of-
+slurm-jobs pattern this work targets. Fixed by retrying the WAL switch + schema
+DDL in `SqliteStore.__init__`. Also replaced an inherently racy "render-not-
+blocked-by-apply" threaded test with a deterministic structural one (assert
+`_flock_depth == 0` and the render-lock file is `LOCK_NB`-grabbable during
+apply). Tradeoff accepted: every acquire now forces at least one (coalesced,
+idempotent) apply even when joining an already-live model — chosen for drift-
+healing + simplicity over a "skip apply if already up" optimization (noted as a
+possible future tweak). What might break: backends that have `converge` but no
+`apply` and *honor* `apply=False` by not realizing are now invalid (render leaves
+nothing up, no apply step to finish) — updated `BudgetBackend` in the queue test
+to model the render/apply contract (record placed in render, realize in apply).
+
+264 tests green (added `tests/test_leasing_coalesced_apply.py`). Not yet
+exercised on real docker/GPU — the compose `apply()` path is covered only by
+fakes here; the slurm e2e tier on aiq-gpu is where it meets real `docker compose
+up` under contention.

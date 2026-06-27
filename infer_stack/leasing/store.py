@@ -104,22 +104,48 @@ class SqliteStore:
             check_same_thread=False,
         )
         self._lock = threading.RLock()
+        self._busy_timeout_ms = busy_timeout_ms
         self._conn.row_factory = sqlite3.Row
         self._conn.execute('PRAGMA foreign_keys = ON')
         self._conn.execute(f'PRAGMA busy_timeout = {busy_timeout_ms}')
         if self.path != ':memory:':
-            self._conn.execute('PRAGMA journal_mode = WAL')
+            # Switching the journal to WAL needs a brief *exclusive* lock, and
+            # sqlite returns "database is locked" immediately rather than honoring
+            # busy_timeout for this pragma. Several processes opening the SAME
+            # fresh ledger at once (e.g. a batch of pipeline jobs all calling
+            # `infer-stack acquire`) therefore race here — so retry. Idempotent:
+            # once it is WAL, re-running the pragma is a quick no-op.
+            self._retry_locked(lambda: self._conn.execute('PRAGMA journal_mode = WAL'))
         self._ensure_schema()
 
+    def _retry_locked(self, fn, *, attempts: int = 100, delay: float = 0.05):
+        """Run ``fn``, retrying on a transient "database is locked" from a
+        concurrent opener. Re-raises any other error (and the lock error if it
+        never clears within ``attempts``)."""
+        import time
+
+        for _ in range(attempts - 1):
+            try:
+                return fn()
+            except sqlite3.OperationalError as ex:
+                if 'locked' not in str(ex).lower():
+                    raise
+                time.sleep(delay)
+        return fn()  # last attempt: let a persistent lock surface
+
     def _ensure_schema(self) -> None:
-        self._conn.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
+        # first-open race as the WAL switch, so retry it too.
+        self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
         if row is None:
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+            self._retry_locked(
+                lambda: self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
             )
 
     def close(self) -> None:
@@ -144,6 +170,55 @@ class SqliteStore:
             except Exception:
                 self._conn.execute('ROLLBACK')
                 raise
+
+    # -- generation (coalesced-apply coordination) -------------------------
+    #
+    # Two monotonic counters in `meta` let separate processes coalesce the slow
+    # `docker compose up` step (see Controller._ensure_applied):
+    #   desired_gen  bumped whenever a mutation changes the desired set (a new
+    #                deployment, an idled/evicted/expired one). Captured by an
+    #                acquirer right after it renders -> "the generation my change
+    #                is in".
+    #   applied_gen  the floor a successful apply has materialized. An acquirer is
+    #                covered once applied_gen >= its captured desired_gen, so one
+    #                apply satisfies every waiter that rendered before it.
+
+    def bump_desired_generation(self) -> int:
+        """Increment `desired_gen`. MUST be called inside :meth:`transaction`
+        (it rides the caller's ``BEGIN IMMEDIATE`` so the bump is atomic with the
+        ledger row change). Returns the new value."""
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('desired_gen', '1') "
+            'ON CONFLICT(key) DO UPDATE SET '
+            'value = CAST(meta.value AS INTEGER) + 1'
+        )
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'desired_gen'"
+        ).fetchone()
+        return int(row['value'])
+
+    def desired_generation(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'desired_gen'"
+        ).fetchone()
+        return int(row['value']) if row else 0
+
+    def applied_generation(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'applied_gen'"
+        ).fetchone()
+        return int(row['value']) if row else 0
+
+    def set_applied_generation(self, gen: int) -> None:
+        """Publish the applied generation. Monotonic: an out-of-order older apply
+        can never lower it (the ``WHERE`` guards the upsert)."""
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('applied_gen', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value '
+                'WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)',
+                (str(int(gen)),),
+            )
 
     # -- leases ------------------------------------------------------------
 
