@@ -192,3 +192,62 @@ the harness by wiping the ledger between tiers; worth fixing in the product):
   the first bullet, one leaked active lease re-spawns a GPU-hogging group on
   every subsequent reconcile. An `observe()`-driven reconciliation of ledger
   state (or just fixing the leak) would close this.
+
+---
+
+## Upstream LiteLLM: a quiet, generation-level readiness probe
+
+**Status:** want to submit a patch upstream; interim = we accept the log noise
+(documented in `docs/litellm-gateway-routing.md`). Not urgent.
+
+### Problem
+
+With the static superset route table (now the default), the gateway advertises
+**every** catalog endpoint immediately, but each endpoint's upstream vLLM is
+down until its container is placed *and* the model finishes loading. We poll
+readiness by sending a **real, protocol-aware generation** through the gateway
+every few seconds until it answers (see
+`ComposeBackend.probe_ready` / `openai_ready`) — because a container can be
+`running`/Docker-`healthy` long before vLLM can actually serve, so only a
+successful generation is trustworthy.
+
+Every poll that lands before the model is ready makes LiteLLM forward to an
+unreachable upstream and log a full **ERROR** stack
+(`InternalServerError: ... Connection error ... LiteLLM Retried: 3 times`). For
+a TP2 model waiting on a 2-GPU window this can repeat for minutes, per pending
+endpoint. The errors are **expected and self-healing**, but they look alarming
+and bury genuine failures in noise.
+
+### Why existing endpoints don't fully solve it
+
+- `/v1/models` only proves the route is *configured*, not that the upstream can
+  serve — useless as a readiness signal here.
+- `/health` / `/health/readiness` probe configured upstreams, but (a) `/health`
+  fans out over **all** configured models (our superset = the whole catalog),
+  and (b) it checks reachability, not a real **generation** — which is exactly
+  the distinction `probe_ready` exists to make (loaded-and-serving, protocol
+  correct). So it's not a drop-in for our gate.
+
+### What we want upstream
+
+A way to poll **one model's** readiness with a **generation-level** check that is
+**quiet on the expected not-ready path** (log at debug, not error, because
+"warming up" is a normal, caller-handled state). Concrete shapes to propose
+(verify against current LiteLLM before implementing):
+
+1. **Request-scoped log suppression** (smallest, most general): a header/param
+   that marks a call as a readiness probe so a failed upstream is logged at
+   `debug` and skips the retry/exception-stack ERROR — caller is explicitly
+   expecting and handling the failure. Our existing generation probe stays the
+   source of truth; only the noise goes away.
+2. **Per-model generation health check**: extend `/health?model=X` (or a new
+   `/health/generate?model=X`) to optionally do a minimal generation and return
+   a structured ready/not-ready, logging not-ready quietly.
+3. **Warmup/cooldown-aware logging**: while a deployment is inside a configurable
+   warmup window, downgrade unreachable-upstream logs to debug.
+
+Preference: **#1** — it's a tiny, broadly useful change and keeps our
+generation-level signal intact. Until it lands, the noise is acceptable and
+explained in the gateway-routing doc; do **not** globally lower LiteLLM's log
+level or set `num_retries: 0`, as that also hides real transient-upstream
+failures.

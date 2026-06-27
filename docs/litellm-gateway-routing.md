@@ -29,6 +29,13 @@ recreated are first bring-up and an actual **catalog** change.
 
 - `/v1/models` advertises the whole catalog, including endpoints whose upstream
   is currently down (they error until placed). This is intentional.
+- **Warmup log noise:** because readiness is polled with a real generation
+  through the gateway (see `ComposeBackend.probe_ready`), every poll before the
+  upstream is serving logs a LiteLLM `InternalServerError`/`Connection error`
+  stack. This is expected and self-healing; we want to submit an upstream patch
+  for a quiet, generation-level readiness probe — see
+  `dev/leasing-followups.md` ("Upstream LiteLLM: a quiet, generation-level
+  readiness probe"). Do not globally silence LiteLLM logs to hide it.
 - An endpoint that is **not in the catalog** (ad-hoc / interactive `acquire`)
   cannot be routed without changing the config file — which means a recreation
   (a blip). The legacy fallback (`_litellm_model_list` from live deployments)
