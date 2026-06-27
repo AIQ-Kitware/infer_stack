@@ -1357,7 +1357,7 @@ class ComposeBackend:
             return []
         return data if isinstance(data, list) else []
 
-    def _reconcile_routes(self, *, attempts: int = 30, delay: float = 2.0) -> None:
+    def _reconcile_routes(self, *, attempts: int = 90, delay: float = 2.0) -> None:
         """Make the live gateway's managed routes match the rendered route set.
 
         The render half wrote the desired routes (one per live deployment×
@@ -1378,9 +1378,10 @@ class ComposeBackend:
           alone.
 
         Best-effort: the gateway may still be starting (it waits on Postgres
-        health, then boots), so the initial listing is retried. A persistent
-        failure is logged and left for the next converge rather than raised —
-        apply must stay non-fatal, like ``docker compose up``.
+        health, then boots — and on first-ever bring-up runs LiteLLM's Prisma DB
+        migrations, which can take a while), so the initial listing is retried
+        generously. A persistent failure is logged and left for the next converge
+        rather than raised — apply must stay non-fatal, like ``docker compose up``.
         """
         from .._log import logger
 
