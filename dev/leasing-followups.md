@@ -8,8 +8,8 @@ Not bugs (those are fixed on the branch / in CHANGELOG) — these are deliberate
 
 ## LiteLLM reload on model switch — keep the gateway alive
 
-**Status:** interim fix shipped; **#1 chosen as the real fix (not yet done)**;
-**#2 to retry in the future.**
+**Status:** interim fix shipped; **#1 (static superset) shipped as the default**;
+**#2 (admin API + Postgres) shipped as opt-in `dynamic_routing`.**
 
 ### Background
 
@@ -126,17 +126,30 @@ yield-under-pressure above (placement evicting an idle group when a live acquire
 can't otherwise place) is still open — `evict_idle` / `Controller.evict` are the
 reusable primitive it should call once the placer detects contention.
 
-### #2 — DB-backed live model management (retry later)
+### #2 — DB-backed live model management — DONE (implemented as opt-in)
 
-Bring back `postgres-litellm` and use LiteLLM's admin API (`/model/new`,
-`/model/delete`, `STORE_MODEL_IN_DB`) so converge updates routes on a **running**
-gateway — zero blip, no restart at all.
+**Status: implemented** (maintainer chose this direction). `postgres-litellm` is
+revived and LiteLLM's admin API (`/model/new`, `/model/delete`,
+`STORE_MODEL_IN_DB` + `DATABASE_URL`) updates routes on a **running** gateway —
+zero blip, no restart. Off by default; enable with `config set dynamic_routing
+true` / `--dynamic-routing`. See `docs/litellm-gateway-routing.md` and
+`infer_stack/leasing/compose.py` (`_litellm_routes`,
+`ComposeBackend._reconcile_routes`); tests in
+`tests/test_leasing_dynamic_routing.py`.
 
-**We tried this before and hit issues** (per the maintainer; details to recover
-from the legacy stack's history). Not the current direction, but **worth
-retrying in the future** — it's strictly nicer than #1 (no blip, and no
-advertising of undeployed models) if the earlier problems can be resolved. When
-revisiting, capture *what* broke last time before re-committing to it.
+It is strictly nicer than #1 (no blip, no advertising of undeployed models) and
+additionally fixes the same-model `--dedicated` collision (each deployment gets
+its own `vllm-<served>-<id>` upstream, so N dedicated deployments land on N GPUs;
+LiteLLM load-balances the shared public alias across them).
+
+**Verified fact (was a misconception):** the admin API is **not** DB-less — in
+`litellm v1.82.3`, `/model/new` 500s unless a DB is connected *and*
+`STORE_MODEL_IN_DB=true`. So Postgres is required, not optional. The render/apply
+shape sidesteps the "imperative drift" risk: render writes the desired route set
+(`litellm_routes.json`), apply reconciles it as an idempotent set-diff keyed by a
+deterministic `model_info.id` (drift-healing, co-exists with hand-added models).
+The earlier "we hit issues" concern was the Postgres dependency itself, now
+accepted by the maintainer ("having the litellm db makes a lot of sense").
 
 ### Recommendation / sequencing
 

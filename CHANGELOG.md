@@ -5,6 +5,28 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **Dynamic LiteLLM routing via the admin API + Postgres (opt-in
+  `dynamic_routing`).** A new mode that manages the gateway's route table *live*
+  through LiteLLM's admin API (`/model/new` / `/model/delete`) against a
+  Postgres-backed model store (`STORE_MODEL_IN_DB`), instead of a static config
+  file. It fixes the **same-model `--dedicated` collision**: in static-superset
+  mode every dedicated deployment of one served model collapses onto a single
+  `vllm-<served>` container (one GPU), but with dynamic routing each deployment
+  gets its own `vllm-<served>-<id>` upstream, so N dedicated deployments run on N
+  GPUs (LiteLLM load-balances the shared public alias across them). It follows
+  the render/apply split: render writes the desired route set (`litellm_routes
+  .json`, one entry per live `(deployment, endpoint)` with a deterministic
+  `model_info.id`) and a *static* base gateway config (empty `model_list`, so the
+  gateway is never recreated — no blip); apply reconciles the live gateway as an
+  idempotent set-diff (`ComposeBackend._reconcile_routes`), so it coalesces,
+  heals drift (routes lost to a restart reappear; stale routes are deleted), and
+  leaves hand-added models (no `isr-` id) alone. Off by default (static superset
+  stays the default); enable with `config set dynamic_routing true` or
+  `--dynamic-routing`. Backed by `compose._litellm_routes` / `_postgres_service`
+  / `ComposeBackend.db_password()`; tests in
+  `tests/test_leasing_dynamic_routing.py`. NOTE: verified against the pinned
+  `litellm v1.82.3` that the admin API requires a DB (it is *not* DB-less), so
+  Postgres is a hard requirement for this mode.
 * **Coalesced apply: one `docker compose up` serves a whole batch of concurrent
   acquires.** The controller's critical section is split into a fast RENDER lock
   (ledger write + placement + compose-file render) and a separate APPLY lock

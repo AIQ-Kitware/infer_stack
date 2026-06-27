@@ -40,46 +40,79 @@ recreated are first bring-up and an actual **catalog** change.
   cannot be routed without changing the config file — which means a recreation
   (a blip). The legacy fallback (`_litellm_model_list` from live deployments)
   routes only placed deployments and *does* rewrite-and-recreate per change.
+- **Same-model `--dedicated` collapses.** Because the upstream host is derived
+  from the served name alone (`vllm-<served>`), N dedicated deployments of one
+  model render to ONE compose service — one container, one GPU — defeating
+  multi-GPU dedicated use. Both this and the non-catalog limitation above are
+  fixed by the opt-in **dynamic routing** mode below.
 
-## Direction we want to head: LiteLLM admin API for dynamic routes
+## Dynamic routing: LiteLLM admin API + Postgres (implemented, opt-in)
 
-> **For a future agent working on gateway routing:** the intended evolution is
-> to add/remove routes at runtime via LiteLLM's admin API instead of (only)
-> rendering a static file. Static superset is fine for now and should remain the
-> default; treat the admin API as an additive capability, not a replacement.
+Dynamic routing is now **implemented** as an opt-in mode (off by default; static
+superset remains the default). Enable it with `--dynamic-routing` or
+`config set dynamic_routing true`. It is the *proper* fix for the dedicated
+collision and the way to route non-catalog/interactive acquires with zero blip.
 
-LiteLLM proxy supports runtime model management with no container restart:
+### Important correction (verified against the pinned LiteLLM source)
 
-- **Admin API:** `POST /model/new` and `POST /model/delete`, authenticated with
-  the master key (already set via `API_KEY_ENV`). Add or remove a single route
-  live.
-- **DB-backed model store:** `STORE_MODEL_IN_DB=true` + `DATABASE_URL`
-  (Postgres). Models live in the DB and LiteLLM hot-loads them; this is what the
-  admin UI uses.
+The admin API is **not** DB-less. In `litellm v1.82.3`,
+`add_new_model` (`/model/new`) returns HTTP 500 unless **both** a database is
+connected (`prisma_client is not None`) **and** `STORE_MODEL_IN_DB=true`; the
+same gate guards `/model/delete` and `/model/update`. There is no in-memory
+runtime model-add. So "admin-API dynamic routing" **requires Postgres** — this
+is the revival of the `postgres-litellm` store (the prior follow-up #2), now done
+deliberately. (An earlier draft of this doc implied plain `/model/new` worked
+in-memory but non-durably; that was wrong.)
 
-### Why this is wanted
+### How it works (render desired routes → apply as a diff)
 
-It removes the one thing static superset can't do: route **non-catalog /
-interactive** acquires with zero blip. It also avoids first-bring-up and
-catalog-change recreations.
+It follows the project's render/apply separation exactly:
 
-### What to watch out for when implementing it
+- **Render** (`converge(apply=False)` → `render_compose(dynamic_routing=True)`):
+  - Each vLLM deployment gets its **own** unique service `vllm-<served>-<id>`
+    (`vllm_service_name(unique=True)`), so same-model `--dedicated` deployments
+    become distinct containers on distinct GPUs (the bug the static gateway
+    couldn't fix).
+  - A `postgres-litellm` service is rendered, and the `litellm` service gets
+    `DATABASE_URL` + `STORE_MODEL_IN_DB=true` env and `depends_on` the DB being
+    healthy. The rendered `litellm_config.yaml` is a **static base** (empty
+    `model_list`), so its `config_hash` never changes as models come/go — the
+    gateway is never recreated (**no blip**).
+  - The desired route set (one entry per live `(deployment, endpoint)`, each
+    with a deterministic `model_info.id`) is written to `litellm_routes.json` —
+    the rendered desired state for the gateway's route table.
+- **Apply** (`apply()` → `_reconcile_routes()`): after `docker compose up`, list
+  the gateway's current models (`GET /v1/model/info`), diff against
+  `litellm_routes.json` by `model_info.id`, then `POST /model/new` for the
+  missing and `POST /model/delete` for the extra — no container restart.
 
-- **It is imperative, stateful mutation.** The gateway's in-memory route set can
-  drift from the ledger's desired state, so it needs a reconcile (list current
-  routes → diff against desired → add/remove), not fire-and-forget calls.
-- **Partial failure:** `/model/new` succeeding while the deployment dies (or
-  vice versa) must be handled so the gateway and ledger don't disagree.
-- **Survivability:** plain `/model/new` state is lost on a gateway restart
-  unless `STORE_MODEL_IN_DB` is used — which adds a Postgres dependency.
-- **Render/apply fit:** the static config file *is* the rendered desired state,
-  which matches the project's render/apply separation. Keep that model — render
-  the desired route set, then apply it via the API as a diff — rather than
-  scattering imperative calls through acquire/release.
+Several dedicated deployments of one model share one public `model_name` but
+distinct upstreams, so LiteLLM **load-balances** the alias across them — each on
+its own GPU, while clients still ask for the one name. Clients keep the uniform
+gateway `base_url`; nothing about the env-file descriptor changes.
 
-### Recommended shape
+### Why this is robust (the implementation honors these)
 
-Keep static superset as the default. Add admin-API routing as an **opt-in**
-(e.g. a flag / setting) that, when enabled, reconciles the live route set on
-each converge. That preserves today's behavior while unlocking non-catalog
-dynamic routing for callers that need it.
+- **Deterministic ids ⇒ pure set-diff reconcile.** `_route_id(deployment, endpoint)`
+  is stable, so the same route is added once and never churned, and a dropped
+  route is deleted by exactly its id. Reconcile is idempotent (a redundant apply
+  is a no-op), which is what makes the controller's *coalesced* apply correct for
+  routes too.
+- **Drift-healing.** Routes lost to a gateway/DB restart reappear in the diff and
+  are re-added; stale routes from a prior run (still in the DB) are deleted
+  because they are no longer desired. (DB persistence is the survivability that
+  plain in-memory adds would lack — another reason Postgres is required, not
+  incidental.)
+- **Co-existence.** Only routes infer-stack created (id prefix `isr-`) are ever
+  deleted, so a model added by hand through the UI/admin API is left alone.
+- **Best-effort apply.** The gateway may still be starting (it waits on Postgres
+  health), so the initial `/v1/model/info` listing is retried; a persistent
+  failure is logged and left for the next converge rather than raised — apply
+  stays non-fatal, like `docker compose up`.
+
+### Consistency requirement
+
+Every verb (`acquire`/`release`/`gc`/`evict`/`apply`) must agree on the mode, or
+they render inconsistent service names. The **persisted setting**
+(`config set dynamic_routing true`) is therefore the primary switch; the
+`--dynamic-routing` flag is a per-invocation override.

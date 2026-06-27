@@ -1865,3 +1865,64 @@ to model the render/apply contract (record placed in render, realize in apply).
 exercised on real docker/GPU — the compose `apply()` path is covered only by
 fakes here; the slurm e2e tier on aiq-gpu is where it meets real `docker compose
 up` under contention.
+
+## 2026-06-26 23:18:49 -0400
+
+Model: claude-opus-4-8[1m] (Claude Code, fast Opus). Jon's directive: "we are
+going to do the dynamic routing work. And get this done elegantly and properly."
+The trigger was the slurm e2e tier exposing a real product bug: `--dedicated`
+same-model deployments place on distinct GPUs in the ledger but the Compose
+backend names every vLLM service `vllm-<served>`, so they collapse onto ONE
+container/GPU — and worse, the test stays green (everyone routes to the one
+container that answers). The static-superset gateway can't fix this because its
+no-blip property *depends on* that name being derivable from the served model
+alone (so a catalog route can address it without knowing the live deployment).
+
+Before touching code I verified the load-bearing fact against the pinned
+`litellm v1.82.3` source: `/model/new` (and `/model/delete`/`/model/update`)
+HTTP-500 unless a DB is connected AND `STORE_MODEL_IN_DB=true`. So "the admin-API
+direction" is NOT DB-less — it *is* the postgres-litellm revival (the old
+follow-up #2 the maintainer had parked as "tried it, hit issues"). I surfaced
+this fork explicitly rather than silently reintroduce Postgres; Jon chose
+admin-API+Postgres and confirmed "having the litellm db makes a lot of sense."
+Correcting that misconception in the doc was important — an earlier draft implied
+plain `/model/new` worked in-memory, which would have led a future agent astray.
+
+Design (in code + CHANGELOG + docs/litellm-gateway-routing.md): an opt-in
+`dynamic_routing` mode that honors the project's render/apply split. RENDER:
+each deployment gets a unique `vllm-<served>-<id>` service (so dedicated spreads
+across GPUs), a `postgres-litellm` service is added, the litellm service gets
+`DATABASE_URL`+`STORE_MODEL_IN_DB` env + `depends_on` DB-healthy, the rendered
+config is a *static* base (empty `model_list`) so its hash never moves (no blip),
+and the desired route set is written to `litellm_routes.json` (one entry per live
+(deployment,endpoint), each with a deterministic `model_info.id`). APPLY: after
+`docker compose up`, `_reconcile_routes()` lists `/v1/model/info`, diffs by id,
+and POSTs `/model/new`/`/model/delete`. The deterministic id is the crux — it
+turns reconcile into a pure set-diff that is idempotent (so the controller's
+coalesced apply is correct for routes too), drift-healing (lost routes reappear,
+stale ones deleted), and co-existent (only `isr-`-prefixed ids are ever deleted,
+so a UI-added model is safe).
+
+Why this shape over alternatives: I considered (a) a DB-less dynamic config file
+— rejected, reintroduces the per-change gateway recreate/blip static-superset was
+built to avoid; (b) direct per-deployment URLs in the env-file for dedicated —
+rejected, splits addressing into two modes and abandons the gateway's value.
+Admin-API+Postgres is the only path that gives per-deployment routing AND no
+blip, and the env-file descriptor is unchanged (clients keep one gateway
+base_url; LiteLLM load-balances the shared alias across the dedicated upstreams).
+
+Confident: the rendering + reconcile logic is unit-covered (10 new tests in
+`tests/test_leasing_dynamic_routing.py` incl. the dedicated-collision fix, the
+no-blip invariance, deterministic routes, and add/delete/idempotent/co-existence
+reconcile against a RecordingGateway fake); full suite 274 green; static mode is
+byte-for-byte unchanged (default off). Not yet exercised against a real LiteLLM
++ Postgres on a GPU host — the reconcile is fakes-only here. Risks/uncertainties
+to watch on aiq-gpu: (1) gateway-startup timing — `_reconcile_routes` retries the
+initial `/v1/model/info` (30×2s) while litellm boots behind the DB healthcheck;
+if a first-ever image pull makes that window too short, routes get added on the
+next converge instead (acquire's wait_ready could then time out on the very first
+cold acquire). (2) LiteLLM load-balancing a public alias across N dedicated
+upstreams is the intended behavior but unverified end-to-end. (3) every verb must
+agree on the mode or service names diverge — hence the persisted `dynamic_routing`
+setting is the primary switch (the flag is a per-call override), mirroring how
+`catalog` is resolved for release/gc.
