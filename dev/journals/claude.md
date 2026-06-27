@@ -1,3 +1,49 @@
+## 2026-06-27 09:04:20 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.
+
+User intent: in the TUI they cleaned up leases, then "Clean up" on deployments
+did nothing — a pile of IDLE deployments with no container (running/gpus "-",
+0 leases) just sat there. Diagnosed first: "Clean up" = `ledger.prune()`, which
+only forgets STOPPED deployments + RELEASED/EXPIRED leases; IDLE keep-warm
+deployments are deliberately retained (still in the desired set — an apply would
+re-spawn them), so prune correctly skips them. The retire path is Release →
+Evict (IDLE→STOPPED) → Clean up. The "-" containers are drift (torn down
+out-of-band, e.g. the port-churn fix earlier today, but the ledger still lists
+them as warm-pool entries). User then asked for two ergonomics fixes.
+
+What I changed (TUI):
+- **Evict all idle** button in the deployments pane → `controller.evict(None)`
+  (evicts every IDLE deployment in one go). One click takes the whole warm pool
+  to STOPPED so a following Clean up forgets it.
+- **Multi-select** in the leases + deployments tables. Space toggles a check on
+  the cursor row, rendered in a new leading marker column; Release/Evict act on
+  every checked row via `_target_ids()` (checked set wins; else the cursor row,
+  so the old single-row behaviour is unchanged). Selection is held by id in
+  `_lease_sel`/`_dep_sel` so it survives a poll refresh, pruned to live rows on
+  refill, and cleared after an action.
+
+Design choices: kept prune's conservative semantics (never auto-forget a
+deployment the system still wants) — the fix is discoverability (a bulk evict +
+clearer button/desc text), not changing what "Clean up" means. I deliberately
+did NOT (yet) auto-heal the "IDLE-but-container-gone" drift to STOPPED; that's a
+separate reconcile decision I flagged to the user. Also left the two confusingly
+duplicated "Clean up" buttons as-is for now (raised earlier as a rescope option).
+
+Gotcha worth remembering (now a lesson): named the selection helper
+`_action_targets` and it blew up with `'set' object is not callable` — Textual's
+`App.__init__` binds `self._action_targets` to a set (action-namespace
+resolution), an *instance* attribute that shadows a class method. Renamed to
+`_target_ids`. `hasattr(App, '_action_targets')` is False because it's per
+instance, which is exactly what made it shadow.
+
+Confident: full suite 280 passed incl. 3 new TUI tests (evict-all flips IDLE→
+STOPPED; multi-select releases both checked leases + clears selection; space
+toggles off again). Low risk — additive UI, single-row paths unchanged. Minor
+uncertainty: `space` relies on the DataTable not consuming it; the headless
+pilot test pressing 'space' exercises that path and passes, so the app-level
+binding does receive it.
+
 ## 2026-06-27 08:38:01 -0400
 
 Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.

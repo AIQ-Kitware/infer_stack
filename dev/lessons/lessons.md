@@ -20,6 +20,21 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Applies when:** designing/maintaining runtime LiteLLM route management;
     deciding whether a Postgres dependency is avoidable (it isn't).
 
+- **Lesson:** In a Textual `App`/`Widget` subclass, do not name a helper method
+  with a leading-underscore name the framework also uses as an *instance*
+  attribute — it will be silently shadowed and calling it raises a confusing
+  `'<type>' object is not callable`. `_action_targets` is such a name: Textual's
+  `App.__init__` binds `self._action_targets` to a *set* (action-namespace
+  resolution), so a method `def _action_targets(self, ...)` is never reached and
+  `self._action_targets(...)` fails with `'set' object is not callable` at the
+  call site (not the def). The class has no such attribute, so `hasattr(App,
+  '_action_targets')` is False — it's set per-instance, which is exactly what
+  shadows a class method.
+  - **Evidence:** `textual` `App`; `infer_stack.tui` (renamed the helper to
+    `_target_ids`); guarded by the multi-select tests in `tests/test_tui.py`.
+  - **Applies when:** adding private helpers to a Textual widget/app; debugging a
+    `not callable` on something you defined as a method.
+
 - **Lesson:** In a declarative compose project that is re-rendered whole on
   every change, any per-service field derived from the *live set* (not from the
   service's own identity) silently churns survivors. A vLLM/ollama host port

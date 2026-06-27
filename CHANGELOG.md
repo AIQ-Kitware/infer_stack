@@ -5,6 +5,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **TUI: "Evict all idle" + multi-select in the leases/deployments tables.**
+  Clearing a pile of released-but-kept-warm deployments no longer means evicting
+  one row at a time: a new **Evict all idle** button (deployments pane) flips
+  every IDLE deployment to STOPPED in one action (then **Clean up** forgets
+  them). Both tables also gained multi-select — **space** toggles a check on the
+  cursor row (shown in a leading marker column), and **Release** / **Evict** act
+  on every checked row, falling back to the cursor row when nothing is checked.
+  The selection is kept by id so it survives a poll refresh and is pruned to live
+  rows. Note: "Clean up" still only forgets STOPPED deployments + RELEASED/
+  EXPIRED leases by design — IDLE (keep-warm) deployments are retained until
+  evicted. Tests in `tests/test_tui.py`.
 * **Dynamic LiteLLM routing via the admin API + Postgres (opt-in
   `dynamic_routing`).** A new mode that manages the gateway's route table *live*
   through LiteLLM's admin API (`/model/new` / `/model/delete`) against a
