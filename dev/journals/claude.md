@@ -16,12 +16,28 @@ What I changed (TUI):
 - **Evict all idle** button in the deployments pane → `controller.evict(None)`
   (evicts every IDLE deployment in one go). One click takes the whole warm pool
   to STOPPED so a following Clean up forgets it.
-- **Multi-select** in the leases + deployments tables. Space toggles a check on
-  the cursor row, rendered in a new leading marker column; Release/Evict act on
+- **Multi-select** in the leases + deployments tables. Space toggles the cursor
+  row; **ctrl/cmd-click** toggles a discontiguous row; **shift-click** extends a
+  contiguous range from the anchor (`_click_select` is pure over (tid,row,mods)
+  so it unit-tests without synthesizing mouse events; `on_click` reads the
+  already-moved `cursor_row` and delegates, mirroring the existing ctrl+click-to-
+  open path). Selection rendered in a leading marker column; Release/Evict act on
   every checked row via `_target_ids()` (checked set wins; else the cursor row,
-  so the old single-row behaviour is unchanged). Selection is held by id in
-  `_lease_sel`/`_dep_sel` so it survives a poll refresh, pruned to live rows on
-  refill, and cleared after an action.
+  so old single-row behaviour is unchanged). Held by id in `_lease_sel`/`_dep_sel`
+  so it survives a poll refresh, pruned to live rows on refill, cleared after an
+  action.
+
+Course-correction worth recording: the user first asked for "normal" ctrl/shift-
+click; on finding Textual 8.x has **no native row multi-select** (only text
+selection — `anchor`/`get_selection` are for copy/paste; the row API is the
+unreleased PR #6585, see discussion #3606) they said drop it rather than carry a
+hand-rolled surface, then "if you almost have it just finish it." It was nearly
+done, so I finished it but boxed it as an explicitly **removable shim** (one
+marker column + two sel-sets + `_click_select`/`_repaint_marks`, all behind the
+`_table_sel` accessor) with a code/CHANGELOG note to delete it wholesale if/when
+Textual ships the native API. Takeaway: when you must shim a missing framework
+feature, isolate it behind one seam and name the eventual native replacement so
+the removal is mechanical.
 
 Design choices: kept prune's conservative semantics (never auto-forget a
 deployment the system still wants) — the fix is discoverability (a bulk evict +
@@ -37,12 +53,15 @@ resolution), an *instance* attribute that shadows a class method. Renamed to
 `_target_ids`. `hasattr(App, '_action_targets')` is False because it's per
 instance, which is exactly what made it shadow.
 
-Confident: full suite 280 passed incl. 3 new TUI tests (evict-all flips IDLE→
+Confident: full suite 281 passed incl. new TUI tests (evict-all flips IDLE→
 STOPPED; multi-select releases both checked leases + clears selection; space
-toggles off again). Low risk — additive UI, single-row paths unchanged. Minor
-uncertainty: `space` relies on the DataTable not consuming it; the headless
-pilot test pressing 'space' exercises that path and passes, so the app-level
-binding does receive it.
+toggles off again; `_click_select` covers ctrl-toggle / shift-range / plain-
+clear). Low risk — additive UI, single-row paths unchanged. Testing note: I
+first added a pixel-offset `pilot.click(..., control=True)` wiring test; it
+passed alone but flaked under the full suite (offset geometry), so I dropped it —
+the pure `_click_select` unit test plus the robust `space` keypress test cover
+logic and wiring without the brittleness. `space` relies on the DataTable not
+consuming it; the headless space test confirms the app-level binding receives it.
 
 ## 2026-06-27 08:38:01 -0400
 

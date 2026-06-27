@@ -539,8 +539,15 @@ class InferStackTUI(App):
         self._deployment_ids: list[str] = []
         # Multi-select sets (by id) for the leases/deployments tables. Kept by id
         # so a selection survives a poll refresh; pruned to live rows on refill.
+        # NOTE: this is a hand-rolled shim — Textual 8.x has no native row
+        # multi-select (only text selection). If it gains one (see
+        # github.com/Textualize/textual discussion #3606 / PR #6585), this whole
+        # marker-column + sel-set + click machinery can be deleted in favour of
+        # the native `selected_rows` / `selection_anchor` API.
         self._lease_sel: set[str] = set()
         self._dep_sel: set[str] = set()
+        # Range anchor (row index, per table) for shift-click range selection.
+        self._sel_anchor: dict[str, int] = {}
         self._last_leases: list[Any] = []   # row-aligned with the leases table
         self._last_deployments: list[Any] = []   # row-aligned with the deployments table
         self._service_options: list[str] = []
@@ -600,7 +607,8 @@ class InferStackTUI(App):
                             'Reservations you hold. Each maps to one deployment '
                             'below (see the deployment column); many leases can '
                             'share one. Release acts on the cursor row, or on '
-                            'every row you check with space.', classes='desc',
+                            'every row you check (space, or ctrl/shift-click).',
+                            classes='desc',
                         )
                         yield DataTable(id='leases', cursor_type='row',
                                         zebra_stripes=True)
@@ -614,9 +622,9 @@ class InferStackTUI(App):
                             'Running model deployments and the GPUs they hold. '
                             "The 'leases' column is how many leases hold each. "
                             'Evict an idle one to free its GPU (cursor row, or '
-                            'space-checked rows); Evict all idle clears every '
-                            'kept-warm one; Clean up forgets stopped ones.',
-                            classes='desc',
+                            'rows checked with space / ctrl/shift-click); Evict '
+                            'all idle clears every kept-warm one; Clean up forgets '
+                            'stopped ones.', classes='desc',
                         )
                         yield DataTable(id='deployments', cursor_type='row',
                                         zebra_stripes=True)
@@ -1361,28 +1369,71 @@ class InferStackTUI(App):
         one = self._selected(table_id, ids)
         return [one] if one else []
 
+    def _table_sel(self, tid: str | None) -> tuple[list[str], set[str]] | None:
+        """(ids, selection-set) for the leases/deployments table, else None."""
+        if tid == 'leases':
+            return self._lease_ids, self._lease_sel
+        if tid == 'deployments':
+            return self._deployment_ids, self._dep_sel
+        return None
+
+    def _repaint_marks(self, tid: str) -> None:
+        """Redraw the marker column of a table from its current selection set."""
+        res = self._table_sel(tid)
+        if res is None:
+            return
+        ids, sel = res
+        table = self.query_one(f'#{tid}', DataTable)
+        for r, gid in enumerate(ids):
+            if r < table.row_count:
+                mark = SELECT_MARK if gid in sel else ''
+                table.update_cell_at(Coordinate(r, 0), mark)
+
+    def _click_select(self, tid: str, row: int, *, shift: bool, ctrl: bool) -> None:
+        """Apply a (possibly modified) click on row ``row`` to the selection.
+
+        Desktop semantics: ctrl/cmd toggles one row (discontiguous); shift
+        extends a contiguous range from the anchor; a plain click collapses the
+        multi-selection back to the single cursor row. Pure over (tid, row,
+        modifiers) so it's unit-testable without synthesizing mouse events.
+        """
+        res = self._table_sel(tid)
+        if res is None:
+            return
+        ids, sel = res
+        if not (0 <= row < len(ids)):
+            return
+        if shift:
+            anchor = self._sel_anchor.get(tid, row)
+            lo, hi = sorted((anchor, min(row, len(ids) - 1)))
+            sel.update(ids[lo:hi + 1])
+        elif ctrl:
+            gid = ids[row]
+            sel.discard(gid) if gid in sel else sel.add(gid)
+            self._sel_anchor[tid] = row
+        else:  # plain click -> collapse selection to the cursor row
+            sel.clear()
+            self._sel_anchor[tid] = row
+        self._repaint_marks(tid)
+        if sel:
+            self._status(f'{len(sel)} checked in {tid}')
+
     def action_toggle_select(self) -> None:
         """Space: toggle the cursor row of the focused leases/deployments table."""
         focused = self.focused
         tid = getattr(focused, 'id', None)
-        if tid == 'leases':
-            ids, sel = self._lease_ids, self._lease_sel
-        elif tid == 'deployments':
-            ids, sel = self._deployment_ids, self._dep_sel
-        else:
+        res = self._table_sel(tid)
+        if res is None:
             return
+        ids, sel = res
         row = focused.cursor_row
         if not (0 <= row < len(ids)):
             return
         gid = ids[row]
-        if gid in sel:
-            sel.discard(gid)
-            mark = ''
-        else:
-            sel.add(gid)
-            mark = SELECT_MARK
-        focused.update_cell_at(Coordinate(row, 0), mark)
-        self._status(f'{len(sel)} checked in {tid} (space toggles)')
+        sel.discard(gid) if gid in sel else sel.add(gid)
+        self._sel_anchor[tid] = row
+        self._repaint_marks(tid)
+        self._status(f'{len(sel)} checked in {tid} (space/ctrl-click toggles)')
 
     def action_acquire(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
@@ -1423,24 +1474,37 @@ class InferStackTUI(App):
             )
 
     def on_click(self, event: events.Click) -> None:
-        # Ctrl+click a served endpoint -> open it in Open WebUI.
-        if not getattr(event, 'ctrl', False):
-            return
+        # Resolve which dashboard element was clicked (walk up to a known id).
+        zone = None
         try:
             node, _ = self.screen.get_widget_at(event.screen_x, event.screen_y)
         except Exception:  # noqa: BLE001
-            return
+            node = None
         while node is not None:
             nid = getattr(node, 'id', None)
-            if nid == 'endpoints':
-                self.action_open()
-                event.stop()
-                return
-            if nid == 'api-urls':
-                self.action_open_webui()
-                event.stop()
-                return
+            if nid in ('leases', 'deployments', 'endpoints', 'api-urls'):
+                zone = nid
+                break
             node = getattr(node, 'parent', None)
+
+        ctrl = getattr(event, 'ctrl', False) or getattr(event, 'meta', False)
+        shift = getattr(event, 'shift', False)
+
+        # Multi-select on the leases/deployments tables via ctrl/shift-click (the
+        # DataTable moved its cursor to the clicked row first, so cursor_row is
+        # the click target). A plain click collapses any multi-selection.
+        if zone in ('leases', 'deployments'):
+            table = self.query_one(f'#{zone}', DataTable)
+            self._click_select(zone, table.cursor_row, shift=shift, ctrl=ctrl)
+            return
+
+        # Ctrl+click a served endpoint / the API URLs -> open in the browser.
+        if ctrl and zone == 'endpoints':
+            self.action_open()
+            event.stop()
+        elif ctrl and zone == 'api-urls':
+            self.action_open_webui()
+            event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {

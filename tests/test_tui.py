@@ -952,6 +952,44 @@ def test_tui_space_toggles_selection_off_again():
     _run(scenario)
 
 
+def test_tui_click_select_ctrl_toggle_shift_range_plain_clear():
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import SELECT_MARK, InferStackTUI
+
+    controller, catalog = _ctx()
+    controller.acquire('a', catalog.resolve_names(['qwen-coder']))
+    controller.acquire('b', catalog.resolve_names(['qwen-fast']))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ids = app._lease_ids
+            assert len(ids) == 2
+            table = app.query_one('#leases', DataTable)
+            # ctrl-click toggles one row on, then off (discontiguous pick)
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            assert app._lease_sel == {ids[0]}
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            assert app._lease_sel == set()
+            # ctrl-click sets the anchor; shift-click extends a contiguous range
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            app._click_select('leases', 1, shift=True, ctrl=False)
+            assert app._lease_sel == {ids[0], ids[1]}
+            assert table.get_row_at(0)[0] == SELECT_MARK
+            assert table.get_row_at(1)[0] == SELECT_MARK
+            # a plain click collapses the selection back to the cursor row
+            app._click_select('leases', 1, shift=False, ctrl=False)
+            assert app._lease_sel == set()
+            assert table.get_row_at(0)[0] == ''
+
+    _run(scenario)
+
+
+
+
 def test_tui_model_cached_label(tmp_path):
     from infer_stack.tui import InferStackTUI
 
