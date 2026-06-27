@@ -308,3 +308,81 @@ def test_db_password_is_persisted_and_reused(tmp_path):
     assert be.db_password() == pw1
     be2 = make_backend(tmp_path, RecordingGateway())
     assert be2.db_password() == pw1
+
+
+# -- no blip on the UPSTREAMS too (the readiness-killing churn) -------------
+
+
+def test_dynamic_upstreams_have_no_host_ports_and_survive_set_change(tmp_path):
+    """The blip that broke readiness mid-request: each vLLM upstream published a
+    host port assigned by *position* in the live set (BASE + i), so adding or
+    removing any deployment renumbered the survivors' ports — which changed their
+    service specs and made ``docker compose up -d`` recreate unrelated, in-flight
+    containers. Behind the gateway an upstream is internal (reached by
+    compose-network DNS), so it publishes NO host port and each survivor's spec
+    is byte-identical when the set changes -> nothing to recreate."""
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    b = dep('grp-bbbbbb', served='smol', t=1)
+    c = dep('grp-cccccc', served='smol', t=2)
+    full = render_compose(
+        [a, b, c], {a.id: [0], b.id: [1], c.id: [2]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, aux_dir=tmp_path, dynamic_routing=True,
+    )
+    # upstreams behind the gateway publish no host port (only the gateway does)
+    for name, svc in full.compose['services'].items():
+        if name.startswith('vllm-'):
+            assert 'ports' not in svc, f'{name} should not publish a host port'
+    # drop `a`; b and c keep their GPUs (sticky placement)
+    shrunk = render_compose(
+        [b, c], {b.id: [1], c.id: [2]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, aux_dir=tmp_path, dynamic_routing=True,
+    )
+    for d in (b, c):
+        name = vllm_service_name(d, unique=True)
+        assert shrunk.compose['services'][name] == full.compose['services'][name], (
+            f'{name} spec changed when an unrelated deployment was removed -> '
+            'docker compose would recreate it (a blip)'
+        )
+
+
+def test_no_gateway_still_publishes_upstream_host_port(tmp_path):
+    """Without a gateway there is no front door, so the upstream MUST publish a
+    host port (the readiness probe hits it directly). Guards against the no-blip
+    change above accidentally dropping ports in the no-gateway path too."""
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    rc = render_compose(
+        [a], {a.id: [0]}, images=IMAGES, ports=PORTS, state=STATE,
+        litellm=False,
+    )
+    svc = rc.compose['services'][vllm_service_name(a)]
+    assert svc['ports'] == ['18000:8000']
+
+
+def test_reconcile_delete_tolerates_already_gone(tmp_path, monkeypatch):
+    """A shared gateway lets another converge delete a route between this one's
+    list and delete; LiteLLM then answers the delete with 'not found in db'.
+    That IS the desired end-state (route gone), so it must be swallowed, not
+    warned. A real failure (or a delete without the flag) still warns."""
+    import infer_stack._log as _log
+
+    class NotFoundOnDelete(RecordingGateway):
+        def post(self, url, **kw):
+            if url.endswith('/model/delete'):
+                rid = (kw.get('json') or {}).get('id')
+                self.calls.append(('delete', rid))
+                return FakeResp(
+                    400, {'error': f'Model with id={rid} not found in db'}
+                )
+            return super().post(url, **kw)
+
+    be = make_backend(tmp_path, NotFoundOnDelete())
+    warnings: list = []
+    monkeypatch.setattr(
+        _log.logger, 'warning', lambda *a, **k: warnings.append((a, k))
+    )
+    be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x', ok_if_missing=True)
+    assert warnings == []  # already gone -> no warning
+    be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x')
+    assert warnings  # same response without the flag -> warns

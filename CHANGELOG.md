@@ -124,6 +124,22 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
 
 ### Fixed
+* **Upstream containers blipped (and broke readiness mid-request) when an
+  unrelated deployment was added or released.** Each vLLM/ollama upstream
+  published a host port assigned by *position* in the live set (`BASE + i`), so
+  adding or removing any deployment renumbered every survivor's port — which
+  changed their rendered service specs and made `docker compose up -d` recreate
+  unrelated, still-leased containers. With the gateway up, LiteLLM's route then
+  pointed at a container that was restarting, so in-flight requests got
+  `InternalServerError: Connection error` for the ~minute it took vLLM to reload
+  — surfacing as a flaky slurm-e2e node failure when one job's `release` landed
+  during another's readiness probe. Behind the gateway an upstream is internal
+  (reached by compose-network DNS at `:8000`), so it now publishes **no** host
+  port and each survivor's spec is byte-identical as the set changes — the same
+  no-blip property the static gateway config already has. The no-gateway path
+  still publishes (the readiness probe hits the upstream directly there). Also
+  hardened the dynamic-routing reconcile to treat a `/model/delete` "not found in
+  db" as success (a shared gateway lets another converge delete the route first).
 * **`database is locked` when several processes open a fresh ledger at once.**
   Switching the journal to WAL (and creating the schema) on first open needs a
   brief exclusive lock that sqlite returns immediately as "locked" rather than

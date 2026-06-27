@@ -1,3 +1,53 @@
+## 2026-06-27 08:38:01 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.
+
+User intent: debug a slurm-e2e failure from the dynamic-routing run the user
+rsynced back (`tests/infer_stack_pipeline_e2e/_runs/20260627T080504-slurm`, still
+running). One `smol_135_01` node failed; the rest passed.
+
+Investigation (the interesting part — the converge log alone lies): the node's
+acquire succeeded and readiness passed, but the probe then got 20× `litellm
+.InternalServerError: Connection error … Model Group=smol-135`. The converge log
+just said "up -d 5/6 services" each time — nothing looked wrong. The GPU-memory
+**timeline** (`diag/timeline.log`) was the tell: all four upstreams loaded
+(08:10:51), then *every* GPU dropped to ~2 MiB at 08:12:38 and reloaded over the
+next ~2 min. So an unrelated `gpt2` *release* at 08:12:26 recreated the still-
+leased smol/gpt2-tp2 containers. Root cause: `render_compose` assigned each
+upstream's published host port by enumeration index (`BASE + vllm_i`) over the
+live set, so removing one deployment renumbered the survivors' ports → changed
+their service specs → `docker compose up -d` recreated them. LiteLLM's route then
+pointed at a restarting container → connection errors for the reload window.
+
+Fix: behind the gateway an upstream is internal (reached by compose-network DNS
+at :8000), so publish **no** host port — removing the only set-dependent field,
+so a survivor's spec is byte-identical as the set changes (the same no-blip
+property the static gateway config already has). No-gateway path still publishes
+(the readiness probe hits the upstream directly). Also made the dynamic-routing
+reconcile treat `/model/delete` "not found in db" as success (a shared gateway
+lets a concurrent converge delete the route first — saw that warning in the log).
+
+Considered alternatives: (a) stable per-deployment port via id-hash — rejected,
+collisions reintroduce set-dependence and it keeps useless host-port pressure
+with many `--dedicated` upstreams; (b) persist a port on the deployment record —
+heavier (ledger/migration) for a debug-only convenience. "Internal services
+don't need host ports" is the simplest invariant and gives *guaranteed* zero
+churn (no field to renumber), so it won.
+
+Confident about: the root cause (placement is sticky — verified — so device_ids
+were stable, leaving the port as the only changing field; arithmetic matches the
+two renders 18000/18001/18002 → 18000/18001). Tests: full suite 277 passed incl.
+a new no-churn regression (`test_dynamic_upstreams_have_no_host_ports_and_survive
+_set_change`) and the delete-race test. Risks/uncertainties: (1) the *first*
+converge after deploying this on the real stack will recreate upstreams once (the
+ports disappear from the on-disk file) — a one-time blip, then stable. (2)
+Separately observed a worker-propagation race — the successful jobs' probes saw a
+few `404 model does not exist` right after `/model/new` before settling; the
+probe's retries absorb it, but if LiteLLM runs multiple workers the admin-API add
+propagates asynchronously, so readiness can pass on a warm worker while a client
+hits a cold one. Not what failed this run; noted as a watch-item. I implement
+here; the user re-runs on aiq-gpu.
+
 ## 2026-05-22 21:30 -0400
 
 Model: claude-sonnet-4-6, then claude-opus-4-7 (model switch mid-session).

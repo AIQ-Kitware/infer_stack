@@ -218,7 +218,7 @@ def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
 def _vllm_service(
     deployment: Deployment,
     gpus: list[int],
-    host_port: int,
+    host_port: int | None,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
@@ -234,7 +234,6 @@ def _vllm_service(
     service: dict[str, Any] = {
         'image': images['vllm'],
         'command': command,
-        'ports': [f'{host_port}:8000'],
         'environment': {'HF_TOKEN': '${HF_TOKEN:-}'},
         'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
         'restart': 'unless-stopped',
@@ -247,6 +246,12 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
+    # Only publish a host port when there's no gateway to front the upstream.
+    # Behind LiteLLM the upstream is internal (reached by compose-network DNS at
+    # :8000), and a published port would have to be unique across the live set,
+    # which reintroduces the set-dependence this avoids. See render_compose.
+    if host_port is not None:
+        service['ports'] = [f'{host_port}:8000']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
     return service
@@ -255,7 +260,7 @@ def _vllm_service(
 def _ollama_service(
     deployment: Deployment,
     gpus: list[int],
-    host_port: int,
+    host_port: int | None,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
@@ -278,7 +283,6 @@ def _ollama_service(
     # the reservation alone; ollama does the same.
     service: dict[str, Any] = {
         'image': deployment.spec.get('image') or images['ollama'],
-        'ports': [f'{host_port}:11434'],
         'environment': env,
         'volumes': [f'{state["ollama"]}:/root/.ollama'],
         'restart': 'unless-stopped',
@@ -290,6 +294,9 @@ def _ollama_service(
             'retries': 5,
         },
     }
+    # See _vllm_service: only publish a host port when there is no gateway.
+    if host_port is not None:
+        service['ports'] = [f'{host_port}:11434']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
     return service
@@ -791,18 +798,28 @@ def render_compose(
         if deployment.id not in assignments:
             continue
         gpus = assignments[deployment.id]
+        # Host ports are published ONLY when there is no LiteLLM gateway. Behind
+        # the gateway every upstream is reached by compose-network DNS, so a host
+        # port is unnecessary — and harmful: it was assigned by position in the
+        # live set (BASE + i), so adding/removing any deployment renumbered the
+        # survivors' ports, which changed their service definitions and made
+        # `docker compose up -d` recreate unrelated, in-flight containers (a blip
+        # that killed readiness mid-request). Omitting it makes each upstream's
+        # rendered service depend only on the deployment itself -> no churn, the
+        # same no-blip property the static gateway config already has.
         if deployment.engine == 'vllm':
             # Unique-per-deployment names in dynamic-routing mode so same-model
             # --dedicated deployments don't collapse onto one container/GPU.
             name = vllm_service_name(deployment, unique=dynamic_routing)
-            port = VLLM_HOST_PORT_BASE + vllm_i
-            vllm_i += 1
+            port = None if litellm else VLLM_HOST_PORT_BASE + vllm_i
+            vllm_i += 0 if litellm else 1
             services[name] = _vllm_service(deployment, gpus, port, images, state)
             vllm_v1_urls.append(f'http://{name}:{VLLM_CONTAINER_PORT}/v1')
         elif deployment.engine == 'ollama':
             name = ollama_service_name(deployment)
-            port = ports.get('ollama', DEFAULT_PORTS['ollama']) + ollama_i
-            ollama_i += 1
+            base = ports.get('ollama', DEFAULT_PORTS['ollama'])
+            port = None if litellm else base + ollama_i
+            ollama_i += 0 if litellm else 1
             services[name] = _ollama_service(deployment, gpus, port, images, state)
             ollama_native_urls.append(f'http://{name}:{OLLAMA_CONTAINER_PORT}')
         else:
@@ -1402,7 +1419,12 @@ class ComposeBackend:
         for route in to_add:
             self._post_route('/model/new', route, route.get('model_name'))
         for rid in to_delete:
-            self._post_route('/model/delete', {'id': rid}, rid)
+            # ok_if_missing: with a shared gateway, another converge may have
+            # deleted this route already; "not found in db" means the desired
+            # end-state (route gone) is reached, so don't treat it as an error.
+            self._post_route(
+                '/model/delete', {'id': rid}, rid, ok_if_missing=True
+            )
         if to_add or to_delete:
             logger.info(
                 'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
@@ -1438,11 +1460,20 @@ class ComposeBackend:
                 self._sleep(delay)
         return None
 
-    def _post_route(self, path: str, payload: dict[str, Any], label: Any) -> None:
+    def _post_route(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        label: Any,
+        *,
+        ok_if_missing: bool = False,
+    ) -> None:
         """POST one admin-API call (``/model/new`` or ``/model/delete``).
 
         Per-call best-effort: a failure is logged and the rest still run; the
         next converge re-reconciles, so a transient error self-heals.
+        ``ok_if_missing`` swallows a "model not found" response (a delete whose
+        target is already gone has already reached its desired end-state).
         """
         from .._log import logger
 
@@ -1457,10 +1488,12 @@ class ComposeBackend:
             logger.warning('dynamic routing: POST {} {} error: {}', path, label, ex)
             return
         if getattr(resp, 'status_code', 0) >= 300:
+            body = str(getattr(resp, 'text', ''))
+            if ok_if_missing and 'not found' in body.lower():
+                return
             logger.warning(
                 'dynamic routing: POST {} {} -> {} {}',
-                path, label, resp.status_code,
-                str(getattr(resp, 'text', ''))[:200],
+                path, label, resp.status_code, body[:200],
             )
 
     def observe(self) -> set[str]:
