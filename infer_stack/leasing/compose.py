@@ -300,6 +300,12 @@ def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
     currently running simply errors/cools-down until it comes up; the
     ``router_settings`` below make that warmup self-healing. ``/v1/models`` lists
     the whole catalog (some upstreams down) rather than only the live set.
+
+    Direction (see ``docs/litellm-gateway-routing.md``): static superset is the
+    default and is fine for now, but the intended evolution is to add/remove
+    routes at runtime via LiteLLM's admin API (``/model/new`` / ``/model/delete``)
+    so that non-catalog / interactive acquires can route with zero blip too. Add
+    that as an opt-in reconcile, not a replacement for this static path.
     """
     entries: list[dict[str, Any]] = []
     for name in sorted(getattr(catalog, 'endpoints', {})):
