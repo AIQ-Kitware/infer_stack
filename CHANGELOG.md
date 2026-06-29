@@ -5,6 +5,59 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **TUI: "Evict all idle" + multi-select in the leases/deployments tables.**
+  Clearing a pile of released-but-kept-warm deployments no longer means evicting
+  one row at a time: a new **Evict all idle** button (deployments pane) flips
+  every IDLE deployment to STOPPED in one action (then **Clean up** forgets
+  them). Both tables also gained multi-select: **space** toggles the cursor row,
+  **ctrl/cmd-click** toggles a discontiguous row, and **shift-click** extends a
+  contiguous range (selection shown in a leading marker column); **Release** /
+  **Evict** then act on every checked row, falling back to the cursor row when
+  nothing is checked. The selection is kept by id so it survives a poll refresh
+  and is pruned to live rows. Note: "Clean up" still only forgets STOPPED
+  deployments + RELEASED/EXPIRED leases by design — IDLE (keep-warm) deployments
+  are retained until evicted. The multi-select is a hand-rolled shim (Textual 8.x
+  has no native row multi-select, only text selection); it is self-contained and
+  can be dropped if Textual ships one (see textual#3606 / PR #6585). Tests in
+  `tests/test_tui.py`.
+* **Dynamic LiteLLM routing via the admin API + Postgres (opt-in
+  `dynamic_routing`).** A new mode that manages the gateway's route table *live*
+  through LiteLLM's admin API (`/model/new` / `/model/delete`) against a
+  Postgres-backed model store (`STORE_MODEL_IN_DB`), instead of a static config
+  file. It fixes the **same-model `--dedicated` collision**: in static-superset
+  mode every dedicated deployment of one served model collapses onto a single
+  `vllm-<served>` container (one GPU), but with dynamic routing each deployment
+  gets its own `vllm-<served>-<id>` upstream, so N dedicated deployments run on N
+  GPUs (LiteLLM load-balances the shared public alias across them). It follows
+  the render/apply split: render writes the desired route set (`litellm_routes
+  .json`, one entry per live `(deployment, endpoint)` with a deterministic
+  `model_info.id`) and a *static* base gateway config (empty `model_list`, so the
+  gateway is never recreated — no blip); apply reconciles the live gateway as an
+  idempotent set-diff (`ComposeBackend._reconcile_routes`), so it coalesces,
+  heals drift (routes lost to a restart reappear; stale routes are deleted), and
+  leaves hand-added models (no `isr-` id) alone. Off by default (static superset
+  stays the default); enable with `config set dynamic_routing true` or
+  `--dynamic-routing`. Backed by `compose._litellm_routes` / `_postgres_service`
+  / `ComposeBackend.db_password()`; tests in
+  `tests/test_leasing_dynamic_routing.py`. NOTE: verified against the pinned
+  `litellm v1.82.3` that the admin API requires a DB (it is *not* DB-less), so
+  Postgres is a hard requirement for this mode.
+* **Coalesced apply: one `docker compose up` serves a whole batch of concurrent
+  acquires.** The controller's critical section is split into a fast RENDER lock
+  (ledger write + placement + compose-file render) and a separate APPLY lock
+  around the slow `docker compose up`, so a second caller can render while the
+  first is still applying (acquires no longer serialize end-to-end behind each
+  other's bring-up). A monotonic generation in the ledger (`desired_gen` bumped
+  by each mutation, `applied_gen` published after a successful apply) lets the
+  apply lock double as a coalescing wait-queue: an acquirer whose generation is
+  already covered skips its own apply, so N concurrent acquires need far fewer
+  than N applies. The snapshot is a guaranteed-covered floor (taken before the
+  `up`), so a render landing mid-apply is re-applied next, never dropped; crash
+  during apply is safe (the flock auto-releases and `up` is idempotent). Backed
+  by `Controller._render` / `_ensure_applied` / `_apply_lock` and the new
+  `ComposeBackend.apply()`. `infer-stack apply` uses the new
+  `Controller.apply_now()` (force) so it still heals drift when nothing changed.
+
 * **`infer-stack gc` — reclaim leaked leases and free their GPUs.** Sweeps
   TTL-expired leases (a hard-killed job — SIGKILL/OOM/reboot — never runs its
   `release`, so its lease lingers until TTL) and reconciles, tearing down any
@@ -86,6 +139,28 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
 
 ### Fixed
+* **Upstream containers blipped (and broke readiness mid-request) when an
+  unrelated deployment was added or released.** Each vLLM/ollama upstream
+  published a host port assigned by *position* in the live set (`BASE + i`), so
+  adding or removing any deployment renumbered every survivor's port — which
+  changed their rendered service specs and made `docker compose up -d` recreate
+  unrelated, still-leased containers. With the gateway up, LiteLLM's route then
+  pointed at a container that was restarting, so in-flight requests got
+  `InternalServerError: Connection error` for the ~minute it took vLLM to reload
+  — surfacing as a flaky slurm-e2e node failure when one job's `release` landed
+  during another's readiness probe. Behind the gateway an upstream is internal
+  (reached by compose-network DNS at `:8000`), so it now publishes **no** host
+  port and each survivor's spec is byte-identical as the set changes — the same
+  no-blip property the static gateway config already has. The no-gateway path
+  still publishes (the readiness probe hits the upstream directly there). Also
+  hardened the dynamic-routing reconcile to treat a `/model/delete` "not found in
+  db" as success (a shared gateway lets another converge delete the route first).
+* **`database is locked` when several processes open a fresh ledger at once.**
+  Switching the journal to WAL (and creating the schema) on first open needs a
+  brief exclusive lock that sqlite returns immediately as "locked" rather than
+  honoring `busy_timeout` — so a batch of pipeline jobs all running
+  `infer-stack acquire` against a brand-new ledger could race and crash in
+  `SqliteStore.__init__`. These DDL steps now retry on a transient lock.
 * **Ollama GPU pinning to a non-zero GPU** silently fell back to CPU. The docker
   device reservation (`device_ids`) already exposes only the pinned GPU and the
   NVIDIA runtime renumbers it to `0` inside the container, but the service also

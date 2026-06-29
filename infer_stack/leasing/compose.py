@@ -30,7 +30,9 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -56,6 +58,20 @@ LITELLM_CONFIG_FILENAME = 'litellm_config.yaml'
 LOCK_FILENAME = '.converge.lock'
 LITELLM_SERVICE = 'litellm'
 API_KEY_ENV = 'LITELLM_MASTER_KEY'
+
+# Dynamic-routing (admin-API) extras. When dynamic routing is on, the gateway's
+# route table is managed live via LiteLLM's admin API against a Postgres-backed
+# model store, instead of a static config file. See render_compose +
+# ComposeBackend._reconcile_routes and docs/litellm-gateway-routing.md.
+LITELLM_ROUTES_FILENAME = 'litellm_routes.json'  # rendered desired route set
+POSTGRES_SERVICE = 'postgres-litellm'
+POSTGRES_CONTAINER_PORT = 5432
+POSTGRES_DB_NAME = 'litellm'
+POSTGRES_DB_USER = 'litellm'
+DB_PASSWORD_ENV = 'LITELLM_DB_PASSWORD'  # managed secret in the sidecar .env
+# Marks a LiteLLM route as infer-stack-managed, so reconcile only ever deletes
+# routes it created (never a model added by hand through the UI/admin API).
+ROUTE_ID_PREFIX = 'isr-'
 
 VLLM_DEFAULTS = {
     'gpu_memory_utilization': 0.9,
@@ -88,21 +104,46 @@ def vllm_service_name_for(served: str) -> str:
     return f'vllm-{_dns_slug(served)}'
 
 
-def vllm_service_name(deployment: Deployment) -> str:
+def _unique_vllm_service_name(served: str, deployment_id: str) -> str:
+    """Per-deployment vLLM service/DNS name: ``vllm-<served>-<id-tail>``.
+
+    The static-superset gateway needs a name derivable from the served model
+    *alone* (so a catalog route can address it without knowing the live
+    deployment) — but that deliberately drops the deployment id, which
+    **collapses every** ``--dedicated`` **deployment of one model onto a single
+    container** (hence one GPU). Dynamic routing manages the gateway's routes
+    live via the admin API, so the upstream host no longer has to be predictable
+    from the catalog. That frees us to give each deployment its **own** service,
+    so N dedicated deployments of one model become N containers on N GPUs. The
+    suffix is the deployment id's hex tail, keeping the name short and DNS-safe.
+    """
+    tail = deployment_id.rsplit('-', 1)[-1][:8] or 'x'
+    return f'{vllm_service_name_for(served)}-{_dns_slug(tail)}'
+
+
+def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:
     """Compose service name for a vLLM deployment (see :func:`vllm_service_name_for`).
 
-    Deterministic from the served model name only — *no* deployment-id suffix —
-    so it matches the gateway's pre-rendered route for that endpoint. Trade-off:
-    two *simultaneously desired* deployments that share a served name (an endpoint
-    re-pointed at a new model while the old one is still live) would collide on
-    this name; that interactive case is unsupported under the static-gateway
-    model (the catalog endpoint is the unit). ``observe`` correlates a running
-    container back to its deployment id via the ``infer-stack.deployment`` label,
-    not this name, so the dropped suffix does not affect reconcile bookkeeping.
+    Default (``unique=False``, static-superset mode): deterministic from the
+    served model name only — *no* deployment-id suffix — so it matches the
+    gateway's pre-rendered route for that endpoint. Trade-off: two
+    *simultaneously desired* deployments that share a served name collide on this
+    name; under the static gateway the catalog endpoint is the unit, so that case
+    (including same-model ``--dedicated``) is unsupported.
+
+    ``unique=True`` (dynamic-routing mode): append the deployment-id tail
+    (:func:`_unique_vllm_service_name`) so same-model dedicated deployments get
+    distinct containers/GPUs; the admin-API route table addresses each by name.
+
+    Either way ``observe`` correlates a running container back to its deployment
+    id via the ``infer-stack.deployment`` label, not this name, so the choice of
+    suffix does not affect reconcile bookkeeping.
     """
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
     )
+    if unique:
+        return _unique_vllm_service_name(served, deployment.id)
     return vllm_service_name_for(served)
 
 
@@ -127,6 +168,10 @@ class RenderedCompose:
     services: dict[str, str] = field(default_factory=dict)  # service -> deployment id
     litellm_config: str | None = None
     nginx_config: str | None = None
+    # Desired LiteLLM route set for dynamic routing (None in static-superset
+    # mode). The render half writes it to litellm_routes.json; the apply half
+    # reconciles it against the live gateway via the admin API.
+    litellm_routes: list[dict[str, Any]] | None = None
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -173,7 +218,7 @@ def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
 def _vllm_service(
     deployment: Deployment,
     gpus: list[int],
-    host_port: int,
+    host_port: int | None,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
@@ -189,7 +234,6 @@ def _vllm_service(
     service: dict[str, Any] = {
         'image': images['vllm'],
         'command': command,
-        'ports': [f'{host_port}:8000'],
         'environment': {'HF_TOKEN': '${HF_TOKEN:-}'},
         'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
         'restart': 'unless-stopped',
@@ -202,6 +246,12 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
+    # Only publish a host port when there's no gateway to front the upstream.
+    # Behind LiteLLM the upstream is internal (reached by compose-network DNS at
+    # :8000), and a published port would have to be unique across the live set,
+    # which reintroduces the set-dependence this avoids. See render_compose.
+    if host_port is not None:
+        service['ports'] = [f'{host_port}:8000']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
     return service
@@ -210,7 +260,7 @@ def _vllm_service(
 def _ollama_service(
     deployment: Deployment,
     gpus: list[int],
-    host_port: int,
+    host_port: int | None,
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
@@ -233,7 +283,6 @@ def _ollama_service(
     # the reservation alone; ollama does the same.
     service: dict[str, Any] = {
         'image': deployment.spec.get('image') or images['ollama'],
-        'ports': [f'{host_port}:11434'],
         'environment': env,
         'volumes': [f'{state["ollama"]}:/root/.ollama'],
         'restart': 'unless-stopped',
@@ -245,6 +294,9 @@ def _ollama_service(
             'retries': 5,
         },
     }
+    # See _vllm_service: only publish a host port when there is no gateway.
+    if host_port is not None:
+        service['ports'] = [f'{host_port}:11434']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
     return service
@@ -300,6 +352,15 @@ def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
     currently running simply errors/cools-down until it comes up; the
     ``router_settings`` below make that warmup self-healing. ``/v1/models`` lists
     the whole catalog (some upstreams down) rather than only the live set.
+
+    This static-superset path is the default. Its one limitation — it cannot give
+    same-model ``--dedicated`` deployments distinct upstreams, and cannot route
+    non-catalog acquires without a config change — is addressed by the opt-in
+    *dynamic routing* mode (``dynamic_routing=True``), which manages routes live
+    via LiteLLM's admin API against a Postgres model store (see
+    :func:`_litellm_routes`, :meth:`ComposeBackend._reconcile_routes`, and
+    ``docs/litellm-gateway-routing.md``). The two are mutually exclusive per
+    converge; this function is used only when dynamic routing is off.
     """
     entries: list[dict[str, Any]] = []
     for name in sorted(getattr(catalog, 'endpoints', {})):
@@ -340,7 +401,115 @@ def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def _route_id(deployment_id: str, endpoint: str) -> str:
+    """Deterministic LiteLLM model id for one (deployment, endpoint) route.
+
+    Stable across converges, so route reconcile (:meth:`ComposeBackend.
+    _reconcile_routes`) is a pure set-diff: the same logical route always has the
+    same id (added once, never churned), and a route that drops out of the
+    desired set is deleted by exactly this id. The ``isr-`` prefix marks it
+    infer-stack-managed so reconcile never deletes a model someone added by hand.
+    """
+    digest = hashlib.sha256(f'{deployment_id}|{endpoint}'.encode()).hexdigest()
+    return f'{ROUTE_ID_PREFIX}{digest[:32]}'
+
+
+def _litellm_routes(
+    deployments: list[Deployment], assignments: dict[str, list[int]]
+) -> list[dict[str, Any]]:
+    """Desired LiteLLM route set for the *live* deployments (dynamic routing).
+
+    One entry per (placed deployment, served endpoint), addressing the
+    deployment's **own** unique upstream service (:func:`vllm_service_name` with
+    ``unique=True``). Several dedicated deployments of the same model therefore
+    yield several entries that share one public ``model_name`` but point at
+    distinct upstreams — LiteLLM load-balances the alias across them, so each
+    runs on its own GPU while clients still ask for the single name. Each entry
+    carries a deterministic ``model_info.id`` (:func:`_route_id`) so applying the
+    set via the admin API is an idempotent diff, not fire-and-forget calls.
+    """
+    entries: list[dict[str, Any]] = []
+    for deployment in sorted(deployments, key=lambda g: (g.created_at, g.id)):
+        if deployment.id not in assignments:
+            continue
+        if deployment.engine == 'vllm':
+            served = deployment.spec.get('served_model_name') or deployment.id
+            api_base = (
+                f'http://{vllm_service_name(deployment, unique=True)}'
+                f':{VLLM_CONTAINER_PORT}/v1'
+            )
+            for endpoint in sorted(deployment.served):
+                entries.append(
+                    {
+                        'model_name': endpoint,
+                        'litellm_params': {
+                            'model': f'openai/{served}',
+                            'api_base': api_base,
+                            'api_key': 'EMPTY',
+                        },
+                        'model_info': {'id': _route_id(deployment.id, endpoint)},
+                    }
+                )
+        elif deployment.engine == 'ollama':
+            api_base = (
+                f'http://{ollama_service_name(deployment)}:{OLLAMA_CONTAINER_PORT}'
+            )
+            for endpoint, payload in sorted(deployment.served.items()):
+                tag = payload.get('model', endpoint)
+                entries.append(
+                    {
+                        'model_name': endpoint,
+                        'litellm_params': {
+                            'model': f'ollama/{tag}',
+                            'api_base': api_base,
+                        },
+                        'model_info': {'id': _route_id(deployment.id, endpoint)},
+                    }
+                )
+    return entries
+
+
 CONFIG_HASH_LABEL = 'infer-stack.config-hash'
+
+
+def _postgres_service(
+    images: dict[str, str], state: dict[str, str]
+) -> dict[str, Any]:
+    """Postgres backing LiteLLM's runtime model store (dynamic routing only).
+
+    LiteLLM's admin API (``/model/new`` / ``/model/delete``) only functions with
+    ``STORE_MODEL_IN_DB=true`` + a database, so dynamic routing needs a DB. This
+    is an **internal** service (no published host port); LiteLLM reaches it on
+    the compose network at ``postgres-litellm:5432``. The password is the managed
+    :data:`DB_PASSWORD_ENV` secret in the sidecar ``.env`` (interpolated by
+    ``docker compose --env-file``), so it never appears literally in the YAML.
+    The healthcheck lets the litellm service ``depends_on`` it (condition:
+    service_healthy) so the gateway only starts once the DB can accept queries.
+    """
+    data_path = state.get('postgres_litellm') or str(
+        Path(next(iter(state.values()), '.')).parent / 'postgres-litellm'
+    )
+    return {
+        'image': images.get('postgres', PINNED_IMAGES['postgres']),
+        'environment': {
+            'POSTGRES_USER': POSTGRES_DB_USER,
+            'POSTGRES_PASSWORD': '${' + DB_PASSWORD_ENV + '}',
+            'POSTGRES_DB': POSTGRES_DB_NAME,
+        },
+        'volumes': [f'{data_path}:/var/lib/postgresql/data'],
+        'restart': 'unless-stopped',
+        'labels': {ENGINE_LABEL: 'postgres'},
+        'healthcheck': {
+            'test': [
+                'CMD-SHELL',
+                f'pg_isready -U {POSTGRES_DB_USER} -d {POSTGRES_DB_NAME}',
+            ],
+            'interval': '5s',
+            'timeout': '5s',
+            'retries': 30,
+            'start_period': '30s',
+        },
+    }
 
 
 def _litellm_service(
@@ -350,6 +519,8 @@ def _litellm_service(
     aux_dir: str,
     master_key: str | None = None,
     config_hash: str | None = None,
+    *,
+    dynamic_routing: bool = False,
 ) -> dict[str, Any]:
     # Reference the managed key via ${...} rather than baking the literal secret
     # into the compose YAML. Its value lives in the sidecar .env next to the
@@ -361,6 +532,17 @@ def _litellm_service(
         if master_key is not None
         else '${' + API_KEY_ENV + ':-sk-local}'
     )
+    environment = {API_KEY_ENV: key_value}
+    if dynamic_routing:
+        # DB-backed runtime model store so the admin API (/model/new,
+        # /model/delete) works; the gateway then never needs recreating to learn
+        # a route. Both are read from the env by LiteLLM. The password is
+        # interpolated from the sidecar .env, so no secret lands in the YAML.
+        environment['DATABASE_URL'] = (
+            f'postgresql://{POSTGRES_DB_USER}:${{{DB_PASSWORD_ENV}}}'
+            f'@{POSTGRES_SERVICE}:{POSTGRES_CONTAINER_PORT}/{POSTGRES_DB_NAME}'
+        )
+        environment['STORE_MODEL_IN_DB'] = 'True'
     labels = {ENGINE_LABEL: 'litellm'}
     if config_hash is not None:
         # LiteLLM reads its routing config once at startup; the file is bind-
@@ -381,12 +563,19 @@ def _litellm_service(
         ],
         'ports': [f'{host_port}:{LITELLM_CONTAINER_PORT}'],
         'volumes': [f'{aux_dir}/{LITELLM_CONFIG_FILENAME}:/etc/litellm/config.yaml:ro'],
-        'environment': {API_KEY_ENV: key_value},
+        'environment': environment,
         'restart': 'unless-stopped',
         'labels': labels,
     }
-    # Only wait on upstreams when there are any (zero models -> empty gateway).
-    if service_names:
+    if dynamic_routing:
+        # Wait for the DB to accept queries before the gateway boots; do NOT add
+        # per-model depends_on (that would churn the spec, i.e. blip, on every
+        # model change). The route table is filled in afterward via the API.
+        service['depends_on'] = {
+            POSTGRES_SERVICE: {'condition': 'service_healthy'}
+        }
+    elif service_names:
+        # Only wait on upstreams when there are any (zero models -> empty gateway).
         service['depends_on'] = sorted(service_names)
     return service
 
@@ -580,6 +769,7 @@ def render_compose(
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
     catalog: Any = None,
+    dynamic_routing: bool = False,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
 
@@ -608,16 +798,28 @@ def render_compose(
         if deployment.id not in assignments:
             continue
         gpus = assignments[deployment.id]
+        # Host ports are published ONLY when there is no LiteLLM gateway. Behind
+        # the gateway every upstream is reached by compose-network DNS, so a host
+        # port is unnecessary — and harmful: it was assigned by position in the
+        # live set (BASE + i), so adding/removing any deployment renumbered the
+        # survivors' ports, which changed their service definitions and made
+        # `docker compose up -d` recreate unrelated, in-flight containers (a blip
+        # that killed readiness mid-request). Omitting it makes each upstream's
+        # rendered service depend only on the deployment itself -> no churn, the
+        # same no-blip property the static gateway config already has.
         if deployment.engine == 'vllm':
-            name = vllm_service_name(deployment)
-            port = VLLM_HOST_PORT_BASE + vllm_i
-            vllm_i += 1
+            # Unique-per-deployment names in dynamic-routing mode so same-model
+            # --dedicated deployments don't collapse onto one container/GPU.
+            name = vllm_service_name(deployment, unique=dynamic_routing)
+            port = None if litellm else VLLM_HOST_PORT_BASE + vllm_i
+            vllm_i += 0 if litellm else 1
             services[name] = _vllm_service(deployment, gpus, port, images, state)
             vllm_v1_urls.append(f'http://{name}:{VLLM_CONTAINER_PORT}/v1')
         elif deployment.engine == 'ollama':
             name = ollama_service_name(deployment)
-            port = ports.get('ollama', DEFAULT_PORTS['ollama']) + ollama_i
-            ollama_i += 1
+            base = ports.get('ollama', DEFAULT_PORTS['ollama'])
+            port = None if litellm else base + ollama_i
+            ollama_i += 0 if litellm else 1
             services[name] = _ollama_service(deployment, gpus, port, images, state)
             ollama_native_urls.append(f'http://{name}:{OLLAMA_CONTAINER_PORT}')
         else:
@@ -625,24 +827,33 @@ def render_compose(
         service_map[name] = deployment.id
 
     litellm_config = None
+    litellm_routes = None
     # The front door (gateway + UI) is rendered whenever it's enabled, even with
     # zero models — it's a standing entry point, not a per-model service. So
     # releasing/evicting every model leaves an empty gateway (and an empty Open
     # WebUI picker) up instead of tearing the whole stack down; only an explicit
     # `stack down` removes it. With no models the model_list is simply empty.
     if litellm:
-        # Prefer a STATIC superset route table from the catalog: one route per
-        # catalog endpoint, addressing a deterministic upstream host. That config
-        # depends only on the catalog, not on which models are placed — so
-        # acquiring/releasing a model leaves the LiteLLM config (hence its
-        # container) untouched and the gateway is not recreated ("no blip"). The
-        # config_hash still changes if the *catalog* changes, correctly
-        # recreating the gateway to pick up new/removed endpoints. Without a
-        # catalog (legacy / tests) fall back to routing only the placed
-        # deployments, which does churn per model change.
-        if catalog is not None:
+        # Three route-table strategies, in order of preference:
+        #  * DYNAMIC ROUTING: the rendered config is a STATIC base (empty
+        #    model_list); the real routes live in Postgres and are applied to the
+        #    running gateway via the admin API (see _reconcile_routes). The config
+        #    hash never changes as models come/go, so the gateway is never
+        #    recreated — no blip, and per-deployment routing works (so same-model
+        #    --dedicated deployments each get their own upstream).
+        #  * STATIC SUPERSET (catalog): one route per catalog endpoint to a
+        #    deterministic host; config depends only on the catalog, so the
+        #    gateway is not recreated as models come/go (no blip) but same-model
+        #    dedicated collapses to one upstream.
+        #  * LEGACY (no catalog): route only the placed deployments; churns the
+        #    config (and recreates the gateway) on every model change.
+        if dynamic_routing:
+            entries: list[dict[str, Any]] = []
+            litellm_routes = _litellm_routes(deployments, assignments)
+            litellm_depends: list[str] = []
+        elif catalog is not None:
             entries = _litellm_model_list_from_catalog(catalog)
-            litellm_depends: list[str] = []  # no per-model depends_on -> no churn
+            litellm_depends = []  # no per-model depends_on -> no churn
         else:
             entries = _litellm_model_list(deployments, assignments)
             litellm_depends = list(service_map)
@@ -670,6 +881,8 @@ def render_compose(
         config_hash = hashlib.sha256(
             litellm_config.encode('utf-8')
         ).hexdigest()[:12]
+        if dynamic_routing:
+            services[POSTGRES_SERVICE] = _postgres_service(images, state)
         services[LITELLM_SERVICE] = _litellm_service(
             litellm_depends,
             litellm_port,
@@ -677,6 +890,7 @@ def render_compose(
             str(aux_dir or '.'),
             master_key=litellm_master_key,
             config_hash=config_hash,
+            dynamic_routing=dynamic_routing,
         )
 
     # Open WebUI is its own standing front door, rendered whenever ``ui`` is set
@@ -734,6 +948,7 @@ def render_compose(
         services=service_map,
         litellm_config=litellm_config,
         nginx_config=nginx_config,
+        litellm_routes=litellm_routes,
     )
 
 
@@ -803,6 +1018,8 @@ class ComposeBackend:
         require_generation: bool = False,
         assume_yes: bool = True,
         catalog: Any = None,
+        dynamic_routing: bool = False,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -832,6 +1049,12 @@ class ComposeBackend:
         # static superset route table (one route per catalog endpoint) so the
         # gateway is never recreated as models come and go. See render_compose.
         self.catalog = catalog
+        # Dynamic routing: manage the gateway's routes live via the admin API
+        # against a Postgres-backed model store, instead of a static config file.
+        # Gives each deployment its own upstream (so same-model --dedicated
+        # deployments land on distinct GPUs) with no gateway recreation/blip.
+        self.dynamic_routing = dynamic_routing
+        self._sleep = sleep
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
@@ -857,6 +1080,10 @@ class ComposeBackend:
     def _env_path(self) -> Path:
         return self.state_dir / '.env'
 
+    @property
+    def _routes_file(self) -> Path:
+        return self.state_dir / LITELLM_ROUTES_FILENAME
+
     def master_key(self) -> str:
         """The managed LiteLLM master key.
 
@@ -872,13 +1099,43 @@ class ComposeBackend:
             write_env_file(self._env_path, {API_KEY_ENV: key})
         return key
 
+    def db_password(self) -> str:
+        """The managed Postgres password for LiteLLM's model store.
+
+        Same managed-secret pattern as :meth:`master_key`: reused if already
+        present in the state-dir ``.env`` (you may pin your own), else generated
+        and persisted. ``docker compose --env-file`` interpolates it into the
+        postgres + litellm services, so it never appears literally in the YAML.
+        Only used when ``dynamic_routing`` is on. ``token_urlsafe`` output is safe
+        inside the ``postgresql://`` URL (no ``@ : /`` characters).
+        """
+        existing = parse_env_file(self._env_path)
+        pw = ensure_secret(existing, DB_PASSWORD_ENV)
+        if pw != existing.get(DB_PASSWORD_ENV):
+            write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
+        return pw
+
+    @staticmethod
+    def _atomic_write(path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically (temp + ``os.replace``).
+
+        The render half (``converge(apply=False)``) and the apply half
+        (:meth:`apply`) run under *different* locks so a render can proceed while
+        another process applies. A reader (``apply`` / ``docker compose``) must
+        therefore never see a half-written file — ``os.replace`` swaps it in one
+        atomic step, so every read sees either the old or the new file whole.
+        """
+        tmp = path.with_name(f'{path.name}.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
     def _load_sidecar(self) -> dict[str, Any]:
         if self._state_file.exists():
             return json.loads(self._state_file.read_text())
         return {}
 
     def _save_sidecar(self, data: dict[str, Any]) -> None:
-        self._state_file.write_text(json.dumps(data, indent=2))
+        self._atomic_write(self._state_file, json.dumps(data, indent=2))
 
     def _compose(self, args: list[str]) -> str:
         cmd = ['docker', 'compose']
@@ -985,6 +1242,11 @@ class ComposeBackend:
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
             for err in plan.errors:
                 logger.warning('  placement: {}', err)
+            if self.litellm and self.dynamic_routing:
+                # Persist the DB secret to the sidecar .env *before* rendering, so
+                # docker compose --env-file can interpolate ${LITELLM_DB_PASSWORD}
+                # into the postgres + litellm services at apply time.
+                self.db_password()
             rendered = render_compose(
                 desired,
                 plan.assignments,
@@ -1002,6 +1264,7 @@ class ComposeBackend:
                 aux_dir=self.state_dir,
                 project=self.project,
                 catalog=self.catalog,
+                dynamic_routing=self.dynamic_routing,
             )
 
             compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
@@ -1014,17 +1277,29 @@ class ComposeBackend:
                 planned[self.state_dir / NGINX_CONFIG_FILENAME] = (
                     rendered.nginx_config
                 )
+            routes_text = (
+                json.dumps(rendered.litellm_routes, indent=2)
+                if rendered.litellm_routes is not None
+                else None
+            )
+            if routes_text is not None:
+                planned[self._routes_file] = routes_text
             self._approve_changes(planned)  # may raise ConvergeAborted
 
             if rendered.litellm_config is not None:
-                (self.state_dir / LITELLM_CONFIG_FILENAME).write_text(
-                    rendered.litellm_config
+                self._atomic_write(
+                    self.state_dir / LITELLM_CONFIG_FILENAME,
+                    rendered.litellm_config,
                 )
             if rendered.nginx_config is not None:
-                (self.state_dir / NGINX_CONFIG_FILENAME).write_text(
-                    rendered.nginx_config
+                self._atomic_write(
+                    self.state_dir / NGINX_CONFIG_FILENAME, rendered.nginx_config
                 )
-            self.compose_file.write_text(compose_text)
+            if routes_text is not None:
+                # The rendered desired route set for the running gateway (applied
+                # via the admin API in apply() -> _reconcile_routes).
+                self._atomic_write(self._routes_file, routes_text)
+            self._atomic_write(self.compose_file, compose_text)
             self._save_sidecar(
                 {'assignments': plan.assignments, 'services': rendered.services}
             )
@@ -1036,24 +1311,190 @@ class ComposeBackend:
                     len(services or {}), self.compose_file,
                 )
                 return plan
-            if services:
-                logger.info(
-                    'docker compose up -d ({} service(s): {})',
-                    len(services), ', '.join(sorted(services)),
-                )
-                self._compose(['up', '-d', '--remove-orphans'])
-            else:
-                # Nothing at all to run — only reachable with the gateway off
-                # (litellm=False) and zero models, since the front door otherwise
-                # keeps the project non-empty. `docker compose up` errors with
-                # "no service selected" on a services-less file, so tear the
-                # project down instead (`down` works on the empty file). With the
-                # gateway on, releasing every model lands in the `up` branch above
-                # and leaves the front door standing; `stack down` is the way to
-                # take everything off.
-                logger.info('no services desired -> docker compose down')
-                self._compose(['down', '--remove-orphans'])
+        # Apply OUTSIDE the converge (render) lock: the controller coalesces and
+        # serializes applies via its own apply-lock, so re-taking the render lock
+        # here would needlessly serialize renders against this slow `up`.
+        self.apply()
         return plan
+
+    def apply(self) -> None:
+        """Bring the already-rendered compose project up (``docker compose up -d``).
+
+        Reads the on-disk compose file last written by :meth:`converge` (render)
+        and applies it — it does NOT re-render. Deliberately does **not** take the
+        converge (render) lock: the controller serializes and coalesces applies
+        via its apply-lock + the ledger generation, and taking the render lock
+        here would re-serialize renders against this slow step (the whole point of
+        the split). Idempotent — a no-op when reality already matches the file,
+        which is what makes coalescing safe (a redundant apply costs ~nothing).
+        """
+        from .._log import logger
+
+        if not self.compose_file.exists():
+            return
+        try:
+            doc = yaml.safe_load(self.compose_file.read_text()) or {}
+        except Exception:  # noqa: BLE001 - a torn/old file must not brick apply
+            return
+        services = doc.get('services') or {}
+        if services:
+            logger.info(
+                'docker compose up -d ({} service(s): {})',
+                len(services), ', '.join(sorted(services)),
+            )
+            self._compose(['up', '-d', '--remove-orphans'])
+            if self.litellm and self.dynamic_routing:
+                # Apply the rendered desired route set to the now-running gateway
+                # via the admin API (the dynamic-routing half of apply).
+                self._reconcile_routes()
+        else:
+            # Nothing at all to run — only reachable with the gateway off
+            # (litellm=False) and zero models, since the front door otherwise
+            # keeps the project non-empty. `docker compose up` errors with "no
+            # service selected" on a services-less file, so tear the project down
+            # instead (`down` works on the empty file). With the gateway on,
+            # releasing every model lands in the `up` branch above and leaves the
+            # front door standing; `stack down` is the way to take everything off.
+            logger.info('no services desired -> docker compose down')
+            self._compose(['down', '--remove-orphans'])
+
+    # -- dynamic routing (admin API) --------------------------------------
+
+    def _gateway_base(self) -> str:
+        return f'http://127.0.0.1:{self.litellm_port}'
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {'Authorization': f'Bearer {self.master_key()}'}
+
+    def _desired_routes(self) -> list[dict[str, Any]]:
+        """The rendered desired route set (litellm_routes.json), or empty."""
+        try:
+            data = json.loads(self._routes_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _reconcile_routes(self, *, attempts: int = 90, delay: float = 2.0) -> None:
+        """Make the live gateway's managed routes match the rendered route set.
+
+        The render half wrote the desired routes (one per live deployment×
+        endpoint) to ``litellm_routes.json``; this is the apply half. List the
+        gateway's current models, then add the missing routes and delete the ones
+        no longer desired — through the admin API, with **no** container restart.
+
+        Properties this relies on:
+
+        * **Idempotent / coalescing-safe.** A redundant apply re-diffs to the
+          same set and does nothing, which is what makes the controller's
+          coalesced apply correct for routes too.
+        * **Drift-healing.** Routes lost to a gateway/DB restart reappear in the
+          diff and are re-added; stale routes from a prior run (still in the DB)
+          are deleted because they're no longer desired.
+        * **Co-existence.** Only routes infer-stack created (id prefix ``isr-``)
+          are ever deleted, so a model added by hand through the UI/API is left
+          alone.
+
+        Best-effort: the gateway may still be starting (it waits on Postgres
+        health, then boots — and on first-ever bring-up runs LiteLLM's Prisma DB
+        migrations, which can take a while), so the initial listing is retried
+        generously. A persistent failure is logged and left for the next converge
+        rather than raised — apply must stay non-fatal, like ``docker compose up``.
+        """
+        from .._log import logger
+
+        desired = {
+            r['model_info']['id']: r
+            for r in self._desired_routes()
+            if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
+        }
+        current = self._list_managed_routes(attempts=attempts, delay=delay)
+        if current is None:
+            logger.warning(
+                'dynamic routing: gateway not reachable to reconcile routes; '
+                'leaving it for the next converge'
+            )
+            return
+        to_add = [desired[i] for i in desired if i not in current]
+        to_delete = [i for i in current if i not in desired]
+        for route in to_add:
+            self._post_route('/model/new', route, route.get('model_name'))
+        for rid in to_delete:
+            # ok_if_missing: with a shared gateway, another converge may have
+            # deleted this route already; "not found in db" means the desired
+            # end-state (route gone) is reached, so don't treat it as an error.
+            self._post_route(
+                '/model/delete', {'id': rid}, rid, ok_if_missing=True
+            )
+        if to_add or to_delete:
+            logger.info(
+                'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
+                len(to_add), len(to_delete), len(desired),
+            )
+
+    def _list_managed_routes(
+        self, *, attempts: int, delay: float
+    ) -> set[str] | None:
+        """Ids of infer-stack-managed routes currently on the gateway.
+
+        Returns ``None`` if the gateway never became reachable within
+        ``attempts`` (so the caller can skip the diff and retry next converge).
+        """
+        for attempt in range(max(1, attempts)):
+            resp = None
+            try:
+                resp = self.http.get(
+                    f'{self._gateway_base()}/v1/model/info',
+                    headers=self._auth_headers(),
+                    timeout=10,
+                )
+            except Exception:  # noqa: BLE001 - the gateway may still be starting
+                resp = None
+            if resp is not None and getattr(resp, 'status_code', 0) == 200:
+                ids: set[str] = set()
+                for m in (resp.json().get('data') or []):
+                    rid = (m.get('model_info') or {}).get('id')
+                    if isinstance(rid, str) and rid.startswith(ROUTE_ID_PREFIX):
+                        ids.add(rid)
+                return ids
+            if attempt < attempts - 1:
+                self._sleep(delay)
+        return None
+
+    def _post_route(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        label: Any,
+        *,
+        ok_if_missing: bool = False,
+    ) -> None:
+        """POST one admin-API call (``/model/new`` or ``/model/delete``).
+
+        Per-call best-effort: a failure is logged and the rest still run; the
+        next converge re-reconciles, so a transient error self-heals.
+        ``ok_if_missing`` swallows a "model not found" response (a delete whose
+        target is already gone has already reached its desired end-state).
+        """
+        from .._log import logger
+
+        try:
+            resp = self.http.post(
+                f'{self._gateway_base()}{path}',
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=30,
+            )
+        except Exception as ex:  # noqa: BLE001 - one bad call must not abort apply
+            logger.warning('dynamic routing: POST {} {} error: {}', path, label, ex)
+            return
+        if getattr(resp, 'status_code', 0) >= 300:
+            body = str(getattr(resp, 'text', ''))
+            if ok_if_missing and 'not found' in body.lower():
+                return
+            logger.warning(
+                'dynamic routing: POST {} {} -> {} {}',
+                path, label, resp.status_code, body[:200],
+            )
 
     def observe(self) -> set[str]:
         if not self.compose_file.exists():

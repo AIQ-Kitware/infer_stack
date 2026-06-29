@@ -8,8 +8,8 @@ Not bugs (those are fixed on the branch / in CHANGELOG) — these are deliberate
 
 ## LiteLLM reload on model switch — keep the gateway alive
 
-**Status:** interim fix shipped; **#1 chosen as the real fix (not yet done)**;
-**#2 to retry in the future.**
+**Status:** interim fix shipped; **#1 (static superset) shipped as the default**;
+**#2 (admin API + Postgres) shipped as opt-in `dynamic_routing`.**
 
 ### Background
 
@@ -126,17 +126,30 @@ yield-under-pressure above (placement evicting an idle group when a live acquire
 can't otherwise place) is still open — `evict_idle` / `Controller.evict` are the
 reusable primitive it should call once the placer detects contention.
 
-### #2 — DB-backed live model management (retry later)
+### #2 — DB-backed live model management — DONE (implemented as opt-in)
 
-Bring back `postgres-litellm` and use LiteLLM's admin API (`/model/new`,
-`/model/delete`, `STORE_MODEL_IN_DB`) so converge updates routes on a **running**
-gateway — zero blip, no restart at all.
+**Status: implemented** (maintainer chose this direction). `postgres-litellm` is
+revived and LiteLLM's admin API (`/model/new`, `/model/delete`,
+`STORE_MODEL_IN_DB` + `DATABASE_URL`) updates routes on a **running** gateway —
+zero blip, no restart. Off by default; enable with `config set dynamic_routing
+true` / `--dynamic-routing`. See `docs/litellm-gateway-routing.md` and
+`infer_stack/leasing/compose.py` (`_litellm_routes`,
+`ComposeBackend._reconcile_routes`); tests in
+`tests/test_leasing_dynamic_routing.py`.
 
-**We tried this before and hit issues** (per the maintainer; details to recover
-from the legacy stack's history). Not the current direction, but **worth
-retrying in the future** — it's strictly nicer than #1 (no blip, and no
-advertising of undeployed models) if the earlier problems can be resolved. When
-revisiting, capture *what* broke last time before re-committing to it.
+It is strictly nicer than #1 (no blip, no advertising of undeployed models) and
+additionally fixes the same-model `--dedicated` collision (each deployment gets
+its own `vllm-<served>-<id>` upstream, so N dedicated deployments land on N GPUs;
+LiteLLM load-balances the shared public alias across them).
+
+**Verified fact (was a misconception):** the admin API is **not** DB-less — in
+`litellm v1.82.3`, `/model/new` 500s unless a DB is connected *and*
+`STORE_MODEL_IN_DB=true`. So Postgres is required, not optional. The render/apply
+shape sidesteps the "imperative drift" risk: render writes the desired route set
+(`litellm_routes.json`), apply reconciles it as an idempotent set-diff keyed by a
+deterministic `model_info.id` (drift-healing, co-exists with hand-added models).
+The earlier "we hit issues" concern was the Postgres dependency itself, now
+accepted by the maintainer ("having the litellm db makes a lot of sense").
 
 ### Recommendation / sequencing
 
@@ -192,3 +205,62 @@ the harness by wiping the ledger between tiers; worth fixing in the product):
   the first bullet, one leaked active lease re-spawns a GPU-hogging group on
   every subsequent reconcile. An `observe()`-driven reconciliation of ledger
   state (or just fixing the leak) would close this.
+
+---
+
+## Upstream LiteLLM: a quiet, generation-level readiness probe
+
+**Status:** want to submit a patch upstream; interim = we accept the log noise
+(documented in `docs/litellm-gateway-routing.md`). Not urgent.
+
+### Problem
+
+With the static superset route table (now the default), the gateway advertises
+**every** catalog endpoint immediately, but each endpoint's upstream vLLM is
+down until its container is placed *and* the model finishes loading. We poll
+readiness by sending a **real, protocol-aware generation** through the gateway
+every few seconds until it answers (see
+`ComposeBackend.probe_ready` / `openai_ready`) — because a container can be
+`running`/Docker-`healthy` long before vLLM can actually serve, so only a
+successful generation is trustworthy.
+
+Every poll that lands before the model is ready makes LiteLLM forward to an
+unreachable upstream and log a full **ERROR** stack
+(`InternalServerError: ... Connection error ... LiteLLM Retried: 3 times`). For
+a TP2 model waiting on a 2-GPU window this can repeat for minutes, per pending
+endpoint. The errors are **expected and self-healing**, but they look alarming
+and bury genuine failures in noise.
+
+### Why existing endpoints don't fully solve it
+
+- `/v1/models` only proves the route is *configured*, not that the upstream can
+  serve — useless as a readiness signal here.
+- `/health` / `/health/readiness` probe configured upstreams, but (a) `/health`
+  fans out over **all** configured models (our superset = the whole catalog),
+  and (b) it checks reachability, not a real **generation** — which is exactly
+  the distinction `probe_ready` exists to make (loaded-and-serving, protocol
+  correct). So it's not a drop-in for our gate.
+
+### What we want upstream
+
+A way to poll **one model's** readiness with a **generation-level** check that is
+**quiet on the expected not-ready path** (log at debug, not error, because
+"warming up" is a normal, caller-handled state). Concrete shapes to propose
+(verify against current LiteLLM before implementing):
+
+1. **Request-scoped log suppression** (smallest, most general): a header/param
+   that marks a call as a readiness probe so a failed upstream is logged at
+   `debug` and skips the retry/exception-stack ERROR — caller is explicitly
+   expecting and handling the failure. Our existing generation probe stays the
+   source of truth; only the noise goes away.
+2. **Per-model generation health check**: extend `/health?model=X` (or a new
+   `/health/generate?model=X`) to optionally do a minimal generation and return
+   a structured ready/not-ready, logging not-ready quietly.
+3. **Warmup/cooldown-aware logging**: while a deployment is inside a configurable
+   warmup window, downgrade unreachable-upstream logs to debug.
+
+Preference: **#1** — it's a tiny, broadly useful change and keeps our
+generation-level signal intact. Until it lands, the noise is acceptable and
+explained in the gateway-routing doc; do **not** globally lower LiteLLM's log
+level or set `num_retries: 0`, as that also hides real transient-upstream
+failures.

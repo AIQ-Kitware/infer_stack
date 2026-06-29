@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterable
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -56,9 +57,10 @@ from .cli.commands_leasing import (
     _placement_view,
     _running_label,
 )
-from .leasing import DeploymentState, LeaseState
+from .leasing import LeaseState
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
+SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
 DEFAULT_THEME = 'textual-dark'
 
 
@@ -498,6 +500,9 @@ class InferStackTUI(App):
         Binding('e', 'evict', 'Evict', show=False),
         Binding('a', 'release_all', 'Release all', show=False),
         Binding('x', 'cleanup', 'Clean up', show=False),
+        # Multi-select: space toggles the cursor row in the focused leases/
+        # deployments table; release/evict then act on every checked row.
+        Binding('space', 'toggle_select', 'Select row', show=False),
         Binding('g', 'suggest', 'Suggest', show=False),
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
@@ -532,6 +537,17 @@ class InferStackTUI(App):
         self._model_names: list[str] = []
         self._lease_ids: list[str] = []
         self._deployment_ids: list[str] = []
+        # Multi-select sets (by id) for the leases/deployments tables. Kept by id
+        # so a selection survives a poll refresh; pruned to live rows on refill.
+        # NOTE: this is a hand-rolled shim — Textual 8.x has no native row
+        # multi-select (only text selection). If it gains one (see
+        # github.com/Textualize/textual discussion #3606 / PR #6585), this whole
+        # marker-column + sel-set + click machinery can be deleted in favour of
+        # the native `selected_rows` / `selection_anchor` API.
+        self._lease_sel: set[str] = set()
+        self._dep_sel: set[str] = set()
+        # Range anchor (row index, per table) for shift-click range selection.
+        self._sel_anchor: dict[str, int] = {}
         self._last_leases: list[Any] = []   # row-aligned with the leases table
         self._last_deployments: list[Any] = []   # row-aligned with the deployments table
         self._service_options: list[str] = []
@@ -590,7 +606,9 @@ class InferStackTUI(App):
                         yield Static(
                             'Reservations you hold. Each maps to one deployment '
                             'below (see the deployment column); many leases can '
-                            'share one. Select one → Release.', classes='desc',
+                            'share one. Release acts on the cursor row, or on '
+                            'every row you check (space, or ctrl/shift-click).',
+                            classes='desc',
                         )
                         yield DataTable(id='leases', cursor_type='row',
                                         zebra_stripes=True)
@@ -603,13 +621,16 @@ class InferStackTUI(App):
                         yield Static(
                             'Running model deployments and the GPUs they hold. '
                             "The 'leases' column is how many leases hold each. "
-                            'Evict an idle one to free its GPU; Clean up forgets '
+                            'Evict an idle one to free its GPU (cursor row, or '
+                            'rows checked with space / ctrl/shift-click); Evict '
+                            'all idle clears every kept-warm one; Clean up forgets '
                             'stopped ones.', classes='desc',
                         )
                         yield DataTable(id='deployments', cursor_type='row',
                                         zebra_stripes=True)
                         with Horizontal(id='deployment-actions'):
                             yield Button('Evict', id='btn-evict')
+                            yield Button('Evict all idle', id='btn-evict-all')
                             yield Button('Clean up', id='btn-cleanup-deployments')
                 yield _Divider('y', self._drag_logs, id='hsplit')
                 with Collapsible(title='docker', collapsed=False, id='docker'):
@@ -728,10 +749,14 @@ class InferStackTUI(App):
         self.query_one('#models', DataTable).add_columns(
             'model', 'source', 'quant', 'cached'
         )
-        self.query_one('#leases', DataTable).add_columns(
+        leases_tbl = self.query_one('#leases', DataTable)
+        leases_tbl.add_column('', width=2, key='sel')  # multi-select marker
+        leases_tbl.add_columns(
             'id', 'owner', 'state', 'ttl', 'endpoints', 'deployment'
         )
-        self.query_one('#deployments', DataTable).add_columns(
+        deployments_tbl = self.query_one('#deployments', DataTable)
+        deployments_tbl.add_column('', width=2, key='sel')  # multi-select marker
+        deployments_tbl.add_columns(
             'id', 'engine', 'state', 'running', 'gpus', 'served',
             'leases', 'held by'
         )
@@ -1020,10 +1045,12 @@ class InferStackTUI(App):
         cursor = table.cursor_row
         table.clear()
         self._lease_ids = []
+        self._lease_sel &= {le.id for le in leases}  # drop selections for gone rows
         for le in leases:
             # The 'deployment' column is the join key: it lists the same deployment
             # id(s) shown in the deployments pane, so lease -> deployment is visible.
             table.add_row(
+                SELECT_MARK if le.id in self._lease_sel else '',
                 le.id, le.owner, str(le.state), _lease_ttl(le),
                 ','.join(le.endpoints) or '-',
                 ','.join(le.deployment_ids) or '-',
@@ -1036,6 +1063,7 @@ class InferStackTUI(App):
         cursor = table.cursor_row
         table.clear()
         self._deployment_ids = []
+        self._dep_sel &= {g.id for g in deployments}  # drop selections for gone rows
         # owners of the active leases holding each deployment (the "many" side)
         owners: dict[str, list[str]] = {}
         for le in leases:
@@ -1044,6 +1072,7 @@ class InferStackTUI(App):
                     owners.setdefault(gid, []).append(le.owner)
         for g in deployments:
             table.add_row(
+                SELECT_MARK if g.id in self._dep_sel else '',
                 g.id, g.engine, str(g.state),
                 _running_label(g.id, observed),
                 _gpu_label(g.id, observed, assignments),
@@ -1326,6 +1355,86 @@ class InferStackTUI(App):
         row = self.query_one(f'#{table_id}', DataTable).cursor_row
         return ids[row] if 0 <= row < len(ids) else None
 
+    def _target_ids(
+        self, table_id: str, ids: list[str], sel: set[str]
+    ) -> list[str]:
+        """Ids an action should act on: every checked row, else the cursor row.
+
+        Returned in table order. Multi-select (space) wins when anything is
+        checked; otherwise we fall back to the single cursor row so the buttons
+        behave exactly as before when nothing is checked.
+        """
+        if sel:
+            return [i for i in ids if i in sel]
+        one = self._selected(table_id, ids)
+        return [one] if one else []
+
+    def _table_sel(self, tid: str | None) -> tuple[list[str], set[str]] | None:
+        """(ids, selection-set) for the leases/deployments table, else None."""
+        if tid == 'leases':
+            return self._lease_ids, self._lease_sel
+        if tid == 'deployments':
+            return self._deployment_ids, self._dep_sel
+        return None
+
+    def _repaint_marks(self, tid: str) -> None:
+        """Redraw the marker column of a table from its current selection set."""
+        res = self._table_sel(tid)
+        if res is None:
+            return
+        ids, sel = res
+        table = self.query_one(f'#{tid}', DataTable)
+        for r, gid in enumerate(ids):
+            if r < table.row_count:
+                mark = SELECT_MARK if gid in sel else ''
+                table.update_cell_at(Coordinate(r, 0), mark)
+
+    def _click_select(self, tid: str, row: int, *, shift: bool, ctrl: bool) -> None:
+        """Apply a (possibly modified) click on row ``row`` to the selection.
+
+        Desktop semantics: ctrl/cmd toggles one row (discontiguous); shift
+        extends a contiguous range from the anchor; a plain click collapses the
+        multi-selection back to the single cursor row. Pure over (tid, row,
+        modifiers) so it's unit-testable without synthesizing mouse events.
+        """
+        res = self._table_sel(tid)
+        if res is None:
+            return
+        ids, sel = res
+        if not (0 <= row < len(ids)):
+            return
+        if shift:
+            anchor = self._sel_anchor.get(tid, row)
+            lo, hi = sorted((anchor, min(row, len(ids) - 1)))
+            sel.update(ids[lo:hi + 1])
+        elif ctrl:
+            gid = ids[row]
+            sel.discard(gid) if gid in sel else sel.add(gid)
+            self._sel_anchor[tid] = row
+        else:  # plain click -> collapse selection to the cursor row
+            sel.clear()
+            self._sel_anchor[tid] = row
+        self._repaint_marks(tid)
+        if sel:
+            self._status(f'{len(sel)} checked in {tid}')
+
+    def action_toggle_select(self) -> None:
+        """Space: toggle the cursor row of the focused leases/deployments table."""
+        focused = self.focused
+        tid = getattr(focused, 'id', None)
+        res = self._table_sel(tid)
+        if res is None:
+            return
+        ids, sel = res
+        row = focused.cursor_row
+        if not (0 <= row < len(ids)):
+            return
+        gid = ids[row]
+        sel.discard(gid) if gid in sel else sel.add(gid)
+        self._sel_anchor[tid] = row
+        self._repaint_marks(tid)
+        self._status(f'{len(sel)} checked in {tid} (space/ctrl-click toggles)')
+
     def action_acquire(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
@@ -1365,24 +1474,37 @@ class InferStackTUI(App):
             )
 
     def on_click(self, event: events.Click) -> None:
-        # Ctrl+click a served endpoint -> open it in Open WebUI.
-        if not getattr(event, 'ctrl', False):
-            return
+        # Resolve which dashboard element was clicked (walk up to a known id).
+        zone = None
         try:
             node, _ = self.screen.get_widget_at(event.screen_x, event.screen_y)
         except Exception:  # noqa: BLE001
-            return
+            node = None
         while node is not None:
             nid = getattr(node, 'id', None)
-            if nid == 'endpoints':
-                self.action_open()
-                event.stop()
-                return
-            if nid == 'api-urls':
-                self.action_open_webui()
-                event.stop()
-                return
+            if nid in ('leases', 'deployments', 'endpoints', 'api-urls'):
+                zone = nid
+                break
             node = getattr(node, 'parent', None)
+
+        ctrl = getattr(event, 'ctrl', False) or getattr(event, 'meta', False)
+        shift = getattr(event, 'shift', False)
+
+        # Multi-select on the leases/deployments tables via ctrl/shift-click (the
+        # DataTable moved its cursor to the clicked row first, so cursor_row is
+        # the click target). A plain click collapses any multi-selection.
+        if zone in ('leases', 'deployments'):
+            table = self.query_one(f'#{zone}', DataTable)
+            self._click_select(zone, table.cursor_row, shift=shift, ctrl=ctrl)
+            return
+
+        # Ctrl+click a served endpoint / the API URLs -> open in the browser.
+        if ctrl and zone == 'endpoints':
+            self.action_open()
+            event.stop()
+        elif ctrl and zone == 'api-urls':
+            self.action_open_webui()
+            event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
@@ -1390,6 +1512,7 @@ class InferStackTUI(App):
             'btn-release': self.action_release,
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
+            'btn-evict-all': self.action_evict_all,
             'btn-cleanup': self.action_cleanup,
             'btn-cleanup-deployments': self.action_cleanup,
             'btn-suggest': self.action_suggest,
@@ -1431,24 +1554,32 @@ class InferStackTUI(App):
             self._status(f'save settings failed: {ex}')
 
     def action_release(self) -> None:
-        sid = self._selected('leases', self._lease_ids)
-        if not sid:
-            self._status('select a lease row to release')
+        ids = self._target_ids('leases', self._lease_ids, self._lease_sel)
+        if not ids:
+            self._status('select a lease row (or check rows with space) to release')
             return
-        self._status(f'releasing {sid}…')
-        self._do_release(sid)
+        self._status(f'releasing {len(ids)} lease(s)…')
+        self._do_release(ids)
 
     def action_release_all(self) -> None:
         self._status('releasing all active leases…')
         self._do_release_all()
 
     def action_evict(self) -> None:
-        gid = self._selected('deployments', self._deployment_ids)
-        if not gid:
-            self._status('select a deployment row to evict')
+        ids = self._target_ids(
+            'deployments', self._deployment_ids, self._dep_sel
+        )
+        if not ids:
+            self._status(
+                'select a deployment row (or check rows with space) to evict'
+            )
             return
-        self._status(f'evicting {gid}…')
-        self._do_evict(gid)
+        self._status(f'evicting {len(ids)} deployment(s)…')
+        self._do_evict(ids)
+
+    def action_evict_all(self) -> None:
+        self._status('evicting all idle deployments…')
+        self._do_evict_all()
 
     def action_cleanup(self) -> None:
         self._status('cleaning up released/expired leases + stopped deployments…')
@@ -1901,12 +2032,19 @@ class InferStackTUI(App):
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
-    def _do_release(self, sid: str) -> None:
+    def _do_release(self, ids: list[str]) -> None:
         try:
-            self.controller.release(sid)
-            msg = f'released {sid}'
+            if len(ids) == 1:
+                self.controller.release(ids[0])
+            else:
+                # Release every selected lease in the ledger, then converge once.
+                for sid in ids:
+                    self.controller.ledger.release(sid)
+                self.controller.reconcile()
+            self._lease_sel.clear()
+            msg = f'released {len(ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
-            msg = f'release {sid} failed: {ex}'
+            msg = f'release failed: {ex}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -1924,17 +2062,32 @@ class InferStackTUI(App):
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
-    def _do_evict(self, gid: str) -> None:
+    def _do_evict(self, ids: list[str]) -> None:
         try:
-            self.controller.ledger.sweep()
-            deployment = self.controller.ledger.get_deployment(gid)
-            if deployment is None or deployment.state != DeploymentState.IDLE:
-                msg = f'{gid} is not idle — release it first'
+            # evict() only touches IDLE deployments (others are skipped), so a
+            # mixed selection still does the right thing; report what stuck.
+            outcome = self.controller.evict(ids)
+            n = len(outcome.evicted_deployment_ids)
+            self._dep_sel.clear()
+            if n:
+                msg = f'evicted {n} of {len(ids)} deployment(s)'
             else:
-                self.controller.evict([gid])
-                msg = f'evicted {gid}'
+                msg = (f'none of the {len(ids)} selected were idle — '
+                       'release their leases first')
         except Exception as ex:  # noqa: BLE001
-            msg = f'evict {gid} failed: {ex}'
+            msg = f'evict failed: {ex}'
+        self._after_mutation(msg)
+
+    @work(thread=True, exclusive=True, group='mutate')
+    def _do_evict_all(self) -> None:
+        try:
+            outcome = self.controller.evict(None)  # every idle deployment
+            n = len(outcome.evicted_deployment_ids)
+            self._dep_sel.clear()
+            msg = (f'evicted {n} idle deployment(s)' if n
+                   else 'no idle deployments to evict')
+        except Exception as ex:  # noqa: BLE001
+            msg = f'evict all failed: {ex}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')

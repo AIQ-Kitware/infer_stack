@@ -1,3 +1,118 @@
+## 2026-06-27 09:04:20 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.
+
+User intent: in the TUI they cleaned up leases, then "Clean up" on deployments
+did nothing — a pile of IDLE deployments with no container (running/gpus "-",
+0 leases) just sat there. Diagnosed first: "Clean up" = `ledger.prune()`, which
+only forgets STOPPED deployments + RELEASED/EXPIRED leases; IDLE keep-warm
+deployments are deliberately retained (still in the desired set — an apply would
+re-spawn them), so prune correctly skips them. The retire path is Release →
+Evict (IDLE→STOPPED) → Clean up. The "-" containers are drift (torn down
+out-of-band, e.g. the port-churn fix earlier today, but the ledger still lists
+them as warm-pool entries). User then asked for two ergonomics fixes.
+
+What I changed (TUI):
+- **Evict all idle** button in the deployments pane → `controller.evict(None)`
+  (evicts every IDLE deployment in one go). One click takes the whole warm pool
+  to STOPPED so a following Clean up forgets it.
+- **Multi-select** in the leases + deployments tables. Space toggles the cursor
+  row; **ctrl/cmd-click** toggles a discontiguous row; **shift-click** extends a
+  contiguous range from the anchor (`_click_select` is pure over (tid,row,mods)
+  so it unit-tests without synthesizing mouse events; `on_click` reads the
+  already-moved `cursor_row` and delegates, mirroring the existing ctrl+click-to-
+  open path). Selection rendered in a leading marker column; Release/Evict act on
+  every checked row via `_target_ids()` (checked set wins; else the cursor row,
+  so old single-row behaviour is unchanged). Held by id in `_lease_sel`/`_dep_sel`
+  so it survives a poll refresh, pruned to live rows on refill, cleared after an
+  action.
+
+Course-correction worth recording: the user first asked for "normal" ctrl/shift-
+click; on finding Textual 8.x has **no native row multi-select** (only text
+selection — `anchor`/`get_selection` are for copy/paste; the row API is the
+unreleased PR #6585, see discussion #3606) they said drop it rather than carry a
+hand-rolled surface, then "if you almost have it just finish it." It was nearly
+done, so I finished it but boxed it as an explicitly **removable shim** (one
+marker column + two sel-sets + `_click_select`/`_repaint_marks`, all behind the
+`_table_sel` accessor) with a code/CHANGELOG note to delete it wholesale if/when
+Textual ships the native API. Takeaway: when you must shim a missing framework
+feature, isolate it behind one seam and name the eventual native replacement so
+the removal is mechanical.
+
+Design choices: kept prune's conservative semantics (never auto-forget a
+deployment the system still wants) — the fix is discoverability (a bulk evict +
+clearer button/desc text), not changing what "Clean up" means. I deliberately
+did NOT (yet) auto-heal the "IDLE-but-container-gone" drift to STOPPED; that's a
+separate reconcile decision I flagged to the user. Also left the two confusingly
+duplicated "Clean up" buttons as-is for now (raised earlier as a rescope option).
+
+Gotcha worth remembering (now a lesson): named the selection helper
+`_action_targets` and it blew up with `'set' object is not callable` — Textual's
+`App.__init__` binds `self._action_targets` to a set (action-namespace
+resolution), an *instance* attribute that shadows a class method. Renamed to
+`_target_ids`. `hasattr(App, '_action_targets')` is False because it's per
+instance, which is exactly what made it shadow.
+
+Confident: full suite 281 passed incl. new TUI tests (evict-all flips IDLE→
+STOPPED; multi-select releases both checked leases + clears selection; space
+toggles off again; `_click_select` covers ctrl-toggle / shift-range / plain-
+clear). Low risk — additive UI, single-row paths unchanged. Testing note: I
+first added a pixel-offset `pilot.click(..., control=True)` wiring test; it
+passed alone but flaked under the full suite (offset geometry), so I dropped it —
+the pure `_click_select` unit test plus the robust `space` keypress test cover
+logic and wiring without the brittleness. `space` relies on the DataTable not
+consuming it; the headless space test confirms the app-level binding receives it.
+
+## 2026-06-27 08:38:01 -0400
+
+Model: claude-opus-4-8[1m] (Opus 4.8, 1M context), Claude Code.
+
+User intent: debug a slurm-e2e failure from the dynamic-routing run the user
+rsynced back (`tests/infer_stack_pipeline_e2e/_runs/20260627T080504-slurm`, still
+running). One `smol_135_01` node failed; the rest passed.
+
+Investigation (the interesting part — the converge log alone lies): the node's
+acquire succeeded and readiness passed, but the probe then got 20× `litellm
+.InternalServerError: Connection error … Model Group=smol-135`. The converge log
+just said "up -d 5/6 services" each time — nothing looked wrong. The GPU-memory
+**timeline** (`diag/timeline.log`) was the tell: all four upstreams loaded
+(08:10:51), then *every* GPU dropped to ~2 MiB at 08:12:38 and reloaded over the
+next ~2 min. So an unrelated `gpt2` *release* at 08:12:26 recreated the still-
+leased smol/gpt2-tp2 containers. Root cause: `render_compose` assigned each
+upstream's published host port by enumeration index (`BASE + vllm_i`) over the
+live set, so removing one deployment renumbered the survivors' ports → changed
+their service specs → `docker compose up -d` recreated them. LiteLLM's route then
+pointed at a restarting container → connection errors for the reload window.
+
+Fix: behind the gateway an upstream is internal (reached by compose-network DNS
+at :8000), so publish **no** host port — removing the only set-dependent field,
+so a survivor's spec is byte-identical as the set changes (the same no-blip
+property the static gateway config already has). No-gateway path still publishes
+(the readiness probe hits the upstream directly). Also made the dynamic-routing
+reconcile treat `/model/delete` "not found in db" as success (a shared gateway
+lets a concurrent converge delete the route first — saw that warning in the log).
+
+Considered alternatives: (a) stable per-deployment port via id-hash — rejected,
+collisions reintroduce set-dependence and it keeps useless host-port pressure
+with many `--dedicated` upstreams; (b) persist a port on the deployment record —
+heavier (ledger/migration) for a debug-only convenience. "Internal services
+don't need host ports" is the simplest invariant and gives *guaranteed* zero
+churn (no field to renumber), so it won.
+
+Confident about: the root cause (placement is sticky — verified — so device_ids
+were stable, leaving the port as the only changing field; arithmetic matches the
+two renders 18000/18001/18002 → 18000/18001). Tests: full suite 277 passed incl.
+a new no-churn regression (`test_dynamic_upstreams_have_no_host_ports_and_survive
+_set_change`) and the delete-race test. Risks/uncertainties: (1) the *first*
+converge after deploying this on the real stack will recreate upstreams once (the
+ports disappear from the on-disk file) — a one-time blip, then stable. (2)
+Separately observed a worker-propagation race — the successful jobs' probes saw a
+few `404 model does not exist` right after `/model/new` before settling; the
+probe's retries absorb it, but if LiteLLM runs multiple workers the admin-API add
+propagates asynchronously, so readiness can pass on a warm worker while a client
+hits a cold one. Not what failed this run; noted as a watch-item. I implement
+here; the user re-runs on aiq-gpu.
+
 ## 2026-05-22 21:30 -0400
 
 Model: claude-sonnet-4-6, then claude-opus-4-7 (model switch mid-session).
@@ -1813,3 +1928,116 @@ whole session).
 
 236 tests green. The suggest fix only changes future suggestions; the standing
 on-terminal caveat (clipboard/drag under tmux) is Jon's to confirm live.
+
+## 2026-06-26 22:13:37 -0400
+
+Model: claude-opus-4-8[1m] (Claude Code, fast Opus). Jon asked to implement two
+things we'd designed in conversation for the leasing controller: (A) split the
+single mutate-lock into a fast render lock + a separate apply lock, and (B)
+coalesce the slow `docker compose up` across concurrent acquires. Motivation:
+under the shared-stack model every `acquire` serialized end-to-end behind the
+previous one's bring-up (the global flock wrapped render AND `docker compose up`),
+and concurrent slurm jobs each ran their own redundant `up`.
+
+Design (now in code + CHANGELOG): a monotonic generation pair in the ledger
+`meta` table — `desired_gen` bumped inside the same `BEGIN IMMEDIATE` as each
+desired-set change (acquire always; release/evict/sweep when they actually idle
+something), `applied_gen` published after a successful apply. The render lock
+(the old `_global_lock`, kept reentrant for acquire->render nesting) guards
+ledger-write + placement + compose-file render only. The new `_apply_lock` (a
+second flock, `.apply.lock`) serializes `docker compose up` and doubles as the
+coalescing wait-queue: `_ensure_applied(g_target)` loops `while applied_gen <
+g_target`, takes the apply lock, re-checks (someone may have covered it), else
+snapshots `g = desired_gen` BEFORE the up and publishes that floor after. Floor-
+before-up is the key correctness point — a render landing mid-apply leaves
+applied_gen < its g_target so it re-applies, never silently dropped. `apply()`
+deliberately does NOT take the converge lock (that would re-serialize renders
+against the slow up); compose-file writes are now atomic (`os.replace`) so a
+concurrent render can't be half-read by an apply. `infer-stack apply` routes to
+a new `apply_now()` (force) so the manual re-sync still heals drift when the
+generation hasn't moved.
+
+Reflections / what I'm confident vs not: confident the mechanism is correct —
+the coalescing proof is a *deterministic* test (`_ensure_applied` with the gen
+pre-advanced: exactly one apply; the apply-lock serializes so late winners
+re-read applied_gen and break). I burned real time on test flakiness that turned
+out to be a *genuine product bug*, not test noise: concurrent first-open of a
+fresh ledger raced on `PRAGMA journal_mode=WAL`, which sqlite returns as
+"database is locked" instead of honoring busy_timeout — exactly the batch-of-
+slurm-jobs pattern this work targets. Fixed by retrying the WAL switch + schema
+DDL in `SqliteStore.__init__`. Also replaced an inherently racy "render-not-
+blocked-by-apply" threaded test with a deterministic structural one (assert
+`_flock_depth == 0` and the render-lock file is `LOCK_NB`-grabbable during
+apply). Tradeoff accepted: every acquire now forces at least one (coalesced,
+idempotent) apply even when joining an already-live model — chosen for drift-
+healing + simplicity over a "skip apply if already up" optimization (noted as a
+possible future tweak). What might break: backends that have `converge` but no
+`apply` and *honor* `apply=False` by not realizing are now invalid (render leaves
+nothing up, no apply step to finish) — updated `BudgetBackend` in the queue test
+to model the render/apply contract (record placed in render, realize in apply).
+
+264 tests green (added `tests/test_leasing_coalesced_apply.py`). Not yet
+exercised on real docker/GPU — the compose `apply()` path is covered only by
+fakes here; the slurm e2e tier on aiq-gpu is where it meets real `docker compose
+up` under contention.
+
+## 2026-06-26 23:18:49 -0400
+
+Model: claude-opus-4-8[1m] (Claude Code, fast Opus). Jon's directive: "we are
+going to do the dynamic routing work. And get this done elegantly and properly."
+The trigger was the slurm e2e tier exposing a real product bug: `--dedicated`
+same-model deployments place on distinct GPUs in the ledger but the Compose
+backend names every vLLM service `vllm-<served>`, so they collapse onto ONE
+container/GPU — and worse, the test stays green (everyone routes to the one
+container that answers). The static-superset gateway can't fix this because its
+no-blip property *depends on* that name being derivable from the served model
+alone (so a catalog route can address it without knowing the live deployment).
+
+Before touching code I verified the load-bearing fact against the pinned
+`litellm v1.82.3` source: `/model/new` (and `/model/delete`/`/model/update`)
+HTTP-500 unless a DB is connected AND `STORE_MODEL_IN_DB=true`. So "the admin-API
+direction" is NOT DB-less — it *is* the postgres-litellm revival (the old
+follow-up #2 the maintainer had parked as "tried it, hit issues"). I surfaced
+this fork explicitly rather than silently reintroduce Postgres; Jon chose
+admin-API+Postgres and confirmed "having the litellm db makes a lot of sense."
+Correcting that misconception in the doc was important — an earlier draft implied
+plain `/model/new` worked in-memory, which would have led a future agent astray.
+
+Design (in code + CHANGELOG + docs/litellm-gateway-routing.md): an opt-in
+`dynamic_routing` mode that honors the project's render/apply split. RENDER:
+each deployment gets a unique `vllm-<served>-<id>` service (so dedicated spreads
+across GPUs), a `postgres-litellm` service is added, the litellm service gets
+`DATABASE_URL`+`STORE_MODEL_IN_DB` env + `depends_on` DB-healthy, the rendered
+config is a *static* base (empty `model_list`) so its hash never moves (no blip),
+and the desired route set is written to `litellm_routes.json` (one entry per live
+(deployment,endpoint), each with a deterministic `model_info.id`). APPLY: after
+`docker compose up`, `_reconcile_routes()` lists `/v1/model/info`, diffs by id,
+and POSTs `/model/new`/`/model/delete`. The deterministic id is the crux — it
+turns reconcile into a pure set-diff that is idempotent (so the controller's
+coalesced apply is correct for routes too), drift-healing (lost routes reappear,
+stale ones deleted), and co-existent (only `isr-`-prefixed ids are ever deleted,
+so a UI-added model is safe).
+
+Why this shape over alternatives: I considered (a) a DB-less dynamic config file
+— rejected, reintroduces the per-change gateway recreate/blip static-superset was
+built to avoid; (b) direct per-deployment URLs in the env-file for dedicated —
+rejected, splits addressing into two modes and abandons the gateway's value.
+Admin-API+Postgres is the only path that gives per-deployment routing AND no
+blip, and the env-file descriptor is unchanged (clients keep one gateway
+base_url; LiteLLM load-balances the shared alias across the dedicated upstreams).
+
+Confident: the rendering + reconcile logic is unit-covered (10 new tests in
+`tests/test_leasing_dynamic_routing.py` incl. the dedicated-collision fix, the
+no-blip invariance, deterministic routes, and add/delete/idempotent/co-existence
+reconcile against a RecordingGateway fake); full suite 274 green; static mode is
+byte-for-byte unchanged (default off). Not yet exercised against a real LiteLLM
++ Postgres on a GPU host — the reconcile is fakes-only here. Risks/uncertainties
+to watch on aiq-gpu: (1) gateway-startup timing — `_reconcile_routes` retries the
+initial `/v1/model/info` (30×2s) while litellm boots behind the DB healthcheck;
+if a first-ever image pull makes that window too short, routes get added on the
+next converge instead (acquire's wait_ready could then time out on the very first
+cold acquire). (2) LiteLLM load-balancing a public alias across N dedicated
+upstreams is the intended behavior but unverified end-to-end. (3) every verb must
+agree on the mode or service names diverge — hence the persisted `dynamic_routing`
+setting is the primary switch (the flag is a per-call override), mirroring how
+`catalog` is resolved for release/gc.

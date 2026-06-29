@@ -867,6 +867,129 @@ def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
     assert not any(str(le.state) == 'released' for le in leases)
 
 
+def test_tui_evict_all_idle_button():
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    out = controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    gid = out.lease.deployment_ids[0]
+    controller.release(out.lease.id)          # deployment -> IDLE (keep-warm)
+    assert controller.ledger.get_deployment(gid).state == DeploymentState.IDLE
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_evict_all()                # one action clears every idle one
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    # the idle keep-warm deployment is now STOPPED (so Clean up can forget it)
+    assert controller.ledger.get_deployment(gid).state == DeploymentState.STOPPED
+
+
+def test_tui_multiselect_releases_checked_leases():
+    from textual.widgets import DataTable
+
+    from infer_stack.leasing import LeaseState
+    from infer_stack.tui import SELECT_MARK, InferStackTUI
+
+    controller, catalog = _ctx()
+    controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    controller.acquire('bob', catalog.resolve_names(['qwen-fast']))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one('#leases', DataTable)
+            assert table.row_count == 2
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press('space')            # check row 0
+            table.move_cursor(row=1)
+            await pilot.press('space')            # check row 1
+            await pilot.pause()
+            assert len(app._lease_sel) == 2
+            # the marker column (col 0) shows the check on a selected row
+            assert table.get_row_at(0)[0] == SELECT_MARK
+            app.action_release()                  # acts on both checked rows
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app._lease_sel == set()        # selection cleared after action
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert leases and all(le.state == LeaseState.RELEASED for le in leases)
+
+
+def test_tui_space_toggles_selection_off_again():
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one('#leases', DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press('space')            # select
+            assert len(app._lease_sel) == 1
+            await pilot.press('space')            # toggle back off
+            assert app._lease_sel == set()
+            assert table.get_row_at(0)[0] == ''   # marker cleared
+
+    _run(scenario)
+
+
+def test_tui_click_select_ctrl_toggle_shift_range_plain_clear():
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import SELECT_MARK, InferStackTUI
+
+    controller, catalog = _ctx()
+    controller.acquire('a', catalog.resolve_names(['qwen-coder']))
+    controller.acquire('b', catalog.resolve_names(['qwen-fast']))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ids = app._lease_ids
+            assert len(ids) == 2
+            table = app.query_one('#leases', DataTable)
+            # ctrl-click toggles one row on, then off (discontiguous pick)
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            assert app._lease_sel == {ids[0]}
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            assert app._lease_sel == set()
+            # ctrl-click sets the anchor; shift-click extends a contiguous range
+            app._click_select('leases', 0, shift=False, ctrl=True)
+            app._click_select('leases', 1, shift=True, ctrl=False)
+            assert app._lease_sel == {ids[0], ids[1]}
+            assert table.get_row_at(0)[0] == SELECT_MARK
+            assert table.get_row_at(1)[0] == SELECT_MARK
+            # a plain click collapses the selection back to the cursor row
+            app._click_select('leases', 1, shift=False, ctrl=False)
+            assert app._lease_sel == set()
+            assert table.get_row_at(0)[0] == ''
+
+    _run(scenario)
+
+
+
+
 def test_tui_model_cached_label(tmp_path):
     from infer_stack.tui import InferStackTUI
 

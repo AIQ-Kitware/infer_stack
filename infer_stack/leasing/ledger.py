@@ -146,6 +146,11 @@ class Ledger:
                     lease_id=lease_id, endpoint=req.endpoint, deployment_id=deployment.id
                 )
                 deployment_ids.append(deployment.id)
+            # Every acquire bumps the desired generation, even when it coalesces
+            # onto an already-live deployment: this is the signal that the caller
+            # needs an apply to have run including its claim (and it heals drift —
+            # a crashed container gets re-upped by the apply this forces).
+            self.store.bump_desired_generation()
         lease = self.store.get_lease(lease_id)
         deployments = [
             self.store.get_deployment(gid, now=now)
@@ -163,6 +168,8 @@ class Ledger:
                 return ReleaseResult()
             self.store.set_lease_state(lease_id, LeaseState.RELEASED)
             idled = self._idle_deployments(lease.deployment_ids, now)
+            if idled:  # desired set shrank -> an apply must run to tear them down
+                self.store.bump_desired_generation()
         return ReleaseResult(idled_deployment_ids=idled)
 
     def renew(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None:
@@ -197,6 +204,8 @@ class Ledger:
                 expired.append(lease.id)
                 affected.extend(lease.deployment_ids)
             idled = self._idle_deployments(affected, now)
+            if expired or idled:  # TTL reclaim changed the desired set
+                self.store.bump_desired_generation()
         return SweepResult(expired_lease_ids=expired, idled_deployment_ids=idled)
 
     def reclaimable_deployments(self) -> list[Deployment]:
@@ -227,6 +236,8 @@ class Ledger:
                     continue
                 self.store.set_deployment_state(g.id, DeploymentState.STOPPED, now)
                 evicted.append(g.id)
+            if evicted:  # desired set shrank -> an apply must run to tear them down
+                self.store.bump_desired_generation()
         return evicted
 
     def prune(self) -> tuple[int, int]:
@@ -245,6 +256,17 @@ class Ledger:
         """Snapshot for ``infer-stack status`` (leases, deployments-with-demand)."""
         now = self.clock()
         return self.store.list_leases(), self.store.list_deployments(now=now)
+
+    # -- generation (coalesced-apply coordination, see store + controller) --
+
+    def desired_generation(self) -> int:
+        return self.store.desired_generation()
+
+    def applied_generation(self) -> int:
+        return self.store.applied_generation()
+
+    def set_applied_generation(self, gen: int) -> None:
+        self.store.set_applied_generation(gen)
 
     def get_lease(self, lease_id: str) -> Lease | None:
         return self.store.get_lease(lease_id)

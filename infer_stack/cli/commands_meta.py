@@ -335,6 +335,15 @@ _SETTINGS: tuple[_Setting, ...] = (
         '`config edit`). No TLS/auth — localhost / trusted networks only.',
         'bool', False,
     ),
+    _Setting(
+        'dynamic_routing', 'Manage gateway routes live via the admin API (+Postgres)',
+        'Manage the LiteLLM gateway routes live via its admin API against a '
+        'Postgres model store, instead of a static config file (true | false). '
+        'Off by default. When on, each deployment gets its own upstream so '
+        'same-model --dedicated deployments land on distinct GPUs, with no '
+        'gateway recreation/blip.',
+        'bool', False,
+    ),
 )
 
 # Keys the leasing world actually honors (others are allowed but warned about).

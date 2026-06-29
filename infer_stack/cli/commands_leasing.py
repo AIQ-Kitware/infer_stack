@@ -133,6 +133,26 @@ def _resolve_litellm(config) -> bool:
     return _coerce_bool(get_setting('litellm'), True)
 
 
+def _resolve_dynamic_routing(config) -> bool:
+    """Dynamic LiteLLM routing (admin API + Postgres) on/off.
+
+    Off by default (the static-superset gateway). When on, each deployment gets
+    its own upstream container and the gateway's routes are managed live via the
+    admin API against a Postgres model store — so same-model ``--dedicated``
+    deployments land on distinct GPUs and the gateway is never recreated (no
+    blip). Enable with ``--dynamic-routing`` or ``config set dynamic_routing
+    true``. Because every verb (acquire/release/gc/apply) must agree on the mode
+    to render consistent service names, the persisted setting is the primary
+    switch; the flag is a per-invocation override.
+    """
+    from ..paths import get_setting
+
+    flag = getattr(config, 'dynamic_routing', None)
+    if flag is not None:
+        return bool(flag)
+    return _coerce_bool(get_setting('dynamic_routing'), False)
+
+
 def _resolve_reverse_proxy(config) -> tuple[bool, int, str | None]:
     """Resolve the reverse-proxy front door: (enabled, port, byo_config_path).
 
@@ -219,6 +239,7 @@ def _make_backend(config, *, interactive: bool = False):
             require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
             catalog=catalog,
+            dynamic_routing=_resolve_dynamic_routing(config),
         )
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI yet '
@@ -503,6 +524,17 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         '(localhost / trusted networks only). Port + bring-your-own nginx.conf '
         'live in the `reverse_proxy` setting (`config set` / `config edit`).',
     )
+    dynamic_routing = scfg.Value(
+        None,
+        isflag=True,
+        alias=['dynamic-routing'],
+        help='Manage the LiteLLM gateway routes LIVE via its admin API against a '
+        'Postgres model store, instead of a static config file. Gives each '
+        'deployment its own upstream (so same-model --dedicated deployments land '
+        'on distinct GPUs) with no gateway recreation/blip. Off by default; the '
+        'mode must be consistent across verbs, so prefer `config set '
+        'dynamic_routing true`. Overrides that setting per-invocation.',
+    )
 
 
 class _ApprovalMixin(_LeasingCommonMixin):
@@ -716,7 +748,11 @@ class ApplyCLI(_ApprovalMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
         try:
-            rec = controller.reconcile(apply=True)
+            # apply_now() FORCES the docker up even if the generation has not
+            # advanced -- this is the "re-sync after a manual edit / backend
+            # hiccup" button, so it must heal drift (the coalesced reconcile path
+            # would skip an up when desired == applied).
+            rec = controller.apply_now()
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
         result = None
