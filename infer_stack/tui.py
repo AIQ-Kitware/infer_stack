@@ -417,12 +417,14 @@ class InferStackTUI(App):
     .desc { height: auto; color: $text-muted; padding: 0 1; }
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
 
-    #endpoint-actions, #lease-actions, #deployment-actions, #model-actions {
+    #endpoint-actions, #lease-actions, #deployment-actions, #model-actions,
+    #suggest-actions {
         height: auto; margin: 0 0 1 0;
     }
     /* width: 1fr + min-width: 0 so several buttons share a narrow sidebar row
        instead of overflowing it (Button's default min-width is 16). */
-    #endpoint-actions Button, #model-actions Button { width: 1fr; min-width: 0; }
+    #endpoint-actions Button, #model-actions Button,
+    #suggest-actions Button { width: 1fr; min-width: 0; }
     #lease-actions Button, #deployment-actions Button {
         margin: 0 1 0 0; min-width: 8;
     }
@@ -435,7 +437,7 @@ class InferStackTUI(App):
        render. nowrap skips that fold path entirely. (We can't just set
        line-pad: 0 -- Textual's integer CSS parser rejects 0.) */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
-    #model-actions Button, #api-controls Button {
+    #model-actions Button, #api-controls Button, #suggest-actions Button {
         height: 1; border: none; padding: 0 1; text-wrap: nowrap;
     }
     #api { padding: 1 2; }
@@ -593,10 +595,11 @@ class InferStackTUI(App):
                                 zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
                     yield Button('Acquire', id='btn-acquire', variant='primary')
-                    yield Button('Suggest', id='btn-suggest')
                     yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
+                with Horizontal(id='suggest-actions'):
+                    yield Button('✨  Suggest from my GPUs', id='btn-suggest')
                 yield _Divider('y', self._drag_models, id='csplit')
                 yield Static(
                     'Models — weights an endpoint can serve. Add models here, '
