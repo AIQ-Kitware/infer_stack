@@ -268,13 +268,34 @@ def test_tui_monitor_panes_are_collapsible():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # the four monitor panes collapse (docker/system already did)
-            for pid in ('#leases-pane', '#deployments-pane', '#docker', '#system'):
+            # docker/system are collapsible auxiliary panes
+            for pid in ('#docker', '#system'):
                 pane = app.query_one(pid, Collapsible)
                 pane.collapsed = True
             await pilot.pause()
-            assert app.query_one('#leases-pane', Collapsible).collapsed
-            assert app.query_one('#deployments-pane', Collapsible).collapsed
+            assert app.query_one('#docker', Collapsible).collapsed
+            assert app.query_one('#system', Collapsible).collapsed
+
+    _run(scenario)
+
+
+def test_tui_leases_deployments_are_separate_panes():
+    from textual.containers import Vertical
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # leases/deployments are their own panes split by a drag handle,
+            # not collapsibles.
+            assert isinstance(app.query_one('#leases-pane'), Vertical)
+            assert isinstance(app.query_one('#deployments-pane'), Vertical)
+            assert app.query_one('#tsplit')
 
     _run(scenario)
 
@@ -287,16 +308,19 @@ def test_tui_panes_drag_resize():
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
                             proc_factory=lambda svc: None)
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             w0, h0 = app._sidebar_w, app._log_h
             m0 = app._models_h
+            l0 = app._leases_h
             app._drag_sidebar(6)            # pull the vertical splitter right
             app._drag_logs(3)               # pull the horizontal splitter down
             app._drag_models(2)             # catalog endpoints|models splitter
+            app._drag_tables(2)             # leases|deployments splitter
             assert app._sidebar_w == w0 + 6
             assert app._log_h == h0 - 3     # down = shorter logs
             assert app._models_h == m0 - 2  # drag down = bar down = models shorter
+            assert app._leases_h == l0 + 2  # drag down = bar down = leases taller
 
     _run(scenario)
 
@@ -315,6 +339,7 @@ def test_tui_dividers_have_a_grab_area():
             assert app.query_one('#vsplit').region.height > 1
             assert app.query_one('#hsplit').region.width > 1
             assert app.query_one('#csplit').region.width > 1   # endpoints|models
+            assert app.query_one('#tsplit').region.width > 1   # leases|deployments
 
     _run(scenario)
 
