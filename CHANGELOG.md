@@ -139,6 +139,17 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `catalog endpoint add [--force]` / `catalog endpoint rm` / `catalog model rm`.
 
 ### Fixed
+* **A `acquire` that timed out waiting for readiness left its lease ACTIVE,
+  pinning a GPU indefinitely.** Unlike `run` (which releases in a `finally`), a
+  plain `acquire --timeout` whose endpoints never became ready returned with the
+  lease still held, so the deployment stayed LIVE and — combined with reconcile
+  trusting the ledger as desired-state — could be re-realized on every subsequent
+  converge. A readiness timeout is now the third "couldn't deliver" rollback path
+  in `Controller.acquire` (alongside `ConvergeAborted` / `PlacementError`): it
+  releases the lease and reconciles, tearing the deployment down per its reclaim
+  policy. The `acquire` CLI prints the teardown and exits non-zero; the outcome
+  carries `released_on_timeout=True`. To intentionally hold a lease while a slow
+  model loads, use `--no-wait` (acquire detached) and `wait` for it separately.
 * **Upstream containers blipped (and broke readiness mid-request) when an
   unrelated deployment was added or released.** Each vLLM/ollama upstream
   published a host port assigned by *position* in the live set (`BASE + i`), so

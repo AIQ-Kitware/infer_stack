@@ -2041,3 +2041,57 @@ upstreams is the intended behavior but unverified end-to-end. (3) every verb mus
 agree on the mode or service names diverge — hence the persisted `dynamic_routing`
 setting is the primary switch (the flag is a per-call override), mirroring how
 `catalog` is resolved for release/gc.
+
+## 2026-06-30 10:55:23 -0400
+
+Model: claude-opus-4-8[1m] (Claude Code, fast Opus). Directive: "A not-ready
+acquire should not keep its lease ACTIVE if the acquire times out." This is the
+first bullet of the leaked-active-lease cluster the GPU e2e suite surfaced (see
+`dev/leasing-followups.md`), where the harness had to wipe the ledger between
+tiers to mask it. The user explicitly rejected preserving the old behavior behind
+a flag — "buggy behavior is not something to preserve with parameters" — so the
+fix is unconditional, no `--keep-on-timeout` escape hatch.
+
+The bug was an asymmetry: `Controller.acquire` already rolls the just-created
+lease back on two "couldn't deliver" paths — operator-declined converge
+(`ConvergeAborted`) and unplaceable request (`PlacementError`) — but the readiness
+*timeout* was the one failure that returned `wait.ready=False` with the lease
+still ACTIVE. The deployment then stayed LIVE, and because reconcile trusts the
+ledger as desired-state and never prunes a LIVE group whose lease leaked, one
+timed-out acquire could re-spawn a GPU-hogging container on every later converge.
+`run` happened to dodge this (it releases in a `finally`); the `acquire`/`serve`
+CLI leaked it; the TUI uses `wait=False` so it never reached the path.
+
+Fix: make readiness-timeout the *third* rollback path in `acquire` — on
+`not wait_result.ready`, call `self.release(lease.id)` (which reconciles, tearing
+down per reclaim policy) and set a new `AcquireOutcome.released_on_timeout=True`.
+Design fork I weighed: raise a symmetric `ReadinessTimeout` exception (matches
+`PlacementError`) vs. a return-marker. Chose the marker — `acquire` already
+returns `wait.ready=False` to *describe* the timeout, so "and I released it" is a
+natural extension, and it avoids forcing a try/except on every caller and a
+test-wide churn. Release is idempotent (`ledger.release` no-ops on an
+already-RELEASED lease), so `run`'s redundant inline release + `finally` stay
+safe; I dropped `run`'s now-redundant inline release and left only the SystemExit
+message. `_emit_acquire` reports the teardown (and skips `--env-file`, since a
+released lease has no standing endpoint to point a sourceable file at) and keeps
+exit 2.
+
+The escape hatch for the legitimate "hold a lease while a slow model loads"
+workflow is `--no-wait` — it acquires detached (`wait_result is None`), never
+reaches the timeout path, so the lease is correctly kept; you `wait` for it
+separately. That's a distinct non-buggy behavior, not a flag preserving the leak.
+
+Confident: covered by `test_wait_ready_timeout_releases_lease` /
+`_keepwarm_idles_deployment` (controller: stop-policy tears down + GPU freed;
+keep-warm idles but the lease is still RELEASED) and `test_acquire_timeout_*`
+(CLI: rc==2, lease released, env-file not written), via a monkeypatched
+`MemoryBackend(ready=False)` + `--timeout 0` (deadline passes on the first poll,
+so the test is instant — no real sleep). Ran the leasing/CLI/TUI suites: 66 + 87
+green. Uncertainty: the *other two* bullets of the cluster stay open and I said so
+in the tracker — re-acquire spawning a new group instead of reviving an idle one
+(that's the deterministic-group-id work) and observe()-driven ledger/reality
+reconciliation. This change closes the leak at its source (the leaked ACTIVE
+lease); it does not add the observe()-driven self-heal. Reusable takeaway: when a
+function has N "couldn't deliver" exits that all roll back, an (N+1)th failure
+mode that *doesn't* roll back is almost certainly the bug — grep the siblings for
+the rollback idiom and match it, rather than inventing new cleanup.

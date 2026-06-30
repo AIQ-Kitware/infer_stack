@@ -387,7 +387,9 @@ def _emit_acquire(config, controller, outcome) -> int:
     descriptor = _descriptor_for(
         controller, outcome.lease, outcome.deployments, config
     )
-    if config.env_file:
+    # A readiness timeout means the controller already released the lease, so
+    # there is no standing endpoint to point a sourceable env-file at.
+    if config.env_file and not outcome.released_on_timeout:
         Path(config.env_file).expanduser().write_text(
             render_env_file(descriptor)
         )
@@ -406,10 +408,21 @@ def _emit_acquire(config, controller, outcome) -> int:
                     'pending': []
                     if outcome.wait is None
                     else outcome.wait.pending,
+                    'released_on_timeout': outcome.released_on_timeout,
                 },
                 indent=2,
             )
         )
+    elif outcome.released_on_timeout:
+        # The readiness wait timed out; the controller released the lease so it
+        # doesn't pin a GPU. Report the teardown, not a phantom "acquired".
+        print(
+            f'not ready within {config.timeout:.0f}s — '
+            f'lease {outcome.lease.id} released'
+        )
+        for gid, endpoint in outcome.wait.pending:
+            print(f'  pending: {endpoint} ({gid})')
+        print('  (use --no-wait to hold a lease while a slow model loads)')
     else:
         print(f'acquired {outcome.lease.id} (owner={outcome.lease.owner})')
         for endpoint, model in descriptor['endpoints'].items():
@@ -1212,7 +1225,8 @@ class RunCLI(_LeasingCommonMixin):
             wait_for_placement=bool(getattr(config, 'queue', False)),
         )
         if outcome.wait is not None and not outcome.wait.ready:
-            controller.release(outcome.lease.id)
+            # The controller already released the lease on timeout
+            # (released_on_timeout); just surface why we're not running.
             raise SystemExit(
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )

@@ -108,6 +108,43 @@ def test_acquire_writes_env_file(env):
     assert 'INFER_STACK_API_KEY_ENV=LITELLM_MASTER_KEY' in text
 
 
+def test_acquire_timeout_releases_lease(env, capsys, monkeypatch):
+    """A readiness timeout must not leave a phantom ACTIVE lease pinning a GPU:
+    the controller releases it and ``acquire`` exits non-zero (--timeout 0 makes
+    the never-ready wait fail on the first poll)."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import MemoryBackend
+
+    monkeypatch.setattr(
+        cl, '_make_backend',
+        lambda config, *, interactive=False: MemoryBackend(ready=False),
+    )
+    rc = AcquireCLI.main(argv=['qwen-coder', *_base(env), '--timeout', '0'])
+    assert rc == 2
+    assert 'released' in capsys.readouterr().out
+    data = _leases_json(env, capsys)
+    assert data['leases'][0]['state'] == 'released'
+
+
+def test_acquire_timeout_skips_env_file(env, capsys, monkeypatch):
+    """A released-on-timeout lease has no standing endpoint, so --env-file is not
+    written (pointing a sourceable file at a torn-down lease would be a trap)."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import MemoryBackend
+
+    monkeypatch.setattr(
+        cl, '_make_backend',
+        lambda config, *, interactive=False: MemoryBackend(ready=False),
+    )
+    envf = env.tmp / 'is.env'
+    rc = AcquireCLI.main(
+        argv=['qwen-coder', *_base(env), '--timeout', '0',
+              '--env-file', str(envf)]
+    )
+    assert rc == 2
+    assert not envf.exists()
+
+
 def test_acquire_coalesces_demand(env, capsys):
     AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'alice'])
     AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'bob'])

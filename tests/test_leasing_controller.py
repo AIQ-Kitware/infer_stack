@@ -5,8 +5,10 @@ from __future__ import annotations
 from infer_stack.leasing import (
     Catalog,
     Controller,
+    DeploymentState,
     EndpointRequest,
     Ledger,
+    LeaseState,
     MemoryBackend,
     Sharing,
     SqliteStore,
@@ -117,11 +119,34 @@ def test_release_last_stop_tears_down():
     assert backend.observe() == set()
 
 
-def test_wait_ready_timeout():
+def test_wait_ready_timeout_releases_lease():
+    # A readiness timeout must roll the lease back (release + reconcile) so a
+    # never-ready acquire doesn't leave the deployment LIVE pinning a GPU.
     ctl, backend, _ = make_controller(ready=False)
-    out = ctl.acquire('alice', [vreq('qwen')], timeout=10, interval=2)
+    out = ctl.acquire(
+        'alice', [vreq('qwen', reclaim='stop')], timeout=10, interval=2
+    )
+    gid = out.deployments[0].id
     assert out.wait.ready is False
-    assert out.wait.pending == [(out.deployments[0].id, 'qwen')]
+    assert out.wait.pending == [(gid, 'qwen')]
+    assert out.released_on_timeout is True
+    # Lease released, stop-policy deployment torn down, GPU freed.
+    assert ctl.ledger.get_lease(out.lease.id).state == LeaseState.RELEASED
+    assert backend.teardown_calls == [gid]
+    assert backend.observe() == set()
+
+
+def test_wait_ready_timeout_keepwarm_idles_deployment():
+    # Same rollback for a keep-warm deployment: the lease is released (no longer
+    # ACTIVE) even though the warm container is kept resident as a courtesy.
+    ctl, backend, _ = make_controller(ready=False)
+    out = ctl.acquire(
+        'alice', [vreq('qwen', reclaim='keep-warm')], timeout=10, interval=2
+    )
+    gid = out.deployments[0].id
+    assert out.released_on_timeout is True
+    assert ctl.ledger.get_lease(out.lease.id).state == LeaseState.RELEASED
+    assert ctl.ledger.get_deployment(gid).state == DeploymentState.IDLE
 
 
 def test_wait_ready_becomes_ready():

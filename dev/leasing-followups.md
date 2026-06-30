@@ -188,11 +188,17 @@ should hide/prune stopped groups or keep them as history. (Surfaced by the
 The GPU e2e suite surfaced a cluster of related product issues (worked around in
 the harness by wiping the ledger between tiers; worth fixing in the product):
 
-- **A not-ready `acquire` keeps its lease ACTIVE with no auto-cleanup.** Unlike
-  `run` (which releases in a `finally`), a plain `acquire` that times out / never
-  becomes ready leaves the lease active, so its group stays LIVE and holds a GPU
-  indefinitely. Decide: should `acquire --timeout` that fails auto-release? At
-  minimum it's a footgun — a failed acquire silently pins a GPU.
+- **A not-ready `acquire` keeps its lease ACTIVE with no auto-cleanup. RESOLVED.**
+  `Controller.acquire` now treats a readiness timeout as the third "couldn't
+  deliver" rollback path (alongside `ConvergeAborted` / `PlacementError`): when
+  the wait times out it releases the lease and reconciles, tearing the deployment
+  down per its reclaim policy so a never-ready acquire no longer pins a GPU. The
+  outcome carries `released_on_timeout=True` (not raised, so callers can still
+  report `wait.pending`); the `acquire` CLI prints the teardown and exits 2. The
+  buggy "keep the lease" behavior is *not* preserved behind a flag — to hold a
+  lease while a slow model loads, use `--no-wait` (acquire detached, never waits)
+  and `wait` for it separately. See `test_wait_ready_timeout_*` (controller) and
+  `test_acquire_timeout_*` (CLI).
 - **Re-acquiring a model spawns a new group instead of reviving a compatible
   idle one.** Repeated acquire/release of the same model accumulates distinct
   group rows (different ids) rather than coalescing onto the existing idle group.

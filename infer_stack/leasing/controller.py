@@ -71,6 +71,9 @@ class AcquireOutcome:
     reconcile: ReconcileResult
     wait: WaitResult | None = None
     applied: bool = True  # False for a --no-apply (staged, not brought up) acquire
+    # True when the readiness wait timed out and the controller rolled the lease
+    # back (released + reconciled) so a never-ready acquire doesn't pin a GPU.
+    released_on_timeout: bool = False
 
 
 @dataclass
@@ -451,6 +454,15 @@ class Controller:
         bringing it up (and skips the readiness wait, since nothing is running).
         Placement is still computed, so an unplaceable request still fails fast.
 
+        A readiness wait that *times out* (``wait=True`` and the endpoints never
+        become ready within ``timeout``) is the third "acquire couldn't deliver"
+        path, alongside :class:`ConvergeAborted` and :class:`PlacementError`: the
+        lease is rolled back (released + reconciled, tearing down per reclaim
+        policy) so a never-ready acquire doesn't leave a LIVE deployment pinning a
+        GPU. The outcome is returned with ``released_on_timeout=True`` (not raised,
+        so callers can still inspect ``wait.pending``). Use ``wait=False`` to hold
+        a lease while a slow model loads and wait for it separately.
+
         ``wait_for_placement`` turns acquire into an *admission queue*: instead of
         failing fast when every GPU is busy, it polls until a deployment frees one.
         Each retry ``reconcile``s, which first ``sweep``s the ledger — so a crashed
@@ -520,6 +532,7 @@ class Controller:
         deployments = [self.ledger.get_deployment(g.id) for g in result.deployments]
         deployments = [g for g in deployments if g is not None]
         wait_result = None
+        released_on_timeout = False
         if wait and apply:  # nothing to wait on when we only staged the render
             wait_result = self.wait_ready(
                 deployments,
@@ -527,12 +540,20 @@ class Controller:
                 timeout=timeout,
                 interval=interval,
             )
+            if not wait_result.ready:
+                # The endpoints never became ready. Roll the lease back (release +
+                # reconcile) so a timed-out acquire doesn't leave the deployment
+                # LIVE holding a GPU indefinitely -- the readiness analogue of the
+                # ConvergeAborted / PlacementError rollbacks above.
+                self.release(result.lease.id)
+                released_on_timeout = True
         return AcquireOutcome(
             lease=result.lease,
             deployments=deployments,
             reconcile=rec,
             wait=wait_result,
             applied=apply,
+            released_on_timeout=released_on_timeout,
         )
 
     def release(self, lease_id: str) -> ReleaseOutcome:
