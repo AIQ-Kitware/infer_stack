@@ -1150,3 +1150,56 @@ def test_tui_observe_interval_never_below_refresh():
             assert app.observe_interval >= app.ledger_interval
 
     _run(scenario)
+
+
+def test_tui_table_rebuild_preserves_scroll_offset():
+    """A refresh that rebuilds a table (rows added / removed / reordered) must
+    not yank the viewport back to the top — the user's scroll offset survives.
+
+    Regression: ``_diff_fill`` used to restore only the cursor after a
+    clear()+rebuild, so a scrolled-away viewport snapped to row 0 on the next
+    poll. ``_restore_view`` now restores the scroll offset too.
+    """
+    from textual.widgets import DataTable
+
+    from infer_stack.leasing import (
+        Catalog,
+        Controller,
+        Ledger,
+        NullBackend,
+        SqliteStore,
+    )
+    from infer_stack.tui import InferStackTUI
+
+    # Many endpoints -> many lease rows, so the leases table actually scrolls.
+    cat = {
+        'models': {'qc': {'source': 'hf://Qwen/Qwen2.5-Coder-32B-Instruct'}},
+        'endpoints': {
+            f'ep-{i:02d}': {'engine': 'vllm', 'model': 'qc'} for i in range(40)
+        },
+    }
+    catalog = Catalog.from_dict(cat)
+    controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
+    for i in range(40):
+        controller.acquire(f'u{i:02d}', catalog.resolve_names([f'ep-{i:02d}']))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one('#leases', DataTable)
+            assert table.row_count == 40
+            # Scroll a few rows down, away from the top.
+            table.scroll_to(y=6, animate=False)
+            await pilot.pause()
+            before = table.scroll_offset.y
+            assert before > 0, 'precondition: table must be scrolled off the top'
+            # Force the rebuild path: dropping one lease changes the row count,
+            # so _diff_fill clear()+rebuilds rather than patching cells.
+            app._fill_leases(app._last_leases[1:])
+            await pilot.pause()
+            assert table.row_count == 39
+            assert table.scroll_offset.y == before  # not reset to the top
+
+    _run(scenario)

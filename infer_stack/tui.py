@@ -1154,8 +1154,10 @@ class InferStackTUI(App):
         Idle poll (rows identical to last time) → do nothing. Same set of rows
         with a few cells changed → ``update_cell_at`` only those cells, which
         leaves the cursor/scroll untouched and doesn't flicker. Rows added,
-        removed or reordered → fall back to clear()+rebuild. ``id_index`` is the
-        column whose value identifies a row across polls (None = always rebuild).
+        removed or reordered → fall back to clear()+rebuild, restoring the
+        cursor *and* scroll offset afterwards (see ``_restore_view``) so the
+        viewport doesn't jump to the top. ``id_index`` is the column whose value
+        identifies a row across polls (None = always rebuild).
         """
         cached: list[tuple] = getattr(self, cache_attr)
         if new_rows == cached:
@@ -1173,10 +1175,11 @@ class InferStackTUI(App):
                         table.update_cell_at(Coordinate(r, col), nv)
         else:
             cursor = table.cursor_row
+            scroll_x, scroll_y = table.scroll_offset
             table.clear()
             for row in new_rows:
                 table.add_row(*row)
-            self._restore_cursor(table, cursor)
+            self._restore_view(table, cursor, scroll_x, scroll_y)
         setattr(self, cache_attr, new_rows)
 
     def _fill_leases(self, leases) -> None:
@@ -1244,9 +1247,36 @@ class InferStackTUI(App):
         self._diff_fill(table, new_rows, '_gpus_rows_cache', id_index=0)
 
     @staticmethod
-    def _restore_cursor(table: DataTable, row: int) -> None:
+    def _restore_view(
+        table: DataTable, row: int, scroll_x: int, scroll_y: int
+    ) -> None:
+        """Put the cursor *and* scroll offset back after a clear()+rebuild.
+
+        ``DataTable.clear()`` snaps both the cursor and the scroll offset to
+        the top, so a rebuilt table would otherwise jump to row 0 on every poll
+        that adds / removes / reorders a row. Restoring only the cursor isn't
+        enough: ``move_cursor`` (and the cursor-coordinate watcher) scroll the
+        cursor *into view*, which still yanks the viewport whenever the user has
+        scrolled away from the cursor row. So restore the user's exact scroll
+        offset, and make sure that restore is what lands last.
+
+        Timing: both the cursor's scroll-into-view and our ``scroll_to`` are
+        deferred via ``call_after_refresh`` because the post-``add_row`` virtual
+        height is only recomputed on the next idle — scrolling sooner clamps
+        against a stale (usually zero) height. This is exactly why
+        ``DataTable.move_cursor`` defers too. ``call_after_refresh`` runs FIFO,
+        and the cursor's scroll is queued (by ``move_cursor`` below) before
+        ours, so our offset wins.
+        """
         if table.row_count:
-            table.move_cursor(row=min(max(row, 0), table.row_count - 1))
+            # scroll=False: don't let the cursor drag the viewport — we restore
+            # the user's own scroll offset just below, and it must win.
+            table.move_cursor(
+                row=min(max(row, 0), table.row_count - 1), scroll=False
+            )
+        table.call_after_refresh(
+            table.scroll_to, x=scroll_x, y=scroll_y, animate=False
+        )
 
     # -- system info -------------------------------------------------------
 
