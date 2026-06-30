@@ -21,6 +21,7 @@ from .compose import ComposeBackend, RenderedCompose, render_compose
 from .controller import (
     AcquireOutcome,
     Controller,
+    LeaseLockError,
     ReconcileResult,
     ReleaseOutcome,
     WaitResult,
@@ -65,6 +66,7 @@ __all__ = [
     'EndpointSpec',
     'GpuPlan',
     'DeploymentState',
+    'LeaseLockError',
     'Ledger',
     'Lease',
     'LeaseState',

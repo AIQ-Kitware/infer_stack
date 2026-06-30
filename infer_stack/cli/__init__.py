@@ -145,7 +145,14 @@ def __getattr__(name: str):
 
 
 def main(argv=None) -> int:
-    rv = ManageCLI.main(argv=argv)
+    from ..leasing import LeaseLockError
+
+    try:
+        rv = ManageCLI.main(argv=argv)
+    except LeaseLockError as exc:
+        # A mutating verb (acquire/release/gc/evict/apply) could not get the
+        # cross-process lock; surface the actionable diagnosis, not a traceback.
+        raise SystemExit(str(exc))
     return int(rv) if rv is not None else 0
 
 

@@ -2095,3 +2095,74 @@ lease); it does not add the observe()-driven self-heal. Reusable takeaway: when 
 function has N "couldn't deliver" exits that all roll back, an (N+1)th failure
 mode that *doesn't* roll back is almost certainly the bug — grep the siblings for
 the rollback idiom and match it, rather than inventing new cleanup.
+
+## 2026-06-30 13:49:48 -0400
+
+**Intent.** A slurm/tmux teardown (`infer-stack release --env-file …`) was
+emitting `UserWarning: could not open a cross-process lock file (tried
+/data/service/infer-stack/leasing/.leasing.lock and /tmp/infer-stack-…lock);
+proceeding with in-process locking only`. The user's concurrency is N separate
+CLI *processes* across tmux/slurm sessions, so the in-process `RLock` fallback
+serializes nothing. They asked for (a) a precheck that ensures the lock dir and
+file are group-writable, (b) group-write-by-default on new files we create, and
+(c) — chosen via AskUserQuestion — that a mutating verb **raise / refuse to
+mutate** rather than degrade when no real cross-process lock is obtainable.
+
+**Model/harness.** Claude Opus 4.8 (1M), Claude Code CLI.
+
+**Root cause (confirmed by reading + reproducing the digest).** `_open_flock`
+tries the beside-ledger lock then a `/tmp` fallback named
+`sha1(str(lock_path))[:16]` — I reproduced `485b0da6e53b99d5` exactly, so the
+fallback is keyed on the *ledger path, not the user*. Path 1 fails because the
+service-owned ledger dir is writable at the *file* level (the sqlite db) but not
+for a *new* file (the lock). Path 2 fails because the first user created the
+shared `/tmp` file `0644`; a different uid (the teardown) can't reopen it for
+append and the sticky bit blocks replacing it. Both `OSError` → old code warned
+and proceeded on `threading.RLock`.
+
+**Change (`leasing/controller.py`).**
+- `_ensure_group_writable(handle, path)`: best-effort, ownership-gated. `fchmod`
+  the lock fd to `g+rw`; `chmod` the dir to `g+rwx | setgid` (so siblings'
+  files inherit the group). Only touches paths we own — a non-owner *can't*
+  chmod a service dir and shouldn't try; that case is the raise path. Idempotent
+  (only chmods when bits differ), never raises. Called on every successful open
+  so it also self-heals our own pre-existing `0600` lock files.
+- `_open_flock` no longer warns/None-degrades silently; it returns the handle
+  (after self-heal) or `None`.
+- `_global_lock` (and `_apply_lock`) **raise `LeaseLockError`** on a `None`
+  handle, gated by `_lock_path is not None` so the in-memory ledger (tests)
+  still yields lock-free. Placed *before* `_flock_depth += 1`, so the raise
+  leaks no depth/handle state and reentrancy is preserved. All mutating verbs
+  (reconcile/apply_now/acquire/release/evict/gc) funnel through `_global_lock`,
+  so one raise covers them.
+- `_diagnose_lock_failure` / `_lock_path_reason`: re-inspect both candidates and
+  build the actionable message (owner uid, mode, group-writable?, why each open
+  failed) + the `chgrp … && chmod g+rwX … && chmod g+s …` (+ `umask 002`) fix.
+- Exported `LeaseLockError`; `cli/__init__.main` catches it → `SystemExit(msg)`
+  so teardown shows a clean diagnosis, not a traceback.
+
+**Design forks.** (1) `_apply_lock` raising is unreachable in normal flow (the
+render lock is taken first in the same dir, so it raises first) but I made it
+raise too for invariant-consistency — "no real lock ⇒ no mutation" everywhere.
+(2) Considered gating self-heal strictly on "newly created" per the user's
+"new file" wording, but applying it whenever-we-own-it is idempotent and also
+repairs stale locks, strictly better. (3) Setgid on the dir is slightly beyond
+"group write," but it's the standard mechanism that makes a *shared* lock dir
+actually work across uids, so I included it (documented in docstring/CHANGELOG).
+(4) User explicitly declined the env-flag "configurable" option — hard raise.
+
+**Tests.** Added `test_global_lock_raises_when_no_lock_obtainable` (monkeypatch
+`tempfile.gettempdir` at a regular file so *both* candidates fail; asserts the
+raise, message content, and no leaked `_flock_depth`/`_flock_handle`) and
+`test_created_lock_file_and_dir_are_group_writable`. Full submodule suite green
+(247 passed, 1 skipped). The pre-existing `test_lock_falls_back_when_ledger_dir_
+unwritable` still passes — the writable `/tmp` fallback must NOT raise.
+
+**Open / for the operator.** This makes the *code* cooperative, but the live fix
+on the cluster is still ops: make `/data/service/infer-stack/leasing` group-
+shared (`chgrp` + `g+rwxs`) or run all sessions as one user. The `/tmp` fallback
+can never be truly cross-user (different `TMPDIR`/systemd `PrivateTmp` silently
+split it) — it only ever serializes same-user/same-`/tmp` processes, and now we
+fail loudly instead of pretending otherwise. Reusable takeaway: a "degrade to a
+weaker lock + warn" fallback is a footgun when the weaker lock doesn't model the
+real concurrency — prefer self-heal-then-refuse over silent degrade.

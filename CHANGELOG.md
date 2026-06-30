@@ -172,6 +172,23 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   honoring `busy_timeout` — so a batch of pipeline jobs all running
   `infer-stack acquire` against a brand-new ledger could race and crash in
   `SqliteStore.__init__`. These DDL steps now retry on a transient lock.
+* **A mutating verb silently degraded to an in-process lock — which serializes
+  nothing across CLIs — when the cross-process lock file couldn't be opened.**
+  The render lock falls back from the (often service-owned, read-only) ledger
+  dir to a host-temp file keyed by the ledger path; that fallback is shared by
+  *all* users on the host, so the first user to run created it `0644` and a
+  second user/uid (a different tmux or slurm session) hit `EACCES` reopening it.
+  With *both* candidates unopenable the controller used to `warn` and proceed on
+  a `threading.RLock`, which only serializes threads of one process — useless
+  against separate CLI processes, so concurrent `acquire`/`release`/`gc`/`evict`
+  could collide on the ledger (`database is locked`, stale-diff renders). Now:
+  (1) a lock file/dir we create is made **group-writable** (file `g+rw`, dir
+  `g+rws`, best-effort, only for paths we own) so the next session in the owning
+  group can open the same flock file; and (2) when no cross-process lock can be
+  obtained at all, a mutating verb **raises `LeaseLockError`** (refuses to
+  mutate) with an actionable diagnosis (the exact paths tried, why each failed,
+  and the `chgrp`/`chmod g+s`/`umask 002` fix) instead of silently racing. The
+  in-memory ledger (tests) and the writable-fallback case are unchanged.
 * **Ollama GPU pinning to a non-zero GPU** silently fell back to CPU. The docker
   device reservation (`device_ids`) already exposes only the pinned GPU and the
   NVIDIA runtime renumbers it to `0` inside the container, but the service also

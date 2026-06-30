@@ -44,6 +44,22 @@ LOCK_FILENAME = '.leasing.lock'
 APPLY_LOCK_FILENAME = '.apply.lock'
 
 
+class LeaseLockError(RuntimeError):
+    """A mutating verb could not obtain the cross-process lock, so it refuses to
+    touch the shared ledger.
+
+    The render critical section (ledger write + placement + compose render) is
+    single-writer across processes via an ``flock`` on a file beside the shared
+    ledger. When neither that file nor the host-temp fallback can be opened for
+    writing, degrading to an in-process lock would let concurrent CLIs in other
+    tmux/slurm sessions corrupt the ledger (colliding ``BEGIN IMMEDIATE`` writes,
+    stale-diff renders) — the in-process lock only serializes threads of *one*
+    process, and the concurrency here is separate CLI processes. We raise this
+    instead. The message names the exact paths tried and the ``chgrp``/``chmod``
+    fix that makes the lock dir shareable by every CLI identity.
+    """
+
+
 @dataclass
 class ReconcileResult:
     realized: list[str] = field(default_factory=list)
@@ -155,34 +171,147 @@ class Controller:
         return self._open_flock(self._lock_path)
 
     def _open_flock(self, lock_path: Path):
-        """Open an ``flock``-able handle for ``lock_path``.
+        """Open an ``flock``-able handle for ``lock_path`` (``None`` if neither
+        candidate is openable).
 
         Normally the lock file sits beside the ledger. If that directory is not
         writable for a *new* file (e.g. a service-owned shared data dir that this
         user can read but not write), fall back to a host-shared temp path keyed
         by the lock location, so same-host processes still serialize on a
-        consistent file. If even that fails, return ``None`` and the caller
-        proceeds with only the in-process lock. Opened append-mode (never
-        truncated): the file is a pure ``flock`` token, its content is unused.
+        consistent file. A lock file (and the dir) we create is made
+        group-writable (best-effort, see :meth:`_ensure_group_writable`) so the
+        *other* tmux / slurm sessions running the CLI — which may be a different
+        uid in the same group — can open the same file rather than colliding on
+        permissions (a 0644 file owned by the first user is the classic ``/tmp``
+        fallback collision).
+
+        Returns ``None`` if neither path can be opened; the caller (a mutating
+        verb) raises :class:`LeaseLockError` rather than silently degrading to an
+        in-process lock, which would not serialize separate CLI processes.
+        Opened append-mode (never truncated): the file is a pure ``flock`` token,
+        its content is unused.
         """
         import hashlib
         import tempfile
-        import warnings
 
         digest = hashlib.sha1(str(lock_path).encode()).hexdigest()[:16]
         fallback = Path(tempfile.gettempdir()) / f'infer-stack-{digest}.lock'
         for path in (lock_path, fallback):
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                return open(path, 'a')
+                handle = open(path, 'a')
             except OSError:
                 continue
-        warnings.warn(
-            'infer-stack: could not open a cross-process lock file (tried '
-            f'{lock_path} and {fallback}); proceeding with in-process '
-            'locking only — concurrent CLIs on this host may race.'
-        )
+            self._ensure_group_writable(handle, path)
+            return handle
         return None
+
+    def _ensure_group_writable(self, handle, path: Path) -> None:
+        """Best-effort: give the lock file and its directory group read+write so
+        the next session in the owning group can share the same ``flock`` file.
+
+        Only touches paths we own — a non-owner cannot ``chmod`` (and must not:
+        a service-owned lock dir is fixed by an admin, not silently widened
+        here). The directory also gets the setgid bit so files siblings create
+        inherit the group. Idempotent and never raises: a lock we cannot widen
+        is surfaced by :meth:`_diagnose_lock_failure` on the raise path, not here.
+        """
+        import os
+        import stat
+
+        uid = os.getuid()
+        # The lock file: fchmod the open fd (race-free; skip if it is not ours).
+        try:
+            st = os.fstat(handle.fileno())
+            if st.st_uid == uid:
+                mode = stat.S_IMODE(st.st_mode)
+                want = mode | stat.S_IRGRP | stat.S_IWGRP
+                if want != mode:
+                    os.fchmod(handle.fileno(), want)
+        except OSError:
+            pass
+        # The directory: group rwx + setgid, so new lock/db files stay shareable.
+        try:
+            directory = path.parent
+            dst = directory.stat()
+            if dst.st_uid == uid:
+                mode = stat.S_IMODE(dst.st_mode)
+                want = (
+                    mode
+                    | stat.S_IRGRP
+                    | stat.S_IWGRP
+                    | stat.S_IXGRP
+                    | stat.S_ISGID
+                )
+                if want != mode:
+                    directory.chmod(want)
+        except OSError:
+            pass
+
+    def _diagnose_lock_failure(self, lock_path: Path) -> str:
+        """Build the actionable message for :class:`LeaseLockError`.
+
+        Re-inspects the two candidate lock paths (beside-ledger + host-temp
+        fallback) and reports, for each, *why* it could not be opened for
+        writing — the parent dir is not writable, or the existing file is owned
+        by another uid without group write — then names the ``chgrp``/``chmod``
+        fix that makes the shared lock dir usable by every CLI identity.
+        """
+        import hashlib
+        import os
+        import tempfile
+
+        digest = hashlib.sha1(str(lock_path).encode()).hexdigest()[:16]
+        fallback = Path(tempfile.gettempdir()) / f'infer-stack-{digest}.lock'
+        tried = '\n'.join(
+            f'  - {p}: {self._lock_path_reason(p)}' for p in (lock_path, fallback)
+        )
+        directory = lock_path.parent
+        return (
+            f'infer-stack: refusing to mutate the shared ledger as uid={os.getuid()} '
+            '— no usable cross-process lock.\n'
+            f'{tried}\n'
+            'A mutating verb (acquire/release/gc/evict) needs an flock file every '
+            'CLI on this host can open for writing; without it, concurrent CLIs in '
+            'other tmux/slurm sessions can corrupt the ledger. Make the lock '
+            'directory shareable by every CLI identity, e.g.:\n'
+            f'  chgrp -R <shared-group> {directory} && chmod -R g+rwX {directory} '
+            f'&& chmod g+s {directory}\n'
+            '  (and run the CLIs under `umask 002` so new files keep group write)\n'
+            'or run all sessions as the same user.'
+        )
+
+    def _lock_path_reason(self, path: Path) -> str:
+        """One-line reason a single candidate lock path is not openable."""
+        import os
+        import stat
+
+        try:
+            if path.exists():
+                st = path.stat()
+                mode = stat.S_IMODE(st.st_mode)
+                grp_w = (
+                    'group-writable'
+                    if mode & stat.S_IWGRP
+                    else 'NOT group-writable'
+                )
+                return (
+                    f'file exists (owner uid={st.st_uid}, mode={oct(mode)}, '
+                    f'{grp_w}); not openable for append by uid={os.getuid()}'
+                )
+            parent = path.parent
+            if not parent.exists():
+                return f'parent dir {parent} is missing and could not be created'
+            pst = parent.stat()
+            pmode = stat.S_IMODE(pst.st_mode)
+            if not os.access(parent, os.W_OK | os.X_OK):
+                return (
+                    f'parent dir {parent} not writable by uid={os.getuid()} '
+                    f'(owner uid={pst.st_uid}, mode={oct(pmode)})'
+                )
+            return 'open failed'
+        except OSError as exc:
+            return f'inspection failed: {exc}'
 
     @contextlib.contextmanager
     def _global_lock(self):
@@ -212,8 +341,11 @@ class Controller:
         try:
             if self._flock_depth == 0:
                 self._flock_handle = self._open_lock_handle()
-                if self._flock_handle is not None:
-                    fcntl.flock(self._flock_handle, fcntl.LOCK_EX)
+                if self._flock_handle is None:
+                    raise LeaseLockError(
+                        self._diagnose_lock_failure(self._lock_path)
+                    )
+                fcntl.flock(self._flock_handle, fcntl.LOCK_EX)
             self._flock_depth += 1
             try:
                 yield
@@ -245,8 +377,9 @@ class Controller:
             return
         handle = self._open_flock(self._apply_lock_path)
         if handle is None:
-            yield
-            return
+            raise LeaseLockError(
+                self._diagnose_lock_failure(self._apply_lock_path)
+            )
         try:
             fcntl.flock(handle, fcntl.LOCK_EX)
             yield

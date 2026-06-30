@@ -12,9 +12,12 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from infer_stack.leasing import (
     Controller,
     EndpointRequest,
+    LeaseLockError,
     Ledger,
     SqliteStore,
     vllm_structural,
@@ -98,6 +101,57 @@ def test_lock_falls_back_when_ledger_dir_unwritable(tmp_path):
 
     with ctl._global_lock():  # must not raise
         pass
+
+
+def test_global_lock_raises_when_no_lock_obtainable(tmp_path, monkeypatch):
+    """When NEITHER the beside-ledger lock nor the host-temp fallback can be
+    opened, a mutating verb refuses to mutate (raises) rather than degrading to
+    an in-process lock that cannot serialize separate CLI processes.
+    """
+    import tempfile as _tempfile
+
+    ctl = Controller(
+        Ledger(SqliteStore(str(tmp_path / 'ledger.db'))), OverlapBackend()
+    )
+    # Primary lock path uncreatable: its parent is a regular file.
+    blocker = tmp_path / 'not-a-dir'
+    blocker.write_text('x')
+    ctl._lock_path = blocker / 'sub' / '.leasing.lock'
+    # Fallback uncreatable too: point gettempdir() at a regular file so the
+    # fallback's parent.mkdir() fails as well.
+    fake_tmp = tmp_path / 'fake-tmp-is-a-file'
+    fake_tmp.write_text('x')
+    monkeypatch.setattr(_tempfile, 'gettempdir', lambda: str(fake_tmp))
+
+    assert ctl._open_lock_handle() is None
+    with pytest.raises(LeaseLockError) as ei:
+        with ctl._global_lock():
+            pass
+    msg = str(ei.value)
+    assert 'refusing to mutate' in msg and 'chgrp' in msg  # actionable diagnosis
+    # The render lock raised before incrementing depth -> no leaked state.
+    assert ctl._flock_depth == 0 and ctl._flock_handle is None
+
+
+def test_created_lock_file_and_dir_are_group_writable(tmp_path):
+    """A lock file (and its dir) we create is widened to group rw so the next
+    tmux/slurm session in the owning group can open the same flock file."""
+    import stat
+
+    ctl = Controller(
+        Ledger(SqliteStore(str(tmp_path / 'ledger.db'))), OverlapBackend()
+    )
+    handle = ctl._open_lock_handle()
+    assert handle is not None
+    handle.close()
+
+    lock_file = tmp_path / '.leasing.lock'
+    fmode = stat.S_IMODE(lock_file.stat().st_mode)
+    assert fmode & stat.S_IWGRP, f'lock file not group-writable: {oct(fmode)}'
+
+    dmode = stat.S_IMODE(tmp_path.stat().st_mode)
+    assert dmode & stat.S_IWGRP, f'lock dir not group-writable: {oct(dmode)}'
+    assert dmode & stat.S_ISGID, f'lock dir missing setgid: {oct(dmode)}'
 
 
 class SharedOverlapBackend:
