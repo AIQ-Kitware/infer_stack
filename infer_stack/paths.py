@@ -46,6 +46,11 @@ DATA_DIR_ENV = 'INFER_STACK_DATA_DIR'
 MODEL_PATH_ENV = 'INFER_STACK_MODEL_PATH'
 
 SETTINGS_FILENAME = 'settings.yaml'
+# UI-only preferences for the TUI (poll cadences, pane sizes). Deliberately a
+# SEPARATE file from settings.yaml: settings.yaml is the CLI-facing leasing
+# config (backend, data dir, proxy) that changes how the stack runs; this one
+# only tunes the dashboard and never affects a `config`/`acquire` from the CLI.
+TUI_SETTINGS_FILENAME = 'tui_settings.yaml'
 
 _config_root_override: Path | None = None
 _data_root_override: Path | None = None
@@ -82,6 +87,36 @@ def save_settings(settings: dict) -> Path:
 
 def get_setting(key: str, default=None):
     return load_settings().get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# UI-only preferences (TUI dashboard): poll cadences etc. Kept apart from the
+# CLI's settings.yaml so tuning the dashboard never touches how the stack runs.
+# ---------------------------------------------------------------------------
+
+
+def tui_settings_path() -> Path:
+    """Where the TUI's own UI preferences live (separate from settings.yaml)."""
+    return config_root() / TUI_SETTINGS_FILENAME
+
+
+def load_tui_settings() -> dict:
+    """Load ``tui_settings.yaml`` (empty dict if absent)."""
+    path = tui_settings_path()
+    if path.exists():
+        import yaml
+
+        return yaml.safe_load(path.read_text()) or {}
+    return {}
+
+
+def save_tui_settings(settings: dict) -> Path:
+    import yaml
+
+    path = tui_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
 
 
 def _default_config_root() -> Path:
