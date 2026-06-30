@@ -26,6 +26,7 @@ is fully exercisable headless via Textual's pilot.
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -407,22 +408,24 @@ class InferStackTUI(App):
     #vsplit { width: 1; height: 1fr; background: $panel; }
     #vsplit:hover { background: $accent; }
     #main { width: 1fr; }
-    #tables { height: 1fr; overflow-y: auto; }
-    #hsplit, #csplit {
+    #tables { height: 1fr; layout: vertical; }
+    #hsplit, #csplit, #tsplit {
         width: 1fr; height: 1; background: $panel; margin: 0 0 1 0;
     }
-    #hsplit:hover, #csplit:hover { background: $accent; }
+    #hsplit:hover, #csplit:hover, #tsplit:hover { background: $accent; }
 
     /* one-line, per-pane descriptions (replaces the old global intro) */
     .desc { height: auto; color: $text-muted; padding: 0 1; }
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
 
-    #endpoint-actions, #lease-actions, #deployment-actions, #model-actions {
+    #endpoint-actions, #lease-actions, #deployment-actions, #model-actions,
+    #suggest-actions {
         height: auto; margin: 0 0 1 0;
     }
     /* width: 1fr + min-width: 0 so several buttons share a narrow sidebar row
        instead of overflowing it (Button's default min-width is 16). */
-    #endpoint-actions Button, #model-actions Button { width: 1fr; min-width: 0; }
+    #endpoint-actions Button, #model-actions Button,
+    #suggest-actions Button { width: 1fr; min-width: 0; }
     #lease-actions Button, #deployment-actions Button {
         margin: 0 1 0 0; min-width: 8;
     }
@@ -435,7 +438,7 @@ class InferStackTUI(App):
        render. nowrap skips that fold path entirely. (We can't just set
        line-pad: 0 -- Textual's integer CSS parser rejects 0.) */
     #endpoint-actions Button, #lease-actions Button, #deployment-actions Button,
-    #model-actions Button, #api-controls Button {
+    #model-actions Button, #api-controls Button, #suggest-actions Button {
         height: 1; border: none; padding: 0 1; text-wrap: nowrap;
     }
     #api { padding: 1 2; }
@@ -459,9 +462,12 @@ class InferStackTUI(App):
 
     #endpoints { height: 1fr; min-height: 5; }
     #models { height: 8; min-height: 4; }   /* height set via _apply_sizes */
-    /* leases/deployments are collapsible panes; bound their tables so the
-       column sizes sanely and #tables scrolls when both are expanded. */
-    #leases, #deployments { height: 10; min-height: 3; }
+    /* leases/deployments are separate panes split by #tsplit: leases gets a
+       resizable fixed height (_apply_sizes), deployments takes the rest. Their
+       tables flex to fill each pane around the desc + action rows. */
+    #leases-pane { height: 14; min-height: 6; }   /* height set via _apply_sizes */
+    #deployments-pane { height: 1fr; min-height: 6; }
+    #leases, #deployments { height: 1fr; min-height: 3; }
     #docker-tabs { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
@@ -479,10 +485,11 @@ class InferStackTUI(App):
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
 
-    #settings { padding: 1 2; }
-    #settings Label { margin: 1 0 0 0; color: $text-muted; }
-    #settings Input, #settings Select { margin: 0 0 1 0; width: 64; }
-    #settings-actions { height: auto; margin: 1 0 0 0; }
+    #settings, #ui-settings { padding: 1 2; }
+    #settings Label, #ui-settings Label { margin: 1 0 0 0; color: $text-muted; }
+    #settings Input, #settings Select,
+    #ui-settings Input { margin: 0 0 1 0; width: 64; }
+    #settings-actions, #ui-settings-actions { height: auto; margin: 1 0 0 0; }
     #compose-path { height: auto; color: $text-muted; padding: 0 1; margin: 0 0 1 0; }
     #compose-actions { height: auto; }
     #compose-actions Button { margin: 0 1 0 0; }
@@ -530,6 +537,30 @@ class InferStackTUI(App):
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
+        # Two cadences (see the UI tab): the ledger is cheap in-memory state, so
+        # it drives the visible refresh; ``observe()``/``plan()`` shell out to
+        # docker, so they run on a slower beat and their result is cached between
+        # ledger ticks. Persisted UI prefs (tui_settings.yaml) override the
+        # CLI-supplied ``interval`` default; they are NOT the CLI's settings.yaml.
+        from .paths import load_tui_settings
+        ui_prefs = load_tui_settings()
+        self.ledger_interval = float(ui_prefs.get('ledger_interval', interval))
+        self.observe_interval = max(
+            float(ui_prefs.get('observe_interval', interval * 2)),
+            self.ledger_interval,
+        )
+        self._refresh_timer: Any = None
+        # Cached observed/desired-placement view, refreshed every observe_interval.
+        self._observed: set[str] = set()
+        self._assignments: dict[str, list[int]] = {}
+        self._observed_at: float | None = None
+        # Last-rendered row tuples per table, so a poll that changed nothing skips
+        # the widget entirely and a small change updates only the cells that moved
+        # (instead of clear()+rebuild, which flickers and resets the cursor).
+        self._leases_rows: list[tuple] = []
+        self._deployments_rows: list[tuple] = []
+        self._ps_rows_cache: list[tuple] = []
+        self._gpus_rows_cache: list[tuple] = []
         self.catalog_path = Path(catalog_path).expanduser() if catalog_path else None
         self._http = http
         self._proc_factory = proc_factory or self._default_proc_factory()
@@ -558,6 +589,7 @@ class InferStackTUI(App):
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
         self._log_h = 16      # resizable via - + or dragging #hsplit
         self._models_h = 8    # resizable by dragging #csplit
+        self._leases_h = 14   # resizable by dragging #tsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
         self._collapsed = {'docker': False, 'system': True}
@@ -572,6 +604,8 @@ class InferStackTUI(App):
                 yield from self._compose_dashboard()
             with TabPane('API', id='tab-api'):
                 yield from self._compose_api()
+            with TabPane('UI', id='tab-ui'):
+                yield from self._compose_ui_settings()
             with TabPane('Settings', id='tab-settings'):
                 yield from self._compose_settings()
         yield Static('', id='status')
@@ -581,8 +615,8 @@ class InferStackTUI(App):
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
                 yield Static(
-                    'Models & endpoints you can run. Acquire one, or Suggest a '
-                    'set sized to your GPUs.', classes='desc',
+                    'Endpoints — runnable model + engine configs. Acquire one to '
+                    'serve it, or Suggest a set sized to your GPUs.', classes='desc',
                 )
                 yield Static('', id='catalog-help')
                 yield DataTable(id='endpoints', cursor_type='row',
@@ -592,7 +626,13 @@ class InferStackTUI(App):
                     yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
                     yield Button('Remove', id='btn-remove-endpoint')
+                with Horizontal(id='suggest-actions'):
+                    yield Button('✨  Suggest from my GPUs', id='btn-suggest')
                 yield _Divider('y', self._drag_models, id='csplit')
+                yield Static(
+                    'Models — weights an endpoint can serve. Add models here, '
+                    'then point an endpoint at one.', classes='desc',
+                )
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
                 with Horizontal(id='model-actions'):
@@ -601,8 +641,7 @@ class InferStackTUI(App):
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):
                 with Vertical(id='tables'):
-                    with Collapsible(title='leases', collapsed=False,
-                                     id='leases-pane'):
+                    with Vertical(id='leases-pane'):
                         yield Static(
                             'Reservations you hold. Each maps to one deployment '
                             'below (see the deployment column); many leases can '
@@ -616,8 +655,8 @@ class InferStackTUI(App):
                             yield Button('Release', id='btn-release')
                             yield Button('Release all', id='btn-release-all')
                             yield Button('Clean up', id='btn-cleanup')
-                    with Collapsible(title='deployments', collapsed=False,
-                                     id='deployments-pane'):
+                    yield _Divider('y', self._drag_tables, id='tsplit')
+                    with Vertical(id='deployments-pane'):
                         yield Static(
                             'Running model deployments and the GPUs they hold. '
                             "The 'leases' column is how many leases hold each. "
@@ -689,6 +728,30 @@ class InferStackTUI(App):
             yield RichLog(id='api-out', highlight=False, markup=False,
                           wrap=True, max_lines=500)
 
+    def _compose_ui_settings(self) -> ComposeResult:
+        from .paths import tui_settings_path
+
+        with Vertical(id='ui-settings'):
+            yield Static(
+                'Dashboard-only preferences for this TUI — they tune how fast the '
+                'panes poll and nothing else. Saved to the TUI’s own file, '
+                'separate from the CLI settings on the Settings tab.',
+                classes='desc',
+            )
+            yield Static(f'file: {tui_settings_path()}', classes='hint')
+            yield Label('refresh interval (seconds) — leases/deployments + GPUs')
+            yield Input(value=f'{self.ledger_interval:g}',
+                        id='set-ledger-interval')
+            yield Label(
+                'docker observe interval (seconds) — the "running" / GPU-placement '
+                'columns; higher = fewer `docker compose ps` calls'
+            )
+            yield Input(value=f'{self.observe_interval:g}',
+                        id='set-observe-interval')
+            with Horizontal(id='ui-settings-actions'):
+                yield Button('Apply', variant='primary',
+                             id='btn-apply-ui-settings')
+
     def _compose_settings(self) -> ComposeResult:
         from .cli.commands_leasing import _coerce_bool
         from .paths import data_root, get_setting, settings_path
@@ -726,11 +789,6 @@ class InferStackTUI(App):
             with Horizontal(id='settings-actions'):
                 yield Button('Save settings', variant='primary',
                              id='btn-save-settings')
-            yield Static(
-                'Catalog: seed a fits-your-GPUs set of models + endpoints from '
-                'the suggestion pool (merges into your catalog).', classes='desc',
-            )
-            yield Button('✨  Suggest from my GPUs', id='btn-suggest')
 
     def on_mount(self) -> None:
         try:
@@ -740,6 +798,7 @@ class InferStackTUI(App):
             pass
         titles = {
             '#endpoints': 'catalog · endpoints', '#models': 'catalog · models',
+            '#leases-pane': 'leases', '#deployments-pane': 'deployments',
         }
         for sel, title in titles.items():
             self.query_one(sel).border_title = title
@@ -777,9 +836,11 @@ class InferStackTUI(App):
         self._fill_catalog()
         self._update_api_urls()
         self._update_api_curl()
-        self._refresh_now()           # synchronous first paint (snappy + testable)
+        self._first_paint()           # instant paint from cheap ledger state
         self._restart_logs(self._log_service)
-        self.set_interval(self.interval, self.action_refresh)
+        self._refresh_timer = self.set_interval(
+            self.ledger_interval, self.action_refresh
+        )
         self.query_one('#endpoints', DataTable).focus()
 
     def on_unmount(self) -> None:
@@ -814,6 +875,7 @@ class InferStackTUI(App):
         self.query_one('#sidebar').styles.width = self._sidebar_w
         self.query_one('#docker-tabs').styles.height = self._log_h
         self.query_one('#models').styles.height = self._models_h
+        self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
         # Allow the full width range (down to a sliver, up to nearly all of it),
@@ -831,6 +893,13 @@ class InferStackTUI(App):
         # Divider above the models table (models fixed-height, endpoints flexes):
         # drag down = bar follows the cursor down = models shorter.
         self._models_h = max(3, min(40, self._models_h - delta))
+        self._apply_sizes()
+
+    def _drag_tables(self, delta: int) -> None:
+        # Divider between the leases pane (fixed-height) and deployments pane
+        # (flexes): drag down = bar follows the cursor down = leases taller.
+        hi = max(8, self.size.height - 10)
+        self._leases_h = max(6, min(hi, self._leases_h + delta))
         self._apply_sizes()
 
     def action_sidebar_narrower(self) -> None:
@@ -959,10 +1028,19 @@ class InferStackTUI(App):
         try:
             self.controller.ledger.sweep()
             leases, deployments = self.controller.ledger.status()
-            observed, assignments = _placement_view(self.controller)
+            # The always-on expense was re-running observe()/plan() (a
+            # `docker compose ps` + placement compute) on *every* tick. The
+            # ledger above is cheap and drives the visible refresh; the docker
+            # view only needs to refresh every observe_interval, so cache it and
+            # reuse the last result between those beats.
+            now = time.monotonic()
+            if (self._observed_at is None
+                    or (now - self._observed_at) >= self.observe_interval):
+                self._observed, self._assignments = _placement_view(self.controller)
+                self._observed_at = now
             data: dict[str, Any] = {
-                'leases': leases, 'deployments': deployments, 'observed': observed,
-                'assignments': assignments,
+                'leases': leases, 'deployments': deployments,
+                'observed': self._observed, 'assignments': self._assignments,
             }
             if not self._collapsed['docker'] and self._active_tab == 'tab-containers':
                 data['ps'] = self._compose_ps_rows()
@@ -1011,9 +1089,36 @@ class InferStackTUI(App):
             pass
 
     def _refresh_now(self) -> None:
-        """Synchronous collect + render (first paint; also what tests rely on)."""
+        """Synchronous collect + render (also what tests rely on)."""
         self._sync_pane_state()
         self._render(self._collect())
+
+    def _first_paint(self) -> None:
+        """Paint immediately from cheap in-memory ledger state, then kick the
+        docker observe to the worker — so mount never blocks on `docker
+        compose ps` (which used to freeze the very first frame)."""
+        self._sync_pane_state()
+        try:
+            self.controller.ledger.sweep()
+            leases, deployments = self.controller.ledger.status()
+        except Exception as ex:  # noqa: BLE001 - first paint must not crash mount
+            self._status(f'refresh error: {ex}')
+            return
+        self._render({
+            'leases': leases, 'deployments': deployments,
+            'observed': self._observed, 'assignments': self._assignments,
+        })
+        self._refresh_bg()
+
+    def _apply_poll_settings(self) -> None:
+        """Restart the refresh timer at the current ledger cadence and force the
+        next observe to run, so changes from the UI tab take effect at once."""
+        if self._refresh_timer is not None:
+            self._refresh_timer.stop()
+        self._refresh_timer = self.set_interval(
+            self.ledger_interval, self.action_refresh
+        )
+        self._observed_at = None
 
     @work(thread=True, exclusive=True, group='refresh')
     def _refresh_bg(self) -> None:
@@ -1031,47 +1136,78 @@ class InferStackTUI(App):
             self.query_one('#docker', Collapsible).title = (
                 f'docker — {running} running'
             )
-            self.query_one('#leases-pane', Collapsible).title = (
+            self.query_one('#leases-pane').border_title = (
                 f'leases — {active} active / {len(leases)}'
             )
-            self.query_one('#deployments-pane', Collapsible).title = (
+            self.query_one('#deployments-pane').border_title = (
                 f'deployments — {running} running / {len(deployments)}'
             )
         except Exception:  # noqa: BLE001
             pass
 
+    def _diff_fill(
+        self, table: DataTable, new_rows: list[tuple], cache_attr: str,
+        *, id_index: int | None,
+    ) -> None:
+        """Reconcile ``table`` to ``new_rows`` with the least churn.
+
+        Idle poll (rows identical to last time) → do nothing. Same set of rows
+        with a few cells changed → ``update_cell_at`` only those cells, which
+        leaves the cursor/scroll untouched and doesn't flicker. Rows added,
+        removed or reordered → fall back to clear()+rebuild. ``id_index`` is the
+        column whose value identifies a row across polls (None = always rebuild).
+        """
+        cached: list[tuple] = getattr(self, cache_attr)
+        if new_rows == cached:
+            return
+        same_shape = (
+            id_index is not None
+            and len(new_rows) == len(cached)
+            and all(n[id_index] == c[id_index]
+                    for n, c in zip(new_rows, cached))
+        )
+        if cached and same_shape:
+            for r, (new, old) in enumerate(zip(new_rows, cached)):
+                for col, (nv, ov) in enumerate(zip(new, old)):
+                    if nv != ov:
+                        table.update_cell_at(Coordinate(r, col), nv)
+        else:
+            cursor = table.cursor_row
+            table.clear()
+            for row in new_rows:
+                table.add_row(*row)
+            self._restore_cursor(table, cursor)
+        setattr(self, cache_attr, new_rows)
+
     def _fill_leases(self, leases) -> None:
         table = self.query_one('#leases', DataTable)
-        cursor = table.cursor_row
-        table.clear()
-        self._lease_ids = []
         self._lease_sel &= {le.id for le in leases}  # drop selections for gone rows
-        for le in leases:
-            # The 'deployment' column is the join key: it lists the same deployment
-            # id(s) shown in the deployments pane, so lease -> deployment is visible.
-            table.add_row(
+        self._lease_ids = [le.id for le in leases]
+        # The 'deployment' column is the join key: it lists the same deployment
+        # id(s) shown in the deployments pane, so lease -> deployment is visible.
+        new_rows = [
+            (
                 SELECT_MARK if le.id in self._lease_sel else '',
                 le.id, le.owner, str(le.state), _lease_ttl(le),
                 ','.join(le.endpoints) or '-',
                 ','.join(le.deployment_ids) or '-',
             )
-            self._lease_ids.append(le.id)
-        self._restore_cursor(table, cursor)
+            for le in leases
+        ]
+        self._diff_fill(table, new_rows, '_leases_rows', id_index=1)
 
     def _fill_deployments(self, deployments, observed, assignments, leases) -> None:
         table = self.query_one('#deployments', DataTable)
-        cursor = table.cursor_row
-        table.clear()
-        self._deployment_ids = []
         self._dep_sel &= {g.id for g in deployments}  # drop selections for gone rows
+        self._deployment_ids = [g.id for g in deployments]
         # owners of the active leases holding each deployment (the "many" side)
         owners: dict[str, list[str]] = {}
         for le in leases:
             if le.state == LeaseState.ACTIVE:
                 for gid in le.deployment_ids:
                     owners.setdefault(gid, []).append(le.owner)
-        for g in deployments:
-            table.add_row(
+        new_rows = [
+            (
                 SELECT_MARK if g.id in self._dep_sel else '',
                 g.id, g.engine, str(g.state),
                 _running_label(g.id, observed),
@@ -1079,36 +1215,33 @@ class InferStackTUI(App):
                 ','.join(sorted(g.served)) or '-',
                 str(g.demand), ','.join(owners.get(g.id, [])) or '-',
             )
-            self._deployment_ids.append(g.id)
-        self._restore_cursor(table, cursor)
+            for g in deployments
+        ]
+        self._diff_fill(table, new_rows, '_deployments_rows', id_index=1)
 
     def _fill_ps(self, rows) -> None:
         table = self.query_one('#ps', DataTable)
-        cursor = table.cursor_row
-        table.clear()
-        for row in rows:
-            table.add_row(
-                row['service'], row['status'], row['created'] or '-',
-                row['id'] or '-', row['ports'] or '-',
-            )
+        new_rows = [
+            (row['service'], row['status'], row['created'] or '-',
+             row['id'] or '-', row['ports'] or '-')
+            for row in rows
+        ]
         if not rows:
-            table.add_row('(nothing running)', '-', '-', '-', '-')
-        self._restore_cursor(table, cursor)
+            new_rows = [('(nothing running)', '-', '-', '-', '-')]
+        self._diff_fill(table, new_rows, '_ps_rows_cache', id_index=0)
 
     def _fill_gpus(self, rows) -> None:
         table = self.query_one('#gpus', DataTable)
-        cursor = table.cursor_row
-        table.clear()
         if rows is None:
-            table.add_row('—', 'nvidia-smi not found on this host', '-', '-', '-')
+            new_rows = [('—', 'nvidia-smi not found on this host', '-', '-', '-')]
         elif not rows:
-            table.add_row('—', '(no GPUs reported)', '-', '-', '-')
+            new_rows = [('—', '(no GPUs reported)', '-', '-', '-')]
         else:
-            for r in rows:
-                idx, name, util, used, total, temp = r
-                table.add_row(idx, name, f'{util}%',
-                              f'{used}/{total} MiB', f'{temp}°C')
-        self._restore_cursor(table, cursor)
+            new_rows = [
+                (idx, name, f'{util}%', f'{used}/{total} MiB', f'{temp}°C')
+                for idx, name, util, used, total, temp in rows
+            ]
+        self._diff_fill(table, new_rows, '_gpus_rows_cache', id_index=0)
 
     @staticmethod
     def _restore_cursor(table: DataTable, row: int) -> None:
@@ -1527,12 +1660,40 @@ class InferStackTUI(App):
             'btn-api-copy-curl': self.action_api_copy_curl,
             'btn-open-webui': self.action_open_webui,
             'btn-save-settings': self._on_save_settings,
+            'btn-apply-ui-settings': self._on_apply_ui_settings,
             'btn-compose-up': self.action_compose_up,
             'btn-compose-down': self.action_compose_down,
         }
         handler = handlers.get(event.button.id or '')
         if handler:
             handler()
+
+    def _on_apply_ui_settings(self) -> None:
+        from .paths import load_tui_settings, save_tui_settings
+
+        try:
+            ledger = float(self.query_one('#set-ledger-interval', Input).value)
+            observe = float(self.query_one('#set-observe-interval', Input).value)
+        except ValueError:
+            self._status('poll intervals must be numbers')
+            return
+        if ledger <= 0 or observe <= 0:
+            self._status('poll intervals must be positive')
+            return
+        self.ledger_interval = ledger
+        self.observe_interval = max(observe, ledger)  # observe never beats ledger
+        self._apply_poll_settings()
+        prefs = load_tui_settings()
+        prefs['ledger_interval'] = self.ledger_interval
+        prefs['observe_interval'] = self.observe_interval
+        try:
+            path = save_tui_settings(prefs)
+            self._status(
+                f'poll: refresh {self.ledger_interval:g}s / observe '
+                f'{self.observe_interval:g}s → {path}'
+            )
+        except Exception as ex:  # noqa: BLE001
+            self._status(f'save UI settings failed: {ex}')
 
     def _on_save_settings(self) -> None:
         from .paths import load_settings, save_settings

@@ -268,13 +268,34 @@ def test_tui_monitor_panes_are_collapsible():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # the four monitor panes collapse (docker/system already did)
-            for pid in ('#leases-pane', '#deployments-pane', '#docker', '#system'):
+            # docker/system are collapsible auxiliary panes
+            for pid in ('#docker', '#system'):
                 pane = app.query_one(pid, Collapsible)
                 pane.collapsed = True
             await pilot.pause()
-            assert app.query_one('#leases-pane', Collapsible).collapsed
-            assert app.query_one('#deployments-pane', Collapsible).collapsed
+            assert app.query_one('#docker', Collapsible).collapsed
+            assert app.query_one('#system', Collapsible).collapsed
+
+    _run(scenario)
+
+
+def test_tui_leases_deployments_are_separate_panes():
+    from textual.containers import Vertical
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # leases/deployments are their own panes split by a drag handle,
+            # not collapsibles.
+            assert isinstance(app.query_one('#leases-pane'), Vertical)
+            assert isinstance(app.query_one('#deployments-pane'), Vertical)
+            assert app.query_one('#tsplit')
 
     _run(scenario)
 
@@ -287,16 +308,19 @@ def test_tui_panes_drag_resize():
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
                             proc_factory=lambda svc: None)
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             w0, h0 = app._sidebar_w, app._log_h
             m0 = app._models_h
+            l0 = app._leases_h
             app._drag_sidebar(6)            # pull the vertical splitter right
             app._drag_logs(3)               # pull the horizontal splitter down
             app._drag_models(2)             # catalog endpoints|models splitter
+            app._drag_tables(2)             # leases|deployments splitter
             assert app._sidebar_w == w0 + 6
             assert app._log_h == h0 - 3     # down = shorter logs
             assert app._models_h == m0 - 2  # drag down = bar down = models shorter
+            assert app._leases_h == l0 + 2  # drag down = bar down = leases taller
 
     _run(scenario)
 
@@ -315,6 +339,7 @@ def test_tui_dividers_have_a_grab_area():
             assert app.query_one('#vsplit').region.height > 1
             assert app.query_one('#hsplit').region.width > 1
             assert app.query_one('#csplit').region.width > 1   # endpoints|models
+            assert app.query_one('#tsplit').region.width > 1   # leases|deployments
 
     _run(scenario)
 
@@ -1040,5 +1065,88 @@ def test_tui_logs_stream_from_injected_source():
             await app.workers.wait_for_complete()     # drain the log stream
             await pilot.pause()
             assert any('ready' in line for line in app._log_lines)
+
+    _run(scenario)
+
+
+def test_tui_observe_is_throttled_between_ledger_ticks():
+    """The expensive observe()/plan() view is cached between ledger polls and
+    only refreshed once observe_interval has elapsed."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    calls = {'n': 0}
+    real_observe = controller.backend.observe
+
+    def counting_observe():
+        calls['n'] += 1
+        return real_observe()
+
+    controller.backend.observe = counting_observe
+
+    async def scenario():
+        # observe_interval huge -> after the first poll it must not run again
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        app.observe_interval = 10_000
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.workers.wait_for_complete()      # first observe (mount)
+            await pilot.pause()
+            assert calls['n'] >= 1
+            seen = calls['n']
+            app._collect()                             # extra polls within window
+            app._collect()
+            assert calls['n'] == seen                  # served from cache
+
+    _run(scenario)
+
+
+def test_tui_apply_ui_settings_retunes_and_persists(tmp_path, monkeypatch):
+    from textual.widgets import Input
+
+    from infer_stack import paths
+    from infer_stack.tui import InferStackTUI
+
+    monkeypatch.setattr(paths, '_config_root_override', tmp_path)
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#set-ledger-interval', Input).value = '2'
+            app.query_one('#set-observe-interval', Input).value = '8'
+            app._on_apply_ui_settings()
+            await pilot.pause()
+            assert app.ledger_interval == 2.0
+            assert app.observe_interval == 8.0
+
+    _run(scenario)
+    # persisted to the TUI's own file, not the CLI settings.yaml
+    saved = paths.load_tui_settings()
+    assert saved['ledger_interval'] == 2.0 and saved['observe_interval'] == 8.0
+    assert not (tmp_path / paths.SETTINGS_FILENAME).exists()
+
+
+def test_tui_observe_interval_never_below_refresh():
+    from textual.widgets import Input
+
+    from infer_stack import paths
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#set-ledger-interval', Input).value = '5'
+            app.query_one('#set-observe-interval', Input).value = '1'
+            app._on_apply_ui_settings()
+            await pilot.pause()
+            assert app.observe_interval >= app.ledger_interval
 
     _run(scenario)
