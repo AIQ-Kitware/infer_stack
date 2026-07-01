@@ -6,8 +6,10 @@ action buttons, and (for the heavy ones) collapses with a click so it isn't
 polled while hidden:
 
 * **Catalog** (left) — the models + endpoints you can run; Acquire the selected
-  endpoint, Suggest a set sized to your GPUs, or add one by hand. Ctrl+click a
-  served endpoint to open it in Open WebUI.
+  endpoint (double-click a row, press Enter, or the Acquire button — a lone
+  click only highlights, so a stray click never brings one up), Suggest a set
+  sized to your GPUs, or add one by hand. Ctrl+click a served endpoint to open
+  it in Open WebUI.
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
 * **docker** — a collapsible pane with **Logs** and **Containers** (the
@@ -62,6 +64,10 @@ from .leasing import LeaseState
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
+# Two endpoint clicks within this window (on the same row) count as a
+# double-click and acquire it; a lone click only highlights. Keeps a stray
+# click from bringing an endpoint up — or bringing it up twice.
+DOUBLE_CLICK_SECS = 0.4
 DEFAULT_THEME = 'textual-dark'
 
 
@@ -594,6 +600,13 @@ class InferStackTUI(App):
         # heavy panes start collapsed (and therefore unpolled)
         self._collapsed = {'docker': False, 'system': True}
         self._ready_endpoints: list[str] = []
+        # Bringing an endpoint up needs a deliberate double-click (or Enter) so
+        # a stray single click never acquires. Track the last endpoint click for
+        # double-click detection, and whether a pending RowSelected came from the
+        # keyboard (Enter) rather than the mouse.
+        self._select_via_key = False
+        self._last_ep_click_row: int | None = None
+        self._last_ep_click_at = 0.0
 
     # -- layout ------------------------------------------------------------
 
@@ -1607,8 +1620,14 @@ class InferStackTUI(App):
         self._do_acquire(name)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # Enter on the endpoints table acquires that endpoint.
-        if event.data_table.id == 'endpoints':
+        # Enter on the endpoints table acquires that endpoint. A mouse click
+        # also raises RowSelected (when the clicked row is already the cursor),
+        # but we deliberately do NOT acquire on it — a lone click must not bring
+        # an endpoint up. The mouse path acquires only on a double-click, handled
+        # in on_mouse_down. `_select_via_key` distinguishes the two (set by
+        # on_key for Enter, cleared by on_mouse_down for any click).
+        if event.data_table.id == 'endpoints' and self._select_via_key:
+            self._select_via_key = False
             self.action_acquire()
 
     def on_data_table_row_highlighted(
@@ -1636,20 +1655,70 @@ class InferStackTUI(App):
                 f'deployment {g.id} ← held by {g.demand} lease(s): {who}'
             )
 
-    def on_click(self, event: events.Click) -> None:
-        # Resolve which dashboard element was clicked (walk up to a known id).
-        zone = None
+    def _zone_at(self, screen_x: int, screen_y: int) -> str | None:
+        """Which dashboard element is at this screen point (walk up to a known id)."""
         try:
-            node, _ = self.screen.get_widget_at(event.screen_x, event.screen_y)
+            node, _ = self.screen.get_widget_at(screen_x, screen_y)
         except Exception:  # noqa: BLE001
-            node = None
+            return None
         while node is not None:
             nid = getattr(node, 'id', None)
             if nid in ('leases', 'deployments', 'endpoints', 'api-urls'):
-                zone = nid
-                break
+                return nid
             node = getattr(node, 'parent', None)
+        return None
 
+    def on_key(self, event: events.Key) -> None:
+        # Mark that a pending endpoint RowSelected came from a deliberate Enter
+        # (not a mouse click), so it acquires on a single press. Passive: we
+        # never stop the event, so the DataTable's own Enter handling still runs.
+        if event.key == 'enter' and getattr(self.focused, 'id', None) == 'endpoints':
+            self._select_via_key = True
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Endpoint bring-up is gated on a double-click here (the App never sees a
+        # plain Click on a DataTable cell — the table stops it — but mouse-down
+        # still bubbles up). A lone click only highlights; two clicks on the same
+        # row within DOUBLE_CLICK_SECS acquire it.
+        self._select_via_key = False  # a mouse interaction is not a keyboard select
+        if self._zone_at(event.screen_x, event.screen_y) != 'endpoints':
+            self._last_ep_click_row = None
+            return
+        # Row under the pointer, straight from the rendered cell metadata
+        # (scroll-independent; -1 for the header, absent off the rows).
+        try:
+            row = event.style.meta.get('row')
+        except Exception:  # noqa: BLE001
+            row = None
+        if not isinstance(row, int) or not (0 <= row < len(self._endpoint_names)):
+            self._last_ep_click_row = None
+            return
+        # Ctrl/Cmd+click opens the served endpoint in the browser (never acquires).
+        if getattr(event, 'ctrl', False) or getattr(event, 'meta', False):
+            self._last_ep_click_row = None
+            self._open_endpoint(self._endpoint_names[row])
+            return
+        now = time.monotonic()
+        if (row == self._last_ep_click_row
+                and now - self._last_ep_click_at <= DOUBLE_CLICK_SECS):
+            self._last_ep_click_row = None
+            name = self._endpoint_names[row]
+            self._status(
+                f'acquiring {name}… (docker output appears in the logs pane)'
+            )
+            self._do_acquire(name)
+        else:
+            self._last_ep_click_row = row
+            self._last_ep_click_at = now
+            self._status(
+                f'{self._endpoint_names[row]} selected — '
+                'double-click or press Enter to acquire'
+            )
+
+    def on_click(self, event: events.Click) -> None:
+        # A Click on a DataTable cell is stopped by the table, so this only fires
+        # for the leases/deployments multi-select shim and the api-urls zone.
+        zone = self._zone_at(event.screen_x, event.screen_y)
         ctrl = getattr(event, 'ctrl', False) or getattr(event, 'meta', False)
         shift = getattr(event, 'shift', False)
 
@@ -1661,11 +1730,9 @@ class InferStackTUI(App):
             self._click_select(zone, table.cursor_row, shift=shift, ctrl=ctrl)
             return
 
-        # Ctrl+click a served endpoint / the API URLs -> open in the browser.
-        if ctrl and zone == 'endpoints':
-            self.action_open()
-            event.stop()
-        elif ctrl and zone == 'api-urls':
+        # Ctrl+click the API URLs -> open Open WebUI. (Endpoint ctrl+click is
+        # handled in on_mouse_down, since the table swallows the Click there.)
+        if ctrl and zone == 'api-urls':
             self.action_open_webui()
             event.stop()
 
@@ -1841,6 +1908,9 @@ class InferStackTUI(App):
         if not name:
             self._status('select an endpoint to open in the browser')
             return
+        self._open_endpoint(name)
+
+    def _open_endpoint(self, name: str) -> None:
         url = self._ui_url(name)
         if not url:
             self._status('no Open WebUI URL (compose backend only)')

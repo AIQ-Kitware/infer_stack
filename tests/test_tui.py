@@ -127,6 +127,100 @@ def test_tui_acquire_from_catalog_creates_a_lease():
     assert 'qwen-coder' in leases[0].endpoints      # first row, sorted
 
 
+def _endpoint_row_points(app):
+    """Screen (x, y) of each endpoint DataTable data row, keyed by row index.
+
+    Scans the rendered cell metadata so it's independent of header height and
+    scroll — the same mapping the click handler reads from ``event.style.meta``.
+    """
+    from textual.widgets import DataTable
+
+    reg = app.query_one('#endpoints', DataTable).region
+    points: dict[int, tuple[int, int]] = {}
+    for y in range(reg.y, reg.y + reg.height):
+        node, _ = app.screen.get_widget_at(reg.x + 2, y)
+        if getattr(node, 'id', None) != 'endpoints':
+            continue
+        row = app.screen.get_style_at(reg.x + 2, y).meta.get('row')
+        if isinstance(row, int) and row >= 0:
+            points.setdefault(row, (reg.x + 2, y))
+    return points
+
+
+def test_tui_single_click_highlights_but_does_not_acquire():
+    """A lone click must not bring an endpoint up (see double-click gate)."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            points = _endpoint_row_points(app)
+            await pilot.click(offset=points[0])
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert leases == []                              # nothing acquired
+
+
+def test_tui_double_click_acquires_from_any_row():
+    """Two quick clicks on the same row acquire it, even from an unfocused row."""
+    from infer_stack.leasing import LeaseState
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            points = _endpoint_row_points(app)
+            # row 1 is not the initial cursor row, so this also proves the
+            # gesture works without a prior "highlight" click.
+            await pilot.click(offset=points[1])
+            await pilot.click(offset=points[1])
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert len(leases) == 1                          # exactly one, no double-fire
+    assert leases[0].state == LeaseState.ACTIVE
+    assert 'qwen-fast' in leases[0].endpoints        # second row, sorted
+
+
+def test_tui_enter_still_acquires_selected_endpoint():
+    """The keyboard path keeps its single-press Enter-to-acquire behaviour."""
+    from infer_stack.leasing import LeaseState
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#endpoints').focus()
+            await pilot.press('enter')
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    leases, _ = controller.ledger.status()
+    assert len(leases) == 1
+    assert leases[0].state == LeaseState.ACTIVE
+    assert 'qwen-coder' in leases[0].endpoints
+
+
 def test_tui_panes_are_keyboard_resizable():
     from infer_stack.tui import InferStackTUI
 
