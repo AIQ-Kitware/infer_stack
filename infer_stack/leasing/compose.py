@@ -26,11 +26,8 @@ routable). The Ollama tag pull/warmup rung is a follow-up.
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import hashlib
 import json
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -43,7 +40,7 @@ from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
 from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import vllm_args
-from .backend import Readiness
+from .backend import ConvergeScaffold, Readiness
 from .models import Deployment
 from .placement import plan_placement
 
@@ -55,7 +52,6 @@ LITELLM_CONTAINER_PORT = 4000
 STATE_FILENAME = 'leasing-compose-state.json'
 COMPOSE_FILENAME = 'docker-compose.yml'
 LITELLM_CONFIG_FILENAME = 'litellm_config.yaml'
-LOCK_FILENAME = '.converge.lock'
 LITELLM_SERVICE = 'litellm'
 API_KEY_ENV = 'LITELLM_MASTER_KEY'
 
@@ -84,10 +80,14 @@ DEPLOYMENT_LABEL = 'infer-stack.deployment'
 ENGINE_LABEL = 'infer-stack.engine'
 
 
-def _dns_slug(text: str) -> str:
-    """A lowercase ``[a-z0-9-]`` label safe as a compose service/DNS name."""
+def dns_slug(text: str) -> str:
+    """A lowercase ``[a-z0-9-]`` label safe as a compose service / DNS /
+    Kubernetes object name (shared by the compose and kubeai backends)."""
     out = re.sub(r'[^a-z0-9]+', '-', str(text).lower()).strip('-')
     return out or 'model'
+
+
+_dns_slug = dns_slug  # historical internal name
 
 
 def vllm_service_name_for(served: str) -> str:
@@ -197,8 +197,10 @@ def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
     }
 
 
-def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
-    """Build the dict ``vllm_args`` consumes from a deployment's runtime spec."""
+def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
+    """Build the dict ``vllm_args`` consumes from a deployment's runtime spec
+    (shared by the compose and kubeai backends, so every serving knob renders
+    identically on both)."""
     runtime = deployment.spec.get('runtime', {}) or {}
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
@@ -230,6 +232,9 @@ def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'enable_prefix_caching': bool(runtime.get('enable_prefix_caching', False)),
         'extra_args': list(runtime.get('extra_args', []) or []),
     }
+
+
+_vllm_service_dict = vllm_service_dict  # historical internal name
 
 
 def _vllm_service(
@@ -1029,13 +1034,17 @@ def _parse_ps(out: str) -> set[str]:
     return running
 
 
-class ComposeBackend:
+class ComposeBackend(ConvergeScaffold):
     """Single-host docker compose backend (converge-style).
 
     Driven by the controller's ``converge`` path. ``run`` / ``http_get`` are the
     injected docker/HTTP seams; defaults shell out to ``docker compose`` and
-    ``requests``.
+    ``requests``. State-dir plumbing (atomic writes, the converge lock, the
+    sidecar, diff-confirm) comes from :class:`ConvergeScaffold`.
     """
+
+    _approve_title = 'infer-stack will update the compose project'
+    _state_noun = 'compose project'
 
     def __init__(
         self,
@@ -1156,28 +1165,6 @@ class ComposeBackend:
             write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
         return pw
 
-    @staticmethod
-    def _atomic_write(path: Path, text: str) -> None:
-        """Write ``text`` to ``path`` atomically (temp + ``os.replace``).
-
-        The render half (``converge(apply=False)``) and the apply half
-        (:meth:`apply`) run under *different* locks so a render can proceed while
-        another process applies. A reader (``apply`` / ``docker compose``) must
-        therefore never see a half-written file — ``os.replace`` swaps it in one
-        atomic step, so every read sees either the old or the new file whole.
-        """
-        tmp = path.with_name(f'{path.name}.tmp')
-        tmp.write_text(text)
-        os.replace(tmp, path)
-
-    def _load_sidecar(self) -> dict[str, Any]:
-        if self._state_file.exists():
-            return json.loads(self._state_file.read_text())
-        return {}
-
-    def _save_sidecar(self, data: dict[str, Any]) -> None:
-        self._atomic_write(self._state_file, json.dumps(data, indent=2))
-
     def _compose(self, args: list[str]) -> str:
         cmd = ['docker', 'compose']
         # Resolve ${LITELLM_MASTER_KEY} (and any other managed secret) from the
@@ -1190,50 +1177,6 @@ class ComposeBackend:
             cmd += ['--env-file', str(self._env_path)]
         cmd += ['-p', self.project, '-f', str(self.compose_file)]
         return self.run([*cmd, *args])
-
-    @contextlib.contextmanager
-    def _converge_lock(self):
-        """Serialize converge across processes sharing this state dir."""
-        handle = open(self.state_dir / LOCK_FILENAME, 'w')
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-            handle.close()
-
-    def _approve_changes(self, planned: dict[Path, str]) -> None:
-        """Show pending compose/litellm changes and confirm them.
-
-        ``planned`` maps target paths to their new content. When nothing
-        actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
-        non-interactive / ``--yes``), it applies after a one-line log. Otherwise
-        it renders a per-file diff and prompts; a decline raises
-        :class:`ConvergeAborted` so the caller can roll back.
-        """
-        from .._log import logger
-        from .backend import ConvergeAborted
-
-        changed = {
-            p: text
-            for p, text in planned.items()
-            if (p.read_text() if p.exists() else '') != text
-        }
-        if not changed:
-            logger.debug('compose project already up to date')
-            return
-        names = ', '.join(p.name for p in changed)
-        if self.assume_yes:
-            logger.info('Updating compose project ({})', names)
-            return
-        from ..diff_prompt import confirm_writes
-
-        if not confirm_writes(
-            changed,
-            assume_yes=False,
-            title='infer-stack will update the compose project',
-        ):
-            raise ConvergeAborted('compose changes were not approved')
 
     def plan(self, desired: list[Deployment]):
         """Compute GPU placement for ``desired`` without writing or applying.

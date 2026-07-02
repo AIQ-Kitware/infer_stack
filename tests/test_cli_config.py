@@ -138,3 +138,17 @@ def test_backend_setting_resolved_by_make_backend(tmp_path, monkeypatch):
     # Explicit --backend still wins (null overrides the setting)
     cfg = AcquireCLI.cli(argv=['e', '--backend', 'null'], strict=False)
     assert type(mod._make_backend(cfg)).__name__ == 'NullBackend'
+
+
+def test_config_set_recognizes_backend_settings(tmp_path, monkeypatch, capsys):
+    """kubeai_* keys are recognized by `config set` (no unknown-key warning)
+    without `config init` prompting for them."""
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    from infer_stack.cli.commands_meta import ConfigSetCLI
+    from infer_stack.paths import get_setting, set_data_root
+
+    set_data_root(None)
+    ConfigSetCLI.main(argv=['kubeai_namespace', 'serving'])
+    out = capsys.readouterr().out
+    assert 'warning' not in out
+    assert get_setting('kubeai_namespace') == 'serving'

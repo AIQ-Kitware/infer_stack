@@ -371,3 +371,127 @@ def test_keep_warm_stays_resident_after_release(tmp_path):
     assert set(kubectl.applied) == {'qwen'}   # idle keep-warm stays up
     ctl.evict(None)
     assert kubectl.applied == {}              # evict frees the cluster
+
+# -- edge cases / preflight ----------------------------------------------------
+
+
+def test_converge_decline_raises_converge_aborted(tmp_path, monkeypatch):
+    """assume_yes=False + a declined diff must raise ConvergeAborted (which the
+    controller turns into a full lease rollback)."""
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    be, kubectl = make_backend(tmp_path, assume_yes=False)
+    monkeypatch.setattr(
+        'infer_stack.diff_prompt.confirm_writes',
+        lambda *a, **kw: False,
+    )
+    with pytest.raises(ConvergeAborted):
+        be.converge([vllm('grp-a', served='qwen')])
+    assert kubectl.applied == {}          # nothing reached the cluster
+
+
+def test_apply_failure_carries_setup_hint(tmp_path):
+    """A kubectl apply failure must say what to check, not just traceback."""
+    calls = []
+
+    def kubectl(args):
+        calls.append(args)
+        if len(args) > 3 and args[3] == 'apply':
+            raise RuntimeError('the server could not find the requested resource')
+        return json.dumps({'items': []})
+
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=object())
+    with pytest.raises(RuntimeError, match='KubeAI chart installed'):
+        be.converge([vllm('grp-a', served='qwen')])
+
+
+def test_corrupt_sidecar_degrades_gracefully(tmp_path):
+    be, _ = make_backend(tmp_path)
+    be.converge([vllm('grp-a', served='qwen')])
+    be._state_file.write_text('{not json')
+    info = be.access(['grp-a'])
+    # falls back to the slug-of-endpoint guess rather than crashing
+    assert info['request_names'] == {'grp-a': 'grp-a'}
+    be.apply()  # and apply still works (prunes against an empty wanted-set...
+    # ...which would drop qwen; the next converge re-renders it. No crash is
+    # the contract here.)
+
+
+def test_probe_not_ready_when_gateway_down(tmp_path):
+    class DownHttp:
+        def get(self, url, **kw):
+            raise ConnectionError('refused')
+
+        def post(self, url, **kw):
+            raise ConnectionError('refused')
+
+    kubectl = FakeKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=DownHttp())
+    dep = vllm('grp-a', served='qwen')
+    be.converge([dep])
+    ready = be.probe_ready(dep, 'grp-a')
+    assert not ready.ready
+
+
+def test_doctor_all_green(tmp_path):
+    be, kubectl = make_backend(tmp_path)
+    checks = be.doctor()
+    assert all(ok for _, ok, _ in checks), checks
+    names = [c[0] for c in checks]
+    assert any('cluster' in n for n in names)
+    assert any('CRD' in n for n in names)
+    assert any('gateway' in n for n in names)
+
+
+def test_doctor_stops_at_first_missing_dependency(tmp_path):
+    def no_cluster(args):
+        raise RuntimeError('connection refused')
+
+    be = KubeaiBackend(state_dir=tmp_path, run=no_cluster, http=object())
+    checks = be.doctor()
+    assert checks[0][1] is False
+    assert 'kubeconfig' in checks[0][2]
+    assert len(checks) == 1               # later checks would only cascade
+
+
+def test_doctor_reports_gateway_down(tmp_path):
+    class DownHttp:
+        def get(self, url, **kw):
+            raise ConnectionError('refused')
+
+    kubectl = FakeKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=DownHttp())
+    checks = be.doctor()
+    gateway = [c for c in checks if c[0].startswith('gateway')][0]
+    assert gateway[1] is False
+    assert 'port-forward' in gateway[2]
+
+
+def test_doctor_cli_exit_codes(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.cli.commands_runtime import DoctorCLI
+
+    kubectl = FakeKubectl()
+    be = KubeaiBackend(
+        state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl),
+    )
+    monkeypatch.setattr(cl, '_make_backend', lambda config, **kw: be)
+    assert DoctorCLI.main(argv=[]) == 0
+    assert 'all checks passed' in capsys.readouterr().out
+
+    be.run = lambda args: (_ for _ in ()).throw(RuntimeError('down'))
+    assert DoctorCLI.main(argv=[]) == 1
+    out = capsys.readouterr().out
+    assert 'FAIL' in out
+
+
+def test_doctor_cli_backends_without_preflight(monkeypatch, capsys):
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.cli.commands_runtime import DoctorCLI
+    from infer_stack.leasing import NullBackend
+
+    monkeypatch.setattr(
+        cl, '_make_backend', lambda config, **kw: NullBackend()
+    )
+    assert DoctorCLI.main(argv=[]) == 0
+    assert 'nothing to verify' in capsys.readouterr().out

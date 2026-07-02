@@ -31,24 +31,20 @@ uses, and a route to the gateway (the default ``base_url`` assumes
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
-from ..leasing.backend import Readiness
-from ..leasing.compose import _dns_slug, _vllm_service_dict
+from ..leasing.backend import ConvergeScaffold, Readiness
+from ..leasing.compose import dns_slug, vllm_service_dict
 from ..leasing.models import Deployment
 from ..probe import openai_ready
 from ..profile_runtime import vllm_args
 
 MODELS_FILENAME = 'models.yaml'
 STATE_FILENAME = 'leasing-kubeai-state.json'
-LOCK_FILENAME = '.converge.lock'
 MANAGED_LABEL = 'infer-stack/managed'
 DEPLOYMENT_LABEL = 'infer-stack/deployment'
 DEFAULT_NAMESPACE = 'kubeai'
@@ -64,7 +60,7 @@ def model_name_for(served: str) -> str:
     is identical across releases/re-acquires of the same endpoint — the request
     name clients use through the KubeAI gateway never changes.
     """
-    return _dns_slug(served)
+    return dns_slug(served)
 
 
 def _served_name(deployment: Deployment) -> str:
@@ -96,7 +92,7 @@ def _model_doc(
     gateway's request name and vLLM's served name agree.
     """
     name = model_name_for(_served_name(deployment))
-    svc = _vllm_service_dict(deployment)
+    svc = vllm_service_dict(deployment)
     svc['served_model_name'] = name
     profile = resource_profile
     if ':' not in profile:
@@ -208,18 +204,37 @@ def render_models(
 
 
 def _default_kubectl_run(args: list[str]) -> str:
+    """Run kubectl, returning stdout; a failure raises with stderr attached.
+
+    ``check_output`` alone would lose kubectl's actual complaint ("connection
+    refused", "the server doesn't have a resource type models") — exactly the
+    text needed to debug a cluster that isn't set up yet.
+    """
     import subprocess
 
-    return subprocess.check_output(args, text=True, timeout=120)
+    proc = subprocess.run(
+        args, capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or '').strip()
+        raise RuntimeError(
+            f'{" ".join(args)} failed ({proc.returncode}): {detail[:500]}'
+        )
+    return proc.stdout
 
 
-class KubeaiBackend:
+class KubeaiBackend(ConvergeScaffold):
     """Cluster KubeAI backend (converge-style).
 
     Driven by the controller's ``converge`` path exactly like
     :class:`ComposeBackend`. ``run`` / ``http`` are the injected kubectl/HTTP
-    seams; defaults shell out to ``kubectl`` and ``requests``.
+    seams; defaults shell out to ``kubectl`` and ``requests``. State-dir
+    plumbing (atomic writes, the converge lock, the sidecar, diff-confirm)
+    comes from :class:`ConvergeScaffold`.
     """
+
+    _approve_title = 'infer-stack will update the KubeAI models'
+    _state_noun = 'kubeai manifests'
 
     def __init__(
         self,
@@ -258,56 +273,6 @@ class KubeaiBackend:
     @property
     def _state_file(self) -> Path:
         return self.state_dir / STATE_FILENAME
-
-    @staticmethod
-    def _atomic_write(path: Path, text: str) -> None:
-        tmp = path.with_name(f'{path.name}.tmp')
-        tmp.write_text(text)
-        os.replace(tmp, path)
-
-    def _load_sidecar(self) -> dict[str, Any]:
-        if self._state_file.exists():
-            try:
-                return json.loads(self._state_file.read_text())
-            except json.JSONDecodeError:
-                return {}
-        return {}
-
-    @contextlib.contextmanager
-    def _converge_lock(self):
-        handle = open(self.state_dir / LOCK_FILENAME, 'w')
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-            handle.close()
-
-    def _approve_changes(self, planned: dict[Path, str]) -> None:
-        """Diff + confirm pending manifest changes (compose parity)."""
-        from .._log import logger
-        from ..leasing.backend import ConvergeAborted
-
-        changed = {
-            p: text
-            for p, text in planned.items()
-            if (p.read_text() if p.exists() else '') != text
-        }
-        if not changed:
-            logger.debug('kubeai manifests already up to date')
-            return
-        names = ', '.join(p.name for p in changed)
-        if self.assume_yes:
-            logger.info('Updating kubeai manifests ({})', names)
-            return
-        from ..diff_prompt import confirm_writes
-
-        if not confirm_writes(
-            changed,
-            assume_yes=False,
-            title='infer-stack will update the KubeAI models',
-        ):
-            raise ConvergeAborted('kubeai changes were not approved')
 
     # -- kubectl plumbing ------------------------------------------------------
 
@@ -366,15 +331,11 @@ class KubeaiBackend:
                 logger.warning('  render: {}', err)
             self._approve_changes({self.models_file: rendered.text})
             self._atomic_write(self.models_file, rendered.text)
-            self._atomic_write(
-                self._state_file,
-                json.dumps(
-                    {
-                        'models': rendered.models,
-                        'request_names': rendered.request_names,
-                    },
-                    indent=2,
-                ),
+            self._save_sidecar(
+                {
+                    'models': rendered.models,
+                    'request_names': rendered.request_names,
+                }
             )
             if not apply:
                 logger.info(
@@ -496,3 +457,59 @@ class KubeaiBackend:
             self._kubectl(
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
+
+    # -- preflight -------------------------------------------------------------
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        """Preflight the cluster prerequisites: ``(check, ok, detail)`` rows.
+
+        Everything ``acquire`` needs, checked cheaply and in dependency order,
+        so a fresh setup fails as a checklist instead of a mid-acquire
+        traceback: cluster reachable -> KubeAI CRD installed -> namespace
+        exists -> gateway answering at ``base_url``. Never raises.
+        """
+        checks: list[tuple[str, bool, str]] = []
+
+        def _run_check(name: str, args: list[str], hint: str) -> bool:
+            try:
+                self.run(['kubectl', *args])
+            except Exception as ex:  # noqa: BLE001 - report, don't raise
+                checks.append((name, False, f'{ex} — {hint}'))
+                return False
+            checks.append((name, True, ''))
+            return True
+
+        if not _run_check(
+            'cluster reachable',
+            ['version', '--client=false', '-o', 'json'],
+            'is the kubeconfig set up? (scripts/bootstrap_k3s.sh)',
+        ):
+            return checks
+        if not _run_check(
+            'KubeAI Model CRD installed',
+            ['get', 'crd', 'models.kubeai.org', '-o', 'name'],
+            'install the chart: scripts/install_kubeai.sh',
+        ):
+            return checks
+        _run_check(
+            f'namespace {self.namespace!r} exists',
+            ['get', 'namespace', self.namespace, '-o', 'name'],
+            f'kubectl create namespace {self.namespace} (or install the '
+            'chart there)',
+        )
+        try:
+            resp = self.http.get(f'{self.base_url}/models', timeout=10)
+            code = getattr(resp, 'status_code', 0)
+            ok = code == 200
+            detail = '' if ok else (
+                f'HTTP {code} from {self.base_url}/models'
+            )
+        except Exception as ex:  # noqa: BLE001 - report, don't raise
+            ok = False
+            detail = (
+                f'{ex} — is the gateway routed? e.g. '
+                f'`kubectl -n {self.namespace} port-forward svc/kubeai '
+                '8000:80` (or set kubeai_base_url)'
+            )
+        checks.append((f'gateway at {self.base_url}', ok, detail))
+        return checks

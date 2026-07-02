@@ -347,7 +347,22 @@ _SETTINGS: tuple[_Setting, ...] = (
 )
 
 # Keys the leasing world actually honors (others are allowed but warned about).
+# `config init` prompts for and persists exactly these.
 KNOWN_SETTINGS = {s.key: s.help for s in _SETTINGS}
+# Backend-specific keys `config init` does not prompt for but `config set`
+# recognizes without a warning (see docs/kubeai-backend.md).
+BACKEND_SETTINGS = {
+    'kubeai_namespace':
+        'Kubernetes namespace the KubeAI chart is installed in '
+        '(default: kubeai).',
+    'kubeai_base_url':
+        'KubeAI gateway OpenAI base URL (default: '
+        'http://127.0.0.1:8000/openai/v1 — the '
+        '`kubectl port-forward svc/kubeai 8000:80` shape).',
+    'kubeai_resource_profile':
+        'Fallback KubeAI resourceProfiles name for catalog endpoints whose '
+        'runtime omits resource_profile.',
+}
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -487,9 +502,10 @@ class ConfigSetCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
         if not config.key or config.value is None:
             raise SystemExit('config set: KEY and VALUE are required')
-        if config.key not in KNOWN_SETTINGS:
+        if config.key not in KNOWN_SETTINGS and config.key not in BACKEND_SETTINGS:
+            known = sorted({**KNOWN_SETTINGS, **BACKEND_SETTINGS})
             print(f"warning: '{config.key}' is not a recognized setting "
-                  f'(known: {", ".join(sorted(KNOWN_SETTINGS))})')
+                  f'(known: {", ".join(known)})')
         settings = load_settings()
         settings[config.key] = yaml.safe_load(config.value)
         path = save_settings(settings)

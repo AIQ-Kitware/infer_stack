@@ -37,7 +37,7 @@ def openai_ready(
     headers = headers or {}
     try:
         models_resp = http.get(f'{base_url}/models', headers=headers, timeout=10)
-    except requests.exceptions.RequestException as ex:
+    except Exception as ex:  # noqa: BLE001 - a probe reports, never raises
         return False, f'/models not reachable yet: {ex}'
     if models_resp.status_code >= 400:
         body = (models_resp.text or '').strip()
@@ -74,7 +74,7 @@ def openai_ready(
         endpoint = f'{base_url}/chat/completions'
     try:
         resp = http.post(endpoint, headers=headers, json=payload, timeout=45)
-    except requests.exceptions.RequestException as ex:
+    except Exception as ex:  # noqa: BLE001 - a probe reports, never raises
         return False, f'{endpoint} not serving yet: {ex}'
     if resp.status_code >= 400:
         body = (resp.text or '').strip()
@@ -99,7 +99,7 @@ def ollama_ready(
     http = http if http is not None else requests
     try:
         tags_resp = http.get(f'{base_url}/api/tags', timeout=10)
-    except requests.exceptions.RequestException as ex:
+    except Exception as ex:  # noqa: BLE001 - a probe reports, never raises
         return False, f'/api/tags not reachable yet: {ex}'
     if tags_resp.status_code >= 400:
         body = (tags_resp.text or '').strip()
@@ -130,7 +130,7 @@ def ollama_ready(
     }
     try:
         resp = http.post(f'{base_url}/api/chat', json=payload, timeout=45)
-    except requests.exceptions.RequestException as ex:
+    except Exception as ex:  # noqa: BLE001 - a probe reports, never raises
         return False, f'/api/chat not serving yet: {ex}'
     if resp.status_code >= 400:
         body = (resp.text or '').strip()

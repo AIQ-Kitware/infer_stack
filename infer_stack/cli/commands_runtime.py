@@ -42,9 +42,17 @@ def _day2_compose_base(config, command: str) -> list[str]:
     _apply_path_overrides(config)
     compose_file = _leasing_compose_file()
     if not compose_file.exists():
+        hint = ''
+        if (get_setting('backend') or '') == 'kubeai':
+            hint = (
+                ' Note: the configured backend is kubeai — these verbs manage '
+                'the docker compose stack only; inspect the cluster with '
+                '`infer-stack doctor` / `kubectl -n <namespace> get models`.'
+            )
         raise SystemExit(
             f'nothing deployed yet (no {compose_file}). '
-            'Bring a model up first, e.g. `infer-stack acquire <endpoint>`.'
+            f'Bring a model up first, e.g. `infer-stack acquire <endpoint>`.'
+            f'{hint}'
         )
     return [
         'docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file)
@@ -439,3 +447,47 @@ class StackModalCLI(scfg.ModalCLI):
     start = StartCLI
     stop = StopCLI
     down = StackDownCLI
+
+
+class DoctorCLI(_PathOverridesMixin):
+    """Preflight the configured backend: is everything acquire needs in place?
+
+    Runs the backend's cheap dependency-ordered checks (for kubeai: cluster
+    reachable -> KubeAI CRD installed -> namespace exists -> gateway
+    answering) and prints a checklist. Exits nonzero if any check fails, so
+    scripts can gate on it. Backends without a preflight (null/compose) report
+    that there is nothing to check.
+    """
+
+    __command__ = 'doctor'
+
+    backend = scfg.Value(
+        None, type=str,
+        help='Backend to check (default: the configured `backend` setting).',
+    )
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        from .commands_leasing import _make_backend
+
+        backend = _make_backend(config)
+        doctor = getattr(backend, 'doctor', None)
+        name = type(backend).__name__
+        if doctor is None:
+            print(f'{name}: no preflight checks defined — nothing to verify.')
+            return 0
+        failed = 0
+        for check, ok, detail in doctor():
+            mark = 'ok  ' if ok else 'FAIL'
+            line = f'[{mark}] {check}'
+            if detail:
+                line += f' — {detail}'
+            print(line)
+            failed += 0 if ok else 1
+        if failed:
+            print(f'{failed} check(s) failed')
+            return 1
+        print('all checks passed')
+        return 0

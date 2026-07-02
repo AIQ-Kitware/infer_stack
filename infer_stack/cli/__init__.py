@@ -59,6 +59,7 @@ from .commands_meta import (
     VersionCLI,
 )
 from .commands_runtime import (
+    DoctorCLI,
     LogsCLI,
     PsCLI,
     StackModalCLI,
@@ -107,6 +108,7 @@ class ManageCLI(scfg.ModalCLI):
     config = ConfigModalCLI
     paths = ConfigPathsCLI  # top-level alias for `config paths`
     status = StatusCLI
+    doctor = DoctorCLI  # preflight the configured backend's prerequisites
 
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI

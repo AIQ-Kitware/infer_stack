@@ -71,6 +71,13 @@ endpoints:
       resource_profile: nvidia-gpu-rtx-4090   # -> nvidia-gpu-rtx-4090:2
 ```
 
+Verify the setup before the first acquire — `doctor` checks the chain in
+dependency order (cluster reachable → CRD installed → namespace → gateway):
+
+```bash
+infer-stack doctor
+```
+
 Then the normal verbs just work:
 
 ```bash
@@ -98,3 +105,6 @@ infer-stack release --env-file lease.env
   (default 1/1 — the lease lifecycle, not the autoscaler, decides residency).
 - The legacy profile-era renderer (`infer_stack/backends/kubeai_renderer.py`,
   `kubeai_ops.py`) is superseded by this backend and kept only for reference.
+- `dev/kubeai_e2e.sh` runs the full lifecycle (doctor → acquire → generation
+  through the gateway → release → prune-verified) against a real cluster with
+  an isolated config/data root; use it as the first smoke test on new setups.

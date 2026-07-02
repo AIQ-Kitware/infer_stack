@@ -82,6 +82,135 @@ class Backend(Protocol):
         ...
 
 
+@runtime_checkable
+class ConvergeBackend(Backend, Protocol):
+    """The optional converge-style surface the controller prefers.
+
+    A backend exposing these drives the render/apply split: the controller
+    calls ``converge(desired, apply=False)`` inside the render lock (fast,
+    writes on-disk state only) and ``apply()`` under the separate apply lock
+    (slow, coalesced across processes via the ledger generation). After a
+    converge the controller reads the three ``last_*`` attributes:
+
+    * ``last_unplaced`` — desired deployment ids the render/placement could not
+      deliver; an acquire whose deployment lands here fails loudly
+      (:class:`PlacementError`) and rolls its lease back.
+    * ``last_errors`` — per-deployment reasons, each prefixed with the
+      deployment id.
+    * ``last_assignments`` — deployment id -> GPU indices (empty for backends
+      where the cluster schedules).
+
+    Backends without this surface fall back to the per-deployment
+    ``realize``/``teardown`` path in :meth:`Controller._render`.
+    """
+
+    last_unplaced: set[str]
+    last_errors: list[str]
+    last_assignments: dict[str, list[int]]
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True):
+        """Render the desired set to backend state; optionally apply it."""
+        ...
+
+    def apply(self) -> None:
+        """Converge reality to the last render (idempotent, slow half)."""
+        ...
+
+
+class ConvergeScaffold:
+    """Shared state-dir plumbing for converge-style backends.
+
+    Hosts the pieces ComposeBackend and KubeaiBackend would otherwise copy:
+    atomic writes (a concurrent ``apply`` must never read a half-written
+    render), the per-state-dir converge flock, the tolerant JSON sidecar, and
+    the diff-confirm gate. Subclasses set ``state_dir``, ``assume_yes``, a
+    ``_state_file`` property, and may override ``_approve_title`` /
+    ``_state_noun`` for their prompt/log wording.
+    """
+
+    CONVERGE_LOCK_FILENAME = '.converge.lock'
+    _approve_title = 'infer-stack will update the rendered state'
+    _state_noun = 'rendered state'
+
+    @staticmethod
+    def _atomic_write(path, text: str) -> None:
+        """Write atomically (temp + ``os.replace``): the render half and the
+        apply half run under different locks, so a reader must see either the
+        old or the new file whole, never a torn one."""
+        import os
+
+        tmp = path.with_name(f'{path.name}.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
+    def _converge_lock(self):
+        """Serialize converge across processes sharing this state dir."""
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def _lock():
+            handle = open(self.state_dir / self.CONVERGE_LOCK_FILENAME, 'w')
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.close()
+
+        return _lock()
+
+    def _load_sidecar(self) -> dict:
+        """The render-time bookkeeping sidecar (tolerant: a corrupt/absent
+        file reads as empty rather than bricking every verb)."""
+        import json
+
+        state_file = self._state_file
+        if state_file.exists():
+            try:
+                return json.loads(state_file.read_text())
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _save_sidecar(self, data: dict) -> None:
+        import json
+
+        self._atomic_write(self._state_file, json.dumps(data, indent=2))
+
+    def _approve_changes(self, planned: dict) -> None:
+        """Show pending rendered-state changes and confirm them.
+
+        ``planned`` maps target paths to their new content. When nothing
+        actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
+        non-interactive / ``--yes``), it applies after a one-line log.
+        Otherwise it renders a per-file diff and prompts; a decline raises
+        :class:`ConvergeAborted` so the caller can roll back.
+        """
+        from .._log import logger
+
+        changed = {
+            p: text
+            for p, text in planned.items()
+            if (p.read_text() if p.exists() else '') != text
+        }
+        if not changed:
+            logger.debug('{} already up to date', self._state_noun)
+            return
+        names = ', '.join(p.name for p in changed)
+        if self.assume_yes:
+            logger.info('Updating {} ({})', self._state_noun, names)
+            return
+        from ..diff_prompt import confirm_writes
+
+        if not confirm_writes(
+            changed, assume_yes=False, title=self._approve_title
+        ):
+            raise ConvergeAborted(
+                f'{self._state_noun} changes were not approved'
+            )
+
+
 class MemoryBackend:
     """In-memory backend that records calls and has configurable readiness.
 
