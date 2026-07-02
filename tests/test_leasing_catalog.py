@@ -192,3 +192,27 @@ def test_catalog_bundle_distinct_models(catalog):
     ledger = Ledger(SqliteStore(':memory:'))
     res = ledger.acquire('alice', catalog.resolve_names(['draft-and-verify']))
     assert len({g.id for g in res.deployments}) == 2
+
+
+def test_resolve_vllm_carries_model_knobs_into_spec():
+    """Regression: model-level revision/quantization/dtype went into the compat
+    key but not the spec, so the renderer could never emit them."""
+    cat = Catalog.from_dict({
+        'models': {
+            'q-awq': {
+                'source': 'hf://Qwen/Q-AWQ',
+                'revision': 'v1.2',
+                'quantization': 'awq',
+                'dtype': 'half',
+            },
+        },
+        'endpoints': {
+            'q': {'model': 'q-awq', 'engine': 'vllm'},
+        },
+    })
+    req = cat.resolve_endpoint('q')
+    assert req.spec['revision'] == 'v1.2'
+    assert req.spec['quantization'] == 'awq'
+    assert req.spec['dtype'] == 'half'
+    # and they stay structural (distinct deployments per quantization)
+    assert req.structural['quantization'] == 'awq'

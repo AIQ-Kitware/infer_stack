@@ -199,7 +199,17 @@ def _vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
     return {
         'served_model_name': served,
         'tensor_parallel_size': int(runtime.get('tensor_parallel_size', 1) or 1),
+        'pipeline_parallel_size': int(
+            runtime.get('pipeline_parallel_size', 1) or 1
+        ),
         'data_parallel_size': int(runtime.get('data_parallel_size', 1) or 1),
+        # Model-level knobs (compat-key members; see catalog._resolve_vllm).
+        'revision': deployment.spec.get('revision'),
+        'quantization': deployment.spec.get('quantization'),
+        'dtype': deployment.spec.get('dtype'),
+        'chat_template': runtime.get('chat_template'),
+        'trust_remote_code': bool(runtime.get('trust_remote_code', False)),
+        'image': runtime.get('image'),
         'max_model_len': runtime.get('max_model_len', VLLM_DEFAULTS['max_model_len']),
         'gpu_memory_utilization': runtime.get(
             'gpu_memory_utilization', VLLM_DEFAULTS['gpu_memory_utilization']
@@ -232,7 +242,9 @@ def _vllm_service(
         *vllm_args(svc),
     ]
     service: dict[str, Any] = {
-        'image': images['vllm'],
+        # A runtime image override is structural (distinct deployments), so it
+        # must also pick the container image — like _ollama_service does.
+        'image': svc.get('image') or images['vllm'],
         'command': command,
         'environment': {'HF_TOKEN': '${HF_TOKEN:-}'},
         'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],

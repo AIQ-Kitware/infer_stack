@@ -7,12 +7,26 @@ def vllm_args(service: dict[str, Any]) -> list[str]:
     args = [
         f'--served-model-name={service["served_model_name"]}',
         f'--tensor-parallel-size={service["tensor_parallel_size"]}',
+        # .get: older KubeAI lock data predates these keys.
+        f'--pipeline-parallel-size={service.get("pipeline_parallel_size", 1)}',
         f'--data-parallel-size={service["data_parallel_size"]}',
         f'--max-model-len={service["max_model_len"]}',
         f'--gpu-memory-utilization={service["gpu_memory_utilization"]}',
         f'--max-num-batched-tokens={service["max_num_batched_tokens"]}',
         f'--max-num-seqs={service["max_num_seqs"]}',
     ]
+    # Optional model-serving knobs: emitted only when set, so a knob-less
+    # service keeps vLLM's own defaults (revision=main, dtype=auto, ...).
+    if service.get('revision'):
+        args.append(f'--revision={service["revision"]}')
+    if service.get('quantization'):
+        args.append(f'--quantization={service["quantization"]}')
+    if service.get('dtype'):
+        args.append(f'--dtype={service["dtype"]}')
+    if service.get('chat_template'):
+        args.append(f'--chat-template={service["chat_template"]}')
+    if service.get('trust_remote_code'):
+        args.append('--trust-remote-code')
     if service.get('enable_prefix_caching'):
         args.append('--enable-prefix-caching')
     if service.get('enable_auto_tool_choice'):

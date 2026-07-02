@@ -147,6 +147,66 @@ def test_render_vllm_service():
     assert rc.services == {name: 'grp-a'}
 
 
+def test_render_vllm_serving_knobs_reach_the_command():
+    """Regression: revision/quantization/dtype/pp/chat_template/trust_remote_code
+    /image were hashed into the compat key (distinct deployments) but silently
+    dropped from the rendered command — `quantization: awq` served the
+    full-precision `main` revision and OOM'd with no warning."""
+    from infer_stack.leasing.models import DeploymentState
+
+    deployment = Deployment(
+        'grp-k', 'ck-k', 'vllm', 'shared-compatible', {},
+        {
+            'engine': 'vllm',
+            'hf_model_id': 'Qwen/Q-AWQ',
+            'served_model_name': 'qwen-awq',
+            'revision': 'v1.2',
+            'quantization': 'awq',
+            'dtype': 'half',
+            'runtime': {
+                'tensor_parallel_size': 1,
+                'pipeline_parallel_size': 2,
+                'chat_template': '/templates/chatml.jinja',
+                'trust_remote_code': True,
+                'image': 'vllm/vllm-openai:nightly',
+            },
+            'reclaim': 'keep-warm',
+        },
+        {'grp-k': {'served_model_name': 'qwen-awq'}},
+        DeploymentState.LIVE, 0.0, 0.0,
+    )
+    rc = render_compose(
+        [deployment], {'grp-k': [0, 1]},
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    cmd = svc['command']
+    assert '--revision=v1.2' in cmd
+    assert '--quantization=awq' in cmd
+    assert '--dtype=half' in cmd
+    assert '--pipeline-parallel-size=2' in cmd
+    assert '--chat-template=/templates/chatml.jinja' in cmd
+    assert '--trust-remote-code' in cmd
+    assert svc['image'] == 'vllm/vllm-openai:nightly'
+
+
+def test_render_vllm_omits_unset_serving_knobs():
+    """A knob-less service keeps vLLM's own defaults: no --revision /
+    --quantization / --dtype / --chat-template / --trust-remote-code emitted."""
+    deployment = vllm('grp-a', hf='Qwen/Q', served='qwen')
+    rc = render_compose(
+        [deployment], {'grp-a': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    cmd = rc.compose['services'][vllm_service_name(deployment)]['command']
+    assert not any(a.startswith('--revision') for a in cmd)
+    assert not any(a.startswith('--quantization') for a in cmd)
+    assert not any(a.startswith('--dtype') for a in cmd)
+    assert not any(a.startswith('--chat-template') for a in cmd)
+    assert '--trust-remote-code' not in cmd
+    assert '--pipeline-parallel-size=1' in cmd
+
+
 def test_render_two_vllm_distinct_ports():
     a, b = vllm('a', served='aa', t=0), vllm('b', served='bb', t=1)
     rc = render_compose(

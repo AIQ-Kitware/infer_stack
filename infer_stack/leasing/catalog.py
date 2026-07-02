@@ -382,6 +382,13 @@ class Catalog:
             'engine': VLLM,
             'hf_model_id': model.hf_model_id,
             'served_model_name': served_name,
+            # Model-level serving knobs: they are part of the compat key above
+            # (they distinguish deployments), so they MUST also reach the
+            # rendered command — a deployment keyed on quantization=awq that
+            # serves the full-precision default would OOM with no warning.
+            'revision': model.revision,
+            'quantization': model.quantization,
+            'dtype': model.dtype,
             'runtime': dict(rt),
             'reclaim': ep.reclaim,
         }
