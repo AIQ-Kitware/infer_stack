@@ -70,11 +70,12 @@ def available_indices(
 
 
 def required_gpu_count(deployment: Deployment) -> int:
-    """GPUs a vLLM deployment needs = tensor_parallel × data_parallel."""
+    """GPUs a vLLM deployment needs = tensor × pipeline × data parallelism."""
     runtime = deployment.spec.get('runtime', {}) or {}
     tp = int(runtime.get('tensor_parallel_size', 1) or 1)
+    pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
     dp = int(runtime.get('data_parallel_size', 1) or 1)
-    return max(1, tp * dp)
+    return max(1, tp * pp * dp)
 
 
 def explicit_indices(deployment: Deployment) -> list[int] | None:

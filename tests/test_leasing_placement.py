@@ -7,8 +7,10 @@ from infer_stack.leasing import plan_placement
 from infer_stack.leasing.models import Deployment, DeploymentState
 
 
-def vllm(gid, *, tp=1, dp=1, gpu_indices=None, t=0.0):
-    runtime = {'tensor_parallel_size': tp, 'data_parallel_size': dp}
+def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None, t=0.0):
+    runtime = {'tensor_parallel_size': tp,
+               'pipeline_parallel_size': pp,
+               'data_parallel_size': dp}
     if gpu_indices is not None:
         runtime['gpu_indices'] = gpu_indices
     return Deployment(
@@ -51,6 +53,15 @@ def test_tensor_parallel_spans_gpus():
 def test_data_parallel_multiplies_count():
     plan = plan_placement([vllm('a', tp=2, dp=2)], inv())
     assert plan.assignments == {'a': [0, 1, 2, 3]}
+
+
+def test_pipeline_parallel_multiplies_count():
+    """Regression: pp was ignored, so a tp=1,pp=2 deployment got ONE GPU and
+    vLLM crashed with insufficient devices (or ran unsharded and OOM'd)."""
+    plan = plan_placement([vllm('a', tp=1, pp=2)], inv())
+    assert plan.assignments == {'a': [0, 1]}
+    plan = plan_placement([vllm('b', tp=2, pp=2)], inv())
+    assert plan.assignments == {'b': [0, 1, 2, 3]}
 
 
 def test_insufficient_gpus_errors():

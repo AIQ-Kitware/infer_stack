@@ -368,6 +368,7 @@ class Catalog:
             dtype=model.dtype,
             tensor_parallel_size=rt.get('tensor_parallel_size', 1),
             pipeline_parallel_size=rt.get('pipeline_parallel_size', 1),
+            data_parallel_size=rt.get('data_parallel_size', 1),
             image=rt.get('image'),
             chat_template=rt.get('chat_template'),
             trust_remote_code=rt.get('trust_remote_code', False),

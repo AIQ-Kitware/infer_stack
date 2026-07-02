@@ -22,7 +22,9 @@ def _kubeai_resource_profile(service: dict[str, Any]) -> str:
     gpu_count = max(
         1,
         len(service.get('gpu_indices', [])),
-        int(service.get('tensor_parallel_size', 1) or 1),
+        int(service.get('tensor_parallel_size', 1) or 1)
+        * int(service.get('pipeline_parallel_size', 1) or 1)
+        * int(service.get('data_parallel_size', 1) or 1),
     )
     return f'{profile}:{gpu_count}'
 

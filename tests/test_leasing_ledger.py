@@ -316,3 +316,13 @@ def test_evict_idle_skips_deployment_with_demand(ledger):
     assert ledger.get_deployment(gid).demand == 1
     assert ledger.evict_idle(None) == []
     assert ledger.get_deployment(gid).state == DeploymentState.IDLE
+
+
+def test_data_parallel_is_structural():
+    """Regression: dp multiplies the GPU count in placement, so two requests
+    differing only in dp must not coalesce onto one deployment."""
+    from infer_stack.leasing.models import compatibility_key, vllm_structural
+
+    dp1 = vllm_structural(model_ref='qwen', data_parallel_size=1)
+    dp2 = vllm_structural(model_ref='qwen', data_parallel_size=2)
+    assert compatibility_key('vllm', dp1) != compatibility_key('vllm', dp2)
