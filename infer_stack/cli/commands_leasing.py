@@ -242,9 +242,20 @@ def _make_backend(config, *, interactive: bool = False):
             catalog=catalog,
             dynamic_routing=_resolve_dynamic_routing(config),
         )
+    if name == 'kubeai':
+        from ..backends.kubeai import KubeaiBackend
+
+        return KubeaiBackend(
+            state_dir=data_root() / 'leasing' / 'kubeai',
+            namespace=get_setting('kubeai_namespace') or 'kubeai',
+            base_url=get_setting('kubeai_base_url') or None,
+            default_resource_profile=get_setting('kubeai_resource_profile')
+            or None,
+            assume_yes=_resolve_assume_yes(config, interactive=interactive),
+        )
     raise SystemExit(
-        f'backend {name!r} is not implemented in the leasing CLI yet '
-        '(kubeai is a later stage). Use --backend null or compose.'
+        f'backend {name!r} is not implemented in the leasing CLI. '
+        'Use --backend null, compose, or kubeai.'
     )
 
 
@@ -521,7 +532,8 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
     backend = scfg.Value(
         None,
         choices=['null', 'compose', 'kubeai'],
-        help='Serving backend. "null" (dry-run) and "compose" are implemented. '
+        help='Serving backend: "null" (dry-run), "compose" (single-host '
+        'docker), or "kubeai" (cluster; see docs/kubeai-backend.md). '
         'Defaults to `config set backend …`, else "null".',
     )
     ledger = scfg.Value(

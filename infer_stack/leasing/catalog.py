@@ -21,6 +21,10 @@ Schema (all sections optional except as referenced)::
         model: qwen-coder-32b
         engine: vllm
         runtime: {tensor_parallel_size: 1, max_model_len: 32768}
+        # kubeai backend only: which KubeAI resourceProfiles entry serves this
+        # endpoint (GPU count is appended automatically from tp*pp*dp); falls
+        # back to `config set kubeai_resource_profile <name>`.
+        #   runtime: {resource_profile: nvidia-gpu-rtx-4090, ...}
         sharing: {mode: shared-compatible}
         reclaim: {policy: keep-warm}
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI

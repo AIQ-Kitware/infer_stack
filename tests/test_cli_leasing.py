@@ -385,8 +385,34 @@ def test_run_releases_on_exit(env, capsys):
 
 
 def test_unimplemented_backend_errors(env):
-    with pytest.raises(SystemExit):
-        AcquireCLI.main(argv=['qwen-coder', '--backend', 'kubeai', *_base(env)])
+    from infer_stack.cli.commands_leasing import _make_backend
+    from types import SimpleNamespace
+    with pytest.raises(SystemExit, match='not implemented'):
+        _make_backend(SimpleNamespace(backend='nomad'))
+
+
+def test_kubeai_backend_constructs(env, monkeypatch, tmp_path):
+    """--backend kubeai builds a KubeaiBackend wired from settings."""
+    from types import SimpleNamespace
+
+    from infer_stack.backends.kubeai import KubeaiBackend
+    from infer_stack.cli import commands_leasing as cl
+
+    settings = {
+        'kubeai_namespace': 'serving',
+        'kubeai_base_url': 'http://10.0.0.5:8000/openai/v1',
+        'kubeai_resource_profile': 'rtx-4090',
+    }
+    monkeypatch.setattr(cl, 'data_root', lambda: tmp_path)
+    monkeypatch.setattr(
+        'infer_stack.paths.get_setting', lambda key: settings.get(key)
+    )
+    be = cl._make_backend(SimpleNamespace(backend='kubeai', yes=True))
+    assert isinstance(be, KubeaiBackend)
+    assert be.namespace == 'serving'
+    assert be.base_url == 'http://10.0.0.5:8000/openai/v1'
+    assert be.default_resource_profile == 'rtx-4090'
+    assert be.state_dir == tmp_path / 'leasing' / 'kubeai'
 
 
 def test_unknown_endpoint_errors(env):
