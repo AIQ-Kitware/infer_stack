@@ -172,6 +172,13 @@ class RenderedCompose:
     # mode). The render half writes it to litellm_routes.json; the apply half
     # reconciles it against the live gateway via the admin API.
     litellm_routes: list[dict[str, Any]] | None = None
+    # Placed deployments the render had to EXCLUDE (e.g. a compose service-name
+    # collision) + the per-deployment reasons, each prefixed with the deployment
+    # id like placement errors. The backend folds these into last_unplaced /
+    # last_errors so a colliding acquire fails loudly instead of the later
+    # deployment silently never getting a container.
+    unrenderable: set[str] = field(default_factory=set)
+    errors: list[str] = field(default_factory=list)
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -803,6 +810,8 @@ def render_compose(
     # LiteLLM gateway (or, for Ollama, *in addition* to it — see below).
     vllm_v1_urls: list[str] = []      # OpenAI /v1 of each vLLM process
     ollama_native_urls: list[str] = []  # native Ollama API of each daemon
+    unrenderable: set[str] = set()
+    errors: list[str] = []
     ordered = sorted(deployments, key=lambda g: (g.created_at, g.id))
     vllm_i = 0
     ollama_i = 0
@@ -810,6 +819,30 @@ def render_compose(
         if deployment.id not in assignments:
             continue
         gpus = assignments[deployment.id]
+        if deployment.engine == 'vllm':
+            # Unique-per-deployment names in dynamic-routing mode so same-model
+            # --dedicated deployments don't collapse onto one container/GPU.
+            name = vllm_service_name(deployment, unique=dynamic_routing)
+        elif deployment.engine == 'ollama':
+            name = ollama_service_name(deployment)
+        else:
+            continue
+        # Two live deployments can map to one service name (same served name in
+        # static-superset mode — e.g. same-model --dedicated — or two Ollama
+        # deployments on one host with different structural settings). Writing
+        # both would silently drop the earlier one: its container never exists,
+        # observe() never sees it, and its probes fail until lease timeout with
+        # no error anywhere. The oldest deployment keeps the name; later ones
+        # are excluded and reported like placement failures.
+        if name in services:
+            unrenderable.add(deployment.id)
+            errors.append(
+                f'{deployment.id}: compose service name {name!r} is already '
+                f'used by deployment {service_map[name]} — simultaneously '
+                'live deployments must have distinct served names '
+                '(use dynamic routing for same-model dedicated deployments)'
+            )
+            continue
         # Host ports are published ONLY when there is no LiteLLM gateway. Behind
         # the gateway every upstream is reached by compose-network DNS, so a host
         # port is unnecessary — and harmful: it was assigned by position in the
@@ -820,22 +853,16 @@ def render_compose(
         # rendered service depend only on the deployment itself -> no churn, the
         # same no-blip property the static gateway config already has.
         if deployment.engine == 'vllm':
-            # Unique-per-deployment names in dynamic-routing mode so same-model
-            # --dedicated deployments don't collapse onto one container/GPU.
-            name = vllm_service_name(deployment, unique=dynamic_routing)
             port = None if litellm else VLLM_HOST_PORT_BASE + vllm_i
             vllm_i += 0 if litellm else 1
             services[name] = _vllm_service(deployment, gpus, port, images, state)
             vllm_v1_urls.append(f'http://{name}:{VLLM_CONTAINER_PORT}/v1')
-        elif deployment.engine == 'ollama':
-            name = ollama_service_name(deployment)
+        else:
             base = ports.get('ollama', DEFAULT_PORTS['ollama'])
             port = None if litellm else base + ollama_i
             ollama_i += 0 if litellm else 1
             services[name] = _ollama_service(deployment, gpus, port, images, state)
             ollama_native_urls.append(f'http://{name}:{OLLAMA_CONTAINER_PORT}')
-        else:
-            continue
         service_map[name] = deployment.id
 
     litellm_config = None
@@ -961,6 +988,8 @@ def render_compose(
         litellm_config=litellm_config,
         nginx_config=nginx_config,
         litellm_routes=litellm_routes,
+        unrenderable=unrenderable,
+        errors=errors,
     )
 
 
@@ -1245,10 +1274,6 @@ class ComposeBackend:
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
             plan = self.plan(desired)
-            self.last_errors = plan.errors
-            self.last_unplaced = {
-                g.id for g in desired if g.id not in plan.assignments
-            }
             self.last_assignments = dict(plan.assignments)
             for gid, gpus in sorted(plan.assignments.items()):
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
@@ -1278,6 +1303,15 @@ class ComposeBackend:
                 catalog=self.catalog,
                 dynamic_routing=self.dynamic_routing,
             )
+            # A deployment the render excluded (service-name collision) is as
+            # undeliverable as an unplaced one: fold it into last_unplaced /
+            # last_errors so acquire fails loudly and rolls the lease back.
+            self.last_errors = list(plan.errors) + list(rendered.errors)
+            self.last_unplaced = {
+                g.id for g in desired if g.id not in plan.assignments
+            } | set(rendered.unrenderable)
+            for err in rendered.errors:
+                logger.warning('  render: {}', err)
 
             compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
             planned: dict[Path, str] = {self.compose_file: compose_text}

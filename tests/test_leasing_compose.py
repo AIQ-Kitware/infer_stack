@@ -207,6 +207,53 @@ def test_render_vllm_omits_unset_serving_knobs():
     assert '--pipeline-parallel-size=1' in cmd
 
 
+def test_render_reports_service_name_collisions():
+    """Regression: two live deployments sharing a served name rendered to ONE
+    compose service (dict overwrite) — the earlier deployment's container never
+    existed and its probes failed until lease timeout with no error anywhere.
+    The oldest deployment keeps the name; later ones are reported."""
+    a = vllm('grp-old', served='qwen', t=0)
+    b = vllm('grp-new', served='qwen', t=1)     # same served name, later
+    rc = render_compose(
+        [a, b], {'grp-old': [0], 'grp-new': [1]},
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert rc.services == {'vllm-qwen': 'grp-old'}   # oldest wins
+    assert rc.unrenderable == {'grp-new'}
+    assert any(
+        e.startswith('grp-new') and 'grp-old' in e for e in rc.errors
+    )
+
+
+def test_render_dynamic_routing_avoids_same_served_collision():
+    """Dynamic routing appends the deployment-id tail, so same-served-name
+    dedicated deployments get distinct services and nothing collides."""
+    a = vllm('grp-old', served='qwen', t=0)
+    b = vllm('grp-new', served='qwen', t=1)
+    rc = render_compose(
+        [a, b], {'grp-old': [0], 'grp-new': [1]},
+        images=IMAGES, ports=PORTS, state=STATE,
+        litellm=True, dynamic_routing=True,
+    )
+    assert rc.unrenderable == set()
+    assert rc.errors == []
+    assert sorted(rc.services.values()) == ['grp-new', 'grp-old']
+
+
+def test_converge_surfaces_collision_as_unplaced(tmp_path):
+    """The backend folds render collisions into last_unplaced/last_errors, so
+    the controller treats the colliding acquire like a placement failure
+    (fail loudly + roll back) instead of leasing a container that never runs."""
+    be = make_backend(tmp_path)
+    be.converge([
+        vllm('grp-old', served='qwen', t=0),
+        vllm('grp-new', served='qwen', t=1),
+    ])
+    assert 'grp-new' in be.last_unplaced
+    assert any('grp-new' in e for e in be.last_errors)
+    assert be.observe() == {'grp-old'}   # only the survivor is up
+
+
 def test_render_two_vllm_distinct_ports():
     a, b = vllm('a', served='aa', t=0), vllm('b', served='bb', t=1)
     rc = render_compose(
