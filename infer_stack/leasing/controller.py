@@ -516,12 +516,15 @@ class Controller:
         apply_fn = getattr(self.backend, 'apply', None)
         if apply_fn is not None:
             with self._apply_lock():
+                # Floor snapshot BEFORE the up, like _ensure_applied: a render
+                # that lands mid-apply changed files this apply never read, so
+                # publishing the post-apply generation would mark it covered
+                # and its deployment would never be brought up.
+                g = self.ledger.desired_generation()
                 before = set(self.backend.observe())
                 apply_fn()
                 after = set(self.backend.observe())
-                self.ledger.set_applied_generation(
-                    self.ledger.desired_generation()
-                )
+                self.ledger.set_applied_generation(g)
                 rec.realized = sorted(set(rec.realized) | (after - before))
                 rec.torn_down = sorted(set(rec.torn_down) | (before - after))
                 rec.applied = True
@@ -564,6 +567,42 @@ class Controller:
                 )
             self.sleep(interval)
             pairs = pending
+
+    def _rollback_acquire(self, lease_id: str) -> int:
+        """Roll a failed acquire back under the render lock.
+
+        Releases the lease, evicts any deployment the release idled that is not
+        actually running (keep-warm only means something for a deployment that
+        came up: a pre-existing warm deployment this lease merely coalesced onto
+        stays resident, but a never-ran one would pin a phantom in the desired
+        set — and an unplaceable one would be re-planned, and re-fail, on every
+        future render), then re-renders so the on-disk project matches the
+        ledger before the lock drops. That last step is the generation contract:
+        release/evict bump the desired generation, and a concurrent
+        ``_ensure_applied`` waiter snapshots it and applies whatever is on
+        disk — which must therefore no longer contain the rolled-back
+        deployment. Returns the post-rollback desired generation so the caller
+        can coalesce a teardown apply.
+        """
+        from .backend import ConvergeAborted
+
+        with self._global_lock():
+            rel = self.ledger.release(lease_id)
+            if rel.idled_deployment_ids:
+                running = set(self.backend.observe())
+                never_ran = [
+                    gid for gid in rel.idled_deployment_ids
+                    if gid not in running
+                ]
+                if never_ran:
+                    self.ledger.evict_idle(never_ran)
+            # Best-effort: the rollback render normally diffs clean (the
+            # deployment never reached disk, or leaves it), but an operator can
+            # still decline an unrelated swept-in change — no worse than not
+            # rendering, and the original failure must surface, not this.
+            with contextlib.suppress(ConvergeAborted):
+                self._render()
+            return self.ledger.desired_generation()
 
     # -- thin acquire / release -------------------------------------------
 
@@ -627,7 +666,7 @@ class Controller:
             except ConvergeAborted:
                 # The operator declined the compose changes — don't leave the
                 # just-created lease dangling in the ledger.
-                self.ledger.release(result.lease.id)
+                self._rollback_acquire(result.lease.id)
                 raise
             # If a deployment this lease just requested could not be placed (e.g. no
             # free GPU), either queue for one (wait_for_placement) or — the default —
@@ -651,8 +690,11 @@ class Controller:
                     unplaced = requested & set(rec.unplaced)
                     g_target = self.ledger.desired_generation()
         if unplaced:
-            with self._global_lock():
-                self.ledger.release(result.lease.id)
+            g_rollback = self._rollback_acquire(result.lease.id)
+            if apply:
+                # Tear down anything of ours a concurrent apply brought up
+                # (coalesced; a no-op when applied_gen already covers it).
+                self._ensure_applied(g_rollback)
             reasons = [
                 e
                 for e in rec.placement_errors

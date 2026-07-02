@@ -248,3 +248,71 @@ def test_status_snapshot(ledger):
     assert len(leases) == 2
     assert len(deployments) == 2
     assert {g.engine for g in deployments} == {'vllm', 'ollama'}
+
+
+def test_renew_refuses_released_and_expired_leases(ledger):
+    """Regression: renew must not resurrect a RELEASED/EXPIRED lease — its
+    deployments may already be idled/evicted behind it, so a silently re-ACTIVATED
+    lease would "protect" nothing that runs; the caller must re-acquire."""
+    a = ledger.acquire('alice', [vllm_req('qwen-coder')])
+    gid = a.deployments[0].id
+    ledger.release(a.lease.id)
+    assert ledger.renew(a.lease.id, ttl_seconds=3600) is None
+    assert ledger.get_lease(a.lease.id).state == LeaseState.RELEASED
+    assert ledger.get_deployment(gid).state == DeploymentState.IDLE
+
+    b = ledger.acquire('bob', [vllm_req('qwen-coder')], ttl_seconds=100)
+    ledger.clock.advance(200)
+    ledger.sweep()
+    assert ledger.get_lease(b.lease.id).state == LeaseState.EXPIRED
+    assert ledger.renew(b.lease.id, ttl_seconds=3600) is None
+    assert ledger.get_lease(b.lease.id).state == LeaseState.EXPIRED
+
+    assert ledger.renew('lease-nope', ttl_seconds=3600) is None
+
+
+def test_renew_revives_idled_deployment_of_active_lease(ledger):
+    """An ACTIVE lease whose TTL lapsed unswept can find its deployment idled
+    (the other demand vanished while it wasn't protecting). Renewing re-LIVEs
+    the deployment and bumps the desired generation so the next apply re-ups it."""
+    a = ledger.acquire('alice', [vllm_req('qwen-coder')], ttl_seconds=100)
+    b = ledger.acquire('bob', [vllm_req('qwen-coder')])  # infinite, shares gid
+    gid = a.deployments[0].id
+    ledger.clock.advance(200)      # alice lapses; unswept, so still ACTIVE
+    ledger.release(b.lease.id)     # demand hits 0 -> deployment idles
+    assert ledger.get_deployment(gid).state == DeploymentState.IDLE
+    assert ledger.get_lease(a.lease.id).state == LeaseState.ACTIVE
+
+    g_before = ledger.desired_generation()
+    lease = ledger.renew(a.lease.id, ttl_seconds=3600)
+    assert lease is not None and lease.state == LeaseState.ACTIVE
+    assert ledger.get_deployment(gid).state == DeploymentState.LIVE
+    assert ledger.get_deployment(gid).demand == 1
+    assert ledger.desired_generation() > g_before  # an apply must re-up it
+
+
+def test_release_reports_found_and_idempotent(ledger):
+    """Regression: a missing lease id must be distinguishable from a release
+    that idled nothing, so the CLI can't report success for a typo'd id."""
+    a = ledger.acquire('alice', [vllm_req('qwen-coder')])
+    assert ledger.release('lease-nope').found is False
+    first = ledger.release(a.lease.id)
+    assert first.found and not first.already_released
+    again = ledger.release(a.lease.id)  # idempotent (cleanup traps fire twice)
+    assert again.found and again.already_released
+    assert again.idled_deployment_ids == []
+
+
+def test_evict_idle_skips_deployment_with_demand(ledger):
+    """An IDLE deployment that still has protecting demand (an anomaly, e.g. a
+    heartbeat landing in the idle->reclaim window) must never be stopped."""
+    a = ledger.acquire('alice', [vllm_req('qwen-coder')])
+    gid = a.deployments[0].id
+    # Force the anomalous state directly: IDLE while alice still protects it.
+    with ledger.store.transaction():
+        ledger.store.set_deployment_state(
+            gid, DeploymentState.IDLE, ledger.clock()
+        )
+    assert ledger.get_deployment(gid).demand == 1
+    assert ledger.evict_idle(None) == []
+    assert ledger.get_deployment(gid).state == DeploymentState.IDLE

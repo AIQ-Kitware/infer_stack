@@ -59,7 +59,13 @@ class AcquireResult:
 
 @dataclass
 class ReleaseResult:
+    # ``found=False`` means the lease id does not exist in the ledger at all —
+    # callers reporting success/failure must distinguish that from a release
+    # that simply idled nothing. ``already_released=True`` is the idempotent
+    # re-release of a RELEASED lease (a cleanup trap firing twice is fine).
     idled_deployment_ids: list[str] = field(default_factory=list)
+    found: bool = True
+    already_released: bool = False
 
 
 @dataclass
@@ -164,8 +170,10 @@ class Ledger:
         idled: list[str] = []
         with self.store.transaction():
             lease = self.store.get_lease(lease_id)
-            if lease is None or lease.state == LeaseState.RELEASED:
-                return ReleaseResult()
+            if lease is None:
+                return ReleaseResult(found=False)
+            if lease.state == LeaseState.RELEASED:
+                return ReleaseResult(already_released=True)
             self.store.set_lease_state(lease_id, LeaseState.RELEASED)
             idled = self._idle_deployments(lease.deployment_ids, now)
             if idled:  # desired set shrank -> an apply must run to tear them down
@@ -173,11 +181,23 @@ class Ledger:
         return ReleaseResult(idled_deployment_ids=idled)
 
     def renew(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None:
-        """Extend (or make infinite) a lease's protection window."""
+        """Extend (or make infinite) a lease's protection window.
+
+        Only an ACTIVE lease renews; a RELEASED/EXPIRED one returns ``None``
+        (like an unknown id). Silently re-ACTIVATING a lapsed lease would
+        "protect" deployments that were already idled, evicted, or torn down
+        behind it — the caller must re-acquire instead, which re-realizes them.
+
+        An ACTIVE lease *can* legitimately find its deployment IDLE (its TTL
+        lapsed unswept while the other demand vanished, then a heartbeat
+        arrived before the reclaim). Renewing re-LIVEs such deployments and bumps
+        the desired generation so the next apply re-ups anything torn down.
+        """
         now = self.clock()
         expires_at = None if ttl_seconds is None else now + ttl_seconds
         with self.store.transaction():
-            if self.store.get_lease(lease_id) is None:
+            lease = self.store.get_lease(lease_id)
+            if lease is None or lease.state != LeaseState.ACTIVE:
                 return None
             self.store.renew_lease(
                 lease_id,
@@ -185,6 +205,19 @@ class Ledger:
                 expires_at=expires_at,
                 heartbeat_at=now,
             )
+            revived = []
+            for gid in dict.fromkeys(lease.deployment_ids):
+                deployment = self.store.get_deployment(gid)
+                if (
+                    deployment is not None
+                    and deployment.state == DeploymentState.IDLE
+                ):
+                    self.store.set_deployment_state(
+                        gid, DeploymentState.LIVE, now
+                    )
+                    revived.append(gid)
+            if revived:  # demand is back -> an apply must run to re-up them
+                self.store.bump_desired_generation()
         return self.store.get_lease(lease_id)
 
     def sweep(self) -> SweepResult:
@@ -233,6 +266,10 @@ class Ledger:
                 if g.state != DeploymentState.IDLE:
                     continue
                 if wanted is not None and g.id not in wanted:
+                    continue
+                # IDLE with demand > 0 is an anomaly (e.g. a heartbeat landed
+                # in the idle->reclaim window); never stop a protected deployment.
+                if g.demand > 0:
                     continue
                 self.store.set_deployment_state(g.id, DeploymentState.STOPPED, now)
                 evicted.append(g.id)

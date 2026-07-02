@@ -258,3 +258,130 @@ def test_apply_runs_outside_the_render_lock(tmp_path):
         'the render-lock file could not be acquired during apply — another caller '
         'could not render concurrently'
     )
+
+
+def test_apply_now_snapshots_generation_before_apply(tmp_path):
+    """Regression: apply_now must publish the desired generation captured BEFORE
+    the up, like _ensure_applied — a render that lands mid-apply changed files
+    this apply never read, and covering it would leave that deployment never
+    brought up (applied >= desired suppresses all coalesced applies)."""
+    db = str(tmp_path / 'ledger.db')
+    shared = {'rendered': set(), 'realized': set(), 'apply_calls': 0}
+
+    class MidApplyRender(SharedStackBackend):
+        def apply(self) -> None:
+            other = Ledger(SqliteStore(db))  # a concurrent acquirer renders now
+            with other.store.transaction():
+                other.store.bump_desired_generation()
+            super().apply()
+
+    ledger = Ledger(SqliteStore(db))
+    ctl = Controller(ledger, MidApplyRender(shared, threading.Lock()))
+    ctl.apply_now()
+    assert ledger.applied_generation() < ledger.desired_generation(), (
+        'a render that landed mid-apply was marked covered; its deployment '
+        'would never be brought up'
+    )
+
+
+class _NoRoomBackend(SharedStackBackend):
+    """Converge fake that can never place an endpoint named ``big``."""
+
+    def converge(self, desired, *, apply: bool = True) -> None:
+        placeable = [g for g in desired if 'big' not in g.served]
+        self.last_unplaced = [g.id for g in desired if 'big' in g.served]
+        super().converge(placeable, apply=apply)
+
+
+def test_placement_rollback_evicts_and_rerenders(tmp_path):
+    """Regression: a failed placement must fully roll back — lease released, the
+    never-ran deployments evicted (not left idle-keep-warm, which would pin them
+    in the desired set), the placed sibling removed from the on-disk render, and
+    the ledger converged (a concurrent waiter can never apply a stale render)."""
+    import pytest
+
+    from infer_stack.leasing import DeploymentState, LeaseState
+    from infer_stack.leasing.backend import PlacementError
+
+    db = str(tmp_path / 'ledger.db')
+    shared = {'rendered': set(), 'realized': set(), 'apply_calls': 0}
+    ledger = Ledger(SqliteStore(db))
+    ctl = Controller(ledger, _NoRoomBackend(shared, threading.Lock()))
+
+    with pytest.raises(PlacementError):
+        ctl.acquire('alice', [_vreq('ok'), _vreq('big')], wait=False)
+
+    leases, deployments = ledger.status()
+    assert [le.state for le in leases] == [LeaseState.RELEASED]
+    assert {g.state for g in deployments} == {DeploymentState.STOPPED}
+    # 'ok' was rendered by the failed acquire; the rollback re-render removed it.
+    assert shared['rendered'] == set()
+    assert shared['realized'] == set()
+    assert ledger.applied_generation() == ledger.desired_generation()
+
+
+def test_rollback_keeps_coalesced_warm_deployment_resident(tmp_path):
+    """A failed acquire that coalesced onto a pre-existing warm (idle keep-warm)
+    deployment must roll that deployment back to IDLE — not evict the resident
+    model someone else may still want warm."""
+    import pytest
+
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.leasing.backend import PlacementError
+
+    db = str(tmp_path / 'ledger.db')
+    shared = {'rendered': set(), 'realized': set(), 'apply_calls': 0}
+    ledger = Ledger(SqliteStore(db))
+    ctl = Controller(ledger, _NoRoomBackend(shared, threading.Lock()))
+
+    warm = ctl.acquire('alice', [_vreq('m')], wait=False)
+    mid = warm.deployments[0].id
+    ctl.release(warm.lease.id)      # keep-warm: idles but stays resident
+    assert mid in shared['realized']
+
+    with pytest.raises(PlacementError):
+        ctl.acquire('bob', [_vreq('m'), _vreq('big')], wait=False)
+
+    m = ledger.get_deployment(mid)
+    assert m.state == DeploymentState.IDLE      # not STOPPED
+    assert mid in shared['realized']            # still resident
+
+
+def test_converge_aborted_rollback_rerenders(tmp_path):
+    """Regression: declining an acquire's compose diff must roll the lease back
+    AND re-render, restoring the generation contract — release/evict bump the
+    desired generation, so whatever is on disk when the lock drops must not
+    contain the declined deployment."""
+    import pytest
+
+    from infer_stack.leasing import DeploymentState, LeaseState
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    db = str(tmp_path / 'ledger.db')
+    shared = {'rendered': set(), 'realized': set(), 'apply_calls': 0}
+
+    class DecliningBackend(SharedStackBackend):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.converge_calls = 0
+            self.declined = False
+
+        def converge(self, desired, *, apply: bool = True) -> None:
+            self.converge_calls += 1
+            if desired and not self.declined:
+                self.declined = True
+                raise ConvergeAborted('operator declined')
+            super().converge(desired, apply=apply)
+
+    ledger = Ledger(SqliteStore(db))
+    backend = DecliningBackend(shared, threading.Lock())
+    ctl = Controller(ledger, backend)
+
+    with pytest.raises(ConvergeAborted):
+        ctl.acquire('alice', [_vreq('a')], wait=False)
+
+    leases, deployments = ledger.status()
+    assert [le.state for le in leases] == [LeaseState.RELEASED]
+    assert [g.state for g in deployments] == [DeploymentState.STOPPED]
+    assert backend.converge_calls == 2  # the declined render + the rollback render
+    assert shared['rendered'] == set()
