@@ -22,6 +22,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import scriptconfig as scfg
@@ -867,6 +868,8 @@ class ReleaseCLI(_ApprovalMixin):
                     'release: give a lease id, --env-file, or --all'
                 )
             rel = controller.ledger.release(sid)
+            if not rel.found:
+                raise SystemExit(f'release: no such lease: {sid}')
             released = [sid]
             evicted = []
             if config.evict:
@@ -946,17 +949,24 @@ class EvictCLI(_ApprovalMixin):
         names = _collect_names(config.names)
         if not names and not config.all:
             raise SystemExit('evict: give an endpoint/deployment name or --all')
+        missing: list[str] = []
         try:
             if config.all:
                 outcome = controller.evict(None)
             else:
                 targets, missing = _resolve_idle_targets(controller, names)
                 if missing:
-                    print(f'no idle deployment for: {", ".join(missing)}')
+                    # Diagnostic, not payload: stdout must stay pure JSON
+                    # under --json (and stay grep-able human output without).
+                    print(
+                        f'no idle deployment for: {", ".join(missing)}',
+                        file=sys.stderr,
+                    )
                 if not targets:
                     if config.json:
                         print(json.dumps(
-                            {'evicted': [], 'torn_down': []}, indent=2))
+                            {'evicted': [], 'torn_down': [],
+                             'missing': missing}, indent=2))
                     else:
                         print('nothing to evict')
                     return 0
@@ -967,6 +977,7 @@ class EvictCLI(_ApprovalMixin):
             print(json.dumps({
                 'evicted': outcome.evicted_deployment_ids,
                 'torn_down': outcome.reconcile.torn_down,
+                'missing': missing,
             }, indent=2))
         elif not outcome.evicted_deployment_ids:
             print('nothing to evict')
@@ -1166,7 +1177,10 @@ class RenewCLI(_LeasingCommonMixin):
             sid, ttl_seconds=_parse_duration(config.ttl)
         )
         if lease is None:
-            raise SystemExit(f'renew: no such lease {sid}')
+            raise SystemExit(
+                f'renew: no active lease {sid} (unknown, released, or already '
+                'expired — re-acquire instead)'
+            )
         print(f'renewed {sid}')
         return 0
 

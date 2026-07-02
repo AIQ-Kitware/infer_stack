@@ -569,3 +569,36 @@ def test_test_command_reports_failure(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert 'FAILED' in out and 'chat' in out
+
+
+def test_release_unknown_lease_fails(env):
+    """Regression: `release <typo>` printed `released 1 lease(s)` and exited 0
+    while the real lease kept pinning its GPU."""
+    with pytest.raises(SystemExit, match='no such lease'):
+        ReleaseCLI.main(argv=['lease-nope', '--ledger', env.db])
+
+
+def test_renew_released_lease_fails(env):
+    """Regression: renew silently resurrected a released lease (state back to
+    ACTIVE) without re-realizing anything behind it."""
+    envf = env.tmp / 'is.env'
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--env-file', str(envf)])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', str(envf)])
+    with pytest.raises(SystemExit, match='no active lease'):
+        RenewCLI.main(
+            argv=['--ledger', env.db, '--env-file', str(envf), '--ttl', '3h']
+        )
+
+
+def test_evict_json_stdout_is_pure_json(env, capsys):
+    """Regression: the `no idle deployment for: ...` diagnostic printed to stdout
+    ahead of the JSON document, breaking `json.loads`/jq consumers."""
+    from infer_stack.cli.commands_leasing import EvictCLI
+
+    capsys.readouterr()
+    rc = EvictCLI.main(argv=['ghost', '--ledger', env.db, '--json'])
+    out, err = capsys.readouterr()
+    data = json.loads(out)  # must parse: no human text mixed into stdout
+    assert data == {'evicted': [], 'torn_down': [], 'missing': ['ghost']}
+    assert 'no idle deployment for: ghost' in err
+    assert rc == 0
