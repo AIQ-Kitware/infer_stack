@@ -329,6 +329,26 @@ def _descriptor_for(controller, lease, deployments, config):
     )
 
 
+def _public_descriptor(descriptor: dict) -> dict:
+    """The descriptor as printed on stdout: real key material redacted.
+
+    ``--json`` output lands in job logs that get collected, rsynced, and
+    shared — the key must not travel with them. Consumers get the key from the
+    env-file (the delivery mechanism, which keeps the real value) or via
+    ``infer-stack env $api_key_env``. The 'EMPTY' placeholder (keyless direct
+    upstreams) is not a secret and passes through untouched.
+    """
+    key = descriptor.get('api_key')
+    if not key or key == 'EMPTY':
+        return descriptor
+    public = dict(descriptor)
+    public['api_key'] = (
+        f'<redacted — source the env-file or run'
+        f' `infer-stack env {descriptor.get("api_key_env", "")}`>'
+    )
+    return public
+
+
 def _compose_file_path(controller) -> str | None:
     path = getattr(controller.backend, 'compose_file', None)
     return str(path) if path else None
@@ -356,7 +376,7 @@ def _emit_staged(config, controller, outcome) -> int:
             'lease_id': outcome.lease.id,
             'owner': outcome.lease.owner,
             'applied': False,
-            'descriptor': descriptor,
+            'descriptor': _public_descriptor(descriptor),
             'compose_file': _compose_file_path(controller),
             'placement': [
                 {'deployment': g.id, 'served': sorted(g.served),
@@ -401,7 +421,7 @@ def _emit_acquire(config, controller, outcome) -> int:
                 {
                     'lease_id': outcome.lease.id,
                     'owner': outcome.lease.owner,
-                    'descriptor': descriptor,
+                    'descriptor': _public_descriptor(descriptor),
                     'realized': outcome.reconcile.realized,
                     'ready': None
                     if outcome.wait is None

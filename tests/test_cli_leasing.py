@@ -602,3 +602,35 @@ def test_evict_json_stdout_is_pure_json(env, capsys):
     assert data == {'evicted': [], 'torn_down': [], 'missing': ['ghost']}
     assert 'no idle deployment for: ghost' in err
     assert rc == 0
+
+
+def test_acquire_json_redacts_api_key(env, capsys, monkeypatch):
+    """Regression: `acquire --json` printed the real LiteLLM master key inside
+    the descriptor — stdout lands in job logs that get collected and rsynced.
+    The env-file (the delivery mechanism) must still carry the real key."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import MemoryBackend
+
+    class KeyedBackend(MemoryBackend):
+        def access(self, endpoints):
+            return {
+                'base_url': 'http://x:1/v1',
+                'api_key_env': 'LITELLM_MASTER_KEY',
+                'api_key': 'sk-secret123',
+            }
+
+    monkeypatch.setattr(
+        cl, '_make_backend',
+        lambda config, *, interactive=False: KeyedBackend(ready=True),
+    )
+    envf = env.tmp / 'is.env'
+    capsys.readouterr()
+    rc = AcquireCLI.main(
+        argv=['qwen-coder', *_base(env), '--json', '--env-file', str(envf)]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    data = json.loads(out)
+    assert 'sk-secret123' not in out
+    assert 'redacted' in data['descriptor']['api_key']
+    assert 'sk-secret123' in envf.read_text()
