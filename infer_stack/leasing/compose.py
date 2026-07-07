@@ -230,6 +230,9 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
             'max_num_seqs', VLLM_DEFAULTS['max_num_seqs']
         ),
         'enable_prefix_caching': bool(runtime.get('enable_prefix_caching', False)),
+        # Selected via the VLLM_ATTENTION_BACKEND env var, not a CLI flag — the
+        # backend renderer (compose environment / kubeai CR env) turns it into env.
+        'attention_backend': runtime.get('attention_backend'),
         'extra_args': list(runtime.get('extra_args', []) or []),
     }
 
@@ -253,12 +256,18 @@ def _vllm_service(
         '8000',
         *vllm_args(svc),
     ]
+    environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
+    # Attention backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
+    # flag; forward it verbatim when the endpoint sets one (e.g. TORCH_SDPA to
+    # match a HuggingFace-eager deployment's numerics).
+    if svc.get('attention_backend'):
+        environment['VLLM_ATTENTION_BACKEND'] = str(svc['attention_backend'])
     service: dict[str, Any] = {
         # A runtime image override is structural (distinct deployments), so it
         # must also pick the container image — like _ollama_service does.
         'image': svc.get('image') or images['vllm'],
         'command': command,
-        'environment': {'HF_TOKEN': '${HF_TOKEN:-}'},
+        'environment': environment,
         'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
         'restart': 'unless-stopped',
         'labels': {DEPLOYMENT_LABEL: deployment.id, ENGINE_LABEL: 'vllm'},

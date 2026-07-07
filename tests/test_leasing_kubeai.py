@@ -170,6 +170,27 @@ def test_render_serving_knobs_reach_args():
     assert doc['spec']['resourceProfile'] == 'rtx-4090:2'  # pp counts
 
 
+def test_render_attention_backend_reaches_cr_env():
+    """attention_backend is a vLLM env var, so it lands in the Model CR's env
+    map (not spec.args) — parity with the compose backend's environment."""
+    rendered = render_models(
+        [vllm('grp-attn', served='q', attention_backend='TORCH_SDPA')],
+        namespace='kubeai', default_resource_profile=None,
+    )
+    (doc,) = rendered.docs
+    assert doc['spec']['env'] == {'VLLM_ATTENTION_BACKEND': 'TORCH_SDPA'}
+    assert not any('attention' in a.lower() for a in doc['spec']['args'])
+
+
+def test_render_omits_env_without_attention_backend():
+    rendered = render_models(
+        [vllm('grp-a', served='q')],
+        namespace='kubeai', default_resource_profile=None,
+    )
+    (doc,) = rendered.docs
+    assert 'env' not in doc['spec']
+
+
 def test_render_explicit_profile_count_wins():
     """A `profile:N` value is passed through, not re-suffixed."""
     rendered = render_models(

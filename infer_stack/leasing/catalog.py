@@ -21,6 +21,10 @@ Schema (all sections optional except as referenced)::
         model: qwen-coder-32b
         engine: vllm
         runtime: {tensor_parallel_size: 1, max_model_len: 32768}
+        # attention_backend: forwarded as the VLLM_ATTENTION_BACKEND env var
+        # (not a CLI flag); part of the compat key, so distinct backends don't
+        # coalesce. e.g. TORCH_SDPA / XFORMERS / FLASH_ATTN / FLASHINFER.
+        #   runtime: {attention_backend: TORCH_SDPA}
         # kubeai backend only: which KubeAI resourceProfiles entry serves this
         # endpoint (GPU count is appended automatically from tp*pp*dp); falls
         # back to `config set kubeai_resource_profile <name>`.
@@ -377,6 +381,7 @@ class Catalog:
             chat_template=rt.get('chat_template'),
             trust_remote_code=rt.get('trust_remote_code', False),
             lora_adapters=rt.get('lora_adapters'),
+            attention_backend=rt.get('attention_backend'),
             served_name=served_name,
         )
         capacity: dict[str, Any] = {}

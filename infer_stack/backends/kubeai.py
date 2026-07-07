@@ -121,6 +121,10 @@ def _model_doc(
             'args': vllm_args(svc),
         },
     }
+    # Attention backend is a vLLM env var, not a CLI arg (see compose._vllm_service);
+    # forward it through the KubeAI Model's env map for parity across backends.
+    if svc.get('attention_backend'):
+        doc['spec']['env'] = {'VLLM_ATTENTION_BACKEND': str(svc['attention_backend'])}
     return doc
 
 

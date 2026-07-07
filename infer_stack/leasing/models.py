@@ -147,6 +147,7 @@ def vllm_structural(
     chat_template: str | None = None,
     trust_remote_code: bool = False,
     lora_adapters: list[str] | None = None,
+    attention_backend: str | None = None,
     served_name: str | None = None,
 ) -> dict[str, Any]:
     """Build the structural dict for a vLLM endpoint (one process per model)."""
@@ -163,6 +164,10 @@ def vllm_structural(
         'chat_template': chat_template,
         'trust_remote_code': trust_remote_code,
         'lora_adapters': sorted(lora_adapters or []),
+        # The attention backend (VLLM_ATTENTION_BACKEND) changes the engine's
+        # numerics, so two endpoints differing only in it must be distinct
+        # deployments (not coalesced onto one process).
+        'attention_backend': attention_backend,
         'served_name': served_name or model_ref,
     }
 

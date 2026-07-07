@@ -216,3 +216,29 @@ def test_resolve_vllm_carries_model_knobs_into_spec():
     assert req.spec['dtype'] == 'half'
     # and they stay structural (distinct deployments per quantization)
     assert req.structural['quantization'] == 'awq'
+
+
+def test_attention_backend_is_structural_and_splits_compat_key():
+    """Two endpoints on the same model+runtime but different attention backends
+    must be distinct deployments (the env var changes engine numerics), so their
+    compat keys differ and neither coalesces onto the backend-less default."""
+    cat = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/model'}},
+        'endpoints': {
+            'default': {'model': 'm', 'engine': 'vllm'},
+            'sdpa': {'model': 'm', 'engine': 'vllm',
+                     'runtime': {'attention_backend': 'TORCH_SDPA'}},
+            'flash': {'model': 'm', 'engine': 'vllm',
+                      'runtime': {'attention_backend': 'FLASH_ATTN'}},
+        },
+    })
+    default = cat.resolve_endpoint('default')
+    sdpa = cat.resolve_endpoint('sdpa')
+    flash = cat.resolve_endpoint('flash')
+    # carried into the structural key...
+    assert default.structural['attention_backend'] is None
+    assert sdpa.structural['attention_backend'] == 'TORCH_SDPA'
+    # ...and the runtime knob survives into the spec for rendering.
+    assert sdpa.spec['runtime']['attention_backend'] == 'TORCH_SDPA'
+    # ...so all three are distinct deployments (no coalescing).
+    assert len({default.compat_key, sdpa.compat_key, flash.compat_key}) == 3

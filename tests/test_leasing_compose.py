@@ -198,13 +198,42 @@ def test_render_vllm_omits_unset_serving_knobs():
         [deployment], {'grp-a': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
     )
-    cmd = rc.compose['services'][vllm_service_name(deployment)]['command']
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    cmd = svc['command']
     assert not any(a.startswith('--revision') for a in cmd)
     assert not any(a.startswith('--quantization') for a in cmd)
     assert not any(a.startswith('--dtype') for a in cmd)
     assert not any(a.startswith('--chat-template') for a in cmd)
     assert '--trust-remote-code' not in cmd
     assert '--pipeline-parallel-size=1' in cmd
+    # attention backend is a vLLM env var; unset => not in the environment.
+    assert 'VLLM_ATTENTION_BACKEND' not in svc['environment']
+
+
+def test_render_vllm_attention_backend_reaches_environment_not_command():
+    """attention_backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
+    flag — it must land in the service environment, never in the command."""
+    from infer_stack.leasing.models import DeploymentState
+
+    deployment = Deployment(
+        'grp-attn', 'ck-attn', 'vllm', 'shared-compatible', {},
+        {
+            'engine': 'vllm',
+            'hf_model_id': 'org/model',
+            'served_model_name': 'm-sdpa',
+            'runtime': {'attention_backend': 'TORCH_SDPA'},
+            'reclaim': 'keep-warm',
+        },
+        {'grp-attn': {'served_model_name': 'm-sdpa'}},
+        DeploymentState.LIVE, 0.0, 0.0,
+    )
+    rc = render_compose(
+        [deployment], {'grp-attn': [0]},
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    assert svc['environment']['VLLM_ATTENTION_BACKEND'] == 'TORCH_SDPA'
+    assert not any('attention' in a.lower() for a in svc['command'])
 
 
 def test_render_reports_service_name_collisions():
