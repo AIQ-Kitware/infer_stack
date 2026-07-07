@@ -232,7 +232,11 @@ class _AddEndpointScreen(ModalScreen):
         rt = self._entry.get('runtime') or {}
         extra = rt.get('extra_args') or []
         extra_str = ' '.join(extra) if isinstance(extra, list) else str(extra)
-        reclaim = (self._entry.get('reclaim') or {}).get('policy', '')
+        reclaim_spec = self._entry.get('reclaim')
+        if isinstance(reclaim_spec, dict):
+            reclaim = reclaim_spec.get('policy', '')
+        else:
+            reclaim = reclaim_spec or ''
         cur_model = self._entry.get('model')
         cur_engine = self._entry.get('engine', 'vllm')
         with Vertical(id='dialog'):
