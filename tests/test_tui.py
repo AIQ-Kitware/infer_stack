@@ -942,6 +942,67 @@ def test_tui_api_list_models_and_curl():
     assert http.url.endswith('/v1/models')
 
 
+def test_tui_api_tester_respects_completions_protocol():
+    # A completions-only endpoint must be probed on /v1/completions with a
+    # `prompt` body (not /v1/chat/completions with `messages`), and its `text`
+    # response must be surfaced.
+    from textual.widgets import Select
+
+    from infer_stack.leasing import Catalog, Controller, Ledger, NullBackend, SqliteStore
+    from infer_stack.tui import InferStackTUI
+
+    catalog = Catalog.from_dict({
+        'models': {'qc': {'source': 'hf://Qwen/Qwen2.5-Coder-32B-Instruct'}},
+        'endpoints': {
+            'legacy-completions': {
+                'engine': 'vllm', 'model': 'qc', 'protocol': 'completions',
+            },
+        },
+    })
+    controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'choices': [{'text': 'pong'}]}
+
+    class _HTTP:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            return _Resp()
+
+    http = _HTTP()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None, http=http)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.litellm_port = 14042
+            app._sync_api_models(['legacy-completions'])
+            assert app.query_one('#api-model', Select).value == 'legacy-completions'
+            # curl preview reflects the completions surface
+            app._update_api_curl()
+            curl = str(app.query_one('#api-curl').render())
+            assert '/v1/completions' in curl and '/v1/chat/completions' not in curl
+            assert '"prompt"' in curl
+            app.action_api_send()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any('pong' in line for line in app._api_lines)
+
+    _run(scenario)
+    assert http.calls
+    url, body = http.calls[0]
+    assert url.endswith('/v1/completions')
+    assert 'prompt' in body and 'messages' not in body
+
+
 def test_tui_api_lists_only_ready_models():
     from textual.widgets import Select
 

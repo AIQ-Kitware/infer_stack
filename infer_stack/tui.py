@@ -600,6 +600,10 @@ class InferStackTUI(App):
         # heavy panes start collapsed (and therefore unpolled)
         self._collapsed = {'docker': False, 'system': True}
         self._ready_endpoints: list[str] = []
+        # served endpoint name -> OpenAI surface ('chat' | 'completions'), read
+        # from the live deployment payload so the API tab probes the surface a
+        # completions-only model actually serves (see _protocol_for).
+        self._ready_protocols: dict[str, str] = {}
         # Bringing an endpoint up needs a deliberate double-click (or Enter) so
         # a stray single click never acquires. Track the last endpoint click for
         # double-click detection, and whether a pending RowSelected came from the
@@ -1081,9 +1085,16 @@ class InferStackTUI(App):
             self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
         # Ready = endpoints served by a deployment that is actually running.
         ready: set[str] = set()
+        protocols: dict[str, str] = {}
         for g in data['deployments']:
             if g.id in data['observed']:
                 ready.update(g.served)
+                for name, payload in g.served.items():
+                    proto = payload.get('protocol') if isinstance(payload, dict) \
+                        else None
+                    if proto:
+                        protocols[name] = proto
+        self._ready_protocols = protocols
         self._sync_api_models(sorted(ready))
         self._update_summary(data['leases'], data['deployments'], data['observed'])
         self._sync_log_services()
@@ -2130,37 +2141,71 @@ class InferStackTUI(App):
         import requests
         return requests
 
+    def _protocol_for(self, model: str) -> str:
+        """OpenAI surface an endpoint is served on: 'chat' or 'completions'.
+
+        A completions-only model never answers a chat probe, so the API tab must
+        hit the surface it is actually served on. Prefer the live deployment's
+        payload (what is really running); fall back to the catalog spec so the
+        curl preview is correct before anything is deployed; default to 'chat'.
+        """
+        proto = self._ready_protocols.get(model)
+        if not proto:
+            ep = self.catalog.endpoints.get(model)
+            proto = getattr(ep, 'protocol', None)
+        return proto or 'chat'
+
+    @staticmethod
+    def _completion_text(data: dict) -> str:
+        """Pull the generated text from either a chat or a completions response
+        (chat nests it under ``message.content``; completions uses ``text``)."""
+        choice = (data.get('choices') or [{}])[0]
+        message = choice.get('message')
+        if isinstance(message, dict) and message.get('content') is not None:
+            return message['content']
+        return choice.get('text', '')
+
     def _api_chat(self, model: str, prompt: str) -> str:
         base, key = self._litellm()
         if not base:
             raise RuntimeError('no LiteLLM gateway (needs the compose backend)')
         headers = {'Authorization': f'Bearer {key}'} if key else {}
+        if self._protocol_for(model) == 'completions':
+            url = f'{base}/v1/completions'
+            body = {'model': model, 'prompt': prompt,
+                    'max_tokens': 128, 'temperature': 0}
+        else:
+            url = f'{base}/v1/chat/completions'
+            body = {'model': model,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 128, 'temperature': 0}
         resp = self._http_client().post(
-            f'{base}/v1/chat/completions',
-            json={
-                'model': model,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': 128, 'temperature': 0,
-            },
-            headers=headers, timeout=120,
-        )
+            url, json=body, headers=headers, timeout=120)
         resp.raise_for_status()
-        data = resp.json()
-        return data['choices'][0]['message']['content']
+        return self._completion_text(resp.json())
 
     def _curl_for(self, model: str, prompt: str) -> str:
-        """The equivalent ``curl`` for a chat-completion against the gateway."""
+        """The equivalent ``curl`` for a chat- or text-completion, matching the
+        endpoint's served protocol, against the gateway."""
         import json as _json
 
         base, key = self._litellm()
         if not base:
             return '# acquire a model first — no LiteLLM gateway yet'
         auth = f" -H 'Authorization: Bearer {key}'" if key else ''
-        body = _json.dumps({
-            'model': model or '<model>',
-            'messages': [{'role': 'user', 'content': prompt or 'hello'}],
-        })
-        return (f"curl -s {base}/v1/chat/completions{auth} "
+        if self._protocol_for(model) == 'completions':
+            path = '/v1/completions'
+            body = _json.dumps({
+                'model': model or '<model>',
+                'prompt': prompt or 'hello',
+            })
+        else:
+            path = '/v1/chat/completions'
+            body = _json.dumps({
+                'model': model or '<model>',
+                'messages': [{'role': 'user', 'content': prompt or 'hello'}],
+            })
+        return (f"curl -s {base}{path}{auth} "
                 f"-H 'Content-Type: application/json' -d '{body}'")
 
     def _update_api_urls(self) -> None:
