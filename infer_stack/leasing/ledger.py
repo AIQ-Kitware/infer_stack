@@ -36,6 +36,7 @@ from .models import (
     LeaseState,
     Sharing,
     capacity_satisfies,
+    is_reservation,
 )
 from .store import SqliteStore
 
@@ -149,7 +150,10 @@ class Ledger:
             for req in requests:
                 deployment = self._find_or_create_deployment(req, now)
                 self.store.insert_claim(
-                    lease_id=lease_id, endpoint=req.endpoint, deployment_id=deployment.id
+                    lease_id=lease_id,
+                    endpoint=req.endpoint,
+                    deployment_id=deployment.id,
+                    kind='reserved-gpu' if is_reservation(req) else 'endpoint',
                 )
                 deployment_ids.append(deployment.id)
             # Every acquire bumps the desired generation, even when it coalesces

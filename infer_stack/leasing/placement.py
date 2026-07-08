@@ -70,7 +70,15 @@ def available_indices(
 
 
 def required_gpu_count(deployment: Deployment) -> int:
-    """GPUs a vLLM deployment needs = tensor × pipeline × data parallelism."""
+    """GPUs a deployment needs.
+
+    A reservation asks for a plain ``reserved_gpu_count`` (count-based first-fit,
+    never a pinned index). A vLLM deployment needs tensor × pipeline × data
+    parallelism.
+    """
+    reserved = deployment.spec.get('reserved_gpu_count')
+    if reserved:
+        return max(1, int(reserved))
     runtime = deployment.spec.get('runtime', {}) or {}
     tp = int(runtime.get('tensor_parallel_size', 1) or 1)
     pp = int(runtime.get('pipeline_parallel_size', 1) or 1)

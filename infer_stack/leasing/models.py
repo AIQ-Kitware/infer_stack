@@ -62,6 +62,23 @@ class Sharing:
     DEDICATED = 'dedicated'
 
 
+# Sentinel engine for a *reservation*: a lease that holds N GPUs out of the
+# placement pool without launching any server. It flows through the ledger,
+# placement (first-fit, count-based), and admission queue exactly like a served
+# deployment, but renders no compose service (render_compose skips any engine
+# that is not vllm/ollama) and is never probed for readiness. The consumer runs
+# its own process (e.g. HELM's in-process HuggingFaceClient) on the reserved
+# GPU, whose index the lease reports via the env-file's CUDA_VISIBLE_DEVICES.
+RESERVED_ENGINE = 'reserved'
+# Synthetic endpoint/claim name for a reservation (it serves nothing).
+RESERVED_ENDPOINT = 'reserved-gpu'
+
+
+def is_reservation(obj: Any) -> bool:
+    """True if a :class:`Deployment` / :class:`EndpointRequest` is a GPU reservation."""
+    return getattr(obj, 'engine', None) == RESERVED_ENGINE
+
+
 # Fields that must match *exactly* for two requests to share one deployment.
 # Capacity fields (e.g. ``max_model_len``) are deliberately NOT here: they are
 # handled by subsumption (existing >= requested) in
@@ -306,3 +323,32 @@ class Deployment:
     created_at: float
     updated_at: float
     demand: int = 0
+
+
+def reservation_request(count: int, *, endpoint: str = RESERVED_ENDPOINT) -> EndpointRequest:
+    """A request to reserve ``count`` GPUs without serving anything.
+
+    Modelled as a normal :class:`EndpointRequest` so the ledger / placement /
+    admission queue treat it uniformly:
+
+    * ``engine=RESERVED_ENGINE`` — ``render_compose`` emits no service for it and
+      :func:`is_reservation` short-circuits readiness probing.
+    * ``sharing=DEDICATED`` — two reservations never coalesce onto one deployment
+      (each must hold its *own* GPU); every reserve lease gets a fresh deployment.
+    * ``spec.reserved_gpu_count`` — the count :func:`placement.required_gpu_count`
+      first-fits (never a specific index; infer-stack picks free GPUs).
+    * ``spec.reclaim='reclaim'`` — NOT keep-warm, so a released reservation idles
+      out of the desired set and frees its GPU immediately (the point of a
+      time-boxed GPU hold).
+    """
+    n = max(1, int(count))
+    structural = {'engine': RESERVED_ENGINE, 'reserved_gpu_count': n}
+    return EndpointRequest(
+        endpoint=endpoint,
+        engine=RESERVED_ENGINE,
+        structural=structural,
+        capacity={},
+        sharing=Sharing.DEDICATED,
+        spec={'engine': RESERVED_ENGINE, 'reserved_gpu_count': n, 'reclaim': 'reclaim'},
+        served={},
+    )

@@ -40,6 +40,8 @@ from ..leasing import (
     Sharing,
     SqliteStore,
     default_ledger_path,
+    is_reservation,
+    reservation_request,
 )
 from ..leasing.envfile import (
     build_descriptor,
@@ -317,8 +319,14 @@ def _resolve_lease(config) -> str | None:
     return sid
 
 
-def _descriptor_for(controller, lease, deployments, config):
-    """Build the descriptor, preferring backend-supplied access (real base_url)."""
+def _descriptor_for(controller, lease, deployments, config, *, assignments=None):
+    """Build the descriptor, preferring backend-supplied access (real base_url).
+
+    For a GPU *reservation* the env-file's only useful payload is the reserved
+    GPU index(es): fold the placement assignment into ``cuda_visible_devices`` so
+    a consumer that ``source``s the env-file runs its own process on exactly the
+    GPU infer-stack held for it.
+    """
     base_url = config.base_url
     api_key_env = config.api_key_env
     api_key = None
@@ -330,6 +338,14 @@ def _descriptor_for(controller, lease, deployments, config):
         api_key_env = info.get('api_key_env', api_key_env)
         api_key = info.get('api_key')
         request_names = info.get('request_names')
+    cuda_visible_devices = None
+    if assignments:
+        reserved_gpus: list[int] = []
+        for deployment in deployments:
+            if is_reservation(deployment):
+                reserved_gpus.extend(assignments.get(deployment.id, []))
+        if reserved_gpus:
+            cuda_visible_devices = ','.join(str(i) for i in reserved_gpus)
     return build_descriptor(
         lease,
         deployments,
@@ -337,6 +353,7 @@ def _descriptor_for(controller, lease, deployments, config):
         api_key_env=api_key_env,
         api_key=api_key,
         request_names=request_names,
+        cuda_visible_devices=cuda_visible_devices,
     )
 
 
@@ -376,12 +393,13 @@ def _gpu_where(gpus) -> str:
 
 def _emit_staged(config, controller, outcome) -> int:
     """Output for a ``--no-apply`` acquire: what was written + what would run."""
+    assignments = outcome.reconcile.assignments
     descriptor = _descriptor_for(
-        controller, outcome.lease, outcome.deployments, config
+        controller, outcome.lease, outcome.deployments, config,
+        assignments=assignments,
     )
     if config.env_file:
         Path(config.env_file).expanduser().write_text(render_env_file(descriptor))
-    assignments = outcome.reconcile.assignments
     if config.json:
         print(json.dumps({
             'lease_id': outcome.lease.id,
@@ -417,7 +435,8 @@ def _emit_acquire(config, controller, outcome) -> int:
     if not outcome.applied:
         return _emit_staged(config, controller, outcome)
     descriptor = _descriptor_for(
-        controller, outcome.lease, outcome.deployments, config
+        controller, outcome.lease, outcome.deployments, config,
+        assignments=outcome.reconcile.assignments,
     )
     # A readiness timeout means the controller already released the lease, so
     # there is no standing endpoint to point a sourceable env-file at.
@@ -482,12 +501,24 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     # Staging (--no-apply) is non-destructive (no docker up), so don't gate it
     # behind the diff prompt — the rendered file *is* the thing you asked to see.
     controller = _open_controller(config, interactive=not render_only)
-    catalog = _load_catalog(config)
-    names = _collect_names(config.names)
-    if not names:
-        raise SystemExit('give at least one endpoint or bundle name')
-    sharing = Sharing.DEDICATED if getattr(config, 'dedicated', False) else None
-    requests = _resolve(catalog, names, sharing=sharing)
+    reserve_gpus = int(getattr(config, 'reserve_gpus', 0) or 0)
+    if reserve_gpus > 0:
+        # Reservation mode: hold N available GPUs, serve nothing. No catalog, no
+        # endpoint names — just a count that first-fits free GPUs.
+        if _collect_names(config.names):
+            raise SystemExit(
+                '--reserve-gpus takes no endpoint names (it reserves GPUs, not '
+                'a served model)'
+            )
+        requests = [reservation_request(reserve_gpus)]
+        names = [f'{reserve_gpus} gpu(s)']
+    else:
+        catalog = _load_catalog(config)
+        names = _collect_names(config.names)
+        if not names:
+            raise SystemExit('give at least one endpoint or bundle name')
+        sharing = Sharing.DEDICATED if getattr(config, 'dedicated', False) else None
+        requests = _resolve(catalog, names, sharing=sharing)
     logger.info('Acquiring {} for {}', ', '.join(names), owner)
     if render_only:
         logger.info('Render-only: staging the compose project without applying')
@@ -715,6 +746,19 @@ class AcquireCLI(_AcquireFlagsMixin):
         False,
         isflag=True,
         help='Force a dedicated deployment instead of coalescing.',
+    )
+    reserve_gpus = scfg.Value(
+        0,
+        type=int,
+        alias=['reserve-gpus'],
+        help='Reserve N *available* GPUs without launching any server (N is a '
+        'count, not an index — infer-stack first-fits free GPUs). The lease holds '
+        'the GPU(s) out of the placement pool so concurrent served runs skip '
+        'them, and reports the chosen index(es) via the env-file\'s '
+        'CUDA_VISIBLE_DEVICES so you can run your own process (e.g. HELM\'s '
+        'in-process HuggingFaceClient) on exactly those GPUs. Takes no endpoint '
+        'names; use --ttl/--queue/--env-file as usual, release by lease id or '
+        'env-file.',
     )
 
     @classmethod

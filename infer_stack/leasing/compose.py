@@ -41,7 +41,7 @@ from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import vllm_args
 from .backend import ConvergeScaffold, Readiness
-from .models import Deployment
+from .models import Deployment, is_reservation
 from .placement import plan_placement
 
 LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
@@ -1596,6 +1596,10 @@ class ComposeBackend(ConvergeScaffold):
         model never answers a chat probe). The probe goes through the gateway when
         present, else straight to the vLLM upstream's own published ``/v1``.
         """
+        if is_reservation(deployment):
+            # A reservation holds a GPU but runs no server, so there is nothing to
+            # probe — it is "ready" the moment placement assigned it a GPU.
+            return Readiness(True, 'gpu reserved (no server to probe)')
         if deployment.id not in self.observe():
             return Readiness(False, 'container not running')
         served = deployment.served.get(endpoint) or {}

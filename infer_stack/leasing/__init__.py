@@ -34,6 +34,8 @@ from .ledger import (
     default_ledger_path,
 )
 from .models import (
+    RESERVED_ENDPOINT,
+    RESERVED_ENGINE,
     Deployment,
     DeploymentState,
     EndpointRequest,
@@ -42,7 +44,9 @@ from .models import (
     Sharing,
     capacity_satisfies,
     compatibility_key,
+    is_reservation,
     ollama_structural,
+    reservation_request,
     vllm_structural,
 )
 from .placement import (
@@ -73,6 +77,8 @@ __all__ = [
     'MemoryBackend',
     'ModelSpec',
     'NullBackend',
+    'RESERVED_ENDPOINT',
+    'RESERVED_ENGINE',
     'Readiness',
     'ReconcileResult',
     'ReleaseOutcome',
@@ -87,9 +93,11 @@ __all__ = [
     'capacity_satisfies',
     'compatibility_key',
     'default_ledger_path',
+    'is_reservation',
     'ollama_structural',
     'plan_placement',
     'render_compose',
     'required_gpu_count',
+    'reservation_request',
     'vllm_structural',
 ]
