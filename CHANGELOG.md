@@ -5,6 +5,23 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 ## [Version 0.7.0] - Unreleased
 
 ### Added
+* **Reserve-only GPU lease: `infer-stack acquire --reserve-gpus N`.** Hold N
+  *available* GPUs (count-based first-fit — infer-stack picks which, never a
+  pinned index) without launching any server, so an external process can run on
+  exactly the reserved card under the SAME admission-queue / render-lock
+  accounting as served runs (a reserved GPU is withheld from concurrent vLLM
+  placements and vice-versa, because the reservation is a real ledger Deployment
+  visible cross-process). Modelled as a non-servable deployment
+  (`engine='reserved'`, DEDICATED so two reservations never coalesce onto one
+  GPU, `reclaim!=keep-warm` so release frees the GPU at once); it renders no
+  container (render_compose already skips non-vllm/ollama), is never probed for
+  readiness, and reports the chosen index via the env-file's
+  `CUDA_VISIBLE_DEVICES`. Honors `allowed_gpus`/`$SLURM_JOB_GPUS` like any
+  placement. Claims are recorded with `kind='reserved-gpu'`. This turns the
+  previously-unwired Phase-2 `reserved` scaffolding into a usable feature.
+  `tests/test_leasing_reservation.py`; `tests/test_reservation_gpu_frame_e2e.py`
+  is an opt-in on-host probe that the reserved index and `docker --gpus device=`
+  agree on the same physical GPU.
 * **TUI: "Evict all idle" + multi-select in the leases/deployments tables.**
   Clearing a pile of released-but-kept-warm deployments no longer means evicting
   one row at a time: a new **Evict all idle** button (deployments pane) flips
