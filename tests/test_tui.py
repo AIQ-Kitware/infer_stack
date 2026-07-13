@@ -880,6 +880,45 @@ def test_tui_api_tester_sends_via_injected_http():
     assert http.calls and http.calls[0][0].endswith('/v1/chat/completions')
 
 
+def test_tui_api_send_surfaces_http_error_body():
+    """A gateway 400 must show its BODY (e.g. 'Invalid model name'), not just a
+    bare '400 Client Error' — the missing body is what made the route-stripping
+    incident hard to diagnose from the TUI."""
+    import requests
+    from textual.widgets import Select
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    class _Resp:
+        status_code = 400
+        url = 'http://x:14042/v1/chat/completions'
+        text = '{"error":{"message":"Invalid model name passed in"}}'
+
+        def raise_for_status(self):
+            raise requests.HTTPError('400 Client Error: Bad Request')
+
+    class _HTTP:
+        def post(self, url, json=None, headers=None, timeout=None):
+            return _Resp()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None, http=_HTTP())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controller.backend.litellm_port = 14042
+            app._sync_api_models(['qwen-coder'])
+            assert app.query_one('#api-model', Select).value == 'qwen-coder'
+            app.action_api_send()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any('Invalid model name' in line for line in app._api_lines)
+
+    _run(scenario)
+
+
 def test_tui_api_urls_render_without_markup_error():
     # Regression: the URLs were rendered with Textual [link=URL] markup, which
     # rejects the ':' in http:// and crashed on get_content_height.

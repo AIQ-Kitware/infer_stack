@@ -2169,6 +2169,28 @@ class InferStackTUI(App):
             return message['content']
         return choice.get('text', '')
 
+    @staticmethod
+    def _raise_for_body(resp) -> None:
+        """``raise_for_status`` that folds the response *body* into the error.
+
+        A bare ``400 Client Error`` hides the gateway's actual detail — e.g. the
+        ``Invalid model name`` a route-stripped LiteLLM returns — which is what
+        made the shared-gateway route incident hard to diagnose from the TUI. On
+        failure, append the response body (truncated) to the raised error.
+        Tolerant of fake/minimal responses that lack ``.text`` (re-raise as-is).
+        """
+        try:
+            resp.raise_for_status()
+        except Exception as ex:  # noqa: BLE001 - re-raised with more context
+            body = ''
+            try:
+                body = (resp.text or '').strip()
+            except Exception:  # noqa: BLE001 - body is best-effort context
+                body = ''
+            if body:
+                raise RuntimeError(f'{ex} — {body[:500]}') from ex
+            raise
+
     def _api_chat(self, model: str, prompt: str) -> str:
         base, key = self._litellm()
         if not base:
@@ -2185,7 +2207,7 @@ class InferStackTUI(App):
                     'max_tokens': 128, 'temperature': 0}
         resp = self._http_client().post(
             url, json=body, headers=headers, timeout=120)
-        resp.raise_for_status()
+        self._raise_for_body(resp)
         return self._completion_text(resp.json())
 
     def _curl_for(self, model: str, prompt: str) -> str:
@@ -2305,7 +2327,7 @@ class InferStackTUI(App):
             headers = {'Authorization': f'Bearer {key}'} if key else {}
             resp = self._http_client().get(
                 f'{base}/v1/models', headers=headers, timeout=30)
-            resp.raise_for_status()
+            self._raise_for_body(resp)
             ids = [m.get('id') for m in (resp.json().get('data') or [])]
             self.call_from_thread(
                 self._api_log, f'  routes: {", ".join(ids) or "(none)"}')
