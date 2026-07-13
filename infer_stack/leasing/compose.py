@@ -15,6 +15,18 @@ talks to ``http://host:<litellm>/v1`` and asks for the public endpoint name.
 That is what makes the endpoint descriptor's ``base_url`` correct (the backend
 supplies it via :meth:`ComposeBackend.access`).
 
+In static-superset mode the gateway's ``model_list`` is rendered from an
+**append-only route registry** (``litellm_registry.json`` in the shared state
+dir): every converge merges the invoking catalog plus every live deployment
+(across all runbooks sharing the stack) into the registry and renders from the
+whole thing. That makes the render a function of accumulated shared state — not
+of which runbook invoked the converge — so a cross-catalog converge can no
+longer strip another's live routes and, once every catalog has merged once, the
+config is byte-stable (the gateway is never recreated). See
+:meth:`ComposeBackend._update_route_registry` and
+:func:`_litellm_model_list_from_registry`; ``infer-stack routes`` inspects/seeds/
+prunes it; ``docs/litellm-gateway-routing.md`` has the full story.
+
 Docker and HTTP are invoked through injected seams (``run`` / ``http_get``), so
 all logic here is unit-testable without docker or a network. The real
 docker/GPU path is validated on a GPU host. ``converge`` is serialized with a
@@ -60,6 +72,16 @@ API_KEY_ENV = 'LITELLM_MASTER_KEY'
 # model store, instead of a static config file. See render_compose +
 # ComposeBackend._reconcile_routes and docs/litellm-gateway-routing.md.
 LITELLM_ROUTES_FILENAME = 'litellm_routes.json'  # rendered desired route set
+# Append-only route registry for static-superset mode: accumulates the semantic
+# route inputs (served name / engine / host) of every catalog *and* every live
+# deployment ever merged, across all runbooks sharing this state dir. The gateway
+# `model_list` is rendered from the whole registry, so a converge under one
+# runbook's catalog can no longer strip another's still-live routes, and once
+# every catalog has been merged once the rendered config is byte-stable (the
+# gateway is never recreated). See docs/litellm-gateway-routing.md and
+# ComposeBackend._update_route_registry.
+LITELLM_REGISTRY_FILENAME = 'litellm_registry.json'
+LITELLM_REGISTRY_VERSION = 1
 POSTGRES_SERVICE = 'postgres-litellm'
 POSTGRES_CONTAINER_PORT = 5432
 POSTGRES_DB_NAME = 'litellm'
@@ -335,6 +357,38 @@ def _ollama_service(
     return service
 
 
+def _vllm_route_entry(
+    model_name: str, served: str, api_base: str
+) -> dict[str, Any]:
+    """One LiteLLM ``model_list`` entry routing ``model_name`` to a vLLM upstream.
+
+    Shared by every render path (legacy per-deployment, catalog-superset, and
+    the route registry) so a registry-rendered entry can never drift from what
+    the catalog/deployment paths produce for the same endpoint."""
+    return {
+        'model_name': model_name,
+        'litellm_params': {
+            'model': f'openai/{served}',
+            'api_base': api_base,
+            'api_key': 'EMPTY',
+        },
+    }
+
+
+def _ollama_route_entry(
+    model_name: str, tag: str, api_base: str
+) -> dict[str, Any]:
+    """One LiteLLM ``model_list`` entry routing ``model_name`` to an Ollama tag
+    (see :func:`_vllm_route_entry` for why this is factored out)."""
+    return {
+        'model_name': model_name,
+        'litellm_params': {
+            'model': f'ollama/{tag}',
+            'api_base': api_base,
+        },
+    }
+
+
 def _litellm_model_list(
     deployments: list[Deployment], assignments: dict[str, list[int]]
 ) -> list[dict[str, Any]]:
@@ -347,29 +401,12 @@ def _litellm_model_list(
             served = deployment.spec.get('served_model_name') or deployment.id
             api_base = f'http://{vllm_service_name(deployment)}:8000/v1'
             for endpoint in sorted(deployment.served):
-                entries.append(
-                    {
-                        'model_name': endpoint,
-                        'litellm_params': {
-                            'model': f'openai/{served}',
-                            'api_base': api_base,
-                            'api_key': 'EMPTY',
-                        },
-                    }
-                )
+                entries.append(_vllm_route_entry(endpoint, served, api_base))
         elif deployment.engine == 'ollama':
             api_base = f'http://{ollama_service_name(deployment)}:{OLLAMA_CONTAINER_PORT}'
             for endpoint, payload in sorted(deployment.served.items()):
                 tag = payload.get('model', endpoint)
-                entries.append(
-                    {
-                        'model_name': endpoint,
-                        'litellm_params': {
-                            'model': f'ollama/{tag}',
-                            'api_base': api_base,
-                        },
-                    }
-                )
+                entries.append(_ollama_route_entry(endpoint, tag, api_base))
     return entries
 
 
@@ -406,32 +443,191 @@ def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
             api_base = (
                 f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1'
             )
-            entries.append(
-                {
-                    'model_name': name,
-                    'litellm_params': {
-                        'model': f'openai/{served}',
-                        'api_base': api_base,
-                        'api_key': 'EMPTY',
-                    },
-                }
-            )
+            entries.append(_vllm_route_entry(name, served, api_base))
         elif req.engine == 'ollama':
             host = req.spec.get('host') or req.host
             tag = req.served.get('model') or name
             api_base = (
                 f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
             )
-            entries.append(
-                {
-                    'model_name': name,
-                    'litellm_params': {
-                        'model': f'ollama/{tag}',
-                        'api_base': api_base,
-                    },
-                }
-            )
+            entries.append(_ollama_route_entry(name, tag, api_base))
     return entries
+
+
+# -- Route registry (static-superset persistence) --------------------------
+#
+# The registry stores *semantic* route inputs (served name / engine / host),
+# never rendered LiteLLM entries — render derives entries through the same
+# helpers the catalog/deployment paths use (:func:`_litellm_model_list_from_registry`),
+# so a future renderer change propagates to old registry rows automatically.
+# All functions here are pure; the backend owns the file I/O and locking.
+
+
+def _registry_incoming_from_catalog(catalog: Any) -> dict[str, dict[str, Any]]:
+    """Semantic route rows for every resolvable endpoint of ``catalog``.
+
+    Mirrors :func:`_litellm_model_list_from_catalog`'s iteration (unresolvable
+    endpoints skipped) but emits registry rows keyed by endpoint name. A vLLM
+    row carries only ``served`` (the upstream host is re-derived at render via
+    :func:`vllm_service_name_for`); an Ollama row carries ``model`` (tag) +
+    ``host``."""
+    incoming: dict[str, dict[str, Any]] = {}
+    for name in sorted(getattr(catalog, 'endpoints', {})):
+        try:
+            req = catalog.resolve_endpoint(name)
+        except Exception:  # noqa: BLE001 - a bad endpoint must not break the gateway
+            continue
+        if req.engine == 'vllm':
+            served = req.served.get('served_model_name') or name
+            incoming[name] = {'engine': 'vllm', 'served': served}
+        elif req.engine == 'ollama':
+            host = req.spec.get('host') or req.host
+            tag = req.served.get('model') or name
+            incoming[name] = {'engine': 'ollama', 'model': tag, 'host': host}
+    return incoming
+
+
+def _registry_incoming_from_deployments(
+    deployments: list[Deployment], assignments: dict[str, list[int]]
+) -> dict[str, dict[str, Any]]:
+    """Semantic route rows for every *placed* deployment in ``assignments``.
+
+    ``deployments`` is the full ``desired`` set (which spans all runbooks via
+    the shared ledger), so this keeps non-catalog / dedicated acquires routable
+    and — because the registry persists — routable past release. One row per key
+    of ``deployment.served`` (a coalesced deployment can back several endpoint
+    aliases). Only ``vllm``/``ollama`` engines contribute; ``RESERVED_ENGINE``
+    and unknown engines render no service, so they contribute no row — exactly
+    as :func:`render_compose`'s service loop skips them.
+
+    The vLLM ``served`` uses the same fallback chain as :func:`vllm_service_name`
+    (``spec['served_model_name'] or sorted(served)[0] or id``), so a
+    catalog-listed endpoint acquired live reduces to the identical row a catalog
+    merge produces — live-vs-released status never moves the rendered bytes."""
+    incoming: dict[str, dict[str, Any]] = {}
+    for deployment in deployments:
+        if deployment.id not in assignments:
+            continue
+        if deployment.engine == 'vllm':
+            served = deployment.spec.get('served_model_name') or (
+                sorted(deployment.served)[0] if deployment.served else deployment.id
+            )
+            for endpoint in sorted(deployment.served):
+                incoming[endpoint] = {'engine': 'vllm', 'served': served}
+        elif deployment.engine == 'ollama':
+            host = deployment.spec.get('host') or deployment.id
+            for endpoint, payload in sorted(deployment.served.items()):
+                tag = payload.get('model', endpoint)
+                incoming[endpoint] = {
+                    'engine': 'ollama',
+                    'model': tag,
+                    'host': host,
+                }
+    return incoming
+
+
+def _litellm_model_list_from_registry(
+    registry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Render the gateway ``model_list`` from the whole accumulated registry.
+
+    Iterates ``sorted(entries)`` (determinism, §8) and derives each upstream
+    ``api_base`` through the live naming helpers, so the registry never becomes
+    a rendered-config parse surface."""
+    entries: list[dict[str, Any]] = []
+    rows = registry.get('entries', {}) if isinstance(registry, dict) else {}
+    for name in sorted(rows):
+        row = rows[name]
+        if not isinstance(row, dict):
+            continue
+        engine = row.get('engine')
+        if engine == 'vllm':
+            served = row.get('served') or name
+            api_base = (
+                f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1'
+            )
+            entries.append(_vllm_route_entry(name, served, api_base))
+        elif engine == 'ollama':
+            tag = row.get('model') or name
+            host = row.get('host') or name
+            api_base = (
+                f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
+            )
+            entries.append(_ollama_route_entry(name, tag, api_base))
+    return entries
+
+
+def _merge_route_registry(
+    existing: dict[str, Any], incoming: dict[str, dict[str, Any]]
+) -> tuple[dict[str, Any], list[str]]:
+    """Merge ``incoming`` semantic rows into ``existing`` (append-only).
+
+    Idempotent (merging identical rows is a no-op) and additive (never removes a
+    row). On a conflict — same key, different row — *incoming wins* and a warning
+    naming both definitions is emitted; the changed definition changes the
+    rendered bytes, which is the one justified recreate. The existing ``version``
+    is preserved (an unknown version merged under is not silently rewritten to
+    the current schema; see :meth:`ComposeBackend._load_route_registry`)."""
+    version = LITELLM_REGISTRY_VERSION
+    entries: dict[str, dict[str, Any]] = {}
+    if isinstance(existing, dict):
+        version = existing.get('version', LITELLM_REGISTRY_VERSION)
+        prior = existing.get('entries')
+        if isinstance(prior, dict):
+            entries = {k: v for k, v in prior.items()}
+    warnings: list[str] = []
+    for name in sorted(incoming):
+        row = incoming[name]
+        if name in entries and entries[name] != row:
+            warnings.append(
+                f"route {name!r} redefined: {entries[name]} -> {row} "
+                '(incoming wins; gateway will be recreated once)'
+            )
+        entries[name] = row
+    return {'version': version, 'entries': entries}, warnings
+
+
+def _seed_registry_from_litellm_config(
+    config_text: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """One-shot upgrade seed: recover registry rows from a rendered
+    ``litellm_config.yaml`` so the first post-upgrade converge does not strip
+    the other runbooks' routes.
+
+    Single-format, migration-time only (no cross-version promise): ``openai/<served>``
+    inverts *exactly* to ``{engine: vllm, served}``. Ollama rows are skipped with
+    a warning — the host survives only as a non-invertible ``dns_slug`` inside
+    ``api_base`` — and re-enter the registry at the next converge that has them
+    in its catalog or live set. Anything else unparseable is likewise skipped."""
+    entries: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    try:
+        data = yaml.safe_load(config_text) or {}
+    except Exception:  # noqa: BLE001 - a torn file must not brick seeding
+        return {'version': LITELLM_REGISTRY_VERSION, 'entries': {}}, [
+            'seed: litellm_config.yaml is unparseable; starting an empty registry'
+        ]
+    for entry in data.get('model_list', []) or []:
+        name = entry.get('model_name')
+        model = (entry.get('litellm_params') or {}).get('model', '')
+        if not name:
+            continue
+        if isinstance(model, str) and model.startswith('openai/'):
+            entries[name] = {'engine': 'vllm', 'served': model[len('openai/'):]}
+        elif isinstance(model, str) and model.startswith('ollama/'):
+            warnings.append(
+                f"seed: skipping Ollama route {name!r} (host not recoverable "
+                'from the rendered api_base; it re-enters at its next converge)'
+            )
+        else:
+            warnings.append(f'seed: skipping unparseable route {name!r}')
+    return {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}, warnings
+
+
+def _dump_route_registry(registry: dict[str, Any]) -> str:
+    """Canonical, byte-stable serialization (§3): sorted keys + trailing
+    newline. A nondeterministic dump would manufacture phantom hash changes."""
+    return json.dumps(registry, sort_keys=True, indent=2) + '\n'
 
 
 def _route_id(deployment_id: str, endpoint: str) -> str:
@@ -802,6 +998,7 @@ def render_compose(
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
     catalog: Any = None,
+    route_registry: dict[str, Any] | None = None,
     dynamic_routing: bool = False,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
@@ -894,16 +1091,26 @@ def render_compose(
         #    hash never changes as models come/go, so the gateway is never
         #    recreated — no blip, and per-deployment routing works (so same-model
         #    --dedicated deployments each get their own upstream).
+        #  * ROUTE REGISTRY (static-superset default from ComposeBackend): render
+        #    from the whole accumulated registry (every catalog + live deployment
+        #    ever merged, across all runbooks). Byte-stable once seeded, so the
+        #    gateway is never recreated and a cross-catalog converge can no longer
+        #    strip another runbook's routes. The backend loads/merges/writes the
+        #    registry and passes the merged dict in; this function stays pure.
         #  * STATIC SUPERSET (catalog): one route per catalog endpoint to a
         #    deterministic host; config depends only on the catalog, so the
         #    gateway is not recreated as models come/go (no blip) but same-model
-        #    dedicated collapses to one upstream.
+        #    dedicated collapses to one upstream. Unreachable from ComposeBackend
+        #    once the registry is wired; kept for direct callers/tests.
         #  * LEGACY (no catalog): route only the placed deployments; churns the
         #    config (and recreates the gateway) on every model change.
         if dynamic_routing:
             entries: list[dict[str, Any]] = []
             litellm_routes = _litellm_routes(deployments, assignments)
             litellm_depends: list[str] = []
+        elif route_registry is not None:
+            entries = _litellm_model_list_from_registry(route_registry)
+            litellm_depends = []  # no per-model depends_on -> no churn
         elif catalog is not None:
             entries = _litellm_model_list_from_catalog(catalog)
             litellm_depends = []  # no per-model depends_on -> no churn
@@ -1143,6 +1350,10 @@ class ComposeBackend(ConvergeScaffold):
     def _routes_file(self) -> Path:
         return self.state_dir / LITELLM_ROUTES_FILENAME
 
+    @property
+    def _registry_file(self) -> Path:
+        return self.state_dir / LITELLM_REGISTRY_FILENAME
+
     def master_key(self) -> str:
         """The managed LiteLLM master key.
 
@@ -1205,6 +1416,129 @@ class ComposeBackend(ConvergeScaffold):
             skip_display=self.skip_display,
         )
 
+    def _load_route_registry(self) -> dict[str, Any]:
+        """Read the route registry, tolerantly (fail-open — a broken registry
+        must never block a converge).
+
+        Missing file → seed from the live ``litellm_config.yaml`` if present
+        (upgrade migration, §6), else an empty registry. An *unknown* schema
+        version whose ``entries`` still parses as a name→row map is preserved
+        as-is (render what's understood, warn, do NOT rewrite) rather than
+        reseeded, so a binary rollback doesn't discard the accumulated union.
+        Only a structurally unusable file (not a map / garbage JSON) falls back
+        to seeding."""
+        from .._log import logger
+
+        if not self._registry_file.exists():
+            config = self.state_dir / LITELLM_CONFIG_FILENAME
+            if config.exists():
+                seeded, warnings = _seed_registry_from_litellm_config(
+                    config.read_text()
+                )
+                for w in warnings:
+                    logger.warning('  route registry: {}', w)
+                logger.info(
+                    '  route registry: seeded {} vLLM route(s) from {}',
+                    len(seeded['entries']), config.name,
+                )
+                return seeded
+            return {'version': LITELLM_REGISTRY_VERSION, 'entries': {}}
+        try:
+            data = json.loads(self._registry_file.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                '  route registry: {} is unreadable ({}); rebuilding from seed',
+                self._registry_file.name, exc,
+            )
+            data = None
+        if not isinstance(data, dict) or not isinstance(
+            data.get('entries'), dict
+        ):
+            config = self.state_dir / LITELLM_CONFIG_FILENAME
+            if config.exists():
+                seeded, warnings = _seed_registry_from_litellm_config(
+                    config.read_text()
+                )
+                for w in warnings:
+                    logger.warning('  route registry: {}', w)
+                return seeded
+            return {'version': LITELLM_REGISTRY_VERSION, 'entries': {}}
+        version = data.get('version')
+        if version != LITELLM_REGISTRY_VERSION:
+            logger.warning(
+                '  route registry: unknown schema version {!r} in {} — '
+                'rendering as-is without rewrite (fields this renderer does '
+                'not understand are ignored)',
+                version, self._registry_file.name,
+            )
+        return data
+
+    def _update_route_registry(
+        self, desired: list[Deployment], assignments: dict[str, list[int]]
+    ) -> dict[str, Any]:
+        """Load, merge the invoking catalog (if any) + all live deployments,
+        persist iff changed, and return the merged registry.
+
+        Called under the converge flock (:meth:`_converge_lock`), so the
+        read-merge-write is race-safe against concurrent converges from other
+        runbooks with no new locking."""
+        from .._log import logger
+
+        existing = self._load_route_registry()
+        incoming: dict[str, dict[str, Any]] = {}
+        if self.catalog is not None:
+            incoming.update(_registry_incoming_from_catalog(self.catalog))
+        # `desired` spans all runbooks via the shared ledger, so this keeps every
+        # live cross-runbook deployment routable (and, via persistence, routable
+        # past release).
+        incoming.update(
+            _registry_incoming_from_deployments(desired, assignments)
+        )
+        merged, warnings = _merge_route_registry(existing, incoming)
+        for w in warnings:
+            logger.warning('  route registry: {}', w)
+        if merged != existing:
+            prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
+            added = sorted(set(merged['entries']) - set(prior))
+            updated = sorted(
+                k for k in merged['entries']
+                if k in prior and merged['entries'][k] != prior[k]
+            )
+            if added:
+                logger.info('  route registry: +{} route(s): {}',
+                            len(added), ', '.join(added))
+            if updated:
+                logger.info('  route registry: updated route(s): {}',
+                            ', '.join(updated))
+            self._atomic_write(
+                self._registry_file, _dump_route_registry(merged)
+            )
+        return merged
+
+    def merge_route_registry(
+        self, incoming: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Public write path for out-of-converge registry seeds (``routes seed``).
+
+        Takes the converge flock, read-merge-writes the registry, and returns the
+        merged dict. ``converge`` only ever merges the invoking process's own
+        catalog, so a standalone caller (seeding a *sibling* runbook's catalog)
+        needs this to fold extra rows in before the follow-up ``reconcile``
+        renders+applies. The flock here and the one the subsequent converge takes
+        are sequential acquisitions, not nested — no reentrancy concern."""
+        from .._log import logger
+
+        with self._converge_lock():
+            existing = self._load_route_registry()
+            merged, warnings = _merge_route_registry(existing, incoming)
+            for w in warnings:
+                logger.warning('  route registry: {}', w)
+            if merged != existing:
+                self._atomic_write(
+                    self._registry_file, _dump_route_registry(merged)
+                )
+        return merged
+
     def converge(self, desired: list[Deployment], *, apply: bool = True):
         """Place + render the desired union, then optionally apply it.
 
@@ -1236,6 +1570,18 @@ class ComposeBackend(ConvergeScaffold):
                 # docker compose --env-file can interpolate ${LITELLM_DB_PASSWORD}
                 # into the postgres + litellm services at apply time.
                 self.db_password()
+            route_registry = None
+            if self.litellm and not self.dynamic_routing:
+                # Unconditional in static-superset mode: `self.catalog` may be
+                # None (a bare release/gc with no discoverable config dir) — the
+                # incoming set is then deployments-only, and the render still
+                # comes from the accumulated registry, so a catalog-less converge
+                # cannot strip routes or blip. This retires the legacy
+                # per-deployment `_litellm_model_list` branch from the backend
+                # path entirely (it survives in render_compose for direct callers).
+                route_registry = self._update_route_registry(
+                    desired, plan.assignments
+                )
             rendered = render_compose(
                 desired,
                 plan.assignments,
@@ -1253,6 +1599,7 @@ class ComposeBackend(ConvergeScaffold):
                 aux_dir=self.state_dir,
                 project=self.project,
                 catalog=self.catalog,
+                route_registry=route_registry,
                 dynamic_routing=self.dynamic_routing,
             )
             # A deployment the render excluded (service-name collision) is as

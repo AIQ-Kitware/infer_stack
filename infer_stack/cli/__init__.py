@@ -45,6 +45,7 @@ from .commands_leasing import (
     LeasesCLI,
     ReleaseCLI,
     RenewCLI,
+    RoutesModalCLI,
     RunCLI,
     TestCLI,
     TuiCLI,
@@ -125,6 +126,7 @@ class ManageCLI(scfg.ModalCLI):
     apply = ApplyCLI  # bring the desired set up (the trigger for acquire --no-apply)
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
+    routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
     test = TestCLI  # smoke-test a served endpoint through the front door
     env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE
