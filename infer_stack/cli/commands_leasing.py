@@ -1707,3 +1707,279 @@ class EnvCLI(_PathOverridesMixin):
         for name, value in env.items():
             print(f'export {name}={shlex.quote(value)}')
         return 0
+
+
+# ---------------------------------------------------------------------------
+# `routes` — inspect / seed / prune the LiteLLM route registry (static mode)
+# ---------------------------------------------------------------------------
+
+
+def _require_compose_backend(controller):
+    """The controller's ComposeBackend, or a SystemExit for other backends.
+
+    The route registry is a compose-backend concept (it feeds the static-superset
+    LiteLLM gateway); ``--backend null``/``kubeai`` have no registry to touch."""
+    backend = controller.backend
+    if not isinstance(backend, ComposeBackend):
+        raise SystemExit(
+            'the `routes` commands require the compose backend '
+            '(set `--backend compose` or `config set backend compose`)'
+        )
+    return backend
+
+
+def _live_endpoints(controller) -> set[str]:
+    """Endpoint aliases served by a currently-live deployment (for annotation)."""
+    controller.ledger.sweep()
+    _, deployments = controller.ledger.status()
+    return {
+        ep
+        for g in deployments
+        if g.state == DeploymentState.LIVE
+        for ep in g.served
+    }
+
+
+class RoutesListCLI(_LeasingCommonMixin):
+    """Print the accumulated LiteLLM route registry (static-superset mode).
+
+    One row per persisted route: its alias, engine, served-model/tag, the
+    upstream compose service it derives, and whether a live deployment is
+    currently backing it. Routes with no live backer still list (that is the
+    point — a released endpoint stays routable/testable); their upstream simply
+    errors until something serves it.
+    """
+
+    __command__ = 'list'
+
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.compose import (
+            OLLAMA_CONTAINER_PORT,
+            VLLM_CONTAINER_PORT,
+            ollama_service_name_for,
+            vllm_service_name_for,
+        )
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        backend = _require_compose_backend(controller)
+        registry = backend._load_route_registry()
+        entries = registry.get('entries', {})
+        live = _live_endpoints(controller)
+
+        rows = []
+        for name in sorted(entries):
+            row = entries[name]
+            engine = row.get('engine')
+            if engine == 'vllm':
+                served = row.get('served') or name
+                upstream = (
+                    f'http://{vllm_service_name_for(served)}:'
+                    f'{VLLM_CONTAINER_PORT}/v1'
+                )
+                target = served
+            elif engine == 'ollama':
+                target = row.get('model') or name
+                host = row.get('host') or name
+                upstream = (
+                    f'http://{ollama_service_name_for(host)}:'
+                    f'{OLLAMA_CONTAINER_PORT}'
+                )
+            else:
+                target, upstream = '?', '?'
+            rows.append({
+                'name': name,
+                'engine': engine,
+                'target': target,
+                'upstream': upstream,
+                'live': name in live,
+            })
+
+        if config.json:
+            print(json.dumps(
+                {'version': registry.get('version'), 'routes': rows}, indent=2
+            ))
+            return 0
+        if not rows:
+            print('route registry is empty (no converge has run yet)')
+            return 0
+        print(f'{len(rows)} route(s) in the registry:')
+        for r in rows:
+            flag = 'live' if r['live'] else '   -'
+            print(
+                f'  [{flag}] {r["name"]:<28} {r["engine"]:<7} '
+                f'{r["target"]:<24} -> {r["upstream"]}'
+            )
+        return 0
+
+
+class RoutesPruneCLI(_ApprovalMixin):
+    """Forget stale routes: rewrite the registry to *invoking catalog ∪ live*,
+    then converge (one accepted gateway recreate).
+
+    The registry is append-only by design (that is what keeps the gateway config
+    byte-stable), so pruning is the explicit, operator-driven "forget" verb —
+    automatic pruning is deliberately excluded because any catalog-keyed rule
+    reintroduces the cross-catalog alternation churn this whole mechanism exists
+    to avoid.
+
+    A prune run from the WRONG ``INFER_STACK_CONFIG_DIR`` would silently drop
+    every other runbook's routes, so the exact drop list is shown and confirmed
+    first (``--yes`` / a non-terminal skips the prompt).
+    """
+
+    __command__ = 'prune'
+
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..diff_prompt import confirm_writes
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.compose import (
+            LITELLM_REGISTRY_VERSION,
+            _dump_route_registry,
+            _registry_incoming_from_catalog,
+            _registry_incoming_from_deployments,
+        )
+
+        config = cls.cli(argv=argv, data=kwargs)
+        # interactive=False so reconcile auto-applies the compose diff; the
+        # meaningful gate (which routes get dropped) is confirmed here instead.
+        controller = _open_controller(config, interactive=False)
+        backend = _require_compose_backend(controller)
+
+        controller.ledger.sweep()
+        desired = controller.desired_deployments()
+        plan = backend.plan(desired)
+        keep: dict = {}
+        if backend.catalog is not None:
+            keep.update(_registry_incoming_from_catalog(backend.catalog))
+        keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+
+        current = backend._load_route_registry()
+        dropped = sorted(set(current.get('entries', {})) - set(keep))
+        if not dropped:
+            print('routes prune: nothing to drop (registry already minimal)')
+            return 0
+
+        pruned = {'version': LITELLM_REGISTRY_VERSION, 'entries': keep}
+        skip_prompt = bool(config.yes) or not sys.stdout.isatty()
+        if not skip_prompt:
+            print('routes prune will DROP these routes:')
+            for name in dropped:
+                print(f'  - {name}')
+            ok = confirm_writes(
+                {backend._registry_file: _dump_route_registry(pruned)},
+                assume_yes=False,
+                title='infer-stack routes prune',
+            )
+            if not ok:
+                raise SystemExit('aborted: registry not pruned')
+
+        with backend._converge_lock():
+            backend._atomic_write(
+                backend._registry_file, _dump_route_registry(pruned)
+            )
+        try:
+            controller.reconcile(apply=True)
+        except ConvergeAborted:
+            raise SystemExit('aborted: compose changes not applied')
+
+        if config.json:
+            print(json.dumps({'dropped': dropped, 'kept': sorted(keep)}, indent=2))
+        else:
+            print(f'routes prune: dropped {len(dropped)} route(s), '
+                  f'kept {len(keep)}')
+        return 0
+
+
+class RoutesSeedCLI(_ApprovalMixin):
+    """Merge extra catalog files' routes into the registry, then converge.
+
+    The operational key to blip-free concurrency: seed *all* the overlapping
+    runbooks' catalogs once while the stack is idle, and then no converge from
+    any of them ever recreates the gateway (the registry is already the full
+    union). Works before ``stack up`` too — the follow-up reconcile brings the
+    standing gateway up with the complete route table, which is exactly what
+    pre-seeding is for.
+
+    Unlike a normal converge (which only ever merges the *invoking* process's own
+    catalog), this folds in sibling catalogs you name explicitly.
+    """
+
+    __command__ = 'seed'
+
+    catalogs = scfg.Value(
+        None, nargs='+', position=1, type=str,
+        help='One or more catalog.yaml files whose endpoints to merge into the '
+        'route registry.',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.compose import _registry_incoming_from_catalog
+
+        config = cls.cli(argv=argv, data=kwargs)
+        paths = _collect_names(config.catalogs)
+        if not paths:
+            raise SystemExit('routes seed: name at least one catalog.yaml file')
+        # interactive=False: the reconcile auto-applies (seeding is additive, so
+        # there is no destructive gate to confirm).
+        controller = _open_controller(config, interactive=False)
+        backend = _require_compose_backend(controller)
+
+        incoming: dict = {}
+        for raw in paths:
+            path = Path(raw).expanduser()
+            if not path.exists():
+                raise SystemExit(f'catalog not found: {path}')
+            try:
+                cat = Catalog.load(path)
+            except CatalogError as ex:
+                raise SystemExit(f'invalid catalog {path}: {ex}')
+            incoming.update(_registry_incoming_from_catalog(cat))
+        if not incoming:
+            raise SystemExit(
+                'routes seed: the named catalog(s) resolved no routable endpoints'
+            )
+
+        before = set(backend._load_route_registry().get('entries', {}))
+        backend.merge_route_registry(incoming)
+        try:
+            controller.reconcile(apply=True)
+        except ConvergeAborted:
+            raise SystemExit('aborted: compose changes not applied')
+        added = sorted(set(incoming) - before)
+
+        if config.json:
+            print(json.dumps(
+                {'merged': sorted(incoming), 'added': added}, indent=2
+            ))
+        else:
+            print(
+                f'routes seed: merged {len(incoming)} route(s) '
+                f'({len(added)} new): {", ".join(added) or "(all already present)"}'
+            )
+        return 0
+
+
+class RoutesModalCLI(scfg.ModalCLI):
+    """Inspect + manage the LiteLLM route registry (static-superset mode).
+
+    The registry accumulates every catalog's and every live deployment's routes
+    across the runbooks that share one stack, so a cross-catalog converge cannot
+    strip another's live routes and the gateway config stays byte-stable. See
+    docs/litellm-gateway-routing.md.
+    """
+
+    __command__ = 'routes'
+
+    list = RoutesListCLI
+    seed = RoutesSeedCLI
+    prune = RoutesPruneCLI

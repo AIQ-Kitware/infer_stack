@@ -15,6 +15,18 @@ talks to ``http://host:<litellm>/v1`` and asks for the public endpoint name.
 That is what makes the endpoint descriptor's ``base_url`` correct (the backend
 supplies it via :meth:`ComposeBackend.access`).
 
+In static-superset mode the gateway's ``model_list`` is rendered from an
+**append-only route registry** (``litellm_registry.json`` in the shared state
+dir): every converge merges the invoking catalog plus every live deployment
+(across all runbooks sharing the stack) into the registry and renders from the
+whole thing. That makes the render a function of accumulated shared state — not
+of which runbook invoked the converge — so a cross-catalog converge can no
+longer strip another's live routes and, once every catalog has merged once, the
+config is byte-stable (the gateway is never recreated). See
+:meth:`ComposeBackend._update_route_registry` and
+:func:`_litellm_model_list_from_registry`; ``infer-stack routes`` inspects/seeds/
+prunes it; ``docs/litellm-gateway-routing.md`` has the full story.
+
 Docker and HTTP are invoked through injected seams (``run`` / ``http_get``), so
 all logic here is unit-testable without docker or a network. The real
 docker/GPU path is validated on a GPU host. ``converge`` is serialized with a

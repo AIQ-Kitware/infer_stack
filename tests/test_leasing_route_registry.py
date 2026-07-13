@@ -399,6 +399,22 @@ def test_unknown_version_preserved_not_reseeded(tmp_path):
     assert any('unknown schema version' in m for m in warnings)
 
 
+# -- 10. concurrency smoke: two backends, one state dir, no lost update -----
+
+
+def test_concurrency_smoke_no_lost_update(tmp_path):
+    """Two backends sharing one state dir converge different catalogs (serialized
+    by the per-state-dir flock the converge already takes). The final registry
+    file must contain BOTH catalogs' routes — neither converge clobbers the
+    other's contribution."""
+    be_a = make_backend(tmp_path, catalog=_catalog('alpha'))
+    be_b = make_backend(tmp_path, catalog=_catalog('beta'))
+    be_a.converge([vllm_ep('alpha')], apply=False)
+    be_b.converge([vllm_ep('beta')], apply=False)
+    entries = _registry(tmp_path)['entries']
+    assert set(entries) == {'alpha', 'beta'}
+
+
 # -- extra: catalog vs live reduce to the identical row --------------------
 
 

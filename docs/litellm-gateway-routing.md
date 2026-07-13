@@ -4,21 +4,83 @@ This explains how the leasing stack exposes models through the LiteLLM gateway,
 why the current design avoids restarting the gateway, and the direction we
 intend to take it.
 
-## How it works today: static superset route table
+## How it works today: static superset route table, backed by a route registry
 
-When a catalog is available, the gateway is rendered with a **static superset
-route table**: one LiteLLM `model_list` entry per *catalog* endpoint, each
-pointed at the endpoint's deterministic upstream host
-(`vllm_service_name_for` / `ollama_service_name_for`). See
-`infer_stack/leasing/compose.py::_litellm_model_list_from_catalog` and the
-`catalog is not None` branch of `render_compose`.
+The gateway is rendered with a **static superset route table**: one LiteLLM
+`model_list` entry per endpoint, each pointed at the endpoint's deterministic
+upstream host (`vllm_service_name_for` / `ollama_service_name_for`).
 
-The key property: **the gateway config depends only on the catalog, not on which
-deployments are currently placed.** Acquiring or releasing a model does not
-change the rendered `litellm_config.yaml`, so its `config_hash` label is stable,
-so `docker compose up -d` leaves the gateway container untouched — **no blip.**
-A route whose upstream vLLM/Ollama is not up yet simply cools down until the
-container appears; `router_settings` make that warmup self-healing.
+The set of routes comes from an **append-only route registry** persisted in the
+shared state dir (`<state_dir>/litellm_registry.json`). On every converge the
+backend merges two sources into the registry and renders `model_list` from the
+**whole registry**:
+
+1. the **invoking catalog's** endpoints (when a catalog is discoverable), and
+2. every **placed deployment in the full `desired` set** — which spans *all*
+   runbooks sharing the stack, via the shared ledger.
+
+See `ComposeBackend._update_route_registry`,
+`_litellm_model_list_from_registry`, and the `route_registry is not None` branch
+of `render_compose`. The registry stores *semantic* inputs (served name /
+engine / host), never rendered LiteLLM entries, so a renderer change propagates
+to old rows automatically.
+
+Two key properties:
+
+- **The gateway config depends only on accumulated shared state, not on which
+  runbook invoked the converge or which deployments are currently placed.**
+  Acquiring or releasing a model does not change the rendered
+  `litellm_config.yaml`, so its `config_hash` label is stable and
+  `docker compose up -d` leaves the gateway container untouched — **no blip.** A
+  route whose upstream is not up yet simply cools down until the container
+  appears; `router_settings` make that warmup self-healing.
+- **A cross-catalog converge can no longer strip another runbook's live
+  routes.** Because the render is the union of everything ever merged (not just
+  the invoking catalog), converging runbook B's disjoint catalog does not drop
+  runbook A's still-live routes. This is the fix for the "olmo healthy, gateway
+  400 `Invalid model name`" incident: another runbook's converge used to
+  re-render the shared gateway from *its* catalog alone and evict olmo's routes,
+  even though the olmo container was healthy. Routes also **persist past
+  release** — a released endpoint stays routable/testable until explicitly
+  pruned.
+
+Once every catalog has been merged once, all converges render byte-identical
+configs, so the gateway is never recreated regardless of how the runbooks
+interleave. The only residual (justified) recreations are the first-ever
+appearance of a new endpoint or a genuinely changed endpoint definition.
+
+### Managing the registry: `infer-stack routes`
+
+- `infer-stack routes list` — print the registry (alias, engine, served/tag,
+  upstream, and whether a live deployment currently backs each route).
+- `infer-stack routes seed <catalog.yaml> [...]` — merge sibling runbooks'
+  catalogs into the registry and converge once. The operational key to
+  blip-free concurrency: **seed all overlapping runbooks' catalogs once while
+  idle**, and then no converge from any of them ever recreates the gateway (the
+  registry is already the full union). Works before `stack up`.
+- `infer-stack routes prune` — the explicit "forget stale endpoints" verb:
+  rewrite the registry to *invoking catalog ∪ live deployments* and converge
+  (one accepted recreate). It prints the exact drop list and asks for
+  confirmation first (`--yes` / non-terminal skips), because a prune from the
+  wrong `INFER_STACK_CONFIG_DIR` would silently drop every other runbook's
+  routes. Automatic pruning is deliberately excluded — any catalog-keyed rule
+  would reintroduce the cross-catalog alternation churn the registry exists to
+  avoid.
+
+Both `routes` and the automatic first-converge merge are safe under
+concurrency: the read-merge-write runs under the per-state-dir converge flock
+the converge already holds.
+
+### Seeding on upgrade
+
+A state dir upgraded in place (a rendered `litellm_config.yaml` but no registry
+yet) seeds the registry from that config on the first converge: `openai/<served>`
+inverts exactly to a vLLM row, so no route is lost. Ollama rows are skipped with
+a warning (their host survives only as a non-invertible slug in `api_base`) and
+re-enter the registry at the next converge that has them in its catalog or live
+set. A corrupt/garbage registry is fail-open (rebuilt from seed + catalog); an
+*unknown* schema version with a parseable `entries` map is rendered as-is
+without rewrite, so a binary rollback never discards the accumulated union.
 
 LiteLLM reads `--config /etc/litellm/config.yaml` **once at startup** and does
 not watch the file, so this static-config approach is what lets us avoid
@@ -37,9 +99,12 @@ recreated are first bring-up and an actual **catalog** change.
   `dev/leasing-followups.md` ("Upstream LiteLLM: a quiet, generation-level
   readiness probe"). Do not globally silence LiteLLM logs to hide it.
 - An endpoint that is **not in the catalog** (ad-hoc / interactive `acquire`)
-  cannot be routed without changing the config file — which means a recreation
-  (a blip). The legacy fallback (`_litellm_model_list` from live deployments)
-  routes only placed deployments and *does* rewrite-and-recreate per change.
+  is now routed too: every placed deployment in the `desired` set is merged into
+  the registry (item 2 above), so a non-catalog acquire becomes — and, via the
+  registry's persistence, stays — routable. (Before the registry, the legacy
+  `_litellm_model_list` fallback routed only placed deployments and
+  rewrote-and-recreated the gateway per change; that path now survives only in
+  `render_compose` for direct callers/tests, never from `ComposeBackend`.)
 - **Same-model `--dedicated` collapses.** Because the upstream host is derived
   from the served name alone (`vllm-<served>`), N dedicated deployments of one
   model render to ONE compose service — one container, one GPU — defeating

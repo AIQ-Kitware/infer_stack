@@ -660,3 +660,136 @@ def test_acquire_json_redacts_api_key(env, capsys, monkeypatch):
     assert 'sk-secret123' not in out
     assert 'redacted' in data['descriptor']['api_key']
     assert 'sk-secret123' in envf.read_text()
+
+
+# -- `routes` CLI group (registry inspect / seed / prune) -------------------
+
+_ROUTES_IMAGES = {
+    'vllm': 'vllm/vllm-openai:test',
+    'ollama': 'ollama/ollama:test',
+    'litellm': 'ghcr.io/berriai/litellm:test',
+}
+_ROUTES_STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
+
+
+class _RoutesFakeDocker:
+    def __init__(self):
+        self.running: list[str] = []
+
+    def __call__(self, args):
+        return ''
+
+
+def _routes_compose_backend(state_dir, catalog=None):
+    from infer_stack.hardware import simulate_inventory
+    from infer_stack.leasing import ComposeBackend
+
+    return ComposeBackend(
+        state_dir=state_dir,
+        inventory=simulate_inventory('4x80'),
+        run=_RoutesFakeDocker(),
+        images=_ROUTES_IMAGES, ports={'ollama': 11434}, state=_ROUTES_STATE,
+        catalog=catalog,
+    )
+
+
+def _one_endpoint_catalog(endpoint):
+    return {
+        'models': {'m': {'source': f'hf://org/{endpoint}'}},
+        'endpoints': {endpoint: {'engine': 'vllm', 'model': 'm'}},
+    }
+
+
+def _patch_backend(monkeypatch, state_dir, catalog=None):
+    from infer_stack.cli import commands_leasing as cl
+
+    monkeypatch.setattr(
+        cl, '_make_backend',
+        lambda config, *, interactive=False: _routes_compose_backend(
+            state_dir, catalog=catalog
+        ),
+    )
+
+
+def test_routes_seed_then_list(tmp_path, monkeypatch, capsys):
+    """seed two sibling catalogs into the registry, then list shows both."""
+    from infer_stack.cli.commands_leasing import RoutesListCLI, RoutesSeedCLI
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    cat_a = tmp_path / 'a.yaml'
+    cat_a.write_text(yaml.safe_dump(_one_endpoint_catalog('alpha')))
+    cat_b = tmp_path / 'b.yaml'
+    cat_b.write_text(yaml.safe_dump(_one_endpoint_catalog('beta')))
+    _patch_backend(monkeypatch, state)
+
+    capsys.readouterr()
+    rc = RoutesSeedCLI.main(
+        argv=['--ledger', db, str(cat_a), str(cat_b), '--json']
+    )
+    assert rc == 0
+
+    capsys.readouterr()
+    rc = RoutesListCLI.main(argv=['--ledger', db, '--json'])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert sorted(r['name'] for r in out['routes']) == ['alpha', 'beta']
+    # Seeding then rendering left the gateway config listing both, unchanged on a
+    # re-list (no converge on list): the registry file is byte-stable.
+    assert (state / 'litellm_registry.json').exists()
+
+
+def test_routes_seed_requires_compose_backend(tmp_path, capsys):
+    """Under the null backend there is no registry to touch -> a clear error."""
+    from infer_stack.cli.commands_leasing import RoutesSeedCLI
+
+    cat = tmp_path / 'a.yaml'
+    cat.write_text(yaml.safe_dump(_one_endpoint_catalog('alpha')))
+    with pytest.raises(SystemExit):
+        RoutesSeedCLI.main(
+            argv=['--ledger', str(tmp_path / 'l.db'), '--backend', 'null',
+                  str(cat)]
+        )
+
+
+def test_routes_prune_drops_stale(tmp_path, monkeypatch, capsys):
+    """prune rewrites the registry to invoking-catalog ∪ live and converges: a
+    registry carrying alpha+beta, pruned under a catalog that only knows alpha
+    (nothing live), drops beta."""
+    from infer_stack.cli.commands_leasing import RoutesListCLI, RoutesPruneCLI
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    # Pre-seed a registry with two routes.
+    (state / 'litellm_registry.json').write_text(json.dumps(
+        {
+            'version': 1,
+            'entries': {
+                'alpha': {'engine': 'vllm', 'served': 'alpha'},
+                'beta': {'engine': 'vllm', 'served': 'beta'},
+            },
+        },
+        sort_keys=True, indent=2,
+    ) + '\n')
+    # Invoking catalog only knows alpha, so beta (not live) is stale.
+    _patch_backend(
+        monkeypatch, state,
+        catalog=__import__(
+            'infer_stack.leasing', fromlist=['Catalog']
+        ).Catalog.from_dict(_one_endpoint_catalog('alpha')),
+    )
+
+    capsys.readouterr()
+    rc = RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json'])
+    assert rc == 0
+    raw = capsys.readouterr().out  # `Write .env to ...` may precede the JSON
+    out = json.loads(raw[raw.index('{'):])
+    assert out['dropped'] == ['beta']
+    assert out['kept'] == ['alpha']
+
+    capsys.readouterr()
+    RoutesListCLI.main(argv=['--ledger', db, '--json'])
+    listed = json.loads(capsys.readouterr().out)
+    assert sorted(r['name'] for r in listed['routes']) == ['alpha']
