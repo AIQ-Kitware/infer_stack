@@ -846,6 +846,20 @@ class InferStackTUI(App):
         self.query_one('#gpus', DataTable).add_columns(
             'gpu', 'name', 'util%', 'mem (used/total)', 'temp'
         )
+        # Loading notes: these panes are filled by subprocess observes (docker
+        # compose ps / nvidia-smi) that run in workers on their own beat, so
+        # between the pane becoming visible and the first poll landing they
+        # would silently sit empty. Show '(loading…)' instead, and prime the
+        # diff caches with a sentinel no real poll produces so the first real
+        # fill (even an empty one) rebuilds over the placeholder.
+        self.query_one('#ps', DataTable).add_row(
+            '(loading…)', '-', '-', '-', '-'
+        )
+        self._ps_rows_cache = [('__loading__',) * 5]
+        self.query_one('#gpus', DataTable).add_row(
+            '…', '(loading…)', '-', '-', '-'
+        )
+        self._gpus_rows_cache = [('__loading__',) * 5]
         compose_file = getattr(self.controller.backend, 'compose_file', None)
         self.query_one('#compose-path', Static).update(
             f'compose file: {compose_file or "(not rendered yet)"}'
@@ -1160,15 +1174,20 @@ class InferStackTUI(App):
     def _update_summary(self, leases, deployments, observed) -> None:
         active = sum(1 for le in leases if str(le.state) == 'active')
         running = sum(1 for g in deployments if g.id in observed)
+        # Until the first docker observe lands (it runs in a worker; the first
+        # paint is ledger-only), the running counts would read as a confident
+        # "0 running" — say we're still observing instead of silently lying.
+        observing = self._observed_at is None
+        running_label = 'observing…' if observing else f'{running} running'
         try:
             self.query_one('#docker', Collapsible).title = (
-                f'docker — {running} running'
+                f'docker — {running_label}'
             )
             self.query_one('#leases-pane').border_title = (
                 f'leases — {active} active / {len(leases)}'
             )
             self.query_one('#deployments-pane').border_title = (
-                f'deployments — {running} running / {len(deployments)}'
+                f'deployments — {running_label} / {len(deployments)}'
             )
         except Exception:  # noqa: BLE001
             pass

@@ -1266,7 +1266,7 @@ class ComposeBackend(ConvergeScaffold):
         self,
         *,
         state_dir: str | Path,
-        inventory: dict[str, Any],
+        inventory: dict[str, Any] | None = None,
         run: Callable[[list[str]], str] | None = None,
         http: Any = None,
         images: dict[str, str] | None = None,
@@ -1289,7 +1289,10 @@ class ComposeBackend(ConvergeScaffold):
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.inventory = inventory
+        # None => detect lazily on first use (see the `inventory` property):
+        # startup paths (notably the TUI) must never wait on nvidia-smi
+        # before the first frame.
+        self._inventory = inventory
         self.run = run or _default_docker_run
         if http is None:
             import requests
@@ -1325,6 +1328,27 @@ class ComposeBackend(ConvergeScaffold):
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
+
+    @property
+    def inventory(self) -> dict[str, Any]:
+        """GPU inventory, detected lazily on first use.
+
+        Startup paths (notably the TUI) construct the backend with
+        ``inventory=None`` so nothing waits on the nvidia-smi subprocess before
+        the first frame; the first placement (``plan``/``converge``) pays the
+        detection instead — off the UI thread when driven from the TUI's
+        workers. Tests and callers that pass an explicit inventory are
+        unaffected.
+        """
+        if self._inventory is None:
+            from ..hardware import detect_inventory
+
+            self._inventory = detect_inventory()
+        return self._inventory
+
+    @inventory.setter
+    def inventory(self, value: dict[str, Any] | None) -> None:
+        self._inventory = value
 
     @property
     def compose_file(self) -> Path:

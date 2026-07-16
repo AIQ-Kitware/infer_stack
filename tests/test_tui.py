@@ -1397,3 +1397,58 @@ def test_tui_table_rebuild_preserves_scroll_offset():
             assert table.scroll_offset.y == before  # not reset to the top
 
     _run(scenario)
+
+
+def test_tui_subprocess_backed_panes_note_loading():
+    # The containers/GPU tables are filled by subprocess observes (docker
+    # compose ps / nvidia-smi) that run on their own beat in workers. Until a
+    # pane's first poll lands it must say it is loading, not sit silently
+    # empty. Deterministic here: the default docker tab is logs (ps never
+    # polled) and the system pane starts collapsed (gpus never polled).
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ps = app.query_one('#ps', DataTable)
+            assert ps.row_count == 1
+            assert ps.get_row_at(0)[0] == '(loading…)'
+            gpus = app.query_one('#gpus', DataTable)
+            assert gpus.row_count == 1
+            assert gpus.get_row_at(0)[1] == '(loading…)'
+
+    _run(scenario)
+
+
+def test_tui_titles_say_observing_before_first_docker_observe():
+    # Before the first (worker-run) docker observe lands, the running counts
+    # are unknown — the titles must say 'observing…' rather than a confident
+    # '0 running'.
+    from textual.widgets import Collapsible
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._observed_at = None
+            app._update_summary([], [], set())
+            assert 'observing…' in app.query_one('#docker', Collapsible).title
+            assert 'observing…' in str(
+                app.query_one('#deployments-pane').border_title
+            )
+            app._observed_at = 123.0
+            app._update_summary([], [], set())
+            assert '0 running' in app.query_one('#docker', Collapsible).title
+
+    _run(scenario)

@@ -1344,3 +1344,41 @@ def test_rendered_compose_passes_docker_schema(name, deployments, litellm, tmp_p
         capture_output=True, text=True,
     )
     assert result.returncode == 0, f'{name}: {result.stderr}'
+
+
+def test_inventory_detected_lazily_not_at_construction(tmp_path, monkeypatch):
+    # Startup paths (the TUI especially) construct the backend with
+    # inventory=None; nothing may wait on the nvidia-smi subprocess until the
+    # first placement actually needs the inventory.
+    calls = []
+
+    def fake_detect():
+        calls.append(1)
+        return simulate_inventory('2x48')
+
+    import infer_stack.hardware as hardware
+    monkeypatch.setattr(hardware, 'detect_inventory', fake_detect)
+
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=None,
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert calls == []                       # construction paid nothing
+    assert be.inventory['gpu_count'] == 2    # first access detects...
+    assert be.inventory['gpu_count'] == 2    # ...and caches
+    assert calls == [1]
+
+
+def test_explicit_inventory_never_detects(tmp_path, monkeypatch):
+    import infer_stack.hardware as hardware
+    monkeypatch.setattr(
+        hardware, 'detect_inventory',
+        lambda: (_ for _ in ()).throw(AssertionError('must not detect')),
+    )
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert be.inventory['gpu_count'] == 4

@@ -6,9 +6,14 @@ from copy import deepcopy
 from typing import Any
 
 
-def _run(cmd: list[str]) -> str:
+def _run(cmd: list[str], *, timeout: float = 20.0) -> str:
+    # Bounded: a wedged driver can make nvidia-smi hang indefinitely, and this
+    # runs on interactive paths (placement, the TUI's system pane). A timeout
+    # degrades to the same empty-inventory result as nvidia-smi being absent.
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout
+        )
     except Exception:
         return ''
     return out
