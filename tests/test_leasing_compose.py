@@ -1382,3 +1382,37 @@ def test_explicit_inventory_never_detects(tmp_path, monkeypatch):
         images=IMAGES, ports=PORTS, state=STATE,
     )
     assert be.inventory['gpu_count'] == 4
+
+
+def test_vllm_service_mounts_persistent_compile_caches(tmp_path):
+    # Regression: only the HF cache was mounted, so with `reclaim: stop` every
+    # re-acquire cold-started the container and re-paid the full
+    # torch.compile / Triton / CUDA-jit pass (~10-20 min on big models). The
+    # state dirs existed in default_state_paths all along — assert they are
+    # actually mounted now.
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x48'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS,
+        state={**STATE,
+               'vllm_cache': '/cache/vllm', 'torch_cache': '/cache/torch',
+               'triton_cache': '/cache/triton', 'cuda_cache': '/cache/cuda'},
+    )
+    be.converge([vllm('a')])
+    import yaml as _yaml
+    doc = _yaml.safe_load(be.compose_file.read_text())
+    svc = next(v for k, v in doc['services'].items() if k.startswith('vllm-'))
+    assert '/cache/vllm:/root/.cache/vllm' in svc['volumes']
+    assert '/cache/torch:/root/.cache/torch' in svc['volumes']
+    assert '/cache/triton:/root/.triton' in svc['volumes']
+    assert '/cache/cuda:/root/.nv' in svc['volumes']
+
+
+def test_partial_state_dict_merges_over_defaults(tmp_path):
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x48'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,  # partial: no cache keys
+    )
+    assert be.state['hf_cache'] == STATE['hf_cache']   # explicit wins
+    assert 'vllm_cache' in be.state                    # defaults fill the rest

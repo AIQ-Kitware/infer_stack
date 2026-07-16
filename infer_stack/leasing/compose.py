@@ -269,6 +269,9 @@ def _vllm_service(
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
+    # Merge over the defaults so direct callers (tests, embedders) with a
+    # partial state dict still resolve every cache-mount key below.
+    state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
     command = [
         deployment.spec['hf_model_id'],
@@ -290,7 +293,19 @@ def _vllm_service(
         'image': svc.get('image') or images['vllm'],
         'command': command,
         'environment': environment,
-        'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
+        # Weights AND compile artifacts persist across container recreations:
+        # with `reclaim: stop`, every re-acquire cold-starts the container, and
+        # without these mounts vLLM re-pays its full torch.compile / Triton /
+        # CUDA-jit pass (~10-20 min on big models) on every lease. The state
+        # dirs have existed in default_state_paths all along — they were simply
+        # never mounted.
+        'volumes': [
+            f'{state["hf_cache"]}:/root/.cache/huggingface',
+            f'{state["vllm_cache"]}:/root/.cache/vllm',
+            f'{state["torch_cache"]}:/root/.cache/torch',
+            f'{state["triton_cache"]}:/root/.triton',
+            f'{state["cuda_cache"]}:/root/.nv',
+        ],
         'restart': 'unless-stopped',
         'labels': {DEPLOYMENT_LABEL: deployment.id, ENGINE_LABEL: 'vllm'},
         'healthcheck': {
@@ -1300,7 +1315,9 @@ class ComposeBackend(ConvergeScaffold):
         self.http = http
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
-        self.state = state or default_state_paths()
+        # Merge over the defaults (not replace) so a caller-supplied partial
+        # state dict — tests, embedders — still resolves every cache-mount key.
+        self.state = {**default_state_paths(), **(state or {})}
         self.allowed_gpus = allowed_gpus
         self.reserved = tuple(reserved)
         self.project = project
