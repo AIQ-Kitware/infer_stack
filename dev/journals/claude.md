@@ -2221,3 +2221,18 @@ pinned-tier-wins-over-new-declaration is the right stability tradeoff
 **Next:** Phase 0 (tests) when Jon green-lights implementation. The
 eval_audit-side adoption (declare requirements in the Qwen3.5 catalogs,
 drop the pinning plan) is tracked in the doc as Phase 3.
+
+**Same-session update (12:20):** Jon resolved the open questions. (1) The
+numbers come from *self-measurement*: models measure themselves at first
+healthy serve and the result updates their catalog via an explicit promote —
+now design §3 + Phase 3. Key trap designed around: `nvidia-smi memory.used`
+measures the `gpu_memory_utilization` knob (vLLM preallocates KV to fill the
+fraction — a 0.8B "uses" ~41 GiB of a 48 GiB card), so measurement parses
+vLLM's own profiling breakdown instead; measured values live in a data_dir
+overlay, never silently rewrite catalog.yaml. (2) suggest will NOT precompute
+placement numbers — Jon's tried, they're never exactly right; precomputation
+survives only as the weight-bytes *floor* (sound underestimate, prevents the
+9B→16GiB class of misplacement from day one with zero measurement).
+(3) KubeAI/k3s: warn-and-ignore confirmed. (4) VRAM-aware reservations:
+explicitly deferred, no decision. Phases renumbered (measurement = 3,
+adoption = 4, future = 5).

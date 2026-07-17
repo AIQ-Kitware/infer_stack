@@ -1,6 +1,7 @@
 # VRAM-aware placement: endpoints declare what they need, GPUs satisfy what they can
 
-**Status:** proposed 2026-07-17 · not started
+**Status:** proposed 2026-07-17 · open questions resolved same day (see
+"Resolutions") · not started
 **Origin:** eval_audit Qwen3.5 small-model planning (yardrat, heterogeneous
 2-GPU host). Written down so the objective survives even if this particular
 plan gets reconsidered.
@@ -135,9 +136,9 @@ endpoints:
   N GPUs must individually satisfy it (same semantics as suggest.py's
   `min_vram_gib_per_replica`).
 - **Declared, not sniffed.** It is a recorded substrate fact: works offline,
-  survives HF metadata drift, and is auditable. (`infer-stack suggest`
-  already computes the number; a helper can pre-fill it, the catalog still
-  records it.)
+  survives HF metadata drift, and is auditable. (Where the declared number
+  comes from — weight-bytes floor + self-measurement, *not* precomputation —
+  is design §3.)
 - Validated by `Catalog.errors()` (positive float, warn if an endpoint's
   `gpu_memory_utilization × min_vram_gib` arithmetic is obviously
   inconsistent — exact rule TBD in implementation).
@@ -177,7 +178,45 @@ Within the existing three-tier structure of `plan_placement()`:
   required GiB, and the host inventory table — copy-pasteable. "No eligible
   GPU currently free" is not an error; it queues, as today.
 
-### 3. Accepted limitation (document, don't solve)
+### 3. Where the numbers come from: floor + self-measurement, not precomputation
+
+Precomputing `min_vram_gib` from first principles has been tried and does not
+produce exactly-right numbers (activation/compile overhead, allocator
+fragmentation, engine-version drift). Measurement does. Three tiers, weakest
+to strongest, resolved in reverse order (declared > measured > floor):
+
+- **Weight-bytes floor (automatic, offline, always sound).** fp16 weight
+  bytes (from the HF safetensors index, or the local cache once downloaded)
+  is a guaranteed *underestimate* of need: a GPU that cannot even hold the
+  weights can never be eligible. This floor alone — no measurement, no
+  declaration — already prevents the catastrophic misplacement (9B, 19.3 GB
+  weights, offered a 16 GiB card). It never suffices as the final number and
+  is never treated as one.
+- **Self-measurement (the real number).** After a deployment's first healthy
+  serve, record what the model actually needed. ⚠️ **Not** by reading
+  `nvidia-smi memory.used`: vLLM preallocates KV cache to fill
+  `gpu_memory_utilization`, so observed usage reflects the *knob* on *that
+  card* (a 0.8B "uses" ~41 GiB of a 48 GiB card at 0.85), not the
+  requirement. Instead parse vLLM's own memory-profiling breakdown from the
+  serve log (model weights + non-torch + activation peak, reported per
+  serve; our images are version-pinned so the format is stable) and add the
+  chosen KV budget for our `max_model_len`/`max_num_seqs` settings plus a
+  small margin. The measurement is keyed by (model, engine image, dtype,
+  max_model_len) — the things that change it.
+- **Declared (operator override).** `placement.min_vram_gib` in the catalog
+  wins over both, as before.
+
+**Storage: measured values do not silently rewrite `catalog.yaml`.** The
+catalog is a hand-edited, git-tracked recorded fact; a machine mutating it in
+place is against the grain. Measurements land in a machine-managed overlay
+under `data_dir` (e.g. `leasing/measurements.json`), which the resolver
+consults at plan time. An explicit `infer-stack placement promote` (name
+TBD) copies measured numbers into `catalog.yaml` as an operator action —
+git-diffable, deliberate. Bootstrap story: first-ever serve of a model runs
+with floor-only eligibility (weights fit ⇒ eligible), measurement tightens
+it from then on.
+
+### 4. Accepted limitation (document, don't solve)
 
 Without preemption/migration (out of scope), a temporal ordering can still
 block: if the 16-GiB card is busy and a small model is therefore placed on
@@ -185,7 +224,7 @@ the 48-GiB card, a 9B arriving later queues until the small model releases.
 Best-fit minimizes how often this happens; `reclaim: stop` bounds how long it
 lasts. Fine at this scale.
 
-### 4. Test/verification plan
+### 5. Test/verification plan
 
 - Extend `simulate_inventory` to accept heterogeneous specs
   (e.g. `'48,16'` — comma-separated per-GPU GiB) so tests and demos can model
@@ -217,25 +256,37 @@ lasts. Fine at this scale.
 - **Phase 2 — planner.** Eligibility, most-constrained-first, best-fit,
   capacity internals with exclusive flag, error messages. Update the
   `placement.py` docstring (the scope amendment above).
-- **Phase 3 — adoption (eval_audit side, tracked there).** Declare
-  `min_vram_gib` in the Qwen3.5 catalogs (measured numbers); retire the
-  plan to pin small-model runbooks via `INFER_STACK_ALLOWED_GPUS`; then the
-  9B re-run and the small-model batch share yardrat under concurrent
-  schedules with no GPU indices anywhere in config.
-- **Phase 4 — future.** Co-hosting opt-in (multiple vLLM servers on one big
+- **Phase 3 — floor + self-measurement.** Weight-bytes floor wired into
+  eligibility (design §3); measurement recorder parsing the vLLM profiling
+  breakdown at first healthy serve into the `data_dir` overlay; resolver
+  order declared > measured > floor; explicit promote command. The planner
+  from Phase 2 needs no changes — it just receives better numbers.
+- **Phase 4 — adoption (eval_audit side, tracked there).** Let the Qwen3.5
+  family measure itself on yardrat; promote the numbers into the catalogs;
+  retire the plan to pin small-model runbooks via
+  `INFER_STACK_ALLOWED_GPUS`; then the 9B re-run and the small-model batch
+  share yardrat under concurrent schedules with no GPU indices anywhere in
+  config.
+- **Phase 5 — future.** Co-hosting opt-in (multiple vLLM servers on one big
   GPU for very small models — the greedy capacity accounting from Phase 2 is
   the whole "knapsack" we need); additional `placement` keys such as
   `min_compute_capability`.
 
-## Open questions
+## Resolutions (2026-07-17, with Jon)
 
-1. Exact `min_vram_gib` numbers for the Qwen3.5 family — measure on yardrat
-   (weights + activation overhead at our `max_model_len`/batch settings),
-   don't guess from weight bytes alone.
-2. Should `suggest` learn to emit the `placement:` block into generated
-   catalog entries? (Probably yes, cheap.)
-3. Does the KubeAI backend need to *reject* `placement.min_vram_gib`
-   (k8s owns placement there) or silently ignore it? Leaning: warn-and-ignore
-   with a note that k8s resource requests are the equivalent mechanism.
-4. Reservations (`acquire --reserve-gpus N`) stay count-based for now; should
-   they later accept `--min-vram-gib`? Follow-up, not blocking.
+1. **Where do the exact numbers come from?** → **Models measure themselves**
+   (design §3): weight-bytes floor for safety from day one, vLLM
+   profiling-breakdown measurement at first healthy serve for the real
+   number, recorded in a `data_dir` overlay and *promoted* into the catalog
+   by an explicit command — never a silent catalog rewrite. Now Phase 3.
+2. **Should `suggest` precompute `placement:` numbers?** → **No.** Tried;
+   precomputed numbers are never exactly right (activation/compile overhead,
+   fragmentation, version drift). Precomputation survives only as the
+   weight-bytes *floor*, which doesn't need to be exact — just sound.
+   Measurement owns precision.
+3. **KubeAI/k3s backend policy for the new field** → **warn-and-ignore**
+   (k8s owns placement there; resource requests/limits are the equivalent
+   mechanism on that side).
+4. **VRAM-aware reservations** (`acquire --reserve-gpus N --min-vram-gib`) →
+   explicitly **deferred, no decision now**. Reservations stay count-based;
+   revisit after Phases 0–3 land.
