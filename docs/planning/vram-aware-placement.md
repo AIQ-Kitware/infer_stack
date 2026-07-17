@@ -1,7 +1,11 @@
 # VRAM-aware placement: endpoints declare what they need, GPUs satisfy what they can
 
 **Status:** proposed 2026-07-17 · open questions resolved same day (see
-"Resolutions") · not started
+"Resolutions") · **Phases 0–2 implemented 2026-07-17** (heterogeneous
+`simulate_inventory`, catalog `placement.min_vram_gib`, eligibility +
+most-constrained-first + best-fit planner with `GpuPlan.warnings`; 15 new
+placement tests + 9 catalog tests, legacy plans byte-identical) · Phases 3–5
+not started
 **Origin:** eval_audit Qwen3.5 small-model planning (yardrat, heterogeneous
 2-GPU host). Written down so the objective survives even if this particular
 plan gets reconsidered.
@@ -161,10 +165,14 @@ Within the existing three-tier structure of `plan_placement()`:
 - **Most-constrained-first:** order unplaced deployments by
   (number of eligible GPUs ascending, then deployment name for determinism).
   The 9B (1 eligible GPU) places before the 0.8B (2 eligible GPUs).
-- **Best-fit:** each deployment takes the *smallest* eligible free GPU
-  (tie-break by index). Small models gravitate to the small card; the big
-  card stays free for the model that needs it. This mirrors
-  `suggest._host_gpus()`'s smallest-that-fits logic.
+- **Best-fit (declared deployments only):** each *declared* deployment takes
+  the *smallest* eligible free GPU (tie-break by index). Small models
+  gravitate to the small card; the big card stays free for the model that
+  needs it. This mirrors `suggest._host_gpus()`'s smallest-that-fits logic.
+  **Undeclared deployments keep legacy index-order first-fit** — not
+  best-fit — so pre-declaration catalogs place byte-identically (an
+  undeclared 9B on yardrat still lands on GPU 0 exactly as today, rather
+  than being "best-fit" onto the 16-GiB card it can't run on).
 - **Pinned tier wins over new declarations:** an already-realized deployment
   keeps its persisted GPUs even if a newly added `min_vram_gib` says
   otherwise (stability across reconciles, same principle as today) — but log

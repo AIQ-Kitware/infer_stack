@@ -2247,3 +2247,38 @@ rewritten around that flow; Phase 3/Resolution 1 aligned; floor-clamp test
 case added (9B declared at 8 GiB still never lands on the 16-GiB card).
 Design takeaway: the guess doesn't need to be right — it needs to fail
 diagnosably and cheaply, with the fix one copy-paste away.
+
+**Same-session update (13:05) — Phases 0–2 implemented.** Jon green-lit
+implementation. Tests-first as planned: 14 failing semantics-pinning tests
+authored against the agreed behavior, then made green without touching the
+20 legacy tests. What landed:
+
+- `hardware.simulate_inventory` accepts heterogeneous specs — comma-separated
+  `M` or `NxM` entries (`'48,16'` is yardrat) — legacy `'4x96'` unchanged.
+- `catalog.py`: endpoint-level `placement: {min_vram_gib: N}` block —
+  strict-keyed (a `min_vram_gb` typo is a CatalogError, not a silent
+  no-constraint), positive-number-validated, vllm-only, threaded into
+  `spec['placement']` only when non-empty so existing catalogs resolve
+  byte-identical specs. Deliberately NOT structural: it says where a
+  deployment may land, not what process it is (test pins compat-key
+  equality across differing declarations).
+- `placement.py`: `min_vram_per_gpu()` = max(declared, floor_vram_gib) —
+  the floor field is planner-supported NOW so Phase 3 only has to produce
+  it; eligibility filter (per-shard, memory_gib >= req); fit tier ordered
+  by (n_eligible-in-pool, created_at, id) = most-constrained-first with
+  legacy tie-break; declared deployments take smallest-eligible-free
+  (best-fit, final selection re-sorted ascending so CUDA_VISIBLE_DEVICES
+  stays index-ordered); UNDECLARED deployments keep exact legacy
+  index-order first-fit — an undeclared 9B still lands on GPU 0, not
+  "best-fit" onto the 16er it can't run (this scoping was the one deviation
+  worth writing back into the plan doc's §2). Permanent-vs-transient error
+  split: "pool can never satisfy" (with copy-pasteable inventory) vs "only
+  N free" (the queue case). `GpuPlan.warnings` carries honored-but-suspect
+  pins/explicit indices that contradict declarations; converge logs them.
+
+Validation: 357 passed / 2 env-skips full suite; placement 35/35 (20 legacy
++ 15 new); catalog 29/29 (20 + 9 new); doctests pass. Reusable takeaway:
+when adding a scheduler constraint to a live system, scope the new
+*preference* (best-fit) to participants that opted in, and give
+non-participants bit-identical legacy behavior — backward compat isn't just
+"old tests pass", it's "old configs cannot be made worse by the upgrade".

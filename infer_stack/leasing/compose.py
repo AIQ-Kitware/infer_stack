@@ -1641,6 +1641,11 @@ class ComposeBackend(ConvergeScaffold):
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
             for err in plan.errors:
                 logger.warning('  placement: {}', err)
+            for note in plan.warnings:
+                # Honored-but-suspect decisions (a pin/explicit index that
+                # contradicts a declared min_vram_gib): never fail the plan,
+                # never be silent either.
+                logger.warning('  placement: {}', note)
             if self.litellm and self.dynamic_routing:
                 # Persist the DB secret to the sidecar .env *before* rendering, so
                 # docker compose --env-file can interpolate ${LITELLM_DB_PASSWORD}

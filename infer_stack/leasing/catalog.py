@@ -34,6 +34,13 @@ Schema (all sections optional except as referenced)::
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
                               # surface the readiness probe (and clients) use; a
                               # completions-only model needs protocol: completions
+        # VRAM eligibility (docs/planning/vram-aware-placement.md): each GPU
+        # this endpoint lands on must have at least this much memory (per tp
+        # shard). Absent -> every GPU is eligible (legacy behavior). A best
+        # guess is fine: too high wastes a small GPU, too low is caught by a
+        # guided OOM error; the weight-bytes floor (Phase 3) clamps unsound
+        # guesses.
+        #   placement: {min_vram_gib: 24}
       qwen-small:
         engine: ollama
         host: local-ollama
@@ -122,6 +129,9 @@ class EndpointSpec:
     # /chat/completions, 'completions' hits /completions. A completions-only
     # model never answers a chat probe, so this must match how it is served.
     protocol: str = 'chat'
+    # Placement eligibility constraints (vllm only; validated in errors()).
+    # Today: {'min_vram_gib': float} — see docs/planning/vram-aware-placement.md.
+    placement: dict[str, Any] = field(default_factory=dict)
 
 
 def _parse_sharing(value: Any) -> str:
@@ -152,6 +162,41 @@ def _parse_protocol(value: Any) -> str:
     raise CatalogError(
         f"invalid protocol {value!r} (use 'chat' or 'completions')"
     )
+
+
+#: Keys the endpoint-level ``placement`` block accepts. Deliberately strict —
+#: an unknown key is a typo (min_vram_gb) that would otherwise silently mean
+#: "no constraint", which on a heterogeneous host means an OOM later.
+PLACEMENT_KEYS = frozenset({'min_vram_gib'})
+
+
+def _placement_errors(ep: EndpointSpec) -> list[str]:
+    """Validate an endpoint's ``placement`` block (vllm-only, typed keys)."""
+    if not ep.placement:
+        return []
+    errors: list[str] = []
+    if ep.engine != VLLM:
+        errors.append(
+            f"endpoint '{ep.name}': 'placement' is only supported on vllm "
+            f"endpoints (engine is '{ep.engine}'); Ollama daemons pin via "
+            f"their runtime_host's placement.gpu_indices"
+        )
+        return errors
+    unknown = sorted(set(ep.placement) - PLACEMENT_KEYS)
+    if unknown:
+        errors.append(
+            f"endpoint '{ep.name}': unknown placement key(s) {unknown} "
+            f"(supported: {sorted(PLACEMENT_KEYS)})"
+        )
+    value = ep.placement.get('min_vram_gib')
+    if value is not None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                or value <= 0:
+            errors.append(
+                f"endpoint '{ep.name}': placement.min_vram_gib must be a "
+                f"positive number of GiB, got {value!r}"
+            )
+    return errors
 
 
 @dataclass
@@ -215,6 +260,7 @@ class Catalog:
                 reclaim=_parse_reclaim(spec.get('reclaim')),
                 served_name=spec.get('public_name') or spec.get('served_name'),
                 protocol=_parse_protocol(spec.get('protocol')),
+                placement=dict(spec.get('placement') or {}),
             )
         bundles = {
             name: list(members or [])
@@ -270,6 +316,7 @@ class Catalog:
                 errors.append(
                     f"endpoint '{ep.name}' has unknown engine '{ep.engine}'"
                 )
+            errors.extend(_placement_errors(ep))
         for bundle, members in self.bundles.items():
             for member in members:
                 if member not in self.endpoints:
@@ -401,6 +448,14 @@ class Catalog:
             'runtime': dict(rt),
             'reclaim': ep.reclaim,
         }
+        if ep.placement:
+            # Placement eligibility (min_vram_gib) rides the spec, NOT the
+            # structural compat key: it describes where the deployment may
+            # land, not what process it is. Same-model endpoints should
+            # declare the same number (the first request's spec wins on
+            # coalesce). Only set when non-empty so existing catalogs keep
+            # byte-identical specs.
+            spec['placement'] = dict(ep.placement)
         served = {
             'served_model_name': served_name,
             'hf_model_id': model.hf_model_id,

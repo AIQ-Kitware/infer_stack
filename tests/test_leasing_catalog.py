@@ -242,3 +242,66 @@ def test_attention_backend_is_structural_and_splits_compat_key():
     assert sdpa.spec['runtime']['attention_backend'] == 'TORCH_SDPA'
     # ...so all three are distinct deployments (no coalescing).
     assert len({default.compat_key, sdpa.compat_key, flash.compat_key}) == 3
+
+
+# ---------------------------------------------------------------------------
+# VRAM-aware placement declarations (docs/planning/vram-aware-placement.md).
+# ---------------------------------------------------------------------------
+
+
+def _one_vllm(placement=None, engine='vllm'):
+    ep = {'engine': engine, 'model': 'm'}
+    if engine == 'ollama':
+        ep = {'engine': 'ollama', 'model': 'tag', 'host': 'h'}
+    if placement is not None:
+        ep['placement'] = placement
+    data = {
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {'e': ep},
+        'runtime_hosts': {'h': {'engine': 'ollama'}},
+    }
+    return data
+
+
+def test_placement_min_vram_reaches_resolved_spec():
+    cat = Catalog.from_dict(_one_vllm({'min_vram_gib': 24}))
+    req = cat.resolve_endpoint('e')
+    assert req.spec['placement'] == {'min_vram_gib': 24}
+
+
+def test_absent_placement_keeps_spec_byte_identical():
+    # No declaration -> no 'placement' key at all, so existing catalogs
+    # produce exactly the specs they produced before this feature.
+    cat = Catalog.from_dict(_one_vllm())
+    req = cat.resolve_endpoint('e')
+    assert 'placement' not in req.spec
+
+
+def test_placement_is_not_structural():
+    # Same model/runtime with different declarations still coalesces: the
+    # requirement says where a deployment may LAND, not what process it is.
+    a = Catalog.from_dict(_one_vllm({'min_vram_gib': 8})).resolve_endpoint('e')
+    b = Catalog.from_dict(_one_vllm({'min_vram_gib': 24})).resolve_endpoint('e')
+    assert a.compat_key == b.compat_key
+
+
+@pytest.mark.parametrize(
+    'placement, needle',
+    [
+        ({'min_vram_gib': -1}, 'positive number'),
+        ({'min_vram_gib': 0}, 'positive number'),
+        ({'min_vram_gib': 'lots'}, 'positive number'),
+        ({'min_vram_gib': True}, 'positive number'),
+        ({'min_vram_gb': 24}, 'unknown placement key'),   # the typo case
+    ],
+)
+def test_placement_validation_errors(placement, needle):
+    with pytest.raises(CatalogError) as exc:
+        Catalog.from_dict(_one_vllm(placement))
+    assert needle in str(exc.value)
+
+
+def test_placement_rejected_on_ollama_endpoints():
+    with pytest.raises(CatalogError) as exc:
+        Catalog.from_dict(_one_vllm({'min_vram_gib': 8}, engine='ollama'))
+    assert 'only supported on vllm' in str(exc.value)

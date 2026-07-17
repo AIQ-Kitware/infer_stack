@@ -85,7 +85,7 @@ class _SimulateHardwareMixin(scfg.DataConfig):
     simulate_hardware = scfg.Value(
         None,
         type=str,
-        help='Simulate N GPUs with M GiB each (e.g. 4x96, 2x80). Useful for planning on smaller machines.',
+        help='Simulate GPUs: comma-separated NxM or M entries (e.g. 4x96, 2x80, "48,16" for a heterogeneous host). Useful for planning on smaller machines.',
     )
 
 
