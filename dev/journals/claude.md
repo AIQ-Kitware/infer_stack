@@ -2166,3 +2166,58 @@ split it) — it only ever serializes same-user/same-`/tmp` processes, and now w
 fail loudly instead of pretending otherwise. Reusable takeaway: a "degrade to a
 weaker lock + warn" fallback is a footgun when the weaker lock doesn't model the
 real concurrency — prefer self-heal-then-refuse over silent degrade.
+
+## 2026-07-17 12:04:27 -0400
+
+**Model/config:** claude-fable-5[1m] (Fable), Claude Code VSCode extension;
+planning session driven from the eval_audit superproject.
+
+**User intent:** Jon is preparing to benchmark the small Qwen3.5 models
+(0.8B/2B/4B) on yardrat's second GPU (Quadro RTX 5000, 16 GiB) alongside the
+9B on the RTX 8000 (48 GiB), and rejected operator GPU-pinning as the
+mechanism: "I really don't want to think about having to tell it which model
+can go where. I'd love if infer-stack understood that a request for a
+particular endpoint could only be satisfied by certain GPUs." Asked for the
+full plan written into docs/planning with the objective forefront so it
+survives future reconsideration.
+
+**What landed:** `docs/planning/vram-aware-placement.md` (new dir). Plan in
+one line: endpoints declare `placement: {min_vram_gib: N}` in the catalog
+(validated, backward-compatible when absent); `plan_placement()` filters GPUs
+by eligibility (`memory_gib >= min_vram_gib`), orders deployments
+most-constrained-first, and picks best-fit (smallest eligible GPU) instead of
+index-order first-fit; internals become capacity subtraction with an
+exclusive-per-GPU flag so future co-hosting is a policy flip.
+
+**Why this shape (state of mind):** The investigation found the codebase has
+both halves already — inventory records per-GPU `memory_gib`
+(hardware.py:67), and suggest.py owns the exact fit vocabulary
+(`min_vram_gib_per_replica`, `fits_on`, `_host_gpus` picking
+smallest-that-fits with a written rationale) — they've just never been
+introduced to each other at placement time. So this is a wiring change along
+the codebase's own grain, not new machinery. `plan_placement` being a pure
+function with 20 tests makes it the ideal seam; Phase 0 is
+tests-first (heterogeneous `simulate_inventory('48,16')` + semantics-pinning
+cases) before touching the planner.
+
+**Alternatives rejected (recorded in the doc):** per-runbook
+`INFER_STACK_ALLOWED_GPUS` pinning (hand-encoded schedule, rots, per-host);
+undocumented `runtime.gpu_indices` (manual + unvalidated); SLURM typed GRES
+(relocates the mapping into job specs plus a cluster-config project;
+composes later anyway via the existing `$SLURM_JOB_GPUS` design).
+
+**Deliberate scope amendment:** placement.py's docstring says bin-packing is
+"explicitly out of scope"; the plan narrows that to *multi-node* bin-packing
+and preemption. Single-host eligibility + greedy best-fit is now in scope —
+and greedy is adequate forever at ≤8 GPUs; the doc says so to preempt future
+ILP temptation.
+
+**Uncertainties:** exact min_vram_gib numbers must be measured on yardrat,
+not derived from weight bytes (activation overhead at our max_model_len);
+KubeAI backend policy for the new field (leaning warn-and-ignore); whether
+pinned-tier-wins-over-new-declaration is the right stability tradeoff
+(chose stability + warning).
+
+**Next:** Phase 0 (tests) when Jon green-lights implementation. The
+eval_audit-side adoption (declare requirements in the Qwen3.5 catalogs,
+drop the pinning plan) is tracked in the doc as Phase 3.
