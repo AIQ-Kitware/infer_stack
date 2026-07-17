@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 import pytest
@@ -1402,7 +1403,12 @@ def test_vllm_service_mounts_persistent_compile_caches(tmp_path):
     import yaml as _yaml
     doc = _yaml.safe_load(be.compose_file.read_text())
     svc = next(v for k, v in doc['services'].items() if k.startswith('vllm-'))
-    assert '/cache/vllm:/root/.cache/vllm' in svc['volumes']
+    vllm_mounts = [v for v in svc['volumes'] if v.endswith(':/root/.cache/vllm')]
+    assert len(vllm_mounts) == 1
+    # Keyed per serve config: any arg change (e.g. --limit-mm-per-prompt)
+    # starts a fresh compile cache instead of reloading a graph traced under
+    # different inputs (vLLM's own cache key misses such knobs).
+    assert re.match(r'/cache/vllm/cfg-[0-9a-f]{12}$', vllm_mounts[0].split(':')[0])
     assert '/cache/torch:/root/.cache/torch' in svc['volumes']
     assert '/cache/triton:/root/.triton' in svc['volumes']
     assert '/cache/cuda:/root/.nv' in svc['volumes']
@@ -1416,3 +1422,25 @@ def test_partial_state_dict_merges_over_defaults(tmp_path):
     )
     assert be.state['hf_cache'] == STATE['hf_cache']   # explicit wins
     assert 'vllm_cache' in be.state                    # defaults fill the rest
+
+
+def test_vllm_compile_cache_rekeys_on_config_change(tmp_path):
+    # Same model, different extra_args (the observed --limit-mm-per-prompt
+    # change) -> different compile-cache subdir; identical config -> same.
+    def _mount(extra_args):
+        be = ComposeBackend(
+            state_dir=tmp_path / str(len(extra_args)), inventory=simulate_inventory('2x48'),
+            run=FakeDocker(), http=FakeHttp(tmp_path),
+            images=IMAGES, ports=PORTS, state=STATE,
+        )
+        dep = vllm('a')
+        dep.spec['runtime'] = {**dep.spec.get('runtime', {}), 'extra_args': extra_args}
+        be.converge([dep])
+        doc = yaml.safe_load(be.compose_file.read_text())
+        svc = next(v for k, v in doc['services'].items() if k.startswith('vllm-'))
+        return next(v for v in svc['volumes'] if v.endswith(':/root/.cache/vllm'))
+
+    plain = _mount([])
+    limited = _mount(['--limit-mm-per-prompt', '{"image": 0}'])
+    assert plain != limited
+    assert _mount([]) == plain  # deterministic for identical config

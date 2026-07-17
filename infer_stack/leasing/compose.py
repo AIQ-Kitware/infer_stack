@@ -262,6 +262,30 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
 _vllm_service_dict = vllm_service_dict  # historical internal name
 
 
+def _serve_config_hash(
+    svc: dict[str, Any],
+    images: dict[str, str],
+    command: list[str],
+    environment: dict[str, str],
+) -> str:
+    """Stable short hash of everything that shapes the serve's compiled graphs.
+
+    Used to key the vLLM compile-cache mount per serve config (see the volumes
+    comment in ``_vllm_service``). Image + rendered command + generation-
+    relevant env cover every knob that can reach the traced graph, including
+    ``extra_args`` that are deliberately non-structural for deployment
+    identity (e.g. ``--limit-mm-per-prompt``).
+    """
+    material = "\x00".join(
+        [
+            str(svc.get("image") or images["vllm"]),
+            *command,
+            *(f"{k}={v}" for k, v in sorted(environment.items()) if k != "HF_TOKEN"),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
 def _vllm_service(
     deployment: Deployment,
     gpus: list[int],
@@ -299,9 +323,20 @@ def _vllm_service(
         # CUDA-jit pass (~10-20 min on big models) on every lease. The state
         # dirs have existed in default_state_paths all along — they were simply
         # never mounted.
+        #
+        # The vLLM compile cache is keyed by a hash of the FULL serve config
+        # (image + command + attention env): vLLM's own cache key omits at
+        # least limit_mm_per_prompt, so a config change can silently reload a
+        # graph traced under different inputs — observed as an
+        # AttributeError('NoneType'.size) engine crash when the mm limits
+        # changed, and the quiet failure mode would be wrong numerics. A
+        # per-config subdir makes any arg change start a fresh cache while
+        # identical configs keep the reuse. Weights (hf) and the triton/cuda
+        # jit caches are content-addressed internally and stay shared.
         'volumes': [
             f'{state["hf_cache"]}:/root/.cache/huggingface',
-            f'{state["vllm_cache"]}:/root/.cache/vllm',
+            f'{state["vllm_cache"]}/cfg-{_serve_config_hash(svc, images, command, environment)}'
+            ':/root/.cache/vllm',
             f'{state["torch_cache"]}:/root/.cache/torch',
             f'{state["triton_cache"]}:/root/.triton',
             f'{state["cuda_cache"]}:/root/.nv',
