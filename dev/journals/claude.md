@@ -2236,3 +2236,14 @@ survives only as the weight-bytes *floor* (sound underestimate, prevents the
 (3) KubeAI/k3s: warn-and-ignore confirmed. (4) VRAM-aware reservations:
 explicitly deferred, no decision. Phases renumbered (measurement = 3,
 adoption = 4, future = 5).
+
+**Same-session update (12:30):** Jon refined the measurement design:
+measurement is OPTIONAL, not a pipeline stage. Normal path = operator's
+declared best guess; if a serve OOMs on a GPU the declaration called
+eligible, that's a *diagnosed misdeclaration* with a guided error naming the
+exact `placement measure` command; the weight-bytes floor clamps unsound
+guesses automatically (max(declared-or-measured, floor)). Design §3
+rewritten around that flow; Phase 3/Resolution 1 aligned; floor-clamp test
+case added (9B declared at 8 GiB still never lands on the 16-GiB card).
+Design takeaway: the guess doesn't need to be right — it needs to fail
+diagnosably and cheaply, with the fix one copy-paste away.
