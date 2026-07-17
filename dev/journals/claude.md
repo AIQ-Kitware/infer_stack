@@ -2282,3 +2282,33 @@ when adding a scheduler constraint to a live system, scope the new
 *preference* (best-fit) to participants that opted in, and give
 non-participants bit-identical legacy behavior — backward compat isn't just
 "old tests pass", it's "old configs cannot be made worse by the upgrade".
+
+**Same-session update (14:00) — Phase 3 implemented.** New
+`infer_stack/leasing/vram.py`: tolerant multi-version parser for vLLM's
+memory-profiling log lines (uses the LAST serve in a restarted container's
+log), `derive_min_vram_gib` (non-KV profile × margin + KV budget — the KV
+budget is OUR serving choice, not a model fact), `weight_floor_gib` (stat-only
+over the local HF hub cache; largest single snapshot, never a cross-revision
+sum), `Measurements` overlay (fail-open JSON at <state_dir>/measurements.json),
+and the OOM classifier (explicit allocator/vLLM signatures only — a generic
+'error' match would send operators measuring after unrelated crashes).
+Compose backend enriches specs at plan time (declared > measured > floor,
+best-effort, never persisted); `deployment_logs()` feeds both the guided OOM
+hint in acquire's not-ready paths and the new `infer-stack measure <ep>
+[--record]` command (measures a live deployment in place, or acquires once
+and releases). KubeAI: warn-and-ignore per Resolution 3.
+
+Design catch during implementation: the auto-enriched floor must gate
+ELIGIBILITY only, not flip an undeclared deployment into best-fit selection —
+otherwise the mere act of downloading weights would move existing catalogs'
+deployments (e.g. an undeclared small model hopping to the 16-GiB card).
+Split `declared_min_vram` from `min_vram_per_gpu`; two tests pin it. That's
+the second backward-compat subtlety of this feature and both have the same
+shape: NEW information sources may only ever *restrict* where things can go
+or improve outcomes for opted-in deployments — never reroute a non-consenting
+deployment that was fine.
+
+Suite: 376 passed / 3 skipped (13 new vram tests, 2 new placement tests,
+4 new compose enrichment tests, MeasureCLI registered). Not exercised on real
+GPUs yet — the measure command's acquire-once path and the docker-logs parse
+get their first real run in Phase 4 on yardrat.

@@ -1380,6 +1380,13 @@ class ComposeBackend(ConvergeScaffold):
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
+        # VRAM facts (docs/planning/vram-aware-placement.md Phase 3): the
+        # measured-requirement overlay + a per-process cache of weight-bytes
+        # floors from the local HF hub cache.
+        from .vram import Measurements
+
+        self.measurements = Measurements(self.state_dir / 'measurements.json')
+        self._floor_cache: dict[str, float | None] = {}
 
     @property
     def inventory(self) -> dict[str, Any]:
@@ -1483,14 +1490,78 @@ class ComposeBackend(ConvergeScaffold):
         GPUs; ``converge`` uses it as the first step of render.
         """
         pinned = self._load_sidecar().get('assignments', {})
+        desired = list(desired)
+        self._enrich_placement(desired)
         return plan_placement(
-            list(desired),
+            desired,
             self.inventory,
             allowed_gpus=self.allowed_gpus,
             reserved=self.reserved,
             pinned=pinned,
             skip_display=self.skip_display,
         )
+
+    def _enrich_placement(self, desired: list[Deployment]) -> None:
+        """Attach VRAM facts to vLLM deployments before planning (in-memory).
+
+        Resolution order (docs/planning/vram-aware-placement.md §3):
+        a catalog-declared ``min_vram_gib`` wins; else a recorded measurement
+        from the overlay fills it; the weight-bytes floor rides alongside
+        (``max(declared-or-measured, floor)`` is applied by the planner, and
+        a floor-only deployment keeps legacy index-order selection). Purely
+        best-effort and never persisted — a missing overlay or an
+        un-downloaded model just means placement runs exactly as before.
+        """
+        from .vram import measurement_key_for_spec, weight_floor_gib
+
+        for deployment in desired:
+            if deployment.engine != 'vllm':
+                continue
+            try:
+                spec = deployment.spec
+                placement = dict(spec.get('placement') or {})
+                if not placement.get('min_vram_gib'):
+                    measured = self.measurements.get_min_vram_gib(
+                        measurement_key_for_spec(spec)
+                    )
+                    if measured:
+                        placement['min_vram_gib'] = measured
+                        placement['min_vram_source'] = 'measured'
+                if not placement.get('floor_vram_gib'):
+                    model_id = spec.get('hf_model_id') or ''
+                    if model_id not in self._floor_cache:
+                        self._floor_cache[model_id] = weight_floor_gib(
+                            model_id, self.state.get('hf_cache')
+                        )
+                    floor = self._floor_cache[model_id]
+                    if floor:
+                        placement['floor_vram_gib'] = floor
+                if placement:
+                    spec['placement'] = placement
+            except Exception:
+                continue  # enrichment must never block placement
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        """Recent engine logs for a deployment's compose service.
+
+        Fail-open to ``''`` — this feeds diagnosis paths (OOM classification,
+        ``infer-stack measure``), which must degrade silently when the
+        container is already gone.
+        """
+        try:
+            if deployment.engine == 'vllm':
+                name = vllm_service_name(
+                    deployment, unique=self.dynamic_routing
+                )
+            elif deployment.engine == 'ollama':
+                name = ollama_service_name(deployment)
+            else:
+                return ''
+            return self._compose(
+                ['logs', '--no-color', '--tail', str(tail), name]
+            )
+        except Exception:
+            return ''
 
     def _load_route_registry(self) -> dict[str, Any]:
         """Read the route registry, tolerantly (fail-open — a broken registry

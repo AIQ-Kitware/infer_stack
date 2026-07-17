@@ -1,11 +1,21 @@
 # VRAM-aware placement: endpoints declare what they need, GPUs satisfy what they can
 
 **Status:** proposed 2026-07-17 · open questions resolved same day (see
-"Resolutions") · **Phases 0–2 implemented 2026-07-17** (heterogeneous
-`simulate_inventory`, catalog `placement.min_vram_gib`, eligibility +
-most-constrained-first + best-fit planner with `GpuPlan.warnings`; 15 new
-placement tests + 9 catalog tests, legacy plans byte-identical) · Phases 3–5
-not started
+"Resolutions") · **Phases 0–3 implemented 2026-07-17** · Phase 4 in
+progress (eval_audit) · Phase 5 not started
+
+Phases 0–2: heterogeneous `simulate_inventory`, catalog
+`placement.min_vram_gib`, eligibility + most-constrained-first + best-fit
+planner with `GpuPlan.warnings`; legacy plans byte-identical.
+Phase 3: `leasing/vram.py` (profile parser / floor / overlay /
+OOM classifier), plan-time enrichment in the compose backend
+(declared > measured-overlay > floor), the guided OOM hint on
+not-ready acquires, `infer-stack measure <endpoint> [--record]`, and
+kubeai warn-and-ignore. One semantics refinement discovered during
+implementation, now in design §2/§3: the automatically-enriched floor gates
+ELIGIBILITY only — a floored-but-undeclared deployment keeps legacy
+index-order selection, so merely downloading weights never moves an
+existing catalog's deployments on a host where everything fits.
 **Origin:** eval_audit Qwen3.5 small-model planning (yardrat, heterogeneous
 2-GPU host). Written down so the objective survives even if this particular
 plan gets reconsidered.

@@ -327,3 +327,19 @@ def test_best_fit_ties_break_by_index():
         [vllm('a', vram=12, t=0), vllm('b', vram=12, t=1)], inv('2x16,48')
     )
     assert plan.assignments == {'a': [0], 'b': [1]}
+
+
+def test_floor_only_keeps_legacy_selection():
+    # The floor is enriched automatically once weights land in the HF cache —
+    # for an UNDECLARED deployment it gates eligibility only. Selection stays
+    # legacy index-order: downloading weights must never move a deployment
+    # that fits everywhere (no silent best-fit flip to the small card).
+    plan = plan_placement([vllm('a', floor=1.7)], inv('48,16'))
+    assert plan.assignments == {'a': [0]}
+
+
+def test_floor_only_still_gates_eligibility():
+    # ...but a floor bigger than a GPU still excludes that GPU, even with no
+    # declaration at all (the automatic-safety half of the design).
+    plan = plan_placement([vllm('big', floor=19.3)], inv('16,48'))
+    assert plan.assignments == {'big': [1]}

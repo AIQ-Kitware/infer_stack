@@ -432,6 +432,57 @@ def _emit_staged(config, controller, outcome) -> int:
     return 0
 
 
+def _oom_hints(controller, outcome) -> list[str]:
+    """Guided-failure diagnosis for a not-ready acquire (vram-aware-placement §3).
+
+    When a pending endpoint's engine log shows CUDA OOM, the failure is a
+    *diagnosed misdeclaration*, not a generic crash: report the GPU it OOM'd
+    on, the declared requirement (or its absence), and the exact command
+    that computes the right number. Fail-open — no logs, no hints.
+    """
+    from ..leasing.placement import declared_min_vram
+    from ..leasing.vram import looks_like_cuda_oom
+
+    backend = controller.backend
+    logs_fn = getattr(backend, 'deployment_logs', None)
+    if logs_fn is None or outcome.wait is None or outcome.wait.ready:
+        return []
+    by_id = {g.id: g for g in outcome.deployments}
+    try:
+        memory = {
+            g['index']: g.get('memory_gib')
+            for g in getattr(backend, 'inventory', {}).get('gpus', [])
+        }
+    except Exception:
+        memory = {}
+    assignments = dict(getattr(backend, 'last_assignments', {}) or {})
+    hints: list[str] = []
+    for gid, endpoint in outcome.wait.pending:
+        deployment = by_id.get(gid)
+        if deployment is None:
+            continue
+        text = logs_fn(deployment)
+        if not text or not looks_like_cuda_oom(text):
+            continue
+        gpus = assignments.get(gid, [])
+        where = (
+            ', '.join(f'gpu{i}={memory.get(i)}GiB' for i in gpus)
+            if gpus else 'its GPU'
+        )
+        declared = declared_min_vram(deployment)
+        declared_txt = (
+            f'declared min_vram_gib={declared:g} looks too low'
+            if declared
+            else 'no min_vram_gib is declared for it'
+        )
+        hints.append(
+            f'{endpoint}: engine log shows CUDA OUT-OF-MEMORY on {where} — '
+            f'{declared_txt}. Compute the real requirement with: '
+            f'infer-stack measure {endpoint} --record'
+        )
+    return hints
+
+
 def _emit_acquire(config, controller, outcome) -> int:
     if not outcome.applied:
         return _emit_staged(config, controller, outcome)
@@ -474,6 +525,8 @@ def _emit_acquire(config, controller, outcome) -> int:
         )
         for gid, endpoint in outcome.wait.pending:
             print(f'  pending: {endpoint} ({gid})')
+        for hint in _oom_hints(controller, outcome):
+            print(f'  {hint}')
         print('  (use --no-wait to hold a lease while a slow model loads)')
     else:
         print(f'acquired {outcome.lease.id} (owner={outcome.lease.owner})')
@@ -483,6 +536,8 @@ def _emit_acquire(config, controller, outcome) -> int:
             print(f'  ready: {outcome.wait.ready}')
             for gid, endpoint in outcome.wait.pending:
                 print(f'    pending: {endpoint} ({gid})')
+            for hint in _oom_hints(controller, outcome):
+                print(f'    {hint}')
         access = getattr(controller.backend, 'access', None)
         info = access(list(outcome.lease.endpoints)) if access else None
         if info and info.get('ui_url'):
@@ -1187,6 +1242,191 @@ class WaitCLI(_LeasingCommonMixin):
             for gid, ep in result.pending:
                 print(f'  pending: {ep} ({gid})')
         return 0 if result.ready else 2
+
+
+class MeasureCLI(_LeasingCommonMixin):
+    """Measure an endpoint's real per-GPU VRAM requirement from the engine's
+    own memory-profiling log (docs/planning/vram-aware-placement.md §3).
+
+    Parses vLLM's profiling breakdown (weights + non-torch + activation peak)
+    — deliberately NOT ``nvidia-smi memory.used``, which only reflects the
+    ``gpu_memory_utilization`` preallocation on whatever card the model
+    landed on — then adds a KV budget (our serving choice, not a model
+    property) and a small safety margin, and reports a paste-ready
+    ``placement.min_vram_gib`` value.
+
+    If the endpoint is already live it is measured in place; otherwise it is
+    acquired once (normal placement/queueing applies), measured, and
+    released. ``--record`` writes the measurements overlay, which plan-time
+    enrichment consults automatically for endpoints that declare nothing;
+    promoting the number into ``catalog.yaml`` stays an explicit operator
+    edit (the printed line is paste-ready).
+    """
+
+    __command__ = 'measure'
+
+    endpoint = scfg.Value(
+        None, position=1, required=True, type=str,
+        help='Catalog endpoint to measure.',
+    )
+    record = scfg.Value(
+        False, isflag=True,
+        help='Record the result into the measurements overlay '
+        '(consulted automatically at plan time when the catalog declares '
+        'nothing for this endpoint).',
+    )
+    kv_gib = scfg.Value(
+        2.0, type=float,
+        help='KV-cache budget (GiB) added on top of the non-KV profile. '
+        'A serving choice (max_model_len / max_num_seqs), not a model fact.',
+    )
+    margin = scfg.Value(
+        0.05, type=float,
+        help='Safety-margin fraction over the non-KV profile '
+        '(allocator fragmentation, engine drift).',
+    )
+    timeout = scfg.Value(
+        900, type=float,
+        help='Readiness timeout when the endpoint must be brought up first (s).',
+    )
+    catalog = scfg.Value(
+        None, type=str,
+        help='Catalog path (default: <config-root>/catalog.yaml).',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.vram import (
+            derive_min_vram_gib,
+            measurement_key_for_spec,
+            parse_vllm_memory_profile,
+            weight_floor_gib,
+        )
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        backend = controller.backend
+        logs_fn = getattr(backend, 'deployment_logs', None)
+        if logs_fn is None:
+            raise SystemExit(
+                'measure needs the compose backend '
+                '(the engine container log is the measurement source).'
+            )
+        catalog = _load_catalog(config)
+        name = config.endpoint
+        request = catalog.resolve_names([name])[0]
+        if request.engine != 'vllm':
+            raise SystemExit(
+                f'measure supports vllm endpoints only '
+                f'({name} is {request.engine}).'
+            )
+
+        controller.ledger.sweep()
+        _, deployments = controller.ledger.status()
+        live = [
+            g for g in deployments
+            if g.state == DeploymentState.LIVE
+            and g.compat_key == request.compat_key
+        ]
+        lease_id = None
+        if live:
+            deployment = live[0]
+        else:
+            print(
+                f'{name} is not live — acquiring it once to measure '
+                f'(released afterwards)…'
+            )
+            outcome = controller.acquire(
+                'measure',
+                [request],
+                ttl_seconds=3600.0,
+                wait=True,
+                timeout=float(config.timeout),
+                wait_for_placement=True,
+            )
+            not_ready = outcome.released_on_timeout or (
+                outcome.wait is not None and not outcome.wait.ready
+            )
+            if not_ready:
+                for hint in _oom_hints(controller, outcome):
+                    print(f'  {hint}')
+                raise SystemExit(
+                    f'{name} never became ready — cannot measure '
+                    f'(see `infer-stack logs` for the engine output).'
+                )
+            lease_id = outcome.lease.id
+            by_key = {g.compat_key: g for g in outcome.deployments}
+            deployment = by_key.get(request.compat_key, outcome.deployments[0])
+
+        try:
+            text = logs_fn(deployment, tail=4000) or ''
+            profile = parse_vllm_memory_profile(text)
+            if profile is None:
+                raise SystemExit(
+                    f'no memory-profiling lines found in {name}\'s engine log '
+                    f'— the container may have restarted past its startup '
+                    f'output, or this vLLM build logs an unknown format. '
+                    f'Try right after a fresh serve.'
+                )
+            value = derive_min_vram_gib(
+                profile,
+                kv_budget_gib=float(config.kv_gib),
+                margin_fraction=float(config.margin),
+            )
+            key = measurement_key_for_spec(deployment.spec)
+            floor = weight_floor_gib(
+                deployment.spec.get('hf_model_id'),
+                getattr(backend, 'state', {}).get('hf_cache'),
+            )
+            recorded_to = None
+            if config.record:
+                store = getattr(backend, 'measurements', None)
+                if store is None:
+                    raise SystemExit(
+                        '--record needs the compose backend measurements '
+                        'overlay.'
+                    )
+                store.record(
+                    key, value, endpoint=name, profile=profile,
+                    kv_budget_gib=float(config.kv_gib),
+                    margin_fraction=float(config.margin),
+                )
+                recorded_to = str(store.path)
+            if config.json:
+                print(json.dumps({
+                    'endpoint': name,
+                    'min_vram_gib': value,
+                    'profile': profile,
+                    'floor_vram_gib': floor,
+                    'measurement_key': key,
+                    'recorded_to': recorded_to,
+                }, indent=2))
+            else:
+                print(f'measured {name}:')
+                parts = ', '.join(
+                    f'{k.removesuffix("_gib").replace("_", " ")}='
+                    f'{v:g}GiB'
+                    for k, v in sorted(profile.items())
+                )
+                print(f'  engine profile: {parts}')
+                print(
+                    f'  derived min_vram_gib: {value:g}   '
+                    f'(non-KV profile × {1 + float(config.margin):g} '
+                    f'+ {float(config.kv_gib):g} KV budget)'
+                )
+                if floor:
+                    print(f'  weight-bytes floor: {floor:g} GiB (local HF cache)')
+                if recorded_to:
+                    print(f'  recorded to overlay: {recorded_to}')
+                print(
+                    f'  catalog promotion (explicit edit): '
+                    f'endpoints.{name}.placement.min_vram_gib: {value:g}'
+                )
+        finally:
+            if lease_id is not None:
+                controller.release(lease_id)
+        return 0
 
 
 class TuiCLI(_LeasingCommonMixin):

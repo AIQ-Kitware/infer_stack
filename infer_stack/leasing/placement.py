@@ -118,20 +118,34 @@ def explicit_indices(deployment: Deployment) -> list[int] | None:
     return None
 
 
-def min_vram_per_gpu(deployment: Deployment) -> float:
-    """The per-GPU VRAM eligibility requirement in GiB (0.0 = unconstrained).
+def declared_min_vram(deployment: Deployment) -> float:
+    """The catalog-declared (or measured-overlay) requirement, 0.0 if none.
 
-    ``placement.min_vram_gib`` is the declared best guess (catalog);
-    ``placement.floor_vram_gib`` is the machine-derived weight-bytes floor
-    (Phase 3 populates it — a guaranteed underestimate of need). The
-    effective requirement is ``max(declared, floor)``: the floor clamps an
-    unsoundly low guess, so a 9B declared at 8 GiB still never lands on a
-    16-GiB card.
+    Declaring is the deployment's opt-in to best-fit selection; the floor
+    alone (below) never is.
     """
     placement = deployment.spec.get('placement', {}) or {}
-    declared = float(placement.get('min_vram_gib') or 0.0)
+    return float(placement.get('min_vram_gib') or 0.0)
+
+
+def min_vram_per_gpu(deployment: Deployment) -> float:
+    """The per-GPU VRAM *eligibility* requirement in GiB (0.0 = unconstrained).
+
+    ``placement.min_vram_gib`` is the declared best guess (catalog) or a
+    recorded measurement; ``placement.floor_vram_gib`` is the machine-derived
+    weight-bytes floor (a guaranteed underestimate of need, enriched at plan
+    time once the weights are in the local HF cache). The effective
+    requirement is ``max(declared, floor)``: the floor clamps an unsoundly
+    low guess, so a 9B declared at 8 GiB still never lands on a 16-GiB card.
+
+    The floor affects ELIGIBILITY only — a floored-but-undeclared deployment
+    keeps legacy index-order selection (see ``plan_placement`` tier 3), so
+    the mere act of downloading weights never changes where an existing
+    catalog's deployments land on a host where everything fits everywhere.
+    """
+    placement = deployment.spec.get('placement', {}) or {}
     floor = float(placement.get('floor_vram_gib') or 0.0)
-    return max(declared, floor)
+    return max(declared_min_vram(deployment), floor)
 
 
 def _memory_map(inventory: dict[str, Any]) -> dict[int, float]:
@@ -310,8 +324,18 @@ def plan_placement(
                     f'(>= {req:g} GiB) but only {len(free)} free'
                 )
                 continue
-            best = sorted(free, key=lambda i: (memory.get(i, 0.0), i))[:count]
-            indices = sorted(best)
+            if declared_min_vram(deployment) > 0:
+                # Declaring opts into best-fit (smallest eligible free GPUs).
+                best = sorted(
+                    free, key=lambda i: (memory.get(i, 0.0), i)
+                )[:count]
+                indices = sorted(best)
+            else:
+                # Floor-only (weights merely present in the HF cache): the
+                # floor gates eligibility, but selection stays legacy
+                # index-order — downloading weights must never move an
+                # undeclared deployment on a host where everything fits.
+                indices = free[:count]
         plan.assignments[deployment.id] = indices
         used.update(indices)
 

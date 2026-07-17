@@ -43,6 +43,7 @@ from .commands_leasing import (
     EvictCLI,
     GcCLI,
     LeasesCLI,
+    MeasureCLI,
     ReleaseCLI,
     RenewCLI,
     RoutesModalCLI,
@@ -129,6 +130,7 @@ class ManageCLI(scfg.ModalCLI):
     routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
     test = TestCLI  # smoke-test a served endpoint through the front door
+    measure = MeasureCLI  # measure an endpoint's real VRAM requirement (placement.min_vram_gib)
     env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE
 
     # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
