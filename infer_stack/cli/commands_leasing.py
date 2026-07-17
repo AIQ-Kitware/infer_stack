@@ -217,8 +217,6 @@ def _make_backend(config, *, interactive: bool = False):
     if name in (None, '', 'null', 'dry-run'):
         return NullBackend()
     if name == 'compose':
-        from ..hardware import detect_inventory
-
         rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
         # Best-effort catalog so the LiteLLM gateway gets a static superset route
         # table (one route per catalog endpoint) and is never recreated as models
@@ -231,7 +229,10 @@ def _make_backend(config, *, interactive: bool = False):
             catalog = None  # no catalog -> legacy per-deployment gateway config
         return ComposeBackend(
             state_dir=data_root() / 'leasing' / 'compose',
-            inventory=detect_inventory(),
+            # None => the backend detects lazily on first placement, so no verb
+            # (and especially not the TUI's first frame) blocks on the
+            # nvidia-smi subprocess at construction time.
+            inventory=None,
             allowed_gpus=_parse_gpus(getattr(config, 'allowed_gpus', None)),
             skip_display=_resolve_skip_display(config),
             litellm=_resolve_litellm(config),

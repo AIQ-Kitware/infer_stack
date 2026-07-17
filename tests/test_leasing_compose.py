@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 import pytest
@@ -1344,3 +1345,102 @@ def test_rendered_compose_passes_docker_schema(name, deployments, litellm, tmp_p
         capture_output=True, text=True,
     )
     assert result.returncode == 0, f'{name}: {result.stderr}'
+
+
+def test_inventory_detected_lazily_not_at_construction(tmp_path, monkeypatch):
+    # Startup paths (the TUI especially) construct the backend with
+    # inventory=None; nothing may wait on the nvidia-smi subprocess until the
+    # first placement actually needs the inventory.
+    calls = []
+
+    def fake_detect():
+        calls.append(1)
+        return simulate_inventory('2x48')
+
+    import infer_stack.hardware as hardware
+    monkeypatch.setattr(hardware, 'detect_inventory', fake_detect)
+
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=None,
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert calls == []                       # construction paid nothing
+    assert be.inventory['gpu_count'] == 2    # first access detects...
+    assert be.inventory['gpu_count'] == 2    # ...and caches
+    assert calls == [1]
+
+
+def test_explicit_inventory_never_detects(tmp_path, monkeypatch):
+    import infer_stack.hardware as hardware
+    monkeypatch.setattr(
+        hardware, 'detect_inventory',
+        lambda: (_ for _ in ()).throw(AssertionError('must not detect')),
+    )
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,
+    )
+    assert be.inventory['gpu_count'] == 4
+
+
+def test_vllm_service_mounts_persistent_compile_caches(tmp_path):
+    # Regression: only the HF cache was mounted, so with `reclaim: stop` every
+    # re-acquire cold-started the container and re-paid the full
+    # torch.compile / Triton / CUDA-jit pass (~10-20 min on big models). The
+    # state dirs existed in default_state_paths all along — assert they are
+    # actually mounted now.
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x48'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS,
+        state={**STATE,
+               'vllm_cache': '/cache/vllm', 'torch_cache': '/cache/torch',
+               'triton_cache': '/cache/triton', 'cuda_cache': '/cache/cuda'},
+    )
+    be.converge([vllm('a')])
+    import yaml as _yaml
+    doc = _yaml.safe_load(be.compose_file.read_text())
+    svc = next(v for k, v in doc['services'].items() if k.startswith('vllm-'))
+    vllm_mounts = [v for v in svc['volumes'] if v.endswith(':/root/.cache/vllm')]
+    assert len(vllm_mounts) == 1
+    # Keyed per serve config: any arg change (e.g. --limit-mm-per-prompt)
+    # starts a fresh compile cache instead of reloading a graph traced under
+    # different inputs (vLLM's own cache key misses such knobs).
+    assert re.match(r'/cache/vllm/cfg-[0-9a-f]{12}$', vllm_mounts[0].split(':')[0])
+    assert '/cache/torch:/root/.cache/torch' in svc['volumes']
+    assert '/cache/triton:/root/.triton' in svc['volumes']
+    assert '/cache/cuda:/root/.nv' in svc['volumes']
+
+
+def test_partial_state_dict_merges_over_defaults(tmp_path):
+    be = ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x48'),
+        run=FakeDocker(), http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS, state=STATE,  # partial: no cache keys
+    )
+    assert be.state['hf_cache'] == STATE['hf_cache']   # explicit wins
+    assert 'vllm_cache' in be.state                    # defaults fill the rest
+
+
+def test_vllm_compile_cache_rekeys_on_config_change(tmp_path):
+    # Same model, different extra_args (the observed --limit-mm-per-prompt
+    # change) -> different compile-cache subdir; identical config -> same.
+    def _mount(extra_args):
+        be = ComposeBackend(
+            state_dir=tmp_path / str(len(extra_args)), inventory=simulate_inventory('2x48'),
+            run=FakeDocker(), http=FakeHttp(tmp_path),
+            images=IMAGES, ports=PORTS, state=STATE,
+        )
+        dep = vllm('a')
+        dep.spec['runtime'] = {**dep.spec.get('runtime', {}), 'extra_args': extra_args}
+        be.converge([dep])
+        doc = yaml.safe_load(be.compose_file.read_text())
+        svc = next(v for k, v in doc['services'].items() if k.startswith('vllm-'))
+        return next(v for v in svc['volumes'] if v.endswith(':/root/.cache/vllm'))
+
+    plain = _mount([])
+    limited = _mount(['--limit-mm-per-prompt', '{"image": 0}'])
+    assert plain != limited
+    assert _mount([]) == plain  # deterministic for identical config

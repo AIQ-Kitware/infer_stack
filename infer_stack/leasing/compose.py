@@ -262,6 +262,30 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
 _vllm_service_dict = vllm_service_dict  # historical internal name
 
 
+def _serve_config_hash(
+    svc: dict[str, Any],
+    images: dict[str, str],
+    command: list[str],
+    environment: dict[str, str],
+) -> str:
+    """Stable short hash of everything that shapes the serve's compiled graphs.
+
+    Used to key the vLLM compile-cache mount per serve config (see the volumes
+    comment in ``_vllm_service``). Image + rendered command + generation-
+    relevant env cover every knob that can reach the traced graph, including
+    ``extra_args`` that are deliberately non-structural for deployment
+    identity (e.g. ``--limit-mm-per-prompt``).
+    """
+    material = "\x00".join(
+        [
+            str(svc.get("image") or images["vllm"]),
+            *command,
+            *(f"{k}={v}" for k, v in sorted(environment.items()) if k != "HF_TOKEN"),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
 def _vllm_service(
     deployment: Deployment,
     gpus: list[int],
@@ -269,6 +293,9 @@ def _vllm_service(
     images: dict[str, str],
     state: dict[str, str],
 ) -> dict[str, Any]:
+    # Merge over the defaults so direct callers (tests, embedders) with a
+    # partial state dict still resolve every cache-mount key below.
+    state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
     command = [
         deployment.spec['hf_model_id'],
@@ -290,7 +317,30 @@ def _vllm_service(
         'image': svc.get('image') or images['vllm'],
         'command': command,
         'environment': environment,
-        'volumes': [f'{state["hf_cache"]}:/root/.cache/huggingface'],
+        # Weights AND compile artifacts persist across container recreations:
+        # with `reclaim: stop`, every re-acquire cold-starts the container, and
+        # without these mounts vLLM re-pays its full torch.compile / Triton /
+        # CUDA-jit pass (~10-20 min on big models) on every lease. The state
+        # dirs have existed in default_state_paths all along — they were simply
+        # never mounted.
+        #
+        # The vLLM compile cache is keyed by a hash of the FULL serve config
+        # (image + command + attention env): vLLM's own cache key omits at
+        # least limit_mm_per_prompt, so a config change can silently reload a
+        # graph traced under different inputs — observed as an
+        # AttributeError('NoneType'.size) engine crash when the mm limits
+        # changed, and the quiet failure mode would be wrong numerics. A
+        # per-config subdir makes any arg change start a fresh cache while
+        # identical configs keep the reuse. Weights (hf) and the triton/cuda
+        # jit caches are content-addressed internally and stay shared.
+        'volumes': [
+            f'{state["hf_cache"]}:/root/.cache/huggingface',
+            f'{state["vllm_cache"]}/cfg-{_serve_config_hash(svc, images, command, environment)}'
+            ':/root/.cache/vllm',
+            f'{state["torch_cache"]}:/root/.cache/torch',
+            f'{state["triton_cache"]}:/root/.triton',
+            f'{state["cuda_cache"]}:/root/.nv',
+        ],
         'restart': 'unless-stopped',
         'labels': {DEPLOYMENT_LABEL: deployment.id, ENGINE_LABEL: 'vllm'},
         'healthcheck': {
@@ -1266,7 +1316,7 @@ class ComposeBackend(ConvergeScaffold):
         self,
         *,
         state_dir: str | Path,
-        inventory: dict[str, Any],
+        inventory: dict[str, Any] | None = None,
         run: Callable[[list[str]], str] | None = None,
         http: Any = None,
         images: dict[str, str] | None = None,
@@ -1289,7 +1339,10 @@ class ComposeBackend(ConvergeScaffold):
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.inventory = inventory
+        # None => detect lazily on first use (see the `inventory` property):
+        # startup paths (notably the TUI) must never wait on nvidia-smi
+        # before the first frame.
+        self._inventory = inventory
         self.run = run or _default_docker_run
         if http is None:
             import requests
@@ -1297,7 +1350,9 @@ class ComposeBackend(ConvergeScaffold):
         self.http = http
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
-        self.state = state or default_state_paths()
+        # Merge over the defaults (not replace) so a caller-supplied partial
+        # state dict — tests, embedders — still resolves every cache-mount key.
+        self.state = {**default_state_paths(), **(state or {})}
         self.allowed_gpus = allowed_gpus
         self.reserved = tuple(reserved)
         self.project = project
@@ -1325,6 +1380,27 @@ class ComposeBackend(ConvergeScaffold):
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
+
+    @property
+    def inventory(self) -> dict[str, Any]:
+        """GPU inventory, detected lazily on first use.
+
+        Startup paths (notably the TUI) construct the backend with
+        ``inventory=None`` so nothing waits on the nvidia-smi subprocess before
+        the first frame; the first placement (``plan``/``converge``) pays the
+        detection instead — off the UI thread when driven from the TUI's
+        workers. Tests and callers that pass an explicit inventory are
+        unaffected.
+        """
+        if self._inventory is None:
+            from ..hardware import detect_inventory
+
+            self._inventory = detect_inventory()
+        return self._inventory
+
+    @inventory.setter
+    def inventory(self, value: dict[str, Any] | None) -> None:
+        self._inventory = value
 
     @property
     def compose_file(self) -> Path:
