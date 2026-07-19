@@ -42,6 +42,8 @@ dependencies = [
 optional-dependencies.tests = [
   "pytest>=7.0",
   "pytest-codeblocks>=0.17",
+  "pytest-cov>=3.0",
+  "xdoctest>=1.1.5",
 ]
 optional-dependencies.tui = [
     "textual>=0.50",
@@ -71,7 +73,7 @@ packages.find.include = [
 ]
 
 [tool.uv]
-exclude-newer = "2026-06-03"
+exclude-newer = "2026-06-04T04:00:00Z"
 
 [tool.ruff]
 target-version = "py310"
@@ -158,6 +160,9 @@ tags = [
   "github",
   "kitware",
   "purepy",
+]
+os = [
+  "linux",
 ]
 mod_name = "infer_stack"
 repo_name = "infer_stack"

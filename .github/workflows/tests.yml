@@ -164,46 +164,12 @@ jobs:
           arch: auto
           use-lockfile: 'true'
           lock-requirements: requirements/locks/tests.txt
-        - python-version: '3.10'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'true'
-          lock-requirements: requirements/locks/tests.txt
-        - python-version: '3.10'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'true'
-          lock-requirements: requirements/locks/tests.txt
         - python-version: '3.14'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
           use-lockfile: 'true'
           lock-requirements: requirements/locks/tests.txt
-        - python-version: '3.14'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'true'
-          lock-requirements: requirements/locks/tests.txt
-        - python-version: '3.14'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'true'
-          lock-requirements: requirements/locks/tests.txt
-        - python-version: '3.14'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.14'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
         - python-version: '3.10'
           install-extras: tests
           os: ubuntu-latest
@@ -232,76 +198,11 @@ jobs:
         - python-version: pypy-3.9
           install-extras: tests
           os: ubuntu-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.10'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.11'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.12'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.13'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.14'
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: pypy-3.9
-          install-extras: tests
-          os: macOS-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.10'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.11'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.12'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.13'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: '3.14'
-          install-extras: tests
-          os: windows-latest
-          arch: auto
-          use-lockfile: 'false'
-        - python-version: pypy-3.9
-          install-extras: tests
-          os: windows-latest
           arch: auto
           use-lockfile: 'false'
     steps:
     - name: Checkout source
       uses: actions/checkout@v6.0.2
-    - name: Enable MSVC 64bit
-      uses: ilammy/msvc-dev-cmd@v1.13.0
-      if: ${{ startsWith(matrix.os, 'windows-') }}
-      with:
-        arch: ${{ contains(matrix.os, 'arm') && 'arm64' || 'x64' }}
     - name: Setup Python
       uses: actions/setup-python@v6.2.0
       with:
@@ -312,9 +213,6 @@ jobs:
         pattern: wheels-*
         merge-multiple: true
         path: wheelhouse
-    - name: Set macOS deployment target (arm64)
-      if: runner.os == 'macOS'
-      run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
     - name: Install wheel ${{ matrix.install-extras }}
       shell: bash
       env:
