@@ -7,15 +7,24 @@ from infer_stack.leasing import plan_placement
 from infer_stack.leasing.models import Deployment, DeploymentState
 
 
-def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None, t=0.0):
+def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None, vram=None, floor=None,
+         t=0.0):
     runtime = {'tensor_parallel_size': tp,
                'pipeline_parallel_size': pp,
                'data_parallel_size': dp}
     if gpu_indices is not None:
         runtime['gpu_indices'] = gpu_indices
+    spec = {'engine': 'vllm', 'runtime': runtime}
+    placement = {}
+    if vram is not None:
+        placement['min_vram_gib'] = vram
+    if floor is not None:
+        placement['floor_vram_gib'] = floor
+    if placement:
+        spec['placement'] = placement
     return Deployment(
         gid, 'ck-' + gid, 'vllm', 'shared-compatible', {},
-        {'engine': 'vllm', 'runtime': runtime}, {}, DeploymentState.LIVE, t, t,
+        spec, {}, DeploymentState.LIVE, t, t,
     )
 
 
@@ -170,3 +179,167 @@ def test_new_deployment_restricted_to_allowed_gpus():
     # A fresh (unpinned) deployment may only land inside allowed_gpus.
     plan = plan_placement([vllm('a')], inv('4x80'), allowed_gpus=[2])
     assert plan.assignments == {'a': [2]}
+
+
+# ---------------------------------------------------------------------------
+# VRAM-aware placement (docs/planning/vram-aware-placement.md).
+#
+# The motivating host is yardrat: GPU0 = 48 GiB (RTX 8000), GPU1 = 16 GiB
+# (RTX 5000). A 9B model (~24 GiB declared) must NEVER land on GPU1; small
+# models should gravitate to GPU1 (best-fit) so the big card stays free.
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_inventory_heterogeneous():
+    inventory = simulate_inventory('48,16')
+    sizes = [g['memory_gib'] for g in inventory['gpus']]
+    assert sizes == [48.0, 16.0]
+    assert [g['index'] for g in inventory['gpus']] == [0, 1]
+    # count syntax composes with the comma list
+    inventory = simulate_inventory('2x48,16')
+    assert [g['memory_gib'] for g in inventory['gpus']] == [48.0, 48.0, 16.0]
+    # the homogeneous legacy form still works
+    assert [g['memory_gib'] for g in simulate_inventory('4x96')['gpus']] == [96.0] * 4
+
+
+def test_simulate_inventory_invalid_spec_errors():
+    import pytest
+    with pytest.raises(ValueError):
+        simulate_inventory('bogus')
+    with pytest.raises(ValueError):
+        simulate_inventory('48,,16')
+
+
+def test_vram_requirement_excludes_small_gpu():
+    # 9B-class deployment: only the 48 GiB card is eligible.
+    plan = plan_placement([vllm('big', vram=24)], inv('48,16'))
+    assert plan.ok, plan.errors
+    assert plan.assignments == {'big': [0]}
+
+
+def test_yardrat_scenario():
+    # big -> the 48; one small -> the 16; the second small queues (no free
+    # eligible GPU) — and big is NEVER on GPU1.
+    plan = plan_placement(
+        [vllm('big', vram=24, t=0), vllm('small', vram=12, t=1),
+         vllm('tiny', vram=3, t=2)],
+        inv('48,16'),
+    )
+    assert plan.assignments['big'] == [0]
+    assert plan.assignments['small'] == [1]
+    assert 'tiny' not in plan.assignments
+    assert any('tiny' in e for e in plan.errors)
+
+
+def test_anti_starvation_most_constrained_first():
+    # Arrival order says small first — but index-order first-fit would park it
+    # on GPU0 and strand big (which fits ONLY GPU0). Most-constrained-first +
+    # best-fit must place big on 0 and small on 1 regardless of created_at.
+    plan = plan_placement(
+        [vllm('small', vram=12, t=0), vllm('big', vram=24, t=1)],
+        inv('48,16'),
+    )
+    assert plan.ok, plan.errors
+    assert plan.assignments == {'big': [0], 'small': [1]}
+
+
+def test_declared_best_fit_prefers_smallest_eligible():
+    # A lone small model takes the SMALL card, leaving the big one free.
+    plan = plan_placement([vllm('small', vram=12)], inv('48,16'))
+    assert plan.assignments == {'small': [1]}
+
+
+def test_undeclared_deployments_keep_legacy_index_order():
+    # No declaration -> exactly today's behavior (index-order first-fit), so
+    # existing catalogs see byte-identical plans. (A yardrat 9B endpoint that
+    # has not yet declared min_vram_gib still lands on GPU0 as it does today.)
+    plan = plan_placement([vllm('a', t=0), vllm('b', t=1)], inv('48,16'))
+    assert plan.assignments == {'a': [0], 'b': [1]}
+
+
+def test_mixed_declared_and_undeclared():
+    # The declared-constrained deployment places first even if it arrived
+    # later; the undeclared one then takes the remaining GPU legacy-style.
+    plan = plan_placement(
+        [vllm('legacy', t=0), vllm('big', vram=24, t=1)], inv('48,16')
+    )
+    assert plan.ok, plan.errors
+    assert plan.assignments == {'big': [0], 'legacy': [1]}
+
+
+def test_no_eligible_gpu_exists_is_a_clear_error():
+    # Requirement exceeds every GPU on the host: the error must name the
+    # requirement and what the host actually has (copy-pasteable diagnosis).
+    plan = plan_placement([vllm('big', vram=24)], inv('1x16'))
+    assert not plan.ok
+    (err,) = plan.errors
+    assert 'big' in err and '24' in err and '16' in err
+
+
+def test_floor_clamps_low_declaration():
+    # A too-low declared guess is clamped up by the weight-bytes floor: a 9B
+    # declared at 8 GiB (weights 19.3 GB) still never lands on the 16er.
+    plan = plan_placement([vllm('big', vram=8, floor=19.3)], inv('48,16'))
+    assert plan.assignments == {'big': [0]}
+
+
+def test_tp_per_shard_requirement():
+    # tp=2 with a 24 GiB per-shard requirement needs TWO eligible GPUs.
+    plan = plan_placement([vllm('big', tp=2, vram=24)], inv('2x48,16'))
+    assert plan.assignments == {'big': [0, 1]}
+    plan = plan_placement([vllm('big', tp=2, vram=24)], inv('48,2x16'))
+    assert not plan.ok
+    assert any('big' in e for e in plan.errors)
+
+
+def test_allowed_gpus_intersects_eligibility():
+    # GPU0 is eligible but not allowed; GPU1 is allowed but ineligible.
+    plan = plan_placement(
+        [vllm('big', vram=24)], inv('48,16'), allowed_gpus=[1]
+    )
+    assert not plan.ok
+    assert any('big' in e for e in plan.errors)
+
+
+def test_pinned_wins_over_declaration_with_warning():
+    # Stability beats a newly added declaration: the pin is honored, but the
+    # disagreement is surfaced as a warning.
+    plan = plan_placement(
+        [vllm('a', vram=24)], inv('48,16'), pinned={'a': [1]}
+    )
+    assert plan.assignments == {'a': [1]}
+    assert any('a' in w and '24' in w for w in plan.warnings)
+
+
+def test_explicit_indices_win_over_declaration_with_warning():
+    # An operator's explicit gpu_indices is an override, not a bug — honored,
+    # but warned about when it contradicts the declared requirement.
+    plan = plan_placement(
+        [vllm('a', gpu_indices=[1], vram=24)], inv('48,16')
+    )
+    assert plan.assignments == {'a': [1]}
+    assert any('a' in w and '24' in w for w in plan.warnings)
+
+
+def test_best_fit_ties_break_by_index():
+    # Equal-size eligible GPUs: deterministic index order.
+    plan = plan_placement(
+        [vllm('a', vram=12, t=0), vllm('b', vram=12, t=1)], inv('2x16,48')
+    )
+    assert plan.assignments == {'a': [0], 'b': [1]}
+
+
+def test_floor_only_keeps_legacy_selection():
+    # The floor is enriched automatically once weights land in the HF cache —
+    # for an UNDECLARED deployment it gates eligibility only. Selection stays
+    # legacy index-order: downloading weights must never move a deployment
+    # that fits everywhere (no silent best-fit flip to the small card).
+    plan = plan_placement([vllm('a', floor=1.7)], inv('48,16'))
+    assert plan.assignments == {'a': [0]}
+
+
+def test_floor_only_still_gates_eligibility():
+    # ...but a floor bigger than a GPU still excludes that GPU, even with no
+    # declaration at all (the automatic-safety half of the design).
+    plan = plan_placement([vllm('big', floor=19.3)], inv('16,48'))
+    assert plan.assignments == {'big': [1]}

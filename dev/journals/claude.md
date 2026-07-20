@@ -2166,3 +2166,149 @@ split it) — it only ever serializes same-user/same-`/tmp` processes, and now w
 fail loudly instead of pretending otherwise. Reusable takeaway: a "degrade to a
 weaker lock + warn" fallback is a footgun when the weaker lock doesn't model the
 real concurrency — prefer self-heal-then-refuse over silent degrade.
+
+## 2026-07-17 12:04:27 -0400
+
+**Model/config:** claude-fable-5[1m] (Fable), Claude Code VSCode extension;
+planning session driven from the eval_audit superproject.
+
+**User intent:** Jon is preparing to benchmark the small Qwen3.5 models
+(0.8B/2B/4B) on yardrat's second GPU (Quadro RTX 5000, 16 GiB) alongside the
+9B on the RTX 8000 (48 GiB), and rejected operator GPU-pinning as the
+mechanism: "I really don't want to think about having to tell it which model
+can go where. I'd love if infer-stack understood that a request for a
+particular endpoint could only be satisfied by certain GPUs." Asked for the
+full plan written into docs/planning with the objective forefront so it
+survives future reconsideration.
+
+**What landed:** `docs/planning/vram-aware-placement.md` (new dir). Plan in
+one line: endpoints declare `placement: {min_vram_gib: N}` in the catalog
+(validated, backward-compatible when absent); `plan_placement()` filters GPUs
+by eligibility (`memory_gib >= min_vram_gib`), orders deployments
+most-constrained-first, and picks best-fit (smallest eligible GPU) instead of
+index-order first-fit; internals become capacity subtraction with an
+exclusive-per-GPU flag so future co-hosting is a policy flip.
+
+**Why this shape (state of mind):** The investigation found the codebase has
+both halves already — inventory records per-GPU `memory_gib`
+(hardware.py:67), and suggest.py owns the exact fit vocabulary
+(`min_vram_gib_per_replica`, `fits_on`, `_host_gpus` picking
+smallest-that-fits with a written rationale) — they've just never been
+introduced to each other at placement time. So this is a wiring change along
+the codebase's own grain, not new machinery. `plan_placement` being a pure
+function with 20 tests makes it the ideal seam; Phase 0 is
+tests-first (heterogeneous `simulate_inventory('48,16')` + semantics-pinning
+cases) before touching the planner.
+
+**Alternatives rejected (recorded in the doc):** per-runbook
+`INFER_STACK_ALLOWED_GPUS` pinning (hand-encoded schedule, rots, per-host);
+undocumented `runtime.gpu_indices` (manual + unvalidated); SLURM typed GRES
+(relocates the mapping into job specs plus a cluster-config project;
+composes later anyway via the existing `$SLURM_JOB_GPUS` design).
+
+**Deliberate scope amendment:** placement.py's docstring says bin-packing is
+"explicitly out of scope"; the plan narrows that to *multi-node* bin-packing
+and preemption. Single-host eligibility + greedy best-fit is now in scope —
+and greedy is adequate forever at ≤8 GPUs; the doc says so to preempt future
+ILP temptation.
+
+**Uncertainties:** exact min_vram_gib numbers must be measured on yardrat,
+not derived from weight bytes (activation overhead at our max_model_len);
+KubeAI backend policy for the new field (leaning warn-and-ignore); whether
+pinned-tier-wins-over-new-declaration is the right stability tradeoff
+(chose stability + warning).
+
+**Next:** Phase 0 (tests) when Jon green-lights implementation. The
+eval_audit-side adoption (declare requirements in the Qwen3.5 catalogs,
+drop the pinning plan) is tracked in the doc as Phase 3.
+
+**Same-session update (12:20):** Jon resolved the open questions. (1) The
+numbers come from *self-measurement*: models measure themselves at first
+healthy serve and the result updates their catalog via an explicit promote —
+now design §3 + Phase 3. Key trap designed around: `nvidia-smi memory.used`
+measures the `gpu_memory_utilization` knob (vLLM preallocates KV to fill the
+fraction — a 0.8B "uses" ~41 GiB of a 48 GiB card), so measurement parses
+vLLM's own profiling breakdown instead; measured values live in a data_dir
+overlay, never silently rewrite catalog.yaml. (2) suggest will NOT precompute
+placement numbers — Jon's tried, they're never exactly right; precomputation
+survives only as the weight-bytes *floor* (sound underestimate, prevents the
+9B→16GiB class of misplacement from day one with zero measurement).
+(3) KubeAI/k3s: warn-and-ignore confirmed. (4) VRAM-aware reservations:
+explicitly deferred, no decision. Phases renumbered (measurement = 3,
+adoption = 4, future = 5).
+
+**Same-session update (12:30):** Jon refined the measurement design:
+measurement is OPTIONAL, not a pipeline stage. Normal path = operator's
+declared best guess; if a serve OOMs on a GPU the declaration called
+eligible, that's a *diagnosed misdeclaration* with a guided error naming the
+exact `placement measure` command; the weight-bytes floor clamps unsound
+guesses automatically (max(declared-or-measured, floor)). Design §3
+rewritten around that flow; Phase 3/Resolution 1 aligned; floor-clamp test
+case added (9B declared at 8 GiB still never lands on the 16-GiB card).
+Design takeaway: the guess doesn't need to be right — it needs to fail
+diagnosably and cheaply, with the fix one copy-paste away.
+
+**Same-session update (13:05) — Phases 0–2 implemented.** Jon green-lit
+implementation. Tests-first as planned: 14 failing semantics-pinning tests
+authored against the agreed behavior, then made green without touching the
+20 legacy tests. What landed:
+
+- `hardware.simulate_inventory` accepts heterogeneous specs — comma-separated
+  `M` or `NxM` entries (`'48,16'` is yardrat) — legacy `'4x96'` unchanged.
+- `catalog.py`: endpoint-level `placement: {min_vram_gib: N}` block —
+  strict-keyed (a `min_vram_gb` typo is a CatalogError, not a silent
+  no-constraint), positive-number-validated, vllm-only, threaded into
+  `spec['placement']` only when non-empty so existing catalogs resolve
+  byte-identical specs. Deliberately NOT structural: it says where a
+  deployment may land, not what process it is (test pins compat-key
+  equality across differing declarations).
+- `placement.py`: `min_vram_per_gpu()` = max(declared, floor_vram_gib) —
+  the floor field is planner-supported NOW so Phase 3 only has to produce
+  it; eligibility filter (per-shard, memory_gib >= req); fit tier ordered
+  by (n_eligible-in-pool, created_at, id) = most-constrained-first with
+  legacy tie-break; declared deployments take smallest-eligible-free
+  (best-fit, final selection re-sorted ascending so CUDA_VISIBLE_DEVICES
+  stays index-ordered); UNDECLARED deployments keep exact legacy
+  index-order first-fit — an undeclared 9B still lands on GPU 0, not
+  "best-fit" onto the 16er it can't run (this scoping was the one deviation
+  worth writing back into the plan doc's §2). Permanent-vs-transient error
+  split: "pool can never satisfy" (with copy-pasteable inventory) vs "only
+  N free" (the queue case). `GpuPlan.warnings` carries honored-but-suspect
+  pins/explicit indices that contradict declarations; converge logs them.
+
+Validation: 357 passed / 2 env-skips full suite; placement 35/35 (20 legacy
++ 15 new); catalog 29/29 (20 + 9 new); doctests pass. Reusable takeaway:
+when adding a scheduler constraint to a live system, scope the new
+*preference* (best-fit) to participants that opted in, and give
+non-participants bit-identical legacy behavior — backward compat isn't just
+"old tests pass", it's "old configs cannot be made worse by the upgrade".
+
+**Same-session update (14:00) — Phase 3 implemented.** New
+`infer_stack/leasing/vram.py`: tolerant multi-version parser for vLLM's
+memory-profiling log lines (uses the LAST serve in a restarted container's
+log), `derive_min_vram_gib` (non-KV profile × margin + KV budget — the KV
+budget is OUR serving choice, not a model fact), `weight_floor_gib` (stat-only
+over the local HF hub cache; largest single snapshot, never a cross-revision
+sum), `Measurements` overlay (fail-open JSON at <state_dir>/measurements.json),
+and the OOM classifier (explicit allocator/vLLM signatures only — a generic
+'error' match would send operators measuring after unrelated crashes).
+Compose backend enriches specs at plan time (declared > measured > floor,
+best-effort, never persisted); `deployment_logs()` feeds both the guided OOM
+hint in acquire's not-ready paths and the new `infer-stack measure <ep>
+[--record]` command (measures a live deployment in place, or acquires once
+and releases). KubeAI: warn-and-ignore per Resolution 3.
+
+Design catch during implementation: the auto-enriched floor must gate
+ELIGIBILITY only, not flip an undeclared deployment into best-fit selection —
+otherwise the mere act of downloading weights would move existing catalogs'
+deployments (e.g. an undeclared small model hopping to the 16-GiB card).
+Split `declared_min_vram` from `min_vram_per_gpu`; two tests pin it. That's
+the second backward-compat subtlety of this feature and both have the same
+shape: NEW information sources may only ever *restrict* where things can go
+or improve outcomes for opted-in deployments — never reroute a non-consenting
+deployment that was fine.
+
+Suite: 376 passed / 3 skipped (13 new vram tests, 2 new placement tests,
+4 new compose enrichment tests, MeasureCLI registered). Not exercised on real
+GPUs yet — the measure command's acquire-once path and the docker-logs parse
+get their first real run in Phase 4 on yardrat.

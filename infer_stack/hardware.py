@@ -20,28 +20,41 @@ def _run(cmd: list[str], *, timeout: float = 20.0) -> str:
 
 
 def simulate_inventory(spec: str) -> dict[str, Any]:
-    """Build a fake inventory from a spec string like '4x96' (4 GPUs × 96 GiB)."""
+    """Build a fake inventory from a spec string.
+
+    Comma-separated entries, each ``M`` (one GPU of M GiB) or ``NxM`` (N GPUs
+    of M GiB), so heterogeneous hosts are expressible: ``'4x96'`` is four
+    96-GiB cards, ``'48,16'`` is yardrat (one 48 + one 16), ``'2x48,16'``
+    composes both forms.
+    """
+    sizes: list[float] = []
     try:
-        count_str, gib_str = spec.lower().split('x', 1)
-        gpu_count = int(count_str)
-        memory_gib = float(gib_str)
+        for entry in spec.lower().split(','):
+            entry = entry.strip()
+            if 'x' in entry:
+                count_str, gib_str = entry.split('x', 1)
+                sizes.extend([float(gib_str)] * int(count_str))
+            else:
+                sizes.append(float(entry))
+        if not sizes:
+            raise ValueError
     except (ValueError, AttributeError):
         raise ValueError(
-            f'Invalid --simulate-hardware spec {spec!r}. Expected format: NxM (e.g. 4x96, 2x80).'
+            f'Invalid --simulate-hardware spec {spec!r}. Expected '
+            f'comma-separated NxM or M entries (e.g. 4x96, 2x80, 48,16).'
         )
-    memory_mib = int(memory_gib * 1024)
     gpus = [
         {
             'index': i,
             'uuid': f'GPU-simulated-{i:04d}',
             'name': f'Simulated GPU ({memory_gib:.0f}GiB)',
-            'memory_mib': memory_mib,
+            'memory_mib': int(memory_gib * 1024),
             'memory_gib': memory_gib,
             'display_active': False,
         }
-        for i in range(gpu_count)
+        for i, memory_gib in enumerate(sizes)
     ]
-    return {'gpu_count': gpu_count, 'gpus': gpus}
+    return {'gpu_count': len(gpus), 'gpus': gpus}
 
 
 def detect_inventory() -> dict[str, Any]:

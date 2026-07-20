@@ -1444,3 +1444,66 @@ def test_vllm_compile_cache_rekeys_on_config_change(tmp_path):
     limited = _mount(['--limit-mm-per-prompt', '{"image": 0}'])
     assert plain != limited
     assert _mount([]) == plain  # deterministic for identical config
+
+
+# ---------------------------------------------------------------------------
+# Plan-time VRAM enrichment (docs/planning/vram-aware-placement.md Phase 3).
+# ---------------------------------------------------------------------------
+
+
+def _fake_weights(hf_cache: Path, model_id: str, mib: int):
+    snap = (
+        hf_cache / 'hub'
+        / ('models--' + model_id.replace('/', '--'))
+        / 'snapshots' / 'rev0'
+    )
+    snap.mkdir(parents=True)
+    (snap / 'model.safetensors').write_bytes(b'x' * (mib * 1024 ** 2))
+
+
+def test_plan_enriches_floor_from_hf_cache(tmp_path):
+    # A 20-GiB-weights model with NO declaration must still never plan onto
+    # the 16-GiB card: the weight-bytes floor is attached automatically once
+    # the weights are in the local HF cache.
+    hf_cache = tmp_path / 'hf'
+    _fake_weights(hf_cache, 'org/big', 20 * 1024)   # 20 GiB
+    be = ComposeBackend(
+        state_dir=tmp_path,
+        inventory=simulate_inventory('16,48'),
+        run=FakeDocker(),
+        http=FakeHttp(tmp_path),
+        images=IMAGES, ports=PORTS,
+        state={**STATE, 'hf_cache': str(hf_cache)},
+    )
+    plan = be.plan([vllm('big', hf='org/big')])
+    assert plan.assignments == {'big': [1]}
+
+
+def test_plan_enrichment_absent_cache_is_legacy(tmp_path):
+    # No weights downloaded, nothing declared -> exactly the legacy plan.
+    be = make_backend(tmp_path, spec='16,48')
+    plan = be.plan([vllm('a', hf='org/never-downloaded')])
+    assert plan.assignments == {'a': [0]}
+
+
+def test_plan_uses_measured_overlay_when_undeclared(tmp_path):
+    # A recorded measurement fills min_vram_gib for an undeclared endpoint:
+    # 24 GiB measured -> only the 48 GiB card is eligible.
+    be = make_backend(tmp_path, spec='16,48')
+    g = vllm('m', hf='org/measured', max_len=4096)
+    from infer_stack.leasing.vram import measurement_key_for_spec
+    be.measurements.record(measurement_key_for_spec(g.spec), 24.0)
+    plan = be.plan([g])
+    assert plan.assignments == {'m': [1]}
+
+
+def test_plan_declared_beats_measured_overlay(tmp_path):
+    # A catalog declaration wins over the overlay (declared > measured).
+    be = make_backend(tmp_path, spec='16,48')
+    g = vllm('m', hf='org/measured', max_len=4096)
+    g.spec['placement'] = {'min_vram_gib': 4.0}
+    from infer_stack.leasing.vram import measurement_key_for_spec
+    be.measurements.record(measurement_key_for_spec(g.spec), 24.0)
+    plan = be.plan([g])
+    # declared 4 GiB -> both cards eligible -> best-fit takes the 16er.
+    assert plan.assignments == {'m': [0]}

@@ -323,6 +323,18 @@ class KubeaiBackend(ConvergeScaffold):
                 self.namespace,
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
+            for g in desired:
+                # Warn-and-ignore by decision (vram-aware-placement.md,
+                # Resolutions #3): k8s owns placement on this backend; the
+                # equivalent mechanism is the resourceProfile / resource
+                # requests, not our single-host planner.
+                if (g.spec.get('placement') or {}).get('min_vram_gib'):
+                    logger.warning(
+                        '  {}: placement.min_vram_gib is ignored on the '
+                        'kubeai backend (k8s owns placement — express the '
+                        'requirement via the resource profile instead)',
+                        g.id,
+                    )
             rendered = render_models(
                 desired,
                 namespace=self.namespace,
