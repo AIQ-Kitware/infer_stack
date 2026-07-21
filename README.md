@@ -13,6 +13,16 @@
 > (e.g. `infer-stack legacy render`). This README still describes that legacy
 > flow; a leasing-oriented rewrite is pending.
 
+## Supported platform
+
+`infer-stack` supports **Linux hosts only**. Its process locking, container
+runtime integration, GPU discovery, and deployment workflows are intentionally
+Linux-oriented. Windows is not a supported or tested execution platform.
+
+Operational and security constraints that are accepted during the current
+planning-stage release are tracked in
+[docs/planning/known-limitations.md](docs/planning/known-limitations.md).
+
 `infer_stack` manages **named stack profiles** for local and Kubernetes-backed inference.
 
 A stack profile is a small graph made from:
@@ -151,7 +161,13 @@ There are exactly two path roots:
 | **Everything generated** — `generated/` (docker-compose.yml, .env, plan.yaml, kubeai/*) **and** `state/` (hf-cache, postgres volumes, Ollama store, runtime bind mounts) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `--data-dir` (or `INFER_STACK_DATA_DIR`) |
 
 `--data-dir` is the single knob for "put everything I generate in one
-directory." Set it once at `setup`; it is baked into the absolute
+directory." It **relocates the one infer-stack installation controlling a
+host/backend; it does not create an isolated second installation**. Do not run
+controllers from multiple config/data roots against the same Docker host or
+Kubernetes namespace. See the
+[single-owner limitation](docs/planning/known-limitations.md#one-control-plane-per-host-or-backend-namespace).
+
+Set it once at `setup`; it is baked into the absolute
 `state.*` and `output.generated_dir` paths written to `config.yaml`, so
 later commands don't need it again:
 
