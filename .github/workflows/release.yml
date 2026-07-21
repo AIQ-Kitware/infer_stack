@@ -207,7 +207,7 @@ jobs:
         export VERSION=$(python -c 'import ast, pathlib; tree = ast.parse(pathlib.Path('"'"'infer_stack/__init__.py'"'"').read_text()); print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "__version__" for t in n.targets)))')
         git tag "v$VERSION"
         git push origin "v$VERSION"
-    - uses: softprops/action-gh-release@v1
+    - uses: softprops/action-gh-release@v3
       name: Create Release
       id: create_release
       env:
