@@ -2419,3 +2419,43 @@ degenerate model. The other runs a seven-node DAG and reports that its
 filtering step kept nothing. Both come back INCONCLUSIVE. Neither crashes,
 which is the property worth having — a real cohort containing one hopeless
 model produces the same degenerate input.
+
+**Same-session follow-up (14:15).** The user pushed back on two things, both
+right. First: I had suggested pointing `INFER_STACK_CONFIG_DIR`/`DATA_DIR` at
+a scratch directory to isolate a rehearsal. That is exactly backwards — the
+ledger is the coordination mechanism, and a private one means the run will
+happily place a model on a GPU somebody else's lease already holds. The
+advice is retracted and the rehearsal scripts now say so in a comment where
+someone would otherwise be tempted.
+
+Second, and more substantial: acquire/release belongs *in the pipeline*, not
+in a shell wrapper around the whole evaluation. Wrapping the run holds every
+model in the cohort for its entire duration, including while the fan-in and
+the leave-one-out fit run, which need no model at all. On a simulator that is
+invisible; with real models it is nine GPUs held to compute a logistic fit.
+
+That motivated `INFER_STACK_CATALOG` and `INFER_STACK_BACKEND` env rungs on
+the existing resolution order (flag > env > persisted > default). A DAG whose
+nodes lease their own endpoints has to *generate* `infer-stack run` commands,
+and those commands must not name a catalog path or a machine's backend --
+that would make the pipeline machine-specific and make a rehearsal a
+different pipeline from a real run, which defeats rehearsing. The backend rung
+also closes a quiet failure: without it a generated `infer-stack run` falls
+through to the null backend and serves nothing while looking fine.
+
+The node-side half lives in aiq-magnet (`magnet.leasing.LeasedProcessNode`),
+not here -- kwdagger's `command` is already an overridable property, so no
+change was needed in either kwdagger or infer-stack's leasing core.
+
+One real bug surfaced only under a live run: `--endpoint` is a single
+comma-separated string, so emitting the flag twice silently kept the last
+model and left the other unleased. The ledger showed a
+`per_question_features` job holding the extractor and *not* the model it was
+testing. Nothing errors -- it just races for a GPU it never reserved. Fixed
+in magnet with a test that pins the comma form.
+
+Uncertainty worth flagging: each lease costs a converge (file-locked across
+processes) plus a readiness generation probe. On the simulator that dominates
+the wall clock of a 32-shard rehearsal. On real hardware it should be noise
+against minutes of generation, but I have not measured it there, and it is a
+reason to prefer fewer, larger shards.

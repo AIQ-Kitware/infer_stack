@@ -211,9 +211,22 @@ def _resolve_assume_yes(config, *, interactive: bool) -> bool:
 def _make_backend(config, *, interactive: bool = False):
     from ..paths import get_setting
 
-    # Resolve the backend: explicit --backend wins, else the persisted default
-    # (`config set backend compose`), else the dry-run null backend.
-    name = getattr(config, 'backend', None) or get_setting('backend') or 'null'
+    # Resolve the backend: explicit --backend wins, then the environment, then
+    # the persisted default (`config set backend compose`), else the dry-run
+    # null backend.
+    #
+    # The env rung exists for the same reason as INFER_STACK_CATALOG: a DAG
+    # whose nodes lease their own endpoints generates `infer-stack run`
+    # commands, and those commands must not have to name the machine's
+    # backend -- that would make the pipeline machine-specific. Exporting it
+    # once, outside the DAG, also avoids silently falling through to the null
+    # backend and producing a run where nothing was ever served.
+    name = (
+        getattr(config, 'backend', None)
+        or os.environ.get('INFER_STACK_BACKEND', '').strip()
+        or get_setting('backend')
+        or 'null'
+    )
     if name in (None, '', 'null', 'dry-run'):
         return NullBackend()
     if name == 'compose':
@@ -272,13 +285,32 @@ def _open_controller(config, *, interactive: bool = False) -> Controller:
     return Controller(ledger, _make_backend(config, interactive=interactive))
 
 
-def _load_catalog(config) -> Catalog:
+def _catalog_path(config) -> Path:
+    """Resolve the catalog: ``--catalog``, then the env, then the default.
+
+    The env fallback exists for generated job scripts. A pipeline that leases
+    its own endpoints per node cannot hard-code a catalog path without
+    becoming a different pipeline for a rehearsal than for a real run --
+    which defeats the purpose of rehearsing. Exporting
+    ``INFER_STACK_CATALOG`` once, outside the DAG, lets the same generated
+    command serve both.
+
+    ``--catalog`` still wins, so nothing that passes it explicitly changes.
+    """
     # `catalog` is declared only on the verbs that take a --catalog arg
     # (acquire/run/tui); converge verbs that don't (release/evict/gc) still load
-    # it for no-blip, so fall back to the default path when the field is absent
-    # rather than raising AttributeError off a bare `config.catalog`.
-    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
-    path = Path(raw).expanduser()
+    # it for no-blip, so fall back when the field is absent rather than raising
+    # AttributeError off a bare `config.catalog`.
+    raw = (
+        getattr(config, 'catalog', None)
+        or os.environ.get('INFER_STACK_CATALOG', '').strip()
+        or (config_root() / 'catalog.yaml')
+    )
+    return Path(raw).expanduser()
+
+
+def _load_catalog(config) -> Catalog:
+    path = _catalog_path(config)
     if not path.exists():
         raise SystemExit(
             f'catalog not found: {path} (pass --catalog or create catalog.yaml)'
@@ -296,8 +328,7 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
     hard error here: it loads an empty catalog (the dashboard then shows the
     empty-state with a Suggest button) and returns the path it would write to.
     """
-    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
-    path = Path(raw).expanduser()
+    path = _catalog_path(config)
     if not path.exists():
         return Catalog.from_dict({'models': {}, 'endpoints': {}}), path
     try:
