@@ -229,10 +229,12 @@ class Simulator:
         answer_key: Mapping[str, str] | None = None,
         questions: Mapping[str, str] | None = None,
         seed: str = 'infer-stack-mock',
+        composition: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.profiles = dict(profiles)
         self.answer_key = dict(answer_key or {})
         self.questions = dict(questions or {})
+        self.composition = {k: tuple(v) for k, v in (composition or {}).items()}
         self.seed = seed
 
         # A question may register several surface forms. That matters for
@@ -273,6 +275,50 @@ class Simulator:
         return 'anon:' + hashlib.blake2b(
             haystack.encode('utf-8'), digest_size=8
         ).hexdigest()
+
+    def knows(self, model_id: str, latent_key: str, profile=None) -> bool:
+        """
+        Whether ``model_id`` can answer ``latent_key`` correctly.
+
+        Ability beats difficulty -> correct.  Difficulty is shared across
+        models, which is what couples their errors together.
+
+        A question declared in ``composition`` is *compositional*: the
+        model gets it right only if it can also do every step it decomposes
+        into.  Without this, a step's outcome and its parent's outcome are
+        independent draws, and any feature derived from the decomposition
+        carries no information about whether the final answer is right --
+        so a card claiming that such a feature predicts correctness would
+        measure a true null no matter how much data it was given.
+
+        Args:
+            model_id (str): the answering model.
+            latent_key (str): the question identity.
+            profile (ModelProfile | None): resolved from ``model_id`` when
+                omitted.
+
+        Returns:
+            bool
+        """
+        if profile is None:
+            profile = self.profiles[model_id]
+
+        own = unit_hash(self.seed, 'knows', model_id, latent_key) < (
+            _skill_vs_difficulty(
+                profile.ability, self.difficulty_for(latent_key)
+            )
+        )
+        if not own:
+            return False
+
+        # Recurse into declared steps. Depth is bounded by the config, and
+        # a self-referential entry would otherwise loop forever.
+        for step_key in self.composition.get(latent_key, ()):
+            if step_key == latent_key:
+                continue
+            if not self.knows(model_id, step_key, self.profiles[model_id]):
+                return False
+        return True
 
     def difficulty_for(self, latent_key: str) -> float:
         """
@@ -321,12 +367,7 @@ class Simulator:
             self.seed, 'failure', model_id, prompt, sample_index
         ) < profile.failure_rate
 
-        # Whether this model knows this question at all.  Ability beats
-        # difficulty -> correct.  Shared difficulty couples models together.
-        threshold = self.difficulty_for(latent_key)
-        knows = unit_hash(
-            self.seed, 'knows', model_id, latent_key
-        ) < _skill_vs_difficulty(profile.ability, threshold)
+        knows = self.knows(model_id, latent_key, profile)
 
         # Greedy decoding is reproducible by definition, so only a nonzero
         # temperature lets a resample drift off the model's usual answer.

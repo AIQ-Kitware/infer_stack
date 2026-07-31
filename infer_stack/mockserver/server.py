@@ -63,6 +63,7 @@ def build_simulator(config: dict) -> Simulator:
         profiles=profiles,
         answer_key=config.get('answer_key'),
         questions=config.get('questions'),
+        composition=config.get('composition'),
         seed=str(config.get('seed', 'infer-stack-mock')),
     )
 
