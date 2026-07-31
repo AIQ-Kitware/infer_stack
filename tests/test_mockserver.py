@@ -8,6 +8,7 @@ and self-consistency that actually tracks the configured rate.
 """
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -607,3 +608,47 @@ def test_exceeding_max_model_len_is_a_context_length_error():
         error = json.loads(excinfo.value.read())['error']
     assert error['code'] == 'context_length_exceeded'
     assert 'maximum context length is 64' in error['message']
+
+
+def test_markov_mode_babbles_from_the_prompts_own_vocabulary():
+    # The point of this mode: output that looks like a real response, so a
+    # scorer that quietly fails to extract an answer cannot hide behind
+    # obviously-unparseable text.
+    prompt = ('Passage: The mitochondrion is the powerhouse of the cell, '
+              'generating most of the chemical energy needed to power '
+              'biochemical reactions. Question: Which organelle generates '
+              'chemical energy? Answer with a short phrase.')
+    with MockServer(_mode_cohort('markov'), port=0) as server:
+        text = _post(server.url + '/v1/completions',
+                     {'model': 'm', 'prompt': prompt})['choices'][0]['text']
+
+    prompt_words = set(re.findall(r"[\w'-]+", prompt.lower()))
+    said = re.findall(r"[\w'-]+", text.lower())
+    assert said, 'produced something'
+    assert set(said) <= prompt_words, (
+        f'markov must only use the prompt vocabulary; strays: '
+        f'{sorted(set(said) - prompt_words)}')
+    assert len(said) > 3, 'not a single word'
+    assert text.rstrip()[-1] in '.!?', 'ends like a sentence'
+
+
+def test_markov_mode_is_deterministic_but_varies_across_samples():
+    prompt = ('The quick brown fox jumps over the lazy dog while the quick '
+              'red fox watches the lazy cat sleep near the warm fire.')
+    body = {'model': 'm', 'prompt': prompt, 'temperature': 0.7, 'n': 5}
+    with MockServer(_mode_cohort('markov'), port=0) as server:
+        first = [c['text'] for c in
+                 _post(server.url + '/v1/completions', body)['choices']]
+    with MockServer(_mode_cohort('markov'), port=0) as server:
+        again = [c['text'] for c in
+                 _post(server.url + '/v1/completions', body)['choices']]
+    assert first == again, 'same seed, same babble'
+    assert len(set(first)) > 1, 'samples should not all collapse to one'
+
+
+def test_markov_mode_falls_back_when_there_is_nothing_to_chain_on():
+    # Babbling from three words is not funny, it is just broken.
+    with MockServer(_mode_cohort('markov'), port=0) as server:
+        text = _post(server.url + '/v1/completions',
+                     {'model': 'm', 'prompt': 'hi'})['choices'][0]['text']
+    assert text and 'hi' not in text.lower(), text

@@ -25,10 +25,15 @@ Some are jokes that turned out to be useful:
 ``truncated``
     Stops mid-sentence with ``finish_reason='length'``. Exercises the
     "ran out of budget" path that otherwise only appears at 3am.
+``markov``
+    Babbles a bigram chain built from the prompt. On-topic, fluent, and
+    meaningless -- so answer extraction has to actually work rather than
+    bailing out on obviously-unparseable text.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -135,6 +140,68 @@ def _confidently_wrong(ctx: ModeContext):
     return f'{preamble} {wrong}. There is no room for doubt.', 'stop'
 
 
+#: Words a walk prefers to stop after, so output ends like a sentence
+#: rather than being guillotined mid-clause.
+_TERMINALS = frozenset('.!?')
+
+
+def _markov(ctx: ModeContext):
+    """
+    Babble a bigram chain built from the prompt's own vocabulary.
+
+    The result is on-topic, fluent-looking, and meaningless -- which is
+    exactly what makes it useful. A mock that answers ``answer-3f9c`` is
+    trivially unparseable, so a scorer that quietly fails to extract an
+    answer looks the same as one that extracts a wrong answer. Text drawn
+    from the prompt's own words defeats that: it has the register, the
+    vocabulary and the length of a real response, so extraction and
+    scoring have to actually work rather than bailing out early.
+
+    It also catches the opposite bug. A scorer that rewards topical
+    overlap with the question -- lexical F1 against the prompt, say --
+    will score this well, and it deserves not to.
+
+    Deterministic like every other mode: each step's choice is a hash of
+    the seed, model, prompt, sample index and step number.
+    """
+    tokens = re.findall(r"[\w'\u2019-]+|[.,!?;:]", ctx.prompt)
+    if len(tokens) < 6:
+        # Too little to chain on; babbling from three words is not funny,
+        # it is just broken.
+        return ctx.simulated_text, 'stop'
+
+    bigrams: dict = {}
+    for current, following in zip(tokens, tokens[1:]):
+        bigrams.setdefault(current, []).append(following)
+
+    # Prefer starting on a capitalized word, the way a sentence would.
+    openers = [t for t in tokens if t[:1].isupper()] or tokens
+    word = ctx.choice(openers, 'markov:start')
+
+    out = [word]
+    limit = 12 + int(unit_hash(ctx.seed, 'markov:len', ctx.model_id,
+                               ctx.prompt, ctx.sample_index) * 24)
+    for step in range(limit):
+        options = bigrams.get(word)
+        if not options:
+            break
+        index = int(
+            unit_hash(ctx.seed, f'markov:{step}', ctx.model_id, ctx.prompt,
+                      ctx.sample_index) * len(options)
+        )
+        word = options[min(index, len(options) - 1)]
+        out.append(word)
+        if word in _TERMINALS and step >= 6:
+            break
+
+    text = ' '.join(out)
+    # Undo the spaces the tokenizer split before punctuation.
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)
+    if text[-1:] not in _TERMINALS:
+        text += '.'
+    return text, 'stop'
+
+
 def _pirate(ctx: ModeContext):
     return (f"Arr! After much deliberation on the high seas, I reckon "
             f"it be {ctx.simulated_text}, matey!"), 'stop'
@@ -150,6 +217,7 @@ MODES: dict[str, Callable[[ModeContext], Any]] = {
     'truncated': _truncated,
     'empty': _empty,
     'confidently_wrong': _confidently_wrong,
+    'markov': _markov,
     'pirate': _pirate,
 }
 
