@@ -442,3 +442,168 @@ def test_completions_n_indices_are_per_response():
     # ...but the samples themselves still advance.
     assert ([c['text'] for c in first['choices']]
             != [c['text'] for c in second['choices']])
+
+
+# -- response modes --------------------------------------------------------
+
+
+def _mode_cohort(mode, **over):
+    config = dict(COHORT)
+    config['models'] = {'m': dict({'ability': 0.9, 'mode': mode}, **over)}
+    return config
+
+
+def test_sycophant_mode_always_agrees():
+    # A card that mistakes agreement for correctness scores this at 100%,
+    # which is the bug worth catching before a real model does it subtly.
+    with MockServer(_mode_cohort('sycophant'), port=0) as server:
+        texts = {
+            _post(server.url + '/v1/completions',
+                  {'model': 'm', 'prompt': COHORT['questions'][f'q{i}']}
+                  )['choices'][0]['text']
+            for i in range(8)
+        }
+    assert texts, 'got responses'
+    assert all('correct' in t.lower() or 'right' in t.lower() or
+               'excellent' in t.lower() for t in texts), texts
+
+
+def test_echo_mode_returns_the_prompt_it_was_sent():
+    # The fastest way to see what a client actually sent after templating.
+    prompt = 'Passage: x\nQuestion: y\nAnswer concisely.'
+    with MockServer(_mode_cohort('echo'), port=0) as server:
+        body = _post(server.url + '/v1/completions',
+                     {'model': 'm', 'prompt': prompt})
+    assert body['choices'][0]['text'] == prompt
+
+
+def test_thinking_mode_emits_a_strippable_reasoning_segment():
+    with MockServer(_mode_cohort('thinking'), port=0) as server:
+        text = _post(server.url + '/v1/completions',
+                     {'model': 'm', 'prompt': COHORT['questions']['q1']}
+                     )['choices'][0]['text']
+    assert text.startswith('<think>')
+    assert '</think>' in text
+
+
+def test_truncated_mode_reports_length_not_stop():
+    with MockServer(_mode_cohort('truncated'), port=0) as server:
+        choice = _post(server.url + '/v1/completions',
+                       {'model': 'm', 'prompt': COHORT['questions']['q1']}
+                       )['choices'][0]
+    assert choice['finish_reason'] == 'length'
+
+
+def test_modes_are_still_deterministic():
+    for mode in ('sycophant', 'magic_8ball', 'pirate', 'confidently_wrong'):
+        payload = {'model': 'm', 'prompt': COHORT['questions']['q2']}
+        with MockServer(_mode_cohort(mode), port=0) as server:
+            first = _post(server.url + '/v1/completions', payload)
+        with MockServer(_mode_cohort(mode), port=0) as server:
+            second = _post(server.url + '/v1/completions', payload)
+        assert (first['choices'][0]['text']
+                == second['choices'][0]['text']), mode
+
+
+def test_an_unknown_mode_is_rejected_at_config_time():
+    # A typo would otherwise behave like a normal model and be discovered
+    # only by a puzzling result.
+    with pytest.raises(ValueError, match='unknown response mode'):
+        ModelProfile.coerce('m', {'mode': 'sychophant'})
+
+
+# -- authentication --------------------------------------------------------
+
+
+AUTH_COHORT = dict(COHORT, api_keys=['sk-test-key'])
+
+
+def _post_with(url, payload, token=None):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def test_a_valid_key_is_accepted():
+    with MockServer(AUTH_COHORT, port=0) as server:
+        body = _post_with(server.url + '/v1/completions',
+                          {'model': 'strong', 'prompt': 'hi'},
+                          token='sk-test-key')
+    assert body['choices']
+
+
+def test_a_missing_key_is_rejected_the_way_openai_does():
+    with MockServer(AUTH_COHORT, port=0) as server:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_with(server.url + '/v1/completions',
+                       {'model': 'strong', 'prompt': 'hi'})
+        assert excinfo.value.code == 401
+        error = json.loads(excinfo.value.read())['error']
+    assert error['code'] == 'invalid_api_key'
+    assert 'Authorization header' in error['message']
+
+
+def test_a_wrong_key_is_rejected():
+    with MockServer(AUTH_COHORT, port=0) as server:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_with(server.url + '/v1/completions',
+                       {'model': 'strong', 'prompt': 'hi'}, token='sk-wrong')
+        assert excinfo.value.code == 401
+
+
+def test_auth_is_off_unless_asked_for():
+    with MockServer(COHORT, port=0) as server:
+        assert _post(server.url + '/v1/completions',
+                     {'model': 'strong', 'prompt': 'hi'})['choices']
+
+
+def test_health_stays_open_so_readiness_probes_work():
+    with MockServer(AUTH_COHORT, port=0) as server:
+        assert _get(server.url + '/health')['status'] == 'ok'
+
+
+# -- vLLM serving settings -------------------------------------------------
+
+
+def test_models_advertises_vllm_style_metadata():
+    config = dict(COHORT)
+    config['models'] = {'Qwen/Qwen3-8B': {'ability': 0.7,
+                                          'max_model_len': 32768,
+                                          'served_model_name': 'qwen3'}}
+    with MockServer(config, port=0) as server:
+        entry = _get(server.url + '/v1/models')['data'][0]
+    assert entry['id'] == 'qwen3', 'served under its alias'
+    assert entry['root'] == 'Qwen/Qwen3-8B'
+    assert entry['owned_by'] == 'vllm'
+    assert entry['max_model_len'] == 32768
+
+
+def test_a_model_can_be_requested_by_its_served_alias():
+    config = dict(COHORT)
+    config['models'] = {'Qwen/Qwen3-8B': {'ability': 0.9,
+                                          'served_model_name': 'qwen3'}}
+    with MockServer(config, port=0) as server:
+        by_alias = _post(server.url + '/v1/completions',
+                         {'model': 'qwen3', 'prompt': 'hi'})
+        by_id = _post(server.url + '/v1/completions',
+                      {'model': 'Qwen/Qwen3-8B', 'prompt': 'hi'})
+    assert by_alias['choices'][0]['text'] == by_id['choices'][0]['text']
+
+
+def test_exceeding_max_model_len_is_a_context_length_error():
+    # Otherwise only reachable with a genuinely long prompt, which makes the
+    # client's overflow path effectively untested.
+    config = dict(COHORT)
+    config['models'] = {'m': {'ability': 0.9, 'max_model_len': 64}}
+    with MockServer(config, port=0) as server:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(server.url + '/v1/completions',
+                  {'model': 'm', 'prompt': 'x' * 400, 'max_tokens': 256})
+        assert excinfo.value.code == 400
+        error = json.loads(excinfo.value.read())['error']
+    assert error['code'] == 'context_length_exceeded'
+    assert 'maximum context length is 64' in error['message']

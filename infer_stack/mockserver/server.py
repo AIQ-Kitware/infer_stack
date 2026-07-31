@@ -77,6 +77,8 @@ class _Handler(BaseHTTPRequestHandler):
     max_recorded: int
     draw_counts: dict
     draw_lock: threading.Lock
+    api_keys: set
+    require_auth: bool
 
     protocol_version = 'HTTP/1.1'
 
@@ -121,6 +123,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _check_auth(self) -> bool:
+        """
+        Enforce bearer-token auth, if the config asked for it.
+
+        Real endpoints sit behind a key, and a client that forgets to send
+        one should fail here the way it would in production rather than
+        succeeding locally and 401-ing on first deployment.
+        """
+        if not self.require_auth:
+            return True
+        header = self.headers.get('Authorization', '')
+        token = header[7:].strip() if header.startswith('Bearer ') else ''
+        if token and (not self.api_keys or token in self.api_keys):
+            return True
+        self._send_json(
+            {
+                'error': {
+                    'message': (
+                        'Incorrect API key provided.' if token else
+                        'You didn\'t provide an API key. You need to provide '
+                        'your API key in an Authorization header using Bearer '
+                        'auth (i.e. Authorization: Bearer YOUR_KEY).'
+                    ),
+                    'type': 'invalid_request_error',
+                    'code': 'invalid_api_key',
+                }
+            },
+            status=401,
+        )
+        return False
+
     def _read_json(self) -> dict:
         length = int(self.headers.get('Content-Length') or 0)
         if not length:
@@ -143,15 +176,27 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.rstrip('/') in ('/health', '/healthz'):
             self._send_json({'status': 'ok', 'mock': True})
         elif self.path.rstrip('/') == '/v1/models':
+            if not self._check_auth():
+                return
             self._send_json({
                 'object': 'list',
                 'data': [
                     {
-                        'id': profile.model_id,
+                        'id': profile.served_model_name or profile.model_id,
                         'object': 'model',
-                        'owned_by': 'infer-stack-mock',
-                        'ability': profile.ability,
-                        'consistency': profile.consistency,
+                        'created': 0,
+                        'owned_by': 'vllm',
+                        'root': profile.model_id,
+                        'parent': None,
+                        'max_model_len': profile.max_model_len,
+                        'permission': [],
+                        # Non-standard, but the whole point of a mock is to
+                        # be able to see what it was told to be.
+                        'mock': {
+                            'ability': profile.ability,
+                            'consistency': profile.consistency,
+                            'mode': profile.mode,
+                        },
                         **profile.extra,
                     }
                     for profile in self.simulator.profiles.values()
@@ -165,6 +210,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 - http.server API
         path = self.path.rstrip('/')
+
+        if path.startswith('/v1/') and not self._check_auth():
+            return
 
         if path == '/__mock__/reset':
             with self.record_lock:
@@ -195,7 +243,7 @@ class _Handler(BaseHTTPRequestHandler):
         temperature = float(payload.get('temperature', 0.0) or 0.0)
         n_samples = int(payload.get('n', 1) or 1)
 
-        profile = self.simulator.profiles.get(model_id)
+        profile = self.simulator.resolve_profile(model_id)
         if profile is None:
             self._send_json(
                 {
@@ -211,6 +259,32 @@ class _Handler(BaseHTTPRequestHandler):
                 status=404,
             )
             return
+
+        if profile.max_model_len:
+            # Rough proxy for tokens; enough to exercise the client's
+            # context-overflow path, which is otherwise only reachable with
+            # a real long prompt.
+            approx_tokens = max(1, len(flatten_messages(messages)) // 4)
+            requested = int(payload.get('max_tokens') or 0)
+            if approx_tokens + requested > profile.max_model_len:
+                self._send_json(
+                    {
+                        'error': {
+                            'message': (
+                                f"This model's maximum context length is "
+                                f'{profile.max_model_len} tokens. However, '
+                                f'you requested about '
+                                f'{approx_tokens + requested} tokens '
+                                f'({approx_tokens} in the messages, '
+                                f'{requested} in the completion).'
+                            ),
+                            'type': 'invalid_request_error',
+                            'code': 'context_length_exceeded',
+                        }
+                    },
+                    status=400,
+                )
+                return
 
         if profile.latency_s:
             time.sleep(profile.latency_s)
@@ -245,7 +319,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             choice = {
                 'index': offset,
-                'finish_reason': 'stop',
+                'finish_reason': completion.finish_reason,
                 # Non-standard, but invaluable when debugging why a card
                 # scored the way it did.
                 'mock': {
@@ -321,6 +395,10 @@ class MockServer:
             'max_recorded': max_recorded,
             'draw_counts': {},
             'draw_lock': threading.Lock(),
+            'api_keys': set(config.get('api_keys') or []),
+            'require_auth': bool(
+                config.get('require_auth',
+                           bool(config.get('api_keys')))),
         })
 
         self._httpd = ThreadingHTTPServer((host, port), handler)

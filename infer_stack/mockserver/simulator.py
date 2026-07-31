@@ -128,9 +128,18 @@ class ModelProfile:
     failure_rate: float = 0.0
     failure_status: int = 503
     latency_s: float = 0.0
+    #: Response mode; see :mod:`infer_stack.mockserver.modes`.
+    mode: str = 'simulate'
+    #: Serving settings a vLLM-backed endpoint would advertise or enforce.
+    max_model_len: int | None = None
+    served_model_name: str | None = None
     extra: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        from .modes import resolve_mode
+        # Validate eagerly: a typo'd mode would otherwise behave like a
+        # normal model and be discovered only by a puzzling result.
+        resolve_mode(self.mode)
         self.ability = min(max(float(self.ability), 0.0), 1.0)
         if self.consistency is None:
             self.consistency = default_consistency_for(self.ability)
@@ -155,6 +164,9 @@ class ModelProfile:
             'failure_rate',
             'failure_status',
             'latency_s',
+            'mode',
+            'max_model_len',
+            'served_model_name',
         }
         extra = {k: v for k, v in data.items() if k not in known}
         return cls(
@@ -164,6 +176,9 @@ class ModelProfile:
             failure_rate=data.get('failure_rate', 0.0),
             failure_status=data.get('failure_status', 503),
             latency_s=data.get('latency_s', 0.0),
+            mode=data.get('mode', 'simulate'),
+            max_model_len=data.get('max_model_len'),
+            served_model_name=data.get('served_model_name'),
             extra=extra,
         )
 
@@ -185,6 +200,7 @@ class SimulatedCompletion:
     is_correct: bool
     latent_key: str
     should_fail: bool = False
+    finish_reason: str = 'stop'
 
 
 class Simulator:
@@ -255,6 +271,21 @@ class Simulator:
         self._match_order = sorted(
             forms, key=lambda kv: len(kv[1]), reverse=True
         )
+
+    def resolve_profile(self, model_id):
+        """
+        Find a profile by id or by its ``served_model_name`` alias.
+
+        A deployment often serves a model under a shorter name than its
+        repository id; clients then ask for the alias.
+        """
+        profile = self.profiles.get(model_id)
+        if profile is not None:
+            return profile
+        for candidate in self.profiles.values():
+            if candidate.served_model_name == model_id:
+                return candidate
+        return None
 
     def latent_key_for(self, prompt: str) -> str:
         """
@@ -356,7 +387,7 @@ class Simulator:
         Returns:
             SimulatedCompletion
         """
-        profile = self.profiles.get(model_id)
+        profile = self.resolve_profile(model_id)
         if profile is None:
             raise KeyError(model_id)
 
@@ -392,11 +423,22 @@ class Simulator:
                 self.seed, latent_key, f'{model_id}:{variant}'
             )
 
+        from .modes import ModeContext, resolve_mode
+
+        context = ModeContext(
+            model_id=model_id, prompt=prompt, seed=self.seed,
+            sample_index=sample_index, simulated_text=text,
+            is_correct=is_correct, gold=gold,
+            messages=list(messages),
+        )
+        text, finish_reason = resolve_mode(profile.mode)(context)
+
         return SimulatedCompletion(
             text=text,
             is_correct=is_correct,
             latent_key=latent_key,
             should_fail=should_fail,
+            finish_reason=finish_reason,
         )
 
 

@@ -40,6 +40,42 @@ class MockServeCLI(scfg.DataConfig):
         help='Bind port.  Use 0 to pick a free port and print it.',
     )
 
+    mode = scfg.Value(
+        None,
+        help=ub.paragraph(
+            """
+            Override every model's response mode. Useful for a demo or for
+            exercising a client's parsing: 'sycophant' always agrees,
+            'echo' returns the prompt it was sent, 'thinking' wraps the
+            answer in <think> tags, 'truncated' stops early with
+            finish_reason=length, 'magic_8ball' and 'pirate' are for
+            morale. Default is 'simulate', which answers from the model's
+            configured ability.
+            """
+        ),
+    )
+
+    require_auth = scfg.Value(
+        False,
+        isflag=True,
+        help='Reject requests without a valid bearer token.',
+    )
+
+    api_key = scfg.Value(
+        None,
+        help=ub.paragraph(
+            """
+            Accept only this bearer token. Implies --require_auth. Without
+            it but with --require_auth, any non-empty token is accepted,
+            which is enough to catch a client that sends none.
+            """
+        ),
+    )
+
+    list_modes = scfg.Value(
+        False, isflag=True, help='Print the available response modes and exit.',
+    )
+
     seed = scfg.Value(
         None,
         help=ub.paragraph(
@@ -60,9 +96,16 @@ class MockServeCLI(scfg.DataConfig):
     def main(cls, argv=None, **kwargs):
         import kwutil
 
+        from ..mockserver.modes import available_modes
         from ..mockserver.server import MockServer
 
         config = cls.cli(argv=argv, data=kwargs, strict=True)
+
+        if config.list_modes:
+            print('available response modes:')
+            for name in available_modes():
+                print(f'  {name}')
+            return
 
         if config.config_fpath:
             spec = kwutil.Yaml.coerce(ub.Path(config.config_fpath).read_text())
@@ -80,12 +123,23 @@ class MockServeCLI(scfg.DataConfig):
 
         if config.seed is not None:
             spec['seed'] = config.seed
+        if config.mode:
+            for block in spec.setdefault('models', {}).values():
+                block['mode'] = config.mode
+        if config.api_key:
+            spec['api_keys'] = [config.api_key]
+        if config.require_auth:
+            spec['require_auth'] = True
 
         server = MockServer(spec, host=config.host, port=int(config.port))
         if config.print_url:
             print(f'infer-stack mock server listening on {server.url}')
             print(f'  models: {sorted(server.simulator.profiles)}')
             print(f'  seed:   {server.simulator.seed}')
+            modes = sorted({p.mode for p in server.simulator.profiles.values()})
+            print(f'  modes:  {modes}')
+            if spec.get('require_auth') or spec.get('api_keys'):
+                print('  auth:   bearer token required')
         try:
             server.serve_forever()
         except KeyboardInterrupt:
