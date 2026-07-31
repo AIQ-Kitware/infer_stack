@@ -1,13 +1,24 @@
 # Catalog for the mock dress rehearsal: the same leasing path as a real
-# endpoint, served by a simulator so it runs on a host with no GPU.
+# endpoint, served by llm-d-inference-sim so it runs on a host with no GPU.
 #
-# The endpoints below are deliberately shaped like the ones in catalog.yaml
-# -- same engine, same runtime keys -- so the only difference between a
-# rehearsal and a real run is which catalog you point at.
+# The point of this catalog is API fidelity, not plausible scores. The
+# simulator implements vLLM's OpenAI surface -- streaming SSE, real
+# prompt/completion token accounting, 404 on an unknown model, /v1/models,
+# /health, /metrics, configurable TTFT and inter-token latency, a startup
+# window that answers 503, and injectable rate_limit / server_error /
+# context_length failures. What comes back is random text from a sentence
+# bank, so any *number* a card computes against it is meaningless. This
+# catalog answers "does the client break", not "is the method any good".
 #
-#   docker build -f dockerfiles/mock-vllm.dockerfile -t aiq-mock-vllm:latest .
+#   docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.9.0
 #   infer-stack --catalog dev/e2e_tests/catalog-mock.yaml run \
 #       --endpoint mock-smol -- <command>
+#
+# `runtime.simulator` is what marks these as simulator deployments: it
+# switches the rendered command to the simulator's own CLI (it does not
+# accept vLLM's), drops the GPU requirement to zero, and disables the
+# curl-based container healthcheck the distroless image cannot run.
+# Readiness is still a real generation over HTTP, exactly as for vLLM.
 models:
   smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
   qwen17:  {source: hf://Qwen/Qwen3-1.7B}
@@ -17,10 +28,22 @@ endpoints:
     engine: vllm
     model: smol135
     runtime:
-      image: aiq-mock-vllm:latest
+      image: ghcr.io/llm-d/llm-d-inference-sim:v0.9.0
       max_model_len: 2048
-      gpu_memory_utilization: 0.0     # a simulator reserves nothing
-      extra_args: ['--mock-ability=0.6']
+      max_num_seqs: 8
+      simulator:
+        kind: llm-d-sim
+        mode: random
+        # Fixed so two rehearsals of the same card produce the same
+        # transcript; the responses are still nonsense, just repeatable
+        # nonsense, which is what makes a diff of two runs readable.
+        seed: 20260731
+        # Deliberately non-zero: a client that assumes the first token is
+        # instant, or that a lease is usable the moment the container is
+        # `running`, fails here rather than in production.
+        time_to_first_token: 120ms
+        inter_token_latency: 8ms
+        startup_duration: 10s
     reclaim: {policy: stop}
 
   # Shaped like the model a real evaluation card asks for, so the
@@ -29,22 +52,47 @@ endpoints:
     engine: vllm
     model: qwen17
     runtime:
-      image: aiq-mock-vllm:latest
+      image: ghcr.io/llm-d/llm-d-inference-sim:v0.9.0
       max_model_len: 8192
-      gpu_memory_utilization: 0.0
-      extra_args: ['--mock-ability=0.55']
+      max_num_seqs: 8
+      simulator:
+        kind: llm-d-sim
+        mode: random
+        seed: 20260731
+        time_to_first_token: 120ms
+        inter_token_latency: 8ms
+        startup_duration: 10s
     reclaim: {policy: stop}
 
-  # Same image, sycophantic. Demonstrates a card refusing to verify.
-  mock-sycophant:
+  # Echo mode: the response is the prompt. Useless as an answer, ideal for
+  # confirming what a card actually put on the wire -- the recorded
+  # transcript becomes a copy of the rendered prompts.
+  mock-echo:
     engine: vllm
     model: smol135
-    public_name: mock-smol-sycophant
+    served_name: mock-echo
     runtime:
-      image: aiq-mock-vllm:latest
+      image: ghcr.io/llm-d/llm-d-inference-sim:v0.9.0
       max_model_len: 2048
-      gpu_memory_utilization: 0.0
-      extra_args: ['--mock-mode=sycophant']
+      simulator: {kind: llm-d-sim, mode: echo}
+    reclaim: {policy: stop}
+
+  # One in five requests fails, with the error shapes a real provider
+  # returns. This is the endpoint that finds out whether a card's retry
+  # and error handling work before a 12-hour run finds out for us.
+  mock-flaky:
+    engine: vllm
+    model: smol135
+    served_name: mock-flaky
+    runtime:
+      image: ghcr.io/llm-d/llm-d-inference-sim:v0.9.0
+      max_model_len: 2048
+      simulator:
+        kind: llm-d-sim
+        mode: random
+        seed: 20260731
+        failure_injection_rate: 20
+        failure_types: [rate_limit, server_error]
     reclaim: {policy: stop}
 
 bundles:

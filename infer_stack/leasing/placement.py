@@ -92,11 +92,18 @@ def required_gpu_count(deployment: Deployment) -> int:
     A reservation asks for a plain ``reserved_gpu_count`` (count-based first-fit,
     never a pinned index). A vLLM deployment needs tensor × pipeline × data
     parallelism.
+
+    A ``runtime.simulator`` deployment needs **none**: it serves the API from
+    CPU. That is not a detail -- ``max(1, ...)`` below would otherwise make
+    every simulator endpoint unplaceable on a GPU-less host, which is exactly
+    the host a simulator exists to serve.
     """
     reserved = deployment.spec.get('reserved_gpu_count')
     if reserved:
         return max(1, int(reserved))
     runtime = deployment.spec.get('runtime', {}) or {}
+    if runtime.get('simulator'):
+        return 0
     tp = int(runtime.get('tensor_parallel_size', 1) or 1)
     pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
     dp = int(runtime.get('data_parallel_size', 1) or 1)

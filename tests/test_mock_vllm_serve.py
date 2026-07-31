@@ -1,5 +1,5 @@
 """
-The mock must deploy the way vLLM does.
+The oracle mock must deploy the way vLLM does.
 
 Starting the mock out-of-band exercised the card and the endpoint but
 skipped infer-stack's own acquire / converge / release path -- the very
@@ -7,6 +7,9 @@ machinery a dress rehearsal is meant to validate. Presenting vLLM's
 command line lets an endpoint point at a mock image and be leased like any
 other, so these tests pin the seam: what infer-stack renders is what the
 mock can parse.
+
+This is the answer-key mock (``catalog-mock-oracle.yaml``), not the
+API-fidelity one; see that catalog's header for why both exist.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from infer_stack.leasing.models import Deployment, DeploymentState
 from infer_stack.mockserver.vllm_serve import build_parser, config_from_args
 
 CATALOG = (pathlib.Path(__file__).parent.parent
-           / 'dev' / 'e2e_tests' / 'catalog-mock.yaml')
+           / 'dev' / 'e2e_tests' / 'catalog-mock-oracle.yaml')
 
 
 def _render(endpoint_name: str):

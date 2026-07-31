@@ -2312,3 +2312,80 @@ Suite: 376 passed / 3 skipped (13 new vram tests, 2 new placement tests,
 4 new compose enrichment tests, MeasureCLI registered). Not exercised on real
 GPUs yet — the measure command's acquire-once path and the docker-logs parse
 get their first real run in Phase 4 on yardrat.
+
+## 2026-07-31 11:09:13 -0400
+
+Model: claude-opus-5[1m] (Claude Code, default effort).
+
+**Intent.** "Look into https://github.com/llm-d/llm-d-inference-sim to see if
+we can run it as a mock in the system, then verify that two downstream
+evaluation cards work against a mock vLLM server run via infer-stack."
+This follows a correction I earned: I had built our own mock optimised for
+producing plausible *scores*, and defended that choice against the two
+external simulators the user had suggested. The user's answer was blunt and
+right — "If you had asked I would have said API fidelity matters more. That's
+how we know if this thing is going to break in production or not. I don't care
+what the scores are in the mock run."
+
+**What I found.** llm-d-inference-sim is a far better vLLM stand-in than what
+I wrote: real SSE streaming with configurable TTFT and inter-token delay, real
+prompt/completion token accounting, `/v1/models`, `/v1/embeddings`,
+`/v1/responses`, `/metrics` (vLLM-compatible subset), 404 on an unknown model,
+injectable `rate_limit`/`server_error`/`context_length` failures, a
+`startup-duration` window that answers 503 on `/health/ready`, and LoRA
+lifecycle simulation. Published distroless image on ghcr. It cannot answer a
+question correctly — responses are random sentences — which is precisely the
+thing I over-weighted last time.
+
+**The design decision.** It speaks vLLM's API but not vLLM's CLI: no
+positional model, no `--host`, no `--tensor-parallel-size` /
+`--gpu-memory-utilization`, and it exits on an unknown flag. Three options:
+(a) a shim image translating vLLM argv, (b) a third `engine` alongside
+vllm/ollama, (c) a `runtime.simulator` block on the existing vllm engine.
+
+I took (c). (a) hides the divergence inside a wrapper and buys nothing — the
+vLLM argv renderer is only really testable against vLLM. (b) is ~20 dispatch
+sites across compose/placement/catalog/CLI for something that is, from every
+client's point of view, an ordinary vLLM upstream: port 8000, `/v1`,
+`/health`, same gateway route, same lease bookkeeping. (c) touches exactly the
+three places where a simulator genuinely differs — argv, GPU count, container
+healthcheck — and leaves the rest byte-identical.
+
+Two non-obvious bits. `required_gpu_count` had `max(1, ...)`, which would make
+every simulator endpoint unplaceable on the GPU-less host a simulator exists
+to serve; it returns 0 now. And the healthcheck shells out to `curl`, which a
+distroless image does not contain, so it must be disabled rather than
+inherited — safe only because `probe_ready` gates on a real generation over
+HTTP, which is strictly stronger. I did *not* add `simulator` to
+`VLLM_STRUCTURAL_FIELDS`: adding a key rehashes every existing compat key and
+would orphan live leases, and `image` (already structural) separates simulator
+from real deployments anyway.
+
+**On keeping our own mock.** I kept it, under `catalog-mock-oracle.yaml`, with
+its role stated plainly in both catalog headers and `docs/mock-endpoints.md`:
+llm-d-sim answers "does the client break", ours answers "does the math
+compute". Random text cannot distinguish a working fan-in from one that
+silently drops a model, because garbage is the expected input either way. That
+is a real and separate job — but it is the *second* job, not the first, and
+the docs now say so rather than leaving a future reader to infer my earlier
+priority ordering.
+
+**Validation.** Full leasing path exercised for real (not rendered): acquire →
+placed on "(cpu)" → compose up → LiteLLM route → readiness generation probe →
+command sees `OPENAI_BASE_URL`/`OPENAI_API_KEY` → non-streaming and streaming
+chat with correct usage counts → release → teardown. 7 new tests in
+`tests/test_simulator_runtime.py`; suite green.
+
+**Uncertainties / risks.** The simulator has no bearer-auth option, so the
+auth path is still only covered by our own mock. `--model` must not be a real
+HF repo id or it tries to reach a tokenizer render sidecar and dies at
+startup; I default it to the served name and pin that with a test, but a user
+who sets `simulator.model` to a repo id gets a crash-loop with a message that
+does not obviously say why. Docker access on this host needed `usermod -aG
+docker`; that is environmental, not a repo change.
+
+**Takeaway.** When a stand-in for a real component diverges, the question is
+*which layer* it diverges at. This one is client-identical and
+deployment-different, so the right seam was the deployment renderer, not a new
+engine. Had it diverged at the API it would have needed to be a new engine —
+or not used at all.

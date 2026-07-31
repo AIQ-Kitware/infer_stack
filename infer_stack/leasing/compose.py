@@ -51,7 +51,7 @@ import yaml
 from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
 from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
-from ..profile_runtime import vllm_args
+from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
 from .models import Deployment, is_reservation
 from .placement import plan_placement
@@ -255,6 +255,9 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         # Selected via the VLLM_ATTENTION_BACKEND env var, not a CLI flag — the
         # backend renderer (compose environment / kubeai CR env) turns it into env.
         'attention_backend': runtime.get('attention_backend'),
+        # Present => this deployment runs a simulator image whose CLI is not
+        # vLLM's (see profile_runtime.simulator_args). Absent => a real engine.
+        'simulator': runtime.get('simulator') or None,
         'extra_args': list(runtime.get('extra_args', []) or []),
     }
 
@@ -297,14 +300,18 @@ def _vllm_service(
     # partial state dict still resolve every cache-mount key below.
     state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
-    command = [
-        deployment.spec['hf_model_id'],
-        '--host',
-        '0.0.0.0',
-        '--port',
-        '8000',
-        *vllm_args(svc),
-    ]
+    simulated = bool(svc.get('simulator'))
+    if simulated:
+        command = simulator_args(svc)
+    else:
+        command = [
+            deployment.spec['hf_model_id'],
+            '--host',
+            '0.0.0.0',
+            '--port',
+            '8000',
+            *vllm_args(svc),
+        ]
     environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
     # Attention backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
     # flag; forward it verbatim when the endpoint sets one (e.g. TORCH_SDPA to
@@ -359,6 +366,18 @@ def _vllm_service(
         service['ports'] = [f'{host_port}:8000']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
+    if simulated:
+        # A simulator downloads no weights and compiles no graphs, so the
+        # caches above are dead weight -- and worse, the images ship
+        # distroless and run as a non-root uid that cannot write /root, so
+        # mounting them invites a permission failure for no benefit. The
+        # healthcheck goes for the same reason: it shells out to `curl`,
+        # which a distroless image does not contain, so it would mark a
+        # perfectly healthy container unhealthy forever. Nothing depends on
+        # it -- `probe_ready` gates on a real generation over HTTP, which is
+        # a stronger signal and works against any image.
+        service.pop('volumes', None)
+        service['healthcheck'] = {'disable': True}
     return service
 
 
