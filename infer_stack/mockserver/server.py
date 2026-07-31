@@ -34,7 +34,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .simulator import ModelProfile, Simulator
+from .simulator import ModelProfile, Simulator, flatten_messages
 
 __all__ = ['MockServer', 'build_simulator']
 
@@ -73,8 +73,38 @@ class _Handler(BaseHTTPRequestHandler):
     recorded: list
     record_lock: threading.Lock
     max_recorded: int
+    draw_counts: dict
+    draw_lock: threading.Lock
 
     protocol_version = 'HTTP/1.1'
+
+    def _next_draw(
+        self, model_id: str, messages, temperature: float, n_samples: int = 1
+    ) -> int:
+        """
+        Pick the sample index for this request.
+
+        A real API at ``temperature > 0`` returns a *different* completion
+        each time you send it the same request; the client does not tell it
+        "this is sample 3". Clients that draw K samples therefore just send
+        the same body K times.
+
+        If the mock keyed only on request content, those K identical
+        requests would collapse to one answer and any self-consistency
+        score would be identically 1.0 -- the card would pass while
+        measuring nothing. So repeated identical sampling requests advance a
+        server-side counter.
+
+        At ``temperature == 0`` decoding is greedy, so every request maps to
+        index 0 and stays perfectly reproducible.
+        """
+        if temperature <= 0.0:
+            return 0
+        key = (model_id, flatten_messages(messages), round(temperature, 6))
+        with self.draw_lock:
+            index = self.draw_counts.get(key, 0)
+            self.draw_counts[key] = index + max(1, int(n_samples))
+        return index
 
     def log_message(self, fmt, *args):  # noqa: D102 - silence stderr spam
         pass
@@ -177,8 +207,17 @@ class _Handler(BaseHTTPRequestHandler):
         if profile.latency_s:
             time.sleep(profile.latency_s)
 
+        # Where this request's samples start. Clients that ask for n>1 get
+        # a contiguous block; clients that re-send the same body K times
+        # (the common case, since the OpenAI API has no "sample index")
+        # advance one step per call.
+        base_index = self._next_draw(
+            model_id, messages, temperature, n_samples
+        )
+
         choices = []
-        for sample_index in range(n_samples):
+        for offset in range(n_samples):
+            sample_index = base_index + offset
             completion = self.simulator.complete(
                 model_id,
                 messages,
@@ -268,6 +307,8 @@ class MockServer:
             'recorded': self.recorded,
             'record_lock': threading.Lock(),
             'max_recorded': max_recorded,
+            'draw_counts': {},
+            'draw_lock': threading.Lock(),
         })
 
         self._httpd = ThreadingHTTPServer((host, port), handler)

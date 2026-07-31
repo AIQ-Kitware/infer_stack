@@ -278,6 +278,89 @@ def test_recorded_requests_can_be_reset():
     assert recorded == []
 
 
+def test_repeated_sampling_requests_diverge_over_http():
+    # Real clients draw K samples by sending the same body K times -- the
+    # OpenAI API has no "sample index". If the mock keyed only on request
+    # content those K calls would collapse to one answer and every
+    # self-consistency score would be identically 1.0.
+    body = {
+        'model': 'weak',
+        'messages': [{'role': 'user', 'content': COHORT['questions']['q4']}],
+        'temperature': 0.7,
+    }
+    with MockServer(COHORT, port=0) as server:
+        answers = [
+            _post(server.url + '/v1/chat/completions', body)['choices'][0][
+                'message'
+            ]['content']
+            for _ in range(8)
+        ]
+    assert len(set(answers)) > 1, answers
+
+
+def test_repeated_greedy_requests_stay_identical_over_http():
+    body = {
+        'model': 'weak',
+        'messages': [{'role': 'user', 'content': COHORT['questions']['q4']}],
+        'temperature': 0.0,
+    }
+    with MockServer(COHORT, port=0) as server:
+        answers = [
+            _post(server.url + '/v1/chat/completions', body)['choices'][0][
+                'message'
+            ]['content']
+            for _ in range(8)
+        ]
+    assert len(set(answers)) == 1, answers
+
+
+def test_a_strong_model_resamples_more_stably_than_a_weak_one():
+    def _spread(model_id, server):
+        distinct = 0
+        for question_id in list(COHORT['questions'])[:25]:
+            body = {
+                'model': model_id,
+                'messages': [
+                    {'role': 'user',
+                     'content': COHORT['questions'][question_id]}
+                ],
+                'temperature': 0.7,
+            }
+            answers = {
+                _post(server.url + '/v1/chat/completions', body)['choices'][0][
+                    'message'
+                ]['content']
+                for _ in range(3)
+            }
+            distinct += len(answers)
+        return distinct
+
+    with MockServer(COHORT, port=0) as server:
+        strong_spread = _spread('strong', server)
+        weak_spread = _spread('weak', server)
+
+    assert strong_spread < weak_spread, (strong_spread, weak_spread)
+
+
+def test_n_greater_than_one_reserves_a_contiguous_block():
+    # A client asking for n=3 in one request and a client sending three
+    # requests should both advance the counter by three, so the two styles
+    # cannot silently share sample indices.
+    body = {
+        'model': 'weak',
+        'messages': [{'role': 'user', 'content': COHORT['questions']['q6']}],
+        'temperature': 0.7,
+        'n': 3,
+    }
+    with MockServer(COHORT, port=0) as server:
+        first = _post(server.url + '/v1/chat/completions', body)
+        second = _post(server.url + '/v1/chat/completions', body)
+
+    first_texts = [c['message']['content'] for c in first['choices']]
+    second_texts = [c['message']['content'] for c in second['choices']]
+    assert first_texts != second_texts
+
+
 def test_unknown_model_over_http_is_a_404_naming_the_configured_models():
     with MockServer(COHORT, port=0) as server:
         with pytest.raises(urllib.error.HTTPError) as excinfo:
