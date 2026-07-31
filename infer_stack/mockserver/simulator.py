@@ -235,12 +235,23 @@ class Simulator:
         self.questions = dict(questions or {})
         self.seed = seed
 
-        # Longest question text first so a question that contains another
-        # question's text still matches the more specific one.
+        # A question may register several surface forms. That matters for
+        # decomposition-style cards: a question asked directly and the same
+        # question re-asked in composed form look nothing alike as strings,
+        # but should resolve to one identity -- and only when the composed
+        # form carries the *correct* intermediate answer. Registering the
+        # correctly-composed string as a second form gives exactly that,
+        # so direct/decomposed agreement tracks model ability instead of
+        # being trivially 1.0.
+        forms = []
+        for question_id, value in self.questions.items():
+            texts = value if isinstance(value, (list, tuple)) else [value]
+            forms.extend((question_id, str(text)) for text in texts)
+
+        # Longest form first, so a form containing another form's text
+        # still matches the more specific one.
         self._match_order = sorted(
-            self.questions.items(),
-            key=lambda kv: len(kv[1]),
-            reverse=True,
+            forms, key=lambda kv: len(kv[1]), reverse=True
         )
 
     def latent_key_for(self, prompt: str) -> str:
