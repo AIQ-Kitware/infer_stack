@@ -1,0 +1,51 @@
+# Catalog for the mock dress rehearsal: the same leasing path as a real
+# endpoint, served by a simulator so it runs on a host with no GPU.
+#
+# The endpoints below are deliberately shaped like the ones in catalog.yaml
+# -- same engine, same runtime keys -- so the only difference between a
+# rehearsal and a real run is which catalog you point at.
+#
+#   docker build -f dockerfiles/mock-vllm.dockerfile -t aiq-mock-vllm:latest .
+#   infer-stack --catalog dev/e2e_tests/catalog-mock.yaml run \
+#       --endpoint mock-smol -- <command>
+models:
+  smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
+  qwen17:  {source: hf://Qwen/Qwen3-1.7B}
+
+endpoints:
+  mock-smol:
+    engine: vllm
+    model: smol135
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 2048
+      gpu_memory_utilization: 0.0     # a simulator reserves nothing
+      extra_args: ['--mock-ability=0.6']
+    reclaim: {policy: stop}
+
+  # Shaped like the model a real evaluation card asks for, so the
+  # rehearsal exercises the same alias resolution a real run would.
+  mock-qwen17:
+    engine: vllm
+    model: qwen17
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 8192
+      gpu_memory_utilization: 0.0
+      extra_args: ['--mock-ability=0.55']
+    reclaim: {policy: stop}
+
+  # Same image, sycophantic. Demonstrates a card refusing to verify.
+  mock-sycophant:
+    engine: vllm
+    model: smol135
+    public_name: mock-smol-sycophant
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 2048
+      gpu_memory_utilization: 0.0
+      extra_args: ['--mock-mode=sycophant']
+    reclaim: {policy: stop}
+
+bundles:
+  rehearsal: [mock-smol, mock-qwen17]
