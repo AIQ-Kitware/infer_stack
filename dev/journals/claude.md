@@ -2389,3 +2389,33 @@ docker`; that is environmental, not a repo change.
 deployment-different, so the right seam was the deployment renderer, not a new
 engine. Had it diverged at the API it would have needed to be a new engine —
 or not used at all.
+
+**Same-session follow-up (11:30).** Ran both evaluation cards against the simulator
+for real, and the first one to use a realistically-named endpoint broke:
+its alias *is* `Qwen/Qwen3-8B`, and the simulator resolves `--model`
+against HuggingFace to decide between real and simulated tokenization. A real
+repo id makes it demand a tokenizer render sidecar and die at startup. My
+default of "use the served name" therefore worked only for endpoints named
+`mock/...` — i.e. only in the test I had written. `--model` now gets a
+`sim-<slug>` that cannot resolve to a repo, with `simulator.model` as the
+escape hatch for anyone who wants the render-service path. The lesson is
+narrow but sharp: I validated the default against a fixture I chose, not
+against the naming convention every real catalog uses.
+
+Also measured, not assumed, the fidelity gaps and wrote them into
+docs/mock-endpoints.md: `n > 1` returns one choice on both completions and
+chat; no logprobs; no bearer auth; unknown request fields accepted; 400 on
+context overflow. I initially wrote that the `n` gap was why one card's
+filtering step kept nothing — it is not. That client fans n out into n
+separate requests, so it still gets its distinct samples; the filter keeps
+nothing because the answer extractor finds no answer in random prose and
+every sample is labelled neither correct nor incorrect. Checked the
+intermediate records before believing the tidier story.
+
+Both cards complete and degrade gracefully. One fans 32 jobs in through two
+levels of gather to 4 analyses; every model scores at chance, and the
+analysis step reports that it has too few usable folds instead of fitting a
+degenerate model. The other runs a seven-node DAG and reports that its
+filtering step kept nothing. Both come back INCONCLUSIVE. Neither crashes,
+which is the property worth having — a real cohort containing one hopeless
+model produces the same degenerate input.

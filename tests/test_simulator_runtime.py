@@ -42,7 +42,7 @@ def test_simulator_args_use_the_simulators_own_cli():
         'max_num_seqs': 8,
         'simulator': {'kind': 'llm-d-sim', 'mode': 'random', 'seed': 7},
     })
-    assert args[:2] == ['--model', 'mock-smol']
+    assert args[:2] == ['--model', 'sim-mock-smol']
     assert '--served-model-name=mock-smol' in args
     assert '--max-model-len=2048' in args
     assert ['--mode', 'random'] == args[args.index('--mode'):][:2]
@@ -54,16 +54,34 @@ def test_simulator_args_use_the_simulators_own_cli():
         assert absent not in joined
 
 
-def test_simulator_model_flag_avoids_the_hf_repo_id():
-    """The repo id would send it looking for a tokenizer render service."""
+def test_simulator_model_flag_can_never_resolve_to_a_repo():
+    """A resolvable ``--model`` sends it looking for a render service and dies.
+
+    The served name is normally a real model name (``Qwen/Qwen3-8B``), so
+    passing either it or the HF id through verbatim would make the *ordinary*
+    catalog entry a startup crash loop.
+    """
     svc = _vllm_service(
-        _deployment({'image': IMAGE, 'simulator': {'kind': 'llm-d-sim'}}),
+        _deployment({'image': IMAGE, 'simulator': {'kind': 'llm-d-sim'}},
+                    hf='Qwen/Qwen3-8B', served='Qwen/Qwen3-8B'),
         [], 18000, IMAGES, {},
     )
-    assert '--model' in svc['command']
-    model = svc['command'][svc['command'].index('--model') + 1]
-    assert model == 'mock-smol'
-    assert 'HuggingFaceTB' not in ' '.join(svc['command'])
+    command = svc['command']
+    model = command[command.index('--model') + 1]
+    assert '/' not in model
+    assert model == 'sim-qwen-qwen3-8b'
+    # ... while clients still ask for the alias the catalog advertises.
+    assert '--served-model-name=Qwen/Qwen3-8B' in command
+
+
+def test_simulator_model_can_be_overridden():
+    svc = _vllm_service(
+        _deployment({'image': IMAGE,
+                     'simulator': {'kind': 'llm-d-sim', 'model': 'Qwen/Qwen3-8B'}}),
+        [], 18000, IMAGES, {},
+    )
+    command = svc['command']
+    assert command[command.index('--model') + 1] == 'Qwen/Qwen3-8B'
 
 
 def test_simulator_flags_pass_through_by_name():

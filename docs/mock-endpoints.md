@@ -101,11 +101,29 @@ the block becomes a simulator flag verbatim (`snake_case` → `--kebab-case`,
 `true` → a bare flag, a list → repeated values), so any knob the simulator
 grows is reachable from the catalog without a change to infer-stack.
 
-`--model` defaults to the **served** name rather than the HF repo id on
-purpose: the simulator treats a real repo id as a request for real
-HuggingFace tokenization, which it delegates to a separate render service
-and dies without. A name that is not a repo id selects its built-in
-simulated tokenizer.
+`--model` carries neither the HF repo id nor the served name: it gets a
+`sim-<slug>` that cannot resolve to a repo. The simulator decides how to
+tokenize by looking that value up on HuggingFace — a real repo id means
+real tokenization, which it delegates to a separate render service and
+dies at startup without. Since a catalog endpoint is normally named after
+a real model (`Qwen/Qwen3-8B`), passing either through verbatim would turn
+the ordinary case into a crash loop. Set `simulator.model` if you do want
+the render-service path. The served alias is unaffected either way.
+
+## Known fidelity gaps
+
+Close is not identical. As of `v0.9.0`:
+
+* **`n > 1` is ignored** — both `/v1/completions` and
+  `/v1/chat/completions` return exactly one choice however many you ask
+  for. A client that fans K samples out into K requests is unaffected; one
+  that relies on the server gets K = 1 and degrades quietly. The oracle
+  mock does honour `n`.
+* **No `logprobs`** — the field is accepted and dropped.
+* **No bearer auth** — it cannot reject an unauthenticated request, so the
+  auth path is only covered by the oracle mock.
+* **Unknown request fields are accepted**, where a stricter server might
+  400. It does return 400 when the prompt exceeds `--max-model-len`.
 
 The oracle mock needs none of this — its entrypoint parses vLLM's command
 line, so `runtime.image` alone deploys it.
