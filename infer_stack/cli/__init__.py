@@ -32,11 +32,13 @@ from . import (  # noqa: F401
     commands_catalog,
     commands_leasing,
     commands_meta,
+    commands_mock,
     commands_runtime,
     context,
     options,
 )
 from .commands_catalog import CatalogModalCLI
+from .commands_mock import MockModalCLI
 from .commands_leasing import (
     AcquireCLI,
     ApplyCLI,
@@ -114,6 +116,9 @@ class ManageCLI(scfg.ModalCLI):
 
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI
+
+    # Deterministic mock endpoint for tests/dry-runs (no GPU, no API key)
+    mock = MockModalCLI
 
     # Leasing model (acquire/release/run + status)
     acquire = AcquireCLI  # stand up endpoints: lease + up + wait (--ttl for soft TTL)

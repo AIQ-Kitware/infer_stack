@@ -426,8 +426,8 @@ pipelines can `acquire` the models a node needs, block until ready, and
 `release` after — instead of the current single global "active profile" that is
 last-render-wins under a shared data dir. The full critique + staged plan lives
 in the *parent* repo at `aiq-eval-runner/dev/infer-stack-redesign-critique.md`
-(grounded in the two real consumers: aiq-eval-runner's Incubilate/Contextual
-Drag and eval_audit's HELM/kwdagger path). User explicitly asked to start on a
+(grounded in the two real consumers: aiq-eval-runner's evaluation cards
+and eval_audit's HELM/kwdagger path). User explicitly asked to start on a
 new branch and bump versions; chose sqlite for the store (open question #1 in
 that doc). This is Phase 1's foundation.
 
@@ -875,7 +875,7 @@ the first poll) is host-validated. 17 compose tests (3 new ollama), 88
 leasing/CLI + 7 xdoctests green.
 
 **Next:** consumer integration — wrap eval_audit's MaterializeHelmRunNode command
-with `infer-stack run`, and switch aiq-eval-runner Incubilate to acquire/release.
+with `infer-stack run`, and switch an aiq-eval-runner card to acquire/release.
 
 ## 2026-06-17 12:20:00 -0400
 
