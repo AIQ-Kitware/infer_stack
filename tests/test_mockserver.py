@@ -393,3 +393,52 @@ def test_simulator_requires_profiles_to_be_configured():
     sim = Simulator(profiles={}, seed='x')
     with pytest.raises(KeyError):
         sim.complete('anything', [{'role': 'user', 'content': 'a'}])
+
+
+# -- raw completions endpoint ---------------------------------------------
+
+
+def test_completions_endpoint_shape():
+    # Clients whose prompts are already rendered (a chat template applied
+    # upstream) must not have a second template applied by the server, so
+    # they use /v1/completions rather than /v1/chat/completions.
+    with MockServer(COHORT, port=0) as server:
+        body = _post(
+            server.url + '/v1/completions',
+            {'model': 'strong', 'prompt': COHORT['questions']['q1'],
+             'temperature': 0.0},
+        )
+    assert body['object'] == 'text_completion'
+    choice = body['choices'][0]
+    assert isinstance(choice['text'], str)
+    assert 'message' not in choice, 'completions return text, not a message'
+
+
+def test_completions_and_chat_agree_on_the_same_prompt():
+    prompt = COHORT['questions']['q3']
+    with MockServer(COHORT, port=0) as server:
+        completion = _post(
+            server.url + '/v1/completions',
+            {'model': 'strong', 'prompt': prompt, 'temperature': 0.0},
+        )['choices'][0]['text']
+        chat = _post(
+            server.url + '/v1/chat/completions',
+            {'model': 'strong',
+             'messages': [{'role': 'user', 'content': prompt}],
+             'temperature': 0.0},
+        )['choices'][0]['message']['content']
+    assert completion == chat
+
+
+def test_completions_n_indices_are_per_response():
+    # OpenAI indices are 0..n-1 within a response, not a running counter.
+    body = {'model': 'weak', 'prompt': COHORT['questions']['q2'],
+            'temperature': 0.7, 'n': 3}
+    with MockServer(COHORT, port=0) as server:
+        first = _post(server.url + '/v1/completions', body)
+        second = _post(server.url + '/v1/completions', body)
+    assert [c['index'] for c in first['choices']] == [0, 1, 2]
+    assert [c['index'] for c in second['choices']] == [0, 1, 2]
+    # ...but the samples themselves still advance.
+    assert ([c['text'] for c in first['choices']]
+            != [c['text'] for c in second['choices']])

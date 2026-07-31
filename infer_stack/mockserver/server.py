@@ -14,7 +14,8 @@ Endpoints
 
 ``GET  /health``                 readiness probe
 ``GET  /v1/models``              configured models
-``POST /v1/chat/completions``    the actual completions endpoint
+``POST /v1/chat/completions``    chat completions
+``POST /v1/completions``         raw text completions
 ``GET  /__mock__/requests``      every request received, verbatim
 ``POST /__mock__/reset``         clear the recorded requests
 
@@ -171,7 +172,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({'status': 'reset'})
             return
 
-        if path != '/v1/chat/completions':
+        if path not in ('/v1/chat/completions', '/v1/completions'):
             self._send_json({'error': f'unknown path {self.path}'}, status=404)
             return
 
@@ -184,7 +185,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._record(path, payload)
 
         model_id = payload.get('model')
-        messages = payload.get('messages') or []
+        is_chat = path == '/v1/chat/completions'
+        if is_chat:
+            messages = payload.get('messages') or []
+        else:
+            # A raw completion prompt is already fully rendered; treat it as
+            # a single user turn so both endpoints key on the same text.
+            messages = [{'role': 'user', 'content': payload.get('prompt', '')}]
         temperature = float(payload.get('temperature', 0.0) or 0.0)
         n_samples = int(payload.get('n', 1) or 1)
 
@@ -236,12 +243,8 @@ class _Handler(BaseHTTPRequestHandler):
                     status=profile.failure_status,
                 )
                 return
-            choices.append({
-                'index': sample_index,
-                'message': {
-                    'role': 'assistant',
-                    'content': completion.text,
-                },
+            choice = {
+                'index': offset,
                 'finish_reason': 'stop',
                 # Non-standard, but invaluable when debugging why a card
                 # scored the way it did.
@@ -249,11 +252,19 @@ class _Handler(BaseHTTPRequestHandler):
                     'is_correct': completion.is_correct,
                     'latent_key': completion.latent_key,
                 },
-            })
+            }
+            if is_chat:
+                choice['message'] = {
+                    'role': 'assistant',
+                    'content': completion.text,
+                }
+            else:
+                choice['text'] = completion.text
+            choices.append(choice)
 
         self._send_json({
-            'id': 'chatcmpl-mock',
-            'object': 'chat.completion',
+            'id': 'chatcmpl-mock' if is_chat else 'cmpl-mock',
+            'object': 'chat.completion' if is_chat else 'text_completion',
             'created': 0,
             'model': model_id,
             'choices': choices,
