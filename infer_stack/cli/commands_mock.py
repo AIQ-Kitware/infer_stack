@@ -8,6 +8,8 @@ GPU, an API key, or a network.
 
 from __future__ import annotations
 
+from typing import Any
+
 import scriptconfig as scfg
 import ubelt as ub
 
@@ -107,6 +109,12 @@ class MockServeCLI(scfg.DataConfig):
                 print(f'  {name}')
             return
 
+        # Annotated because the branches below add keys of other types
+        # (api_keys is a list, require_auth a bool); without it the type is
+        # inferred from the default literal alone and every later assignment
+        # looks like a mistake. This is a free-form config mapping -- it
+        # normally arrives from YAML.
+        spec: dict[str, Any]
         if config.config_fpath:
             spec = kwutil.Yaml.coerce(ub.Path(config.config_fpath).read_text())
         else:

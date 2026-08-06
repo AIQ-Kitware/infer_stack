@@ -116,24 +116,29 @@ def config_from_args(args, unknown=()) -> dict:
             'with --model'
         )
 
+    # Annotated, and the models mapping bound to its own name: whatever
+    # `Yaml.coerce` returns is a union wide enough to include a list and a
+    # bool, so indexing straight through `config['models']` makes every
+    # access below look like an error.
+    config: dict[str, Any]
     if args.mock_config:
         config = dict(kwutil.Yaml.coerce(ub.Path(args.mock_config).read_text()))
     else:
         config = {}
-    config.setdefault('models', {})
+    models: dict[str, Any] = config.setdefault('models', {})
 
     # The served model must exist even when a mounted fixture does not
     # mention it, or the endpoint comes up and 404s every request.
-    block: dict[str, Any] = dict(config['models'].get(model) or {})
+    block: dict[str, Any] = dict(models.get(model) or {})
     block.setdefault('ability', float(args.mock_ability))
     if args.served_model_name:
         block['served_model_name'] = args.served_model_name
     if args.max_model_len:
         block['max_model_len'] = int(args.max_model_len)
-    config['models'][model] = block
+    models[model] = block
 
     if args.mock_mode:
-        for entry in config['models'].values():
+        for entry in models.values():
             entry['mode'] = args.mock_mode
     if args.mock_seed:
         config['seed'] = args.mock_seed

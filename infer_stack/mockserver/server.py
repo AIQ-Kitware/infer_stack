@@ -110,7 +110,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.draw_counts[key] = index + max(1, int(n_samples))
         return index
 
-    def log_message(self, fmt, *args):  # noqa: D102 - silence stderr spam
+    # The parameter is named `format` to match BaseHTTPRequestHandler, which
+    # callers may pass by keyword; renaming it breaks the override contract.
+    def log_message(self, format, *args):  # noqa: A002 - silence stderr spam
         pass
 
     # -- helpers ---------------------------------------------------------
@@ -233,6 +235,26 @@ class _Handler(BaseHTTPRequestHandler):
         self._record(path, payload)
 
         model_id = payload.get('model')
+        if not isinstance(model_id, str) or not model_id:
+            # A real server rejects a missing required parameter with 400,
+            # distinct from the 404 below for a model it does not serve. A
+            # client that forgets the field should not look like one asking
+            # for a model that is merely absent from this cohort.
+            self._send_json(
+                {
+                    'error': {
+                        'message': (
+                            "'model' is a required property and must be a "
+                            'non-empty string'
+                        ),
+                        'type': 'invalid_request_error',
+                        'param': 'model',
+                    }
+                },
+                status=400,
+            )
+            return
+
         is_chat = path == '/v1/chat/completions'
         if is_chat:
             messages = payload.get('messages') or []
