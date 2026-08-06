@@ -518,6 +518,20 @@ class EndpointAddCLI(_CatalogCommon):
         None, choices=['keep-warm', 'stop', 'scale-to-zero'],
         help='Reclaim policy when idle.',
     )
+    protocol = scfg.Value(
+        None, choices=['chat', 'completions'],
+        help='Which OpenAI surface this endpoint serves. Load-bearing twice: '
+             'a base model has no chat template, and the readiness probe '
+             'follows this — declaring chat for a completions-only serve '
+             'blocks `acquire` until the TTL. Default (unset): chat.',
+    )
+    min_vram_gib = scfg.Value(
+        None, type=float,
+        help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
+             'planner can pick any eligible free GPU. Declaring this is what '
+             'lets one catalog be correct on every host; the alternative is '
+             'pinning GPU indices, which is not portable.',
+    )
     # vLLM runtime conveniences
     max_model_len = scfg.Value(None, type=int)
     gpu_mem = scfg.Value(
@@ -575,6 +589,10 @@ class EndpointAddCLI(_CatalogCommon):
             entry['runtime'] = runtime
         if config.reclaim:
             entry['reclaim'] = {'policy': config.reclaim}
+        if config.protocol:
+            entry['protocol'] = config.protocol
+        if config.min_vram_gib is not None:
+            entry['placement'] = {'min_vram_gib': config.min_vram_gib}
         data['endpoints'][name] = entry
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:
