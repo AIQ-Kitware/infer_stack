@@ -1357,7 +1357,17 @@ class ComposeBackend(ConvergeScaffold):
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Constructing a backend must not touch the filesystem fatally. `doctor`
+        # builds one before it runs a single check, so an unwritable state dir
+        # used to kill the very command whose job is to say "the state dir is
+        # unwritable" -- the preflight required the thing it was preflighting.
+        # Record the failure instead and let doctor() report it; anything that
+        # actually writes calls _ensure_state_dir() and gets a real error.
+        self._state_dir_error: str | None = None
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            self._state_dir_error = str(ex)
         # None => detect lazily on first use (see the `inventory` property):
         # startup paths (notably the TUI) must never wait on nvidia-smi
         # before the first frame.
@@ -1487,7 +1497,143 @@ class ComposeBackend(ConvergeScaffold):
             write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
         return pw
 
+    def _ensure_state_dir(self) -> None:
+        """Raise a legible error if the state dir could not be created.
+
+        The constructor records rather than raises (see ``__init__``), so the
+        failure has to resurface at the first real write instead of turning
+        into a confusing downstream error about a missing compose file.
+        """
+        if self._state_dir_error is None:
+            return
+        raise RuntimeError(
+            f'infer-stack state dir is not usable: {self._state_dir_error}\n'
+            f'  path: {self.state_dir}\n'
+            '  Run `infer-stack doctor` for the full preflight, and check '
+            'that the data dir from `infer-stack paths` is writable by you.'
+        )
+
+    # -- preflight -----------------------------------------------------------
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        """Preflight everything ``acquire`` needs: ``(check, ok, detail)`` rows.
+
+        Checked cheaply and in dependency order so a fresh host fails as a
+        checklist instead of a mid-converge traceback, and — critically —
+        *before* anything is placed or any lease is recorded. Never raises.
+
+        The image check is the one that earns its keep. A converge brings up
+        every enabled service at once, so an unpullable image belonging to a
+        service that has nothing to do with serving (the Open WebUI frontend,
+        say) aborts a model lease *after* placement has already succeeded, and
+        the ledger is left describing containers that do not exist. Resolving
+        the tags first turns that into one line here.
+        """
+        checks: list[tuple[str, bool, str]] = []
+
+        # 1. State dir. Everything else writes here, so it comes first.
+        if self._state_dir_error is None:
+            probe = self.state_dir / '.doctor-write-probe'
+            try:
+                probe.touch()
+                probe.unlink()
+                checks.append(('state dir writable', True, str(self.state_dir)))
+            except OSError as ex:
+                checks.append((
+                    'state dir writable', False,
+                    f'{self.state_dir}: {ex} — chown/chgrp it to you; on a '
+                    'shared box use a group with the setgid bit so the ledger '
+                    'stays shared (that is how concurrent runs avoid placing '
+                    'two models on one GPU)',
+                ))
+        else:
+            checks.append((
+                'state dir writable', False,
+                f'{self.state_dir}: {self._state_dir_error} — create it and '
+                'make it writable by you',
+            ))
+
+        # 2. Docker daemon, then compose. No point checking images without them.
+        try:
+            ver = self.run(['docker', 'version', '--format', '{{.Server.Version}}']).strip()
+            checks.append(('docker daemon reachable', True, f'server {ver}'))
+        except Exception as ex:  # noqa: BLE001 - report, don't raise
+            checks.append((
+                'docker daemon reachable', False,
+                f'{ex} — is dockerd running, and are you in the docker group? '
+                '(a fresh group membership needs a new login session)',
+            ))
+            return checks
+
+        try:
+            cver = self.run(['docker', 'compose', 'version', '--short']).strip()
+            checks.append(('docker compose available', True, f'v{cver}'))
+        except Exception as ex:  # noqa: BLE001
+            checks.append((
+                'docker compose available', False,
+                f'{ex} — the compose v2 plugin is required (docker-compose v1 '
+                'is not enough)',
+            ))
+            return checks
+
+        # 3. Every image this configuration would actually bring up. Checking
+        #    the full PINNED_IMAGES set would fail on services that are off.
+        wanted: dict[str, str] = {'vllm': self.images['vllm']}
+        if self.litellm:
+            wanted['litellm'] = self.images['litellm']
+            if self.dynamic_routing:
+                wanted['postgres'] = self.images['postgres']
+        if self.ui:
+            wanted['open_webui'] = self.images['open_webui']
+        if self.reverse_proxy:
+            wanted['nginx'] = self.images['nginx']
+
+        for role, image in sorted(wanted.items()):
+            try:
+                # `images -q` prints the id or nothing and always exits 0.
+                # `image inspect` would work too but writes "No such image" to
+                # stderr, which is alarming noise in a preflight that is about
+                # to report the same fact calmly.
+                if self.run(['docker', 'images', '-q', image]).strip():
+                    checks.append((f'image {role}', True, f'{image} (local)'))
+                    continue
+            except Exception:  # noqa: BLE001 - fall through to the remote check
+                pass
+            try:
+                self.run(['docker', 'manifest', 'inspect', image])
+                checks.append((f'image {role}', True, f'{image} (pullable)'))
+            except Exception as ex:  # noqa: BLE001
+                hint = 'not present locally and could not be resolved'
+                if 'denied' in str(ex).lower():
+                    # A public image answering `denied` almost always means a
+                    # stale credential is being sent: docker will not fall back
+                    # to anonymous once it has an auth entry for the registry.
+                    registry = image.split('/')[0]
+                    hint += (
+                        f' — `denied` on a public image usually means a stale '
+                        f'credential; try `docker logout {registry}`'
+                    )
+                checks.append((f'image {role}', False, f'{image}: {hint}'))
+
+        # 4. GPUs. Last because a CPU-only stack is legitimate (mock endpoints,
+        #    the null backend), so this is informational rather than fatal.
+        try:
+            gpus = self.inventory.get('gpus') or []
+            if gpus:
+                checks.append(('GPUs visible', True, f'{len(gpus)} device(s)'))
+            else:
+                checks.append((
+                    'GPUs visible', True,
+                    'none detected — fine for mock/simulator endpoints, but a '
+                    'real vLLM endpoint will not place',
+                ))
+        except Exception as ex:  # noqa: BLE001
+            checks.append(('GPUs visible', False, f'inventory failed: {ex}'))
+
+        return checks
+
     def _compose(self, args: list[str]) -> str:
+        self._ensure_state_dir()
         cmd = ['docker', 'compose']
         # Resolve ${LITELLM_MASTER_KEY} (and any other managed secret) from the
         # sidecar .env beside the compose file, so secrets stay out of the YAML.
