@@ -1838,6 +1838,10 @@ class TestCLI(_PathOverridesMixin):
 
     __command__ = 'test'
 
+    catalog = scfg.Value(
+        None, type=str,
+        help='Catalog path, used only to look up the endpoint protocol.',
+    )
     name = scfg.Value(
         None, position=1, type=str, help='Endpoint alias to test (e.g. chat).'
     )
@@ -1853,6 +1857,11 @@ class TestCLI(_PathOverridesMixin):
         None, type=int, help='Override the gateway port (default: 14042).'
     )
     json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
+    protocol = scfg.Value(
+        None, choices=['chat', 'completions'],
+        help="Which surface to hit. Default: the endpoint's declared "
+             '`protocol` from the catalog, falling back to chat.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1864,19 +1873,36 @@ class TestCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
         if not config.name:
             raise SystemExit('test: give an endpoint alias (e.g. `test chat`)')
+
+        # Follow the endpoint's declared protocol, like the readiness probe
+        # does. Hardcoding chat meant a completions-only endpoint -- a base
+        # model, or anything served for a client that renders its own prompts
+        # -- reported FAILED however healthy it was, because the server
+        # correctly 404s a surface it does not serve.
+        protocol = config.protocol or _endpoint_protocol(config, config.name)
+
         base_url, key = _front_door(config)
         headers = {'Content-Type': 'application/json'}
         if key:
             headers['Authorization'] = f'Bearer {key}'
-        payload = {
-            'model': config.name,
-            'messages': [{'role': 'user', 'content': config.prompt}],
-            'max_tokens': int(config.max_tokens),
-        }
+        if protocol == 'completions':
+            url = f'{base_url}/completions'
+            payload = {
+                'model': config.name,
+                'prompt': config.prompt,
+                'max_tokens': int(config.max_tokens),
+            }
+        else:
+            url = f'{base_url}/chat/completions'
+            payload = {
+                'model': config.name,
+                'messages': [{'role': 'user', 'content': config.prompt}],
+                'max_tokens': int(config.max_tokens),
+            }
         t0 = time.monotonic()
         try:
             resp = requests.post(
-                f'{base_url}/chat/completions',
+                url,
                 headers=headers,
                 json=payload,
                 timeout=float(config.timeout),
@@ -1890,7 +1916,9 @@ class TestCLI(_PathOverridesMixin):
                 config, base_url, f'HTTP {resp.status_code}: {body}'
             )
         try:
-            reply = resp.json()['choices'][0]['message']['content']
+            choice = resp.json()['choices'][0]
+            reply = (choice.get('text') if protocol == 'completions'
+                     else choice['message']['content'])
         except (ValueError, KeyError, IndexError) as ex:
             return _test_fail(config, base_url, f'unexpected response: {ex}')
         reply = (reply or '').strip()
@@ -1901,6 +1929,25 @@ class TestCLI(_PathOverridesMixin):
         else:
             print(f'{config.name}: ok ({dt:.2f}s) {reply!r}')
         return 0
+
+
+def _endpoint_protocol(config, name: str) -> str:
+    """The endpoint's declared protocol, or 'chat' when it cannot be resolved.
+
+    Best-effort on purpose: ``test`` must still work against an endpoint that
+    is live but absent from the catalog (an ad-hoc acquire), so a missing or
+    unreadable catalog falls back to the default rather than failing.
+    """
+    try:
+        from ..leasing import Catalog
+        raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
+        path = Path(raw).expanduser()
+        if not path.exists():
+            return 'chat'
+        ep = Catalog.load(path).endpoints.get(name)
+        return getattr(ep, 'protocol', None) or 'chat'
+    except Exception:  # noqa: BLE001 - a diagnostic must not fail on lookup
+        return 'chat'
 
 
 def _test_fail(config, base_url: str, reason: str) -> int:
