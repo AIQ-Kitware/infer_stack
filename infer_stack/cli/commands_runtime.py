@@ -110,7 +110,78 @@ def _leasing_status() -> dict[str, Any]:
         for d in deployments
     ]
     out['summary'] = (active, len(leases), live, len(deployments))
+    out['served'] = _served_models(deployments)
     return out
+
+
+def _running_services() -> set[str] | None:
+    """Compose service names currently running, or None if docker can't say.
+
+    A single cheap `docker compose ps`. It exists because the ledger's LIVE is
+    a *belief*: a converge that fails partway (an unpullable image, a daemon
+    hiccup) leaves deployments recorded LIVE with no container behind them, and
+    the only way to notice used to be an acquire that hung on readiness.
+    Distinguishing "recorded" from "running" is the whole point of showing this.
+
+    None (not an empty set) when docker is unreachable, so the caller can say
+    "unverified" instead of falsely reporting everything down.
+    """
+    from ..leasing.compose import LEASING_PROJECT
+
+    compose_file = _leasing_compose_file()
+    if not compose_file.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            ['docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file),
+             'ps', '--services', '--filter', 'status=running'],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001 - status must never fail on this
+        return None
+    if proc.returncode != 0:
+        return None
+    return {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
+
+
+def _served_models(deployments) -> list[tuple[str, str, str, str]]:
+    """``(endpoint, model, gpus_or_engine, health)`` rows for what is serving.
+
+    Reads the ledger for what *should* be up and reconciles against the
+    containers that actually are, so `status` answers "what can I send a
+    request to right now" without the user having to cross-read `leases`
+    against `stack ps`.
+    """
+    from ..leasing import DeploymentState
+    from ..leasing.compose import ollama_service_name_for, vllm_service_name_for
+
+    live = [d for d in deployments if d.state == DeploymentState.LIVE]
+    if not live:
+        return []
+    running = _running_services()
+
+    rows: list[tuple[str, str, str, str]] = []
+    for d in live:
+        for endpoint in sorted(d.served):
+            payload = d.served.get(endpoint) or {}
+            model = (payload.get('hf_model_id')
+                     or payload.get('model')
+                     or d.spec.get('hf_model_id') or '-')
+            if d.engine == 'ollama':
+                service = ollama_service_name_for(d.spec.get('host') or endpoint)
+            else:
+                service = vllm_service_name_for(
+                    payload.get('served_model_name') or endpoint)
+            if running is None:
+                health = 'unverified'
+            elif service in running:
+                health = 'up'
+            else:
+                # The ledger says live and nothing is running. Almost always a
+                # converge that failed after the record was written.
+                health = 'STALE'
+            rows.append((endpoint, model, d.engine, health))
+    return rows
 
 
 def _gather_status(config) -> dict[str, Any]:
@@ -143,6 +214,25 @@ _GETTING_STARTED = (
 )
 
 
+def _served_lines(served: list[tuple[str, str, str, str]]) -> list[str]:
+    """Plain-text 'serving now' block; empty when nothing is up."""
+    if not served:
+        return []
+    w_ep = max(8, *(len(r[0]) for r in served))
+    w_mo = max(5, *(len(r[1]) for r in served))
+    out = ['', 'serving now',
+           f'  {"endpoint".ljust(w_ep)}  {"model".ljust(w_mo)}  health']
+    for endpoint, model, _engine, health in served:
+        out.append(f'  {endpoint.ljust(w_ep)}  {model.ljust(w_mo)}  {health}')
+    if any(r[3] == 'STALE' for r in served):
+        out.append('  STALE = the ledger records this live but no container is '
+                   'running; `infer-stack apply` or `gc`')
+    if any(r[3] == 'unverified' for r in served):
+        out.append('  unverified = could not reach docker to confirm; the '
+                   'ledger says live')
+    return out
+
+
 def _print_status_plain(d: dict[str, Any]) -> None:
     print('infer-stack status')
     print(f'  backend:     {d["backend"]}')
@@ -167,6 +257,8 @@ def _print_status_plain(d: dict[str, Any]) -> None:
         print()
         print(f'leasing: {active} active / {total_l} lease(s), '
               f'{live} live / {total_d} deployment(s)  (infer-stack leases)')
+    for line in _served_lines(lz.get('served') or []):
+        print(line)
     if not d['configured']:
         print()
         for cmd, comment in _GETTING_STARTED:
@@ -220,6 +312,27 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
         line.append(f' / {total_d} deployment(s)')
         console.print()
         console.print(line)
+
+    served = lz.get('served') or []
+    if served:
+        served_table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0))
+        served_table.add_column('endpoint', style='bold cyan', no_wrap=True)
+        served_table.add_column('model', overflow='fold')
+        served_table.add_column('engine', style='dim', no_wrap=True)
+        served_table.add_column('health', no_wrap=True)
+        styles = {'up': 'green', 'STALE': 'red', 'unverified': 'yellow'}
+        for endpoint, model, engine, health in served:
+            served_table.add_row(
+                endpoint, model, engine,
+                Text(health, style=styles.get(health, 'dim')),
+            )
+        console.print()
+        console.print(Text('serving now', style='bold'))
+        console.print(served_table)
+        if any(r[3] == 'STALE' for r in served):
+            console.print(Text(
+                '  STALE = recorded live but no container is running; '
+                '`infer-stack apply` or `gc`', style='dim'))
 
     console.print()
     if d['configured']:
