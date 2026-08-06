@@ -120,6 +120,47 @@ def test_add_existing_without_force_errors(tmp_path):
     assert cat.models['m'].source == 'hf://b'
 
 
+def test_re_adding_an_identical_entry_is_a_no_op(tmp_path):
+    """Only a *differing* entry collides.
+
+    Setup scripts get re-run; demanding --force for a request that changes
+    nothing trains people to pass --force habitually, which is exactly when it
+    clobbers a row that had drifted.
+    """
+    args = ['m', '--source', 'hf://a', '--dtype', 'bfloat16', *_opts(tmp_path)]
+    ModelAddCLI.main(argv=args)
+    assert ModelAddCLI.main(argv=args) == 0          # no --force, no raise
+    assert Catalog.load(cat_path(tmp_path)).models['m'].dtype == 'bfloat16'
+
+    # One differing key is still a collision, and the message names it.
+    with pytest.raises(SystemExit) as ex:
+        ModelAddCLI.main(
+            argv=['m', '--source', 'hf://a', '--dtype', 'float16',
+                  *_opts(tmp_path)])
+    assert 'dtype' in str(ex.value)
+
+    ep = ['e', '--engine', 'vllm', '--model', 'm', '--protocol', 'completions',
+          '--min_vram_gib', '14', *_opts(tmp_path)]
+    EndpointAddCLI.main(argv=ep)
+    assert EndpointAddCLI.main(argv=ep) == 0
+    cat = Catalog.load(cat_path(tmp_path))
+    assert cat.endpoints['e'].protocol == 'completions'
+    assert cat.endpoints['e'].placement == {'min_vram_gib': 14.0}
+
+    with pytest.raises(SystemExit):
+        EndpointAddCLI.main(
+            argv=['e', '--engine', 'vllm', '--model', 'm',
+                  '--protocol', 'chat', *_opts(tmp_path)])
+
+
+def test_derived_endpoint_names_still_accumulate(tmp_path):
+    """Idempotency is keyed on an explicit NAME; derived names are free slots."""
+    ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['--model', 'm', *_opts(tmp_path)])
+    assert set(Catalog.load(cat_path(tmp_path)).endpoints) == {'m-1', 'm-2'}
+
+
 def test_rm_missing_errors_and_rm_removes(tmp_path):
     ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
     EndpointAddCLI.main(argv=['e', '--engine', 'vllm', '--model', 'm',
