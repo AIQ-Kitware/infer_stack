@@ -4,6 +4,19 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Version 0.7.0] - Unreleased
 
+### TUI: the logs pane defaults to engines, not everything
+
+The docker logs pane now follows every service EXCEPT the LiteLLM gateway by
+default. LiteLLM emits a line per proxied request, so on a busy host it scrolls
+the engine output -- which is where startup failures, OOMs and CUDA errors
+actually appear -- out of the pane before it can be read.
+
+`(all services)` and the gateway itself remain one selection away in the same
+dropdown. The engines view expands to concrete service names passed to
+`docker compose logs`, so it is a narrower stream rather than a filter applied
+after the fact; with no engine services deployed it falls back to all services
+and says so in the label.
+
 ### Added
 * **Reserve-only GPU lease: `infer-stack acquire --reserve-gpus N`.** Hold N
   *available* GPUs (count-based first-fit — infer-stack picks which, never a

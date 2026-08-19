@@ -63,6 +63,27 @@ from .cli.commands_leasing import (
 from .leasing import LeaseState
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
+# The Select value meaning "every service EXCEPT the gateway". This is the
+# default view: LiteLLM emits a line per proxied request, so on a busy host it
+# scrolls the engine output -- which is where errors actually appear -- off the
+# pane before anyone can read it. The gateway's own logs are one selection away
+# when they are what you want.
+ENGINE_SERVICES = '\x00engines'
+# Substring rather than equality: compose names the gateway service `litellm`
+# today, but deployment naming has carried suffixes before and a missed match
+# silently restores the noisy view.
+GATEWAY_SERVICE_HINT = 'litellm'
+
+
+def is_gateway_service(name: str) -> bool:
+    """Is this compose service the LiteLLM gateway rather than an engine?"""
+    return GATEWAY_SERVICE_HINT in str(name).lower()
+
+
+def engine_services(names) -> list[str]:
+    """Every service that is not the gateway, in the given order."""
+    return [n for n in names if not is_gateway_service(n)]
+
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
 # Two endpoint clicks within this window (on the same row) count as a
 # double-click and acquire it; a lone click only highlights. Keeps a stray
@@ -92,13 +113,18 @@ INFER_THEME = Theme(
 class _DockerLogProc:
     """A live ``docker compose logs -f`` process for one (or all) service(s)."""
 
-    def __init__(self, project: str, compose_file: str, service: str | None):
+    def __init__(self, project: str, compose_file: str, service=None):
         cmd = [
             'docker', 'compose', '-p', project, '-f', compose_file,
             'logs', '-f', '--tail', '200', '--no-color',
         ]
-        if service:
-            cmd.append(service)
+        # `docker compose logs` takes any number of service names, so the
+        # engines-only view is just the gateway left off the end rather than a
+        # filter applied to the stream.
+        if isinstance(service, (list, tuple)):
+            cmd.extend(str(s) for s in service)
+        elif service:
+            cmd.append(str(service))
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
@@ -592,7 +618,7 @@ class InferStackTUI(App):
         self._last_leases: list[Any] = []   # row-aligned with the leases table
         self._last_deployments: list[Any] = []   # row-aligned with the deployments table
         self._service_options: list[str] = []
-        self._log_service: str = ALL_SERVICES
+        self._log_service: str = ENGINE_SERVICES
         self._log_proc: Any = None
         self._log_lines: list[str] = []  # mirror of the log pane, for tests
         self._api_lines: list[str] = []  # mirror of the API output, for tests
@@ -697,7 +723,8 @@ class InferStackTUI(App):
                     with TabbedContent(id='docker-tabs'):
                         with TabPane('Logs', id='tab-logs'):
                             yield Select(
-                                [('(all services)', ALL_SERVICES)],
+                                [('(engines — no litellm)', ENGINE_SERVICES),
+                                 ('(all services)', ALL_SERVICES)],
                                 value=ALL_SERVICES, allow_blank=False,
                                 id='logsvc',
                             )
@@ -1446,10 +1473,19 @@ class InferStackTUI(App):
             return
         self._service_options = names
         select = self.query_one('#logsvc', Select)
-        options = [('(all services)', ALL_SERVICES)] + [(n, n) for n in names]
+        options = [
+            ('(engines — no litellm)', ENGINE_SERVICES),
+            ('(all services)', ALL_SERVICES),
+        ] + [(n, n) for n in names]
         select.set_options(options)
+        # Keep whatever is selected. The two sentinels are not service names,
+        # so they have to be allowed through explicitly or refreshing the
+        # service list would silently knock the view back to a default.
         select.value = (
-            self._log_service if self._log_service in names else ALL_SERVICES
+            self._log_service
+            if self._log_service in names
+            or self._log_service in (ENGINE_SERVICES, ALL_SERVICES)
+            else ENGINE_SERVICES
         )
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -1483,9 +1519,27 @@ class InferStackTUI(App):
         log = self.query_one('#logs', RichLog)
         log.clear()
         self._log_lines = []
-        label = service or 'all services'
+        target, label = self._resolve_log_target(service)
         log.write(f'— following logs: {label} —')
-        self._stream_logs(service or None)
+        self._stream_logs(target)
+
+    def _resolve_log_target(self, service: str):
+        """(what to hand `docker compose logs`, what to show the user).
+
+        ENGINE_SERVICES expands to the concrete non-gateway service names. If
+        there are none -- nothing deployed yet, or a compose file that could
+        not be read -- fall back to every service rather than passing an empty
+        list, which `docker compose logs` would read as "all" anyway but
+        without saying so in the label.
+        """
+        if service == ENGINE_SERVICES:
+            names = engine_services(self._service_names())
+            if not names:
+                return None, 'all services (no engine services yet)'
+            return names, f'engines: {", ".join(names)}'
+        if not service:
+            return None, 'all services'
+        return service, service
 
     def _terminate_logs(self) -> None:
         proc, self._log_proc = self._log_proc, None
