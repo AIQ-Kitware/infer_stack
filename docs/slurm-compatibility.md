@@ -57,10 +57,12 @@ the usual symptom of a lock file created by the first.
 allocation is not consulted at placement time — you get whatever
 `--allowed_gpus` says, or the whole machine if you omitted it.
 
-**A job that exceeds its own allocation is not rejected early.** infer-stack
-checks a request against the GPU pool it was given, so passing a two-GPU
-allow-list and asking for a four-GPU model fails at placement rather than at
-submission.
+**A job that exceeds its own allocation is not rejected at submission.**
+Slurm accepts the job; infer-stack only sees the mismatch at `acquire`. It does
+fail fast there — a request that cannot fit the allow-list even on an idle host
+is rejected immediately rather than queued, including one whose deployments are
+each placeable but cannot fit together — but that is minutes into the job
+rather than at `sbatch`.
 
 Declare resources to Slurm and pass the same slice to infer-stack, and the two
 agree. Skip either and they will not.

@@ -1461,6 +1461,40 @@ def _fake_weights(hf_cache: Path, model_id: str, mib: int):
     (snap / 'model.safetensors').write_bytes(b'x' * (mib * 1024 ** 2))
 
 
+
+def test_plan_on_idle_host_sees_the_aggregate_that_cannot_fit(tmp_path):
+    """Two deployments each placeable alone, impossible together.
+
+    The Incubilate shape: a tensor-parallel-4 answerer plus a 1-GPU extractor
+    on a 4-GPU host. Neither trips the planner's permanent-failure branch --
+    each fits by itself -- so only planning them as a set reveals that the
+    host can never hold both. The controller uses this to fail such a lease
+    immediately instead of queueing for capacity that cannot exist.
+    """
+    be = make_backend(tmp_path, spec='4x80')
+    plan = be.plan_on_idle_host([vllm('big', tp=4), vllm('ext')])
+    assert set(plan.assignments) == {'big'}
+    assert not plan.ok
+    assert any(e.startswith('ext') for e in plan.errors)
+
+    # ... and the pair that does fit reports no error, on the same host.
+    plan = be.plan_on_idle_host([vllm('big', tp=2), vllm('ext')])
+    assert set(plan.assignments) == {'big', 'ext'}
+    assert plan.ok
+
+
+def test_plan_on_idle_host_ignores_what_is_running(tmp_path):
+    """"Idle host" means idle: converged deployments and their pins do not
+    shrink the pool. Answering "is there room now" here would defeat the
+    point -- that is what the ordinary plan/converge path already reports."""
+    be = make_backend(tmp_path, spec='4x80')
+    be.converge([vllm('a'), vllm('b'), vllm('c'), vllm('d')])  # every GPU busy
+    assert len(be.observe()) == 4
+
+    plan = be.plan_on_idle_host([vllm('e', tp=4)])
+    assert plan.assignments == {'e': [0, 1, 2, 3]}
+    assert plan.ok
+
 def test_plan_enriches_floor_from_hf_cache(tmp_path):
     # A 20-GiB-weights model with NO declaration must still never plan onto
     # the 16-GiB card: the weight-bytes floor is attached automatically once

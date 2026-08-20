@@ -20,6 +20,7 @@ from infer_stack.leasing import (
     vllm_structural,
 )
 from infer_stack.leasing.backend import PlacementError, Readiness
+from infer_stack.leasing.placement import GpuPlan
 
 
 class FakeClock:
@@ -216,6 +217,143 @@ def test_gc_leaves_keepwarm_unless_evict():
     out = ctl.gc(evict_idle=True)  # --evict tears down idle keep-warm too
     assert gid in out.evicted_deployment_ids
     assert backend.observe() == set()
+
+
+# -- feasibility check: never queue for capacity that cannot exist ------------
+
+
+class HostBackend(BudgetBackend):
+    """A BudgetBackend that also knows how big the whole host is.
+
+    ``budget`` is how many slots are free right now; ``host_slots`` is the
+    total. ``costs`` maps an endpoint to the slots it needs. A request costing
+    more than ``host_slots`` can never be satisfied however long it waits --
+    which is exactly what ``plan_on_idle_host`` is asked to report.
+    """
+
+    def __init__(self, budget: int, host_slots: int, costs=None):
+        super().__init__(budget)
+        self.host_slots = host_slots
+        self.costs = dict(costs or {})
+        self.idle_plan_calls = 0
+
+    def _cost(self, deployment) -> int:
+        endpoint = next(iter(deployment.served), None)
+        return self.costs.get(endpoint, 1)
+
+    def plan_on_idle_host(self, desired):
+        self.idle_plan_calls += 1
+        plan = GpuPlan()
+        used = 0
+        for deployment in desired:
+            cost = self._cost(deployment)
+            if used + cost <= self.host_slots:
+                plan.assignments[deployment.id] = list(range(used, used + cost))
+                used += cost
+            else:
+                plan.errors.append(
+                    f'{deployment.id}: needs {cost} GPU(s), '
+                    f'{self.host_slots - used} of {self.host_slots} left'
+                )
+        return plan
+
+
+def _make_host(budget, host_slots, costs, sleep):
+    clock = FakeClock()
+    ledger = Ledger(SqliteStore(':memory:'), clock=clock, id_factory=_id_factory())
+    backend = HostBackend(budget=budget, host_slots=host_slots, costs=costs)
+    ctl = Controller(ledger, backend, clock=clock, sleep=sleep(clock, ledger))
+    return ctl, backend, clock, ledger
+
+
+def _advance_only(clock, ledger):
+    return lambda dt: clock.advance(dt)
+
+
+def test_lease_too_big_for_the_host_fails_without_waiting():
+    """A lease whose deployments cannot fit TOGETHER on an idle host must fail
+    at once, not wait out the placement timeout.
+
+    This is the Incubilate shape: a 4-GPU answerer plus a 1-GPU extractor,
+    held by one lease, on a 4-GPU host. Each deployment is individually
+    placeable, so the planner's permanent-failure branch says nothing; only the
+    aggregate is impossible. Waiting is worse than useless -- the lease holds
+    the answerer's GPUs for the whole timeout, so a request that could never
+    succeed blocks the ones that could.
+    """
+    ctl, backend, clock, ledger = _make_host(
+        budget=1, host_slots=4, costs={'BIG': 4, 'EXT': 1}, sleep=_advance_only)
+
+    start = clock()
+    with pytest.raises(PlacementError) as ei:
+        ctl.acquire('alice', [vreq('BIG'), vreq('EXT')],
+                    wait_for_placement=True, timeout=1800, interval=5)
+
+    assert clock() == start, 'waited for capacity that could never exist'
+    assert backend.idle_plan_calls == 1
+    assert 'waiting cannot help' in str(ei.value)
+    # And the lease must not linger holding what it did place.
+    leases, _ = ledger.status()
+    assert all(l.owner != 'alice' or l.state != 'active' for l in leases)
+    assert backend.observe() == set()
+
+
+def test_a_lease_that_merely_needs_room_still_queues():
+    """The check must not turn a legitimate queue into a failure.
+
+    Same machinery, but the request does fit an idle host -- it is only
+    blocked by another job right now. That is the case the admission queue
+    exists for, and it must still wait and then succeed.
+    """
+    state = {'a_lease': None, 'released': False}
+
+    def sleep(clock, ledger):
+        def _sleep(dt):
+            clock.advance(dt)
+            if state['a_lease'] and not state['released']:
+                ledger.release(state['a_lease'])
+                state['released'] = True
+        return _sleep
+
+    ctl, backend, _, _ = _make_host(
+        budget=1, host_slots=4, costs={'A': 1, 'B': 1}, sleep=sleep)
+    a = ctl.acquire('alice', [vreq('A')])
+    state['a_lease'] = a.lease.id
+
+    b = ctl.acquire('bob', [vreq('B')], wait_for_placement=True,
+                    timeout=100, interval=2)
+    assert b.deployments[0].id in backend.observe()
+    assert state['released'] is True
+    assert backend.idle_plan_calls == 1  # consulted once, said "keep waiting"
+
+
+def test_backend_without_an_idle_planner_is_unaffected():
+    """null/kubeai have no plan_on_idle_host: the check is skipped, not failed."""
+    ctl, backend, _, _ = _make(budget=1, sleep=_advance_only)
+    assert not hasattr(backend, 'plan_on_idle_host')
+    a = ctl.acquire('alice', [vreq('A')])
+    assert ctl._infeasible_alone(a.deployments, {g.id for g in a.deployments}) == {}
+
+
+def test_a_broken_feasibility_check_warns_and_falls_back_to_waiting():
+    """A check that raises must not fail the acquire -- and must not be silent.
+
+    The first version of this read ``plan.unplaced`` off a GpuPlan, which has
+    no such field. A bare ``except: return {}`` swallowed the AttributeError,
+    so the check was dead on every call and looked exactly like "everything is
+    feasible". Waiting is the right fallback; silence is not.
+    """
+    ctl, backend, clock, _ = _make_host(
+        budget=1, host_slots=4, costs={'BIG': 4, 'EXT': 1}, sleep=_advance_only)
+    backend.plan_on_idle_host = lambda desired: (_ for _ in ()).throw(
+        AttributeError("'GpuPlan' object has no attribute 'unplaced'"))
+
+    start = clock()
+    with pytest.warns(RuntimeWarning, match='feasibility check skipped'):
+        with pytest.raises(PlacementError):
+            ctl.acquire('alice', [vreq('BIG'), vreq('EXT')],
+                        wait_for_placement=True, timeout=10, interval=2)
+    assert clock() - start >= 10  # fell back to the old behavior: it waited
 
 
 if __name__ == '__main__':

@@ -2,6 +2,24 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### An impossible lease fails instead of queueing
+
+`acquire --wait-for-placement` queued whenever a deployment was unplaced,
+without asking whether the request could be satisfied at all. A lease whose
+deployments cannot fit *together* — a `tensor_parallel_size: 4` answerer plus a
+1-GPU extractor on a 4-GPU host — waited out the full 1800s timeout holding
+whatever it had already placed, so a request that could never succeed blocked
+the ones that could.
+
+The planner's permanent-failure branch does not catch this: each deployment is
+placeable on its own, and only the set is impossible.
+
+`acquire` now re-plans the lease's deployments alone on an idle host before it
+queues (`ComposeBackend.plan_on_idle_host`). If they do not fit *there*,
+waiting cannot help, so the lease is rolled back and `PlacementError` is raised
+at once. Backends without the method (null, kubeai) skip the check and queue
+exactly as before — it can turn a hang into an error, never the reverse.
+
 ### Tensor-parallel deployments can place again
 
 `min_vram_per_gpu` returned the weight-bytes floor unchanged, but that floor is

@@ -1666,6 +1666,32 @@ class ComposeBackend(ConvergeScaffold):
             skip_display=self.skip_display,
         )
 
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Placement for ``desired`` alone, as if nothing else were running.
+
+        The question this answers is "could this request EVER be satisfied
+        here", separate from "is there room right now". Same planner, same
+        inventory and allow-list; the difference from :meth:`plan` is that pins
+        are dropped, and that the caller passes only the deployments it is
+        asking about. So an unplaced result means the host cannot serve the
+        request at all, not that it is busy.
+
+        The distinction matters because the two failures look identical while
+        waiting: an admission queue that waits out its timeout for capacity
+        that could never exist is indistinguishable, from the outside, from one
+        waiting on a GPU that is about to free.
+        """
+        desired = list(desired)
+        self._enrich_placement(desired)
+        return plan_placement(
+            desired,
+            self.inventory,
+            allowed_gpus=self.allowed_gpus,
+            reserved=self.reserved,
+            pinned={},
+            skip_display=self.skip_display,
+        )
+
     def _enrich_placement(self, desired: list[Deployment]) -> None:
         """Attach VRAM facts to vLLM deployments before planning (in-memory).
 
