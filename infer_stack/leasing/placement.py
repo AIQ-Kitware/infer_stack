@@ -7,7 +7,12 @@ will" from the redesign. Multi-node placement, preemption, and migration are
 explicitly out of scope (that is KubeAI/k8s/Slurm territory); single-host
 VRAM-eligibility filtering + greedy best-fit IS in scope — see
 ``docs/planning/vram-aware-placement.md`` for the objective and the scope
-amendment. At this tool's scale (≤ 8 GPUs, a handful of deployments) greedy
+amendment.
+
+Running UNDER Slurm is a different thing from Slurm being out of scope, and the
+two are easy to confuse: Slurm allocates GPUs to a job, and this placer then
+works within that allocation via ``allowed_gpus``. See
+``docs/slurm-compatibility.md``. At this tool's scale (≤ 8 GPUs, a handful of deployments) greedy
 best-fit is adequate; there is deliberately no bin-packing solver.
 
 Placement rules, applied in a deterministic order so the result is stable across

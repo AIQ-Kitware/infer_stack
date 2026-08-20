@@ -21,6 +21,18 @@ pipeline_parallel_size`. `data_parallel_size` is deliberately excluded: it
 replicates the model, so each replica needs the whole thing. A declared
 `placement.min_vram_gib` is untouched, being per-GPU by convention.
 
+### Documented the Slurm compatibility model
+
+`docs/slurm-compatibility.md`. Slurm allocates GPUs to jobs; infer-stack places
+models within the allocation it was given. The two do not overlap, and the
+module docstring saying multi-node placement is "Slurm territory" was easy to
+read as "does not work under Slurm".
+
+States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
+`--allowed_gpus`. Without it placement considers every GPU on the machine,
+including cards allocated to another job, and the failure surfaces later as a
+CUDA OOM in whichever job loses.
+
 ## [Version 0.7.0] - Unreleased
 
 ### TUI: the logs pane defaults to engines, not everything
