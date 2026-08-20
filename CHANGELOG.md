@@ -2,6 +2,25 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Tensor-parallel deployments can place again
+
+`min_vram_per_gpu` returned the weight-bytes floor unchanged, but that floor is
+a WHOLE-MODEL figure while the function's contract is per-GPU. A
+tensor-parallel deployment therefore demanded the entire model on each of its
+cards — so tensor parallelism was unusable exactly when it was needed, since
+the only host that could satisfy it was one where a single card could hold the
+whole model anyway.
+
+Observed: `qwen2.5-72b` at `tensor_parallel_size: 2` asked for 135.43 GiB on
+each of two 95.59 GiB cards and reported "the pool can never satisfy that",
+where ~68 GiB per card is the real requirement. It starved every job that
+needed it as an extractor.
+
+The floor is now divided by `weight_shard_count()` — `tensor_parallel_size ×
+pipeline_parallel_size`. `data_parallel_size` is deliberately excluded: it
+replicates the model, so each replica needs the whole thing. A declared
+`placement.min_vram_gib` is untouched, being per-GPU by convention.
+
 ## [Version 0.7.0] - Unreleased
 
 ### TUI: the logs pane defaults to engines, not everything
