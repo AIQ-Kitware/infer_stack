@@ -1671,10 +1671,25 @@ class ComposeBackend(ConvergeScaffold):
 
         The question this answers is "could this request EVER be satisfied
         here", separate from "is there room right now". Same planner, same
-        inventory and allow-list; the difference from :meth:`plan` is that pins
-        are dropped, and that the caller passes only the deployments it is
+        inventory and allow-list; the difference from :meth:`plan` is which
+        pins survive, and that the caller passes only the deployments it is
         asking about. So an unplaced result means the host cannot serve the
         request at all, not that it is busy.
+
+        "Idle" means *free of everything unrelated to this request*, not
+        *empty*. Pins are kept for the requested deployments and dropped for
+        everything else:
+
+        * An unrelated deployment's pin is contention — precisely what the
+          check exists to see past — so it goes.
+        * A requested deployment that is ALREADY placed keeps its GPU. Under
+          Slurm that GPU may sit outside this call's ``allowed_gpus``: a shared
+          extractor another job started is reusable exactly as it is (see
+          ``docs/slurm-compatibility.md``, and ``pin_pool_set`` in
+          :func:`~infer_stack.leasing.placement.plan_placement`, which
+          validates pins against the whole host). Dropping that pin would force
+          the extractor back inside our own slice and count it against our
+          budget, rejecting a lease that is merely waiting for a GPU to free.
 
         The distinction matters because the two failures look identical while
         waiting: an admission queue that waits out its timeout for capacity
@@ -1682,13 +1697,19 @@ class ComposeBackend(ConvergeScaffold):
         waiting on a GPU that is about to free.
         """
         desired = list(desired)
+        requested = {deployment.id for deployment in desired}
+        pinned = {
+            gid: gpus
+            for gid, gpus in self._load_sidecar().get('assignments', {}).items()
+            if gid in requested
+        }
         self._enrich_placement(desired)
         return plan_placement(
             desired,
             self.inventory,
             allowed_gpus=self.allowed_gpus,
             reserved=self.reserved,
-            pinned={},
+            pinned=pinned,
             skip_display=self.skip_display,
         )
 

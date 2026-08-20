@@ -20,6 +20,14 @@ waiting cannot help, so the lease is rolled back and `PlacementError` is raised
 at once. Backends without the method (null, kubeai) skip the check and queue
 exactly as before — it can turn a hang into an error, never the reverse.
 
+"Idle" means free of everything *unrelated* to the request, not empty. Pins of
+the requested deployments are kept; every other pin is dropped. Under Slurm a
+requested deployment may already be running on a GPU outside this call's
+`allowed_gpus` — a shared extractor another job started — and that is reusable
+as it stands. Dropping its pin would force it back inside our own slice, count
+it against our budget, and reject a lease that was only waiting for a card to
+free.
+
 ### Tensor-parallel deployments can place again
 
 `min_vram_per_gpu` returned the weight-bytes floor unchanged, but that floor is
