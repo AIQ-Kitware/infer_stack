@@ -570,6 +570,16 @@ class DoctorCLI(_PathOverridesMixin):
     answering) and prints a checklist. Exits nonzero if any check fails, so
     scripts can gate on it. Backends without a preflight (null/compose) report
     that there is nothing to check.
+
+    ``--gpu`` adds host GPU checks: is any card busy with nothing allocated,
+    and who holds the device nodes. ``--sudo`` lets the holder scan run as
+    root, which is the only way it means anything -- unprivileged it sees only
+    your own processes, and every containerd shim and Kubernetes pod is owned
+    by root. Without it the holder check reports *not checked* rather than a
+    clean bill of health.
+
+    It never resets or kills anything. The same symptom with a different holder
+    means something else entirely, so the fix is always the operator's call.
     """
 
     __command__ = 'doctor'
@@ -578,6 +588,11 @@ class DoctorCLI(_PathOverridesMixin):
         None, type=str,
         help='Backend to check (default: the configured `backend` setting).',
     )
+    gpu = scfg.Value(False, isflag=True,
+                     help='Also check host GPUs (implied by --sudo).')
+    sudo = scfg.Value(False, isflag=True,
+                      help='Run the GPU holder scan as root. Without it that '
+                           'check reports "not checked", never "clear".')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -590,9 +605,15 @@ class DoctorCLI(_PathOverridesMixin):
         name = type(backend).__name__
         if doctor is None:
             print(f'{name}: no preflight checks defined — nothing to verify.')
-            return 0
+            if not (config['gpu'] or config['sudo']):
+                return 0
+            doctor = list  # GPU checks still apply; the backend just has none
         failed = 0
-        for check, ok, detail in doctor():
+        checks = list(doctor())
+        if config['gpu'] or config['sudo']:
+            from ..gpu_doctor import gpu_checks
+            checks += list(gpu_checks(use_sudo=bool(config['sudo'])))
+        for check, ok, detail in checks:
             mark = 'ok  ' if ok else 'FAIL'
             line = f'[{mark}] {check}'
             if detail:

@@ -2,6 +2,30 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `doctor --gpu` / `--sudo`: why a card looks busy, and who holds it
+
+Twice a GPU has read 100% utilization with ~0 MiB allocated and an empty
+process table, and twice the diagnosis took hours. The tools mislead in a
+specific way: unprivileged `lsof`/`fuser` see only the caller's own processes,
+so they report "nothing holds it" while `nvidia-smi -r` answers `In use by
+another client`. Every containerd shim and Kubernetes pod is owned by root.
+
+`--gpu` samples utilization over several seconds (it is a windowed average, so
+one reading after a process exits proves nothing) and flags a card that is busy
+with nothing allocated. `--sudo` runs the holder scan as root and maps each pid
+to its cgroup, which is what names the container or pod — `pid 9030` is not an
+answer, `gpu-feature-discovery in kubernetes pod 00397bb3…` is.
+
+Without `--sudo` the holder check reports **not checked**, never "clear". A
+false all-clear is what led to recommending a reset that could not succeed.
+
+`nvidia-persistenced` holding every device is treated as expected, but named,
+because it is why `nvidia-smi -pm 0` does not let a reset through: that turns
+the mode off and leaves the daemon holding its handles.
+
+Nothing here resets or kills. The same symptom with a different holder means
+something else, and both times the card computed fine — the gauge was cosmetic.
+
 ### An impossible lease fails instead of queueing
 
 `acquire --wait-for-placement` queued whenever a deployment was unplaced,
