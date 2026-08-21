@@ -13,7 +13,8 @@ polled while hidden:
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
 * **docker** — a collapsible pane with **Logs** and **Containers** (the
-  ``docker ps`` view: status/uptime, created, id, ports) tabs.
+  ``docker ps`` view: status/uptime, created, id, ports) tabs (collapsed by
+  default; ``c`` toggles it).
 * **system** — live ``nvidia-smi`` GPUs + host CPU/mem (collapsed by default).
 * **api** — send a prompt to a *ready* model through the LiteLLM gateway
   (collapsed by default).
@@ -551,7 +552,7 @@ class InferStackTUI(App):
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
-        Binding('c', 'toggle_docker', 'Collapse docker', show=False),
+        Binding('c', 'toggle_docker', 'Toggle docker', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
@@ -628,7 +629,9 @@ class InferStackTUI(App):
         self._leases_h = 14   # resizable by dragging #tsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
-        self._collapsed = {'docker': False, 'system': True}
+        # Must match the Collapsible widgets' initial state, or the gate in
+        # _collect polls for a pane that is shut until the first sync.
+        self._collapsed = {'docker': True, 'system': True}
         self._ready_endpoints: list[str] = []
         # served endpoint name -> OpenAI surface ('chat' | 'completions'), read
         # from the live deployment payload so the API tab probes the surface a
@@ -719,7 +722,7 @@ class InferStackTUI(App):
                             yield Button('Evict all idle', id='btn-evict-all')
                             yield Button('Clean up', id='btn-cleanup-deployments')
                 yield _Divider('y', self._drag_logs, id='hsplit')
-                with Collapsible(title='docker', collapsed=False, id='docker'):
+                with Collapsible(title='docker', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
                         with TabPane('Logs', id='tab-logs'):
                             yield Select(
@@ -899,7 +902,12 @@ class InferStackTUI(App):
         self._update_api_urls()
         self._update_api_curl()
         self._first_paint()           # instant paint from cheap ledger state
-        self._restart_logs(self._log_service)
+        # `docker compose logs -f` is a live subprocess, not a poll, so the
+        # collapsed gate in _collect does not stop it. Starting it for a pane
+        # nobody is looking at costs a process and a stream of lines from
+        # startup onward. _sync_pane_state starts it when the pane opens.
+        if not self.query_one('#docker', Collapsible).collapsed:
+            self._restart_logs(self._log_service)
         self._refresh_timer = self.set_interval(
             self.ledger_interval, self.action_refresh
         )
@@ -1149,11 +1157,18 @@ class InferStackTUI(App):
         in ``_collect`` reflects reality — Collapsible.Toggled doesn't fire on
         every path, so don't depend on it alone."""
         try:
+            was_collapsed = self._collapsed['docker']
             self._collapsed['docker'] = \
                 self.query_one('#docker', Collapsible).collapsed
             self._collapsed['system'] = \
                 self.query_one('#system', Collapsible).collapsed
             self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
+            # Follow logs only while somebody can see them.
+            if was_collapsed and not self._collapsed['docker']:
+                if self._log_proc is None:
+                    self._restart_logs(self._log_service)
+            elif not was_collapsed and self._collapsed['docker']:
+                self._terminate_logs()
         except Exception:  # noqa: BLE001
             pass
 
