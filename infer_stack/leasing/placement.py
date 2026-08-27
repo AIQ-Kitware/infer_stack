@@ -98,16 +98,28 @@ def required_gpu_count(deployment: Deployment) -> int:
     never a pinned index). A vLLM deployment needs tensor × pipeline × data
     parallelism.
 
-    A ``runtime.simulator`` deployment needs **none**: it serves the API from
-    CPU. That is not a detail -- ``max(1, ...)`` below would otherwise make
-    every simulator endpoint unplaceable on a GPU-less host, which is exactly
-    the host a simulator exists to serve.
+    Two runtime markers mean **none**, and they are not the same thing:
+
+    ``runtime.simulator`` says the process is a simulator whose command line
+    differs from vLLM's, so it is also what selects :func:`simulator_args`
+    instead of the vLLM renderer.
+
+    ``runtime.cpu_only`` says only that the deployment needs no GPU. Its
+    command line is still vLLM's. That is the oracle mock in
+    ``dev/e2e_tests/catalog-mock-oracle.yaml``: it deliberately parses vLLM's
+    own arguments, so it must NOT be marked ``simulator``, but it serves from
+    CPU and ``max(1, ...)`` below would otherwise make it unplaceable on the
+    GPU-less host it exists for.
+
+    Both are explicit markers. Neither is inferred from
+    ``gpu_memory_utilization: 0.0`` -- a real deployment may legitimately set
+    that low -- nor from the image name, which is not a contract.
     """
     reserved = deployment.spec.get('reserved_gpu_count')
     if reserved:
         return max(1, int(reserved))
     runtime = deployment.spec.get('runtime', {}) or {}
-    if runtime.get('simulator'):
+    if runtime.get('simulator') or runtime.get('cpu_only'):
         return 0
     tp = int(runtime.get('tensor_parallel_size', 1) or 1)
     pp = int(runtime.get('pipeline_parallel_size', 1) or 1)

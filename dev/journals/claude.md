@@ -2459,3 +2459,96 @@ processes) plus a readiness generation probe. On the simulator that dominates
 the wall clock of a 32-shard rehearsal. On real hardware it should be noise
 against minutes of generation, but I have not measured it there, and it is a
 reason to prefer fewer, larger shards.
+
+## 2026-08-27 18:55:00 -0400
+
+Model: Claude Opus 5 (1M context), `claude-opus-5[1m]`, Claude Code, default
+reasoning effort, bypass-permissions sandbox.
+
+**Intent.** Three release-relevant issues from review of the
+`dev/mock-inference-server` PR, scoped deliberately narrowly: make the
+documented oracle catalog actually deliver a GPU-less answer-key oracle; make
+`infer-stack test` honour `INFER_STACK_CATALOG`; and canonicalize served
+aliases before any simulator behaviour is keyed on model identity. Explicitly
+out of scope: auth/introspection, deployment compat-key lifecycle, `doctor`,
+`status`, GPU-doctor reporting. The API-fidelity (`llm-d-inference-sim`) and
+answer-aware (`infer_stack.mockserver`) mocks stay as two things; neither
+replaces the other.
+
+**The CPU-only representation, which was the one real design choice.** The
+oracle mock is vLLM-shaped on purpose — its entrypoint parses vLLM's own
+command line, which is what lets a catalog deploy it with an image override
+and nothing else. But `required_gpu_count()` treated "not a
+`runtime.simulator`" as "wants a GPU", so the documented CPU-only endpoint was
+unplaceable on the CPU-only host it exists for. `runtime.simulator` was the
+tempting reuse and is wrong: it does double duty as *needs no GPU* and *does
+not speak vLLM's CLI*, and setting it would switch the renderer to
+`simulator_args()` and break the very property this mock is built around.
+
+So the two meanings are now two markers. `runtime.cpu_only: true` means only
+"needs no GPU" and leaves rendering alone; `runtime.simulator` keeps both of
+its meanings, unchanged. Rejected alternatives, both explicitly: inferring
+from `gpu_memory_utilization: 0.0` (a real deployment may legitimately set it
+low) and from the image name (not a contract). Unknown `runtime` keys never
+reach the command line — `vllm_args()` renders an allowlist plus `extra_args`
+— so the marker is inert to rendering by construction, not by care.
+
+The answer key ships *inside the image* rather than as a bind-mount. The
+fixture is `infer_stack/mockserver/data/oracle_questions.yaml`, already copied
+by `COPY infer_stack ./infer_stack`, so the catalog names an absolute in-image
+path and works on any host that can run the image. It carries the question
+corpus only — `questions`, `answer_key`, `composition` — and *not* model
+profiles: each model's ability stays on its endpoint as `--mock-ability`, so
+one corpus serves a whole cohort and competence is described where the
+deployment is. That split is the reusable part of the decision.
+
+**Alias canonicalization.** `resolve_profile()` already accepted either name;
+`complete()` then kept hashing the caller's string. Five sites — the failure
+draw, `knows()` and its composition recursion, the drift draw, the
+wrong-answer variant, and the mode context, which hashes on `model_id` too.
+Patching only the recursion would have removed the `KeyError` while leaving
+alias and canonical id simulating as different models, which is the worse
+failure because it is silent. `complete()` now rebinds `model_id =
+profile.model_id` immediately after resolving, and `knows()` canonicalizes
+independently and carries the resolved profile through recursion rather than
+re-looking-up the alias. Internal only: `/v1/models` still advertises the
+alias and either name is still accepted.
+
+**Validation.** Focused suites all green: mockserver, mock_vllm_serve,
+simulator_runtime, leasing_placement, cli_leasing, leasing_compose — 255
+passed. Full gate green: flake8 (E9,F63,F7,F82) clean, `ty check ./infer_stack`
+clean, `pytest -p no:doctest --xdoctest infer_stack tests` 504 passed / 3
+skipped in ~31s. I checked the new tests actually catch the old bugs rather
+than passing vacuously: 14 of 18 alias cases fail against the pre-fix
+simulator, and the `INFER_STACK_CATALOG` test fails against the pre-fix
+`_endpoint_protocol`.
+
+**Anomaly I could not reproduce.** The first combined `infer_stack tests` run
+exceeded a 600s cap. Four subsequent runs finished in ~31s each, and HEAD ran
+clean too, so I have no explanation and no reproduction. Flagging rather than
+burying it: we fixed a genuine test hang in this same branch yesterday, so an
+unexplained stall here deserves a second pair of eyes if anyone sees it again.
+
+**Risks and limits.** The healthcheck fix installs `curl` in the mock image so
+Compose's rendered `curl` healthcheck can run — the alternative (inherit the
+image's Python HEALTHCHECK by emitting none) would have meant keying compose
+behaviour on `cpu_only`, conflating "needs no GPU" with "lacks curl". Real
+vLLM images carry curl and being a drop-in for them is this image's whole
+purpose, so matching them won. The test asserts the dockerfile provisions
+whatever binary the rendered healthcheck invokes, which is the actual seam;
+it does not build the image, so it cannot catch an apt failure. `probe_ready()`
+is untouched and remains the real readiness gate.
+
+The oracle is answer-aware **only** for the fixture corpus. Unknown questions
+still get deterministic, cohort-correlated verdicts, but their "correct" text
+is a synthetic `answer-…` string. `docs/mock-endpoints.md` now says so
+explicitly, because the previous wording could be read as claiming gold
+answers for arbitrary downstream questions.
+
+Takeaways worth carrying: (1) when one flag has come to mean two things, adding
+a second narrow flag beats overloading the first — the overload here would have
+been invisible until the renderer changed under someone; (2) resolve an
+identity once at the boundary and rebind, rather than resolving and then
+continuing to use the caller's string, which is what turned an alias into a
+second simulated model; (3) a fixture that ships inside the artifact removes a
+whole class of host-specific setup, and is worth the packaging entry.

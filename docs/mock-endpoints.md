@@ -11,7 +11,7 @@ There are two simulators, and they are not interchangeable.
 | | `llm-d-inference-sim` | `infer_stack.mockserver` |
 |---|---|---|
 | catalog | `dev/e2e_tests/catalog-mock.yaml` | `dev/e2e_tests/catalog-mock-oracle.yaml` |
-| answers | random text from a sentence bank | correct at a configured rate, against an answer key |
+| answers | random text from a sentence bank | correct at a configured rate, against a shipped answer key |
 | API surface | vLLM's, closely | the parts a card uses |
 | streaming | SSE, with real TTFT / inter-token delay | no |
 | token usage | real prompt/completion counts | zeroed |
@@ -126,7 +126,46 @@ Close is not identical. As of `v0.9.0`:
   400. It does return 400 when the prompt exceeds `--max-model-len`.
 
 The oracle mock needs none of this — its entrypoint parses vLLM's command
-line, so `runtime.image` alone deploys it.
+line, so `runtime.image` deploys it.
+
+It does need two more things in `runtime`, and they are both explicit:
+
+* `cpu_only: true` — it serves from CPU, so it must be placeable on a host
+  with no GPU. This says *only* that. It is deliberately not
+  `runtime.simulator`, which additionally means "this process does not take
+  vLLM's command line" and would switch the renderer this mock depends on.
+  Nothing is inferred from `gpu_memory_utilization: 0.0` or from the image
+  name.
+* `--mock-config=` in `extra_args`, naming the answer-key fixture.
+
+### Where the answer key comes from
+
+The fixture is `infer_stack/mockserver/data/oracle_questions.yaml`, and it is
+baked into the image by `COPY infer_stack ./infer_stack`, so the catalog names
+an absolute in-image path and no bind-mount has to be arranged:
+
+```yaml
+extra_args:
+  - '--mock-ability=0.6'
+  - '--mock-config=/opt/infer-stack/infer_stack/mockserver/data/oracle_questions.yaml'
+```
+
+It holds the **question corpus only**: `questions`, the matching `answer_key`,
+and the `composition` map that makes a compound question correct only when
+every step is. Per-model behaviour stays on the endpoint — `--mock-ability`
+and `--mock-mode` — so one corpus serves the whole cohort and a model's
+competence is described where its deployment is.
+
+**What "answer-aware" does and does not mean.** For a question in the fixture,
+a model that gets it right returns the literal gold answer. For any other
+question the verdict is still deterministic and still correlated across the
+cohort — which is what a card's arithmetic is being exercised against — but
+the "correct" text is a synthetic `answer-…` string, because nothing has told
+the server what the right answer would be. Neither case says anything about a
+real model.
+
+A different corpus can be supplied by mounting one and pointing
+`--mock-config` at it.
 
 ## Endpoints worth knowing about
 

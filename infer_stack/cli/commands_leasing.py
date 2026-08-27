@@ -1943,11 +1943,15 @@ def _endpoint_protocol(config, name: str) -> str:
     Best-effort on purpose: ``test`` must still work against an endpoint that
     is live but absent from the catalog (an ad-hoc acquire), so a missing or
     unreadable catalog falls back to the default rather than failing.
+
+    Resolution goes through :func:`_catalog_path` rather than repeating it.
+    The copy here omitted ``INFER_STACK_CATALOG``, so leasing and ``test``
+    could read different catalogs on the same machine and ``test`` would probe
+    the wrong API surface for an endpoint it had resolved from the other one.
     """
     try:
         from ..leasing import Catalog
-        raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
-        path = Path(raw).expanduser()
+        path = _catalog_path(config)
         if not path.exists():
             return 'chat'
         ep = Catalog.load(path).endpoints.get(name)

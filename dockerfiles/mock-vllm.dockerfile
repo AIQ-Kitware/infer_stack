@@ -17,11 +17,22 @@
 #         image: aiq-mock-vllm:latest
 #         max_model_len: 2048
 #
-# A fixture can be mounted at /mock/config.yaml to give the simulator an
-# answer key; without one it still serves, using --mock-ability.
+# The answer-key fixture ships in the image: `COPY infer_stack` below brings
+# infer_stack/mockserver/data/oracle_questions.yaml with it, so a catalog can
+# point --mock-config at an absolute in-image path with no bind-mount. A
+# different fixture can still be mounted and named instead.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# curl is here for the healthcheck, not for the server. infer-stack renders one
+# compose healthcheck for every vLLM-shaped deployment and it shells out to
+# curl, which real vLLM images carry. Being a drop-in for those images is the
+# whole point of this one, so it carries curl too. Without it compose marks a
+# perfectly healthy container unhealthy forever.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/infer-stack
 COPY pyproject.toml README.md ./

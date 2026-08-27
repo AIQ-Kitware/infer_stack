@@ -330,7 +330,8 @@ class Simulator:
         measure a true null no matter how much data it was given.
 
         Args:
-            model_id (str): the answering model.
+            model_id (str): the answering model, by canonical id or served
+                alias.
             latent_key (str): the question identity.
             profile (ModelProfile | None): resolved from ``model_id`` when
                 omitted.
@@ -339,7 +340,14 @@ class Simulator:
             bool
         """
         if profile is None:
-            profile = self.profiles[model_id]
+            profile = self.resolve_profile(model_id)
+            if profile is None:
+                raise KeyError(model_id)
+
+        # From here on the profile's own id is the identity, never the string
+        # the caller passed: an alias and a canonical id name one model and
+        # must draw one outcome.
+        model_id = profile.model_id
 
         own = unit_hash(self.seed, 'knows', model_id, latent_key) < (
             _skill_vs_difficulty(
@@ -354,7 +362,7 @@ class Simulator:
         for step_key in self.composition.get(latent_key, ()):
             if step_key == latent_key:
                 continue
-            if not self.knows(model_id, step_key, self.profiles[model_id]):
+            if not self.knows(model_id, step_key, profile):
                 return False
         return True
 
@@ -397,6 +405,16 @@ class Simulator:
         profile = self.resolve_profile(model_id)
         if profile is None:
             raise KeyError(model_id)
+
+        # The request may name the model by its canonical id or by its served
+        # alias. Both name one model, so every deterministic draw below keys on
+        # the profile's own id -- otherwise the same model simulates as two,
+        # and a compositional question asked through an alias recurses into a
+        # profiles lookup that has no such key.
+        #
+        # This is internal only: /v1/models still advertises the alias, and
+        # clients may still ask for either name.
+        model_id = profile.model_id
 
         prompt = flatten_messages(messages)
         latent_key = self.latent_key_for(prompt)

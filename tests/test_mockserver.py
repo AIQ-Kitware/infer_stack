@@ -595,6 +595,93 @@ def test_a_model_can_be_requested_by_its_served_alias():
     assert by_alias['choices'][0]['text'] == by_id['choices'][0]['text']
 
 
+def _alias_simulator():
+    """One model with an alias, a compositional question, and a failure rate.
+
+    Every deterministic draw in ``complete`` keys on model identity: the
+    failure draw, ``knows`` (including its recursion into composition steps),
+    the drift draw, the wrong-answer variant, and the mode context. A profile
+    with a nonzero ``failure_rate`` and a consistency below one exercises the
+    first and third, which a defaults-only profile never reaches.
+    """
+    from infer_stack.mockserver.simulator import ModelProfile, Simulator
+
+    profile = ModelProfile(
+        'org/Big-Model-v2', ability=0.6, consistency=0.5, failure_rate=0.3
+    )
+    profile.served_model_name = 'big'
+    return Simulator(
+        profiles={'org/Big-Model-v2': profile},
+        answer_key={'parent': 'PARENT-GOLD', 'child': 'CHILD-GOLD'},
+        questions={'parent': 'What is the parent question?',
+                   'child': 'What is the child question?'},
+        composition={'parent': ['child']},
+        seed='alias-seed',
+    )
+
+
+@pytest.mark.parametrize('text', [
+    'What is the parent question?',   # compositional: recurses into 'child'
+    'What is the child question?',
+    'a question nobody registered',   # anonymous latent key
+])
+@pytest.mark.parametrize('temperature,sample_index', [
+    (0.0, 0),
+    (0.0, 1),
+    (0.7, 1),    # nonzero temperature: the drift draw is live
+    (0.7, 3),
+    (1.0, 5),
+])
+def test_an_alias_simulates_the_same_model_as_its_canonical_id(
+        text, temperature, sample_index):
+    """An alias and a canonical id name one model, so they must draw alike.
+
+    Resolving the profile and then hashing the caller's string made the same
+    configured model behave as two different ones, differing in correctness
+    and in text. Requesting through the alias also crashed on a compositional
+    question, because the recursion looked the alias up in ``profiles``.
+    """
+    sim = _alias_simulator()
+
+    def ask(name):
+        return sim.complete(name, [{'role': 'user', 'content': text}],
+                            temperature=temperature,
+                            sample_index=sample_index)
+
+    canonical = ask('org/Big-Model-v2')
+    alias = ask('big')
+
+    assert alias.text == canonical.text
+    assert alias.is_correct == canonical.is_correct
+    assert alias.latent_key == canonical.latent_key
+    assert alias.should_fail == canonical.should_fail
+    assert alias.finish_reason == canonical.finish_reason
+
+
+def test_a_compositional_question_through_an_alias_does_not_raise():
+    """The recursion used to do ``self.profiles[alias]`` and KeyError."""
+    sim = _alias_simulator()
+    result = sim.complete(
+        'big', [{'role': 'user', 'content': 'What is the parent question?'}]
+    )
+    assert result.latent_key == 'parent'
+
+
+def test_the_alias_is_still_what_the_server_advertises():
+    """Canonicalization is internal; the served surface is unchanged."""
+    config = dict(COHORT)
+    config['models'] = {'Qwen/Qwen3-8B': {'ability': 0.9,
+                                          'served_model_name': 'qwen3'}}
+    with MockServer(config, port=0) as server:
+        listed = _get(server.url + '/v1/models')
+        by_alias = _post(server.url + '/v1/completions',
+                         {'model': 'qwen3', 'prompt': 'hi'})
+        by_id = _post(server.url + '/v1/completions',
+                      {'model': 'Qwen/Qwen3-8B', 'prompt': 'hi'})
+    assert [e['id'] for e in listed['data']] == ['qwen3']
+    assert by_alias['choices'][0]['text'] == by_id['choices'][0]['text']
+
+
 def test_exceeding_max_model_len_is_a_context_length_error():
     # Otherwise only reachable with a genuinely long prompt, which makes the
     # client's overflow path effectively untested.

@@ -61,6 +61,11 @@ dynamic.version.attr = "infer_stack.__version__"
 package-data.infer_stack = [
   "templates/*.yaml",
   "templates/*.j2",
+  # The oracle mock's answer-key corpus. The mock image installs with `-e .`
+  # so the source path already resolves there, but a non-editable install of
+  # infer-stack must ship it too: a catalog names it by an absolute path
+  # inside the package, not by a bind-mount.
+  "mockserver/data/*.yaml",
 ]
 package-data."*" = [
   "requirements/*.txt",
