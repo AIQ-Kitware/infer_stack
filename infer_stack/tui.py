@@ -1701,6 +1701,8 @@ class InferStackTUI(App):
         """Space: toggle the cursor row of the focused leases/deployments table."""
         focused = self.focused
         tid = getattr(focused, 'id', None)
+        if tid is None:
+            return
         res = self._table_sel(tid)
         if res is None:
             return

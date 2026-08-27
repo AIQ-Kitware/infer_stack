@@ -96,7 +96,7 @@ class MockServeCLI(scfg.DataConfig):
 
     @classmethod
     def main(cls, argv=None, **kwargs):
-        import kwutil
+        import yaml
 
         from ..mockserver.modes import available_modes
         from ..mockserver.server import MockServer
@@ -116,7 +116,9 @@ class MockServeCLI(scfg.DataConfig):
         # normally arrives from YAML.
         spec: dict[str, Any]
         if config.config_fpath:
-            spec = kwutil.Yaml.coerce(ub.Path(config.config_fpath).read_text())
+            spec = yaml.safe_load(
+                ub.Path(config.config_fpath).read_text()
+            ) or {}
         else:
             # A cohort still has to *vary* to be useful, so the built-in
             # default is a spread of abilities rather than one model.

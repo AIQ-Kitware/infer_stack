@@ -221,22 +221,29 @@ class Simulator:
 
     Example:
         >>> from infer_stack.mockserver.simulator import ModelProfile, Simulator
+        >>> questions = {f'q{i}': f'Question number {i}?' for i in range(12)}
         >>> sim = Simulator(
         ...     profiles={'strong': ModelProfile('strong', ability=0.95),
         ...               'weak': ModelProfile('weak', ability=0.05)},
-        ...     answer_key={'q1': 'Paris'},
-        ...     questions={'q1': 'What is the capital of France?'},
+        ...     answer_key={key: f'answer-{key}' for key in questions},
+        ...     questions=questions,
         ...     seed='demo',
         ... )
-        >>> msgs = [{'role': 'user',
-        ...          'content': 'What is the capital of France?'}]
-        >>> strong = sim.complete('strong', msgs, temperature=0.0, sample_index=0)
-        >>> weak = sim.complete('weak', msgs, temperature=0.0, sample_index=0)
-        >>> assert strong.latent_key == 'q1'
-        >>> assert strong.is_correct and not weak.is_correct
+        >>> def ask(model, text):
+        ...     return sim.complete(model, [{'role': 'user', 'content': text}],
+        ...                         temperature=0.0, sample_index=0)
+        >>> # A prompt resolves to the question it is about.
+        >>> ask('strong', 'Question number 3?').latent_key
+        'q3'
+        >>> # Ability shows up across questions, not in any single one: a
+        >>> # 0.05-ability model still gets the occasional easy one right,
+        >>> # so asserting one draw would pin the seed rather than the model.
+        >>> score = lambda m: sum(ask(m, t).is_correct for t in questions.values())
+        >>> score('strong') > score('weak')
+        True
         >>> # Reproducible.
-        >>> again = sim.complete('strong', msgs, temperature=0.0, sample_index=0)
-        >>> assert again.text == strong.text
+        >>> first = ask('strong', 'Question number 3?')
+        >>> assert ask('strong', 'Question number 3?').text == first.text
     """
 
     def __init__(

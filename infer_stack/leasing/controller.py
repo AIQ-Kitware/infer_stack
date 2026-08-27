@@ -451,14 +451,18 @@ class Controller:
         """
         self.ledger.sweep()
         desired = self.desired_deployments()
-        if hasattr(self.backend, 'converge'):
+        # Bound once rather than probed with hasattr: the capability check is
+        # the same, and the bound method keeps its type instead of narrowing
+        # to `object` the way an attribute reached through hasattr does.
+        converge = getattr(self.backend, 'converge', None)
+        if converge is not None:
             before = set(self.backend.observe())
             try:
-                self.backend.converge(desired, apply=False)
+                converge(desired, apply=False)
             except TypeError:
                 # Legacy converge(desired) with no apply kwarg renders+applies
                 # in one shot (no separate apply()); accept that here.
-                self.backend.converge(desired)
+                converge(desired)
             after = set(self.backend.observe())
             return ReconcileResult(
                 realized=sorted(after - before),

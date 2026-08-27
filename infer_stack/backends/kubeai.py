@@ -100,6 +100,18 @@ def _model_doc(
     runtime = deployment.spec.get('runtime', {}) or {}
     min_replicas = int(runtime.get('min_replicas', 1) or 1)
     max_replicas = max(min_replicas, int(runtime.get('max_replicas', 1) or 1))
+    # Bound separately so its type comes from the annotation rather than
+    # being inferred from the literal: `env` is added below and a value type
+    # narrowed to what the literal happens to contain would reject it.
+    spec: dict[str, Any] = {
+        'features': ['TextGeneration'],
+        'url': f'hf://{deployment.spec["hf_model_id"]}',
+        'engine': 'VLLM',
+        'resourceProfile': profile,
+        'minReplicas': min_replicas,
+        'maxReplicas': max_replicas,
+        'args': vllm_args(svc),
+    }
     doc: dict[str, Any] = {
         'apiVersion': 'kubeai.org/v1',
         'kind': 'Model',
@@ -111,20 +123,12 @@ def _model_doc(
                 DEPLOYMENT_LABEL: deployment.id,
             },
         },
-        'spec': {
-            'features': ['TextGeneration'],
-            'url': f'hf://{deployment.spec["hf_model_id"]}',
-            'engine': 'VLLM',
-            'resourceProfile': profile,
-            'minReplicas': min_replicas,
-            'maxReplicas': max_replicas,
-            'args': vllm_args(svc),
-        },
+        'spec': spec,
     }
     # Attention backend is a vLLM env var, not a CLI arg (see compose._vllm_service);
     # forward it through the KubeAI Model's env map for parity across backends.
     if svc.get('attention_backend'):
-        doc['spec']['env'] = {'VLLM_ATTENTION_BACKEND': str(svc['attention_backend'])}
+        spec['env'] = {'VLLM_ATTENTION_BACKEND': str(svc['attention_backend'])}
     return doc
 
 

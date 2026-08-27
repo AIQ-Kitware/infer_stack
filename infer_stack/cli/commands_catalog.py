@@ -115,7 +115,9 @@ def _exists_guard(data, section, name, force, entry, hint='') -> str:
         return 'unchanged'
 
     if isinstance(existing, dict) and isinstance(entry, dict):
-        keys = sorted(set(existing) | set(entry))
+        # key=str: these are YAML mapping keys, so string in practice, but
+        # the static type is `object` and sorting needs a total order.
+        keys = sorted(set(existing) | set(entry), key=str)
         diff = [f'    {k}: {existing.get(k, "(absent)")!r} -> {entry.get(k, "(absent)")!r}'
                 for k in keys if existing.get(k) != entry.get(k)]
         detail = '\n' + '\n'.join(diff)

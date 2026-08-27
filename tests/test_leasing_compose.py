@@ -1458,7 +1458,11 @@ def _fake_weights(hf_cache: Path, model_id: str, mib: int):
         / 'snapshots' / 'rev0'
     )
     snap.mkdir(parents=True)
-    (snap / 'model.safetensors').write_bytes(b'x' * (mib * 1024 ** 2))
+    # Sparse: the floor is read with os.path.getsize, which stats rather than
+    # reads, so the bytes never have to exist. Materializing them cost 20 GiB
+    # of RAM for the 20-GiB case and hit MemoryError on CI.
+    with open(snap / 'model.safetensors', 'wb') as file:
+        file.truncate(mib * 1024 ** 2)
 
 
 

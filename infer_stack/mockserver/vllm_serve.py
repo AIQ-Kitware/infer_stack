@@ -106,8 +106,8 @@ def config_from_args(args, unknown=()) -> dict:
     Returns:
         dict: a config for :class:`infer_stack.mockserver.MockServer`.
     """
-    import kwutil
     import ubelt as ub
+    import yaml
 
     model = args.model_flag or args.model
     if not model:
@@ -116,13 +116,15 @@ def config_from_args(args, unknown=()) -> dict:
             'with --model'
         )
 
-    # Annotated, and the models mapping bound to its own name: whatever
-    # `Yaml.coerce` returns is a union wide enough to include a list and a
-    # bool, so indexing straight through `config['models']` makes every
-    # access below look like an error.
+    # Annotated, and the models mapping bound to its own name: `safe_load`
+    # returns a union wide enough to include a list and a bool, so indexing
+    # straight through `config['models']` makes every access below look like
+    # an error.
     config: dict[str, Any]
     if args.mock_config:
-        config = dict(kwutil.Yaml.coerce(ub.Path(args.mock_config).read_text()))
+        config = dict(
+            yaml.safe_load(ub.Path(args.mock_config).read_text()) or {}
+        )
     else:
         config = {}
     models: dict[str, Any] = config.setdefault('models', {})
