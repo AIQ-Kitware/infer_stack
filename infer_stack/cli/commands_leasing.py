@@ -198,6 +198,11 @@ def _resolve_assume_yes(config, *, interactive: bool) -> bool:
 
     Only the additive verb (``acquire``) prompts, and only on a real terminal
     without ``--yes``. Everything else (release/leases/run/non-TTY) auto-applies.
+
+    Both streams are checked, because the prompt writes to one and reads from
+    the other. Testing stdout alone meant that under ``pytest -s`` -- where
+    stdout is the terminal -- acquire decided to prompt and then blocked
+    forever on a stdin nothing was going to type into.
     """
     import sys
 
@@ -205,7 +210,8 @@ def _resolve_assume_yes(config, *, interactive: bool) -> bool:
         return True
     if getattr(config, 'yes', False):
         return True
-    return not sys.stdout.isatty()
+    answerable = sys.stdin is not None and sys.stdin.isatty()
+    return not (answerable and sys.stdout.isatty())
 
 
 def _make_backend(config, *, interactive: bool = False):
