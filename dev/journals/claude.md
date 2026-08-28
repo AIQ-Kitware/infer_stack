@@ -2552,3 +2552,70 @@ identity once at the boundary and rebind, rather than resolving and then
 continuing to use the caller's string, which is what turned an alias into a
 second simulated model; (3) a fixture that ships inside the artifact removes a
 whole class of host-specific setup, and is worth the packaging entry.
+
+## 2026-08-28 10:40:00 -0400
+
+Model: Claude Opus 5 (1M context), `claude-opus-5[1m]`, Claude Code, default
+reasoning effort.
+
+**Intent.** CI was hanging after the xcookie refresh: the loose-sdist job ran
+nearly two hours, and sdist/3.12 both stalled right after
+`test_created_lock_file_and_dir_are_group_writable`. Some runs finished in 50s,
+so it was intermittent. Separately, pypy-3.11 (newly added to the matrix by the
+refresh) failed `test_leasing_coalesced_apply`, and Jon does not intend to
+support pypy.
+
+**This is the anomaly I flagged yesterday and could not reproduce.** Yesterday
+one combined run exceeded 600s and four retries were clean, so I logged it as
+unexplained. It was real. Worth remembering: an unreproduced stall in a
+concurrency test is evidence, not noise, and "I could not reproduce it" is a
+weaker statement than it feels like at the time.
+
+**Root cause, which turned out to be a product bug.** Looping the two
+concurrency files reproduced a hang in about 8% of runs. `faulthandler` showed
+one worker thread parked in `barrier.wait()` and the main thread in `join()` --
+so the *other* worker had died before reaching the barrier. In
+`test_acquire_serialized_across_separate_controllers` the Controller was built
+outside the `try`, so a construction failure killed the thread silently and
+stranded its peer on a two-party barrier forever.
+
+What killed it: `SqliteStore._ensure_schema` stamped the schema version with
+SELECT-then-INSERT. Two stores opening one fresh ledger concurrently both saw
+no row, both inserted, and the loser raised `UNIQUE constraint failed:
+meta.key`. A standalone repro hit it 5/400. Retrying could never have helped --
+by then the row exists, so the retry fails identically. It now inserts with
+`ON CONFLICT(key) DO NOTHING`, which is the idiom already used for
+`desired_gen` and `applied_gen` a few functions below. Repro: 0/400 after.
+
+This is not test-only. Two `infer-stack` CLIs starting against a fresh ledger is
+the ordinary case -- it is precisely what the cross-process lock exists to
+serialize, and that lock is taken *after* the store is constructed, so the
+store's own initialization was outside the protection the design assumes.
+
+**Test hardening, applied to all four concurrency sites** (two in
+`test_leasing_controller_lock.py`, two in `test_leasing_coalesced_apply.py`):
+every worker now constructs inside its `try`, `barrier.wait()` and `join()` both
+take a 30s bound, and a still-alive thread is an assertion rather than a wedge.
+The fix to the store removes today's cause; the bound removes the *class* of
+two-hour hang, so the next such bug fails in half a minute with a message.
+40 repeats clean, from ~8% hanging.
+
+**PyPy removed** from the tests matrix per Jon. Caveat I want on the record:
+`.github/workflows/tests.yml` is xcookie-generated, so a regeneration will
+reintroduce it. xcookie is not installed here and I did not want to invent a
+config key that might break generation, so I left a note in `[tool.xcookie]`
+saying what was removed and why. Someone who runs xcookie should set the real
+knob.
+
+**Validation.** flake8 clean, `ty` clean, full gate `pytest -p no:doctest
+--xdoctest infer_stack tests` 504 passed / 3 skipped, run three times at ~31s.
+Targeted loops: 40/40 clean on the concurrency files, 400/400 on the schema
+race.
+
+**Uncertainty.** I fixed the race I could reproduce and demonstrate. I cannot
+prove it is the *only* cause of the CI stalls -- the sdist job runs against an
+installed package on a slower, more contended machine, and I have not seen its
+faulthandler output. The bounded joins mean any remaining variant now reports
+itself instead of hanging, which is the property I would actually rely on.
+Takeaway worth keeping: schema/bootstrap paths run *before* whatever lock the
+design relies on, so they have to be idempotent on their own.

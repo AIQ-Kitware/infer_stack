@@ -24,6 +24,14 @@ from infer_stack.leasing import (
 )
 
 
+# A worker that dies before reaching the barrier leaves the survivors waiting
+# on it forever, and an unbounded join() then hangs the whole run rather than
+# failing it -- observed as a CI job stuck for nearly two hours. Both waits are
+# bounded, and every worker builds its own objects INSIDE the try so a
+# construction failure is recorded instead of silently killing the thread.
+THREAD_TIMEOUT_S = 30
+
+
 class OverlapBackend:
     """A converge-style backend that records max concurrent converges."""
 
@@ -59,16 +67,26 @@ def test_reconcile_is_serialized_across_threads(tmp_path):
     assert ctl._lock_path is not None  # file ledger -> real lock
 
     barrier = threading.Barrier(4)
+    errors: list = []
 
     def hammer():
-        barrier.wait()  # maximize the chance of overlap
-        ctl.reconcile()
+        try:
+            barrier.wait(timeout=THREAD_TIMEOUT_S)  # maximize overlap
+            ctl.reconcile()
+        except Exception as e:  # noqa: BLE001 - record, do not strand peers
+            errors.append(repr(e))
 
     threads = [threading.Thread(target=hammer) for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=THREAD_TIMEOUT_S)
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, (
+        f'{len(stuck)} worker(s) never finished; a peer probably died '
+        'before the barrier -- see errors above'
+    )
+    assert not errors, errors
 
     assert backend.max_active == 1, (
         f'reconcile converges overlapped (max_active={backend.max_active}); '
@@ -208,9 +226,14 @@ def test_acquire_serialized_across_separate_controllers(tmp_path):
     errors: list = []
 
     def worker(i):
-        ctl = Controller(Ledger(SqliteStore(db)), SharedOverlapBackend(shared, guard))
         try:
-            barrier.wait()
+            # Inside the try: two stores opening one fresh ledger at once used
+            # to race on stamping the schema version, and the loser's thread
+            # died here -- before the barrier -- hanging its peer forever.
+            ctl = Controller(
+                Ledger(SqliteStore(db)), SharedOverlapBackend(shared, guard)
+            )
+            barrier.wait(timeout=THREAD_TIMEOUT_S)
             out = ctl.acquire(f'owner{i}', [_vreq(f'm{i}')], wait=False)
             results[i] = out.lease.id
         except Exception as e:  # noqa: BLE001 - record for the assertion
@@ -220,7 +243,12 @@ def test_acquire_serialized_across_separate_controllers(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=THREAD_TIMEOUT_S)
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, (
+        f'{len(stuck)} worker(s) never finished; a peer probably died '
+        'before the barrier -- see errors above'
+    )
 
     assert not errors, f'acquire raced instead of blocking: {errors}'
     assert set(results) == {0, 1} and all(results.values()), results

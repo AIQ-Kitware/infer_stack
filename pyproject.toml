@@ -154,6 +154,11 @@ report.omit = [
 ]
 
 [tool.xcookie]
+# NOTE: PyPy is deliberately not supported. A `pypy-3.11` entry arrived in the
+# tests matrix with the 2026-08-28 xcookie refresh and was removed by hand from
+# .github/workflows/tests.yml; it failed test_leasing_coalesced_apply and we do
+# not intend to support the platform. A regeneration will reintroduce it unless
+# xcookie is told not to -- if there is a knob for that, set it here.
 tags = [
   "github",
   "kitware",

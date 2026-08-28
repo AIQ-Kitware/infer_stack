@@ -68,3 +68,30 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
     `model_info_v1` response shape (`data[].model_info.id`). Implemented in
     `ComposeBackend._reconcile_routes` (ids prefixed `isr-`).
   - **Applies when:** building idempotent reconcile over LiteLLM's model store.
+
+- **Lesson:** A store's schema/bootstrap runs *before* the cross-process lock
+  that protects everything else, so it must be idempotent on its own. Stamping
+  a version row with SELECT-then-INSERT is a TOCTOU across processes: two
+  openers of one fresh sqlite ledger both see no row, both insert, and the
+  loser dies with `UNIQUE constraint failed`. Retry cannot rescue it -- the row
+  exists by then, so every retry fails the same way. Use
+  `INSERT ... ON CONFLICT(key) DO NOTHING`.
+- **Evidence / MWE:** `infer_stack/leasing/store.py::_ensure_schema`; reproduced
+  5/400 concurrent constructions before the fix and 0/400 after; surfaced as an
+  ~8%-of-runs CI hang in `tests/test_leasing_controller_lock.py`. Journal entry
+  2026-08-28.
+- **Applies when:** any process-shared sqlite (or file) store whose
+  initialization happens outside the lock the rest of the design relies on.
+
+- **Lesson:** A concurrency test that coordinates with `threading.Barrier` must
+  bound both `barrier.wait()` and `join()`, and build its per-thread objects
+  inside the `try`. A worker that dies before reaching the barrier strands its
+  peers forever, turning a one-line failure into a CI job that burns its whole
+  time budget -- and the traceback is lost, so the actual bug stays invisible.
+- **Evidence / MWE:** `tests/test_leasing_controller_lock.py` and
+  `tests/test_leasing_coalesced_apply.py`; a loose-sdist job ran ~1h50m before
+  this was bounded. `faulthandler_timeout` is what identified it: one thread in
+  `barrier.wait()`, the main thread in `join()`, and the second worker simply
+  absent.
+- **Applies when:** writing or reviewing any multi-threaded test that uses a
+  barrier, latch, or queue rendezvous.
