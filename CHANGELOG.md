@@ -83,7 +83,10 @@ States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
 including cards allocated to another job, and the failure surfaces later as a
 CUDA OOM in whichever job loses.
 
-## [Version 0.7.0] - Unreleased
+## Version 0.7.1 - Unreleased
+
+
+## Version 0.7.0 - Released 2026-08-28
 
 ### TUI: the logs pane defaults to engines, not everything
 
