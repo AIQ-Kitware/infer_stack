@@ -24,3 +24,5 @@ generated/kubeai/*
 
 # rsync target for e2e harness reports (developer artifacts, not source)
 e2e-report-*/
+.coverage
+*.tar.gz

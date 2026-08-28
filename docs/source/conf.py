@@ -8,7 +8,7 @@ Notes:
 
     pip install sphinx sphinx-autobuild sphinx_rtd_theme sphinxcontrib-napoleon
 
-    cd ~/code/eval_audit/submodules/infer_stack
+    cd ~/code/infer_stack
     mkdir -p docs
     cd docs
 
@@ -17,9 +17,9 @@ Notes:
     # need to edit the conf.py
 
     # Remove any old auto docs folder and regenerate it.
-    rm -rf ~/code/eval_audit/submodules/infer_stack/docs/source/auto
-    cd ~/code/eval_audit/submodules/infer_stack/docs
-    sphinx-apidoc --private --separate --force --output-dir ~/code/eval_audit/submodules/infer_stack/docs/source/auto ~/code/eval_audit/submodules/infer_stack/infer_stack
+    rm -rf ~/code/infer_stack/docs/source/auto
+    cd ~/code/infer_stack/docs
+    sphinx-apidoc --private --separate --force --output-dir ~/code/infer_stack/docs/source/auto ~/code/infer_stack/infer_stack
     git add source/auto/*.rst
 
     # Note: the module should importable before running this
@@ -132,7 +132,7 @@ def parse_version(fpath):
         def visit_Assign(self, node):
             for target in node.targets:
                 if getattr(target, 'id', None) == '__version__':
-                    self.version = node.value.s
+                    self.version = node.value.value
 
     visitor = VersionVisitor()
     visitor.visit(pt)
@@ -236,6 +236,7 @@ intersphinx_mapping = {
     'xdoctest': ('https://xdoctest.readthedocs.io/en/latest/', None),
     'networkx': ('https://networkx.org/documentation/stable/', None),
     'scriptconfig': ('https://scriptconfig.readthedocs.io/en/latest/', None),
+    'kwconf': ('https://kwconf.readthedocs.io/en/latest/', None),
     'rich': ('https://rich.readthedocs.io/en/latest/', None),
     'numpy': ('https://numpy.org/doc/stable/', None),
     'sympy': ('https://docs.sympy.org/latest/', None),

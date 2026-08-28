@@ -24,6 +24,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Utilities",
 ]
@@ -46,25 +47,17 @@ optional-dependencies.tests = [
   "xdoctest>=1.1.5",
 ]
 optional-dependencies.tui = [
-    "textual>=0.50",
+  "textual>=0.50",
 ]
 urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
 scripts.infer-stack = "infer_stack.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-dynamic.readme.file = [
-  "README.md",
-]
-dynamic.readme.content-type = "text/markdown"
 dynamic.version.attr = "infer_stack.__version__"
 package-data.infer_stack = [
   "templates/*.yaml",
   "templates/*.j2",
-  # The oracle mock's answer-key corpus. The mock image installs with `-e .`
-  # so the source path already resolves there, but a non-editable install of
-  # infer-stack must ship it too: a catalog names it by an absolute path
-  # inside the package, not by a bind-mount.
   "mockserver/data/*.yaml",
 ]
 package-data."*" = [
