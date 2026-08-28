@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import plan_placement
 from infer_stack.leasing.models import Deployment, DeploymentState
@@ -343,3 +345,47 @@ def test_floor_only_still_gates_eligibility():
     # declaration at all (the automatic-safety half of the design).
     plan = plan_placement([vllm('big', floor=19.3)], inv('16,48'))
     assert plan.assignments == {'big': [1]}
+
+
+def test_the_weight_floor_is_divided_by_the_shards_not_the_gpus():
+    """A tensor-parallel deployment holds a SLICE of the weights per card.
+
+    The floor is a whole-model figure and min_vram_per_gpu returns a per-GPU
+    one. Without the division a TP endpoint demands the entire model on each
+    of its cards, so tensor parallelism becomes unusable exactly when it is
+    needed: qwen2.5-72b at tensor_parallel_size 2 asked for 135.43 GiB on each
+    of two 95.59 GiB cards and could never place.
+    """
+    from infer_stack.leasing.placement import min_vram_per_gpu
+
+    class _D:
+        def __init__(self, **runtime):
+            self.spec = {'runtime': runtime,
+                         'placement': {'floor_vram_gib': 135.43}}
+
+    assert min_vram_per_gpu(_D()) == pytest.approx(135.43)
+    assert min_vram_per_gpu(_D(tensor_parallel_size=2)) == pytest.approx(67.715)
+    # Pipeline parallelism splits layers, so it splits weights too.
+    assert min_vram_per_gpu(
+        _D(tensor_parallel_size=2, pipeline_parallel_size=2)
+    ) == pytest.approx(33.8575)
+    # Data parallelism REPLICATES: every replica needs the whole model.
+    assert min_vram_per_gpu(_D(data_parallel_size=2)) == pytest.approx(135.43)
+    assert min_vram_per_gpu(
+        _D(tensor_parallel_size=2, data_parallel_size=2)
+    ) == pytest.approx(67.715)
+
+
+def test_a_declared_requirement_is_already_per_gpu():
+    """placement.min_vram_gib is per-GPU by convention and must not be divided.
+
+    The catalogs here declare 72 for a 51.8 GiB model on one card; halving a
+    hand-written number would quietly let it land somewhere it does not fit.
+    """
+    from infer_stack.leasing.placement import min_vram_per_gpu
+
+    class _D:
+        spec = {'runtime': {'tensor_parallel_size': 2},
+                'placement': {'min_vram_gib': 90.0, 'floor_vram_gib': 135.43}}
+
+    assert min_vram_per_gpu(_D()) == pytest.approx(90.0)

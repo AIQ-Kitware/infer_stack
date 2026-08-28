@@ -1,0 +1,85 @@
+# Catalog for the *oracle* mock: infer_stack.mockserver, which knows the
+# answer key.
+#
+# This is the sibling of catalog-mock.yaml, and the two exist for opposite
+# reasons.  catalog-mock.yaml runs llm-d-inference-sim, which is faithful to
+# vLLM's API and says nothing true about any question.  This one runs our own
+# simulator, which is a much thinner HTTP server but answers questions
+# correctly at a configured rate, with correlated correctness across a
+# cohort.  So:
+#
+#   catalog-mock.yaml         -> "does the client break?"   (API fidelity)
+#   catalog-mock-oracle.yaml  -> "does the math compute?"   (signal fidelity)
+#
+# A card whose statistics collapse to NaN on constant input, or whose fan-in
+# silently drops a model, fails here and passes there.  Neither run says
+# anything about a real model, and neither may be submitted as a result.
+#
+# Unlike catalog-mock.yaml this needs no `runtime.simulator`: the mock's
+# entrypoint deliberately parses vLLM's own command line, so infer-stack
+# deploys it with nothing but an image override.
+#
+# It does need `runtime.cpu_only: true`. That marker says only "needs no GPU";
+# it does not change how the command line is rendered, which is exactly the
+# distinction from `runtime.simulator`. Without it a vLLM-shaped deployment is
+# assumed to want at least one GPU and cannot be placed on the GPU-less host
+# this catalog exists for.
+#
+# The answer key comes from a fixture baked into the image by
+# `COPY infer_stack ./infer_stack`, so there is no bind-mount to arrange and
+# the same catalog works anywhere the image runs. It carries the question
+# corpus only -- each model's ability stays here, on its endpoint.
+#
+#   docker build -f dockerfiles/mock-vllm.dockerfile -t aiq-mock-vllm:latest .
+#   infer-stack run --catalog dev/e2e_tests/catalog-mock-oracle.yaml \
+#       --endpoint mock-smol -- <command>
+models:
+  smol135: {source: hf://HuggingFaceTB/SmolLM2-135M-Instruct}
+  qwen17:  {source: hf://Qwen/Qwen3-1.7B}
+
+endpoints:
+  mock-smol:
+    engine: vllm
+    model: smol135
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 2048
+      gpu_memory_utilization: 0.0     # a simulator reserves nothing
+      cpu_only: true
+      extra_args:
+        - '--mock-ability=0.6'
+        - '--mock-config=/opt/infer-stack/infer_stack/mockserver/data/oracle_questions.yaml'
+    reclaim: {policy: stop}
+
+  # Shaped like the model a real evaluation card asks for, so the
+  # rehearsal exercises the same alias resolution a real run would.
+  mock-qwen17:
+    engine: vllm
+    model: qwen17
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 8192
+      gpu_memory_utilization: 0.0
+      cpu_only: true
+      extra_args:
+        - '--mock-ability=0.55'
+        - '--mock-config=/opt/infer-stack/infer_stack/mockserver/data/oracle_questions.yaml'
+    reclaim: {policy: stop}
+
+  # Same image, sycophantic. Demonstrates a card refusing to verify.
+  mock-sycophant:
+    engine: vllm
+    model: smol135
+    public_name: mock-smol-sycophant
+    runtime:
+      image: aiq-mock-vllm:latest
+      max_model_len: 2048
+      gpu_memory_utilization: 0.0
+      cpu_only: true
+      extra_args:
+        - '--mock-mode=sycophant'
+        - '--mock-config=/opt/infer-stack/infer_stack/mockserver/data/oracle_questions.yaml'
+    reclaim: {policy: stop}
+
+bundles:
+  rehearsal: [mock-smol, mock-qwen17]

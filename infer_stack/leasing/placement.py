@@ -7,7 +7,12 @@ will" from the redesign. Multi-node placement, preemption, and migration are
 explicitly out of scope (that is KubeAI/k8s/Slurm territory); single-host
 VRAM-eligibility filtering + greedy best-fit IS in scope — see
 ``docs/planning/vram-aware-placement.md`` for the objective and the scope
-amendment. At this tool's scale (≤ 8 GPUs, a handful of deployments) greedy
+amendment.
+
+Running UNDER Slurm is a different thing from Slurm being out of scope, and the
+two are easy to confuse: Slurm allocates GPUs to a job, and this placer then
+works within that allocation via ``allowed_gpus``. See
+``docs/slurm-compatibility.md``. At this tool's scale (≤ 8 GPUs, a handful of deployments) greedy
 best-fit is adequate; there is deliberately no bin-packing solver.
 
 Placement rules, applied in a deterministic order so the result is stable across
@@ -92,15 +97,51 @@ def required_gpu_count(deployment: Deployment) -> int:
     A reservation asks for a plain ``reserved_gpu_count`` (count-based first-fit,
     never a pinned index). A vLLM deployment needs tensor × pipeline × data
     parallelism.
+
+    Two runtime markers mean **none**, and they are not the same thing:
+
+    ``runtime.simulator`` says the process is a simulator whose command line
+    differs from vLLM's, so it is also what selects :func:`simulator_args`
+    instead of the vLLM renderer.
+
+    ``runtime.cpu_only`` says only that the deployment needs no GPU. Its
+    command line is still vLLM's. That is the oracle mock in
+    ``dev/e2e_tests/catalog-mock-oracle.yaml``: it deliberately parses vLLM's
+    own arguments, so it must NOT be marked ``simulator``, but it serves from
+    CPU and ``max(1, ...)`` below would otherwise make it unplaceable on the
+    GPU-less host it exists for.
+
+    Both are explicit markers. Neither is inferred from
+    ``gpu_memory_utilization: 0.0`` -- a real deployment may legitimately set
+    that low -- nor from the image name, which is not a contract.
     """
     reserved = deployment.spec.get('reserved_gpu_count')
     if reserved:
         return max(1, int(reserved))
     runtime = deployment.spec.get('runtime', {}) or {}
+    if runtime.get('simulator') or runtime.get('cpu_only'):
+        return 0
     tp = int(runtime.get('tensor_parallel_size', 1) or 1)
     pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
     dp = int(runtime.get('data_parallel_size', 1) or 1)
     return max(1, tp * pp * dp)
+
+
+def weight_shard_count(deployment: Deployment) -> int:
+    """How many ways a deployment's WEIGHTS are split across its GPUs.
+
+    ``tensor_parallel_size`` and ``pipeline_parallel_size`` shard the model --
+    each GPU holds its slice. ``data_parallel_size`` REPLICATES it: every
+    replica needs the whole thing, so it must not divide the floor. That is
+    why this is not simply :func:`required_gpu_count`, which multiplies all
+    three.
+    """
+    if deployment.spec.get('reserved_gpu_count'):
+        return 1
+    runtime = deployment.spec.get('runtime', {}) or {}
+    tp = int(runtime.get('tensor_parallel_size', 1) or 1)
+    pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
+    return max(1, tp * pp)
 
 
 def explicit_indices(deployment: Deployment) -> list[int] | None:
@@ -142,9 +183,24 @@ def min_vram_per_gpu(deployment: Deployment) -> float:
     keeps legacy index-order selection (see ``plan_placement`` tier 3), so
     the mere act of downloading weights never changes where an existing
     catalog's deployments land on a host where everything fits everywhere.
+
+    ⚠️ The floor is a WHOLE-MODEL figure and this function returns a PER-GPU
+    one, so it is divided by how many ways the weights are sharded. Without
+    that division a tensor-parallel deployment demands the entire model on
+    each of its cards, which no card can satisfy unless one could have held
+    the whole model alone -- i.e. tensor parallelism becomes unusable exactly
+    when it is needed. Observed: qwen2.5-72b at tensor_parallel_size 2 asked
+    for 135.43 GiB on each of two 95.59 GiB cards ("the pool can never satisfy
+    that"), where ~68 GiB per card is the real requirement.
+
+    The declared value is NOT divided. ``placement.min_vram_gib`` is per-GPU
+    by convention -- the catalogs in this repo declare 72 for a 51.8 GiB model
+    on one card -- so dividing it would silently halve every hand-written
+    requirement.
     """
     placement = deployment.spec.get('placement', {}) or {}
     floor = float(placement.get('floor_vram_gib') or 0.0)
+    floor = floor / weight_shard_count(deployment)
     return max(declared_min_vram(deployment), floor)
 
 

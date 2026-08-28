@@ -2,6 +2,114 @@ from __future__ import annotations
 
 from typing import Any
 
+#: ``runtime.simulator.kind`` values we know how to render a command for.
+SIMULATOR_KINDS = ('llm-d-sim',)
+
+#: Keys of ``runtime.simulator`` that select/describe the simulator rather than
+#: naming one of its flags.
+_SIM_META_KEYS = ('kind', 'model', 'extra_args')
+
+
+def _unresolvable_model_name(served: str) -> str:
+    """A ``--model`` value that cannot be mistaken for a HuggingFace repo id.
+
+    Repo ids are ``org/name``; this has no slash, so the lookup that decides
+    between real and simulated tokenization cannot match one.
+
+    Example:
+        >>> _unresolvable_model_name('Qwen/Qwen3-8B')
+        'sim-qwen-qwen3-8b'
+    """
+    import re
+    slug = re.sub(r'[^a-z0-9]+', '-', str(served).lower()).strip('-')
+    return f'sim-{slug or "model"}'
+
+
+def simulator_args(service: dict[str, Any]) -> list[str]:
+    """Render the argv for a simulator image standing in for vLLM.
+
+    ``llm-d-inference-sim`` speaks the OpenAI/vLLM *API* but not vLLM's *CLI*:
+    it has no positional model argument, no ``--host``, and no
+    ``--tensor-parallel-size`` / ``--gpu-memory-utilization`` (it rejects
+    unknown flags outright).  So a simulator deployment cannot reuse
+    :func:`vllm_args`; it gets its own renderer, driven by the same endpoint
+    fields so the catalog entry still reads like the real one.
+
+    ``--model`` deliberately does **not** carry the HF repo id, and does not
+    carry the served name either.  The simulator decides how to tokenize by
+    looking the ``--model`` value up on HuggingFace: a real repo id means real
+    tokenization, which it delegates to a separate render service and dies at
+    startup without.  Since a catalog endpoint normally *is* named after a real
+    model (``Qwen/Qwen3-8B``), passing either one through verbatim turns the
+    ordinary case into a crash loop.  So the default is a slug that cannot
+    resolve to a repo, which selects the built-in simulated tokenizer -- the
+    whole point of running it GPU-less.  ``simulator.model`` overrides it for
+    anyone who does want the render-service path.
+
+    The served name is unaffected: clients still ask for the alias the catalog
+    advertises.
+
+    Args:
+        service: the dict :func:`vllm_args` consumes, with a ``simulator``
+            block (see :func:`~infer_stack.leasing.compose.vllm_service_dict`).
+
+    Returns:
+        The container command, minus the image's own entrypoint.
+
+    Example:
+        >>> print('\\n'.join(simulator_args({
+        ...     'served_model_name': 'mock-smol',
+        ...     'max_model_len': 2048,
+        ...     'max_num_seqs': 4,
+        ...     'simulator': {'kind': 'llm-d-sim', 'mode': 'random',
+        ...                   'startup_duration': '10s'},
+        ... })))
+        --model
+        sim-mock-smol
+        --port
+        8000
+        --served-model-name=mock-smol
+        --max-model-len=2048
+        --max-num-seqs=4
+        --mode
+        random
+        --startup-duration
+        10s
+    """
+    sim = dict(service.get('simulator') or {})
+    kind = sim.get('kind', 'llm-d-sim')
+    if kind not in SIMULATOR_KINDS:
+        raise ValueError(
+            f'unknown runtime.simulator.kind {kind!r}; '
+            f'known kinds: {", ".join(SIMULATOR_KINDS)}'
+        )
+    served = service['served_model_name']
+    args = [
+        '--model', str(sim.get('model') or _unresolvable_model_name(served)),
+        '--port', '8000',
+        f'--served-model-name={served}',
+    ]
+    if service.get('max_model_len') is not None:
+        args.append(f'--max-model-len={service["max_model_len"]}')
+    if service.get('max_num_seqs') is not None:
+        args.append(f'--max-num-seqs={service["max_num_seqs"]}')
+    # Everything else in the block is a simulator flag verbatim, so any knob
+    # the simulator grows (latency profiles, failure injection, LoRA lifecycle)
+    # is reachable from the catalog without a change here.  snake_case is
+    # accepted because the rest of the runtime block uses it.
+    for key in sorted(k for k in sim if k not in _SIM_META_KEYS):
+        value = sim[key]
+        flag = '--' + str(key).replace('_', '-')
+        if isinstance(value, bool):
+            if value:
+                args.append(flag)
+        elif isinstance(value, (list, tuple)):
+            args.extend([flag, *(str(v) for v in value)])
+        elif value is not None:
+            args.extend([flag, str(value)])
+    args.extend(str(a) for a in (sim.get('extra_args') or []))
+    return args
+
 
 def vllm_args(service: dict[str, Any]) -> list[str]:
     args = [

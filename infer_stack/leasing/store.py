@@ -137,16 +137,24 @@ class SqliteStore:
         # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
         # first-open race as the WAL switch, so retry it too.
         self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'"
-        ).fetchone()
-        if row is None:
-            self._retry_locked(
-                lambda: self._conn.execute(
-                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
+        # Stamp the version idempotently rather than SELECT-then-INSERT. That
+        # read-then-write was a TOCTOU across processes: two CLIs opening the
+        # same fresh ledger both saw no row, both inserted, and the loser died
+        # with `UNIQUE constraint failed: meta.key`. Retrying could not help --
+        # the row exists by then, so the retry fails the same way.
+        #
+        # Two processes racing to open one ledger is the normal case here, not
+        # an edge: it is exactly what the cross-process lock further down
+        # exists to serialize, and that lock is taken *after* the store is
+        # constructed. ON CONFLICT is the idiom already used for desired_gen
+        # and applied_gen below.
+        self._retry_locked(
+            lambda: self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                'ON CONFLICT(key) DO NOTHING',
+                (str(SCHEMA_VERSION),),
             )
+        )
 
     def close(self) -> None:
         self._conn.close()

@@ -96,12 +96,37 @@ def _save_raw(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> Non
     tmp.replace(path)
 
 
-def _exists_guard(data, section, name, force, hint='') -> None:
-    if name in data[section] and not force:
-        raise SystemExit(
-            f"{section[:-1]} '{name}' already exists; "
-            f'pass --force to overwrite{hint}'
-        )
+def _exists_guard(data, section, name, force, entry, hint='') -> str:
+    """Decide what an ``add`` should do, and return ``'added'``/``'unchanged'``.
+
+    Adding the entry that is already there is a no-op, not a collision: these
+    commands get driven from setup scripts that are re-run routinely, and
+    demanding ``--force`` for a request that changes nothing trains people to
+    pass ``--force`` habitually — which is exactly when it silently clobbers a
+    row that had drifted.
+
+    So only a *different* entry is an error, and the message says which keys
+    differ rather than making the caller diff the YAML by hand.
+    """
+    if name not in data[section] or force:
+        return 'added'
+    existing = data[section][name]
+    if existing == entry:
+        return 'unchanged'
+
+    if isinstance(existing, dict) and isinstance(entry, dict):
+        # key=str: these are YAML mapping keys, so string in practice, but
+        # the static type is `object` and sorting needs a total order.
+        keys = sorted(set(existing) | set(entry), key=str)
+        diff = [f'    {k}: {existing.get(k, "(absent)")!r} -> {entry.get(k, "(absent)")!r}'
+                for k in keys if existing.get(k) != entry.get(k)]
+        detail = '\n' + '\n'.join(diff)
+    else:
+        detail = f'\n    {existing!r} -> {entry!r}'
+    raise SystemExit(
+        f"{section[:-1]} '{name}' already exists and differs:{detail}\n"
+        f'  pass --force to overwrite{hint}'
+    )
 
 
 def _next_indexed_name(existing, base: str) -> str:
@@ -430,11 +455,15 @@ class ModelAddCLI(_CatalogCommon):
             raise SystemExit('model add: NAME and --source are required')
         path = _catalog_path(config)
         data = _load_raw(path)
-        _exists_guard(data, 'models', config.name, config.force)
         entry: dict[str, Any] = {'source': config.source}
         for key in ('revision', 'quantization', 'dtype'):
             if getattr(config, key) is not None:
                 entry[key] = getattr(config, key)
+        action = _exists_guard(data, 'models', config.name, config.force, entry)
+        if action == 'unchanged':
+            if not config.dry_run:
+                print(f"model '{config.name}' already up to date")
+            return 0
         data['models'][config.name] = entry
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:
@@ -518,6 +547,20 @@ class EndpointAddCLI(_CatalogCommon):
         None, choices=['keep-warm', 'stop', 'scale-to-zero'],
         help='Reclaim policy when idle.',
     )
+    protocol = scfg.Value(
+        None, choices=['chat', 'completions'],
+        help='Which OpenAI surface this endpoint serves. Load-bearing twice: '
+             'a base model has no chat template, and the readiness probe '
+             'follows this — declaring chat for a completions-only serve '
+             'blocks `acquire` until the TTL. Default (unset): chat.',
+    )
+    min_vram_gib = scfg.Value(
+        None, type=float,
+        help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
+             'planner can pick any eligible free GPU. Declaring this is what '
+             'lets one catalog be correct on every host; the alternative is '
+             'pinning GPU indices, which is not portable.',
+    )
     # vLLM runtime conveniences
     max_model_len = scfg.Value(None, type=int)
     gpu_mem = scfg.Value(
@@ -542,7 +585,7 @@ class EndpointAddCLI(_CatalogCommon):
         data = _load_raw(path)
         if config.name:
             name = config.name
-            _exists_guard(data, 'endpoints', name, config.force)
+            # The guard moved below, after the entry exists to compare against.
         else:
             if not config.model:
                 raise SystemExit(
@@ -575,6 +618,19 @@ class EndpointAddCLI(_CatalogCommon):
             entry['runtime'] = runtime
         if config.reclaim:
             entry['reclaim'] = {'policy': config.reclaim}
+        if config.protocol:
+            entry['protocol'] = config.protocol
+        if config.min_vram_gib is not None:
+            entry['placement'] = {'min_vram_gib': config.min_vram_gib}
+        # Only guarded for an explicit NAME: a derived name is picked by
+        # _next_indexed_name from the free slots, so it never collides.
+        if config.name:
+            action = _exists_guard(
+                data, 'endpoints', name, config.force, entry)
+            if action == 'unchanged':
+                if not config.dry_run:
+                    print(f"endpoint '{name}' already up to date")
+                return 0
         data['endpoints'][name] = entry
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:
@@ -653,7 +709,6 @@ class HostAddCLI(_CatalogCommon):
             raise SystemExit('host add: NAME is required')
         path = _catalog_path(config)
         data = _load_raw(path)
-        _exists_guard(data, 'runtime_hosts', config.name, config.force)
         entry: dict[str, Any] = {'engine': config.engine}
         if config.gpu:
             entry['placement'] = {'gpu_indices': list(config.gpu)}
@@ -670,6 +725,12 @@ class HostAddCLI(_CatalogCommon):
             entry['settings'] = settings
         if config.image:
             entry['image'] = config.image
+        action = _exists_guard(
+            data, 'runtime_hosts', config.name, config.force, entry)
+        if action == 'unchanged':
+            if not config.dry_run:
+                print(f"host '{config.name}' already up to date")
+            return 0
         data['runtime_hosts'][config.name] = entry
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:
@@ -728,7 +789,12 @@ class BundleAddCLI(_CatalogCommon):
             raise SystemExit('bundle add: NAME and at least one endpoint required')
         path = _catalog_path(config)
         data = _load_raw(path)
-        _exists_guard(data, 'bundles', config.name, config.force)
+        action = _exists_guard(
+            data, 'bundles', config.name, config.force, members)
+        if action == 'unchanged':
+            if not config.dry_run:
+                print(f"bundle '{config.name}' already up to date")
+            return 0
         data['bundles'][config.name] = members
         _save_raw(path, data, dry_run=config.dry_run)
         if not config.dry_run:

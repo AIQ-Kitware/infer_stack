@@ -115,6 +115,17 @@ def confirm_writes(
         console.print('[green]--yes provided; applying changes.[/green]')
         return True
 
+    # Last line of defence. A caller that decided to prompt without a stdin to
+    # answer it would block forever; declining is the safe answer, since this
+    # gate is what stands between a render and applying it.
+    import sys
+    if sys.stdin is None or not sys.stdin.isatty():
+        console.print(
+            '[yellow]No terminal to confirm on; not applying. '
+            'Pass --yes to apply non-interactively.[/yellow]'
+        )
+        return False
+
     return Confirm.ask('Apply these changes?', default=False, console=console)
 
 

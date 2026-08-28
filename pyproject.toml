@@ -24,6 +24,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Utilities",
 ]
@@ -46,21 +47,18 @@ optional-dependencies.tests = [
   "xdoctest>=1.1.5",
 ]
 optional-dependencies.tui = [
-    "textual>=0.50",
+  "textual>=0.50",
 ]
 urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
 scripts.infer-stack = "infer_stack.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-dynamic.readme.file = [
-  "README.md",
-]
-dynamic.readme.content-type = "text/markdown"
 dynamic.version.attr = "infer_stack.__version__"
 package-data.infer_stack = [
   "templates/*.yaml",
   "templates/*.j2",
+  "mockserver/data/*.yaml",
 ]
 package-data."*" = [
   "requirements/*.txt",
@@ -156,6 +154,11 @@ report.omit = [
 ]
 
 [tool.xcookie]
+# NOTE: PyPy is deliberately not supported. A `pypy-3.11` entry arrived in the
+# tests matrix with the 2026-08-28 xcookie refresh and was removed by hand from
+# .github/workflows/tests.yml; it failed test_leasing_coalesced_apply and we do
+# not intend to support the platform. A regeneration will reintroduce it unless
+# xcookie is told not to -- if there is a knob for that, set it here.
 tags = [
   "github",
   "kitware",

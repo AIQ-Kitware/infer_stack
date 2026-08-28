@@ -8,8 +8,20 @@ name: PurePyCI
 
 on:
   push:
+    # Restricting push triggers to the default branch avoids running
+    # the whole pipeline twice (push + pull_request events) for every
+    # push to a PR branch. Feature branches are covered by the
+    # pull_request trigger; release branches and tags are handled by
+    # release.yml.
+    branches: [ main ]
   pull_request:
     branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded runs on the same ref are cancelled; deploy-bearing refs
+  # never trigger this workflow (release.yml owns them).
+  cancel-in-progress: true
 
 jobs:
   lint_job:
@@ -61,7 +73,7 @@ jobs:
       shell: bash
       run: |-
         python -m pip install pip uv -U
-        python -m uv pip install setuptools>=0.8 wheel build twine
+        python -m uv pip install setuptools>=77 wheel build twine
         python -m build --sdist --outdir wheelhouse
         python -m twine check ./wheelhouse/infer_stack*.tar.gz
     - name: Install sdist
@@ -81,6 +93,7 @@ jobs:
         # Get path to installed package
         MOD_DPATH=$(python -c "import infer_stack, os; print(os.path.dirname(infer_stack.__file__))")
         echo "MOD_DPATH = $MOD_DPATH"
+        MOD_NAME=infer_stack
         python -m pytest --verbose --cov=infer_stack $MOD_DPATH ../tests
         cd ..
     - name: Test full loose sdist
@@ -97,6 +110,7 @@ jobs:
         # Get path to installed package
         MOD_DPATH=$(python -c "import infer_stack, os; print(os.path.dirname(infer_stack.__file__))")
         echo "MOD_DPATH = $MOD_DPATH"
+        MOD_NAME=infer_stack
         python -m pytest --verbose --cov=infer_stack $MOD_DPATH ../tests
         cd ..
     - uses: actions/upload-artifact@v6.0.0
@@ -109,7 +123,7 @@ jobs:
     # Build the pure-python wheels independently on a per-platform basis.
     # These will be tested later in the test_purepy_wheels step.
     ##
-    name: ${{ matrix.python-version }} on ${{ matrix.os }}, arch=${{ matrix.arch }} with ${{ matrix.install-extras }}
+    name: Build wheel ${{ matrix.python-version }} on ${{ matrix.os }}, arch=${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -131,7 +145,7 @@ jobs:
       shell: bash
       run: |-
         python -m pip install pip uv -U
-        python -m uv pip install setuptools>=0.8 wheel build twine
+        python -m uv pip install setuptools>=77 wheel build twine
         python -m build --wheel --outdir wheelhouse
         python -m twine check ./wheelhouse/infer_stack*.whl
     - name: Show built files
@@ -148,7 +162,6 @@ jobs:
     # build_purepy_wheels step in this independent environment.
     ##
     name: ${{ matrix.python-version }} on ${{ matrix.os }}, arch=${{ matrix.arch }} with ${{ matrix.install-extras }}
-    if: "! startsWith(github.event.ref, 'refs/heads/release')"
     runs-on: ${{ matrix.os }}
     needs:
     - build_purepy_wheels
@@ -162,43 +175,60 @@ jobs:
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'true'
           lock-requirements: requirements/locks/tests.txt
         - python-version: '3.14'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'true'
           lock-requirements: requirements/locks/tests.txt
         - python-version: '3.10'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'false'
         - python-version: '3.11'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'false'
         - python-version: '3.12'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'false'
         - python-version: '3.13'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'false'
         - python-version: '3.14'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'false'
+          check-latest: 'false'
           use-lockfile: 'false'
-        - python-version: pypy-3.9
+        - python-version: '3.15'
           install-extras: tests
           os: ubuntu-latest
           arch: auto
+          allow-prereleases: 'true'
+          check-latest: 'true'
+          experimental: true
           use-lockfile: 'false'
     steps:
     - name: Checkout source
@@ -207,6 +237,10 @@ jobs:
       uses: actions/setup-python@v6.2.0
       with:
         python-version: ${{ matrix.python-version }}
+        allow-prereleases: ${{ matrix.allow-prereleases }}
+        check-latest: ${{ matrix.check-latest }}
+      id: setup_python
+      continue-on-error: ${{ matrix.experimental || false }}
     - uses: actions/download-artifact@v7.0.0
       name: Download wheels
       with:
@@ -214,6 +248,9 @@ jobs:
         merge-multiple: true
         path: wheelhouse
     - name: Install wheel ${{ matrix.install-extras }}
+      id: install_wheel
+      if: steps.setup_python.outcome == 'success'
+      continue-on-error: ${{ matrix.experimental || false }}
       shell: bash
       env:
         INSTALL_EXTRAS: ${{ matrix.install-extras }}
@@ -225,7 +262,7 @@ jobs:
         echo "Installing helpers: update pip"
         python -m pip install pip uv -U
         echo "Installing helpers: setuptools"
-        python -m uv pip install --resolution=highest setuptools>=0.8 setuptools_scm wheel build -U
+        python -m uv pip install --resolution=highest setuptools>=77 setuptools_scm wheel build -U
         echo "Installing helpers: tomli and pkginfo"
         python -m uv pip install --resolution=highest tomli pkginfo packaging
         export WHEEL_FPATH=$(python -c "if 1:
@@ -279,6 +316,9 @@ jobs:
         python -m uv pip install --prerelease=allow "${LOCK_ARGS[@]}" "${INSTALL_TARGET}"
         echo "Install finished."
     - name: Test wheel ${{ matrix.install-extras }}
+      id: test_wheel
+      if: steps.install_wheel.outcome == 'success'
+      continue-on-error: ${{ matrix.experimental || false }}
       shell: bash
       env:
         CI_PYTHON_VERSION: py${{ matrix.python-version }}
@@ -301,7 +341,7 @@ jobs:
         running the pytest command inside the workspace
         ---
         "
-        python -m pytest --verbose -p pytester -p no:doctest --xdoctest --cov-config ../pyproject.toml --cov-report term --durations=100 --cov="$MOD_NAME" "$MOD_DPATH" ../tests
+        python -m pytest --verbose --xdoctest --cov-config ../pyproject.toml --cov-report term --durations=100 --cov="$MOD_NAME" "$MOD_DPATH" ../tests
         echo "pytest command finished, moving the coverage file to the repo root"
         ls -al
         # Move coverage file to a new name
@@ -310,7 +350,7 @@ jobs:
         cd ..
         ls -al
     - name: Combine coverage Linux
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && steps.test_wheel.outcome == 'success'
       run: |-
         echo '############ PWD'
         pwd
@@ -329,5 +369,14 @@ jobs:
       with:
         file: ./coverage.xml
         token: ${{ secrets.CODECOV_TOKEN }}
+      if: steps.test_wheel.outcome == 'success'
+    - name: Report experimental failure
+      if: matrix.experimental && (steps.setup_python.outcome == 'failure' || steps.install_wheel.outcome == 'failure' || steps.test_wheel.outcome == 'failure')
+      shell: bash
+      run: |-
+        message="Experimental matrix entry failed; see logs above."
+        echo "::warning title=Experimental CI failure::$message"
+        echo "### Experimental CI failure" >> "$GITHUB_STEP_SUMMARY"
+        echo "$message" >> "$GITHUB_STEP_SUMMARY"
 
 

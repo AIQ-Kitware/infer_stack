@@ -14,6 +14,7 @@ is already up, or ``teardown`` one that is already gone.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from .models import Deployment
@@ -131,6 +132,13 @@ class ConvergeScaffold:
     CONVERGE_LOCK_FILENAME = '.converge.lock'
     _approve_title = 'infer-stack will update the rendered state'
     _state_noun = 'rendered state'
+
+    # Provided by subclasses, as the docstring says. Annotation-only, so
+    # nothing is created at runtime -- this states the contract to a type
+    # checker, which otherwise flags every use of them in this class.
+    state_dir: Path
+    assume_yes: bool
+    _state_file: Path
 
     @staticmethod
     def _atomic_write(path, text: str) -> None:

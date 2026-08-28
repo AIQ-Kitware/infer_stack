@@ -51,7 +51,7 @@ import yaml
 from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
 from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
-from ..profile_runtime import vllm_args
+from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
 from .models import Deployment, is_reservation
 from .placement import plan_placement
@@ -255,6 +255,9 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         # Selected via the VLLM_ATTENTION_BACKEND env var, not a CLI flag — the
         # backend renderer (compose environment / kubeai CR env) turns it into env.
         'attention_backend': runtime.get('attention_backend'),
+        # Present => this deployment runs a simulator image whose CLI is not
+        # vLLM's (see profile_runtime.simulator_args). Absent => a real engine.
+        'simulator': runtime.get('simulator') or None,
         'extra_args': list(runtime.get('extra_args', []) or []),
     }
 
@@ -297,14 +300,18 @@ def _vllm_service(
     # partial state dict still resolve every cache-mount key below.
     state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
-    command = [
-        deployment.spec['hf_model_id'],
-        '--host',
-        '0.0.0.0',
-        '--port',
-        '8000',
-        *vllm_args(svc),
-    ]
+    simulated = bool(svc.get('simulator'))
+    if simulated:
+        command = simulator_args(svc)
+    else:
+        command = [
+            deployment.spec['hf_model_id'],
+            '--host',
+            '0.0.0.0',
+            '--port',
+            '8000',
+            *vllm_args(svc),
+        ]
     environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
     # Attention backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
     # flag; forward it verbatim when the endpoint sets one (e.g. TORCH_SDPA to
@@ -359,6 +366,18 @@ def _vllm_service(
         service['ports'] = [f'{host_port}:8000']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
+    if simulated:
+        # A simulator downloads no weights and compiles no graphs, so the
+        # caches above are dead weight -- and worse, the images ship
+        # distroless and run as a non-root uid that cannot write /root, so
+        # mounting them invites a permission failure for no benefit. The
+        # healthcheck goes for the same reason: it shells out to `curl`,
+        # which a distroless image does not contain, so it would mark a
+        # perfectly healthy container unhealthy forever. Nothing depends on
+        # it -- `probe_ready` gates on a real generation over HTTP, which is
+        # a stronger signal and works against any image.
+        service.pop('volumes', None)
+        service['healthcheck'] = {'disable': True}
     return service
 
 
@@ -1338,7 +1357,17 @@ class ComposeBackend(ConvergeScaffold):
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Constructing a backend must not touch the filesystem fatally. `doctor`
+        # builds one before it runs a single check, so an unwritable state dir
+        # used to kill the very command whose job is to say "the state dir is
+        # unwritable" -- the preflight required the thing it was preflighting.
+        # Record the failure instead and let doctor() report it; anything that
+        # actually writes calls _ensure_state_dir() and gets a real error.
+        self._state_dir_error: str | None = None
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            self._state_dir_error = str(ex)
         # None => detect lazily on first use (see the `inventory` property):
         # startup paths (notably the TUI) must never wait on nvidia-smi
         # before the first frame.
@@ -1468,7 +1497,143 @@ class ComposeBackend(ConvergeScaffold):
             write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
         return pw
 
+    def _ensure_state_dir(self) -> None:
+        """Raise a legible error if the state dir could not be created.
+
+        The constructor records rather than raises (see ``__init__``), so the
+        failure has to resurface at the first real write instead of turning
+        into a confusing downstream error about a missing compose file.
+        """
+        if self._state_dir_error is None:
+            return
+        raise RuntimeError(
+            f'infer-stack state dir is not usable: {self._state_dir_error}\n'
+            f'  path: {self.state_dir}\n'
+            '  Run `infer-stack doctor` for the full preflight, and check '
+            'that the data dir from `infer-stack paths` is writable by you.'
+        )
+
+    # -- preflight -----------------------------------------------------------
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        """Preflight everything ``acquire`` needs: ``(check, ok, detail)`` rows.
+
+        Checked cheaply and in dependency order so a fresh host fails as a
+        checklist instead of a mid-converge traceback, and — critically —
+        *before* anything is placed or any lease is recorded. Never raises.
+
+        The image check is the one that earns its keep. A converge brings up
+        every enabled service at once, so an unpullable image belonging to a
+        service that has nothing to do with serving (the Open WebUI frontend,
+        say) aborts a model lease *after* placement has already succeeded, and
+        the ledger is left describing containers that do not exist. Resolving
+        the tags first turns that into one line here.
+        """
+        checks: list[tuple[str, bool, str]] = []
+
+        # 1. State dir. Everything else writes here, so it comes first.
+        if self._state_dir_error is None:
+            probe = self.state_dir / '.doctor-write-probe'
+            try:
+                probe.touch()
+                probe.unlink()
+                checks.append(('state dir writable', True, str(self.state_dir)))
+            except OSError as ex:
+                checks.append((
+                    'state dir writable', False,
+                    f'{self.state_dir}: {ex} — chown/chgrp it to you; on a '
+                    'shared box use a group with the setgid bit so the ledger '
+                    'stays shared (that is how concurrent runs avoid placing '
+                    'two models on one GPU)',
+                ))
+        else:
+            checks.append((
+                'state dir writable', False,
+                f'{self.state_dir}: {self._state_dir_error} — create it and '
+                'make it writable by you',
+            ))
+
+        # 2. Docker daemon, then compose. No point checking images without them.
+        try:
+            ver = self.run(['docker', 'version', '--format', '{{.Server.Version}}']).strip()
+            checks.append(('docker daemon reachable', True, f'server {ver}'))
+        except Exception as ex:  # noqa: BLE001 - report, don't raise
+            checks.append((
+                'docker daemon reachable', False,
+                f'{ex} — is dockerd running, and are you in the docker group? '
+                '(a fresh group membership needs a new login session)',
+            ))
+            return checks
+
+        try:
+            cver = self.run(['docker', 'compose', 'version', '--short']).strip()
+            checks.append(('docker compose available', True, f'v{cver}'))
+        except Exception as ex:  # noqa: BLE001
+            checks.append((
+                'docker compose available', False,
+                f'{ex} — the compose v2 plugin is required (docker-compose v1 '
+                'is not enough)',
+            ))
+            return checks
+
+        # 3. Every image this configuration would actually bring up. Checking
+        #    the full PINNED_IMAGES set would fail on services that are off.
+        wanted: dict[str, str] = {'vllm': self.images['vllm']}
+        if self.litellm:
+            wanted['litellm'] = self.images['litellm']
+            if self.dynamic_routing:
+                wanted['postgres'] = self.images['postgres']
+        if self.ui:
+            wanted['open_webui'] = self.images['open_webui']
+        if self.reverse_proxy:
+            wanted['nginx'] = self.images['nginx']
+
+        for role, image in sorted(wanted.items()):
+            try:
+                # `images -q` prints the id or nothing and always exits 0.
+                # `image inspect` would work too but writes "No such image" to
+                # stderr, which is alarming noise in a preflight that is about
+                # to report the same fact calmly.
+                if self.run(['docker', 'images', '-q', image]).strip():
+                    checks.append((f'image {role}', True, f'{image} (local)'))
+                    continue
+            except Exception:  # noqa: BLE001 - fall through to the remote check
+                pass
+            try:
+                self.run(['docker', 'manifest', 'inspect', image])
+                checks.append((f'image {role}', True, f'{image} (pullable)'))
+            except Exception as ex:  # noqa: BLE001
+                hint = 'not present locally and could not be resolved'
+                if 'denied' in str(ex).lower():
+                    # A public image answering `denied` almost always means a
+                    # stale credential is being sent: docker will not fall back
+                    # to anonymous once it has an auth entry for the registry.
+                    registry = image.split('/')[0]
+                    hint += (
+                        f' — `denied` on a public image usually means a stale '
+                        f'credential; try `docker logout {registry}`'
+                    )
+                checks.append((f'image {role}', False, f'{image}: {hint}'))
+
+        # 4. GPUs. Last because a CPU-only stack is legitimate (mock endpoints,
+        #    the null backend), so this is informational rather than fatal.
+        try:
+            gpus = self.inventory.get('gpus') or []
+            if gpus:
+                checks.append(('GPUs visible', True, f'{len(gpus)} device(s)'))
+            else:
+                checks.append((
+                    'GPUs visible', True,
+                    'none detected — fine for mock/simulator endpoints, but a '
+                    'real vLLM endpoint will not place',
+                ))
+        except Exception as ex:  # noqa: BLE001
+            checks.append(('GPUs visible', False, f'inventory failed: {ex}'))
+
+        return checks
+
     def _compose(self, args: list[str]) -> str:
+        self._ensure_state_dir()
         cmd = ['docker', 'compose']
         # Resolve ${LITELLM_MASTER_KEY} (and any other managed secret) from the
         # sidecar .env beside the compose file, so secrets stay out of the YAML.
@@ -1491,6 +1656,53 @@ class ComposeBackend(ConvergeScaffold):
         """
         pinned = self._load_sidecar().get('assignments', {})
         desired = list(desired)
+        self._enrich_placement(desired)
+        return plan_placement(
+            desired,
+            self.inventory,
+            allowed_gpus=self.allowed_gpus,
+            reserved=self.reserved,
+            pinned=pinned,
+            skip_display=self.skip_display,
+        )
+
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Placement for ``desired`` alone, as if nothing else were running.
+
+        The question this answers is "could this request EVER be satisfied
+        here", separate from "is there room right now". Same planner, same
+        inventory and allow-list; the difference from :meth:`plan` is which
+        pins survive, and that the caller passes only the deployments it is
+        asking about. So an unplaced result means the host cannot serve the
+        request at all, not that it is busy.
+
+        "Idle" means *free of everything unrelated to this request*, not
+        *empty*. Pins are kept for the requested deployments and dropped for
+        everything else:
+
+        * An unrelated deployment's pin is contention — precisely what the
+          check exists to see past — so it goes.
+        * A requested deployment that is ALREADY placed keeps its GPU. Under
+          Slurm that GPU may sit outside this call's ``allowed_gpus``: a shared
+          extractor another job started is reusable exactly as it is (see
+          ``docs/slurm-compatibility.md``, and ``pin_pool_set`` in
+          :func:`~infer_stack.leasing.placement.plan_placement`, which
+          validates pins against the whole host). Dropping that pin would force
+          the extractor back inside our own slice and count it against our
+          budget, rejecting a lease that is merely waiting for a GPU to free.
+
+        The distinction matters because the two failures look identical while
+        waiting: an admission queue that waits out its timeout for capacity
+        that could never exist is indistinguishable, from the outside, from one
+        waiting on a GPU that is about to free.
+        """
+        desired = list(desired)
+        requested = {deployment.id for deployment in desired}
+        pinned = {
+            gid: gpus
+            for gid, gpus in self._load_sidecar().get('assignments', {}).items()
+            if gid in requested
+        }
         self._enrich_placement(desired)
         return plan_placement(
             desired,

@@ -162,6 +162,10 @@ class Ledger:
             # a crashed container gets re-upped by the apply this forces).
             self.store.bump_desired_generation()
         lease = self.store.get_lease(lease_id)
+        if lease is None:
+            # Written moments ago in this method. Missing means the store was
+            # mutated underneath us, which is worth saying plainly.
+            raise KeyError(f'lease {lease_id!r} vanished during acquire')
         deployments = [
             self.store.get_deployment(gid, now=now)
             for gid in dict.fromkeys(deployment_ids)

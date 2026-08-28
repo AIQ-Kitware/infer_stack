@@ -2,7 +2,101 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `doctor --gpu` / `--sudo`: why a card looks busy, and who holds it
+
+Twice a GPU has read 100% utilization with ~0 MiB allocated and an empty
+process table, and twice the diagnosis took hours. The tools mislead in a
+specific way: unprivileged `lsof`/`fuser` see only the caller's own processes,
+so they report "nothing holds it" while `nvidia-smi -r` answers `In use by
+another client`. Every containerd shim and Kubernetes pod is owned by root.
+
+`--gpu` samples utilization over several seconds (it is a windowed average, so
+one reading after a process exits proves nothing) and flags a card that is busy
+with nothing allocated. `--sudo` runs the holder scan as root and maps each pid
+to its cgroup, which is what names the container or pod — `pid 9030` is not an
+answer, `gpu-feature-discovery in kubernetes pod 00397bb3…` is.
+
+Without `--sudo` the holder check reports **not checked**, never "clear". A
+false all-clear is what led to recommending a reset that could not succeed.
+
+`nvidia-persistenced` holding every device is treated as expected, but named,
+because it is why `nvidia-smi -pm 0` does not let a reset through: that turns
+the mode off and leaves the daemon holding its handles.
+
+Nothing here resets or kills. The same symptom with a different holder means
+something else, and both times the card computed fine — the gauge was cosmetic.
+
+### An impossible lease fails instead of queueing
+
+`acquire --wait-for-placement` queued whenever a deployment was unplaced,
+without asking whether the request could be satisfied at all. A lease whose
+deployments cannot fit *together* — a `tensor_parallel_size: 4` answerer plus a
+1-GPU extractor on a 4-GPU host — waited out the full 1800s timeout holding
+whatever it had already placed, so a request that could never succeed blocked
+the ones that could.
+
+The planner's permanent-failure branch does not catch this: each deployment is
+placeable on its own, and only the set is impossible.
+
+`acquire` now re-plans the lease's deployments alone on an idle host before it
+queues (`ComposeBackend.plan_on_idle_host`). If they do not fit *there*,
+waiting cannot help, so the lease is rolled back and `PlacementError` is raised
+at once. Backends without the method (null, kubeai) skip the check and queue
+exactly as before — it can turn a hang into an error, never the reverse.
+
+"Idle" means free of everything *unrelated* to the request, not empty. Pins of
+the requested deployments are kept; every other pin is dropped. Under Slurm a
+requested deployment may already be running on a GPU outside this call's
+`allowed_gpus` — a shared extractor another job started — and that is reusable
+as it stands. Dropping its pin would force it back inside our own slice, count
+it against our budget, and reject a lease that was only waiting for a card to
+free.
+
+### Tensor-parallel deployments can place again
+
+`min_vram_per_gpu` returned the weight-bytes floor unchanged, but that floor is
+a WHOLE-MODEL figure while the function's contract is per-GPU. A
+tensor-parallel deployment therefore demanded the entire model on each of its
+cards — so tensor parallelism was unusable exactly when it was needed, since
+the only host that could satisfy it was one where a single card could hold the
+whole model anyway.
+
+Observed: `qwen2.5-72b` at `tensor_parallel_size: 2` asked for 135.43 GiB on
+each of two 95.59 GiB cards and reported "the pool can never satisfy that",
+where ~68 GiB per card is the real requirement. It starved every job that
+needed it as an extractor.
+
+The floor is now divided by `weight_shard_count()` — `tensor_parallel_size ×
+pipeline_parallel_size`. `data_parallel_size` is deliberately excluded: it
+replicates the model, so each replica needs the whole thing. A declared
+`placement.min_vram_gib` is untouched, being per-GPU by convention.
+
+### Documented the Slurm compatibility model
+
+`docs/slurm-compatibility.md`. Slurm allocates GPUs to jobs; infer-stack places
+models within the allocation it was given. The two do not overlap, and the
+module docstring saying multi-node placement is "Slurm territory" was easy to
+read as "does not work under Slurm".
+
+States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
+`--allowed_gpus`. Without it placement considers every GPU on the machine,
+including cards allocated to another job, and the failure surfaces later as a
+CUDA OOM in whichever job loses.
+
 ## [Version 0.7.0] - Unreleased
+
+### TUI: the logs pane defaults to engines, not everything
+
+The docker logs pane now follows every service EXCEPT the LiteLLM gateway by
+default. LiteLLM emits a line per proxied request, so on a busy host it scrolls
+the engine output -- which is where startup failures, OOMs and CUDA errors
+actually appear -- out of the pane before it can be read.
+
+`(all services)` and the gateway itself remain one selection away in the same
+dropdown. The engines view expands to concrete service names passed to
+`docker compose logs`, so it is a narrower stream rather than a filter applied
+after the fact; with no engine services deployed it falls back to all services
+and says so in the label.
 
 ### Added
 * **Reserve-only GPU lease: `infer-stack acquire --reserve-gpus N`.** Hold N

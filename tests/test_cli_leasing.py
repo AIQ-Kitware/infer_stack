@@ -597,6 +597,101 @@ def test_test_command_reports_failure(tmp_path, monkeypatch, capsys):
     assert 'FAILED' in out and 'chat' in out
 
 
+def _completions_catalog(path, *, protocol='completions'):
+    """A catalog whose single endpoint declares its API surface."""
+    path.write_text(yaml.safe_dump({
+        'models': {'base': {'source': 'hf://org/base'}},
+        'endpoints': {
+            'chat': {'engine': 'vllm', 'model': 'base', 'protocol': protocol},
+        },
+    }))
+    return path
+
+
+def _capture_post(monkeypatch, reply_text='ready'):
+    """Stand in for requests.post and record what `test` sent."""
+    import requests
+
+    captured = {}
+
+    class Resp:
+        status_code = 200
+        text = '{}'
+
+        def json(self):
+            return {'choices': [{'text': reply_text,
+                                 'message': {'content': reply_text}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured['url'] = url
+        captured['payload'] = json
+        return Resp()
+
+    monkeypatch.setattr(requests, 'post', fake_post)
+    return captured
+
+
+def test_test_command_honors_the_catalog_env_var(tmp_path, monkeypatch, capsys):
+    """`test` must read the same catalog leasing does.
+
+    Protocol lookup reimplemented catalog resolution and left out
+    INFER_STACK_CATALOG, so a run that leased from the environment-selected
+    catalog would probe the default one, miss the endpoint, fall back to chat,
+    and report a healthy completions-only endpoint as FAILED.
+    """
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    cat = _completions_catalog(tmp_path / 'env-catalog.yaml')
+    monkeypatch.setenv('INFER_STACK_CATALOG', str(cat))
+
+    from infer_stack.cli.commands_leasing import TestCLI
+
+    captured = _capture_post(monkeypatch)
+    rc = TestCLI.main(argv=['chat'])          # no --catalog, no --protocol
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert captured['url'].endswith('/v1/completions')
+    assert 'prompt' in captured['payload']
+    assert 'messages' not in captured['payload']
+    # The completions surface reads choices[0].text, not .message.content.
+    assert 'ready' in out
+
+
+def test_an_explicit_catalog_beats_the_env_var(tmp_path, monkeypatch, capsys):
+    """Precedence is --catalog, then the env, then the default."""
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    env_cat = _completions_catalog(tmp_path / 'env.yaml')
+    explicit = _completions_catalog(tmp_path / 'explicit.yaml', protocol='chat')
+    monkeypatch.setenv('INFER_STACK_CATALOG', str(env_cat))
+
+    from infer_stack.cli.commands_leasing import TestCLI
+
+    captured = _capture_post(monkeypatch)
+    rc = TestCLI.main(argv=['chat', '--catalog', str(explicit)])
+    capsys.readouterr()
+
+    assert rc == 0
+    # The explicit file says chat, so chat is what gets probed.
+    assert captured['url'].endswith('/v1/chat/completions')
+    assert 'messages' in captured['payload']
+
+
+def test_test_command_falls_back_to_chat_when_the_catalog_is_unusable(
+        tmp_path, monkeypatch, capsys):
+    """A diagnostic must not fail on catalog lookup."""
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    monkeypatch.setenv('INFER_STACK_CATALOG', str(tmp_path / 'absent.yaml'))
+
+    from infer_stack.cli.commands_leasing import TestCLI
+
+    captured = _capture_post(monkeypatch)
+    rc = TestCLI.main(argv=['chat'])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert captured['url'].endswith('/v1/chat/completions')
+
+
 def test_release_unknown_lease_fails(env):
     """Regression: `release <typo>` printed `released 1 lease(s)` and exited 0
     while the real lease kept pinning its GPU."""

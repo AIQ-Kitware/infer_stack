@@ -13,7 +13,8 @@ polled while hidden:
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
 * **docker** — a collapsible pane with **Logs** and **Containers** (the
-  ``docker ps`` view: status/uptime, created, id, ports) tabs.
+  ``docker ps`` view: status/uptime, created, id, ports) tabs (collapsed by
+  default; ``c`` toggles it).
 * **system** — live ``nvidia-smi`` GPUs + host CPU/mem (collapsed by default).
 * **api** — send a prompt to a *ready* model through the LiteLLM gateway
   (collapsed by default).
@@ -63,6 +64,27 @@ from .cli.commands_leasing import (
 from .leasing import LeaseState
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
+# The Select value meaning "every service EXCEPT the gateway". This is the
+# default view: LiteLLM emits a line per proxied request, so on a busy host it
+# scrolls the engine output -- which is where errors actually appear -- off the
+# pane before anyone can read it. The gateway's own logs are one selection away
+# when they are what you want.
+ENGINE_SERVICES = '\x00engines'
+# Substring rather than equality: compose names the gateway service `litellm`
+# today, but deployment naming has carried suffixes before and a missed match
+# silently restores the noisy view.
+GATEWAY_SERVICE_HINT = 'litellm'
+
+
+def is_gateway_service(name: str) -> bool:
+    """Is this compose service the LiteLLM gateway rather than an engine?"""
+    return GATEWAY_SERVICE_HINT in str(name).lower()
+
+
+def engine_services(names) -> list[str]:
+    """Every service that is not the gateway, in the given order."""
+    return [n for n in names if not is_gateway_service(n)]
+
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
 # Two endpoint clicks within this window (on the same row) count as a
 # double-click and acquire it; a lone click only highlights. Keeps a stray
@@ -92,13 +114,18 @@ INFER_THEME = Theme(
 class _DockerLogProc:
     """A live ``docker compose logs -f`` process for one (or all) service(s)."""
 
-    def __init__(self, project: str, compose_file: str, service: str | None):
+    def __init__(self, project: str, compose_file: str, service=None):
         cmd = [
             'docker', 'compose', '-p', project, '-f', compose_file,
             'logs', '-f', '--tail', '200', '--no-color',
         ]
-        if service:
-            cmd.append(service)
+        # `docker compose logs` takes any number of service names, so the
+        # engines-only view is just the gateway left off the end rather than a
+        # filter applied to the stream.
+        if isinstance(service, (list, tuple)):
+            cmd.extend(str(s) for s in service)
+        elif service:
+            cmd.append(str(service))
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
@@ -525,7 +552,7 @@ class InferStackTUI(App):
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
-        Binding('c', 'toggle_docker', 'Collapse docker', show=False),
+        Binding('c', 'toggle_docker', 'Toggle docker', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
@@ -592,7 +619,7 @@ class InferStackTUI(App):
         self._last_leases: list[Any] = []   # row-aligned with the leases table
         self._last_deployments: list[Any] = []   # row-aligned with the deployments table
         self._service_options: list[str] = []
-        self._log_service: str = ALL_SERVICES
+        self._log_service: str = ENGINE_SERVICES
         self._log_proc: Any = None
         self._log_lines: list[str] = []  # mirror of the log pane, for tests
         self._api_lines: list[str] = []  # mirror of the API output, for tests
@@ -602,7 +629,9 @@ class InferStackTUI(App):
         self._leases_h = 14   # resizable by dragging #tsplit
         self._active_tab = 'tab-logs'   # which docker tab is visible
         # heavy panes start collapsed (and therefore unpolled)
-        self._collapsed = {'docker': False, 'system': True}
+        # Must match the Collapsible widgets' initial state, or the gate in
+        # _collect polls for a pane that is shut until the first sync.
+        self._collapsed = {'docker': True, 'system': True}
         self._ready_endpoints: list[str] = []
         # served endpoint name -> OpenAI surface ('chat' | 'completions'), read
         # from the live deployment payload so the API tab probes the surface a
@@ -693,11 +722,12 @@ class InferStackTUI(App):
                             yield Button('Evict all idle', id='btn-evict-all')
                             yield Button('Clean up', id='btn-cleanup-deployments')
                 yield _Divider('y', self._drag_logs, id='hsplit')
-                with Collapsible(title='docker', collapsed=False, id='docker'):
+                with Collapsible(title='docker', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
                         with TabPane('Logs', id='tab-logs'):
                             yield Select(
-                                [('(all services)', ALL_SERVICES)],
+                                [('(engines — no litellm)', ENGINE_SERVICES),
+                                 ('(all services)', ALL_SERVICES)],
                                 value=ALL_SERVICES, allow_blank=False,
                                 id='logsvc',
                             )
@@ -872,7 +902,12 @@ class InferStackTUI(App):
         self._update_api_urls()
         self._update_api_curl()
         self._first_paint()           # instant paint from cheap ledger state
-        self._restart_logs(self._log_service)
+        # `docker compose logs -f` is a live subprocess, not a poll, so the
+        # collapsed gate in _collect does not stop it. Starting it for a pane
+        # nobody is looking at costs a process and a stream of lines from
+        # startup onward. _sync_pane_state starts it when the pane opens.
+        if not self.query_one('#docker', Collapsible).collapsed:
+            self._restart_logs(self._log_service)
         self._refresh_timer = self.set_interval(
             self.ledger_interval, self.action_refresh
         )
@@ -1122,11 +1157,18 @@ class InferStackTUI(App):
         in ``_collect`` reflects reality — Collapsible.Toggled doesn't fire on
         every path, so don't depend on it alone."""
         try:
+            was_collapsed = self._collapsed['docker']
             self._collapsed['docker'] = \
                 self.query_one('#docker', Collapsible).collapsed
             self._collapsed['system'] = \
                 self.query_one('#system', Collapsible).collapsed
             self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
+            # Follow logs only while somebody can see them.
+            if was_collapsed and not self._collapsed['docker']:
+                if self._log_proc is None:
+                    self._restart_logs(self._log_service)
+            elif not was_collapsed and self._collapsed['docker']:
+                self._terminate_logs()
         except Exception:  # noqa: BLE001
             pass
 
@@ -1446,10 +1488,19 @@ class InferStackTUI(App):
             return
         self._service_options = names
         select = self.query_one('#logsvc', Select)
-        options = [('(all services)', ALL_SERVICES)] + [(n, n) for n in names]
+        options = [
+            ('(engines — no litellm)', ENGINE_SERVICES),
+            ('(all services)', ALL_SERVICES),
+        ] + [(n, n) for n in names]
         select.set_options(options)
+        # Keep whatever is selected. The two sentinels are not service names,
+        # so they have to be allowed through explicitly or refreshing the
+        # service list would silently knock the view back to a default.
         select.value = (
-            self._log_service if self._log_service in names else ALL_SERVICES
+            self._log_service
+            if self._log_service in names
+            or self._log_service in (ENGINE_SERVICES, ALL_SERVICES)
+            else ENGINE_SERVICES
         )
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -1483,9 +1534,27 @@ class InferStackTUI(App):
         log = self.query_one('#logs', RichLog)
         log.clear()
         self._log_lines = []
-        label = service or 'all services'
+        target, label = self._resolve_log_target(service)
         log.write(f'— following logs: {label} —')
-        self._stream_logs(service or None)
+        self._stream_logs(target)
+
+    def _resolve_log_target(self, service: str):
+        """(what to hand `docker compose logs`, what to show the user).
+
+        ENGINE_SERVICES expands to the concrete non-gateway service names. If
+        there are none -- nothing deployed yet, or a compose file that could
+        not be read -- fall back to every service rather than passing an empty
+        list, which `docker compose logs` would read as "all" anyway but
+        without saying so in the label.
+        """
+        if service == ENGINE_SERVICES:
+            names = engine_services(self._service_names())
+            if not names:
+                return None, 'all services (no engine services yet)'
+            return names, f'engines: {", ".join(names)}'
+        if not service:
+            return None, 'all services'
+        return service, service
 
     def _terminate_logs(self) -> None:
         proc, self._log_proc = self._log_proc, None
@@ -1632,6 +1701,8 @@ class InferStackTUI(App):
         """Space: toggle the cursor row of the focused leases/deployments table."""
         focused = self.focused
         tid = getattr(focused, 'id', None)
+        if tid is None:
+            return
         res = self._table_sel(tid)
         if res is None:
             return

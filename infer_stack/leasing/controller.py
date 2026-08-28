@@ -24,6 +24,7 @@ import contextlib
 import fcntl
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -404,6 +405,40 @@ class Controller:
                     desired.append(deployment)
         return desired
 
+    def _infeasible_alone(self, deployments, requested: set) -> dict:
+        """Which of this lease's deployments cannot be placed even on an idle host.
+
+        Returns ``{deployment_id: reason}``, empty when the whole set fits.
+        Backends without an idle-host planner (null, kubeai) return empty --
+        the check is an optimisation over waiting, never a new failure mode.
+        """
+        plan_alone = getattr(self.backend, 'plan_on_idle_host', None)
+        if plan_alone is None:
+            return {}
+        try:
+            plan = plan_alone(list(deployments))
+        except Exception as ex:  # noqa: BLE001 -- never fail an acquire on the check
+            # Waiting (the old behavior) is still correct, so a broken check
+            # must not break acquire. But it must not be silent either: a
+            # swallowed AttributeError here disables the check on every call
+            # and is indistinguishable from "everything is feasible".
+            warnings.warn(f'feasibility check skipped: {ex!r}',
+                          RuntimeWarning, stacklevel=2)
+            return {}
+        # GpuPlan reports what it PLACED; unplaced is the complement. It has no
+        # ``unplaced``/``placement_errors`` -- those belong to ReconcileResult.
+        blocked = requested - set(plan.assignments)
+        if not blocked:
+            return {}
+        reasons = {}
+        for gid in sorted(blocked):
+            why = next((e for e in plan.errors if e.startswith(gid)), gid)
+            reasons[gid] = (
+                f'{why} -- and that is the whole host with nothing else '
+                f'running, so waiting cannot help'
+            )
+        return reasons
+
     def _render(self) -> ReconcileResult:
         """Render the desired state to disk WITHOUT the slow apply.
 
@@ -416,14 +451,18 @@ class Controller:
         """
         self.ledger.sweep()
         desired = self.desired_deployments()
-        if hasattr(self.backend, 'converge'):
+        # Bound once rather than probed with hasattr: the capability check is
+        # the same, and the bound method keeps its type instead of narrowing
+        # to `object` the way an attribute reached through hasattr does.
+        converge = getattr(self.backend, 'converge', None)
+        if converge is not None:
             before = set(self.backend.observe())
             try:
-                self.backend.converge(desired, apply=False)
+                converge(desired, apply=False)
             except TypeError:
                 # Legacy converge(desired) with no apply kwarg renders+applies
                 # in one shot (no separate apply()); accept that here.
-                self.backend.converge(desired)
+                converge(desired)
             after = set(self.backend.observe())
             return ReconcileResult(
                 realized=sorted(after - before),
@@ -676,6 +715,22 @@ class Controller:
             unplaced = requested & set(rec.unplaced)
             g_target = self.ledger.desired_generation()
         if unplaced and wait_for_placement and apply:
+            # Never queue for capacity that cannot exist. Re-plan this lease's
+            # deployments ALONE on an idle host: if they do not fit there, no
+            # amount of waiting will help, and waiting is actively harmful --
+            # the lease holds whatever it did place for the whole timeout, so a
+            # request that was never satisfiable can block ones that are.
+            #
+            # Only the aggregate case needs this. A single deployment too large
+            # for any card is already caught by the planner's permanent branch;
+            # what is missed is a lease whose deployments cannot fit TOGETHER,
+            # e.g. a 4-GPU model plus a 1-GPU extractor on a 4-GPU host.
+            infeasible = self._infeasible_alone(result.deployments, requested)
+            if infeasible:
+                g_rollback = self._rollback_acquire(result.lease.id)
+                self._ensure_applied(g_rollback)
+                raise PlacementError(sorted(infeasible.keys()),
+                                     sorted(infeasible.values()))
             p_timeout = timeout if placement_timeout is None else placement_timeout
             p_interval = (
                 interval if placement_interval is None else placement_interval

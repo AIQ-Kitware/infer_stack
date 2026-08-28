@@ -1,0 +1,51 @@
+# Answer-key fixture for the oracle mock (infer_stack.mockserver).
+#
+# This is the question corpus ONLY: what is asked, what the gold answer is, and
+# which questions decompose into which. It deliberately carries no model
+# profiles. Each deployed model's ability comes from its endpoint's
+# `--mock-ability` in the catalog, so one corpus serves a whole cohort and the
+# per-model behaviour stays where the deployment is described.
+#
+# It lives under `infer_stack/` so `COPY infer_stack ./infer_stack` in
+# dockerfiles/mock-vllm.dockerfile puts it in the image at a stable path:
+#
+#   /opt/infer-stack/infer_stack/mockserver/data/oracle_questions.yaml
+#
+# passed with `--mock-config=`. No bind-mount, so the same catalog works on any
+# host that can run the image.
+#
+# Scope: the oracle is answer-aware for THESE questions. A question it has
+# never seen still gets a deterministic, correlated-across-the-cohort verdict,
+# but its "correct" answer is a synthetic string, not a known gold one. That is
+# enough to exercise a card's arithmetic; it is not a claim about any model.
+
+questions:
+  cap-fr: 'What is the capital of France?'
+  cap-jp: 'What is the capital of Japan?'
+  arith-sum: 'What is 17 plus 25?'
+  arith-prod: 'What is 6 times 7?'
+  # The parent of the compositional pair below.
+  arith-combined: 'What is 6 times 7, plus 17 plus 25?'
+  bool-and: 'Is 10 both even and greater than 3?'
+  bool-even: 'Is 10 even?'
+  bool-gt3: 'Is 10 greater than 3?'
+
+answer_key:
+  cap-fr: 'Paris'
+  cap-jp: 'Tokyo'
+  arith-sum: '42'
+  arith-prod: '42'
+  arith-combined: '84'
+  bool-and: 'yes'
+  bool-even: 'yes'
+  bool-gt3: 'yes'
+
+# A compositional question is answered correctly only when every step is too.
+# Without this the parent and its steps are independent draws, and any feature
+# derived from the decomposition carries no information about whether the final
+# answer is right -- so a card claiming such a feature predicts correctness
+# would measure a true null however much data it was given. Exercising that
+# path is a large part of why the oracle exists.
+composition:
+  arith-combined: [arith-prod, arith-sum]
+  bool-and: [bool-even, bool-gt3]

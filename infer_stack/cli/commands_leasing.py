@@ -198,6 +198,11 @@ def _resolve_assume_yes(config, *, interactive: bool) -> bool:
 
     Only the additive verb (``acquire``) prompts, and only on a real terminal
     without ``--yes``. Everything else (release/leases/run/non-TTY) auto-applies.
+
+    Both streams are checked, because the prompt writes to one and reads from
+    the other. Testing stdout alone meant that under ``pytest -s`` -- where
+    stdout is the terminal -- acquire decided to prompt and then blocked
+    forever on a stdin nothing was going to type into.
     """
     import sys
 
@@ -205,15 +210,29 @@ def _resolve_assume_yes(config, *, interactive: bool) -> bool:
         return True
     if getattr(config, 'yes', False):
         return True
-    return not sys.stdout.isatty()
+    answerable = sys.stdin is not None and sys.stdin.isatty()
+    return not (answerable and sys.stdout.isatty())
 
 
 def _make_backend(config, *, interactive: bool = False):
     from ..paths import get_setting
 
-    # Resolve the backend: explicit --backend wins, else the persisted default
-    # (`config set backend compose`), else the dry-run null backend.
-    name = getattr(config, 'backend', None) or get_setting('backend') or 'null'
+    # Resolve the backend: explicit --backend wins, then the environment, then
+    # the persisted default (`config set backend compose`), else the dry-run
+    # null backend.
+    #
+    # The env rung exists for the same reason as INFER_STACK_CATALOG: a DAG
+    # whose nodes lease their own endpoints generates `infer-stack run`
+    # commands, and those commands must not have to name the machine's
+    # backend -- that would make the pipeline machine-specific. Exporting it
+    # once, outside the DAG, also avoids silently falling through to the null
+    # backend and producing a run where nothing was ever served.
+    name = (
+        getattr(config, 'backend', None)
+        or os.environ.get('INFER_STACK_BACKEND', '').strip()
+        or get_setting('backend')
+        or 'null'
+    )
     if name in (None, '', 'null', 'dry-run'):
         return NullBackend()
     if name == 'compose':
@@ -272,13 +291,32 @@ def _open_controller(config, *, interactive: bool = False) -> Controller:
     return Controller(ledger, _make_backend(config, interactive=interactive))
 
 
-def _load_catalog(config) -> Catalog:
+def _catalog_path(config) -> Path:
+    """Resolve the catalog: ``--catalog``, then the env, then the default.
+
+    The env fallback exists for generated job scripts. A pipeline that leases
+    its own endpoints per node cannot hard-code a catalog path without
+    becoming a different pipeline for a rehearsal than for a real run --
+    which defeats the purpose of rehearsing. Exporting
+    ``INFER_STACK_CATALOG`` once, outside the DAG, lets the same generated
+    command serve both.
+
+    ``--catalog`` still wins, so nothing that passes it explicitly changes.
+    """
     # `catalog` is declared only on the verbs that take a --catalog arg
     # (acquire/run/tui); converge verbs that don't (release/evict/gc) still load
-    # it for no-blip, so fall back to the default path when the field is absent
-    # rather than raising AttributeError off a bare `config.catalog`.
-    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
-    path = Path(raw).expanduser()
+    # it for no-blip, so fall back when the field is absent rather than raising
+    # AttributeError off a bare `config.catalog`.
+    raw = (
+        getattr(config, 'catalog', None)
+        or os.environ.get('INFER_STACK_CATALOG', '').strip()
+        or (config_root() / 'catalog.yaml')
+    )
+    return Path(raw).expanduser()
+
+
+def _load_catalog(config) -> Catalog:
+    path = _catalog_path(config)
     if not path.exists():
         raise SystemExit(
             f'catalog not found: {path} (pass --catalog or create catalog.yaml)'
@@ -296,8 +334,7 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
     hard error here: it loads an empty catalog (the dashboard then shows the
     empty-state with a Suggest button) and returns the path it would write to.
     """
-    raw = getattr(config, 'catalog', None) or (config_root() / 'catalog.yaml')
-    path = Path(raw).expanduser()
+    path = _catalog_path(config)
     if not path.exists():
         return Catalog.from_dict({'models': {}, 'endpoints': {}}), path
     try:
@@ -1807,6 +1844,10 @@ class TestCLI(_PathOverridesMixin):
 
     __command__ = 'test'
 
+    catalog = scfg.Value(
+        None, type=str,
+        help='Catalog path, used only to look up the endpoint protocol.',
+    )
     name = scfg.Value(
         None, position=1, type=str, help='Endpoint alias to test (e.g. chat).'
     )
@@ -1822,6 +1863,11 @@ class TestCLI(_PathOverridesMixin):
         None, type=int, help='Override the gateway port (default: 14042).'
     )
     json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
+    protocol = scfg.Value(
+        None, choices=['chat', 'completions'],
+        help="Which surface to hit. Default: the endpoint's declared "
+             '`protocol` from the catalog, falling back to chat.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1833,19 +1879,36 @@ class TestCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
         if not config.name:
             raise SystemExit('test: give an endpoint alias (e.g. `test chat`)')
+
+        # Follow the endpoint's declared protocol, like the readiness probe
+        # does. Hardcoding chat meant a completions-only endpoint -- a base
+        # model, or anything served for a client that renders its own prompts
+        # -- reported FAILED however healthy it was, because the server
+        # correctly 404s a surface it does not serve.
+        protocol = config.protocol or _endpoint_protocol(config, config.name)
+
         base_url, key = _front_door(config)
         headers = {'Content-Type': 'application/json'}
         if key:
             headers['Authorization'] = f'Bearer {key}'
-        payload = {
-            'model': config.name,
-            'messages': [{'role': 'user', 'content': config.prompt}],
-            'max_tokens': int(config.max_tokens),
-        }
+        if protocol == 'completions':
+            url = f'{base_url}/completions'
+            payload = {
+                'model': config.name,
+                'prompt': config.prompt,
+                'max_tokens': int(config.max_tokens),
+            }
+        else:
+            url = f'{base_url}/chat/completions'
+            payload = {
+                'model': config.name,
+                'messages': [{'role': 'user', 'content': config.prompt}],
+                'max_tokens': int(config.max_tokens),
+            }
         t0 = time.monotonic()
         try:
             resp = requests.post(
-                f'{base_url}/chat/completions',
+                url,
                 headers=headers,
                 json=payload,
                 timeout=float(config.timeout),
@@ -1859,7 +1922,9 @@ class TestCLI(_PathOverridesMixin):
                 config, base_url, f'HTTP {resp.status_code}: {body}'
             )
         try:
-            reply = resp.json()['choices'][0]['message']['content']
+            choice = resp.json()['choices'][0]
+            reply = (choice.get('text') if protocol == 'completions'
+                     else choice['message']['content'])
         except (ValueError, KeyError, IndexError) as ex:
             return _test_fail(config, base_url, f'unexpected response: {ex}')
         reply = (reply or '').strip()
@@ -1870,6 +1935,29 @@ class TestCLI(_PathOverridesMixin):
         else:
             print(f'{config.name}: ok ({dt:.2f}s) {reply!r}')
         return 0
+
+
+def _endpoint_protocol(config, name: str) -> str:
+    """The endpoint's declared protocol, or 'chat' when it cannot be resolved.
+
+    Best-effort on purpose: ``test`` must still work against an endpoint that
+    is live but absent from the catalog (an ad-hoc acquire), so a missing or
+    unreadable catalog falls back to the default rather than failing.
+
+    Resolution goes through :func:`_catalog_path` rather than repeating it.
+    The copy here omitted ``INFER_STACK_CATALOG``, so leasing and ``test``
+    could read different catalogs on the same machine and ``test`` would probe
+    the wrong API surface for an endpoint it had resolved from the other one.
+    """
+    try:
+        from ..leasing import Catalog
+        path = _catalog_path(config)
+        if not path.exists():
+            return 'chat'
+        ep = Catalog.load(path).endpoints.get(name)
+        return getattr(ep, 'protocol', None) or 'chat'
+    except Exception:  # noqa: BLE001 - a diagnostic must not fail on lookup
+        return 'chat'
 
 
 def _test_fail(config, base_url: str, reason: str) -> int:

@@ -1452,3 +1452,62 @@ def test_tui_titles_say_observing_before_first_docker_observe():
             assert '0 running' in app.query_one('#docker', Collapsible).title
 
     _run(scenario)
+
+
+def test_gateway_services_are_excluded_from_the_default_log_view():
+    """The logs pane defaults to engines, not everything.
+
+    LiteLLM logs a line per proxied request, so on a busy host it scrolls the
+    engine output -- where errors actually appear -- out of the pane.
+    """
+    from infer_stack.tui import (
+        ALL_SERVICES,
+        ENGINE_SERVICES,
+        engine_services,
+        is_gateway_service,
+    )
+
+    assert is_gateway_service('litellm')
+    # Substring, not equality: a suffixed gateway service must still match, or
+    # the noisy view comes back silently.
+    assert is_gateway_service('infer-stack-litellm-1')
+    assert not is_gateway_service('vllm-qwen-qwen3-8-27b')
+
+    names = ['litellm', 'vllm-a', 'vllm-b']
+    assert engine_services(names) == ['vllm-a', 'vllm-b']
+    # The two sentinels must stay distinguishable from each other and from any
+    # real service name.
+    assert ENGINE_SERVICES != ALL_SERVICES
+    assert ENGINE_SERVICES not in names
+
+
+def test_log_target_resolves_the_engines_sentinel_to_service_names():
+    from infer_stack.tui import ALL_SERVICES, ENGINE_SERVICES, InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._service_names = lambda: ['litellm', 'vllm-a', 'vllm-b']
+
+            target, label = app._resolve_log_target(ENGINE_SERVICES)
+            assert target == ['vllm-a', 'vllm-b']
+            assert 'litellm' not in label
+
+            # A named service is passed straight through.
+            assert app._resolve_log_target('litellm') == ('litellm', 'litellm')
+
+            # "all" stays None so docker compose logs gets no service argument.
+            target, label = app._resolve_log_target(ALL_SERVICES)
+            assert target is None and label == 'all services'
+
+            # With no engines to show, fall back rather than passing an empty
+            # list and mislabelling it.
+            app._service_names = lambda: ['litellm']
+            target, label = app._resolve_log_target(ENGINE_SERVICES)
+            assert target is None and 'all services' in label
+
+    _run(scenario)

@@ -426,8 +426,8 @@ pipelines can `acquire` the models a node needs, block until ready, and
 `release` after — instead of the current single global "active profile" that is
 last-render-wins under a shared data dir. The full critique + staged plan lives
 in the *parent* repo at `aiq-eval-runner/dev/infer-stack-redesign-critique.md`
-(grounded in the two real consumers: aiq-eval-runner's Incubilate/Contextual
-Drag and eval_audit's HELM/kwdagger path). User explicitly asked to start on a
+(grounded in the two real consumers: aiq-eval-runner's evaluation cards
+and eval_audit's HELM/kwdagger path). User explicitly asked to start on a
 new branch and bump versions; chose sqlite for the store (open question #1 in
 that doc). This is Phase 1's foundation.
 
@@ -875,7 +875,7 @@ the first poll) is host-validated. 17 compose tests (3 new ollama), 88
 leasing/CLI + 7 xdoctests green.
 
 **Next:** consumer integration — wrap eval_audit's MaterializeHelmRunNode command
-with `infer-stack run`, and switch aiq-eval-runner Incubilate to acquire/release.
+with `infer-stack run`, and switch an aiq-eval-runner card to acquire/release.
 
 ## 2026-06-17 12:20:00 -0400
 
@@ -2312,3 +2312,310 @@ Suite: 376 passed / 3 skipped (13 new vram tests, 2 new placement tests,
 4 new compose enrichment tests, MeasureCLI registered). Not exercised on real
 GPUs yet — the measure command's acquire-once path and the docker-logs parse
 get their first real run in Phase 4 on yardrat.
+
+## 2026-07-31 11:09:13 -0400
+
+Model: claude-opus-5[1m] (Claude Code, default effort).
+
+**Intent.** "Look into https://github.com/llm-d/llm-d-inference-sim to see if
+we can run it as a mock in the system, then verify that two downstream
+evaluation cards work against a mock vLLM server run via infer-stack."
+This follows a correction I earned: I had built our own mock optimised for
+producing plausible *scores*, and defended that choice against the two
+external simulators the user had suggested. The user's answer was blunt and
+right — "If you had asked I would have said API fidelity matters more. That's
+how we know if this thing is going to break in production or not. I don't care
+what the scores are in the mock run."
+
+**What I found.** llm-d-inference-sim is a far better vLLM stand-in than what
+I wrote: real SSE streaming with configurable TTFT and inter-token delay, real
+prompt/completion token accounting, `/v1/models`, `/v1/embeddings`,
+`/v1/responses`, `/metrics` (vLLM-compatible subset), 404 on an unknown model,
+injectable `rate_limit`/`server_error`/`context_length` failures, a
+`startup-duration` window that answers 503 on `/health/ready`, and LoRA
+lifecycle simulation. Published distroless image on ghcr. It cannot answer a
+question correctly — responses are random sentences — which is precisely the
+thing I over-weighted last time.
+
+**The design decision.** It speaks vLLM's API but not vLLM's CLI: no
+positional model, no `--host`, no `--tensor-parallel-size` /
+`--gpu-memory-utilization`, and it exits on an unknown flag. Three options:
+(a) a shim image translating vLLM argv, (b) a third `engine` alongside
+vllm/ollama, (c) a `runtime.simulator` block on the existing vllm engine.
+
+I took (c). (a) hides the divergence inside a wrapper and buys nothing — the
+vLLM argv renderer is only really testable against vLLM. (b) is ~20 dispatch
+sites across compose/placement/catalog/CLI for something that is, from every
+client's point of view, an ordinary vLLM upstream: port 8000, `/v1`,
+`/health`, same gateway route, same lease bookkeeping. (c) touches exactly the
+three places where a simulator genuinely differs — argv, GPU count, container
+healthcheck — and leaves the rest byte-identical.
+
+Two non-obvious bits. `required_gpu_count` had `max(1, ...)`, which would make
+every simulator endpoint unplaceable on the GPU-less host a simulator exists
+to serve; it returns 0 now. And the healthcheck shells out to `curl`, which a
+distroless image does not contain, so it must be disabled rather than
+inherited — safe only because `probe_ready` gates on a real generation over
+HTTP, which is strictly stronger. I did *not* add `simulator` to
+`VLLM_STRUCTURAL_FIELDS`: adding a key rehashes every existing compat key and
+would orphan live leases, and `image` (already structural) separates simulator
+from real deployments anyway.
+
+**On keeping our own mock.** I kept it, under `catalog-mock-oracle.yaml`, with
+its role stated plainly in both catalog headers and `docs/mock-endpoints.md`:
+llm-d-sim answers "does the client break", ours answers "does the math
+compute". Random text cannot distinguish a working fan-in from one that
+silently drops a model, because garbage is the expected input either way. That
+is a real and separate job — but it is the *second* job, not the first, and
+the docs now say so rather than leaving a future reader to infer my earlier
+priority ordering.
+
+**Validation.** Full leasing path exercised for real (not rendered): acquire →
+placed on "(cpu)" → compose up → LiteLLM route → readiness generation probe →
+command sees `OPENAI_BASE_URL`/`OPENAI_API_KEY` → non-streaming and streaming
+chat with correct usage counts → release → teardown. 7 new tests in
+`tests/test_simulator_runtime.py`; suite green.
+
+**Uncertainties / risks.** The simulator has no bearer-auth option, so the
+auth path is still only covered by our own mock. `--model` must not be a real
+HF repo id or it tries to reach a tokenizer render sidecar and dies at
+startup; I default it to the served name and pin that with a test, but a user
+who sets `simulator.model` to a repo id gets a crash-loop with a message that
+does not obviously say why. Docker access on this host needed `usermod -aG
+docker`; that is environmental, not a repo change.
+
+**Takeaway.** When a stand-in for a real component diverges, the question is
+*which layer* it diverges at. This one is client-identical and
+deployment-different, so the right seam was the deployment renderer, not a new
+engine. Had it diverged at the API it would have needed to be a new engine —
+or not used at all.
+
+**Same-session follow-up (11:30).** Ran both evaluation cards against the simulator
+for real, and the first one to use a realistically-named endpoint broke:
+its alias *is* `Qwen/Qwen3-8B`, and the simulator resolves `--model`
+against HuggingFace to decide between real and simulated tokenization. A real
+repo id makes it demand a tokenizer render sidecar and die at startup. My
+default of "use the served name" therefore worked only for endpoints named
+`mock/...` — i.e. only in the test I had written. `--model` now gets a
+`sim-<slug>` that cannot resolve to a repo, with `simulator.model` as the
+escape hatch for anyone who wants the render-service path. The lesson is
+narrow but sharp: I validated the default against a fixture I chose, not
+against the naming convention every real catalog uses.
+
+Also measured, not assumed, the fidelity gaps and wrote them into
+docs/mock-endpoints.md: `n > 1` returns one choice on both completions and
+chat; no logprobs; no bearer auth; unknown request fields accepted; 400 on
+context overflow. I initially wrote that the `n` gap was why one card's
+filtering step kept nothing — it is not. That client fans n out into n
+separate requests, so it still gets its distinct samples; the filter keeps
+nothing because the answer extractor finds no answer in random prose and
+every sample is labelled neither correct nor incorrect. Checked the
+intermediate records before believing the tidier story.
+
+Both cards complete and degrade gracefully. One fans 32 jobs in through two
+levels of gather to 4 analyses; every model scores at chance, and the
+analysis step reports that it has too few usable folds instead of fitting a
+degenerate model. The other runs a seven-node DAG and reports that its
+filtering step kept nothing. Both come back INCONCLUSIVE. Neither crashes,
+which is the property worth having — a real cohort containing one hopeless
+model produces the same degenerate input.
+
+**Same-session follow-up (14:15).** The user pushed back on two things, both
+right. First: I had suggested pointing `INFER_STACK_CONFIG_DIR`/`DATA_DIR` at
+a scratch directory to isolate a rehearsal. That is exactly backwards — the
+ledger is the coordination mechanism, and a private one means the run will
+happily place a model on a GPU somebody else's lease already holds. The
+advice is retracted and the rehearsal scripts now say so in a comment where
+someone would otherwise be tempted.
+
+Second, and more substantial: acquire/release belongs *in the pipeline*, not
+in a shell wrapper around the whole evaluation. Wrapping the run holds every
+model in the cohort for its entire duration, including while the fan-in and
+the leave-one-out fit run, which need no model at all. On a simulator that is
+invisible; with real models it is nine GPUs held to compute a logistic fit.
+
+That motivated `INFER_STACK_CATALOG` and `INFER_STACK_BACKEND` env rungs on
+the existing resolution order (flag > env > persisted > default). A DAG whose
+nodes lease their own endpoints has to *generate* `infer-stack run` commands,
+and those commands must not name a catalog path or a machine's backend --
+that would make the pipeline machine-specific and make a rehearsal a
+different pipeline from a real run, which defeats rehearsing. The backend rung
+also closes a quiet failure: without it a generated `infer-stack run` falls
+through to the null backend and serves nothing while looking fine.
+
+The node-side half lives in aiq-magnet (`magnet.leasing.LeasedProcessNode`),
+not here -- kwdagger's `command` is already an overridable property, so no
+change was needed in either kwdagger or infer-stack's leasing core.
+
+One real bug surfaced only under a live run: `--endpoint` is a single
+comma-separated string, so emitting the flag twice silently kept the last
+model and left the other unleased. The ledger showed a
+`per_question_features` job holding the extractor and *not* the model it was
+testing. Nothing errors -- it just races for a GPU it never reserved. Fixed
+in magnet with a test that pins the comma form.
+
+Uncertainty worth flagging: each lease costs a converge (file-locked across
+processes) plus a readiness generation probe. On the simulator that dominates
+the wall clock of a 32-shard rehearsal. On real hardware it should be noise
+against minutes of generation, but I have not measured it there, and it is a
+reason to prefer fewer, larger shards.
+
+## 2026-08-27 18:55:00 -0400
+
+Model: Claude Opus 5 (1M context), `claude-opus-5[1m]`, Claude Code, default
+reasoning effort, bypass-permissions sandbox.
+
+**Intent.** Three release-relevant issues from review of the
+`dev/mock-inference-server` PR, scoped deliberately narrowly: make the
+documented oracle catalog actually deliver a GPU-less answer-key oracle; make
+`infer-stack test` honour `INFER_STACK_CATALOG`; and canonicalize served
+aliases before any simulator behaviour is keyed on model identity. Explicitly
+out of scope: auth/introspection, deployment compat-key lifecycle, `doctor`,
+`status`, GPU-doctor reporting. The API-fidelity (`llm-d-inference-sim`) and
+answer-aware (`infer_stack.mockserver`) mocks stay as two things; neither
+replaces the other.
+
+**The CPU-only representation, which was the one real design choice.** The
+oracle mock is vLLM-shaped on purpose — its entrypoint parses vLLM's own
+command line, which is what lets a catalog deploy it with an image override
+and nothing else. But `required_gpu_count()` treated "not a
+`runtime.simulator`" as "wants a GPU", so the documented CPU-only endpoint was
+unplaceable on the CPU-only host it exists for. `runtime.simulator` was the
+tempting reuse and is wrong: it does double duty as *needs no GPU* and *does
+not speak vLLM's CLI*, and setting it would switch the renderer to
+`simulator_args()` and break the very property this mock is built around.
+
+So the two meanings are now two markers. `runtime.cpu_only: true` means only
+"needs no GPU" and leaves rendering alone; `runtime.simulator` keeps both of
+its meanings, unchanged. Rejected alternatives, both explicitly: inferring
+from `gpu_memory_utilization: 0.0` (a real deployment may legitimately set it
+low) and from the image name (not a contract). Unknown `runtime` keys never
+reach the command line — `vllm_args()` renders an allowlist plus `extra_args`
+— so the marker is inert to rendering by construction, not by care.
+
+The answer key ships *inside the image* rather than as a bind-mount. The
+fixture is `infer_stack/mockserver/data/oracle_questions.yaml`, already copied
+by `COPY infer_stack ./infer_stack`, so the catalog names an absolute in-image
+path and works on any host that can run the image. It carries the question
+corpus only — `questions`, `answer_key`, `composition` — and *not* model
+profiles: each model's ability stays on its endpoint as `--mock-ability`, so
+one corpus serves a whole cohort and competence is described where the
+deployment is. That split is the reusable part of the decision.
+
+**Alias canonicalization.** `resolve_profile()` already accepted either name;
+`complete()` then kept hashing the caller's string. Five sites — the failure
+draw, `knows()` and its composition recursion, the drift draw, the
+wrong-answer variant, and the mode context, which hashes on `model_id` too.
+Patching only the recursion would have removed the `KeyError` while leaving
+alias and canonical id simulating as different models, which is the worse
+failure because it is silent. `complete()` now rebinds `model_id =
+profile.model_id` immediately after resolving, and `knows()` canonicalizes
+independently and carries the resolved profile through recursion rather than
+re-looking-up the alias. Internal only: `/v1/models` still advertises the
+alias and either name is still accepted.
+
+**Validation.** Focused suites all green: mockserver, mock_vllm_serve,
+simulator_runtime, leasing_placement, cli_leasing, leasing_compose — 255
+passed. Full gate green: flake8 (E9,F63,F7,F82) clean, `ty check ./infer_stack`
+clean, `pytest -p no:doctest --xdoctest infer_stack tests` 504 passed / 3
+skipped in ~31s. I checked the new tests actually catch the old bugs rather
+than passing vacuously: 14 of 18 alias cases fail against the pre-fix
+simulator, and the `INFER_STACK_CATALOG` test fails against the pre-fix
+`_endpoint_protocol`.
+
+**Anomaly I could not reproduce.** The first combined `infer_stack tests` run
+exceeded a 600s cap. Four subsequent runs finished in ~31s each, and HEAD ran
+clean too, so I have no explanation and no reproduction. Flagging rather than
+burying it: we fixed a genuine test hang in this same branch yesterday, so an
+unexplained stall here deserves a second pair of eyes if anyone sees it again.
+
+**Risks and limits.** The healthcheck fix installs `curl` in the mock image so
+Compose's rendered `curl` healthcheck can run — the alternative (inherit the
+image's Python HEALTHCHECK by emitting none) would have meant keying compose
+behaviour on `cpu_only`, conflating "needs no GPU" with "lacks curl". Real
+vLLM images carry curl and being a drop-in for them is this image's whole
+purpose, so matching them won. The test asserts the dockerfile provisions
+whatever binary the rendered healthcheck invokes, which is the actual seam;
+it does not build the image, so it cannot catch an apt failure. `probe_ready()`
+is untouched and remains the real readiness gate.
+
+The oracle is answer-aware **only** for the fixture corpus. Unknown questions
+still get deterministic, cohort-correlated verdicts, but their "correct" text
+is a synthetic `answer-…` string. `docs/mock-endpoints.md` now says so
+explicitly, because the previous wording could be read as claiming gold
+answers for arbitrary downstream questions.
+
+Takeaways worth carrying: (1) when one flag has come to mean two things, adding
+a second narrow flag beats overloading the first — the overload here would have
+been invisible until the renderer changed under someone; (2) resolve an
+identity once at the boundary and rebind, rather than resolving and then
+continuing to use the caller's string, which is what turned an alias into a
+second simulated model; (3) a fixture that ships inside the artifact removes a
+whole class of host-specific setup, and is worth the packaging entry.
+
+## 2026-08-28 10:40:00 -0400
+
+Model: Claude Opus 5 (1M context), `claude-opus-5[1m]`, Claude Code, default
+reasoning effort.
+
+**Intent.** CI was hanging after the xcookie refresh: the loose-sdist job ran
+nearly two hours, and sdist/3.12 both stalled right after
+`test_created_lock_file_and_dir_are_group_writable`. Some runs finished in 50s,
+so it was intermittent. Separately, pypy-3.11 (newly added to the matrix by the
+refresh) failed `test_leasing_coalesced_apply`, and Jon does not intend to
+support pypy.
+
+**This is the anomaly I flagged yesterday and could not reproduce.** Yesterday
+one combined run exceeded 600s and four retries were clean, so I logged it as
+unexplained. It was real. Worth remembering: an unreproduced stall in a
+concurrency test is evidence, not noise, and "I could not reproduce it" is a
+weaker statement than it feels like at the time.
+
+**Root cause, which turned out to be a product bug.** Looping the two
+concurrency files reproduced a hang in about 8% of runs. `faulthandler` showed
+one worker thread parked in `barrier.wait()` and the main thread in `join()` --
+so the *other* worker had died before reaching the barrier. In
+`test_acquire_serialized_across_separate_controllers` the Controller was built
+outside the `try`, so a construction failure killed the thread silently and
+stranded its peer on a two-party barrier forever.
+
+What killed it: `SqliteStore._ensure_schema` stamped the schema version with
+SELECT-then-INSERT. Two stores opening one fresh ledger concurrently both saw
+no row, both inserted, and the loser raised `UNIQUE constraint failed:
+meta.key`. A standalone repro hit it 5/400. Retrying could never have helped --
+by then the row exists, so the retry fails identically. It now inserts with
+`ON CONFLICT(key) DO NOTHING`, which is the idiom already used for
+`desired_gen` and `applied_gen` a few functions below. Repro: 0/400 after.
+
+This is not test-only. Two `infer-stack` CLIs starting against a fresh ledger is
+the ordinary case -- it is precisely what the cross-process lock exists to
+serialize, and that lock is taken *after* the store is constructed, so the
+store's own initialization was outside the protection the design assumes.
+
+**Test hardening, applied to all four concurrency sites** (two in
+`test_leasing_controller_lock.py`, two in `test_leasing_coalesced_apply.py`):
+every worker now constructs inside its `try`, `barrier.wait()` and `join()` both
+take a 30s bound, and a still-alive thread is an assertion rather than a wedge.
+The fix to the store removes today's cause; the bound removes the *class* of
+two-hour hang, so the next such bug fails in half a minute with a message.
+40 repeats clean, from ~8% hanging.
+
+**PyPy removed** from the tests matrix per Jon. Caveat I want on the record:
+`.github/workflows/tests.yml` is xcookie-generated, so a regeneration will
+reintroduce it. xcookie is not installed here and I did not want to invent a
+config key that might break generation, so I left a note in `[tool.xcookie]`
+saying what was removed and why. Someone who runs xcookie should set the real
+knob.
+
+**Validation.** flake8 clean, `ty` clean, full gate `pytest -p no:doctest
+--xdoctest infer_stack tests` 504 passed / 3 skipped, run three times at ~31s.
+Targeted loops: 40/40 clean on the concurrency files, 400/400 on the schema
+race.
+
+**Uncertainty.** I fixed the race I could reproduce and demonstrate. I cannot
+prove it is the *only* cause of the CI stalls -- the sdist job runs against an
+installed package on a slower, more contended machine, and I have not seen its
+faulthandler output. The bounded joins mean any remaining variant now reports
+itself instead of hanging, which is the property I would actually rely on.
+Takeaway worth keeping: schema/bootstrap paths run *before* whatever lock the
+design relies on, so they have to be idempotent on their own.

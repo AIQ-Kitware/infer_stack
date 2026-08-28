@@ -27,6 +27,14 @@ from infer_stack.leasing import (
 from infer_stack.leasing.backend import Readiness
 
 
+
+# A worker that dies before reaching the barrier leaves the survivors waiting
+# on it forever, and an unbounded join() then hangs the whole run rather than
+# failing it -- observed as a CI job stuck for nearly two hours. Both waits are
+# bounded, and every worker builds its own objects INSIDE the try so a
+# construction failure is recorded instead of silently killing the thread.
+THREAD_TIMEOUT_S = 30
+
 def _vreq(endpoint: str) -> EndpointRequest:
     return EndpointRequest(
         endpoint=endpoint,
@@ -149,12 +157,12 @@ def test_ensure_applied_coalesces_concurrent_waiters(tmp_path):
     errors: list[str] = []
 
     def worker() -> None:
-        ctl = Controller(
-            Ledger(SqliteStore(db)),
-            SharedStackBackend(shared, guard, apply_sleep=0.05),
-        )
         try:
-            barrier.wait()
+            ctl = Controller(
+                Ledger(SqliteStore(db)),
+                SharedStackBackend(shared, guard, apply_sleep=0.05),
+            )
+            barrier.wait(timeout=THREAD_TIMEOUT_S)
             ctl._ensure_applied(g_target)
         except Exception as e:  # noqa: BLE001
             errors.append(repr(e))
@@ -163,7 +171,12 @@ def test_ensure_applied_coalesces_concurrent_waiters(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=THREAD_TIMEOUT_S)
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, (
+        f'{len(stuck)} worker(s) never finished; a peer probably died '
+        'before the barrier -- see errors above'
+    )
 
     assert not errors, errors
     assert shared['apply_calls'] == 1, (
@@ -187,12 +200,12 @@ def test_concurrent_acquires_all_converge(tmp_path):
     errors: list[str] = []
 
     def worker(i: int) -> None:
-        ctl = Controller(
-            Ledger(SqliteStore(db)),
-            SharedStackBackend(shared, guard, apply_sleep=0.02),
-        )
         try:
-            barrier.wait()
+            ctl = Controller(
+                Ledger(SqliteStore(db)),
+                SharedStackBackend(shared, guard, apply_sleep=0.02),
+            )
+            barrier.wait(timeout=THREAD_TIMEOUT_S)
             out = ctl.acquire(f'owner{i}', [_vreq(f'm{i}')], wait=False)
             results[i] = [g.id for g in out.deployments]
         except Exception as e:  # noqa: BLE001
@@ -202,7 +215,12 @@ def test_concurrent_acquires_all_converge(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=THREAD_TIMEOUT_S)
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, (
+        f'{len(stuck)} worker(s) never finished; a peer probably died '
+        'before the barrier -- see errors above'
+    )
 
     assert not errors, errors
     assert len(results) == n

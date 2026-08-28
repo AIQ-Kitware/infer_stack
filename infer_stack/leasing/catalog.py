@@ -253,7 +253,9 @@ class Catalog:
             endpoints[name] = EndpointSpec(
                 name=name,
                 engine=spec.get('engine', VLLM),
-                model=spec.get('model'),
+                # Absent reads as empty, which is exactly what `errors()`
+                # reports as "needs a 'model'".
+                model=spec.get('model') or '',
                 host=spec.get('host'),
                 runtime=dict(spec.get('runtime') or {}),
                 sharing=_parse_sharing(spec.get('sharing')),
@@ -474,6 +476,13 @@ class Catalog:
     def _resolve_ollama(
         self, ep: EndpointSpec, sharing: str
     ) -> EndpointRequest:
+        # `errors()` reports a hostless ollama endpoint, but resolution can be
+        # reached without validating first, and a KeyError on None reads as an
+        # infer-stack bug rather than a catalog one.
+        if not ep.host:
+            raise CatalogError(
+                f"endpoint '{ep.name}' (ollama) needs a 'host'"
+            )
         host = self.hosts[ep.host]
         settings = host.settings
         structural = ollama_structural(

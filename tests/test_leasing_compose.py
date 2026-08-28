@@ -1458,8 +1458,82 @@ def _fake_weights(hf_cache: Path, model_id: str, mib: int):
         / 'snapshots' / 'rev0'
     )
     snap.mkdir(parents=True)
-    (snap / 'model.safetensors').write_bytes(b'x' * (mib * 1024 ** 2))
+    # Sparse: the floor is read with os.path.getsize, which stats rather than
+    # reads, so the bytes never have to exist. Materializing them cost 20 GiB
+    # of RAM for the 20-GiB case and hit MemoryError on CI.
+    with open(snap / 'model.safetensors', 'wb') as file:
+        file.truncate(mib * 1024 ** 2)
 
+
+
+def test_plan_on_idle_host_sees_the_aggregate_that_cannot_fit(tmp_path):
+    """Two deployments each placeable alone, impossible together.
+
+    The Incubilate shape: a tensor-parallel-4 answerer plus a 1-GPU extractor
+    on a 4-GPU host. Neither trips the planner's permanent-failure branch --
+    each fits by itself -- so only planning them as a set reveals that the
+    host can never hold both. The controller uses this to fail such a lease
+    immediately instead of queueing for capacity that cannot exist.
+    """
+    be = make_backend(tmp_path, spec='4x80')
+    plan = be.plan_on_idle_host([vllm('big', tp=4), vllm('ext')])
+    assert set(plan.assignments) == {'big'}
+    assert not plan.ok
+    assert any(e.startswith('ext') for e in plan.errors)
+
+    # ... and the pair that does fit reports no error, on the same host.
+    plan = be.plan_on_idle_host([vllm('big', tp=2), vllm('ext')])
+    assert set(plan.assignments) == {'big', 'ext'}
+    assert plan.ok
+
+
+def test_plan_on_idle_host_ignores_what_is_running(tmp_path):
+    """"Idle host" means idle: converged deployments and their pins do not
+    shrink the pool. Answering "is there room now" here would defeat the
+    point -- that is what the ordinary plan/converge path already reports."""
+    be = make_backend(tmp_path, spec='4x80')
+    be.converge([vllm('a'), vllm('b'), vllm('c'), vllm('d')])  # every GPU busy
+    assert len(be.observe()) == 4
+
+    plan = be.plan_on_idle_host([vllm('e', tp=4)])
+    assert plan.assignments == {'e': [0, 1, 2, 3]}
+    assert plan.ok
+
+
+def test_plan_on_idle_host_reuses_a_shared_deployment_pinned_elsewhere(tmp_path):
+    """A requested deployment already running outside our allow-list is reusable.
+
+    The Slurm shape: job A owns GPU 2 and started the shared extractor there;
+    job B owns GPUs [0, 1] and wants a 2-GPU answerer plus that same extractor.
+    B should queue for its two cards, not be rejected.
+
+    Dropping every pin asked the wrong question -- "do a 2-GPU answerer AND a
+    1-GPU extractor fit inside [0, 1]" -- and answered no. The extractor is
+    already placed and does not need a card from B's slice at all; placement
+    validates pins against the whole host for exactly this reason.
+    """
+    job_a = make_backend(tmp_path, spec='4x80', allowed_gpus=[2])
+    job_a.converge([vllm('ext')])
+    assert job_a.plan([vllm('ext')]).assignments == {'ext': [2]}
+
+    job_b = make_backend(tmp_path, spec='4x80', allowed_gpus=[0, 1])
+    plan = job_b.plan_on_idle_host([vllm('ans', tp=2), vllm('ext')])
+    assert plan.assignments == {'ans': [0, 1], 'ext': [2]}
+    assert plan.ok
+
+
+def test_plan_on_idle_host_still_rejects_when_a_kept_pin_fills_the_host(tmp_path):
+    """Keeping the requested deployments' pins must not weaken the detection.
+
+    The answerer already holds all four cards, so the extractor has nowhere to
+    go and never will. Honoring the pin is what makes that obvious.
+    """
+    be = make_backend(tmp_path, spec='4x80')
+    be.converge([vllm('ans', tp=4)])
+    plan = be.plan_on_idle_host([vllm('ans', tp=4), vllm('ext')])
+    assert set(plan.assignments) == {'ans'}
+    assert not plan.ok
+    assert any(e.startswith('ext') for e in plan.errors)
 
 def test_plan_enriches_floor_from_hf_cache(tmp_path):
     # A 20-GiB-weights model with NO declaration must still never plan onto
