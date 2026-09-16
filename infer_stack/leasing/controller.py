@@ -31,7 +31,7 @@ from typing import Callable, Iterable
 
 from .backend import Backend
 from .ledger import Ledger
-from .models import Deployment, DeploymentState, EndpointRequest, Lease
+from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
 
 KEEP_WARM = 'keep-warm'
 
@@ -103,6 +103,16 @@ class AcquireOutcome:
 class ReleaseOutcome:
     idled_deployment_ids: list[str]
     reconcile: ReconcileResult
+
+
+@dataclass
+class RenewOutcome:
+    # None when the lease is unknown or no longer ACTIVE.
+    lease: Lease | None
+    # IDLE deployments this renew made LIVE again (empty for a TTL-only renew).
+    revived_deployment_ids: list[str]
+    # None for a TTL-only renew, which changes no desired state.
+    reconcile: ReconcileResult | None = None
 
 
 @dataclass
@@ -869,6 +879,32 @@ class Controller:
         return ReleaseOutcome(
             idled_deployment_ids=rel.idled_deployment_ids, reconcile=rec
         )
+
+    def renew(self, lease_id: str, *, ttl_seconds: float | None) -> RenewOutcome:
+        """Extend a lease's TTL; publish if that revives an idle deployment.
+
+        Every renew is serialised under the lock, because a renew of an ACTIVE
+        lease whose deployment went IDLE makes it LIVE again, which changes the
+        desired state. A TTL-only renew (nothing to revive) takes no marker and
+        runs no apply; under the lock nothing else can idle a deployment between
+        the check and the renew. (A lock-free TTL-only fast path is plan step P5.)
+        """
+        with self._global_lock():
+            lease = self.ledger.get_lease(lease_id)
+            reviving = []
+            if lease is not None and lease.state == LeaseState.ACTIVE:
+                for gid in dict.fromkeys(lease.deployment_ids):
+                    deployment = self.ledger.get_deployment(gid)
+                    if deployment is not None and deployment.state == DeploymentState.IDLE:
+                        reviving.append(gid)
+            if not reviving:
+                return RenewOutcome(
+                    self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [],
+                )
+            self._mark_pending(apply=True)
+            renewed = self.ledger.renew(lease_id, ttl_seconds=ttl_seconds)
+            rec = self._publish()
+        return RenewOutcome(renewed, reviving, rec)
 
     def evict(self, deployment_ids: Iterable[str] | None = None) -> EvictOutcome:
         """Force-evict idle (released) deployments now, overriding keep-warm.

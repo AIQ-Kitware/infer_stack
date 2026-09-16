@@ -1535,15 +1535,21 @@ class RenewCLI(_LeasingCommonMixin):
         sid = _resolve_lease(config)
         if not sid:
             raise SystemExit('renew: give a lease id or --env-file')
-        lease = controller.ledger.renew(
-            sid, ttl_seconds=_parse_duration(config.ttl)
-        )
-        if lease is None:
+        # Through the controller: a renew can revive an idle deployment, which
+        # is a desired-state change and must be serialised with applies.
+        outcome = controller.renew(sid, ttl_seconds=_parse_duration(config.ttl))
+        if outcome.lease is None:
             raise SystemExit(
                 f'renew: no active lease {sid} (unknown, released, or already '
                 'expired — re-acquire instead)'
             )
         print(f'renewed {sid}')
+        if outcome.revived_deployment_ids:
+            print(f'  revived: {", ".join(outcome.revived_deployment_ids)}')
+        if outcome.reconcile is not None and outcome.reconcile.publication_pending:
+            print('  ! the apply did not fully take effect; the change is still '
+                  'pending -- retry `infer-stack apply`')
+            return 3
         return 0
 
 

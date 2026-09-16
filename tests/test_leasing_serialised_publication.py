@@ -600,3 +600,138 @@ def test_rollback_evicts_a_deployment_with_definitely_no_container(tmp_path):
 
     got = _warm_then_failed_acquire(tmp_path, lambda backend: Residency({}))
     assert got.state == DeploymentState.STOPPED
+
+
+# -- renew is a desired-state mutator ------------------------------------------
+
+
+class MutableClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _lapsed_idle_lease(tmp_path, shared, backend_cls=None, **kw):
+    """An ACTIVE lease whose TTL lapsed unswept while the deployment went IDLE."""
+    clock = MutableClock()
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=clock)
+    ctl = Controller(ledger, (backend_cls or SharedStackBackend)(
+        shared, threading.Lock(), **kw))
+    a = ledger.acquire('alice', [_vreq('m')], ttl_seconds=100)
+    b = ledger.acquire('bob', [_vreq('m')])
+    clock.now += 200
+    ledger.release(b.lease.id)
+    gid = a.deployments[0].id
+    assert ledger.get_deployment(gid).state == 'idle'
+    return ledger, ctl, a.lease.id, gid
+
+
+def test_renew_that_revives_an_idle_deployment_publishes(tmp_path):
+    shared = _shared()
+    ledger, ctl, lease_id, gid = _lapsed_idle_lease(tmp_path, shared)
+    out = ctl.renew(lease_id, ttl_seconds=3600)
+    assert out.revived_deployment_ids == [gid]
+    assert ledger.get_deployment(gid).state == 'live'
+    assert shared['apply_calls'] == 1 and gid in shared['realized']
+    assert ledger.publication_pending() is None
+
+
+def test_ttl_only_renew_takes_no_marker_and_runs_no_apply(tmp_path):
+    shared = _shared()
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared)
+    lease = ctl.acquire('alice', [_vreq('m')], wait=False).lease
+    calls = shared['apply_calls']
+    out = ctl.renew(lease.id, ttl_seconds=3600)
+    assert out.lease is not None and out.reconcile is None
+    assert shared['apply_calls'] == calls
+    assert ledger.publication_pending() is None
+    assert ctl.renew('lease-nope', ttl_seconds=60).lease is None
+
+
+def test_a_reviving_renew_waits_for_an_in_flight_apply(tmp_path):
+    shared = _shared()
+    in_apply, finish = threading.Event(), threading.Event()
+    order = []
+
+    class Slow(SharedStackBackend):
+        def apply(self):
+            if not in_apply.is_set():
+                in_apply.set()
+                finish.wait(THREAD_TIMEOUT_S)
+                order.append('first apply done')
+            return super().apply()
+
+    ledger, ctl, lease_id, gid = _lapsed_idle_lease(tmp_path, shared, Slow)
+    db = str(tmp_path / 'ledger.db')
+    # Step back inside the TTL so t1's own sweep does not expire the lease first;
+    # the deployment stays IDLE in the ledger.
+    ledger.clock.now -= 150
+    t1 = threading.Thread(target=lambda: Controller(
+        Ledger(SqliteStore(db), clock=ledger.clock),
+        Slow(shared, threading.Lock())).apply_now())
+    t1.start()
+    assert in_apply.wait(THREAD_TIMEOUT_S)
+
+    def renew():
+        Controller(Ledger(SqliteStore(db), clock=ledger.clock),
+                   Slow(shared, threading.Lock())).renew(lease_id, ttl_seconds=3600)
+        order.append('renew done')
+
+    t2 = threading.Thread(target=renew)
+    t2.start()
+    time.sleep(0.3)
+    assert ledger.get_deployment(gid).state == 'idle'   # blocked on the lock
+    finish.set()
+    t1.join(THREAD_TIMEOUT_S)
+    t2.join(THREAD_TIMEOUT_S)
+    assert order == ['first apply done', 'renew done']
+    assert ledger.get_deployment(gid).state == 'live'
+
+
+def test_no_cli_or_tui_code_renews_around_the_controller():
+    import pathlib
+    import re
+
+    import infer_stack
+
+    root = pathlib.Path(infer_stack.__file__).parent
+    offenders = [
+        str(path.relative_to(root))
+        for path in root.rglob('*.py')
+        if path.name not in {'ledger.py', 'controller.py'}
+        and re.search(r'ledger\.renew\(', path.read_text())
+    ]
+    assert offenders == []
+
+
+# -- transitional: rollback under unknown residency keeps a phantom warm candidate --
+
+
+def test_transitional_unknown_residency_rollback_keeps_an_idle_candidate(tmp_path):
+    """Records CURRENT behaviour, which plan step P9 changes.
+
+    A brand-new acquire fails; rollback cannot read residency, so it refuses to
+    evict (the safe direction). Until P9 makes IDLE keep-warm deployments
+    optional and resident-only, the desired set still contains that IDLE
+    deployment, so a later successful apply starts it with no lease behind it.
+    After P9 this test must assert the deployment is never started.
+    """
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.leasing.backend import PlacementError
+    from infer_stack.leasing.residency import ResidencyUnknown
+
+    shared = _shared()
+
+    class Backend(_NoRoomBackend):
+        def residency(self):
+            raise ResidencyUnknown('docker ps failed')
+
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared, Backend)
+    with pytest.raises(PlacementError):
+        ctl.acquire('alice', [_vreq('fresh'), _vreq('big')], wait=False)
+    fresh = next(g for g in ledger.status()[1] if 'fresh' in g.served)
+    assert fresh.state == DeploymentState.IDLE          # not evicted
+    ctl.apply_now()
+    assert fresh.id in shared['realized']               # started without a lease (P9 fixes)

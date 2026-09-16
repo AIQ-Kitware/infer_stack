@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `renew` goes through the controller
+
+`infer-stack renew` now calls `Controller.renew`, under the host-wide lock. A
+renew that makes an idle deployment LIVE again is a desired-state change: it
+takes the publication marker and applies. A TTL-only renew takes no marker and
+runs no apply. It could previously run concurrently with another process's
+render and apply. The CLI prints the revived deployments, and exits 3 if their
+apply did not fully take effect.
+
 ### Failed applies no longer leak leases or overlap daemon work
 
 Fixes found in review of the serialised-publication change:

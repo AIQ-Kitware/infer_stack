@@ -154,7 +154,8 @@ the last successful one; do not reintroduce a separate apply lock.
 ### Recovery after an interrupted apply is a settle check, not full quiescence (current)
 
 A timed-out or interrupted apply marks the pending change `interrupted`. Before
-the next apply, the controller waits (at most 60 s) until two consecutive
+the next apply, the controller waits (about 60 s, plus at most one bounded
+Docker query) until two consecutive
 samples of the project's containers show the same ids and states and none is
 `removing`. If the runtime cannot be read, or does not settle, the apply is
 refused and the change stays pending.
@@ -163,6 +164,20 @@ This sees only container ids and states. Daemon work that has not yet changed
 either (an image pull, a container create still in flight) is invisible to it.
 The per-state recovery rules for `created`, `removing` and `restarting`
 containers are part of selective apply (plan step P8).
+
+### Known fault: a failed acquire can leave a leaseless warm candidate (current)
+
+When an acquire fails and rolls back, a deployment it created is evicted only if
+strict residency shows it has no container. If Docker cannot be read, nothing
+is evicted, because evicting on a failed look could discard a genuinely warm
+model. But idle keep-warm deployments are still part of the desired set, so the
+next successful apply starts that deployment with no lease behind it.
+
+- Workaround: `infer-stack evict <deployment>`.
+- Fixed by plan step P9, where idle keep-warm deployments are kept only if
+  already resident and are never started. The regression
+  `test_transitional_unknown_residency_rollback_keeps_an_idle_candidate`
+  records today's behaviour and must be inverted then.
 
 ### Known fault: idle keep-warm deployments can starve new leases (current)
 

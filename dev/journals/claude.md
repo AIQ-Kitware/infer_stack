@@ -2821,3 +2821,34 @@ but not the acquire branch that shares the same rule. The claim and the test
 covered different code. The settle check is deliberately weaker than P8's
 quiescence; its blind spots are written up in known-limitations rather than
 papered over.
+
+## 2026-09-16 19:59:23 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT's second review accepted the fixes. It found `renew` still
+mutating desired state around the controller, and asked for the transitional
+phantom-warm case to be recorded.
+
+**What I did.**
+- **`Controller.renew`.** It runs under the lock. It checks for IDLE
+  deployments to revive first: a TTL-only renew returns without a marker or an
+  apply, while a reviving renew marks, renews and publishes. The CLI uses it.
+  Tests cover:
+  - the revive path;
+  - the TTL-only path;
+  - a reviving renew blocked behind another process's in-flight apply;
+  - a static check that nothing outside `ledger.py`/`controller.py` calls
+    `ledger.renew(`.
+- **Transitional behaviour.** It is recorded as a known fault, with a
+  regression marked for inversion in P9.
+- **Plan.** The P2 row now names `renew`.
+
+**Reflection.** Checking before marking is safe only because the check runs
+under the same lock. Otherwise a concurrent release could idle the deployment
+between check and renew, and the renew would revive it without a marker. I
+wrote that into the docstring so a future fast path in P5 does not move the
+check outside the lock. The overlap test first failed for a reason unrelated to
+the lock: the other thread's sweep expired the lapsed lease before the renew
+ran. Real heartbeats that arrive after a sweep hit the same thing, and correctly
+get "re-acquire".
