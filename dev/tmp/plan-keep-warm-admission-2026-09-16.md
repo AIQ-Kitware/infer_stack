@@ -1,100 +1,107 @@
 # Plan: admission-atomic leasing with optional keep-warm residency
 
-- **Date:** 2026-09-16 · **Revision 2**
+- **Date:** 2026-09-16 · **Revision 3**
 - **Author:** Claude Opus 5 (1M context), `claude-opus-5[1m]`
-- **Status:** **plan for review. No code written.** Revision 1 (`5244229`) was
-  reviewed by an independent model. This revision incorporates that review; §0
-  records each finding and what was done with it.
-- **Code baseline:** `dev/0.7.1` at `e751676`. There are no leasing changes since
-  then; every line reference below was re-checked against that commit.
+- **Status:** **plan for review. No code written.**
+- **History:** revision 1 `5244229`; revision 2 `7be95ba`; revision 2 addendum on
+  gateway misrouting `90d4ca4`. This revision answers the independent review of
+  revision 2 and folds the addendum in. §0 lists every finding and its
+  disposition.
+- **Code baseline:** `dev/0.7.1` at `e751676`. Leasing code is unchanged since;
+  line references were re-checked for this revision.
 - **Evidence:**
-  [`investigation-keep-warm-placement-starvation-2026-09-16.md`](investigation-keep-warm-placement-starvation-2026-09-16.md),
-  cited by its claim IDs (C1-C7, R1-R5, A-G).
+  - [`investigation-keep-warm-placement-starvation-2026-09-16.md`](investigation-keep-warm-placement-starvation-2026-09-16.md)
+    (C1-C7, R1-R5, A-G, and the round-4 generation race);
+  - [`investigation-gateway-stale-upstream-after-recreate-2026-09-16.md`](investigation-gateway-stale-upstream-after-recreate-2026-09-16.md)
+    (M1-M4).
 
 ---
 
-## 0. Changes from revision 1
+## 0. Changes from revision 2
 
-The required/optional/admission model survived review. What did not survive is
-the layer underneath it: **the mutable, full-project render and apply protocol
-is not strong enough to carry the invariants this plan wants.** Revision 2 adds
-a render-generation protocol and selective apply, and reorders the
-implementation so that nothing can displace a running container before those
-exist.
+The reviewer judged the core design correct, and found that the **transaction and
+generation boundaries** were weaker than the invariants claimed. Revision 3
+closes them. Every factual claim below was re-verified against the code.
 
-| # | review finding | disposition |
-|---|---|---|
-| 1 | Apply is not tied to a render generation: an applier can apply an older file and mark a newer generation applied; the barrier and `up` can see different files | **Accepted, and it is pre-existing** (see below). New I9, §4.2; now step P2 |
-| 2 | Carrying a degraded stanza forward (old D3) does not isolate it: a global `up` can still start or remove it, and can cold-start a vanished optional resident | **Accepted.** Replaced by selective apply (I11, §4.6) |
-| 3 | Preview checks placement but not renderability (service-name collisions); publication can fail after commit | **Accepted.** The preview prepares the full render in memory; approval happens before commit; there is a compensation rule (§4.5) |
-| 4 | A committed allocation is not a planner pin: pins are soft and get re-placed | **Accepted.** `assigned_gpus` is a hard claim; invalid means DEGRADED, never re-placed; no automatic re-pinning (I2, §4.3-4.4) |
-| 5 | Migration's sidecar fallback turns stale renders into permanent ownership | **Accepted.** Backfill from Docker only; unresolved allocations block new allocation (§5) |
-| 6 | "Allow admissions that displace nothing" under unknown residency is unprovable; "last applied optional set" has no source | **Accepted.** Only resource-neutral coalescing proceeds (I13); the unsourced sentence is removed |
-| 7 | P1-P8 were not independently safe: optional displacement before admission atomicity can displace for a request that then fails | **Accepted.** Reordered (§8); "no behaviour change" claims corrected |
-| — | Readiness timeout calls `self.release()` directly (`controller.py:778`), not `_rollback_acquire` | **Accepted.** §4.7 now names that path |
-| — | `residency()` should be scoped to this Compose project and use `docker ps -a`/inspect | **Accepted.** §4.1 |
-| — | Admission preview cannot require `backend.plan()`: only the compose backend has it | **Accepted.** Capability-specific (§4.8) |
+| # | finding | re-verified | disposition |
+|---|---|---|---|
+| 1a | Staging and interactive approval ran inside `BEGIN IMMEDIATE`, contradicting "short transaction". The `renew` CLI writes SQLite directly without `_global_lock` (`commands_leasing.py:1530`, `controller.ledger.renew`), so a waiting approval could make renewals fail at the 5 s busy timeout (`store.py:93`). | yes | Admission restructured: prepare and approve **outside** any SQLite write transaction, then a short validating commit (§4.5) |
+| 1b | `Ledger.renew` re-LIVEs an IDLE deployment and bumps the generation without rendering (see its docstring). After P4 that yields a LIVE deployment with no hard allocation, violating I2. | yes | **Accepted, refined.** Renew stays lock-free and TTL-only while its deployments are LIVE; an IDLE one is **re-admitted through admission**, not refused, so a running job is not killed (D13, §4.10) |
+| 2 | Commit→publish is exception-safe but not **crash**-safe: a SIGKILL between COMMIT and `current` leaves an ACTIVE lease pointing at nothing. Two persistent "published" authorities also need a precedence rule. | — | **Accepted.** Durable staging before commit, an `activation` record committed with the lease, idempotent repair on every lock entry, and `current` as the **single** published authority; `published_generation` dropped (§4.2, §4.5) |
+| 3a | D9: stable **paths** are fine but shared **contents** are not. `infer-stack.config-hash` (`CONFIG_HASH_LABEL`, `compose.py:770`, set at `853` and `1039`) would label a container with *G*'s hash while it reads *G+1*'s file. Routes are written at render (`compose.py:2010`) and read at apply (`2081`). | yes | **Accepted.** Auxiliary configs and route sets live in the immutable bundle and are **materialised to their stable runtime paths by apply(G)** under the apply lock. Publication never writes runtime files (§4.2) |
+| 3b | `master_key()` also writes `.env` (via `write_env_file`), not only `db_password()`. | yes | **Accepted.** Secrets are provisioned independently of admission; `prepare()` reads them without writing and fails closed if missing (§4.5) |
+| 4a | Selective apply classified only models and the gateway, not Postgres, Open WebUI or the reverse proxy (`compose.py:791`, `881`, `884`). `up --no-deps litellm` does not bootstrap Postgres. | yes | **Accepted.** Every service is classified from its rendered config, and dependencies are started explicitly (§4.6) |
+| 4b | The barrier missed **same-deployment recreation**: a changed stanza recreates a container that still holds its GPU. | — | **Accepted.** Any recreation of a GPU service stops the old container first (I10) |
+| 5a | "Departing = every labelled resident absent from G" auto-removes historical orphans, contradicting D11. | — | **Accepted.** Departure is derived from the **previously applied manifest**; unknown labelled containers are orphans, reported and never auto-removed. **Refined:** an orphan on a GPU being handed off **blocks** the apply (§4.6) |
+| 5b | `dict[deployment_id, Resident]` silently loses duplicate containers. | — | **Accepted.** Residency keeps all matches; duplicates are ambiguous and fail closed (§4.1) |
+| 6 | `reserved-gpu` deployments run no container (`test_reservation_renders_no_service_and_is_not_unrenderable`), so Docker-only backfill cannot establish their allocation. | yes | **Accepted.** A LIVE reservation stays unresolved and blocks new allocation until released, expired, or repaired (§5) |
+| 7 | D8 "last N + current + applied" can delete an in-flight apply's bundle. | — | **Accepted.** No automatic bundle GC in this campaign |
+| D10 | Which container states count as warm residency. | reviewer cited Docker docs | **Accepted:** `running`, `restarting`, `paused`; not `created`, `exited`, `removing`, `dead`. Non-resident containers remain visible to the barrier and GC |
+| D11 | Orphan cleanup. | — | **Accepted:** `infer-stack gc --orphans`, explicit only, strict snapshot, existing approval / `--yes` |
 
-**Pre-existing race, worth fixing on its own.** Finding 1 is a bug in *today's*
-code, independent of keep-warm. `acquire` commits the ledger, bumping the desired
-generation, and then renders, under `_global_lock` (`controller.py:699`).
-`_ensure_applied` takes only the apply lock (`controller.py:516`), reads
-`desired_generation()` (519), applies whatever file is on disk, and marks that
-generation applied (523). A concurrent applier landing between the commit and the
-file write applies the old file and marks the new generation applied. The
-acquirer then skips its own apply, and its deployment is never started: a silent
-readiness timeout. P2 fixes this even if nothing else here lands.
+### Additions by this author in this round
 
-**Additions by this author on re-verification**, beyond the review:
-
-- **Gateway config paths must stay stable.** The LiteLLM service mounts
-  `{aux_dir}/litellm_config.yaml` by a path embedded in its stanza
-  (`compose.py:863`), and static-superset mode exists so the gateway is *never
-  recreated* (`compose.py:25`, `124`). Per-generation bundles must therefore not
-  move `aux_dir`. Only the compose file and its manifest are per-generation (D9).
-- **Docker's restart policy is a form of residency.** Model services render with
-  `restart: unless-stopped` (`compose.py:351`, `412`). An optional resident that
-  crashes is restarted by *Docker*, not by an infer-stack render. That preserves
-  residency and is allowed by I3. A resident whose container is **removed** is
-  gone. "Resident" is defined on container existence, not on being up this
-  instant (§4.1, D10).
-- **Departing services cannot be named to `docker compose`.** A service absent
-  from the new compose file cannot be stopped with `docker compose stop <svc>`
-  against that file, so selective apply stops and removes departing containers
-  **by container id** taken from residency (§4.6).
-- **Render has side effects today.** Before `render_compose`, converge persists
-  the LiteLLM DB secret (`compose.py:1933-1936`, `db_password()`) and the route
-  registry (`_update_route_registry`, persisted when it changes). An in-memory
-  preview must not perform these on the candidate's behalf (§4.5).
+- **Refusing renew would kill running jobs.** The `renew` docstring describes a
+  legitimate case: an ACTIVE lease whose TTL lapsed unswept, so its deployment went
+  IDLE while the job was still using it, followed by a heartbeat. Refusing that
+  renewal fails a running job over a bookkeeping race. D13 re-admits instead: it is
+  resource-neutral when the container is still resident on GPUs nobody else holds,
+  and an explicit failure otherwise.
+- **Staged bundles are named by id; generations are assigned at commit.** A bundle
+  must be durable before commit, but allocating its generation number before
+  commit leaves gaps and contention from aborted attempts. The commit record maps
+  the staged id to *G*.
+- **The activation record carries its lease ids,** so recovery can compensate if a
+  staged bundle has gone missing after a crash.
+- **An orphan on a target GPU blocks the apply.** Never removing orphans
+  automatically is right, but starting a service on a GPU an orphan occupies would
+  violate I10. The apply refuses and names the orphan and `gc --orphans`.
+- **Migration adopts matching containers.** With no previously applied manifest,
+  every existing container would look like an orphan. A one-time adoption builds a
+  generation-0 manifest from strict residency, but only for containers whose label
+  **and** GPUs match a backfilled LIVE allocation.
+- **Holding `_global_lock` through interactive approval is not new.** Today's
+  converge already approves under the render lock. What changes is that the SQLite
+  write lock is no longer held while approval waits.
 
 ---
 
 ## 1. Problem
 
-A request can wait out its admission timeout while every GPU is empty. Idle
-keep-warm deployments share one hard desired set with deployments under active
-demand (R1). The planner orders by pins and creation time without regard to
-demand (C3). Renders that were never applied persist pins (C4) and publish
-partial projects that another process may apply (R3). The intended "yield under
-pressure" (C2) was never implemented. Underneath all of that, apply is not bound
-to the render it was meant for (§0, finding 1).
+A request can wait out its admission timeout while every GPU is empty:
+
+- idle keep-warm deployments share a hard desired set with live demand (R1);
+- the planner ignores demand (C3);
+- unapplied renders persist pins (C4) and publish partial projects (R3);
+- the intended pressure was never implemented (C2);
+- apply is not bound to the render it was meant for (the round-4 race);
+- recreating containers can make the gateway misroute a model's traffic to another
+  container (M1-M4).
 
 ## 2. Goals and non-goals
 
 **Goals**
 
-1. Idle keep-warm residency never prevents a request from being admitted.
-2. Admission is lease-atomic, including renderability.
-3. An apply acts on exactly one published render and records exactly that
-   render as applied.
-4. No GPU is handed to a container while its previous occupant is still there.
-5. Nothing destructive happens on the strength of an observation that failed.
-6. A degraded deployment is isolated: nothing starts it, removes it, or blocks
-   others on its account.
+1. Idle keep-warm residency never prevents admission.
+2. Admission is lease-atomic, including renderability, and **crash-safe**.
+3. An apply acts on exactly one published generation, **including its auxiliary
+   configs and routes**, and records exactly that generation as applied.
+4. No GPU is handed to a container while a previous occupant is still there,
+   including a replacement for the same deployment.
+5. Nothing destructive is decided from a failed or ambiguous observation.
+6. Degraded deployments and orphans are isolated: nothing starts or removes them
+   implicitly, and they block only what they actually conflict with.
+7. Traffic for a deployment reaches only that deployment's container.
 
-**Non-goals:** FIFO or reserved admission (G); a durable `PENDING` state;
-preempting admitted deployments; automatic re-pinning or migration; multi-node
-placement; changing `observe()`'s best-effort contract.
+**Non-goals**
+
+- FIFO or reserved admission (G);
+- a durable `PENDING` state;
+- preemption;
+- automatic re-pinning or migration;
+- automatic bundle GC;
+- multi-node placement;
+- changing `observe()`'s contract.
 
 ---
 
@@ -102,434 +109,467 @@ placement; changing `observe()`'s best-effort contract.
 
 | id | invariant |
 |---|---|
-| **I1** | An `ACTIVE` lease is an **admitted and published** request. A request still waiting has no lease. |
-| **I2** | A `LIVE` deployment is required and holds a **hard committed allocation** (`assigned_gpus`). It is never re-placed automatically. If that allocation becomes invalid, the deployment is **DEGRADED**, not moved. |
-| **I3** | An `IDLE` keep-warm deployment is **optional**, and is a candidate only while it is **resident**: its container exists in this project. It may keep its GPU if capacity allows. infer-stack never *creates* its container. |
-| **I4** | Admission is **lease-atomic**: every candidate deployment is placed **and renderable**, or the attempt changes nothing. |
-| **I5** | A waiting attempt writes nothing on its own behalf. **Carve-out:** it may sweep TTL-expired admitted state and publish the resulting admitted-only render. |
-| **I6** | Admission is **one speculative transaction under one global-lock hold**. Operator approval precedes commit, and a publication failure after commit is compensated before the lock is released. |
-| **I7** | Every published render contains every admitted LIVE deployment. A DEGRADED deployment is excluded from runtime actions by selective apply (I11). |
-| **I8** | Physical residency comes from a **strict snapshot** of this project's labelled containers (`ps -a` plus inspect). A failed snapshot is **unknown**, never empty. |
-| **I9** | **An apply operates on one immutable published render generation and marks only that generation applied.** A waiter waits for the *published* generation that contains its change. |
-| **I10** | **Handoff barrier:** every container on a GPU being handed to another deployment is stopped by container id, and its exit confirmed, before anything starts on that GPU. The barrier and the start use the same render generation. |
-| **I11** | **Selective apply:** start or reconcile only services that must start or have changed; stop and remove departing containers by id; never start an optional resident; never act on a DEGRADED service; no project-wide `--remove-orphans` in the reconcile path. |
-| **I12** | Established allocations ignore the caller's `allowed_gpus`; only *new* allocations are restricted to it (`placement.py:250-258`). |
-| **I13** | Under **unknown residency**, only **resource-neutral** admission proceeds: coalescing onto an already-LIVE deployment with a committed allocation and no topology change. Releases and sweeps still update the ledger; destructive runtime reconciliation is deferred until residency is known. |
+| **I1** | An `ACTIVE` lease is admitted, and its generation is published **or recoverably awaiting activation**. A waiting request has no lease. |
+| **I2** | A `LIVE` deployment holds a **hard committed allocation**. It is never re-placed automatically; an invalid allocation makes it DEGRADED. No path, renew included, creates a LIVE deployment without one. |
+| **I3** | An `IDLE` keep-warm deployment is optional, and a candidate only while **resident** (`running`, `restarting`, `paused`). infer-stack never creates its container. |
+| **I4** | Admission is lease-atomic: every candidate deployment is placed and renderable, or nothing changes. |
+| **I5** | A waiting attempt writes nothing on its own behalf, beyond the sweep carve-out and **pre-commit staged bundles, which are unreferenced and discardable**. |
+| **I6** | Preparation and approval happen **outside** any SQLite write transaction. The commit is short, validates that its snapshot still holds, and records an activation, all within one `_global_lock` hold. |
+| **I7** | Every published generation contains every admitted LIVE deployment. DEGRADED deployments are excluded from runtime actions. |
+| **I8** | Physical residency comes from a strict, project-scoped Docker snapshot. A failure is **unknown**; several containers for one deployment is **ambiguous** and fails closed for that deployment. |
+| **I9** | `current` is the **single authority** for the published generation. apply(G) materialises G's auxiliary files and routes, acts only on G, and marks only G applied. Publication never writes runtime files. |
+| **I10** | **Barrier:** before any container starts on a GPU, whether a different deployment or a recreation of the same one, every other container occupying that GPU has been stopped by id and its exit confirmed. An **orphan** occupying it blocks the apply. |
+| **I11** | **Selective apply:** every service is classified from G's rendered config. Departing containers come from the **previously applied manifest**, not "everything absent". Unknown labelled containers are orphans. No project-wide `--remove-orphans`. |
+| **I12** | Established allocations ignore the caller's `allowed_gpus`. |
+| **I13** | Under unknown or ambiguous residency, only resource-neutral admission proceeds. Ledger releases and sweeps continue; destructive runtime reconciliation waits. |
+| **I14** | A request routed for deployment D reaches only D's container, including just after containers are removed or created. |
+| **I15** | **Recovery:** every entry into `_global_lock`, and every apply, first completes or compensates any committed-but-unactivated generation. |
 
 ---
 
 ## 4. Design
 
-### 4.1 Strict residency snapshot → I3, I8
+### 4.1 Strict residency → I3, I8
 
 ```python
 @dataclass(frozen=True)
-class Resident:
-    deployment_id: str
+class Container:
     container_id: str
+    deployment_id: str
     gpus: tuple[int, ...]
-    state: str            # created | running | restarting | exited | paused | dead
+    state: str       # running | restarting | paused | created | exited | removing | dead
 
-class ResidencyUnknown(Exception): ...
+@dataclass(frozen=True)
+class Residency:
+    by_deployment: dict[str, tuple[Container, ...]]   # all matches, never collapsed
+    def resident(self, gid) -> Container | None: ...   # exactly one warm container, else None
+    def ambiguous(self, gid) -> bool: ...              # more than one container
+    def occupants(self, gpu: int) -> tuple[Container, ...]: ...  # any non-removed state
 
-def residency(self) -> dict[str, Resident]:   # raises ResidencyUnknown
+def residency(self) -> Residency:     # raises ResidencyUnknown on any Docker error
 ```
 
-- **Scope:** containers carrying **both** `com.docker.compose.project=<project>`
-  and `infer-stack.deployment` (`DEPLOYMENT_LABEL`, `compose.py:101`). Listed with
-  `docker ps -a --filter label=...` and read with `docker inspect`.
-- **GPUs:** from the container's actual device request. Services render
-  `deploy.resources.reservations.devices[].device_ids` (`_gpu_reservation`);
-  expected at `HostConfig.DeviceRequests[].DeviceIDs`. Verify first (§7, V1).
-- **Resident** means the container **exists** in a state that holds or will
-  reclaim its GPU: running, restarting, or exited while its restart policy will
-  restart it. A removed container is not resident (D10 fixes the exact rule).
-- **Failure:** any Docker error or unparseable output raises
-  `ResidencyUnknown`. `observe()` is unchanged: its empty-on-error result is a
-  tested contract (`test_leasing_compose.py:494`).
-- Fix the docstring at `compose.py:161`, which says `observe()` uses the label.
+- **Scope:** labels `com.docker.compose.project=<project>` **and**
+  `infer-stack.deployment`, listed with `docker ps -a` and read with
+  `docker inspect`.
+- **GPUs:** from `HostConfig.DeviceRequests[].DeviceIDs` (V1).
+- **Resident** (D10): `running`, `restarting`, `paused`.
+- **Occupants** include every non-removed state, because a `created` or `exited`
+  container still carries a device request that `up` may start.
+- `observe()` is unchanged.
 
-### 4.2 Render generations → I9 (fixes the pre-existing race)
+### 4.2 Generations, bundles, recovery → I1, I9, I15
 
-- **Published generation.** Add `published_generation` to the store beside
-  `desired_generation` and `applied_generation`.
-- **Immutable bundle per generation.** Publishing generation *G* writes
-  `renders/gen-<G>/docker-compose.yml` plus `renders/gen-<G>/manifest.json`
-  (hard allocations, optional placements, service→deployment map, degraded set,
-  generation) to a temporary directory, then renames it into place. It then
-  atomically replaces a `current` pointer file naming *G*.
-- **Stable shared paths.** The gateway and proxy configs stay at their existing
-  stable paths under `state_dir`, because the LiteLLM stanza mounts them by path
-  and must stay byte-stable (§0; D9). The bundle's compose file references those
-  stable paths. Only model-service stanzas and the manifest vary by generation.
-- **Apply reads one bundle.** `_ensure_applied` reads `current` → *G*, then runs
-  the barrier and the start (§4.6) against `gen-<G>` using
-  `docker compose -p <project> -f renders/gen-<G>/docker-compose.yml`, and sets
-  `applied_generation = G`. Never `desired_generation()`.
-- **Waiters** capture the generation their own publication produced and wait for
-  `applied_generation >= that`.
-- **Retention:** keep the last *N* bundles; never delete `current` or
-  `applied` (D8).
-- The sidecar (`leasing-compose-state.json`) is retired as a source of truth. Its
-  service map moves into the manifest.
+**Bundle layout.** A staged bundle lives at `renders/staged-<uuid>/`; an activated
+one at `renders/gen-<G>/`. Each contains:
 
-### 4.3 Planner: required, optional, and hard allocations → I2, I12
+- `docker-compose.yml`;
+- `manifest.json`: services with their config hashes, hard allocations, optional
+  placements, degraded set, and GPU map;
+- `aux/litellm_config.yaml` and `aux/nginx.conf`, when present;
+- `aux/routes.json`: the dynamic route set;
+- `aux/route_registry.json`: the static-superset registry state.
+
+Paths inside `docker-compose.yml` point at the **stable runtime paths** under
+`state_dir`, because the gateway mount must not move (D9). The bundle carries the
+*contents*.
+
+**Store additions** (no `published_generation`):
+
+- `generation_counter`;
+- `activation(G, staged_id, lease_ids, created_at)`, with at most one row;
+- `applied_generation`, as today.
+
+**Commit** (inside the admission transaction): allocate *G*, insert
+`activation(G, staged_id, lease_ids)`, and write the lease, claims and allocations.
+
+**Activate** (after commit, idempotent):
+
+1. rename `staged-<uuid>` to `gen-<G>` (skip if `gen-<G>` already exists), then
+   fsync the directory;
+2. atomically replace `current` with *G* (write, fsync, rename), unless `current`
+   is already ≥ *G*;
+3. a short transaction deleting the `activation` row.
+
+**Recovery (I15)**, run at the start of every `_global_lock` hold and every apply:
+
+- If an `activation` row exists and `staged-<uuid>` or `gen-<G>` exists: finish
+  activation.
+- If an `activation` row exists and neither directory exists: **compensate**.
+  Release its `lease_ids`, delete the row, and publish an admitted-only
+  generation.
+- `staged-*` directories not named by any activation row are pre-commit leftovers:
+  delete them.
+
+**Precedence:** `current` says what is published; the activation row says only that
+an activation is in flight. Nothing else claims publication.
+
+**apply(G)**, under the apply lock:
+
+1. Run recovery, then set `G := current`.
+2. Materialise `gen-<G>/aux/*` to the stable runtime paths, with atomic writes.
+3. Run the barrier and selective start (§4.6) via
+   `docker compose -p <project> -f renders/gen-<G>/docker-compose.yml`.
+4. Reconcile dynamic routes from `gen-<G>/aux/routes.json`.
+5. Set `applied_generation = G`, and record `gen-<G>` as the previously applied
+   manifest.
+
+**Retention:** keep every bundle (D8). **Waiters** wait for
+`applied_generation >= G`.
+
+### 4.3 Planner: required, optional, hard → I2, I12
+
+Unchanged from revision 2:
 
 ```python
-plan_placement(deployments, inventory, *,
-               required_ids: set[str],
-               hard: dict[str, list[int]],      # committed allocations
-               optional_hints: dict[str, list[int]],  # residents' physical GPUs
-               allowed_gpus=..., reserved=..., skip_display=...)
+plan_placement(deployments, inventory, *, required_ids, hard, optional_hints, allowed_gpus, ...)
 ```
 
-1. **Hard allocations first**, validated against the full physical pool (I12).
-   A valid one is taken as-is. An invalid one (a GPU missing, or a global
-   `reserved` change) is reported in `plan.degraded` and **not re-placed**
-   (unlike today's pins, `placement.py:298-311`).
-2. **Required without an allocation** (the candidate's new deployments): explicit
-   placements, then fit, restricted to `allowed_gpus`.
-3. **Optional residents**: honour `optional_hints` where free; otherwise put them
-   in `plan.displaced`. Optional deployments are never *newly* fit, because I3
-   forbids creating residency.
+1. Hard allocations are validated against the full pool. An invalid one becomes
+   `degraded` and is never re-placed.
+2. Required deployments without an allocation are placed by explicit placement,
+   then fit, restricted to `allowed_gpus`.
+3. Optional residents keep their hint GPUs where free; otherwise they are
+   `displaced`. They are never newly fit.
 
-- `(n_eligible, created_at, id)` survives only as a tie-break within step 2.
-- **Compatibility:** with the new keywords omitted, behave exactly as today
-  (tested).
+With the new keywords omitted, placement is identical to today.
 
-### 4.4 Ledger: hard allocations → I2
+### 4.4 Ledger → I2
 
-- **Schema:** nullable `assigned_gpus` (JSON list) on `deployments`.
-- **Set** in the admission transaction, for every candidate deployment that
-  becomes LIVE.
-- **IDLE→LIVE reuse** (`_find_or_create_deployment`, `ledger.py:324-342`): if the
-  deployment is resident, adopt its **physical** GPUs from residency as the hard
-  allocation, with no move. If it is not resident, place it fresh. If residency is
-  unknown, the reuse is not resource-neutral, so it waits (I13).
-- **Cleared atomically** in the same transaction that takes a deployment from
-  LIVE to IDLE (release, sweep, rollback). A still-running container keeps its GPU
-  only as an optional hint, via residency.
-- **Desired set:** required = LIVE, each with its hard allocation. Optional = IDLE
-  keep-warm ∩ resident. Under unknown residency, the optional set is unknown and
-  nothing is displaced (I13).
+- **`assigned_gpus`:** a nullable column on `deployments`. It is set in the
+  admission commit, and cleared in the same transaction as any LIVE→IDLE change.
+- **IDLE→LIVE reuse:** adopt the physical GPUs of a unique resident container. If
+  none is resident, place it fresh. If residency is unknown or ambiguous, the
+  request is not resource-neutral (I13).
+- **Desired set:** required = LIVE, with their hard allocations. Optional = IDLE
+  keep-warm deployments that are uniquely resident.
 
-### 4.5 Admission as a speculative transaction → I1, I4, I5, I6
+### 4.5 Admission → I1, I4-I6, I13, I15
 
 ```text
 with _global_lock():
-    swept = ledger.sweep()                                   # I5 carve-out
-    try: residency = backend.residency()
-    except ResidencyUnknown: residency = UNKNOWN
-    with store.transaction() as txn:                         # BEGIN IMMEDIATE
-        cand = ledger._acquire_core(txn, owner, requests, ttl)
-        if residency is UNKNOWN and not resource_neutral(cand):
-            raise NotAdmissible('residency unknown')          # rollback
-        prepared = backend.prepare(desired(txn, residency),   # IN MEMORY
-                                   required_ids=..., hard=..., hints=...)
-        if prepared.unplaced_or_unrenderable & cand.deployment_ids:
-            raise NotAdmissible(prepared)                     # rollback
-        ledger._commit_allocations(txn, prepared)
-        bundle = backend.stage(prepared, generation=next_gen) # writes gen-<G>.tmp only
-        backend.approve(bundle)                               # operator diff; may raise -> rollback
-        # COMMIT happens here, at the end of the with-block
-    try:
-        backend.publish(bundle)                               # rename + `current` pointer
-    except Exception:
-        ledger.release(cand.lease_id)                         # compensation, still under the lock
-        backend.publish_admitted_only()                       # best effort
-        raise
-G = bundle.generation
-_ensure_applied(G)                                            # outside the lock
+    recover()                                                    # I15
+    swept = ledger.sweep()                                       # I5 carve-out
+    try: res = backend.residency()
+    except ResidencyUnknown: res = UNKNOWN
+    snap  = ledger.snapshot()               # read-only; includes a validation token
+    cand  = ledger.overlay_acquire(snap, owner, requests, ttl)   # in memory (D1)
+    if (res is UNKNOWN or res.ambiguous(any cand dep)) and not resource_neutral(cand, snap):
+        raise NotAdmissible('residency unknown or ambiguous')
+    prep  = backend.prepare(snap + cand, res)   # in memory; no writes; secrets read-only
+    if prep.unplaced_or_unrenderable & cand.deployment_ids:
+        raise NotAdmissible(prep)
+    staged = backend.stage(prep)                # durable staged-<uuid>, unreferenced
+    backend.approve(staged)                     # may wait for a human; no SQLite lock held
+    with store.transaction():                   # SHORT
+        ledger.validate(snap.token)             # changed -> rollback, discard staged, retry
+        G = ledger.commit_overlay(cand, prep.allocations)
+        ledger.record_activation(G, staged.id, cand.lease_ids)
+    backend.activate(G, staged)                 # idempotent; a crash here is repaired by recover()
+_ensure_applied(G)
 ```
 
-- **`prepare()`** is the full backend render in memory: placement plus
-  `render_compose`, including service-name collision detection
-  (`compose.py:1106-1122`). It performs **no** writes: no DB secret, no route
-  registry, no files. Those side effects move into `publish()`.
-- **Not admissible:** a queued caller sleeps and retries; a non-queued caller
-  raises `PlacementError` naming the blocking **admitted** demand, or the unknown
-  residency. If `swept` changed the desired set, publish the admitted-only render
-  (I5).
-- **Displaced optionals** stay IDLE and appear in the manifest's displaced list.
-  `evict_idle` is not called.
-- **Drift healing is preserved:** a successful coalescing admission still produces
-  a new published generation, so an apply runs and restarts crashed containers
-  (`ledger.py:158-163`).
-- **D1** is this speculative transaction: one transaction that commits on success,
-  not a preview followed by a second commit.
-- **Lock cost:** the residency snapshot is taken **before** `BEGIN IMMEDIATE`, and
-  `prepare()` must not call Docker, so the SQLite write lock is held only for
-  in-memory work.
+- **`overlay_acquire`** runs the same coalescing rules as `Ledger.acquire` (compat
+  key, capacity, sharing, IDLE→LIVE reuse; `ledger.py:324-342`) against a snapshot,
+  **without writing**. Refactor both into one pure core that returns the intended
+  mutations. `Ledger.acquire` applies them inside its transaction; admission
+  applies them in `commit_overlay`. That gives one source of rules, and no write
+  transaction during preview.
+- **Validation token (D14):** a `state_version` counter bumped by every ledger
+  mutation except TTL-only renewal. Lock-free renewals (§4.10) do not invalidate a
+  pending admission.
+- **Secrets:** `master_key()` and `db_password()` both write `.env`. They are
+  provisioned by backend initialisation and by `doctor`. `prepare()` reads them and
+  raises if they are missing; it never creates them.
+- **`prepare()`** renders in memory, including service-name collisions
+  (`compose.py:1106-1122`) and the next route-registry contents, and writes nothing.
+- **Not admissible:** a queued caller sleeps and retries; a non-queued caller raises,
+  naming the blocking admitted demand or the residency state. If `swept` changed
+  state, publish an admitted-only generation through the same
+  stage→commit→activate path.
 
-### 4.6 Selective apply and the barrier → I10, I11, I7
-
-`apply(G)` under the apply lock, against `renders/gen-<G>`:
+### 4.6 Selective apply and the barrier → I7, I10, I11
 
 ```text
-res = residency()                        # unknown -> abort; G stays unapplied; retry later
-m   = manifest(G)
-departing  = residents not in m.required ∪ m.optional_kept     # incl. displaced
-handoff    = departing whose gpus ∩ gpus(m.required ∪ m.optional_kept) ≠ ∅
-for r in handoff:   docker stop r.container_id; wait for exit (bounded) -> else abort
-for r in departing: docker rm -f r.container_id                # by id, not by service
-to_start = [svc for d in m.required
-            if d not in m.degraded and (not resident(d) or stanza_changed(d, G))]
-if gateway stanza changed: to_start += [gateway]
-docker compose -p P -f gen-G/docker-compose.yml up -d --no-deps <to_start...>
-reconcile LiteLLM routes via the admin API (as today)
-applied_generation = G
+prev = manifest(applied_generation)     # generation 0 comes from migration adoption (§5)
+m    = manifest(G); res = residency()   # unknown -> abort; G stays unapplied
+for svc in m.services: classify(svc) in {unchanged, changed, new}
+                       # by config hash: models, gateway, postgres, open-webui, reverse-proxy
+departing = containers owned by prev (by deployment id) that m drops or displaces
+orphans   = labelled containers owned by neither prev nor m       # report; never auto-remove
+
+for gpu in gpus(services in m to start or recreate):
+    blockers = res.occupants(gpu) - {containers m keeps unchanged on that gpu}
+    if any orphan in blockers: abort(f"orphan {id} occupies GPU {gpu}; run gc --orphans")
+    for c in blockers:      # departing, or the old container of a changed service
+        docker stop c; wait for exit (bounded, else abort)
+for c in departing: docker rm -f c.container_id
+start = [s for s in m.services if class(s) in {new, changed}
+         and s.deployment not in m.degraded and not optional(s)]
+start += required dependencies of start that are new or changed    # e.g. postgres for litellm
+docker compose -p P -f gen-G/docker-compose.yml up -d --no-deps <start, in dependency order>
 ```
 
-- **Optional residents** are never in `to_start`. If one's container vanished
-  between render and apply, it stays gone (I3).
-- **DEGRADED** services are never in `to_start` and never in `departing`.
-  Nothing starts or removes them, and an unrelated release still applies (I7).
-- **No `--remove-orphans`** in this path. Stray containers from before this
-  change are handled by an explicit, operator-invoked cleanup (D11).
-- `stanza_changed` compares the service's rendered stanza, or its config hash,
-  between the applied generation and *G* (§7, V5).
+- **A changed GPU service** has its old container stopped by the barrier before
+  `up` recreates it. This is the same-deployment case.
+- **Optional residents** are never started; one that vanished stays gone.
+- **DEGRADED deployments** are never started, stopped or removed.
+- **Orphans** are reported in `status`, and cleaned only by `gc --orphans`.
 
-### 4.7 Rollback and readiness timeout → goal 5
+### 4.7 Gateway routing correctness → I14
 
-- Admission failure needs no rollback: nothing was committed (§4.5).
-- **Readiness timeout after admission** today calls `self.release(...)` directly
-  (`controller.py:778`). Route it through one strict release path, `_release_strict`.
-- `_rollback_acquire`'s "never ran" decision (`controller.py:610-646`) uses strict
-  residency. On `ResidencyUnknown` it evicts nothing.
+The mechanism is chosen at D12. The candidates are in the gateway investigation:
 
-### 4.8 Backend capability → D5
+- setting `AIOHTTP_TTL_DNS_CACHE` low on the gateway service (verified
+  environment-overridable in the pinned image);
+- stable per-service IPs;
+- per-instance aliases;
+- connection draining.
 
-Admission preview is a backend capability (`prepare`, `stage`, `publish`,
-`residency`).
+In every case, add an **upstream-direct readiness check** (`GET /v1/models` on the
+service, verifying the served name), so a gateway/upstream disagreement is reported
+as a routing fault. Because the barrier (§4.6) creates remove-then-create
+sequences, I14 lands **before** P6.
 
-- **Compose:** everything above.
-- **Null / KubeAI:** lease-atomic ledger admission only. No host placement, no
-  residency, no barrier. `prepare()` is renderability-free and always admits what
-  the ledger accepts.
+### 4.8 Backends → D5
 
-### 4.9 Observability
+The admission capability is `residency`, `prepare`, `stage`, `approve`,
+`activate`, `recover`.
 
-- `status` distinguishes **UNKNOWN**, **NOT RUNNING**, **DEGRADED**, and
-  **DISPLACED** (optional, not resident).
-- Waiting and timeout messages name the admitted lease and deployment holding the
-  contested GPU, or say that residency is unknown.
-- Expose `published_generation` and `applied_generation` in `status` so a stuck
-  apply is visible.
+- **Compose:** all of the above.
+- **Null / KubeAI:** overlay admission and a short commit only. No residency,
+  bundles or barrier; `activate` is a no-op, so recovery has nothing to finish.
+
+### 4.9 Rollback and readiness timeout
+
+- Readiness timeout today calls `self.release(...)` directly
+  (`controller.py:778`). Route it through a strict release path.
+- `_rollback_acquire`'s "never ran" decision uses strict residency, and evicts
+  nothing when residency is unknown or ambiguous.
+
+### 4.10 Renew → I2 (D13)
+
+- **All of the lease's deployments LIVE:** update TTL and heartbeat only, lock-free
+  as today, with no generation change.
+- **Any deployment IDLE:** renew does **not** revive it inline. It returns
+  `NEEDS_READMISSION`, and the controller re-admits **the same lease id** through
+  §4.5:
+  - if the container is still uniquely resident, on GPUs no other allocation holds,
+    this is a resource-neutral adoption and the caller sees a successful renew;
+  - otherwise it is ordinary admission (place, queue or fail), and a failure is
+    reported explicitly (`renew: deployment reclaimed, re-acquire`). A deployment
+    is never silently re-LIVEd without an allocation.
+- The CLI `renew` switches from `controller.ledger.renew` to a controller method
+  that does this.
+
+### 4.11 Observability
+
+`status` shows:
+
+- UNKNOWN, AMBIGUOUS, NOT RUNNING, DEGRADED, DISPLACED and ORPHAN;
+- `current`, `applied_generation`, and any in-flight activation;
+- routing faults from the upstream-direct check.
+
+Waiting and timeout messages name the contested GPU and what holds it.
 
 ---
 
 ## 5. Migration
 
-- **Schema:** add `assigned_gpus`, and add the `published_generation` counter.
-- **Backfill hard allocations for existing LIVE deployments from strict residency
-  only.** If residency is unknown, or a LIVE deployment has no resident container,
-  leave its allocation **unresolved**. While any allocation is unresolved, refuse
-  *new* GPU allocations (I13 applies) but allow releases and sweeps. A sidecar
-  value may be logged as a hint to compare against Docker; it is **never** the
-  authority.
-- **First publication** after upgrade writes `gen-<G>` from the current ledger.
-  The old top-level `docker-compose.yml` is left in place until then, then removed.
-- Existing idle keep-warm deployments that are not running need no migration: I3
-  stops desiring them.
-- Manual `infer-stack apply` applies `current` through §4.6 and prints why when it
-  refuses.
+1. **Schema:** add `assigned_gpus`, `generation_counter`, and the `activation`
+   table.
+2. **Secrets:** the migration provisions any missing secrets. Admission never does.
+3. **Backfill hard allocations from strict residency only:**
+   - a LIVE model deployment with exactly one resident container adopts that
+     container's GPUs;
+   - one with no resident container, or an ambiguous set, stays **unresolved**;
+   - a **LIVE `reserved-gpu` deployment** runs no container, so its allocation
+     cannot be established from Docker. It stays **unresolved**, because its
+     descriptor promised an exact `CUDA_VISIBLE_DEVICES`, and re-placing it would
+     break that contract. It resolves on release or expiry, or through an explicit
+     operator release (D15);
+   - while anything is unresolved, **new GPU allocation is refused**, but releases
+     and sweeps proceed. A sidecar value may be logged for comparison, never used.
+4. **Adoption:** generation 0 is a manifest built from the backfilled LIVE
+   deployments and the containers matching them by label **and** GPU. It becomes the
+   previously applied manifest. Every other labelled container is an orphan.
+5. The first real publication writes `gen-1`. The old top-level
+   `docker-compose.yml` and the sidecar are retired after that.
 
 ---
 
 ## 6. Tests
 
-Each test names what it guards. "Real planner" means `plan_placement` on
-`simulate_inventory`. **R** marks tests added by the reviewer; **A** marks those
-added on re-verification.
+**R** marks tests the reviewer added; **A** marks tests this author added. Each
+test names the invariant or risk it guards.
 
 **Placement (I2, I3, I12)**
 
-1. Old unpinned idle resident vs new LIVE, full host: LIVE placed; idle in
-   `displaced`. This is the incident's shape.
-2. Old idle resident holding a physical hint vs new LIVE: LIVE wins that GPU.
-3. Idle keep-warm that is not resident is absent from the plan despite free GPUs.
-4. IDLE→LIVE reuse of a resident adopts its physical GPUs as the hard allocation.
-5. A hard allocation outside the caller's `allowed_gpus` stays valid (I12).
-6. An invalid hard allocation is reported DEGRADED and is **not** re-placed.
+1. Incident shape: an unpinned idle resident against new LIVE demand, on a full
+   host.
+2. An idle resident's physical hint loses to LIVE demand.
+3. A non-resident idle keep-warm deployment is absent from the plan.
+4. IDLE→LIVE reuse adopts the resident container's GPUs.
+5. A hard allocation outside `allowed_gpus` stays valid.
+6. An invalid hard allocation becomes DEGRADED and is not re-placed.
 7. With the new keywords omitted, plans are identical to today's.
 
 **Admission (I1, I4-I6, I13)**
 
-8. Non-queued `acquire` blocked only by warm cache succeeds immediately.
-9. Queued `acquire` blocked by admitted demand: each failed retry leaves the
-   ledger, all three generations, the bundles, and `current` unchanged.
+8. A non-queued request blocked only by warm cache is admitted.
+9. A queued request blocked by admitted demand: failed retries change nothing, and
+   staged directories are cleaned by the next recovery.
 10. An unrelated request that fits is admitted while another waits.
 11. A release applies while another request waits.
-12. Two processes contend for the last GPU: exactly one admitted (real `flock`).
-13. A waiter's sweep frees capacity and publishes admitted-only; nothing of the
-    candidate's is written.
-14. A killed waiter leaves nothing to clean up.
-15. Coalescing admission still produces a new published generation (drift healing).
-16. **R:** a placed but **unrenderable** candidate (service-name collision) never
-    creates an ACTIVE lease.
-17. **A:** approval declined → the transaction rolls back and no bundle is published.
-18. **A:** publication fails after commit → the lease is released under the same
-    lock hold, and no ACTIVE lease survives.
-19. Unknown residency: new deployment and IDLE→LIVE reuse are refused;
-    coalescing onto a LIVE deployment with an allocation is admitted.
+12. Two processes contend for the last GPU: exactly one is admitted.
+13. A waiter's sweep publishes an admitted-only generation.
+14. A killed waiter leaves nothing but a discardable staged directory.
+15. A coalescing admission still produces a new generation (drift healing).
+16. **R:** a placed but unrenderable candidate never creates an ACTIVE lease.
+17. Declined approval: no commit, and the staged bundle is discarded.
+18. **R, A:** approval waiting for a human does **not** hold the SQLite write lock;
+    a concurrent lock-free `renew` of a LIVE lease succeeds.
+19. **A:** a validation-token change between prepare and commit causes rollback and
+    a retry.
+20. Under unknown or ambiguous residency, only resource-neutral coalescing is
+    admitted.
 
-**Render generations (I9)**
+**Generations and crash recovery (I1, I9, I15)**
 
-20. **R:** deterministic race: desired generation committed before its render is
-    published; a concurrent applier cannot mark it applied without applying it.
-21. **R:** the published render changes between barrier inspection and start; the
-    applied target does not change.
-22. **A:** a waiter waits for its own published generation, not a desired
+21. **R:** the generation race (commit before publication) cannot mark an unapplied
+    generation applied.
+22. **R:** `current` advancing during an apply does not change that apply's target.
+23. **R:** the process is **killed between SQLite COMMIT and the `current`
+    replacement** (a real subprocess kill, then reopen). Recovery activates *G*,
+    and I1 holds.
+24. **A:** the process is killed after COMMIT and the staged directory is lost.
+    Recovery releases the activation's leases and publishes an admitted-only
     generation.
-23. **A:** a gateway stanza unchanged across generations does not recreate the
-    gateway (stable `aux_dir` paths).
+25. **A:** the process is killed before COMMIT. The staged directory is discarded,
+    and no lease exists.
+26. **R:** **G/G+1 auxiliary race:** *G+1* is published while *G* is being applied.
+    *G*'s gateway container reads *G*'s config and carries *G*'s hash, and *G*'s
+    routes are the ones reconciled.
+27. Waiters wait on their own *G*.
+28. A gateway stanza unchanged across generations does not recreate the gateway.
 
-**Apply, barrier, degraded (I7, I10, I11)**
+**Apply, barrier, orphans (I7, I10, I11)**
 
-24. Barrier ordering, with a fake runner that rejects the start of a service
-    whose GPU is held by a container it still reports: `stop(B)` → B exited →
-    `up`.
-25. Barrier does not stop residents whose GPUs are not handed off.
-26. **R:** an optional resident that **disappears** (container removed) between
-    render and apply is **not** started.
-27. **A:** an optional resident that **crashes** (container exists; restart policy
-    active) is left to Docker and not removed by apply.
-28. A DEGRADED LIVE deployment is neither started nor removed, and a release
-    elsewhere still applies.
-29. No `--remove-orphans` in the reconcile path; departing containers are removed
-    by id.
+29. Barrier ordering for displacement: a fake runner rejects any start onto an
+    occupied GPU.
+30. **R:** **same-deployment recreation:** a changed stanza on a GPU service stops
+    the old container before `up`.
+31. The barrier leaves unaffected residents alone.
+32. **R:** a vanished optional resident is not started.
+33. **A:** a crashed optional resident (`restarting`) is left to Docker.
+34. A DEGRADED deployment is untouched, and a release elsewhere still applies.
+35. **R:** **fresh dynamic-routing bootstrap:** Postgres starts with the gateway, in
+    dependency order.
+36. **R:** an **unknown orphan** is reported and not removed.
+37. **A:** an orphan occupying a GPU that is about to be started **blocks** the
+    apply, and the message names `gc --orphans`.
+38. `gc --orphans` removes exactly the reported containers, with approval.
 
-**Residency and migration (I8, goal 5)**
+**Residency, migration, renew, routing (I8, I13, I14, D13)**
 
-30. `residency()` maps by label within this project; a same-labelled container in
-    another project is ignored.
-31. `residency()` raises on a Docker error; `observe()` still returns `set()`.
-32. Readiness timeout and `_rollback_acquire` evict nothing under unknown
-    residency.
-33. **R:** a stale sidecar is never accepted as a committed allocation when Docker
-    cannot corroborate it; the allocation stays unresolved and new allocation is
-    refused.
+39. `residency()` is project-scoped; labelled containers in other projects are
+    ignored.
+40. `residency()` raises on a Docker error, while `observe()` still returns `set()`.
+41. **R:** **duplicate deployment labels** are ambiguous and fail closed for that
+    deployment.
+42. A stale sidecar is never accepted as an allocation.
+43. **R:** a **LIVE reservation at migration** stays unresolved and blocks new
+    allocation; releasing it resolves.
+44. **A:** migration adoption: matching containers become generation 0, and
+    non-matching ones are orphans.
+45. **A:** renew on an all-LIVE lease is lock-free and changes no generation.
+46. **A:** renew finding an IDLE deployment still uniquely resident gets transparent
+    re-admission with the adopted GPUs.
+47. **A:** renew finding an IDLE deployment whose GPU is now held elsewhere fails
+    explicitly, and no LIVE deployment is left without an allocation.
+48. Routing: remove X, create Y, and recreate X under continuous traffic. Every
+    request for X reaches X.
+49. The upstream-direct check reports a routing fault distinctly from "not ready".
+50. A readiness timeout goes through the strict release path, and evicts nothing
+    under unknown residency.
 
 ---
 
-## 7. Verification before implementation (host)
+## 7. Host verification before implementation
 
-- **V1:** `docker inspect --format '{{json .HostConfig.DeviceRequests}}' <model container>`
-  shows the indices written by `_gpu_reservation`.
-- **V2:** `docker ps -a --filter label=com.docker.compose.project=<project> --filter label=infer-stack.deployment`
-  lists every model container, including exited ones.
-- **V3:** confirm whether `docker compose up --remove-orphans` can start a new
-  service before an orphan releases its GPU. The barrier does not depend on the
-  answer; it tells us whether the barrier is necessary or only defensive.
-- **V4:** `docker compose -p <project> -f <other path>/docker-compose.yml up -d --no-deps <svc>`
-  manages the same containers as the current top-level file, i.e. the project
-  name, not the file path, determines identity.
+- **V1:** `HostConfig.DeviceRequests[].DeviceIDs` carries the rendered GPU indices.
+- **V2:** a `docker ps -a` scoped to the project and the deployment label lists
+  every model container.
+- **V3:** whether `up --remove-orphans` can start a new service before an orphan
+  frees its GPU. This confirms the barrier is necessary.
+- **V4:** `-p <project> -f <other path>` manages the same containers as today's
+  file.
 - **V5:** `up -d --no-deps <svc>` with an unchanged stanza does not recreate the
-  container. This is what makes "start or changed" cheap and safe.
-- **V6:** confirm how Docker reports a crashed container under
-  `restart: unless-stopped` between restarts, so D10's resident states are exact.
+  container.
+- **V6:** the states Docker reports for a crashed container under
+  `unless-stopped`.
+- **V7:** the gateway misroute reproduction, with container IPs recorded (V3-V4 in
+  the gateway investigation).
+- **V8:** a `paused` container keeps its GPU memory, which justifies D10's
+  inclusion of `paused`.
 
 ---
 
 ## 8. Implementation order
 
-Each step preserves every invariant established by the steps before it. Steps
-that change behaviour are marked. **P6 is the first step at which a running
-container can be displaced**, and it requires P2, P4 and P5.
+A step may land only once every invariant it relies on is established. **P2 does
+not start until the recovery rule and materialisation (§4.2) are implemented, with
+tests 21-28.**
 
 | step | content | behaviour |
 |---|---|---|
-| **P1** | Strict `residency()` (§4.1); tests 30-31; docstring fix | additive |
-| **P2** | Render generations, immutable bundles, apply-one-generation (§4.2); tests 20-23 | **changes apply**; fixes the pre-existing race; worth landing on its own |
-| **P3** | Planner `required_ids` / `hard` / `optional_hints` with compatibility default (§4.3); tests 1-7 at planner level | none for existing callers |
-| **P4** | Ledger `assigned_gpus`, strict backfill, clear on LIVE→IDLE (§4.4, §5); test 33 | allocations become hard |
-| **P5** | Admission as a speculative transaction with full `prepare`, approval before commit, compensation (§4.5), with idle keep-warm **still treated as required**; tests 8-19 | **waiting requests write nothing**; no displacement yet |
-| **P6** | Selective apply plus barrier (§4.6); tests 24-29 | **changes apply**; no `--remove-orphans` |
-| **P7** | Desired split: idle keep-warm becomes optional and resident-only (§4.4) | **idle yields to live**: this fixes the incident |
-| **P8** | Degraded state end to end, strict readiness-timeout path (§4.7), observability (§4.9); test 32 | degraded isolation |
+| **P1** | Strict `residency()`, including duplicates (§4.1); tests 39-41 | additive |
+| **P2** | Bundles, `current` as the authority, activation and recovery, materialisation on apply (§4.2); secrets provisioned outside admission; tests 21-28 | **changes apply**; fixes the round-4 race and the auxiliary race |
+| **P3** | Planner keywords (§4.3); tests 1-7 | none by default |
+| **P4** | Ledger `assigned_gpus`, migration backfill and adoption, reservation handling (§4.4, §5); **renew routed through the controller (§4.10)**; tests 42-47 | allocations become hard; renew no longer re-LIVEs inline |
+| **P5** | Overlay admission with a short validating commit and stage/approve/activate (§4.5), with idle keep-warm **still required**; tests 8-20 | waiting requests write nothing |
+| **P5b** | Gateway routing correctness per D12, and the upstream-direct check (§4.7); tests 48-49 | routing faults prevented and reported |
+| **P6** | Selective apply, the barrier including same-deployment recreation, orphans, `gc --orphans` (§4.6); tests 29-38 | **changes apply**; no `--remove-orphans` |
+| **P7** | Idle keep-warm becomes optional and resident-only (§4.4) | **idle yields to live**: fixes the incident |
+| **P8** | DEGRADED end to end, the strict readiness-timeout path (§4.9), observability (§4.11); test 50 | isolation and visibility |
 
 ---
 
 ## 9. Decisions
 
-**Resolved in review**
+**Resolved**
 
-- **D1:** speculative transaction around shared acquire logic, coupled to a
-  side-effect-free full `prepare()`.
-- **D2:** ledger, as a **hard** allocation, not a pin.
-- **D3:** not carry-forward; selective apply (I11).
-- **D4:** under unknown residency, only resource-neutral coalescing (I13).
-- **D5:** admission preview is a backend capability; null and KubeAI get ledger
-  atomicity only.
-- **D6:** no automatic re-pinning. Any future migration must go through the
-  barrier.
-- **D7:** DEGRADED is derived from the hard allocation plus inventory and runtime,
-  not persisted as a lifecycle state.
+| id | decision |
+|---|---|
+| D1 | Overlay admission: one pure coalescing core; preview without a write transaction; a short validating commit |
+| D2 | Ledger `assigned_gpus`, as a hard claim |
+| D3 | Selective apply, not stanza carry-forward |
+| D4 | Unknown or ambiguous residency: resource-neutral admission only |
+| D5 | Backend capability; null and KubeAI get overlay admission only |
+| D6 | No automatic re-pinning |
+| D7 | DEGRADED is derived, not persisted |
+| D8 | No automatic bundle GC in this campaign |
+| D9 | Stable runtime paths, with immutable per-generation contents materialised by apply |
+| D10 | Warm residency is `running`, `restarting`, `paused` |
+| D11 | `infer-stack gc --orphans`, explicit only |
 
 **Open, for the next review**
 
-- **D8:** bundle retention: how many generations to keep, and when to garbage
-  collect. The bundles currently applied or `current` must never be removed.
-- **D9:** gateway config is at a stable, mutable path while compose bundles are
-  immutable. Is it safe for generation *G*'s apply to see a gateway config written
-  for *G+1*? In static-superset mode it only accumulates routes, so *probably
-  yes*; in dynamic-routing mode routes go through the admin API. Confirm for both.
-- **D10:** exact resident states: running, restarting, and exited with an active
-  restart policy count as resident. Is exited-with-non-zero-and-restart-exhausted
-  resident? Does `paused` count?
-- **D11:** an explicit `infer-stack gc --orphans` for stray containers left from
-  before P6, since the reconcile path no longer uses `--remove-orphans`.
+| id | question | author's lean |
+|---|---|---|
+| **D12** | How to establish I14 | Stable per-service IPs plus the upstream-direct check. A low `AIOHTTP_TTL_DNS_CACHE` is an acceptable interim measure once V7 shows Docker's DNS updates immediately |
+| **D13** | Renew finding an IDLE deployment: re-admit the same lease (§4.10), or refuse and require re-acquire? | Re-admit. Refusing fails running jobs over a bookkeeping race |
+| **D14** | Validation token: an explicit `state_version` counter, or one derived from generations and row versions? | An explicit counter bumped by every non-renew mutation; simplest to reason about |
+| **D15** | Should the operator repair for an unresolved reservation accept GPUs as input, or only release it? | Release only, in this campaign. Entering GPUs by hand is a footgun |
 
 ---
 
-## 10. Explicitly deferred
+## 10. Deferred
 
-- FIFO or reserved admission for large requests (G). Add `PENDING` only then,
-  probably as lease metadata without claims.
-- Automatic re-warming of displaced keep-warm deployments (rejected by I3).
-- Explicit migration of LIVE deployments between GPUs (D6).
-- Any change to `observe()`'s best-effort semantics.
-
----
-
-## Addendum to revision 2: gateway misrouting after recreation
-
-Found after revision 2 was written, by an agent running a batch job; see
-[`investigation-gateway-stale-upstream-after-recreate-2026-09-16.md`](investigation-gateway-stale-upstream-after-recreate-2026-09-16.md).
-A container recreated shortly after another was removed received the removed
-container's IP. The gateway kept routing the removed service's name to that IP
-for 28 minutes, so a healthy deployment failed readiness. **This plan's handoff
-barrier and selective apply produce exactly that remove-then-create sequence**,
-so the fault must be addressed before P6.
-
-**New invariant**
-
-| id | invariant |
-|---|---|
-| **I14** | A request routed for deployment D reaches **only D's container**, including immediately after any container is removed or created. |
-
-**New decision, open for review**
-
-- **D12:** how to establish I14. The options and trade-offs are in the
-  investigation's "Candidate directions": disable or shorten the gateway client's
-  DNS cache, stable per-service IPs, per-instance aliases, or connection draining.
-  In every case, add an upstream-direct readiness check that verifies the served
-  model name, so a routing fault is reported instead of timing out. The author's
-  lean: stable per-service IPs, since they need no gateway config churn and so are
-  compatible with static-superset byte-stability, plus the direct check.
-
-**Ordering change:** a new step **P5b**, landing before P6, establishes I14 and the
-upstream-direct check.
-
-**New tests**
-
-34. Remove service X, create service Y, recreate X within seconds, with requests
-    for X flowing continuously: every request for X reaches X's container.
-    Integration test against a real gateway image, or V3 of the investigation on
-    the host.
-35. The upstream-direct check distinguishes "upstream not listening" from "the
-    gateway routes to a server with a different served name", and reports the
-    latter as a routing fault, not "not ready".
-
-**New host verification:** V1-V4 of the investigation, before P5b is designed in
-detail.
+- FIFO or reserved admission (G).
+- Automatic re-warming of displaced keep-warm deployments.
+- Explicit migration of LIVE deployments between GPUs.
+- Automatic bundle GC, which needs apply-lock or in-use protection.
+- Any change to `observe()`.
+- Whether an ACTIVE lease past its TTL but not yet swept should still count as
+  demand. That is the root of the renew case in §4.10, and is out of scope here.
