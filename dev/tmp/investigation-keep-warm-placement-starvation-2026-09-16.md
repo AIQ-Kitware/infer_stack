@@ -342,3 +342,179 @@ infer-stack evict <alias> [<alias> ...]    # or: infer-stack evict --all
 
 Live deployments (active lease) are never evicted by this command
 (`EvictCLI` help text).
+
+---
+
+## Review round 1 (2026-09-16): second reviewer, then re-verification
+
+A second reviewer, a different model, read this report, the June design
+journal, and the code at `1030c36`. Its findings are below, each re-checked by
+the original author. The headline: **the diagnosis stands, C4 was framed wrongly,
+C6 was too generous, and Q5's answer is yes.** It also proposes a fix shape, and
+this section agrees with most of it and disputes one invariant.
+
+### R1. The missing abstraction: required placement vs opportunistic residency. AGREED
+
+`desired_deployments()` (`controller.py:395-406`) merges two different things
+into one hard desired set:
+
+- **LIVE:** there is lease demand; the deployment *must* be placed;
+- **IDLE + keep-warm:** there is no demand; residency is a cache optimisation.
+
+Once they are merged, `plan_placement` cannot know that one should yield to the
+other. **[code, re-verified]** This is an unfinished piece of the original
+design, not a regression: `dev/journals/claude.md:577-579` (June) says "the
+reclaim model has no *pressure* concept yet: keep-warm idle groups stay up
+forever ... the Compose backend will need a pressure-driven reaper when GPUs are
+contended." The admission queue is what eventually exposed it.
+
+### R2. C4 is real, but it amplifies the bug rather than causing it. AGREED; C4 revised
+
+The reviewer confirmed the sidecar mechanism and, more importantly, showed that
+pins are **not needed** for the first bad placement. Re-verified by running the
+real planner against the incident's shape, with no repo changes:
+
+```python
+from infer_stack.hardware import simulate_inventory
+from infer_stack.leasing.models import Deployment, DeploymentState as S
+from infer_stack.leasing.placement import plan_placement
+
+def dep(gid, state, t, tp=1):
+    return Deployment(gid, 'ck-' + gid, 'vllm', 'shared-compatible', {},
+                      {'engine': 'vllm', 'runtime': {'tensor_parallel_size': tp}},
+                      {}, state, t, t)
+
+inv = simulate_inventory('4x96')
+I1, I2 = dep('I1', S.IDLE, 1.0), dep('I2', S.IDLE, 1.0, tp=2)
+L1, L2 = dep('L1', S.LIVE, 2.0), dep('L2', S.LIVE, 3.0)
+ds = [L2, L1, I2, I1]
+```
+
+| call | assignments | unplaced |
+|---|---|---|
+| `plan_placement(ds, inv)`, **no pins** | I1→[0], I2→[1,2], L1→[3] | **L2** |
+| with the stale pins `{I1:[0], I2:[1,2], L1:[3]}` | same | **L2** |
+| with **only idle pins removed** `{L1:[3]}` | same | **L2** |
+| idle deployments **not in the set** | L1→[3], **L2→[0]** | none |
+
+The last row exactly matches the host's placement after the manual evict. So:
+
+- **C4 revised:** stale pins are confirmed, but they only make the bad decision
+  deterministic retry after retry; they do not cause it. My note that "C4, not
+  C3, may be the proximate cause" (B4) was **wrong**. C3, state-blind ordering,
+  produces the incident on its own.
+- These would all be **incomplete** fixes: sorting only step 3 by demand (idle
+  pins still win step 1); deleting only idle pins (row 3); evicting only inside
+  the queue loop (a non-queued `acquire` also fails, because it rolls back on any
+  unplaced request, `controller.py:746+`, despite reclaimable idle capacity).
+
+### R3. Lease atomicity is local, not global. AGREED; C6 revised, Q5 answered yes
+
+C6 said nothing applies until a lease is fully placed. That is true only within
+the queueing caller's own control flow. **[code, re-verified]**
+
+- `converge(..., apply=False)` writes `docker-compose.yml` and the sidecar before
+  returning (`compose.py:2012` vs `2016`);
+- `ComposeBackend.apply()` runs `docker compose up -d --remove-orphans` on
+  **whatever file is on disk** (`compose.py:2054`);
+- `_ensure_applied` (`controller.py:497-528`) snapshots `desired_generation()`,
+  applies the on-disk file, and marks that generation applied.
+
+So another process's coalesced apply, or a human's `infer-stack apply`, can bring
+up a partial render belonging to a lease that has not placed all of its
+deployments, and mark that generation covered. The reviewer's interleaving:
+
+```text
+queued Q:   desired_generation -> G; render I1, I2, L1 (L2 unplaced);
+            write compose + sidecar; release render lock; sleep
+other P:    take apply lock; sees desired_generation == G;
+            docker compose up on Q's partial file; set applied_generation = G
+```
+
+This did not happen in the incident, since nothing else applied during the
+21-minute wait, but nothing in the code prevents it. It belongs to the bug, not
+merely to observability.
+
+### R4. The proposed invariant, and the one part disputed
+
+The reviewer proposes three invariants:
+
+1. **Every LIVE deployment is required.** Agreed.
+2. **An IDLE keep-warm deployment is reclaimable and never prevents placement of
+   a LIVE one.** Agreed. Place all LIVE deployments ahead of idle keep-warm ones
+   in **every** tier, pins included, then let idle ones take what remains. A
+   reused warm deployment is protected automatically, because
+   `Ledger._find_or_create_deployment` flips IDLE→LIVE before placement
+   (`ledger.py:324-342`, re-verified).
+3. **"No render with an unplaced LIVE deployment should become an applyable
+   shared artifact."** **Disputed as stated.**
+
+Why (3) is too strong: **[code, re-verified]** `Controller.acquire` writes the
+lease and its deployments into the shared ledger **as LIVE before placement is
+attempted** (`controller.py:698-716`: `ledger.acquire(...)` then `_render()`).
+A lease waiting in the admission queue is therefore LIVE in *everyone's* desired
+set for its whole wait. Today other callers are unaffected, because each checks
+only its own requests (`unplaced = requested & set(rec.unplaced)`). Under
+invariant (3) as written, any render while a queued lease remains unplaceable
+would be unpublishable. That includes an unrelated lease acquiring a small model
+that fits, and a release whose teardown is the very thing that would free the
+GPU. That is **head-of-line blocking** of the whole host behind one waiting
+request.
+
+**Proposed refinement (for review, not decided):** the distinction that matters
+is not LIVE vs unplaced but **admitted vs pending** demand.
+
+- A lease in the admission queue should not yet be LIVE in the shared desired
+  set: either a distinct PENDING state, or planned speculatively (like
+  `plan_on_idle_host`) without writing anything.
+- The publish invariant then becomes: **a render publishes placements only for
+  admitted deployments, and never writes a compose file or pins on behalf of a
+  pending lease.** That keeps R3's hole closed without blocking unrelated leases.
+
+The reviewer's broader point stands: this should be fixed by invariants in the
+desired set and the render, **not** by "the queue calls `evict_idle()` when
+stuck".
+
+### R5. New open questions raised by the fix shape
+
+- **Q9. When should displaced idle deployments be evicted?** Marking them STOPPED
+  (via `evict_idle`) is destructive: the warm cache is lost. If a queued lease
+  re-plans every 5 s and ultimately fails for some *other* reason, such as
+  LIVE-vs-LIVE contention, repeated evictions destroy cache for nothing. Should
+  eviction happen only when it makes a pending lease **fully** placeable
+  (minimal sufficient eviction, see Q3)?
+- **Q10. Same-GPU handoff.** If a running idle deployment on GPU *k* is displaced
+  and a LIVE one is rendered onto *k*, a single
+  `docker compose up -d --remove-orphans` both removes the orphan and starts the
+  new service. Is removal guaranteed to finish, and VRAM to be freed, before the
+  new container allocates? Not verified. A wrong order means a transient
+  out-of-memory on start.
+- **Q11. LIVE-vs-LIVE priority.** Once idle deployments always yield, contention
+  is only between LIVE deployments, where `created_at` still decides. Is that
+  acceptable, or should admitted-before-pending apply there too (Q6)?
+
+### Regression tests, merged list
+
+From the reviewer, plus R4 and R5:
+
+- old **pinned** idle vs new LIVE; old **unpinned** idle vs new LIVE;
+- the same with `--queue`, and with an ordinary non-queued `acquire`;
+- re-acquiring the warm deployment itself keeps it warm (IDLE→LIVE reuse);
+- another process's `_ensure_applied()` cannot apply, or mark covered, a
+  generation containing a partially placed pending lease;
+- **an unrelated lease that fits is admitted while another lease is still
+  queued** (guards against the head-of-line blocking in R4);
+- a release still applies while another lease is queued;
+- eviction under pressure is minimal and does not recur on every retry of a
+  lease that stays unplaceable for another reason (Q9).
+
+### Status of the original claims after this round
+
+| claim | status |
+|---|---|
+| C1, C2, C3, C5, C7 | confirmed by the second reviewer |
+| C4 | confirmed as a mechanism; **revised** to an amplifier, not the cause |
+| C6 | **revised**: atomicity holds only locally; see R3 |
+| B4 | **withdrawn** |
+| Q5 | **answered: yes** |
+| Q1, Q2-Q4, Q6-Q8 | open; Q2 and Q3 now shaped by R4 and R5 |
