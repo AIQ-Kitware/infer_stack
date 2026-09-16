@@ -1581,3 +1581,41 @@ def test_plan_declared_beats_measured_overlay(tmp_path):
     plan = be.plan([g])
     # declared 4 GiB -> both cards eligible -> best-fit takes the 16er.
     assert plan.assignments == {'m': [0]}
+
+
+# -- bounded docker commands --------------------------------------------------
+
+
+def test_default_docker_run_returns_stdout_and_raises_on_failure():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    assert _default_docker_run(['sh', '-c', 'echo hello']) == 'hello\n'
+    with pytest.raises(subprocess.CalledProcessError):
+        _default_docker_run(['sh', '-c', 'exit 3'])
+
+
+def test_default_docker_run_kills_the_whole_process_group_on_timeout(tmp_path):
+    # `docker compose` spawns children; killing only the client would leave them
+    # running and, under the controller's host-wide lock, hanging is not an option.
+    import os
+    import time as _time
+
+    from infer_stack.leasing.backend import BackendTimeout
+    from infer_stack.leasing.compose import _default_docker_run
+
+    pidfile = tmp_path / 'child.pid'
+    start = _time.monotonic()
+    with pytest.raises(BackendTimeout):
+        _default_docker_run(
+            ['sh', '-c', f'sleep 60 & echo $! > {pidfile}; wait'], timeout=0.5,
+        )
+    assert _time.monotonic() - start < 10
+    child = int(pidfile.read_text())
+    for _ in range(50):                        # reaped asynchronously
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail(f'child {child} of the timed-out command is still alive')

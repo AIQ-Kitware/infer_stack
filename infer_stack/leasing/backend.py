@@ -28,6 +28,16 @@ class Readiness:
     detail: str = ''
 
 
+class BackendTimeout(RuntimeError):
+    """A backend command exceeded its time bound and was killed.
+
+    Raised instead of hanging, because backend calls run under the controller's
+    host-wide lock: an unbounded ``docker`` command would hold that lock forever.
+    Killing the client does not undo work a daemon had already started, so the
+    caller must treat the runtime state as unknown until it is observed again.
+    """
+
+
 class ConvergeAborted(Exception):
     """A backend's ``converge`` was declined by the user (diff not approved).
 

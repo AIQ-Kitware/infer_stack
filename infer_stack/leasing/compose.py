@@ -1291,10 +1291,76 @@ def render_compose(
     )
 
 
-def _default_docker_run(args: list[str]) -> str:
+#: Wall-clock bounds for Docker commands, by kind (seconds). Controller
+#: operations run these under a host-wide lock, so none may be unbounded.
+#: Generous for now: ``up`` may still pull images. Tune from host measurements.
+DOCKER_TIMEOUT_QUERY = 60.0        # ps, inspect, version, images
+DOCKER_TIMEOUT_LIFECYCLE = 300.0   # stop, rm, start, unpause, exec
+DOCKER_TIMEOUT_CONVERGE = 1800.0   # compose up / down
+DOCKER_TIMEOUT_PULL = 3600.0       # pull, manifest inspect, in-container model pulls
+
+#: Budget for reconciling dynamic routes against the gateway: listing, POSTs
+#: and verification together. This default is the bootstrap budget (a fresh
+#: gateway waits on Postgres health and runs DB migrations); it preserves the
+#: previous 90 x 2 s listing retry.
+ROUTE_RECONCILE_BOOTSTRAP_S = 180.0
+
+
+def _docker_timeout(args: list[str]) -> float:
+    """Pick the time bound for one ``docker`` invocation from its arguments.
+
+    Example:
+        >>> _docker_timeout(['docker', 'inspect', 'abc'])
+        60.0
+        >>> _docker_timeout(['docker', 'compose', '-p', 'x', '-f', 'y', 'up', '-d'])
+        1800.0
+        >>> _docker_timeout(['docker', 'compose', '-p', 'x', 'exec', '-T', 's', 'ollama', 'pull', 't'])
+        3600.0
+    """
+    words = set(args[1:])
+    if 'pull' in words or 'manifest' in words:
+        return DOCKER_TIMEOUT_PULL
+    if 'up' in words or 'down' in words:
+        return DOCKER_TIMEOUT_CONVERGE
+    if words & {'stop', 'rm', 'start', 'unpause', 'exec', 'kill'}:
+        return DOCKER_TIMEOUT_LIFECYCLE
+    return DOCKER_TIMEOUT_QUERY
+
+
+def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str:
+    """Run a docker command and return stdout, bounded in wall-clock time.
+
+    Same contract as ``subprocess.check_output(args, text=True)`` -- stdout is
+    returned, stderr is inherited, a non-zero exit raises ``CalledProcessError``
+    -- plus a time bound. The command runs in its own process group so that, on
+    timeout, the whole group (``docker compose`` spawns children) is killed and
+    :class:`~infer_stack.leasing.backend.BackendTimeout` is raised.
+    """
+    import os
+    import signal
     import subprocess
 
-    return subprocess.check_output(args, text=True)
+    from .backend import BackendTimeout
+
+    bound = _docker_timeout(args) if timeout is None else timeout
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=bound)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise BackendTimeout(
+            f'{" ".join(args)} did not finish within {bound:g}s and was killed; '
+            'runtime state is unknown until observed again'
+        ) from None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args, output=out)
+    return out
 
 
 def _parse_ps(out: str) -> set[str]:
@@ -1363,6 +1429,7 @@ class ComposeBackend(ConvergeScaffold):
         catalog: Any = None,
         dynamic_routing: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.state_dir = Path(state_dir)
         # Constructing a backend must not touch the filesystem fatally. `doctor`
@@ -1413,6 +1480,7 @@ class ComposeBackend(ConvergeScaffold):
         # deployments land on distinct GPUs) with no gateway recreation/blip.
         self.dynamic_routing = dynamic_routing
         self._sleep = sleep
+        self._clock = clock
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
@@ -2091,19 +2159,21 @@ class ComposeBackend(ConvergeScaffold):
             return []
         return data if isinstance(data, list) else []
 
-    def _reconcile_routes(self, *, attempts: int = 90, delay: float = 2.0) -> None:
+    def _reconcile_routes(
+        self, *, deadline_s: float = ROUTE_RECONCILE_BOOTSTRAP_S, delay: float = 2.0,
+    ) -> bool:
         """Make the live gateway's managed routes match the rendered route set.
 
         The render half wrote the desired routes (one per live deployment×
         endpoint) to ``litellm_routes.json``; this is the apply half. List the
-        gateway's current models, then add the missing routes and delete the ones
-        no longer desired — through the admin API, with **no** container restart.
+        gateway's current models, add the missing routes and delete the ones no
+        longer desired -- through the admin API, with **no** container restart --
+        then list again to verify the result.
 
         Properties this relies on:
 
-        * **Idempotent / coalescing-safe.** A redundant apply re-diffs to the
-          same set and does nothing, which is what makes the controller's
-          coalesced apply correct for routes too.
+        * **Idempotent.** A redundant apply re-diffs to the same set and does
+          nothing.
         * **Drift-healing.** Routes lost to a gateway/DB restart reappear in the
           diff and are re-added; stale routes from a prior run (still in the DB)
           are deleted because they're no longer desired.
@@ -2111,58 +2181,82 @@ class ComposeBackend(ConvergeScaffold):
           are ever deleted, so a model added by hand through the UI/API is left
           alone.
 
-        Best-effort: the gateway may still be starting (it waits on Postgres
-        health, then boots — and on first-ever bring-up runs LiteLLM's Prisma DB
-        migrations, which can take a while), so the initial listing is retried
-        generously. A persistent failure is logged and left for the next converge
-        rather than raised — apply must stay non-fatal, like ``docker compose up``.
+        **Bounded and reported.** Everything -- listing retries while the gateway
+        starts, every POST, and the final verification -- shares one wall-clock
+        budget, ``deadline_s``. A retry count alone would not bound it: a listing
+        can take 10 s and a POST 30 s. Returns ``True`` only when the verified
+        managed route set equals the desired set; any failure is logged and
+        returns ``False`` rather than raising, so the caller decides whether an
+        unverified route set blocks anything.
         """
         from .._log import logger
 
+        deadline = self._clock() + max(0.0, deadline_s)
         desired = {
             r['model_info']['id']: r
             for r in self._desired_routes()
             if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
         }
-        current = self._list_managed_routes(attempts=attempts, delay=delay)
+        current = self._list_managed_routes(deadline=deadline, delay=delay)
         if current is None:
             logger.warning(
-                'dynamic routing: gateway not reachable to reconcile routes; '
-                'leaving it for the next converge'
+                'dynamic routing: gateway not reachable within {:g}s to reconcile '
+                'routes; leaving it for the next converge', deadline_s,
             )
-            return
+            return False
         to_add = [desired[i] for i in desired if i not in current]
         to_delete = [i for i in current if i not in desired]
+        ok = True
         for route in to_add:
-            self._post_route('/model/new', route, route.get('model_name'))
+            ok &= self._post_route(
+                '/model/new', route, route.get('model_name'), deadline=deadline,
+            )
         for rid in to_delete:
             # ok_if_missing: with a shared gateway, another converge may have
             # deleted this route already; "not found in db" means the desired
             # end-state (route gone) is reached, so don't treat it as an error.
-            self._post_route(
-                '/model/delete', {'id': rid}, rid, ok_if_missing=True
+            ok &= self._post_route(
+                '/model/delete', {'id': rid}, rid, ok_if_missing=True,
+                deadline=deadline,
             )
         if to_add or to_delete:
             logger.info(
                 'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
                 len(to_add), len(to_delete), len(desired),
             )
+        if not ok:
+            return False
+        if not (to_add or to_delete):
+            return True
+        final = self._list_managed_routes(deadline=deadline, delay=delay)
+        if final != set(desired):
+            logger.warning(
+                'dynamic routing: route set did not verify within {:g}s '
+                '(expected {} managed route(s), saw {})',
+                deadline_s, len(desired), 'none' if final is None else len(final),
+            )
+            return False
+        return True
 
     def _list_managed_routes(
-        self, *, attempts: int, delay: float
+        self, *, deadline: float, delay: float
     ) -> set[str] | None:
         """Ids of infer-stack-managed routes currently on the gateway.
 
-        Returns ``None`` if the gateway never became reachable within
-        ``attempts`` (so the caller can skip the diff and retry next converge).
+        Retries while the gateway is unreachable, until ``deadline`` (a value of
+        ``self._clock``). Each request's own timeout is capped by the time left.
+        Returns ``None`` if no listing succeeded in time.
         """
-        for attempt in range(max(1, attempts)):
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return None
             resp = None
             try:
                 resp = self.http.get(
                     f'{self._gateway_base()}/v1/model/info',
                     headers=self._auth_headers(),
-                    timeout=10,
+                    timeout=min(10.0, remaining),
                 )
             except Exception:  # noqa: BLE001 - the gateway may still be starting
                 resp = None
@@ -2173,9 +2267,9 @@ class ComposeBackend(ConvergeScaffold):
                     if isinstance(rid, str) and rid.startswith(ROUTE_ID_PREFIX):
                         ids.add(rid)
                 return ids
-            if attempt < attempts - 1:
-                self._sleep(delay)
-        return None
+            if deadline - self._clock() <= delay:
+                return None
+            self._sleep(delay)
 
     def _post_route(
         self,
@@ -2184,34 +2278,47 @@ class ComposeBackend(ConvergeScaffold):
         label: Any,
         *,
         ok_if_missing: bool = False,
-    ) -> None:
+        deadline: float | None = None,
+    ) -> bool:
         """POST one admin-API call (``/model/new`` or ``/model/delete``).
 
-        Per-call best-effort: a failure is logged and the rest still run; the
-        next converge re-reconciles, so a transient error self-heals.
-        ``ok_if_missing`` swallows a "model not found" response (a delete whose
-        target is already gone has already reached its desired end-state).
+        Returns whether it reached its desired end state. A failure is logged,
+        not raised, so the remaining calls still run. ``ok_if_missing`` accepts a
+        "model not found" response (a delete whose target is already gone).
+        The request timeout is capped by the time left before ``deadline``.
         """
         from .._log import logger
 
+        timeout = 30.0
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                logger.warning(
+                    'dynamic routing: POST {} {} skipped: route deadline passed',
+                    path, label,
+                )
+                return False
+            timeout = min(timeout, remaining)
         try:
             resp = self.http.post(
                 f'{self._gateway_base()}{path}',
                 headers=self._auth_headers(),
                 json=payload,
-                timeout=30,
+                timeout=timeout,
             )
         except Exception as ex:  # noqa: BLE001 - one bad call must not abort apply
             logger.warning('dynamic routing: POST {} {} error: {}', path, label, ex)
-            return
+            return False
         if getattr(resp, 'status_code', 0) >= 300:
             body = str(getattr(resp, 'text', ''))
             if ok_if_missing and 'not found' in body.lower():
-                return
+                return True
             logger.warning(
                 'dynamic routing: POST {} {} -> {} {}',
                 path, label, resp.status_code, body[:200],
             )
+            return False
+        return True
 
     def residency(self) -> Residency:
         """Strict snapshot of this project's deployment containers and their GPUs.

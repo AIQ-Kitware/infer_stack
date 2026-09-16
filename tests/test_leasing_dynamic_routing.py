@@ -386,3 +386,96 @@ def test_reconcile_delete_tolerates_already_gone(tmp_path, monkeypatch):
     assert warnings == []  # already gone -> no warning
     be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x')
     assert warnings  # same response without the flag -> warns
+
+
+# -- bounded, reported route reconciliation ----------------------------------
+
+
+class FakeTime:
+    """A clock that only moves when the code under test sleeps or waits."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class UnreachableGateway:
+    """Every admin call fails, and each GET burns its whole timeout."""
+
+    def __init__(self, time):
+        self.time = time
+        self.gets = 0
+
+    def get(self, url, **kw):
+        self.gets += 1
+        self.time.now += kw.get('timeout', 0)
+        raise ConnectionError('gateway down')
+
+    def post(self, url, **kw):
+        raise ConnectionError('gateway down')
+
+
+def _timed_backend(tmp_path, http, time):
+    return ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x80'),
+        run=FakeDocker(), http=http, images=IMAGES, ports=PORTS, state=STATE,
+        ui=False, dynamic_routing=True, sleep=time.sleep, clock=time.clock,
+    )
+
+
+def test_reconcile_reports_success_only_when_routes_verify(tmp_path):
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    gw = RecordingGateway()
+    be = make_backend(tmp_path, gw)
+    be.converge([a], apply=False)
+    assert be._reconcile_routes() is True
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
+    assert be._reconcile_routes() is True     # idempotent: nothing to change, still verified
+
+
+def test_reconcile_against_unreachable_gateway_is_bounded_by_its_deadline(tmp_path):
+    # Listing retries, per-request timeouts and sleeps all share ONE deadline;
+    # a retry count would not bound it (a GET can take 10 s, a POST 30 s).
+    time = FakeTime()
+    gw = UnreachableGateway(time)
+    be = _timed_backend(tmp_path, gw, time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be._reconcile_routes(deadline_s=25.0) is False
+    assert time.now <= 25.0
+    assert gw.gets >= 2                        # it did retry within the budget
+
+
+def test_reconcile_reports_failure_when_a_post_fails(tmp_path):
+    class RejectingGateway(RecordingGateway):
+        def post(self, url, **kw):
+            if url.endswith('/model/new'):
+                return FakeResp(500, {'detail': 'db unavailable'})
+            return super().post(url, **kw)
+
+    be = make_backend(tmp_path, RejectingGateway())
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be._reconcile_routes() is False
+
+
+def test_post_timeout_is_capped_by_the_remaining_deadline(tmp_path):
+    time = FakeTime()
+    seen = []
+
+    class SlowGateway(RecordingGateway):
+        def get(self, url, **kw):
+            time.now += 4.0                    # a slow but successful listing
+            return super().get(url, **kw)
+
+        def post(self, url, **kw):
+            seen.append(kw['timeout'])
+            return super().post(url, **kw)
+
+    be = _timed_backend(tmp_path, SlowGateway(), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    be._reconcile_routes(deadline_s=10.0)
+    assert seen and all(t <= 10.0 - 4.0 for t in seen)   # never the default 30 s

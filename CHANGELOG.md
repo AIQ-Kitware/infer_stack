@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Docker commands are time-bounded; route reconciliation is deadline-bound and reports success
+
+Every Docker command run by the Compose backend now has a wall-clock bound
+(queries 60 s, stop/rm/exec 300 s, compose up/down 1800 s, pulls 3600 s). On
+expiry the command's whole process group is killed and `BackendTimeout` is
+raised, rather than the call hanging. These calls will run under the
+controller's host-wide lock (plan step P2), where an unbounded command would
+block every other lease operation.
+
+Dynamic-routing reconciliation now works against one wall-clock budget covering
+listing retries, POSTs and verification, instead of 90 listing attempts whose
+per-request timeouts were not counted. The worst case against an unreachable
+gateway drops from roughly 18 minutes to 180 seconds. When routes change,
+reconciliation lists them again to verify, and `_reconcile_routes` returns
+whether the managed route set matches the desired one. Callers still treat it as
+best-effort for now; gating on the result is part of P2.
+
 ### Strict residency: which deployment containers exist, and on which GPUs
 
 `ComposeBackend.residency()` returns a strict snapshot of this project's
