@@ -81,7 +81,7 @@ when LiteLLM is enabled (see the `probe_ready` docstring and body). A misrouted
 gateway therefore reports a healthy model as not ready. It also misroutes real
 traffic, not only probes.
 
-### M3. The gateway reused a stale name→IP mapping  [inferred]
+### M3. The gateway reused a stale name→IP mapping  [observed on the host; see V3-V4]
 
 The proposed chain:
 
@@ -186,7 +186,7 @@ fault. (1) or (2) addresses the cause.
 
 ## Open questions
 
-- **Q1. Partly answered (M3):** both. The DNS cache allows the bad connection
+- **Q1. Answered by the reproduction below.** Previously partly answered (M3): both. The DNS cache allows the bad connection
   and keep-alive under continuous traffic sustains it; 28 minutes rules out the
   DNS cache alone. Still open: whether Docker's embedded DNS returns the new
   address immediately after recreation, which decides whether direction 1 alone
@@ -219,3 +219,46 @@ first:
 deployment D reaches only D's container*, established before the barrier (plan
 P6) can run, together with direction (4) as the detector. The addendum in the
 plan records this as D12.
+
+---
+
+## Host reproduction (2026-09-16): V3 and V4 done
+
+The agent that found the incident ran V3 and V4 on the serving host, with the
+gateway at default settings. Two single-GPU `stop`-policy models were used: **X**
+(2B) and **Y** (0.8B). This author re-checked the recorded data (a per-sample TSV
+of 330 rows and a summary).
+
+| time | event |
+|---|---|
+| 17:07-17:09:44 | Lease X; 5 requests through the gateway. **X at `172.18.0.3`.** Release; X's container is removed. |
+| 17:09:47 | Lease Y. **Y receives `172.18.0.3`**, X's old address. |
+| 17:09:48 | Lease X again. **X receives `172.18.0.4`.** |
+| 17:11:41-17:17:51 | X ready. From **inside the gateway container**, a fresh lookup of X's service name returns `.0.4`, and `GET /v1/models` there serves X. The gateway answers **404 "does not exist" for X on every sample** (186 samples). |
+| 17:17:54 | X's lease fails: `endpoints not ready` after its 480 s timeout. X is removed, and its name no longer resolves (`gaierror`). |
+| 17:17:55-17:22:39 | The gateway **still** answers X's requests with Y's 404, 144 more samples, although X's name no longer resolves anywhere. |
+| throughout | Y answers **200** through the gateway on all 330 samples. |
+
+**Conclusions [observed]**
+
+- **IP reuse is observed, not inferred.** M3 is confirmed.
+- **Docker's embedded DNS is correct.** A fresh lookup returned X's new address
+  from the first sample. Docker is not the stale layer.
+- **The stale state is the gateway client's pinned connection.** 330 of 330
+  samples were misrouted over about 11 minutes, far longer than the 300 s DNS TTL,
+  and the misroute continued after X's name stopped resolving. Only an
+  established keep-alive connection to `.0.3`, kept busy by traffic every ~2 s,
+  explains that.
+- **Q1 answered:** the DNS cache let the bad connection open, and the pinned
+  connection sustains the misroute indefinitely.
+
+**Consequence for the candidate directions.**
+
+- **Direction 1 (low `AIOHTTP_TTL_DNS_CACHE`) is a mitigation, not a fix.** It
+  narrows the window in which a stale address can open a connection, but a
+  connection opened in that window is pinned under traffic just as here.
+- **Direction 2 (stable per-service addresses) removes the cause.** The plan
+  (revision 4, §4.7) adopts it, with direction 4 (an in-network upstream check) as
+  detection.
+- **Still open:** re-running the reproduction with the TTL lowered, to quantify
+  the mitigation. It restarts the gateway once; that is the operator's call.
