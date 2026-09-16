@@ -1,0 +1,344 @@
+# Investigation: idle keep-warm deployments starve queued leases
+
+- **Date:** 2026-09-16
+- **Author:** Claude Opus 5 (1M context), `claude-opus-5[1m]`, from a guest VM
+  with read-only access to the serving host's catalog, ledger and rendered
+  compose project. The GPU host itself was operated by a human.
+- **Code examined:** this repo at `dev/0.7.1` (`30fa46b`); MAGNET's
+  `magnet/leasing.py` for how leases are requested.
+- **Status:** investigation only. **No code has been changed.** Everything below
+  is for another reviewer to corroborate before any patch is planned.
+
+Each claim is tagged:
+
+- **[code]** read directly in the source, with a location;
+- **[observed]** seen in logs, the ledger, or `nvidia-smi` during the incident;
+- **[inferred]** a conclusion drawn from the above that has **not** been
+  verified. These are the ones most in need of review.
+
+---
+
+## Summary
+
+On a 4-GPU host, two batch jobs each requested a lease on two single-GPU
+deployments. They waited in the admission queue, making no progress, while
+`nvidia-smi` showed all four GPUs empty. Every retry assigned three of the four
+GPUs to two **idle keep-warm deployments left over from a run eleven days
+earlier**, so one of the two requested deployments could never be placed.
+Because a lease is applied only once everything in it is placed, nothing was
+started, not even the requested deployment that did fit.
+
+Evicting the two idle deployments by hand (`infer-stack evict <alias> <alias>`)
+unblocked the queue on its next retry, and the models came up.
+
+The behaviour appears to follow directly from four properties of the current
+code, none of which is individually a bug:
+
+1. idle keep-warm deployments are part of the desired set;
+2. placement ignores state and demand, ordering by pins and then creation time;
+3. the admission queue waits for capacity to free but never creates it;
+4. no test exercises a keep-warm deployment competing with a queued request.
+
+The docstring does promise a resolution, "survive idle **until pressure**", but
+no code path implements that pressure.
+
+---
+
+## The incident
+
+### Host and request
+
+**[observed]** Four identical GPUs, 97,887 MiB each. Serving via the compose
+backend with a LiteLLM gateway.
+
+**[observed]** The jobs were two shards of one pipeline stage, launched under
+Slurm through MAGNET's per-node leasing. Each shard asked for the same pair of
+endpoints: an answerer and an auxiliary model.
+
+**[code]** MAGNET wraps each node as
+`infer-stack run --endpoint <a>,<b> --timeout 1800 --queue -- <cmd>`
+(`magnet/leasing.py`: `lease_timeout=1800`, `lease_queue=True`, and the argv
+built at lines 136-139). So each job waits up to 30 minutes for placement.
+
+### Deployments involved
+
+Labels are used instead of model names. VRAM and parallelism are what matter.
+
+| label | deployment id | ledger state | reclaim | tensor parallel | created |
+|---|---|---|---|---|---|
+| **I1** | `grp-04e5391bdb73` | IDLE | keep-warm | 1 | 09-05 19:18 |
+| **I2** | `grp-723e460d31c4` | IDLE | keep-warm | 2 | 09-05 19:18 |
+| **L1** | `grp-edb7a0e879ff` | LIVE (demand 2) | keep-warm | 1 | 09-05 19:29 |
+| **L2** | `grp-f227afd92ac4` | LIVE (demand 2) | stop | 1 | 09-16 15:01 |
+
+**[observed]** Read from `ledger.db` (table `deployments`, `spec` JSON). **L1**
+was an existing deployment reused by the new leases, so its `created_at` is
+eleven days old even though its demand is new.
+
+### What every retry did, every ~5 s from 15:01 to 15:22
+
+**[observed]** From the jobs' own output:
+
+```
+Converging 4 deployment(s): I1, I2, L1, L2
+  placed I1 on GPU(s) [0]
+  placed I2 on GPU(s) [1, 2]
+  placed L1 on GPU(s) [3]
+  placement: L2: need 1 eligible GPU(s) (>= 51.75 GiB) but only 0 free
+rendered 4 service(s) to .../docker-compose.yml (not applied; `infer-stack apply` to bring it up)
+```
+
+**[observed]** Meanwhile `nvidia-smi` showed 2 MiB used and no processes on all
+four GPUs. `infer-stack status` listed **L1** and **L2** as `STALE` ("recorded
+live but no container is running"). **I1** and **I2** did not appear there at
+all.
+
+### The manual unblock
+
+**[observed]** Between 15:22:16 and 15:22:23 the operator ran
+`infer-stack evict` on I1 and I2. The next retry:
+
+```
+15:22:23 Converging 2 deployment(s): L1, L2
+15:22:23   placed L1 on GPU(s) [3]
+15:22:23   placed L2 on GPU(s) [0]
+```
+
+**[observed]** By about 15:32 the containers for L1 and L2 (and a later shard's
+deployment on GPU 1) were `Running`, and the pipeline moved on to later shards.
+The ledger then held only live deployments, and the compose sidecar held only
+their assignments.
+
+This works as a controlled experiment: removing the two idle keep-warm
+deployments, and changing nothing else, made the unplaceable request placeable
+within one retry.
+
+---
+
+## Mechanism: claims to corroborate
+
+### C1. Idle keep-warm deployments are in the desired set  [code]
+
+`controller.py:395-406`, `Controller.desired_deployments`: LIVE deployments,
+plus IDLE deployments whose `spec['reclaim']` (default `keep-warm`) is
+`keep-warm`. The module docstring (`controller.py:9`) states the same rule.
+
+### C2. "Until pressure" has no implementation  [code]
+
+`controller.py:13-15` describes keep-warm as "survive idle until pressure,
+avoids cold-start thrash". `grep -rn pressure infer_stack/ docs/` finds that
+docstring and nothing else. The only callers of `Ledger.evict_idle`
+(`ledger.py:261`) are:
+
+- `controller.py:637`: on release, for deployments that never ran;
+- `controller.py:810`: the explicit `evict` command;
+- `controller.py:831`: `gc(evict_idle=True)`.
+
+None of these is triggered by a request that cannot be placed.
+
+> Reviewer: please confirm there is no other path, such as in the backend or the
+> TUI, that evicts idle deployments under contention.
+
+### C3. Placement ignores state and demand  [code]
+
+`placement.py`, `plan_placement`:
+
+- deployments are first sorted by `(created_at, id)` (`_sorted`, line 222);
+- **step 1** honours pins, in that order (line 298);
+- **step 2** honours explicit placements (line 313);
+- **step 3** fits the rest by `fit_order = (n_eligible, created_at, id)`
+  (lines 339-350).
+
+Nothing in any step looks at `DeploymentState`, lease demand, or whether a
+deployment is running. On a host of identical GPUs `n_eligible` ties, so step 3
+comes down to creation time. **L1**'s old `created_at` came from reuse, not age
+of demand.
+
+### C4. Pins can come from a render that was never applied  [code] + [inferred]
+
+**[code]**
+
+- `ComposeBackend.plan` (`compose.py:1649-1667`) loads pins from the sidecar
+  (`leasing-compose-state.json`, `assignments`). Its docstring says the result
+  reflects where deployments "are (for running ones) or *would* be (for
+  not-yet-started ones)".
+- `converge` writes the sidecar at `compose.py:2012`, **before** the
+  `if not apply: return` at line 2016. So every non-applied render in the queue
+  loop rewrites the pins.
+
+**[inferred]** Once a render assigns an idle keep-warm deployment a GPU, later
+renders honour that as a pin in step 1, ahead of any fit ordering. The idle
+deployment keeps "its" GPU even though no container ever ran there. If so, a
+fix that only reordered step 3 by demand would **not** resolve this incident.
+
+> Reviewer: this is the claim I am least sure of in effect. The logs cannot
+> distinguish whether I1 and I2 were placed by step 1 (pin) or by step 3 (fit
+> order); both produce the same assignments here. Suggested check: a unit test
+> in which a render with `apply=False` places an idle keep-warm deployment, then
+> a new LIVE request that needs that GPU is rendered. Does the pin win?
+
+### C5. The admission queue waits for capacity but never creates it  [code]
+
+`controller.py:717-745`, in `acquire` with `wait_for_placement` (loop at line 739):
+
+1. `_infeasible_alone` re-plans the request **alone**, via `plan_on_idle_host`,
+   which drops unrelated deployments' pins (`compose.py:1669-1716`). The request
+   fits, so it is not rejected as impossible. That part is correct.
+2. It then loops: sleep, `_render()` (which calls `converge(..., apply=False)`,
+   `controller.py:461`), and recompute `unplaced`, until the deadline.
+3. Each render sweeps TTL-expired leases. It does not evict idle deployments.
+
+So the queue can only succeed if something **else** frees capacity: another
+lease releasing, a TTL expiring, or a human. Idle keep-warm deployments with no
+lease never expire.
+
+Note the asymmetry: `_infeasible_alone` already reasons "unrelated deployments
+are contention, look past them", but the loop that follows never acts on that
+conclusion.
+
+### C6. A lease applies nothing until all of it is placed  [code] + [observed]
+
+**[code]** In the queue loop the render is never applied. Apply happens only
+after `unplaced` is empty (`controller.py:759`).
+
+**[observed]** L1 was placed on every retry for 21 minutes and never started.
+
+This is probably the right behaviour for lease atomicity. It is listed because
+it hides partial progress: from outside, the host looks entirely idle.
+
+### C7. The test suite does not cover this interaction  [code] + [inferred]
+
+**[code]** `tests/test_leasing_controller_queue.py:95`: the helper `vreq` sets
+`reclaim='stop'` by default. `test_acquire_queues_until_a_gpu_frees` and
+`test_acquire_queue_times_out_when_never_freed` therefore never involve a
+keep-warm deployment. They also use `BudgetBackend`, a slot counter, not the
+real `plan_placement`.
+
+**[inferred]** No test sets an idle keep-warm deployment against a queued
+request that needs its GPU. This is based on test names and a grep for
+`keep-warm`/`keep_warm`, not an exhaustive read. Reviewer: please search
+`test_leasing_compose.py` and `test_leasing_coalesced_apply.py` in particular.
+
+---
+
+## Open questions about intended behaviour
+
+**Q1. Why were I1 and I2 idle in the ledger but not running?**
+The ledger says IDLE and desired, but there were no containers. Candidates: a
+host reboot or `docker compose down` outside infer-stack since 09-05, or every
+render since then was also stuck not applied. Whatever the cause, reconcile does
+not seem to notice "desired but not running" for idle deployments, and `status`
+does not show them (it listed only L1 and L2 as STALE). **Is a desired
+deployment with no container meant to be restarted, dropped, or reported?**
+
+**Q2. What should "until pressure" mean precisely?**
+
+- (a) Evict idle keep-warm deployments only when a **waiting** request cannot be
+  placed otherwise?
+- (b) Place demanded deployments first in every render, so idle ones simply lose
+  their GPUs and are not rendered?
+- (c) Something coarser, such as idle keep-warm deployments never holding a pin?
+
+(a) keeps the cold-start benefit longest. (b) is simpler but may tear down warm
+models that a following job would have reused.
+
+**Q3. When several idle deployments could be evicted, which go first?**
+Oldest idle, largest footprint, fewest GPUs needed to satisfy the waiter, or
+least recently used? Should eviction be minimal, freeing just enough?
+
+**Q4. Should pins from a never-applied render be honoured at all?**
+The `plan()` docstring says pins describe where a not-yet-started deployment
+"would be", so this looks intentional. Is it intended for **idle** deployments,
+which by definition have no demand to protect?
+
+**Q5. Is it safe that a stuck queue keeps rewriting `docker-compose.yml`?**
+Each non-applied render writes the compose file and sidecar to a plan that is
+never applied. If a different process's coalesced apply, or a human running
+`infer-stack apply`, ran at that moment, would it bring up the idle keep-warm
+deployments from that plan?
+
+**Q6. Should `created_at` be the tie-breaker?**
+A reused deployment keeps its original `created_at` (L1: 09-05) regardless of
+when its demand arrived, so "older" says nothing about priority.
+
+**Q7. Timeouts.**
+With `--queue --timeout 1800`, a job facing this condition burns 30 minutes of
+its Slurm allocation and then fails. Should the queue say *why* it is waiting,
+for example "waiting on GPUs held by idle keep-warm deployment X, which will not
+free on its own"? That turns a silent 30-minute wait into an actionable message.
+
+**Q8. The end of one job's log is unexplained.**
+One shard's output ends at 15:31:42 with another `rendered 3 service(s) ... (not
+applied)` line, after both its deployments were placed and while other shards
+had containers running. Its subsequent state was not verified. Reviewer: check
+whether this is a normal post-readiness re-render or a separate issue.
+
+---
+
+## Things believed true that deserve a skeptical second look
+
+- **B1** [inferred]: the incident reproduces with **any** idle keep-warm
+  deployment whose GPU a queued request needs. It does not depend on tensor
+  parallelism, Slurm, or MAGNET, only on C1-C5.
+- **B2** [inferred]: without an operator, this state is permanent. Keep-warm
+  idle deployments have no TTL, so every future queued request that needs their
+  GPUs waits out its timeout and fails.
+- **B3** [inferred]: `infer-stack gc --evict` (or `evict --all`) before a
+  batch run is a sufficient operational workaround. It is blunt: it also
+  discards warm models the batch would have reused.
+- **B4** [inferred]: C4, not C3, may be the proximate cause. Reordering by demand
+  without addressing pins may not fix it (see C4).
+
+---
+
+## Candidate directions: not a plan
+
+These are recorded only so a reviewer can argue with them. None is chosen.
+
+1. **Evict on pressure inside the queue loop.** When `unplaced` remains and
+   evicting idle keep-warm deployments (minimal set, some documented order)
+   would make the request placeable, evict them and re-render. This implements
+   C2's docstring literally.
+2. **Demand-aware placement.** Place LIVE deployments before IDLE ones in both
+   step 1 (pins) and step 3 (fit), so an idle deployment's pin is honoured only
+   if nothing live needs the GPU.
+3. **Do not persist pins for idle deployments** from non-applied renders.
+4. **Observability only.** Name the blocking idle deployments in the placement
+   warning and in the queue's timeout error, and have `status` show desired
+   deployments that are not running.
+
+Direction 4 is useful regardless of which of 1-3 is chosen.
+
+---
+
+## Tests a fix should add
+
+Written as behaviour, not implementation:
+
+- An idle keep-warm deployment on the only suitable GPU, plus a queued request
+  for that GPU: the request is placed before its timeout, and the idle
+  deployment is evicted or not rendered.
+- The same, where the idle deployment's GPU is **pinned** from an earlier
+  non-applied render (C4).
+- The same on the real `plan_placement` and compose backend, not only
+  `BudgetBackend` (C7).
+- An idle keep-warm deployment that a queued request **reuses** is not evicted:
+  the cold-start benefit is preserved.
+- Several idle deployments where evicting one suffices: only that one is evicted
+  (if Q3 settles on minimal eviction).
+- A waiting request that no eviction could satisfy still times out, with a
+  message naming what blocked it.
+
+---
+
+## Operational workaround in use
+
+Before a batch run on a shared host, evict idle deployments the batch will not
+reuse:
+
+```bash
+infer-stack evict <alias> [<alias> ...]    # or: infer-stack evict --all
+```
+
+Live deployments (active lease) are never evicted by this command
+(`EvictCLI` help text).

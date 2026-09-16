@@ -2690,3 +2690,29 @@ silently. The fix is not documentation, it is making the correct call cover the
 whole pair. Corollary: if two commands can each answer "where is the service",
 make one of them call the other, or they will drift apart in exactly the
 situation where being right matters.
+
+## 2026-09-16 16:05:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, on a guest VM with
+read-only mounts of a serving host's catalog, ledger and compose project.
+
+**User intent.** A batch run sat in the admission queue with every GPU empty.
+After diagnosing it, the ask was explicitly *not* to patch: write down what was
+found, what is believed, and what is uncertain, so a different reviewer can
+corroborate it before any fix is planned.
+
+**What I did.** Wrote `dev/tmp/investigation-keep-warm-placement-starvation-2026-09-16.md`.
+In short: idle keep-warm deployments are in the desired set, placement orders by
+pins and creation time with no notion of demand, and the queue waits for capacity
+without ever creating it. So two eleven-day-old idle deployments held three of
+four GPUs *on paper* while nothing ran. A hand eviction unblocked it within one
+retry, which is the cleanest evidence in the report.
+
+**Reflection.** The docstring already promises the fix ("survive idle until
+pressure"); the gap is that nothing implements the pressure, and the only queue
+tests use `reclaim='stop'`, so the interaction was never exercised. The claim I
+trust least is that sidecar pins from never-applied renders, rather than fit
+order, are the proximate cause; the logs cannot tell the two apart, and the
+report says so and proposes the test that would. I stopped myself offering a
+patch mid-incident; that was the right call, since a demand-aware reorder that
+missed the pin path would have looked like a fix and not been one.
