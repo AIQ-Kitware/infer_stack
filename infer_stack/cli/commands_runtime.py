@@ -10,11 +10,13 @@ deployments), with pointers to dig deeper.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import scriptconfig as scfg
 
+from ..log_filter import compact_litellm_tracebacks
 from ..paths import config_root, data_root, get_setting, settings_path
 from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
@@ -389,6 +391,34 @@ class _ComposeWrapperBase(_PathOverridesMixin):
     )
 
 
+def _run_compacted_follow(cmd: list[str]) -> int:
+    """Stream Compose logs through the conservative LiteLLM compactor."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        text=True,
+        errors='replace',
+        bufsize=1,
+    )
+    try:
+        if proc.stdout is None:  # pragma: no cover - PIPE guarantees stdout
+            return int(proc.wait())
+        for line in compact_litellm_tracebacks(proc.stdout):
+            sys.stdout.write(line)
+        return int(proc.wait())
+    except KeyboardInterrupt:
+        # The child normally receives the same SIGINT.  If it is still alive,
+        # make sure an interrupted follow does not leave Compose behind.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return 130
+
+
 class LogsCLI(_ComposeWrapperBase):
     """Tail leasing Compose service logs without typing the full docker path."""
 
@@ -404,6 +434,11 @@ class LogsCLI(_ComposeWrapperBase):
     )
     timestamps = scfg.Value(False, isflag=True)
     no_color = scfg.Value(False, isflag=True)
+    raw = scfg.Value(
+        False,
+        isflag=True,
+        help='Show raw followed logs without known LiteLLM traceback compaction.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -418,6 +453,13 @@ class LogsCLI(_ComposeWrapperBase):
         if config.timestamps:
             cmd.append('--timestamps')
         cmd.extend(config.services or [])
+
+        # Compact only the human-facing live view.  Captures and pipelines keep
+        # Docker's exact bytes unless a future explicit compact-output mode is
+        # added; ``--raw`` is also available for interactive LiteLLM debugging.
+        compact = config.follow and not config.raw and sys.stdout.isatty()
+        if compact:
+            return _run_compacted_follow(cmd)
         return int(subprocess.run(cmd).returncode)
 
 

@@ -84,11 +84,17 @@ infer-stack ps                              # docker compose ps
 infer-stack ps -a                           # include stopped
 infer-stack logs -f open-webui              # follow one service
 infer-stack logs --tail=200 litellm vllm-*  # tailored backlog
+infer-stack logs -f --raw litellm            # full LiteLLM tracebacks
 infer-stack restart open-webui              # restart specific services
 infer-stack stop                            # stop everything (no remove)
 infer-stack start                           # start back up
 infer-stack pull                            # refresh images
 ```
+
+Interactive ``infer-stack logs -f`` compacts only explicitly registered, known-noisy
+LiteLLM traceback shapes; unknown tracebacks pass through unchanged. Redirected or
+piped output stays raw, and ``--raw`` disables compaction in an interactive follow.
+The TUI uses the same conservative compactor when LiteLLM logs are visible.
 
 For Ollama model management inside the rendered Ollama service, prefer the
 CLI wrappers:

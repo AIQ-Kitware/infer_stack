@@ -62,6 +62,7 @@ from .cli.commands_leasing import (
     _running_label,
 )
 from .leasing import LeaseState
+from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
 # The Select value meaning "every service EXCEPT the gateway". This is the
@@ -1574,7 +1575,7 @@ class InferStackTUI(App):
             return
         self._log_proc = proc
         try:
-            for line in proc.stdout:
+            for line in compact_litellm_tracebacks(proc.stdout):
                 self.call_from_thread(self._append_log, line.rstrip('\n'))
         except Exception:  # noqa: BLE001 - stream ends when the proc dies
             pass
