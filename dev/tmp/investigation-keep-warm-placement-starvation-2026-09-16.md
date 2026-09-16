@@ -518,3 +518,139 @@ From the reviewer, plus R4 and R5:
 | B4 | **withdrawn** |
 | Q5 | **answered: yes** |
 | Q1, Q2-Q4, Q6-Q8 | open; Q2 and Q3 now shaped by R4 and R5 |
+
+---
+
+## Review round 2 (2026-09-16): architecture converging
+
+The second reviewer accepted R4's objection and revised its design. In short:
+**admission becomes a side-effect-free preview; no lease exists until the whole
+request fits.** Most of this is agreed. The additions below come from
+re-checking the parts of the design that depend on facts about current code.
+
+### Agreed
+
+- **No durable PENDING state in this fix.** A waiting request is planned
+  transiently and is not in the ledger. `ACTIVE` lease means admitted; `LIVE`
+  means required capacity. There is no half-admitted lease to clean up after a
+  killed waiter, and nothing new in `demand()`.
+- **Invariant, restated correctly:** every published render places every admitted
+  LIVE deployment. A request waiting for admission is not LIVE, is not in the
+  desired set, and cannot affect the published render. R4's head-of-line
+  objection no longer applies, because an unrelated lease that fits is admitted
+  regardless of what is waiting.
+- **Pressure does not call `evict_idle()`.** IDLE keep-warm becomes *optional*
+  placement. A displaced deployment stays IDLE and simply gets no assignment.
+  `evict` keeps its stronger meaning: an explicit decision that the deployment
+  is no longer wanted as cache.
+- **Requiredness is explicit in the planner** (for example
+  `plan_placement(..., required_ids=...)`), not derived from
+  `Deployment.state`. A candidate that reuses an existing IDLE deployment must be
+  required in the preview even though the ledger still says IDLE. Tier order:
+  required pins → required explicit → required fit → optional pins → optional
+  explicit → optional fit.
+- **Q9 answered:** displacement happens only inside a preview that proves the
+  whole candidate is admissible. A retry that still cannot admit changes nothing,
+  so there is zero cache churn. A non-queued `acquire` blocked only by warm cache
+  succeeds immediately; `--queue` is needed only when *admitted* demand blocks it.
+- **Q10 answered: a teardown barrier is required.** A displaced resident is
+  stopped, and its exit awaited, before anything starts on its GPU, and a fake
+  runner test must prove the ordering, not just the final container set. The
+  reviewer states that Compose schedules orphan removal independently of service
+  creation; that was **not verified by this author**. The barrier is warranted
+  either way, because nothing documents the order.
+- **Q11 answered:** established LIVE deployments are non-preemptible, and
+  admission is first-successful under the global lock. `created_at` survives only
+  as a deterministic tie-breaker. The documented lack of FIFO fairness is left
+  alone here.
+
+### Concerns and refinements raised in re-verification
+
+**A. Optional re-placement oscillates under batch workloads.** In the reviewer's
+example, B is displaced by E and "when E later releases, the next reconcile can
+place B again". That means reconcile **cold-starts a model nobody requested**
+whenever capacity frees. The workload that hit this incident acquires and
+releases a lease per shard every few minutes, so B would be started, then
+displaced (through the Q10 barrier) by the next shard, then started again,
+indefinitely.
+
+*Proposed refinement:* optional placement **preserves** residency but never
+**creates** it. An IDLE keep-warm deployment is optional **only while it is
+actually running**. If it is not running (displaced, crashed, or gone after a
+host restart), it is not desired at all, while staying IDLE in the ledger. A later
+request that reuses it flips it to LIVE (`ledger.py:324-342`) and starts it then.
+This also answers **Q1**: the incident's I1 and I2 were idle *and not running*,
+so under this rule they would never have entered the plan, before any ordering
+question arose. The cost: warm models are not automatically restarted after a
+host reboot. **Open: does anything rely on that?**
+
+**B. "Running" is not reliably observable today.** **[code, re-verified]**
+`ComposeBackend.observe()` (`compose.py`) lists running compose services, then
+maps service names to deployment ids **through the sidecar's `services` map**,
+which every render rewrites, including renders that are never applied. It also
+returns `set()` on any Docker error ("observe is best-effort"). Consequences:
+
+- a render that drops a service name makes its still-running container invisible
+  to `observe()`;
+- one transient Docker error makes every warm model look not-running.
+
+So refinement A and the Q10 barrier both need a source of truth for **which
+deployment is physically on which GPU** that does not go through the sidecar:
+container labels and device requests via Docker, or a separate record of the last
+**applied** (not last rendered) assignments. And a failed observation must fail
+safe: treat state as unknown and keep the last good render, rather than dropping
+optional residents or skipping the barrier.
+
+**C. The preview-and-commit must be one critical section.** The feasibility
+preview, the lease insert, and the publish must happen under a single hold of
+`_global_lock`, which is re-verified to be a cross-process `flock` plus a thread
+lock. Otherwise two waiting processes can both preview "fits" and both commit,
+overcommitting the host. The reviewer implies this; the plan should state it as
+an invariant with a two-process test.
+
+**D. Sweeping is a ledger write the queue depends on.** **[code, re-verified]**
+`_render()` begins with `self.ledger.sweep()` (`controller.py:452`), which
+reclaims TTL-expired *admitted* leases. The current queue relies on this to free
+capacity held by crashed jobs. "Pending attempts never alter the ledger or
+desired generation" therefore needs an explicit carve-out: a waiting caller may
+sweep expired admitted state and, if that changes desired state, publish the
+admitted-only render. Only the candidate's own effects are forbidden.
+
+**E. "Never replace the last good render" can wedge the host.** An admitted LIVE
+deployment can become unplaceable for reasons unrelated to admission: a GPU
+disappearing, `reserved` changing, or a changed `allowed_gpus` under Slurm, which
+is per call. If every render refuses to publish from then on, releases and
+teardowns can never apply either. The plan must define this case, for example:
+fail loudly, still publish renders that only *remove* deployments, and surface
+the violation in `status`.
+
+**F. Published is not applied.** The sidecar currently conflates "last rendered"
+with "last applied". The barrier's question, *who is on GPU k right now*, needs
+the latter. Even with the new invariant, a published render can fail to apply.
+
+**G. Starvation will bite this workload.** Deferring FIFO is reasonable for this
+fix, but small leases repeatedly beating a large one is the expected pattern when
+per-shard leases mix one-GPU requests with two-GPU requests (answerer plus
+auxiliary model). This should be recorded as a known limitation with a follow-up,
+not an unstated one.
+
+### Additional tests from this round
+
+- an IDLE keep-warm deployment that is **not running** is never started by a
+  reconcile it was not requested in (A);
+- a Docker error during observation does not drop running warm residents and does
+  not skip the teardown barrier (B);
+- two processes previewing the last free GPU: exactly one is admitted (C);
+- a waiting caller's sweep of an expired admitted lease frees capacity and
+  publishes, with nothing of the candidate's written (D);
+- with an admitted deployment made unplaceable, a release still publishes and
+  applies its teardown (E);
+- the barrier consults physical placement, not the last rendered sidecar (B, F).
+
+### Where this leaves the design
+
+Converged: transient admission, required vs optional placement, no eviction
+under pressure, the teardown barrier, and no PENDING state. **Still to settle
+before a plan:** A (should optional residency require that the deployment is
+running?), B/F (what the physical-placement source of truth is), and E (behaviour
+when an admitted deployment becomes unplaceable).
