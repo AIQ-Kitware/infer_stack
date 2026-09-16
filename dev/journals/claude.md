@@ -2619,3 +2619,74 @@ faulthandler output. The bounded joins mean any remaining variant now reports
 itself instead of hanging, which is the property I would actually rely on.
 Takeaway worth keeping: schema/bootstrap paths run *before* whatever lock the
 design relies on, so they have to be idempotent on their own.
+
+## 2026-09-16 12:15:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, running as Claude
+Code on a guest VM with no GPU. Non-interactive constraints: no docker daemon
+worth using, no live gateway, so everything here was proven by unit tests and
+by driving the CLI against an isolated `INFER_STACK_DATA_DIR`.
+
+**User intent.** Downstream, a harness pulls its inference environment together
+by hand: it looks the master key up properly with `infer-stack env
+LITELLM_MASTER_KEY`, and then writes `http://127.0.0.1:14042/v1` on the next
+line as a literal. Jon's ask was that *all* of it be queried programmatically,
+so a script "just runs" when pasted, and that if infer-stack could not serve the
+url and port, infer-stack should learn to.
+
+**What I found.** It nearly could already. `_front_door(config)` in
+`cli/commands_leasing.py` resolves base-url-plus-key from managed state without
+a backend object or GPU detection — `test` uses it. And `envfile.py` already
+calls this value `OPENAI_BASE_URL` when it writes a lease env-file, so the name
+was the project's own vocabulary, not something I invented. The only thing
+missing was that `env` is a flat dict lookup over the secrets file, and a URL is
+not a secret, so it lived nowhere `env` could see.
+
+**The design choice.** Two options: a new verb (`infer-stack url`) or derived
+keys inside `env`. I took derived keys, for the reason the `env` docstring
+already argues for itself — "there's nothing to hide behind a separate verb; one
+`env` does it all". The value of the feature is that a script names ONE command
+twice; a second verb would have split that again. `OPENAI_BASE_URL` and
+`LITELLM_PORT` now answer even with no `.env` on disk, because a URL needs no
+secret to exist, and that is the case that matters: you want the URL *before*
+the first acquire.
+
+I reused `_front_door` rather than re-deriving. That is the whole point rather
+than mere tidiness — if `env` computed its own URL, a script built from `env`
+could address a door `infer-stack test` never knocked on, and they would
+disagree with no symptom until a run failed.
+
+**The bug my own test caught.** First cut derived the port independently of the
+URL. Then I exercised the override path and saw
+`OPENAI_BASE_URL=https://gw:8443/v1` sitting next to `LITELLM_PORT=14042` — a
+mismatch in the output of the one command whose entire job is to stop people
+hardcoding mismatched pairs. The port is now read back off the *effective* URL,
+and omitted when that URL names none (behind a proxy on 80/443 there is nothing
+to report, and a made-up number is precisely the thing a script would bake in).
+Worth recording that I only saw this because I ran the override case by hand
+before writing its test; the happy path looked perfect.
+
+**Tradeoffs / what might break.** `env --export` with no `.env` used to be a
+hard error and now prints the derived lines plus a stderr note. I think that is
+strictly better for `eval "$(infer-stack env --export)"`, but it is a behaviour
+change and someone relying on the non-zero exit would notice. Reading a stored
+value still beats the derived one, so nothing that already wrote these keys
+changes meaning. The port resolution inherits `_front_door`'s limitation: it
+trusts the configured default rather than reading the rendered compose project,
+so a stack brought up on a non-default port without the matching setting will be
+reported wrongly — the same way `test` would already be wrong, which is why I
+did not fix it in one place only.
+
+**Confidence.** High on the behaviour: 541 passed / 2 skipped, 18 doctests, and
+the three cases (default, overridden-with-port, overridden-without) driven by
+hand against a scratch data dir. Lower on the ergonomics being *complete* — I
+have not run this against a live gateway, and there may be a third thing scripts
+reach for that I have not noticed. That would show up the first time someone
+tries to paste a real recipe.
+
+**Takeaway.** When a tool makes you look up half a config properly, people
+hardcode the other half — and the hardcoded half is the one that breaks
+silently. The fix is not documentation, it is making the correct call cover the
+whole pair. Corollary: if two commands can each answer "where is the service",
+make one of them call the other, or they will drift apart in exactly the
+situation where being right matters.

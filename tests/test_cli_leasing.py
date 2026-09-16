@@ -480,6 +480,61 @@ def test_env_read_missing_is_friendly(tmp_path, monkeypatch):
         EnvCLI.main(argv=['NOPE'])                    # no .env yet
 
 
+def test_env_answers_the_front_door_without_a_file(tmp_path, monkeypatch):
+    """The URL needs no secret to exist, so it answers before any acquire.
+
+    This is what lets a script be copy-pasteable: the base url and the key come
+    from the same verb, so neither gets hardcoded next to the other.
+    """
+    import contextlib
+    import io
+
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+
+    for key, expected in [('OPENAI_BASE_URL', 'http://127.0.0.1:14042/v1'),
+                          ('LITELLM_PORT', '14042')]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            EnvCLI.main(argv=[key])
+        assert buf.getvalue().strip() == expected
+
+    # --export still works with no file: the secrets are simply absent.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        EnvCLI.main(argv=['--export'])
+    assert 'export OPENAI_BASE_URL=http://127.0.0.1:14042/v1' in buf.getvalue()
+
+
+def test_env_stored_base_url_wins_and_the_port_follows_it(tmp_path, monkeypatch):
+    """Writing the key pins it -- and the reported port tracks the written URL.
+
+    A derived port beside an overridden URL is the mismatch this command exists
+    to prevent, so it is read back off the effective URL, not re-derived.
+    """
+    import contextlib
+    import io
+
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+
+    EnvCLI.main(argv=['OPENAI_BASE_URL=https://gw.internal:8443/v1'])
+
+    def read(key):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            EnvCLI.main(argv=[key])
+        return buf.getvalue().strip()
+
+    assert read('OPENAI_BASE_URL') == 'https://gw.internal:8443/v1'
+    assert read('LITELLM_PORT') == '8443'
+
+    # A front door that names no port reports none rather than inventing one.
+    EnvCLI.main(argv=['OPENAI_BASE_URL=https://gw.internal/v1'])
+    with pytest.raises(SystemExit):
+        EnvCLI.main(argv=['LITELLM_PORT'])
+
+
 def test_skip_display_gpus_default_off_flag_and_setting(env, monkeypatch):
     """Display GPUs are used by default; --skip-display-gpus / the setting opt in."""
     import infer_stack.cli.commands_leasing as mod

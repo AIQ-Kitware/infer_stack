@@ -2,6 +2,35 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `env` answers the front door, not just the secrets
+
+`infer-stack env OPENAI_BASE_URL` and `infer-stack env LITELLM_PORT` now work,
+so everything a client needs comes from one verb:
+
+```bash
+export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
+export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
+```
+
+Before this, `env` knew only what was written in the managed `.env`, which is
+secrets. The URL was obtainable only from a lease env-file -- so every script
+that wanted both ended up looking the key up properly and hardcoding
+`http://127.0.0.1:14042/v1` beside it. A hardcoded port is wrong exactly when
+it matters (a second stack, a moved front door) and it is wrong silently.
+
+Both keys are DERIVED, not stored, and they answer before any `acquire`,
+because a URL needs no secret to exist. They come from `_front_door`, the same
+resolution `infer-stack test` uses, so a script built from `env` cannot point
+at a door `test` never knocked on.
+
+A stored value still wins: `infer-stack env OPENAI_BASE_URL=https://gw:8443/v1`
+pins it, which is how you aim a script at a gateway that is not the local front
+door. `LITELLM_PORT` is then read back off that URL rather than re-derived --
+a port disagreeing with the URL printed beside it is worse than no port -- and
+is omitted entirely when the effective URL names none, since behind a proxy on
+80/443 there is nothing to report and a made-up number is one a script would
+bake in.
+
 ### `doctor --gpu` / `--sudo`: why a card looks busy, and who holds it
 
 Twice a GPU has read 100% utilization with ~0 MiB allocated and an empty

@@ -1833,6 +1833,39 @@ def _front_door(config) -> tuple[str, str | None]:
     return base_url.rstrip('/'), key
 
 
+def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
+    """The front-door values ``env`` answers without them being stored.
+
+    A base URL is not a secret and has nothing to be read *out* of: it is
+    derived from the configured front-door port. ``_front_door`` is the one
+    function that derives it, and reusing it here is the whole point -- if
+    ``env`` computed its own, a script built from ``env`` could point at a door
+    ``infer-stack test`` never knocked on, and the two would disagree silently.
+
+    ``stored`` is the managed ``.env``, which wins: writing ``OPENAI_BASE_URL``
+    is how you aim a script at a gateway that is not the local front door.
+    THE PORT IS THEN READ BACK OFF THAT URL rather than re-derived, because a
+    port that disagrees with the URL beside it is worse than no port at all --
+    an override to ``:8443`` used to leave ``LITELLM_PORT`` reporting the
+    default, which is exactly the hardcoded-mismatch this command exists to
+    stop. A port explicitly written to the file still wins over both.
+
+    ``LITELLM_PORT`` is omitted when the effective URL names no port: behind a
+    proxy on 80/443 there is nothing to report, and inventing a number is a lie
+    a script would then bake in.
+    """
+    from urllib.parse import urlparse
+
+    base_url = stored.get('OPENAI_BASE_URL')
+    if not base_url:
+        base_url, _ = _front_door(None)
+    entries = {'OPENAI_BASE_URL': base_url}
+    port = urlparse(base_url).port
+    if port is not None:
+        entries['LITELLM_PORT'] = str(port)
+    return entries
+
+
 class TestCLI(_PathOverridesMixin):
     """Smoke-test a served endpoint through the front door (a real generation).
 
@@ -1983,11 +2016,25 @@ class EnvCLI(_PathOverridesMixin):
     \b
       infer-stack env                       # the .env path (source it to load)
       infer-stack env LITELLM_MASTER_KEY    # print one value
+      infer-stack env OPENAI_BASE_URL       # …including the front door
       infer-stack env HF_TOKEN=hf_…         # set one value (merges, before acquire)
       infer-stack env --export              # every entry as `export KEY=value`
 
     The argument is a KEY to read, or ``KEY=VALUE`` to write (writes merge
     non-destructively, so the managed LiteLLM key is preserved).
+
+    Two keys are DERIVED rather than stored -- ``OPENAI_BASE_URL`` and
+    ``LITELLM_PORT`` -- so that everything a client needs comes from one verb
+    and a script never has to hardcode a host and port next to a key it looked
+    up properly::
+
+        export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
+        export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
+
+    They answer before any ``acquire``, because a URL needs no secret to exist.
+    Writing one (``env OPENAI_BASE_URL=…``) pins it: a value in the file always
+    wins over the derived one, which is how you point a script at a gateway
+    that is not the local front door.
     """
 
     __command__ = 'env'
@@ -2021,19 +2068,31 @@ class EnvCLI(_PathOverridesMixin):
             print(env_path)
             return 0
 
-        # Read: `env KEY` / `env --export`
-        if not env_path.exists():
-            raise SystemExit(
-                f'no managed env-file at {env_path}; run an `acquire` '
-                'with --backend compose first (or `infer-stack env KEY=VALUE`)'
-            )
-        env = parse_env_file(env_path)
+        # Read: `env KEY` / `env --export`. A stored value always beats the
+        # derived one -- writing the key is how you override the front door.
+        env = parse_env_file(env_path) if env_path.exists() else {}
+        derived = _front_door_env(env)
         if config.arg:
-            if config.arg not in env:
-                raise SystemExit(f'{config.arg!r} not found in {env_path}')
-            print(env[config.arg])
-            return 0
-        for name, value in env.items():
+            if config.arg in env:
+                print(env[config.arg])
+                return 0
+            if config.arg in derived:
+                print(derived[config.arg])
+                return 0
+            if not env_path.exists():
+                raise SystemExit(
+                    f'no managed env-file at {env_path}; run an `acquire` '
+                    'with --backend compose first (or `infer-stack env KEY=VALUE`)'
+                )
+            raise SystemExit(f'{config.arg!r} not found in {env_path}')
+        if not env_path.exists():
+            # The URL still stands on its own; say what is missing on stderr so
+            # `eval "$(infer-stack env --export)"` keeps working regardless.
+            print(
+                f'no managed env-file at {env_path} yet: no secrets to export',
+                file=sys.stderr,
+            )
+        for name, value in {**derived, **env}.items():
             print(f'export {name}={shlex.quote(value)}')
         return 0
 
