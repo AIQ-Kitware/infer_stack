@@ -489,3 +489,47 @@ container can be displaced**, and it requires P2, P4 and P5.
 - Automatic re-warming of displaced keep-warm deployments (rejected by I3).
 - Explicit migration of LIVE deployments between GPUs (D6).
 - Any change to `observe()`'s best-effort semantics.
+
+---
+
+## Addendum to revision 2: gateway misrouting after recreation
+
+Found after revision 2 was written, by an agent running a batch job; see
+[`investigation-gateway-stale-upstream-after-recreate-2026-09-16.md`](investigation-gateway-stale-upstream-after-recreate-2026-09-16.md).
+A container recreated shortly after another was removed received the removed
+container's IP. The gateway kept routing the removed service's name to that IP
+for 28 minutes, so a healthy deployment failed readiness. **This plan's handoff
+barrier and selective apply produce exactly that remove-then-create sequence**,
+so the fault must be addressed before P6.
+
+**New invariant**
+
+| id | invariant |
+|---|---|
+| **I14** | A request routed for deployment D reaches **only D's container**, including immediately after any container is removed or created. |
+
+**New decision, open for review**
+
+- **D12:** how to establish I14. The options and trade-offs are in the
+  investigation's "Candidate directions": disable or shorten the gateway client's
+  DNS cache, stable per-service IPs, per-instance aliases, or connection draining.
+  In every case, add an upstream-direct readiness check that verifies the served
+  model name, so a routing fault is reported instead of timing out. The author's
+  lean: stable per-service IPs, since they need no gateway config churn and so are
+  compatible with static-superset byte-stability, plus the direct check.
+
+**Ordering change:** a new step **P5b**, landing before P6, establishes I14 and the
+upstream-direct check.
+
+**New tests**
+
+34. Remove service X, create service Y, recreate X within seconds, with requests
+    for X flowing continuously: every request for X reaches X's container.
+    Integration test against a real gateway image, or V3 of the investigation on
+    the host.
+35. The upstream-direct check distinguishes "upstream not listening" from "the
+    gateway routes to a server with a different served name", and reports the
+    latter as a routing fault, not "not ready".
+
+**New host verification:** V1-V4 of the investigation, before P5b is designed in
+detail.
