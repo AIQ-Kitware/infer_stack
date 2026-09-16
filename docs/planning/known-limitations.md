@@ -135,6 +135,14 @@ that stops, removes or hands over a GPU. Use `ComposeBackend.residency()`, which
 raises `ResidencyUnknown` instead. Changing `observe()` to be strict is out of
 scope.
 
+### A staged lease starts on the next ordinary apply (current)
+
+`infer-stack acquire <alias> --no-apply` stages a lease: it enters the desired
+state without starting anything. It is still part of that desired state, so the
+**next ordinary apply by anyone** starts it as well. That includes a later
+`acquire`, `release` or `infer-stack apply`. There is no "declared, but startable
+only by an explicit apply" state, and adding one is out of scope.
+
 ### Known fault: idle keep-warm deployments can starve new leases (current)
 
 An idle keep-warm deployment still claims GPUs during placement, ordered by

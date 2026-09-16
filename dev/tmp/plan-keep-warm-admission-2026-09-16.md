@@ -1,6 +1,6 @@
 # Plan: admission-atomic leasing with optional keep-warm residency
 
-- **Date:** 2026-09-16 · **Revision 7** (consolidated; self-contained)
+- **Date:** 2026-09-16 · **Revision 7a** (consolidated and self-contained; §0.1 records the review of revision 7)
 - **Author:** Claude Opus 5 (1M context), `claude-opus-5[1m]`
 - **Status:** plan for review. **P1 is implemented** on `dev/0.7.1` (`675315c`);
   nothing else is written.
@@ -74,6 +74,22 @@ an older render was being applied.
   acquire or release applies the whole pending desired state, including a lease
   staged with `--no-apply`. The current code does the same: any apply brings up the
   whole rendered set. It is recorded, not changed (D23).
+
+### 0.1 Amendments after the review of revision 7
+
+The reviewer accepted revision 7's architecture and asked for no broad rewrite.
+It answered D23 and D24, and found two **implementation-order** issues. Its code
+claim (`_reconcile_routes` listing timeout 10 s, `compose.py:2162-2166`; route
+POST timeout 30 s, `2180-2203`) was re-verified. Changes:
+
+| # | finding | amendment |
+|---|---|---|
+| 1 | **P2's crash determinism depended on P4's profile.** A process could commit a mutation, die, be upgraded or reconfigured, and recover to a different render. `approved_digest` only covers approved operations, not ordinary releases. | The **minimum immutable render context moves into P2**: the initial profile is persisted once by P2's migration, P2 renders only from it, and P2 uses the explicit Compose environment. P4 keeps `config publish`, drift reporting, image pre-pull and profile-changing workflows (§8) |
+| 2 | **P2 referred to selective apply, which lands in P8.** | P2 serialises **today's backend apply** under `_global_lock`, bounded, with route verification gating the marker. P8 replaces the apply algorithm. Test 21 moves to P8 (§4.3, §8) |
+| 3 | **D24: a retry count does not bound the lock hold,** because each listing can take 10 s and each POST 30 s. | D24 is an **end-to-end wall-clock deadline** covering GETs, POSTs, verification and sleeps: small in steady state, larger for explicit bootstraps. Values come from V15 (§4.11) |
+| 4 | **A stable `created` container would wedge recovery.** A Compose client that died between create and start leaves a container that never changes state on its own, and waiting for it retries forever. | The P8 interrupted-apply rules are replaced with a **quiescence window** and per-state rules (§4.11) |
+| 5 | Test 19 ("a mutation landing during publish is not lost") assumes concurrency that D22 forbids. | Replaced with "no desired-state writer bypasses `_global_lock` or controller publication". The marker keeps its version only as defensive bookkeeping |
+| D23 | Keep current staged-lease behaviour. | **Resolved**, and documented as a current limitation in `docs/planning/known-limitations.md` |
 
 ---
 
@@ -182,6 +198,8 @@ Its behaviour:
 
 **Store:**
 
+- `profile`: the frozen render context. **P2 persists the initial profile** (§5,
+  step 3) and renders only from it; P4 adds `config publish` to change it;
 - `publication_pending(version, apply_requested, approved_digest)`: at most one
   row;
 - `admission_state_version` (§4.6);
@@ -204,10 +222,12 @@ publish():
     if marker.approved_digest and digest(render) != marker.approved_digest:
         fail closed: "rendered state differs from what was approved; run `infer-stack apply`"
     if not marker.apply_requested: return           # staged; marker stays
-    backend.apply(render)                           # selective apply (§4.7); bounded (§4.11)
+    backend.apply(render)                           # P2: today's apply, serialised and bounded (§4.11)
+                                                    # P8: replaced by selective apply (§4.7)
     if dynamic routing: verify routes (bounded)     # failure -> return; marker stays
     with store.transaction():
-        delete publication_pending where version <= rendered_version
+        delete publication_pending          # its version is defensive bookkeeping only;
+                                            # D22 forbids a concurrent desired-state writer
 ```
 
 **Mutator behaviour:**
@@ -399,24 +419,47 @@ under `_global_lock`.
 
 ### 4.11 Bounded operations and interrupted applies → I16
 
-- **Docker calls under the lock** get per-operation timeouts:
-  - `ps` and `inspect`: short;
-  - `stop` and `rm`: moderate;
-  - `up -d`: longer, but bounded.
+**Timeouts (P2).** Docker calls under the lock get per-operation timeouts: short
+for `ps` and `inspect`, moderate for `stop` and `rm`, longer but bounded for
+`up -d` (D25). On timeout:
 
-  On timeout, **kill the process group**, leave the marker set, release the lock,
-  and fail the operation with a message saying so.
-- **Interrupted applies.** A killed client does not stop work the Docker daemon
-  already started. The next apply begins with strict residency. If a target service
-  is `created`, `restarting` or `removing` without having been left there
-  deliberately, it waits briefly (bounded) and retries, instead of acting on a
-  moving state.
-- **Route verification under the lock is fail-fast** (D24): one listing plus a
-  small bounded retry. On failure the marker stays and the operation returns.
-  - The existing 90 × 2 s discovery budget applies only to an explicit gateway
-    bootstrap (`config publish`, `network migrate`, the first apply of a fresh
-    stack).
-  - Static-superset mode does not verify routes (D17).
+1. kill the process group;
+2. leave the marker set;
+3. release the lock;
+4. fail the operation, saying the apply is pending.
+
+**Route reconciliation deadline (P2, D24).** Dynamic-mode reconciliation runs
+against **one end-to-end wall-clock deadline**, covering listing GETs, POSTs,
+verification and retry sleeps. A retry count alone cannot bound it: today a
+listing can take 10 s and each POST 30 s.
+
+- Steady state: a small deadline.
+- Explicit bootstraps (`config publish`, `network migrate`, the first apply against
+  an empty project): a larger one.
+- On expiry, the marker stays set and the operation returns.
+- Static-superset mode does not reconcile routes (D17).
+- Values come from V15.
+
+**Interrupted applies (P8, with selective apply).** A killed Compose client does
+not stop work the Docker daemon already started. A request may still complete
+just after recovery takes its first look. So when recovering an
+`apply_requested` marker:
+
+1. **Quiescence window.** Take strict residency snapshots until the project's
+   container set and states are identical for two consecutive samples, or a
+   bounded settle deadline expires. Act only on a settled view. If the deadline
+   expires unsettled, fail and leave the marker set.
+2. **Per-state rules** on the settled view:
+   - **`removing`:** wait for the container to disappear, within the settle
+     deadline. If it does not, fail and leave the marker set.
+   - **`created`:** managed but not satisfying. Nothing will advance it on its own.
+     **Resume** it by starting the desired Compose service, or remove and recreate
+     it if its key is no longer wanted. **Never wait for it to change
+     spontaneously.**
+   - **`restarting`:** left to Docker's restart policy, as §4.7 says. It still
+     occupies its GPU for the barrier. Readiness, outside the lock, decides whether
+     the workload succeeds.
+   - **Duplicate wanted realisations:** fail closed, as always.
 
 ### 4.12 Backends
 
@@ -498,16 +541,21 @@ One-time, explicit, on upgrade:
 17. Static-superset mode: an unreachable gateway does not gate clearing.
 18. Approved digest mismatch (simulated renderer change between commit and apply):
     fails closed until an explicit approved `apply`.
-19. A mutation landing during publish is not lost (compare-and-clear on version).
+19. No desired-state writer bypasses `_global_lock` or controller publication
+    (behaviour test plus a check that no module outside the controller writes
+    desired state).
 
 **Bounded operations**
 
 20. A hung `docker compose up` times out: the process group is killed, the marker
     stays, and the lock is released.
-21. An apply after an interrupted one does not act on services in transitional
-    states.
-22. Route verification under the lock fails fast while the gateway is
-    unreachable; the lock is not held for the long bootstrap budget.
+21. **(P8)** An interrupted apply is recovered on a **settled** view: a request
+    that completes just after the first snapshot is seen; a stable `created`
+    container is resumed or replaced, never waited on; `removing` is awaited within
+    the deadline; `restarting` is left to Docker.
+22. Route reconciliation under the lock honours its **total** deadline while the
+    gateway is unreachable **and** while POSTs are slow, including several route
+    changes; the lock is never held for the bootstrap deadline outside a bootstrap.
 
 **Profile**
 
@@ -607,13 +655,13 @@ One-time, explicit, on upgrade:
 | step | content | behaviour |
 |---|---|---|
 | **P1** | Strict residency (§4.1) | **done**, `675315c` |
-| **P2** | Serialised publication (§4.3): the marker with `apply_requested` and `approved_digest`; every mutator through the controller; read paths non-mutating (§4.10); route verification gates the marker (§4.11); bounded Docker calls; `_ensure_applied` coalescing removed; registry commands through the controller (§4.9). Tests 8-22, 50-52 | closes the apply/render race and the crash windows. **Valid under both outcomes of V15** |
+| **P2** | Serialised publication (§4.3): the marker with `apply_requested` and `approved_digest`; **today's backend apply**, serialised under `_global_lock` and bounded (§4.11); route reconciliation with a total deadline gates the marker; every mutator through the controller; read paths non-mutating (§4.10); `_ensure_applied` coalescing removed; registry commands through the controller (§4.9); **minimum immutable render context: initial profile persisted once, rendering only from it, explicit Compose environment** (§4.2, §5 step 3). Tests 8-20, 22, 27, 50-52 | closes the apply/render race and the crash windows, with deterministic recovery. **Valid under both outcomes of V15** |
 | **P3** | Planner keywords (§4.4). Tests 1-7 | none by default |
-| **P4** | Profile and `config publish`, including image pre-pull, catalog digest and explicit environment (§4.2); initial-profile migration. Tests 23-27 | render inputs frozen |
+| **P4** | `config publish` (preview-first), drift reporting, image pre-pull, catalog digest and the unpublished-endpoint check, profile-changing workflows (§4.2). The profile store itself landed in P2. Tests 23-26 | profile becomes changeable only explicitly |
 | **P5** | `assigned_gpus`, backfill, and renew paths (§4.5); allocation migration. Tests 36, 54-55 | allocations become hard |
 | **P6** | Admission preview (§4.6). Tests 28-35 | failed attempts commit nothing |
 | **P7** | Stable addresses, persisted subnet, `network migrate`, upstream check (§4.8). Tests 56-60 | I14 |
-| **P8** | Residency extension, labels and fingerprints, ownership, selective apply, barrier, `gc --orphans`, adoption migration (§4.1, §4.7). Tests 38-49, 53 | no `--remove-orphans` |
+| **P8** | Residency extension, labels and fingerprints, ownership, selective apply **replacing P2's apply**, barrier, interrupted-apply quiescence (§4.11), `gc --orphans`, adoption migration (§4.1, §4.7). Tests 21, 38-49, 53 | no `--remove-orphans` |
 | **P9** | Idle keep-warm becomes optional and resident-only | **fixes the incident** |
 | **P10** | DEGRADED end to end and observability (§4.13) | |
 
@@ -629,13 +677,16 @@ in P3-P10 changes.
 
 - **D1-D21:** as recorded in revisions 2-6.
 - **D22: serialised publication**, provisionally adopted, final after V15.
+- **D23:** a later ordinary apply starts leases staged with `--no-apply`. That is
+  current behaviour, kept and documented.
+- **D24:** route reconciliation under the lock has an end-to-end wall-clock
+  deadline: small in steady state, larger for explicit bootstraps. Values come from
+  V15.
 
 **Open:**
 
 | id | question | author's lean |
 |---|---|---|
-| **D23** | A later ordinary apply starts leases staged with `--no-apply`. Keep today's behaviour, or model a staged lease as excluded from applies until an explicit `apply`? | Keep today's behaviour and document it; excluding staged leases is new desired-state semantics, out of scope here |
-| **D24** | Route verification budget inside the lock: how many attempts, and what counts as an explicit bootstrap that may use the long budget? | One listing plus up to 3 retries 2 s apart under the lock; the long budget only for `config publish`, `network migrate` and a first apply against an empty project |
 | **D25** | Timeout values for Docker operations under the lock | Set from V15 measurements: roughly 5× the observed steady-state p95 per operation, with a floor of 30 s for `up -d` |
 
 ---
@@ -657,3 +708,5 @@ Do not approximate these through existing code paths.
 - **Concurrent or coalesced publication** (added if D22 is confirmed): desired-state
   changes are applied one at a time under a host-wide lock.
 - Whether an unswept past-TTL ACTIVE lease counts as demand; left as today.
+- **Staged leases that only a manual `apply` may start** (D23). A lease staged with
+  `--no-apply` is part of the desired state, and any later ordinary apply starts it.
