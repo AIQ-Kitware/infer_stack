@@ -92,10 +92,39 @@ The proposed chain:
 4. Requests for A arrive every ~2 s, so a keep-alive connection to that IP never
    goes idle long enough to close, and the name is never re-resolved.
 
-**Reported by the discovering agent, not verified here** (LiteLLM is not
-installed on the guest): LiteLLM v1.82.3's aiohttp transport uses
-`AIOHTTP_TTL_DNS_CACHE = 300` s and `AIOHTTP_KEEPALIVE_TIMEOUT = 120` s
-(`litellm/constants.py:204-205`). See V1.
+**[code, verified in the pinned image `b959a1816fa4`].** The gateway's HTTP client
+settings:
+
+- `/app/litellm/constants.py:204`:
+  `AIOHTTP_KEEPALIVE_TIMEOUT = int(os.getenv("AIOHTTP_KEEPALIVE_TIMEOUT", 120))`
+- `/app/litellm/constants.py:205`:
+  `AIOHTTP_TTL_DNS_CACHE = int(os.getenv("AIOHTTP_TTL_DNS_CACHE", 300))`
+- `/app/litellm/proxy/proxy_server.py:745-746` passes both to
+  `TCPConnector(**connector_kwargs)` (line 755); `llms/custom_httpx/http_handler.py`
+  imports them for its own connector.
+- The bundled aiohttp is **3.13.3**, whose `TCPConnector` defaults are
+  `use_dns_cache=True` and `ttl_dns_cache=10`. LiteLLM raises the TTL to 300 s.
+
+Both are **environment-overridable**, so they can be changed on the gateway
+service without patching the image.
+
+**The duration tells us which cache held the mapping [inferred, from verified
+numbers].** The misroute lasted about 28 minutes, far longer than the 300 s DNS
+TTL. A DNS cache entry alone would have expired and been re-resolved within five
+minutes. What persisted must be the **connection**: once the client opened a
+keep-alive connection to the reused IP (~19:48:38Z), requests for A arrived every
+~2 s, well inside the 120 s idle timeout, so that connection never closed and the
+name was never looked up again. So the two settings play different parts:
+
+- the **DNS cache** makes the bad connection possible, by using a stale IP when a
+  new connection is opened just after the recreation;
+- **keep-alive under continuous traffic** makes it last indefinitely.
+
+This answers **Q1** in part: both are involved. Shortening only the keep-alive
+timeout would not help while traffic continues. Shortening or disabling the DNS
+cache should prevent the bad connection from being opened, but only if Docker's
+embedded DNS already returns the new address by the time the client reconnects.
+V3 must confirm that.
 
 **Consistent with, not proven by, the evidence:** the rerun succeeded after more
 than 300 s; the 404s start when B could first answer; the pre-404 errors are
@@ -131,7 +160,7 @@ in the related investigation.
 
 | # | direction | trade-off |
 |---|---|---|
-| 1 | **Lower or disable the gateway client's DNS cache**, via environment on the LiteLLM service or a config setting, if the pinned version exposes one. Every *new* connection then resolves the current IP. | Cheap. Does not help if a keep-alive connection is held to a reused IP, though a removed container's connections are reset, which forces a reconnect. Needs V1 and V2. |
+| 1 | **Lower the gateway client's DNS cache TTL**, by setting `AIOHTTP_TTL_DNS_CACHE` on the LiteLLM service's environment (verified environment-overridable). Every *new* connection then resolves the current IP. | Cheapest; no image patch. Prevents the bad connection from being opened, but does nothing about one already open, so it depends on the removed container's old connections failing first, which the 19:45Z–19:47Z connection errors suggest they do. Check what `0` means to aiohttp 3.13.3 before using it; a small positive value is the safe choice. Adding the variable changes the gateway stanza once, so the gateway is recreated once. |
 | 2 | **Stable per-service IPs:** a fixed `ipv4_address` for each model service on the Compose network, derived deterministically from the service, so recreation keeps its address and no other service can take it. | Removes the class at the network layer, with no gateway config change. Needs subnet management and collision-free assignment. |
 | 3 | **Per-instance hostnames/aliases** that change on each recreation. | Correct by construction, but changes `api_base` on every recreation. That breaks static-superset byte-stability, where the gateway must never be recreated, unless routes are reconciled through the admin API. |
 | 4 | **Probe the upstream directly as well** (`GET /v1/models` on the service, checking the served name) and treat a gateway/upstream disagreement as a routing fault. | Detects the fault and names it, instead of a silent 30-minute timeout. Does not fix misrouted *traffic* on its own. |
@@ -144,10 +173,8 @@ fault. (1) or (2) addresses the cause.
 
 ## Verification (host)
 
-- **V1:** `docker exec infer-stack-litellm-1 python -c "import litellm.constants as c; print(c.AIOHTTP_TTL_DNS_CACHE, c.AIOHTTP_KEEPALIVE_TIMEOUT)"`
-  confirms the reported values in the pinned image.
-- **V2:** whether those values are configurable through the environment, or
-  through a LiteLLM setting, without patching the image.
+- **V1: done.** Read from the pinned image; see M3.
+- **V2: done.** Both settings are read from the environment.
 - **V3 (deliberate reproduction):** serve two small models X and Y through the
   gateway; probe X every 2 s; remove X, create Y, then recreate X within a few
   seconds; check whether X's requests return Y's 404. Repeat with direction (1)
@@ -159,9 +186,11 @@ fault. (1) or (2) addresses the cause.
 
 ## Open questions
 
-- **Q1.** Is the stale mapping held by aiohttp's DNS cache, by a pooled
-  keep-alive connection, or by both? This decides between direction 1 and
-  direction 2.
+- **Q1. Partly answered (M3):** both. The DNS cache allows the bad connection
+  and keep-alive under continuous traffic sustains it; 28 minutes rules out the
+  DNS cache alone. Still open: whether Docker's embedded DNS returns the new
+  address immediately after recreation, which decides whether direction 1 alone
+  is sufficient (V3).
 - **Q2.** Can a *successful* misroute happen? That needs two deployments that
   serve the same model name on different containers, e.g. dedicated copies. Then
   the wrong container would answer 200, and the fault would be invisible even to
