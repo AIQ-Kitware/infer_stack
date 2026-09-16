@@ -55,6 +55,13 @@ from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
 from .models import Deployment, is_reservation
 from .placement import plan_placement
+from .residency import (  # DEPLOYMENT_LABEL lives beside the code that reads it back
+    COMPOSE_PROJECT_LABEL,
+    DEPLOYMENT_LABEL,
+    Residency,
+    ResidencyUnknown,
+    residency_from_inspect,
+)
 
 LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
 VLLM_HOST_PORT_BASE = 18000
@@ -98,7 +105,6 @@ VLLM_DEFAULTS = {
     'max_num_seqs': 256,
 }
 
-DEPLOYMENT_LABEL = 'infer-stack.deployment'
 ENGINE_LABEL = 'infer-stack.engine'
 
 
@@ -157,9 +163,11 @@ def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:
     (:func:`_unique_vllm_service_name`) so same-model dedicated deployments get
     distinct containers/GPUs; the admin-API route table addresses each by name.
 
-    Either way ``observe`` correlates a running container back to its deployment
-    id via the ``infer-stack.deployment`` label, not this name, so the choice of
-    suffix does not affect reconcile bookkeeping.
+    Either way the container carries the ``infer-stack.deployment`` label.
+    :meth:`ComposeBackend.residency` correlates containers to deployments by that
+    label, so the choice of suffix does not affect it. (The lenient
+    :meth:`ComposeBackend.observe` still maps service names through the render
+    sidecar; it is for reporting, not for decisions that touch a GPU.)
     """
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
@@ -2204,6 +2212,38 @@ class ComposeBackend(ConvergeScaffold):
                 'dynamic routing: POST {} {} -> {} {}',
                 path, label, resp.status_code, body[:200],
             )
+
+    def residency(self) -> Residency:
+        """Strict snapshot of this project's deployment containers and their GPUs.
+
+        Unlike :meth:`observe`, this never reports "nothing" for "could not look":
+        any Docker error, or output that cannot be parsed, raises
+        :class:`~infer_stack.leasing.residency.ResidencyUnknown`. Containers are
+        found by label (this Compose project and ``infer-stack.deployment``), in
+        every state, so a container absent from the current render or sidecar is
+        still seen. GPUs come from each container's device reservation. See
+        :mod:`infer_stack.leasing.residency` for the ambiguity rules.
+
+        A container removed between the listing and the inspect makes the inspect
+        fail, which is reported as unknown; the caller retries.
+        """
+        try:
+            listing = self.run([
+                'docker', 'ps', '-a', '--no-trunc',
+                '--filter', f'label={COMPOSE_PROJECT_LABEL}={self.project}',
+                '--filter', f'label={DEPLOYMENT_LABEL}',
+                '--format', '{{.ID}}',
+            ])
+        except Exception as ex:  # noqa: BLE001 - any failure is "unknown", never "empty"
+            raise ResidencyUnknown(f'docker ps failed: {ex}') from ex
+        ids = [line.strip() for line in (listing or '').splitlines() if line.strip()]
+        if not ids:
+            return Residency({})
+        try:
+            raw = self.run(['docker', 'inspect', *ids])
+        except Exception as ex:  # noqa: BLE001 - see above
+            raise ResidencyUnknown(f'docker inspect failed: {ex}') from ex
+        return residency_from_inspect(raw, project=self.project)
 
     def observe(self) -> set[str]:
         if not self.compose_file.exists():

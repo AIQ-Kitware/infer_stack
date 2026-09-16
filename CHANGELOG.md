@@ -2,6 +2,25 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Strict residency: which deployment containers exist, and on which GPUs
+
+`ComposeBackend.residency()` returns a strict snapshot of this project's
+deployment containers, found by the `infer-stack.deployment` label in every
+state, with GPUs read from each container's actual device reservation
+(`HostConfig.DeviceRequests`). It is additive: nothing calls it yet.
+
+It exists because `observe()` is the wrong tool for any decision that stops,
+removes or hands over a GPU. `observe()` returns an empty set when Docker cannot
+be read -- deliberately, so acquire never bricks on a stale compose file -- and it
+maps containers through the render sidecar, which describes what was rendered
+rather than what exists. `residency()` has the opposite contract: a Docker
+failure raises `ResidencyUnknown` and is never "nothing running"; a deployment
+with more than one container is reported as ambiguous with every container kept;
+and a reservation that cannot be mapped to GPU indices is treated as occupying
+every GPU rather than guessed. `observe()` is unchanged.
+
+This is step P1 of `dev/tmp/plan-keep-warm-admission-2026-09-16.md`.
+
 ### `env` answers the front door, not just the secrets
 
 `infer-stack env OPENAI_BASE_URL` and `infer-stack env LITELLM_PORT` now work,

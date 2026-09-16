@@ -2716,3 +2716,36 @@ order, are the proximate cause; the logs cannot tell the two apart, and the
 report says so and proposes the test that would. I stopped myself offering a
 patch mid-incident; that was the right call, since a demand-aware reorder that
 missed the pin path would have looked like a fix and not been one.
+
+## 2026-09-16 18:40:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** The keep-warm admission plan is mid-review with a second model;
+the ask was to start implementing whatever is genuinely settled rather than wait.
+Only P1 (strict residency) and P3 (planner keywords) have survived every review
+round unchanged and depend on no open decision, so P1 went first, on its own
+branch so nothing reaches `dev/0.7.1` without the user choosing.
+
+**What I did.** Added `infer_stack/leasing/residency.py` (`Residency`,
+`Container`, `ResidencyUnknown`, `residency_from_inspect`) and
+`ComposeBackend.residency()`. Before writing the parser I created (never started)
+containers from a compose file with a `device_ids` reservation on the guest's
+Docker and read `docker inspect` back, so the `DeviceRequests` shape in the tests
+is observed rather than remembered: `Count: 0, DeviceIDs: ['1','2']`, and `None`
+without a reservation. There is also a real-daemon test that does the same thing
+and skips when `docker info` fails -- the existing `requires_compose` check uses
+`docker compose version`, which succeeds without daemon access and would not
+have skipped where it should.
+
+**Reflection.** The design choice I care most about is refusing to guess. Three
+places invited a guess and each got a fail-closed answer: Docker unreadable
+raises rather than returning empty; two containers for one deployment are kept
+and reported ambiguous rather than one silently winning a dict slot; and a GPU
+reservation that is not a list of indices (`--gpus all`, a count, UUIDs) counts
+as occupying every GPU. Each of those, guessed, becomes a GPU handed to a new
+container while something still holds it -- the exact failure later steps exist
+to prevent. Uncertainty: the shape was verified on the guest's Docker, not the
+serving host's; the plan's V1/V2 still need a host check before P1 is called done.
+I also moved `DEPLOYMENT_LABEL` to the new module and re-export it from
+`compose.py`, so there is one definition beside the code that reads it back.
