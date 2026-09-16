@@ -1,577 +1,659 @@
 # Plan: admission-atomic leasing with optional keep-warm residency
 
-- **Date:** 2026-09-16 · **Revision 6**
+- **Date:** 2026-09-16 · **Revision 7** (consolidated; self-contained)
 - **Author:** Claude Opus 5 (1M context), `claude-opus-5[1m]`
-- **Status:** **plan for review.** Step **P1 is implemented** on `dev/0.7.1`
-  (`675315c`); nothing else is written.
-- **History:**
-
-  | revision | commit |
-  |---|---|
-  | 1 | `5244229` |
-  | 2 | `7be95ba` (addendum `90d4ca4`) |
-  | 3 | `3aeb5c0` |
-  | 4 | `f0bf2f1` |
-  | 5 | `e7242f0` |
-
-  Each revision's §0 records the review round it answers. This one answers the
-  review of revision 5. It is deliberately narrow: the reviewer judged the
-  architecture settled, and the user asked that it not grow.
-- **Scope boundaries** (non-goals and known faults) are documented for users and
-  contributors in
-  [`docs/planning/known-limitations.md`](../../docs/planning/known-limitations.md#leasing-scope-boundaries-and-known-faults).
-  §10 of this plan lists the same items.
-- **Code baseline:** `dev/0.7.1` at `675315c`. That is P1 on top of `e751676`; the
-  rest of the leasing code is unchanged.
+- **Status:** plan for review. **P1 is implemented** on `dev/0.7.1` (`675315c`);
+  nothing else is written.
+- **The central decision in this revision, D22 (serialised publication), is
+  adopted provisionally.** It is confirmed by host measurement V15 (§7). If V15
+  shows serialisation is too slow for real per-shard churn, revision 6 (`be6c89d`)
+  describes the bundle/activation alternative, and only §4.3 changes.
+- **History:** revisions 1-6 are `5244229`, `7be95ba`, `3aeb5c0`, `f0bf2f1`,
+  `e7242f0`, `be6c89d`. Each §0 there records one review round.
 - **Evidence:**
   - [`investigation-keep-warm-placement-starvation-2026-09-16.md`](investigation-keep-warm-placement-starvation-2026-09-16.md)
   - [`investigation-gateway-stale-upstream-after-recreate-2026-09-16.md`](investigation-gateway-stale-upstream-after-recreate-2026-09-16.md)
     (reproduced on the host)
+- **Out of scope** is documented for users and contributors in
+  [`docs/planning/known-limitations.md`](../../docs/planning/known-limitations.md#leasing-scope-boundaries-and-known-faults).
 
 ---
 
-## 0. Changes from revision 5
+## 0. Changes from revision 6
 
-The reviewer closed the three revision-4 gaps in architecture (compensation, the
-frozen profile, and ownership), accepted D16, and **narrowed scope** under an
-operating assumption from the user: the catalog is published before a leasing
-workload, not edited during it. What remains is three mechanical corrections to
-ownership, and binding P2a's interim publication to the render it applied. Every
-code claim was re-verified.
+The reviewer agreed that **if render and apply are serialised under
+`_global_lock`, the immutable-generation machinery buys no correctness.** With
+serialisation, the compose-file race, the auxiliary-file race, the KubeAI race,
+and every crash window are closed by a durable pending marker plus a
+deterministic re-render. That machinery existed only to let renders advance while
+an older render was being applied.
 
-| # | finding | re-verified | disposition |
-|---|---|---|---|
-| D19 | The catalog is configuration-time state, published before the leasing epoch. No hot catalog merge. | — | **Resolved and simplified** (I19, §4.2). The catalog digest goes in the profile, and acquiring an endpoint absent from the published profile fails with "publish the new configuration first". The live-catalog read at acquire is removed. Documented as a scope boundary |
-| 1 | **D21: hash behaviour, not only the stanza.** The gateway and nginx configs are bind-mounted at stable paths, and today's code already stamps a hash of their **contents** on the label ("same trick as LiteLLM", `compose.py:845-858`, `1030-1045`). A stanza-only hash would call two different gateway configs the same realisation. | yes | **Accepted.** The ownership key is a **behavioural fingerprint**: the canonical stanza plus the hashes of the generation-owned files that service consumes (I11, §4.6) |
-| 2 | **Owned is not the same as satisfying G.** An `exited` or `dead` container with the wanted fingerprint must not be "kept" and block a restart. `paused` holds its GPU but serves nothing. Two containers with the same wanted fingerprint must fail closed. | — | **Accepted.** `managed`, `wanted` and `satisfies` are distinct. A required service is satisfied only by a unique `running` container; `paused` is unpaused, `restarting` is left to Docker, and anything else is replaced. Duplicate wanted realisations are ambiguous (§4.6) |
-| 3 | **D20: P2a must bind clearing the marker to applying that exact render.** Otherwise the round-4 mutable-file race persists during the P2a period. | — | **Accepted.** P2a renders **and applies synchronously under `_global_lock`**, and clears the marker only after that apply succeeds (§8). This is transitional; see D22 |
-| 4 | A bundle must be self-sufficient for values infer-stack owns. Compose interpolates `${HF_TOKEN:-}`, the DB password and the master key at apply time (`compose.py:323`, `802`, `837`), and shell variables take precedence over `--env-file`. | yes | **Accepted.** Apply runs Compose with an **explicit environment**: the managed `.env` plus a fixed allow-list, never the caller's shell (§4.2) |
-| — | User direction: anything marked out of scope must be documented in infer-stack's docs so it is not shoehorned in later. | — | **Done.** `docs/planning/known-limitations.md` gains a leasing section, separating today's behaviour (current) from decisions that constrain the redesign (design boundary), plus the two known faults with workarounds |
+**Dropped:**
 
-### A simplification question raised by this round (D22)
+- immutable `gen-<G>` bundles and the `current` pointer;
+- activation rows and the generation counter;
+- `applied_generation` and coalesced waiters;
+- reconstruction from a base generation, and the `repair_required` state machine;
+- generation-relative route registries;
+- KubeAI bundles;
+- bundle retention rules;
+- ownership by "key appears in a retained bundle".
 
-The reviewer accepts, as a transitional step, that P2a render and apply
-synchronously under the global lock. If that serialisation is acceptable
-**permanently**, a large part of P2b exists only to preserve coalesced,
-concurrent applies, and could be dropped:
+**Kept, in simpler form:**
 
-- immutable bundles and the `current` pointer;
-- activation rows and digest reconstruction;
-- `repair_required`;
-- generation-relative route registries and materialisation;
-- KubeAI bundles.
+- the frozen profile and `config publish`;
+- deterministic rendering;
+- behavioural fingerprints and strict residency;
+- the explicit Compose environment;
+- verified route reconciliation;
+- migration and adoption;
+- a small approved-digest guard.
 
-What would remain is a pending marker, a deterministic render from ledger plus
-profile, and a synchronous apply under the lock. Crash recovery re-renders from
-the ledger and re-applies.
+| # | finding (all code claims re-verified) | disposition |
+|---|---|---|
+| 1 | Serialisation removes the need for bundles; a small approved digest still guards a crash between an approved commit and its apply (e.g. across a binary upgrade). | **Adopted provisionally** (D22, §4.3) |
+| 2 | Without bundles, ownership cannot be "key in a retained bundle". Define `managed` by infer-stack's own labels plus migration adoption; forged labels are already out of scope. | **Adopted** (I9, §4.7) |
+| 3 | **`acquire --no-apply`** stages a lease without starting it (`commands_leasing.py:594`, `757-760`, `801-819`), and `infer-stack render` never applies. Recovery must not start a staged lease just because the controller reopened. | **Adopted:** `publication_pending.apply_requested` (§4.3) |
+| 4 | Route reconciliation must gate clearing the marker. Today it is best-effort (`compose.py`, `_reconcile_routes`). Static-superset mode does not gate (D17). | **Adopted** (I5) |
+| 5 | V15 must measure the **whole lock hold**, not only `up -d`. Dynamic routing waits for Postgres health (`depends_on … service_healthy`, `compose.py:792`), and route discovery retries up to 90 × 2 s (`_reconcile_routes(attempts=90, delay=2.0)`). | **Adopted** (V15 expanded) |
+| 6 | `_default_docker_run` is `subprocess.check_output` with **no timeout**. A hung Docker command would hold the host-wide lock forever. | **Adopted:** bounded backend operations (I16, §4.11) |
 
-The cost is that every acquire and release waits behind every other one's
-`docker compose up -d`. That call returns once containers **start**, not once they
-are **ready**, and readiness waiting already happens outside the lock. So the
-question is how long `up -d` takes in steady state. Pulling images dominates, and
-under the catalog assumption, images can be pulled at `config publish`. **V15**
-measures `up -d` on the host.
+**Refinements by this author:**
 
-**This revision does not adopt D22.** It is a candidate simplification for the
-reviewer and the user to weigh against measured cost.
+- **A timeout is not an abort.** Killing the `docker compose` client does not stop
+  work the Docker daemon has already started. After a timeout, the marker stays
+  set, and the next apply begins from a **strict residency snapshot**. Target
+  services still in a transitional state (`created`, `restarting`, `removing`)
+  make it retry rather than act (§4.11).
+- **Route verification inside a host-wide lock must fail fast.** A 180 s retry
+  budget while the gateway is unreachable would block every release. Inside the
+  lock, verification makes a short, bounded attempt and otherwise leaves the
+  marker set for the next retry. The long wait applies only to a fresh gateway
+  bootstrap, which is rare and explicit (§4.11, D24).
+- **Staged-lease promotion is today's behaviour, made explicit.** A later ordinary
+  acquire or release applies the whole pending desired state, including a lease
+  staged with `--no-apply`. The current code does the same: any apply brings up the
+  whole rendered set. It is recorded, not changed (D23).
 
 ---
 
 ## 1. Problem
 
-A request can wait out its admission timeout while every GPU is empty:
+A request can wait out its admission timeout while every GPU is empty.
 
-- idle keep-warm deployments share a hard desired set with live demand (R1);
-- the planner ignores demand (C3);
-- unapplied renders persist pins (C4) and publish partial projects (R3);
-- the intended pressure release was never implemented (C2).
+1. **Idle keep-warm deployments are in the same hard desired set as live
+   demand,** and the planner orders them by creation time rather than demand.
+2. **Nothing releases idle residency under pressure.**
+3. **Renders that were never applied persist GPU pins** and publish partial
+   projects that another process may apply.
+4. **Apply is not bound to the render it was meant for:** an applier can apply an
+   old file and record a newer desired state as covered.
+5. **Many code paths change desired state around the controller,** and render
+   inputs (catalog, settings, image pins) drift between commands.
+6. **Separately:** when a container is recreated and another takes its IP, the
+   gateway can keep a pooled connection to that IP and send one model's traffic to
+   another indefinitely.
 
-Underneath that:
-
-- apply is not bound to its render (the round-4 race);
-- many code paths mutate desired state outside any publication protocol;
-- render inputs drift between commands;
-- recreating containers can pin the gateway's traffic for one model onto another
-  model's container (reproduced).
-
-## 2. Goals and non-goals
-
-**Goals**
+## 2. Goals
 
 1. Idle keep-warm residency never prevents admission.
 2. Admission is lease-atomic, including renderability.
-3. Every desired-state change is published crash-safely, whichever caller made it,
-   and **publishes only what that change changed**.
-4. An apply acts on exactly one published generation, including its auxiliary files
-   and routes, and records it applied only once that is fully true.
-5. infer-stack **never mistakes its own containers for orphans**, whether an apply
-   failed, a process crashed, or a generation was superseded.
-6. No GPU is handed to a container while a previous occupant is still there.
-7. Nothing destructive is decided from a failed or ambiguous observation.
-8. Traffic for a deployment reaches only that deployment's container.
+3. Every desired-state change survives a crash and is applied exactly as rendered.
+4. infer-stack never mistakes its own containers for orphans, and never touches
+   containers it cannot prove it owns.
+5. No GPU is handed to a container while a previous occupant is still there.
+6. Nothing destructive is decided from a failed or ambiguous observation.
+7. Traffic for a deployment reaches only that deployment's container.
+8. No infer-stack operation holds the host-wide lock without bound.
 
-**Non-goals:** FIFO or reserved admission; a durable `PENDING` state; preemption;
-automatic re-pinning; automatic bundle GC; multi-node; changing `observe()`.
+Non-goals are in §10 and the known-limitations document.
 
 ---
 
 ## 3. Invariants
 
-I1-I10 and I12-I18 are as in revision 4, with I11 revised; I19 and I20 are new.
-
 | id | invariant |
 |---|---|
-| **I1** | An `ACTIVE` lease is admitted, and its state is published or recoverably pending. From P5, a failed attempt has no lease. |
-| **I2** | A `LIVE` deployment holds a hard committed allocation; an invalid one makes it DEGRADED; nothing creates a LIVE deployment without one. |
-| **I3** | An `IDLE` keep-warm deployment is optional, and a candidate only while resident (`running`, `restarting`, `paused`). |
-| **I4** | Admission is lease-atomic, including renderability. |
-| **I5** | A waiting attempt writes nothing except discardable pre-commit staged bundles. |
-| **I6** | Admission prepares and approves outside SQLite write transactions, then commits briefly after validating `admission_state_version`, all under one `_global_lock` hold. |
-| **I7** | Every published generation contains every admitted LIVE deployment; DEGRADED deployments are excluded from runtime actions. |
-| **I8** | Residency is a strict, project-scoped Docker snapshot. Failure means unknown; duplicates mean ambiguous. |
-| **I9** | `current` is the single published authority. apply(G) materialises G's auxiliary files and routes and acts only on G. A missing or corrupt activated bundle fails closed. |
-| **I10** | Barrier: nothing starts on a GPU while another container occupies it. An unmanaged container on the GPU, or holding the service's static address, blocks the apply. |
-| **I11** | **Selective apply with content-addressed ownership.** A container's key is `(infer-stack.service, behavioural fingerprint)`, where the fingerprint hashes the canonical stanza **plus the generation-owned files that service consumes**. The container is **managed** if it was adopted at migration, or its key appears in **any retained bundle**. It **satisfies** G if its key is in G, it is the **unique** container with that key, and its state serves G. Apply(G) keeps satisfying containers. Managed containers that do not satisfy G are replaced or removed, except those of DEGRADED deployments. Duplicate wanted realisations are ambiguous and fail closed. Orphans are unmanaged project containers, reported and never removed implicitly. Ownership never depends on `applied_generation`. |
+| **I1** | An `ACTIVE` lease is admitted, and its desired state is applied or durably pending. From P6 on, a failed admission attempt leaves no lease. |
+| **I2** | A `LIVE` deployment holds a **hard committed allocation**. It is never re-placed automatically; if the allocation becomes invalid, the deployment is DEGRADED. Nothing creates a LIVE deployment without one. |
+| **I3** | An `IDLE` keep-warm deployment is **optional**: a placement candidate only while its container is resident (`running`, `restarting`, `paused`). infer-stack never creates its container. |
+| **I4** | **Admission is lease-atomic:** every candidate deployment is placed **and renderable**, or nothing is committed. |
+| **I5** | **Serialised publication.** Every desired-state mutation runs under one `_global_lock` hold: commit the mutation plus `publication_pending`; render deterministically from ledger and published profile; if `apply_requested`, apply **that exact render**; clear the marker only after the **entire** apply succeeds. In dynamic-routing mode that includes verified route reconciliation. |
+| **I6** | **Recovery** at every `_global_lock` entry: if a marker is set, re-render. Apply only if `apply_requested`. If `approved_digest` is set and the re-render's digest differs, **fail closed** until an explicit, approved `infer-stack apply`. |
+| **I7** | **Frozen profile.** Non-ledger render inputs (including the catalog digest and resolved image pins) change only through an explicit, preview-first `config publish`. The catalog is configuration-time state: acquiring an endpoint absent from the published profile fails. |
+| **I8** | **Strict residency** comes from a project-scoped Docker snapshot. A Docker failure means **unknown**; several containers for one deployment or wanted key means **ambiguous**. Both fail closed. |
+| **I9** | **Ownership by label.** A container is `managed` if it was adopted at migration, or it carries this project's label plus `infer-stack.service` and `infer-stack.fingerprint`. It `satisfies` the desired state if its (service, fingerprint) key is wanted, it is the only container with that key, and its state serves. Unmanaged project containers are orphans: reported, never removed implicitly. |
+| **I10** | **Barrier:** nothing starts on a GPU while any other container occupies it. An unmanaged occupant, or an unmanaged holder of the service's static address, blocks the apply. |
+| **I11** | **Selective apply:** keep what satisfies; remove managed containers that do not, **except those of DEGRADED deployments**; start only what is missing; no project-wide `--remove-orphans`. |
 | **I12** | Established allocations ignore the caller's `allowed_gpus`. |
 | **I13** | Under unknown or ambiguous residency, only resource-neutral admission proceeds. |
 | **I14** | A request routed for deployment D reaches only D's container. |
-| **I15** | Recovery: every `_global_lock` entry and every apply first completes or repairs in-flight activations, and publishes pending state. |
-| **I16** | Every desired-state mutator goes through the controller: preview then activation (admission class), or commit with a compare-and-clear pending marker (removal class). |
-| **I17** | Read-only paths do not mutate. |
-| **I18** | A generation is applied only if every part succeeded. In dynamic-routing mode that includes verified route reconciliation. |
-| **I19** | **Frozen render profile.** Every generation carries the complete set of non-ledger render inputs, **including the catalog digest**. Admission-class and removal-class publications inherit `current`'s profile unchanged. The profile changes only through an explicit, preview-first `config publish`. **The catalog is configuration-time state:** acquiring an endpoint absent from the published profile fails with "publish the new configuration first". |
-| **I20** | **Non-reversible compensation.** An activation whose staged bundle is lost is **reconstructed** from its immutable inputs (committed ledger, base generation, profile). It auto-activates only if the reconstruction's digest equals the approved digest; otherwise infer-stack fails closed into an explicit repair. A lease release is never used as compensation. |
+| **I15** | **Every desired-state mutator goes through the controller, and read-only paths do not write.** |
+| **I16** | **Bounded operations:** every backend call made under `_global_lock` has a timeout. On timeout the marker stays set, the lock is released, and the next apply starts from strict residency. |
 
 ---
 
 ## 4. Design
 
-### 4.1 Strict residency → I3, I8, I11
+### 4.1 Strict residency → I3, I8, I9 (P1 done; extended in P8)
 
-**Implemented in P1** (`infer_stack/leasing/residency.py`,
-`ComposeBackend.residency()`). It covers deployment-labelled containers: every match
-is kept, the scope is the project label, GPUs are read from `DeviceRequests`,
-unmappable reservations count as every GPU, and failure raises `ResidencyUnknown`.
+**Done in P1** (`infer_stack/leasing/residency.py`, `ComposeBackend.residency()`):
 
-**P2b extension:** list **all** containers carrying the project label, not only
-deployment-labelled ones, and record for each:
+- deployment-labelled containers in the project, in every state;
+- every match kept, never collapsed;
+- GPUs read from `HostConfig.DeviceRequests`;
+- an unmappable reservation treated as every GPU;
+- `ResidencyUnknown` on any failure.
 
-- `infer-stack.service`, falling back to `com.docker.compose.service`;
-- `infer-stack.config-hash`, when present.
+**P8 extension:** list every container carrying the project label, and record
+each one's `infer-stack.service` (falling back to `com.docker.compose.service`)
+and `infer-stack.fingerprint`. Ownership and the adoption of infrastructure
+services (Postgres, LiteLLM, Open WebUI, reverse proxy) need both.
 
-Ownership (§4.6) and generation-0 adoption both need the infrastructure services
-(Postgres, LiteLLM, Open WebUI, reverse proxy), which carry no deployment label.
+### 4.2 Profile and `config publish` → I7
 
-### 4.2 Publication, profile, bundles, recovery → I1, I9, I15, I16, I19, I20
+A **profile** is stored in the ledger. It holds every non-ledger render input:
 
-**Render profile (I19).** Every bundle includes `profile.json`, holding every
-non-ledger render input:
+- backend kind and Compose project;
+- LiteLLM, UI, dynamic routing, reverse proxy settings and ports;
+- **resolved image pins**;
+- the **catalog digest**, plus the endpoint definitions and route basis derived
+  from the catalog;
+- network configuration (§4.8);
+- for KubeAI: namespace, base URL and resource profile.
 
-- backend kind and Compose project name;
-- LiteLLM on or off, master-key reference (a name, never a value), ports;
-- UI on or off, and its port;
-- dynamic routing on or off;
-- reverse proxy on or off, its port, and its config source;
-- **resolved image pins** (not package defaults);
-- the catalog basis used for the static-superset route registry;
-- network configuration (subnet, §4.7);
-- for KubeAI: namespace, base URL, resource profile.
+Its behaviour:
 
-- **Admission-class and removal-class publications** read the profile from
-  `current`'s bundle and apply only their ledger change.
-- **Drift detection:** every command still resolves settings as today, compares them
-  with `current`'s profile, and on a difference warns that local settings differ
-  from the published profile, pointing at `infer-stack config publish`. It never
-  applies them implicitly.
-- **`infer-stack config publish`** is an admission-class (preview-first) publication
-  of a new profile. A profile change can make state unpublishable, for example
-  removing a route basis or disabling LiteLLM while dynamic routing is in use.
-- **A package upgrade** that changes `PINNED_IMAGES` alters nothing until a
-  profile is published.
-- **Catalog:** configuration-time state (D19). `config publish` records the
-  catalog's digest, and the endpoint definitions and route basis derived from it,
-  in the profile. Acquire resolves endpoints **only from the published profile**.
-  An endpoint added to the catalog afterwards is not acquirable until the next
-  `config publish`, and the error says so. Editing the catalog during a workload
-  changes nothing until it is published.
-- **Explicit apply environment:** Compose is invoked with an environment built
-  from the managed `.env` plus a fixed allow-list, never inherited from the
-  caller's shell. Shell variables otherwise take precedence over `--env-file` in
-  Compose interpolation (`${HF_TOKEN:-}`, the DB password, the master key), so the
-  same bundle could mean different things from different shells.
+- **Renders use the published profile,** never settings resolved by the current
+  process. Commands compare their resolved settings with the published profile
+  and **warn** on drift, pointing at `config publish`.
+- **`infer-stack config publish`** previews the new profile's render, takes
+  approval, then commits the profile and publishes through §4.3 with
+  `approved_digest` set. It also **pre-pulls every image** the profile references,
+  so steady-state applies do not pull.
+- **Acquire resolves endpoints only from the published profile.** An endpoint that
+  is missing fails with "publish the new configuration first".
+- **Explicit Compose environment:** Compose is invoked with an environment built
+  from the managed `.env` plus a fixed allow-list, never the caller's shell. Shell
+  variables otherwise take precedence over `--env-file` for `${HF_TOKEN:-}`, the DB
+  password and the master key.
+
+### 4.3 Serialised publication → I1, I5, I6, I15, I16
 
 **Store:**
 
-- `generation_counter`;
-- `applied_generation`;
-- `admission_state_version`;
-- `publication_pending(version)`;
-- `activation(G, staged_id, lease_ids, base_generation, rendered_version,
-  approved_digest, created_at)`;
-- `repair_required(G, reason)`.
+- `publication_pending(version, apply_requested, approved_digest)`: at most one
+  row;
+- `admission_state_version` (§4.6);
+- legacy `desired_gen` and `applied_gen` are left unused (§5).
 
-**Admission class** (acquire, renew re-admission, `config publish`): preview, stage,
-approve, then a short commit that inserts the activation with
-`base_generation = current` and `approved_digest = sha256(staged bundle)`. Activate
-follows. Detailed in §4.5.
-
-**Removal class** (release, sweep, evict, gc, rollback): one transaction applies the
-mutation, bumps `admission_state_version`, and sets `publication_pending`. Then call
-`publish_pending()`:
-
-1. snapshot the ledger;
-2. `prepare()` on `current`'s profile and route registry;
-3. stage;
-4. short commit inserting the activation (`base_generation = current`);
-5. activate.
-
-**Activate** (idempotent):
-
-1. rename the staged directory to `gen-<G>`, then fsync;
-2. atomically replace `current`;
-3. short commit that deletes the activation and compare-and-clears the pending
-   marker.
-
-**Recovery (I15, I20)**, at every `_global_lock` entry and every apply:
-
-1. **Activation row, directory present** (staged or `gen-<G>`): finish activation.
-2. **Activation row, directory absent: reconstruct.**
-   - `prepare()` from the committed ledger, the `base_generation` bundle's profile and
-     route registry, and the activation's rendered version.
-   - Stage it, and compute its digest.
-   - If the digest equals `approved_digest`, activate.
-   - Otherwise, or if the base bundle is also missing: write `repair_required`, keep
-     the activation row, and **fail closed**.
-3. **Stray staged directories** (not named by any row): delete.
-4. **`publication_pending` set,** and no repair required: `publish_pending()`.
-
-**While `repair_required` is set:**
-
-- no admission-class publication proceeds;
-- removal-class mutations still commit their ledger change and pending marker, but
-  are **not published**, because any new generation would include the
-  unverified committed change;
-- `status` names the activation and the reason.
-
-`infer-stack repair activation` re-renders from the committed ledger and base,
-shows the diff against `base_generation`, takes approval, activates, and clears the
-flag. **Determinism is required:** a render must be byte-identical given the same
-ledger, profile and base registry. That extends the existing byte-stability goal,
-and is tested.
-
-**Bundle contents** (Compose): `docker-compose.yml`, `manifest.json`,
-`profile.json`, and `aux/` holding `litellm_config.yaml`, `nginx.conf`,
-`routes.json` and `route_registry.json`. Paths inside the compose file point at the
-stable runtime paths (D9).
-
-**apply(G)** runs under the apply lock:
-
-1. recovery; `G := current`;
-2. fail closed on a missing, corrupt or unvalidated `gen-<G>`;
-3. materialise `aux/*`;
-4. barrier and selective start (§4.6);
-5. in dynamic mode, reconcile and verify routes; on failure, stop without advancing;
-6. `applied_generation = G`.
-
-Retention: keep every bundle. Content-addressed ownership (§4.6) depends on that, so
-any future GC must preserve every (service, hash) pair still present on a container.
-
-### 4.3 Planner → I2, I12
-
-Unchanged: `required_ids`, `hard`, `optional_hints`. Hard allocations degrade, never
-re-place; optional residents are never newly fit; defaults are unchanged.
-
-### 4.4 Ledger → I2
-
-Unchanged: `assigned_gpus` is set at admission commit and cleared with any LIVE→IDLE
-change; IDLE→LIVE reuse adopts the unique resident's GPUs; the desired set splits
-into required and optional.
-
-### 4.5 Admission → I1, I4-I6, I13, I15
-
-Unchanged from revision 4 in shape:
+**Publishing a mutation** (every controller mutator):
 
 ```text
-recover; maintenance_sweep; residency; snapshot; overlay_acquire; prepare; stage; approve;
-short commit (validate admission_state_version; commit overlay;
-              record activation with base_generation and approved_digest); activate.
+with _global_lock():
+    recover()                                      # below
+    with store.transaction():                      # short
+        apply the ledger mutation; bump admission_state_version if relevant
+        upsert publication_pending:
+            version          = admission_state_version
+            apply_requested  = apply_requested OR <this call applies>
+            approved_digest  = <digest approved by this call, if any>
+    publish()
+publish():
+    render = backend.render(ledger, profile)        # deterministic; writes the mutable files
+    if marker.approved_digest and digest(render) != marker.approved_digest:
+        fail closed: "rendered state differs from what was approved; run `infer-stack apply`"
+    if not marker.apply_requested: return           # staged; marker stays
+    backend.apply(render)                           # selective apply (§4.7); bounded (§4.11)
+    if dynamic routing: verify routes (bounded)     # failure -> return; marker stays
+    with store.transaction():
+        delete publication_pending where version <= rendered_version
 ```
 
-- **Profile:** `prepare()` uses `current`'s profile and route registry.
-- **`admission_state_version`** bumps on:
-  - demand-changing lease transitions;
-  - claims;
-  - deployment create, state, spec or `served` changes;
-  - `assigned_gpus`;
-  - reservation ownership;
-  - route registry and profile publications.
+**Mutator behaviour:**
 
-  It does **not** bump on:
-  - `applied_generation`;
-  - activation or repair housekeeping;
-  - the pending marker;
-  - TTL-only renewals of all-LIVE leases;
-  - history pruning.
+| operation | `apply_requested` | notes |
+|---|---|---|
+| acquire, release, sweep, evict, gc, rollback, renew slow path | set true | applies the whole pending state |
+| `acquire --no-apply` | left false if no apply was requested | staged; the marker stays |
+| `infer-stack render` | unchanged | writes the render only; never applies |
+| `infer-stack apply` | set true, then publish | applies the pending state, including staged leases |
+| `config publish` | set true, with `approved_digest` | preview-first (§4.2) |
 
-### 4.6 Selective apply, ownership, barrier → I7, I10, I11
+- **Promotion (D23):** once any operation sets `apply_requested`, the next publish
+  applies the **whole** pending desired state, including leases staged with
+  `--no-apply`. That is today's behaviour, and is documented rather than changed.
+- **`recover()`** at every lock entry: if a marker exists and `apply_requested` is
+  true, `publish()`. If it is false, only verify that the render on disk matches
+  the ledger, and re-render if not; never apply.
+- **Crash windows, all covered by the marker plus a deterministic re-render:**
+  - before render;
+  - after render, before apply;
+  - during apply (the next apply starts from strict residency);
+  - after apply, before clearing: a redundant idempotent apply.
+- **Waiting:** acquire's readiness wait stays **outside** the lock, as today.
+  `_ensure_applied`'s coalescing is removed; the caller's own publish has already
+  applied.
 
-**Labels.** Every rendered service carries:
+### 4.4 Planner → I2, I12
 
-- `infer-stack.service=<service name>`;
-- `infer-stack.fingerprint=<behavioural fingerprint>`.
+```python
+plan_placement(deployments, inventory, *,
+               required_ids, hard, optional_hints, allowed_gpus, ...)
+```
 
-The fingerprint is `sha256(canonical stanza, excluding this label, ‖ sha256 of each
-generation-owned file the service consumes)`. The gateway's includes its
-`litellm_config.yaml`, and nginx's includes `nginx.conf`. Any future bind-mounted
-generated file follows the same rule. This generalises today's content-hash label
-(`CONFIG_HASH_LABEL`), already stamped on the gateway and proxy for exactly this
-reason (`compose.py:845-858`, `1030-1045`).
+1. **Hard allocations** are validated against the full physical pool. An invalid
+   one becomes `degraded` and is never re-placed.
+2. **Required deployments without an allocation** are placed by explicit
+   placement, then by fit, within `allowed_gpus`. `(n_eligible, created_at, id)` is
+   only a tie-break.
+3. **Optional residents** keep their physical GPUs where free; otherwise they are
+   `displaced`. They are never newly fit.
 
-The fingerprint changes exactly when the service's behaviour changes, so an
-unchanged service is not recreated. That was verified on a real daemon: an
-unchanged label value keeps the container `Running`, and a changed value recreates
-it.
+With the new keywords omitted, behaviour is identical to today.
 
-**Three predicates:**
+### 4.5 Ledger allocations and renew → I2
 
-- `managed(c)`: `c.id` is in `adopted_ids`, or `(c.service, c.fingerprint)` is in
-  `owned_keys`. `owned_keys` is built from every retained manifest.
-- `wanted(c, G)`: `(c.service, c.fingerprint)` is in G, and `c`'s deployment is not
-  displaced in G.
-- `satisfies(c, G)`: `wanted(c, G)`, **and** `c` is the only container with that
-  key, **and** its state serves G:
-  - `running`: satisfies;
-  - `paused`: required services are unpaused, optional ones stay paused (warm but
-    not serving);
-  - `restarting`: left to Docker's restart policy and treated as satisfying for
-    now; readiness decides whether it serves;
-  - `created`, `exited`, `dead`, `removing`: do **not** satisfy; replaced.
+- **`assigned_gpus`:** a nullable column on `deployments`. It is set in the
+  admission commit, and cleared in the same transaction as any LIVE→IDLE change.
+- **IDLE→LIVE reuse** adopts the unique resident container's physical GPUs. It is
+  placed fresh if not resident. Under unknown or ambiguous residency it is not
+  resource-neutral (I13).
+- **Desired set:** required = LIVE, with their allocations. Optional = IDLE
+  keep-warm deployments that are uniquely resident.
+- **Renew fast path:** an ACTIVE lease with every deployment LIVE and allocated
+  updates TTL and heartbeat only. It is lock-free, bumps no version, and publishes
+  nothing.
+- **Renew slow path:** any deployment IDLE → admission (§4.6) under the lock, first
+  re-validating that the lease is still ACTIVE. If it is EXPIRED, or adoption and
+  placement are impossible, renew fails explicitly. The CLI `renew` goes through the
+  controller.
+
+### 4.6 Admission → I1, I4, I13
 
 ```text
-m = manifest(G); res = residency()              # unknown -> abort; G stays unapplied
-for key in m.keys: if count(res containers with key) > 1: abort("ambiguous: <key>")
-keep      = [c : satisfies(c, G)]
-unpause   = [c in keep : c.state == paused and c.service is required]
-departing = [c : managed(c) and not satisfies(c, G) and c.deployment not in m.degraded]
-            # includes stale realisations left by failed or crashed applies,
-            # stopped containers with a wanted key, and adopted containers whose service changed
-orphans   = [c : not managed(c)]                                     # report only
-to_start  = [svc in m : not degraded, not optional, no container in keep carries its key]
+with _global_lock():
+    recover()
+    maintenance sweep (a mutation; publishes)
+    res  = residency() or UNKNOWN
+    snap = ledger.snapshot()                           # includes admission_state_version
+    cand = overlay_acquire(snap, owner, requests)      # pure core shared with Ledger.acquire
+    if residency unknown/ambiguous for cand and not resource_neutral(cand): not admissible
+    prep = backend.prepare(snap + cand, res, profile)  # in memory: placement + render + collisions
+    if any cand deployment unplaced or unrenderable: not admissible
+    if interactive approval needed: approve(prep)      # no SQLite write lock held
+    with store.transaction():
+        if admission_state_version changed: rollback; retry
+        commit overlay + allocations; bump admission_state_version
+        set publication_pending(apply_requested per §4.3, approved_digest = digest(prep) if approved)
+    publish()
+readiness wait (outside the lock)
+```
 
+- **`overlay_acquire`** is one pure coalescing core (compat key, capacity,
+  sharing, IDLE→LIVE reuse, served-alias merge). `Ledger.acquire` and admission
+  both apply its intended mutations. There is one copy of the rules and no write
+  transaction during preview.
+- **`admission_state_version` bumps on** demand-changing lease transitions,
+  claims, deployment create, state, spec and served changes, `assigned_gpus`,
+  reservation ownership, profile publication, and route registry changes.
+- **It does not bump on** the marker itself, TTL-only renewals, or history
+  pruning.
+- **Not admissible:** a queued caller sleeps and retries; a non-queued caller
+  raises, naming the blocking admitted demand or the residency state.
+
+### 4.7 Ownership, selective apply, barrier → I8-I11
+
+**Labels on every rendered service:**
+
+- `infer-stack.service=<name>`;
+- `infer-stack.fingerprint=sha256(canonical stanza excluding this label ‖ sha256 of each generated file the service consumes)`.
+
+The gateway's fingerprint includes its `litellm_config.yaml`, and nginx's includes
+`nginx.conf`. That generalises today's content-hash label on the gateway and proxy
+(`compose.py:845-858`, `1030-1045`).
+
+The fingerprint changes only when behaviour changes. Verified on a real daemon: an
+unchanged label value keeps a container `Running`; a changed one recreates it. A
+per-generation label would therefore recreate everything on every apply.
+
+**Predicates:**
+
+- `managed(c)`: `c.id` is in `adopted_containers`, **or** `c` carries this
+  project's label and both `infer-stack.service` and `infer-stack.fingerprint`.
+- `wanted(c)`: `(c.service, c.fingerprint)` is in the current render, and `c`'s
+  deployment is not displaced.
+- `satisfies(c)`: `wanted(c)`, **and** `c` is the only container with that key,
+  **and** its state serves:
+  - `running`: satisfies;
+  - `paused`: a required service is unpaused; an optional one stays paused;
+  - `restarting`: left to Docker;
+  - `created`, `exited`, `dead`, `removing`: do not satisfy.
+
+```text
+res = residency()                                   # unknown -> abort; marker stays
+if any wanted key has >1 container: abort (ambiguous)
+if any target service is in a transitional state from an interrupted apply: abort; retry (§4.11)
+keep      = [c : satisfies(c)]
+departing = [c : managed(c) and not satisfies(c) and c.deployment not DEGRADED]
+orphans   = [c : not managed(c)]                    # report
+to_start  = [svc in render : not DEGRADED, not optional, no kept container has its key]
 for gpu in gpus(to_start):
     blockers = res.occupants(gpu) - keep
-    if any not managed(b) for b in blockers: abort("unmanaged container <id> occupies GPU <gpu>")
-    for b in blockers: docker stop b; wait for exit (bounded, else abort)
+    if any unmanaged blocker: abort("unmanaged container <id> occupies GPU <gpu>; see gc --orphans")
+    for b in blockers: docker stop b; wait for exit (bounded)
 for svc in to_start with a static address: if an unmanaged container holds it: abort
 for c in departing: docker rm -f c.id
-for c in unpause: docker unpause c.id
-add new-or-changed dependencies of to_start (e.g. postgres)
-docker compose -p P -f gen-G/docker-compose.yml up -d --no-deps <to_start, dependency order>
-     # explicit environment (§4.2)
+unpause required paused kept containers
+docker compose -p P -f <compose file> up -d --no-deps <to_start + new/changed deps, dependency order>
 ```
 
-**Partial applies.** A container started by a failed or crashed apply of G
-carries G's key, so it is managed:
+`infer-stack gc --orphans` is the only way to remove orphans: explicit, strict
+snapshot, with approval or `--yes`.
 
-- if the next generation still wants it and it is running, it is kept;
-- if it is stopped, it is replaced;
-- if it is no longer wanted, it is removed.
+### 4.8 Routing correctness → I14
 
-No transition record is needed.
+The mechanism was reproduced on the host. The gateway pins a pooled connection to
+a reused IP, while Docker DNS stays correct.
 
-### 4.7 Gateway routing correctness → I14
+- **Fix: stable per-service addresses.**
+  - **Explicit network:** the rendered project declares a named network with an
+    IPAM subnet.
+  - **Persisted subnet:** it is persisted in `network_config` at the first
+    allocation, and in the profile. A later settings mismatch is rejected: changing
+    it requires `network migrate --subnet`.
+  - **Append-only address table:** `service_addresses(service, ipv4)`. An address
+    is never reassigned to another name. Allocation is sequential, skipping the
+    network, gateway, broadcast and Docker-reserved addresses. Before the first
+    allocation, a preflight rejects subnets that overlap existing Docker networks
+    or host routes.
+  - **Blocking holders:** an unmanaged container holding a service's address
+    blocks that service (I10).
+  - **`infer-stack network migrate`** is operator-invoked. It assigns addresses to
+    every existing service and recreates every container once, including the
+    gateway. It is refused while leases are ACTIVE, unless forced.
+- **Detection:** an upstream check via
+  `docker exec <gateway> python3 -c '<GET http://<service>:8000/v1/models>'`. The
+  image has `python3` and no `curl`. It resolves fresh inside the gateway's
+  network, and a mismatch with the gateway's answer is reported as a **routing
+  fault**, distinct from "not ready".
+- **Mitigation only:** a low `AIOHTTP_TTL_DNS_CACHE` on the gateway.
 
-As in revision 4:
+### 4.9 Route registry → I15
 
-- explicit network, append-only `service_addresses`, operator-run
-  `infer-stack network migrate`, in-gateway `python3` upstream check;
-- low `AIOHTTP_TTL_DNS_CACHE` as a mitigation only.
+The route registry has **one controller-owned authoritative copy**, changed only
+under `_global_lock`.
 
-**D18, resolved:**
+`routes prune` and `routes seed` become controller mutations that publish through
+§4.3. Today `commands_leasing.py:2266-2278` writes the registry directly and
+`2336-2345` merges into it directly.
 
-- **Persistence.** At the first address allocation, `network_config(subnet)` is
-  written to the ledger and to the profile. The settings value is only the default
-  for that first write.
-- **Mismatch.** A later difference between settings and the persisted subnet is
-  rejected: "subnet is persisted as X; changing it requires
-  `infer-stack network migrate --subnet Y`". It is never reinterpreted.
-- **Allocation.** Addresses are sequential, skipping the network address, the
-  gateway address (`.1`), the broadcast address, and any address Docker reports as
-  reserved.
-- **Preflight** before the first allocation: the subnet must not overlap an existing
-  Docker network or a host route.
+### 4.10 Callers and read paths → I15
 
-### 4.8-4.13
+- **Releases:** the CLI release-all (`commands_leasing.py:1025-1033`) and TUI
+  releases (`tui.py:2465`, `2480`) call `Controller.release`.
+- **Read-only commands** (`commands_leasing.py:943`, `1079`, `1241`, `1362`,
+  `1767`, `2121`, `2243`) and **TUI polling** (`tui.py:1100`, `1187`) stop calling
+  `sweep()`. They show TTL expiry **virtually**.
+- **Sweeping** happens only inside controller operations, and through `gc`.
 
-As in revision 4:
+### 4.11 Bounded operations and interrupted applies → I16
 
-- **4.8 backends:** KubeAI bundles; Null has none.
-- **4.9 rollback and readiness timeout:** removal class.
-- **4.10 renew:** a lock-free fast path; a slow path through admission, which loses
-  to an EXPIRED lease.
-- **4.11 observability:** plus `repair_required` and profile drift.
-- **4.12 route registry and route commands:** generation-relative; commands publish.
-- **4.13 callers:** routed through the controller; read paths non-mutating.
+- **Docker calls under the lock** get per-operation timeouts:
+  - `ps` and `inspect`: short;
+  - `stop` and `rm`: moderate;
+  - `up -d`: longer, but bounded.
+
+  On timeout, **kill the process group**, leave the marker set, release the lock,
+  and fail the operation with a message saying so.
+- **Interrupted applies.** A killed client does not stop work the Docker daemon
+  already started. The next apply begins with strict residency. If a target service
+  is `created`, `restarting` or `removing` without having been left there
+  deliberately, it waits briefly (bounded) and retries, instead of acting on a
+  moving state.
+- **Route verification under the lock is fail-fast** (D24): one listing plus a
+  small bounded retry. On failure the marker stays and the operation returns.
+  - The existing 90 × 2 s discovery budget applies only to an explicit gateway
+    bootstrap (`config publish`, `network migrate`, the first apply of a fresh
+    stack).
+  - Static-superset mode does not verify routes (D17).
+
+### 4.12 Backends
+
+- **Compose:** everything above.
+- **KubeAI:** serialised render and apply of its mutable models file and prune
+  under the lock, with bounded `kubectl` calls. No residency, barrier or
+  addresses.
+- **Null:** the ledger and marker only.
+
+### 4.13 Observability
+
+`status` shows:
+
+- the pending marker (staged or requested, plus approved-digest state);
+- UNKNOWN, AMBIGUOUS, NOT RUNNING, DEGRADED, DISPLACED and ORPHAN;
+- profile drift;
+- routing faults;
+- the address table;
+- virtual TTL expiry.
+
+Waiting and timeout messages name the contested GPU and its holder.
 
 ---
 
 ## 5. Migration
 
-1. **Schema:** `assigned_gpus`, `generation_counter`, `admission_state_version`,
-   `publication_pending`, `activation`, `repair_required`, `service_addresses`,
-   `network_config`, `adopted_containers`.
-2. **Generation rebase:** keep the legacy counters as diagnostics; set
-   `generation_counter = 1` and `applied_generation = 0`.
-3. **Secrets:** provisioned if missing.
-4. **Initial profile:** resolved **once**, from the current settings and catalog, and
-   written into `gen-0/profile.json`. From then on only `config publish` changes it.
-5. **Hard allocations:** backfilled from strict residency only; unresolved entries,
-   including LIVE reservations, block new allocation.
-6. **Adoption covers all project containers.** Every container carrying the project
-   label is recorded in `adopted_containers`, with its service name, when it matches
-   either:
-   - a backfilled LIVE deployment, by label and GPUs; or
-   - an infrastructure service in `gen-0`, by service name (Postgres, LiteLLM, Open
-     WebUI, reverse proxy).
+One-time, explicit, on upgrade:
 
-   Adopted containers are managed without a config-hash label. They stay until their
-   service changes, and the first recreation stamps the label. **No container is
-   recreated by migration.** Every other project container is an orphan.
-7. **First publication** is `gen-1`; the old compose file and sidecar are retired
-   after it applies.
-8. **Addresses and subnet:** not here; see `network migrate` (§4.7).
+1. **Schema:** `assigned_gpus`, `admission_state_version`, `publication_pending`,
+   `profile`, `adopted_containers`, `service_addresses`, `network_config`.
+2. **Legacy generation counters** (`meta.desired_gen`, `meta.applied_gen`) are
+   left in place for diagnostics and never read again.
+3. **Initial profile** is resolved **once** from the current settings and catalog.
+   Secrets are provisioned if missing.
+4. **Hard allocations** are backfilled from strict residency only:
+   - a LIVE model deployment with exactly one resident container adopts its GPUs;
+   - one with no container, or ambiguous containers, stays **unresolved**;
+   - a **LIVE reservation** (which runs no container) stays **unresolved**.
+
+   While anything is unresolved, new GPU allocation is refused; releases proceed.
+   Operator repair is release-only (D15).
+5. **Adoption:** every project container is recorded in `adopted_containers` if it
+   matches a backfilled LIVE deployment (by label and GPUs) or an infrastructure
+   service in the initial render. Adopted containers are managed until their
+   service changes; the first recreation stamps the new labels. **Migration
+   recreates nothing.**
+6. **Addresses** are not assigned here: `network migrate` is a separate, explicit
+   step.
 
 ---
 
 ## 6. Tests
 
-Tests 1-65 are as in revision 4. **P1 has landed with tests 39-41.** New in revision
-5 (**R** = reviewer, **A** = author):
+**Placement and allocations**
 
-66. **R:** G starts B, and route verification fails. A later H drops B: B is
-    removed as managed, never reported as an orphan.
-67. **R:** G crashes halfway through service changes, and H supersedes it. Survivors
-    from both F and G are managed, and H removes exactly those it does not want.
-68. **R:** G completes its Docker actions and dies before advancing
-    `applied_generation`. Recovery and the next apply keep G's containers without
-    recreating them.
-69. **A:** an unchanged service across generations G and G+1 has an identical
-    config-hash label and is not recreated. Real-Docker test.
-70. **R:** a removal publication inherits the profile. With local settings changed
-    (UI, dynamic routing, proxy, catalog), a release publishes a generation whose
-    `profile.json` equals `current`'s, and no unrelated service changes.
-71. **A:** a package upgrade changing `PINNED_IMAGES` changes no image until
+1. The incident: an old idle resident against new live demand on a full host;
+   live demand is placed and the idle deployment displaced.
+2. A pinned idle resident loses its GPU to live demand.
+3. A non-resident idle keep-warm deployment is absent from the plan.
+4. IDLE→LIVE reuse adopts the resident's GPUs.
+5. A hard allocation outside `allowed_gpus` stays valid.
+6. An invalid hard allocation is DEGRADED and not re-placed.
+7. With the new keywords omitted, plans are identical to today's.
+
+**Serialised publication and recovery**
+
+8. Crash **before render**: recovery re-renders and applies.
+9. Crash **after render, before apply**: recovery re-renders and applies.
+10. Crash **after apply, before clearing**: a redundant apply, then clear.
+11. Crash **mid-apply**: the next apply starts from residency and completes.
+12. `acquire --no-apply`, then reopen the controller: **nothing starts**, and the
+    marker stays.
+13. `infer-stack render` never applies.
+14. A later ordinary release applies the pending state, **including** a staged
+    lease (D23).
+15. `infer-stack apply` applies the pending state and clears the marker.
+16. Dynamic mode: a route verification failure leaves the marker set; a retry
+    clears it.
+17. Static-superset mode: an unreachable gateway does not gate clearing.
+18. Approved digest mismatch (simulated renderer change between commit and apply):
+    fails closed until an explicit approved `apply`.
+19. A mutation landing during publish is not lost (compare-and-clear on version).
+
+**Bounded operations**
+
+20. A hung `docker compose up` times out: the process group is killed, the marker
+    stays, and the lock is released.
+21. An apply after an interrupted one does not act on services in transitional
+    states.
+22. Route verification under the lock fails fast while the gateway is
+    unreachable; the lock is not held for the long bootstrap budget.
+
+**Profile**
+
+23. With local settings or the catalog changed, a release renders from the
+    published profile and no unrelated service changes.
+24. A package upgrade changing `PINNED_IMAGES` changes no image until
     `config publish`.
-72. **A:** `config publish` is preview-first. An unpublishable profile commits
-    nothing.
-73. **A:** a lost staged bundle whose reconstruction digest matches is activated
-    automatically.
-74. **R, A:** the served-alias merge case. An acquire adds an alias to an existing
-    shared deployment, and the staged bundle is deleted after commit. Recovery does
-    **not** release the lease: it reconstructs, and on a digest mismatch sets
-    `repair_required`; admissions are refused; releases commit but do not publish;
-    `repair activation` re-renders with approval.
-75. **A:** determinism: the same ledger, profile and base registry produce a
-    byte-identical bundle, across processes.
-76. **R:** adoption covers Postgres, LiteLLM, Open WebUI and nginx containers; none
-    is recreated by migration.
-77. **R:** a subnet settings change after allocation is rejected; allocation skips
-    the network, gateway, broadcast and reserved addresses; an overlapping subnet
-    fails preflight.
-78. **A:** P2a's interim path: the pending marker is published through the existing
-    render/apply path and compare-and-cleared; a mutation during that publication
-    survives.
-79. **A:** the residency extension lists infrastructure containers with their
-    service name and config hash.
-80. **R:** a gateway config content change with an identical stanza changes the
-    fingerprint and recreates the gateway. An identical config does not.
-81. **R:** a managed container with the wanted key in state `exited` or `dead` is
-    replaced, not kept.
-82. **R:** two containers with the same wanted key make the apply fail closed as
-    ambiguous.
-83. **A:** a required `paused` container is unpaused, not recreated; an optional
-    one stays paused.
-84. **R:** P2a exact-render binding: a concurrent mutation during a P2a publication
-    cannot make the marker clear for a render that was not applied.
-85. **R:** apply ignores the caller's shell: with a conflicting `HF_TOKEN` exported,
-    the applied container matches the managed environment.
-86. **R:** acquiring an endpoint absent from the published profile fails, naming
-    `config publish`. An edited but unpublished catalog changes nothing.
+25. Acquiring an endpoint absent from the published profile fails, naming
+    `config publish`.
+26. `config publish` is preview-first; an unrenderable profile commits nothing.
+27. With a conflicting `HF_TOKEN` exported in the caller's shell, the applied
+    container matches the managed environment.
+
+**Admission**
+
+28. A non-queued request blocked only by warm cache is admitted.
+29. A queued request blocked by admitted demand: failed retries commit nothing.
+30. An unrelated request that fits is admitted while another waits.
+31. Two processes contend for the last GPU: exactly one is admitted.
+32. A placed but unrenderable candidate never creates an ACTIVE lease.
+33. Approval waiting for a human does not hold the SQLite write lock, and a
+    concurrent fast-path renew succeeds.
+34. An `admission_state_version` change between prepare and commit causes a retry.
+35. Unknown or ambiguous residency admits only resource-neutral requests.
+36. Renew fast path is lock-free; the slow path re-admits; the slow path loses to
+    an EXPIRED lease.
+
+**Residency, ownership, apply**
+
+37. P1 residency: state, GPU, scoping and ambiguity rules (**done**,
+    `tests/test_leasing_residency.py`).
+38. The residency extension lists infrastructure containers with service and
+    fingerprint.
+39. G starts B and route verification fails; a later render dropping B removes it
+    as managed, never as an orphan.
+40. A crash mid-apply leaves labelled containers that are managed, kept if wanted,
+    and removed otherwise.
+41. A gateway config content change with an identical stanza changes the
+    fingerprint and recreates the gateway; identical content does not.
+42. A managed `exited` or `dead` container with the wanted key is replaced.
+43. Two containers with the same wanted key fail closed.
+44. A required `paused` container is unpaused; an optional one stays paused.
+45. Barrier ordering: a fake runner rejects starting onto an occupied GPU; this
+    includes **same-deployment recreation**.
+46. An unmanaged container on a target GPU, or holding a target address, blocks
+    the apply.
+47. A DEGRADED deployment is never started or removed, and a release elsewhere
+    still applies.
+48. A fresh dynamic bootstrap starts Postgres before the gateway.
+49. `gc --orphans` removes exactly the reported containers, with approval.
+
+**Callers, migration, routing**
+
+50. CLI and TUI releases go through `Controller.release`; nothing writes desired
+    state around the controller.
+51. `status`, `leases` and TUI polling perform no SQLite writes.
+52. `routes prune` and `routes seed` publish through the controller.
+53. Migration adopts infrastructure and model containers; nothing is recreated.
+54. A LIVE reservation at migration stays unresolved and blocks new allocation;
+    releasing it resolves.
+55. A stale sidecar is never used as an allocation.
+56. The subnet is persisted; a settings mismatch is rejected; reserved addresses
+    are skipped; an overlapping subnet fails preflight.
+57. A recreated service keeps its address; no other service ever receives it.
+58. `network migrate` recreates each container once and is refused while leases
+    are ACTIVE.
+59. The upstream check distinguishes routing fault, not ready and healthy.
+60. The host reproduction re-run with stable addresses shows zero misrouted
+    samples.
+61. KubeAI: serialised render and apply under the lock; no concurrent render
+    overwrites a file mid-apply.
 
 ---
 
 ## 7. Host verification
 
-V1-V12 as in revision 4 (V7 done). Also:
-
-- **V13:** on the host daemon, a changed label value recreates a service and an
-  unchanged one does not. Verified on the guest daemon for this revision; confirm
-  that the host's Compose version agrees.
-- **V14:** reconstruction determinism on a real stack: render twice from the same
-  ledger and profile and compare digests.
-- **V15 (decides D22):** on the host with images already present, time
-  `docker compose up -d` for three cases: a no-op, one added model service, and one
-  removed model service. Repeat with several concurrent callers.
+| id | check | gates |
+|---|---|---|
+| V1 | `HostConfig.DeviceRequests[].DeviceIDs` holds rendered GPU indices (confirmed on the guest daemon) | P1 close |
+| V2 | project- and label-scoped `docker ps -a` lists every model container | P1 close |
+| V8 | a `paused` container keeps its GPU memory | P1 close |
+| **V15** | **Whole `_global_lock` hold** for: a no-op apply; adding one model to a running static-gateway stack; removing one; the same add and remove with dynamic routing; a fresh dynamic gateway and Postgres bootstrap, measured separately; KubeAI apply if used; and several concurrent per-shard callers | **D22 final** |
+| V3 | whether `up --remove-orphans` can start a service before an orphan frees its GPU | confirms the barrier is necessary |
+| V5 | `up -d --no-deps <svc>` with an unchanged stanza does not recreate | P8 |
+| V6 | crashed-container states under `unless-stopped` | P8 |
+| V9 | `docker exec <gateway> python3` can reach `http://<service>:8000` | P7 |
+| V10 | whether a stopped container keeps a static `ipv4_address` reserved | P7 |
+| V11 | `network migrate` on a scratch copy of a running stack, measuring gateway downtime | P7 |
+| V12 | the misroute reproduction with a low `AIOHTTP_TTL_DNS_CACHE` (operator's call) | informational |
+| V13 | a changed label value recreates a service on the host daemon (confirmed on the guest) | P8 |
+| V7 | the misroute reproduction | **done** |
 
 ---
 
 ## 8. Implementation order
 
-| step | content | status or behaviour |
+| step | content | behaviour |
 |---|---|---|
-| **P1** | Strict residency for deployment containers | **done** (`675315c`); V1, V2, V8 pending |
-| **P2a** | Pending marker written atomically by every mutator; every caller through the controller; read paths non-mutating. Recovery publishes pending state by **rendering and applying synchronously under `_global_lock`** through the existing path, and compare-and-clears the marker **only after that exact apply succeeds**; the apply runs with the explicit environment (tests 51-54, 78, 84-85) | every mutation is published after a crash; the mutable-file race is closed by serialisation, transitionally (D22) |
-| **P2b** | Render profile and `config publish`; bundles, `current`, activation with digest; reconstruction and repair; content-addressed labels and ownership; residency extended to all project containers; apply-exactly-G, fail-closed, route verification; KubeAI bundles; migration (rebase, profile, adoption) (tests 21-28, 55-60, 66-77, 79) | replaces the mutable publication path |
-| **P3** | Planner keywords (tests 1-7) | none by default |
-| **P4** | `assigned_gpus`, backfill, renew fast and slow paths (tests 42-47) | allocations become hard |
-| **P5** | Admission preview; acquire leaves the removal class (tests 8-20) | failed attempts commit nothing |
-| **P5b** | Explicit network, persisted subnet, addresses, `network migrate`, upstream check (tests 48-49, 61-65, 77) | I14 |
-| **P6** | Selective apply with ownership and barrier, `gc --orphans` (tests 29-38) | no `--remove-orphans` |
-| **P7** | Idle keep-warm becomes optional | **fixes the incident** |
-| **P8** | DEGRADED end to end, observability (test 50) | |
+| **P1** | Strict residency (§4.1) | **done**, `675315c` |
+| **P2** | Serialised publication (§4.3): the marker with `apply_requested` and `approved_digest`; every mutator through the controller; read paths non-mutating (§4.10); route verification gates the marker (§4.11); bounded Docker calls; `_ensure_applied` coalescing removed; registry commands through the controller (§4.9). Tests 8-22, 50-52 | closes the apply/render race and the crash windows. **Valid under both outcomes of V15** |
+| **P3** | Planner keywords (§4.4). Tests 1-7 | none by default |
+| **P4** | Profile and `config publish`, including image pre-pull, catalog digest and explicit environment (§4.2); initial-profile migration. Tests 23-27 | render inputs frozen |
+| **P5** | `assigned_gpus`, backfill, and renew paths (§4.5); allocation migration. Tests 36, 54-55 | allocations become hard |
+| **P6** | Admission preview (§4.6). Tests 28-35 | failed attempts commit nothing |
+| **P7** | Stable addresses, persisted subnet, `network migrate`, upstream check (§4.8). Tests 56-60 | I14 |
+| **P8** | Residency extension, labels and fingerprints, ownership, selective apply, barrier, `gc --orphans`, adoption migration (§4.1, §4.7). Tests 38-49, 53 | no `--remove-orphans` |
+| **P9** | Idle keep-warm becomes optional and resident-only | **fixes the incident** |
+| **P10** | DEGRADED end to end and observability (§4.13) | |
+
+**If V15 fails:** P2 remains correct as a transitional mechanism. Reinstate
+revision 6's bundle and activation design in place of P2's "final" status. Nothing
+in P3-P10 changes.
 
 ---
 
 ## 9. Decisions
 
-**Resolved:** D1-D18.
+**Resolved:**
 
-- D16: accepted, with the frozen profile.
-- D17: dynamic mode gates "applied" on route verification; static-superset mode does
-  not.
-- D18: persisted subnet, explicit migration to change it.
+- **D1-D21:** as recorded in revisions 2-6.
+- **D22: serialised publication**, provisionally adopted, final after V15.
 
-**Resolved this round**
-
-- **D19:** the catalog is configuration-time state, published before the leasing
-  epoch. Acquire uses the published profile only.
-- **D20:** P2a publishes, serialising render and apply under the lock, and clears
-  the marker only after that apply.
-- **D21:** content-addressed ownership, with a behavioural fingerprint and distinct
-  `managed`, `wanted` and `satisfies` predicates.
-
-**Open**
+**Open:**
 
 | id | question | author's lean |
 |---|---|---|
-| **D22** | Keep serialised render-and-apply under `_global_lock` permanently, and drop P2b's bundle, activation, reconstruction, repair and generation-relative registry machinery? | **Decide after V15.** If `docker compose up -d` in steady state (images pre-pulled at `config publish`) takes a few seconds, serialisation is the simpler design and its cost is small. If it routinely takes tens of seconds under concurrent per-shard leasing, keep P2b as specified. Either way, P1, P3, P4, P5, P5b, P6 and P7 are unaffected |
+| **D23** | A later ordinary apply starts leases staged with `--no-apply`. Keep today's behaviour, or model a staged lease as excluded from applies until an explicit `apply`? | Keep today's behaviour and document it; excluding staged leases is new desired-state semantics, out of scope here |
+| **D24** | Route verification budget inside the lock: how many attempts, and what counts as an explicit bootstrap that may use the long budget? | One listing plus up to 3 retries 2 s apart under the lock; the long budget only for `config publish`, `network migrate` and a first apply against an empty project |
+| **D25** | Timeout values for Docker operations under the lock | Set from V15 measurements: roughly 5× the observed steady-state p95 per operation, with a floor of 30 s for `up -d` |
 
 ---
 
 ## 10. Out of scope
 
-Documented for users and contributors in
+Documented in
 [`docs/planning/known-limitations.md`](../../docs/planning/known-limitations.md#leasing-scope-boundaries-and-known-faults).
-Do not approximate these through existing code paths; each needs its own design.
+Do not approximate these through existing code paths.
 
-- **Hot catalog or configuration changes** during a leasing epoch (D19).
-- **FIFO or reserved admission**; a large request can be starved.
-- **Preemption** of admitted leases.
-- **Automatic migration** of LIVE deployments between GPUs.
-- **Automatic re-warming** of displaced keep-warm deployments.
-- **Multi-node placement.**
-- **Forged ownership labels** (threat model).
-- **Changing `observe()`** to strict semantics.
-- **Automatic bundle GC**, if P2b is kept. It must preserve every owned key still
-  present on a container.
-- **Whether an unswept past-TTL ACTIVE lease counts as demand.** Left as today.
+- Hot catalog or configuration changes during a leasing epoch.
+- FIFO or reserved admission; a large request can be starved.
+- Preemption of admitted leases.
+- Automatic migration of LIVE deployments between GPUs.
+- Automatic re-warming of displaced keep-warm deployments.
+- Multi-node placement.
+- Forged ownership labels.
+- Making `observe()` strict.
+- **Concurrent or coalesced publication** (added if D22 is confirmed): desired-state
+  changes are applied one at a time under a host-wide lock.
+- Whether an unswept past-TTL ACTIVE lease counts as demand; left as today.
