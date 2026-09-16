@@ -55,10 +55,11 @@ class LiteLLMTracebackPattern:
         )
 
 
-# Keep this registry deliberately small.  Each entry corresponds to one stack
-# segment observed in the known LiteLLM -> OpenAI-compatible backend connection
-# refusal cascade.  Adding a new family should come with a captured regression
-# fixture plus a near-miss test proving that missing fingerprints fail open.
+# Keep this registry deliberately small. Each entry corresponds to one stack
+# segment from a captured LiteLLM failure family that maintainers have approved
+# as redundant traceback scaffolding. Adding a new family should come with a
+# captured regression fixture plus a near-miss test proving that missing
+# fingerprints fail open.
 LITELLM_TRACEBACK_PATTERNS = (
     LiteLLMTracebackPattern(
         name='backend_connection_refused.aiohttp_socket_connect',
@@ -138,6 +139,46 @@ LITELLM_TRACEBACK_PATTERNS = (
             'site-packages/litellm/proxy/proxy_server.py',
             'site-packages/litellm/proxy/common_request_processing.py',
             'site-packages/litellm/router.py',
+            'site-packages/litellm/litellm_core_utils/exception_mapping_utils.py',
+        ),
+    ),
+    LiteLLMTracebackPattern(
+        name='model_not_found.openai_sdk',
+        terminal=re.compile(
+            r'^openai\.NotFoundError: Error code: 404 - .*'
+            r"The model `[^`]+` does not exist\."
+        ),
+        required_fragments=(
+            'site-packages/litellm/llms/openai/openai.py',
+            'site-packages/litellm/litellm_core_utils/logging_utils.py',
+            'site-packages/openai/resources/chat/completions/completions.py',
+            'site-packages/openai/_base_client.py',
+        ),
+    ),
+    LiteLLMTracebackPattern(
+        name='model_not_found.openai_adapter',
+        terminal=re.compile(
+            r'^litellm\.llms\.openai\.common_utils\.OpenAIError: '
+            r'Error code: 404 - .*The model `[^`]+` does not exist\.'
+        ),
+        required_fragments=(
+            'site-packages/litellm/main.py',
+            'site-packages/litellm/llms/openai/openai.py',
+        ),
+    ),
+    LiteLLMTracebackPattern(
+        name='model_not_found.proxy',
+        terminal=re.compile(
+            r'^litellm\.exceptions\.NotFoundError: '
+            r'litellm\.NotFoundError: NotFoundError: OpenAIException - '
+            r'The model `[^`]+` does not exist\.\.? Received Model Group='
+        ),
+        required_fragments=(
+            'site-packages/litellm/proxy/proxy_server.py',
+            'site-packages/litellm/proxy/common_request_processing.py',
+            'site-packages/litellm/router.py',
+            'site-packages/litellm/utils.py',
+            'site-packages/litellm/main.py',
             'site-packages/litellm/litellm_core_utils/exception_mapping_utils.py',
         ),
     ),

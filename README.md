@@ -94,7 +94,9 @@ infer-stack pull                            # refresh images
 Interactive ``infer-stack logs -f`` compacts only explicitly registered, known-noisy
 LiteLLM traceback shapes; unknown tracebacks pass through unchanged. Redirected or
 piped output stays raw, and ``--raw`` disables compaction in an interactive follow.
-The TUI uses the same conservative compactor when LiteLLM logs are visible.
+The compacted CLI path preserves Compose ANSI service colors when attached to a TTY;
+``--no-color`` still disables them. The TUI uses the same conservative compactor when
+LiteLLM logs are visible.
 
 For Ollama model management inside the rendered Ollama service, prefer the
 CLI wrappers:

@@ -443,7 +443,16 @@ class LogsCLI(_ComposeWrapperBase):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'logs') + ['logs']
+
+        # The compacted path pipes Compose stdout through Python. Without an
+        # explicit ANSI mode Compose sees a non-TTY pipe and drops the service
+        # colors before the compactor can preserve them. Force ANSI only for
+        # the human-facing compacted view; --no-color remains authoritative.
+        compact = config.follow and not config.raw and sys.stdout.isatty()
+        cmd = _day2_compose_base(config, 'logs')
+        if compact and not config.no_color:
+            cmd.extend(['--ansi', 'always'])
+        cmd.append('logs')
         if config.follow:
             cmd.append('--follow')
         if config.tail is not None:
@@ -454,10 +463,9 @@ class LogsCLI(_ComposeWrapperBase):
             cmd.append('--timestamps')
         cmd.extend(config.services or [])
 
-        # Compact only the human-facing live view.  Captures and pipelines keep
+        # Compact only the human-facing live view. Captures and pipelines keep
         # Docker's exact bytes unless a future explicit compact-output mode is
         # added; ``--raw`` is also available for interactive LiteLLM debugging.
-        compact = config.follow and not config.raw and sys.stdout.isatty()
         if compact:
             return _run_compacted_follow(cmd)
         return int(subprocess.run(cmd).returncode)

@@ -1,0 +1,415 @@
+litellm-1                |         ^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |         content_policy_fallbacks=content_policy_fallbacks,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5761, in should_retry_this_error
+litellm-1                |     raise error
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5508, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 552, in exception_type
+litellm-1                |     raise NotFoundError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.NotFoundError: litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | INFO:     172.18.0.1:34676 - "GET /v1/models HTTP/1.1" 200 OK
+vllm-qwen3-5-2b-1        | (APIServer pid=1) ERROR 09-16 20:08:39 [serving.py:193] Error with model error=ErrorInfo(message='The model `qwen3.5-27b` does not exist.', type='NotFoundError', param='model', code=404)
+vllm-qwen3-5-2b-1        | (APIServer pid=1) INFO:     172.18.0.2:40874 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+litellm-1                | 20:08:39 - LiteLLM Proxy:ERROR: common_request_processing.py:1220 - litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | INFO:     172.18.0.1:34692 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 929, in acompletion
+litellm-1                |     headers, response = await self.make_openai_chat_completion_request(
+litellm-1                |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/logging_utils.py", line 297, in async_wrapper
+litellm-1                |     result = await func(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 460, in make_openai_chat_completion_request
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 437, in make_openai_chat_completion_request
+litellm-1                |     await openai_aclient.chat.completions.with_raw_response.create(
+litellm-1                |         **data, timeout=timeout
+litellm-1                |     )
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_legacy_response.py", line 384, in wrapped
+litellm-1                |     return cast(LegacyAPIResponse[R], await func(*args, **kwargs))
+litellm-1                |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/resources/chat/completions/completions.py", line 2700, in create
+litellm-1                |     return await self._post(
+litellm-1                |            ^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<49 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1884, in post
+litellm-1                |     return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1669, in request
+litellm-1                |     raise self._make_status_error_from_response(err.response) from None
+litellm-1                | openai.NotFoundError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 620, in acompletion
+litellm-1                |     response = await init_response
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 989, in acompletion
+litellm-1                |     raise OpenAIError(
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                | litellm.llms.openai.common_utils.OpenAIError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/proxy_server.py", line 6768, in chat_completion
+litellm-1                |     result = await base_llm_response_processor.base_process_llm_request(
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<16 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py", line 953, in base_process_llm_request
+litellm-1                |     responses = await llm_responses
+litellm-1                |                 ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1666, in acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1642, in acompletion
+litellm-1                |     response = await self.async_function_with_fallbacks(**kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5411, in async_function_with_fallbacks
+litellm-1                |     return await self.async_function_with_fallbacks_common_utils(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<8 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5368, in async_function_with_fallbacks_common_utils
+litellm-1                |     raise original_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5402, in async_function_with_fallbacks
+litellm-1                |     response = await self.async_function_with_retries(*args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5557, in async_function_with_retries
+litellm-1                |     self.should_retry_this_error(
+litellm-1                |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+litellm-1                |         error=e,
+litellm-1                |         ^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |         content_policy_fallbacks=content_policy_fallbacks,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5761, in should_retry_this_error
+litellm-1                |     raise error
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5508, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 552, in exception_type
+litellm-1                |     raise NotFoundError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.NotFoundError: litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | INFO:     172.18.0.1:34706 - "GET /v1/models HTTP/1.1" 200 OK
+vllm-qwen3-5-2b-1        | (APIServer pid=1) ERROR 09-16 20:08:43 [serving.py:193] Error with model error=ErrorInfo(message='The model `qwen3.5-27b` does not exist.', type='NotFoundError', param='model', code=404)
+vllm-qwen3-5-2b-1        | (APIServer pid=1) INFO:     172.18.0.2:40874 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+litellm-1                | 20:08:43 - LiteLLM Proxy:ERROR: common_request_processing.py:1220 - litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 929, in acompletion
+litellm-1                |     headers, response = await self.make_openai_chat_completion_request(
+litellm-1                |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/logging_utils.py", line 297, in async_wrapper
+litellm-1                |     result = await func(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 460, in make_openai_chat_completion_request
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 437, in make_openai_chat_completion_request
+litellm-1                | INFO:     172.18.0.1:34712 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+litellm-1                |     await openai_aclient.chat.completions.with_raw_response.create(
+litellm-1                |         **data, timeout=timeout
+litellm-1                |     )
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_legacy_response.py", line 384, in wrapped
+litellm-1                |     return cast(LegacyAPIResponse[R], await func(*args, **kwargs))
+litellm-1                |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/resources/chat/completions/completions.py", line 2700, in create
+litellm-1                |     return await self._post(
+litellm-1                |            ^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<49 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1884, in post
+litellm-1                |     return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1669, in request
+litellm-1                |     raise self._make_status_error_from_response(err.response) from None
+litellm-1                | openai.NotFoundError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 620, in acompletion
+litellm-1                |     response = await init_response
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 989, in acompletion
+litellm-1                |     raise OpenAIError(
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                | litellm.llms.openai.common_utils.OpenAIError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/proxy_server.py", line 6768, in chat_completion
+litellm-1                |     result = await base_llm_response_processor.base_process_llm_request(
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<16 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py", line 953, in base_process_llm_request
+litellm-1                |     responses = await llm_responses
+litellm-1                |                 ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1666, in acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1642, in acompletion
+litellm-1                |     response = await self.async_function_with_fallbacks(**kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5411, in async_function_with_fallbacks
+litellm-1                |     return await self.async_function_with_fallbacks_common_utils(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<8 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5368, in async_function_with_fallbacks_common_utils
+litellm-1                |     raise original_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5402, in async_function_with_fallbacks
+litellm-1                |     response = await self.async_function_with_retries(*args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5557, in async_function_with_retries
+litellm-1                |     self.should_retry_this_error(
+litellm-1                |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+litellm-1                |         error=e,
+litellm-1                |         ^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |         content_policy_fallbacks=content_policy_fallbacks,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5761, in should_retry_this_error
+litellm-1                |     raise error
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5508, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 552, in exception_type
+litellm-1                |     raise NotFoundError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.NotFoundError: litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | INFO:     172.18.0.1:50972 - "GET /v1/models HTTP/1.1" 200 OK
+vllm-qwen3-5-2b-1        | (APIServer pid=1) ERROR 09-16 20:08:45 [serving.py:193] Error with model error=ErrorInfo(message='The model `qwen3.5-27b` does not exist.', type='NotFoundError', param='model', code=404)
+vllm-qwen3-5-2b-1        | (APIServer pid=1) INFO:     172.18.0.2:40874 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+vllm-qwen-qwen3-8-27b-1  | (APIServer pid=1) INFO:     127.0.0.1:41104 - "GET /health HTTP/1.1" 200 OK
+litellm-1                | 20:08:45 - LiteLLM Proxy:ERROR: common_request_processing.py:1220 - litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 929, in acompletion
+litellm-1                |     headers, response = await self.make_openai_chat_completion_request(
+litellm-1                |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/logging_utils.py", line 297, in async_wrapper
+litellm-1                |     result = await func(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 460, in make_openai_chat_completion_request
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 437, in make_openai_chat_completion_request
+litellm-1                |     await openai_aclient.chat.completions.with_raw_response.create(
+litellm-1                |         **data, timeout=timeout
+litellm-1                |     )
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_legacy_response.py", line 384, in wrapped
+litellm-1                |     return cast(LegacyAPIResponse[R], await func(*args, **kwargs))
+litellm-1                |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/resources/chat/completions/completions.py", line 2700, in create
+litellm-1                |     return await self._post(
+litellm-1                |            ^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<49 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1884, in post
+litellm-1                |     return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1669, in request
+litellm-1                |     raise self._make_status_error_from_response(err.response) from None
+litellm-1                | openai.NotFoundError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 620, in acompletion
+litellm-1                |     response = await init_response
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 989, in acompletion
+litellm-1                |     raise OpenAIError(
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                | litellm.llms.openai.common_utils.OpenAIError: Error code: 404 - {'error': {'message': 'The model `qwen3.5-27b` does not exist.', 'type': 'NotFoundError', 'param': 'model', 'code': 404}}
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/proxy_server.py", line 6768, in chat_completion
+litellm-1                |     result = await base_llm_response_processor.base_process_llm_request(
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<16 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py", line 953, in base_process_llm_request
+litellm-1                |     responses = await llm_responses
+litellm-1                | INFO:     172.18.0.1:50986 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+litellm-1                |                 ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1666, in acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1642, in acompletion
+litellm-1                |     response = await self.async_function_with_fallbacks(**kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5411, in async_function_with_fallbacks
+litellm-1                |     return await self.async_function_with_fallbacks_common_utils(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<8 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5368, in async_function_with_fallbacks_common_utils
+litellm-1                |     raise original_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5402, in async_function_with_fallbacks
+litellm-1                |     response = await self.async_function_with_retries(*args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5557, in async_function_with_retries
+litellm-1                |     self.should_retry_this_error(
+litellm-1                |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+litellm-1                |         error=e,
+litellm-1                |         ^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |         content_policy_fallbacks=content_policy_fallbacks,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5761, in should_retry_this_error
+litellm-1                |     raise error
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5508, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 552, in exception_type
+litellm-1                |     raise NotFoundError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.NotFoundError: litellm.NotFoundError: NotFoundError: OpenAIException - The model `qwen3.5-27b` does not exist.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None
