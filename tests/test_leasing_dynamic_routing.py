@@ -457,9 +457,30 @@ def test_reconcile_reports_failure_when_a_post_fails(tmp_path):
                 return FakeResp(500, {'detail': 'db unavailable'})
             return super().post(url, **kw)
 
-    be = make_backend(tmp_path, RejectingGateway())
+    time = FakeTime()
+    be = _timed_backend(tmp_path, RejectingGateway(), time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    assert be._reconcile_routes() is False
+    assert be._reconcile_routes(deadline_s=20.0) is False
+    assert time.now <= 20.0
+
+
+def test_a_transient_post_failure_is_retried_within_the_deadline(tmp_path):
+    failures = [1]
+
+    class FlakyGateway(RecordingGateway):
+        def post(self, url, **kw):
+            if url.endswith('/model/new') and failures:
+                failures.pop()
+                return FakeResp(500, {'detail': 'db briefly unavailable'})
+            return super().post(url, **kw)
+
+    time = FakeTime()
+    gw = FlakyGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a = dep('grp-aaaaaa', served='smol')
+    be.converge([a], apply=False)
+    assert be._reconcile_routes(deadline_s=20.0) is True
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
 
 
 def test_post_timeout_is_capped_by_the_remaining_deadline(tmp_path):

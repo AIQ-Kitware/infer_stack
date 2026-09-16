@@ -943,3 +943,25 @@ def test_routes_prune_drops_stale(tmp_path, monkeypatch, capsys):
     RoutesListCLI.main(argv=['--ledger', db, '--json'])
     listed = json.loads(capsys.readouterr().out)
     assert sorted(r['name'] for r in listed['routes']) == ['alpha']
+
+
+def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.cli.commands_leasing import ApplyCLI
+    from infer_stack.leasing import Controller, Ledger, SqliteStore
+    from infer_stack.leasing.backend import MemoryBackend
+
+    class RoutesNeverVerify(MemoryBackend):
+        def converge(self, desired, *, apply=True):
+            self.last_unplaced, self.last_errors, self.last_assignments = [], [], {}
+
+        def apply(self):
+            return False
+
+    monkeypatch.setattr(cl, '_open_controller', lambda config, **kw: Controller(
+        Ledger(SqliteStore(env.db)), RoutesNeverVerify()))
+    capsys.readouterr()
+    assert ApplyCLI.main(argv=['--ledger', env.db, '--yes', '--json']) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out['publication_pending'] is True and out['applied'] is False
+    assert ApplyCLI.main(argv=['--ledger', env.db, '--yes']) == 3

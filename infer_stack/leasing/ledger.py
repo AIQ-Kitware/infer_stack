@@ -304,9 +304,13 @@ class Ledger:
 
     # -- generation (legacy, see store; superseded by the publication marker) --
 
-    def mark_publication_pending(self, *, apply_requested: bool) -> dict:
+    def mark_publication_pending(
+        self, *, apply_requested: bool, interrupted: bool = False
+    ) -> dict:
         """See :meth:`SqliteStore.mark_publication_pending`."""
-        return self.store.mark_publication_pending(apply_requested=apply_requested)
+        return self.store.mark_publication_pending(
+            apply_requested=apply_requested, interrupted=interrupted,
+        )
 
     def publication_pending(self) -> dict | None:
         return self.store.publication_pending()

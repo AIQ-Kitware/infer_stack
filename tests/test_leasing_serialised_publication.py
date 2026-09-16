@@ -205,20 +205,16 @@ def test_crash_after_mutation_before_render_is_applied_by_the_next_operation(tmp
 def test_crash_after_render_before_apply_is_applied_by_the_next_operation(tmp_path):
     db = str(tmp_path / 'ledger.db')
     shared = _shared()
-
-    class DiesBeforeUp(SharedStackBackend):
-        def apply(self):
-            raise KeyboardInterrupt('killed')
-
-    ledger, ctl = _fresh(db, shared, DiesBeforeUp)
-    with pytest.raises(KeyboardInterrupt):
-        ctl.acquire('alice', [_vreq('a')], wait=False)
+    ledger, _ = _fresh(db, shared)
+    ledger.mark_publication_pending(apply_requested=True)
+    res = ledger.acquire('alice', [_vreq('a')])
+    SharedStackBackend(shared, threading.Lock()).converge(
+        [res.deployments[0]], apply=False)               # rendered; then killed
     assert shared['rendered'] and not shared['realized']
-    assert ledger.publication_pending()['apply_requested'] is True
 
     ledger2, ctl2 = _fresh(db, shared)
     ctl2.apply_now()
-    assert shared['realized'] == shared['rendered']
+    assert shared['realized'] == {res.deployments[0].id}
     assert ledger2.publication_pending() is None
 
 
@@ -310,32 +306,134 @@ def test_an_apply_that_does_not_take_effect_keeps_the_marker_until_a_retry(tmp_p
     assert ledger.publication_pending() is None
 
 
-def test_a_timed_out_apply_leaves_the_marker_and_releases_the_lock(tmp_path):
+class SettleBackend(SharedStackBackend):
+    """Adds a scripted runtime sampler, as ComposeBackend.settle_snapshot."""
+
+    def __init__(self, *args, samples=(), **kw):
+        super().__init__(*args, **kw)
+        self.samples = list(samples)
+
+    def settle_snapshot(self):
+        sample = self.samples.pop(0) if len(self.samples) > 1 else self.samples[0]
+        if isinstance(sample, Exception):
+            raise sample
+        return sample
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def _settle_ctl(db, shared, samples, apply_fn=None):
+    clock = FakeClock()
+
+    class Backend(SettleBackend):
+        def apply(self):
+            if apply_fn is not None:
+                return apply_fn()
+            return super().apply()
+
+    ledger = Ledger(SqliteStore(db))
+    backend = Backend(shared, threading.Lock(), samples=samples)
+    return ledger, Controller(ledger, backend, clock=clock, sleep=clock.sleep), clock
+
+
+def _timeout():
+    from infer_stack.leasing.backend import BackendTimeout
+
+    raise BackendTimeout('docker compose up timed out after 1800s')
+
+
+def test_a_timed_out_acquire_leaves_no_active_lease_and_releases_the_lock(tmp_path):
     import fcntl
 
+    from infer_stack.leasing import LeaseState
     from infer_stack.leasing.backend import BackendTimeout
 
     db = str(tmp_path / 'ledger.db')
     shared = _shared()
-
-    class Hangs(SharedStackBackend):
-        def apply(self):
-            raise BackendTimeout('docker compose up timed out after 1800s')
-
-    ledger, ctl = _fresh(db, shared, Hangs)
+    ledger, ctl, _ = _settle_ctl(db, shared, [()], apply_fn=_timeout)
     with pytest.raises(BackendTimeout):
         ctl.acquire('alice', [_vreq('a')], wait=False)
-    assert ledger.publication_pending()['apply_requested'] is True
+
+    leases, _ = ledger.status()
+    assert [le.state for le in leases] == [LeaseState.RELEASED]
+    marker = ledger.publication_pending()
+    assert marker['apply_requested'] is True and marker['interrupted'] is True
+    assert shared['rendered'] == set()        # the rollback re-rendered, never applied
     handle = ctl._open_flock(ctl._lock_path)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if still held
     finally:
         handle.close()
 
-    ledger2, ctl2 = _fresh(db, shared)
+
+def test_after_an_interrupted_apply_the_next_apply_waits_for_a_settled_runtime(tmp_path):
+    db = str(tmp_path / 'ledger.db')
+    shared = _shared()
+    ledger, ctl, _ = _settle_ctl(db, shared, [()], apply_fn=_timeout)
+    with pytest.raises(Exception):
+        ctl.acquire('alice', [_vreq('a')], wait=False)
+
+    # The daemon is still finishing: states change, then hold still.
+    samples = [(('c1', 'created'),), (('c1', 'running'),), (('c1', 'running'),)]
+    ledger2, ctl2, clock = _settle_ctl(db, shared, samples)
     ctl2.apply_now()
-    assert shared['realized'] == shared['rendered'] != set()
-    assert ledger2.publication_pending() is None
+    assert shared['apply_calls'] == 1
+    assert clock.now >= 2 * 2.0                   # two intervals before applying
+    assert ledger2.publication_pending() is None  # interrupted cleared with it
+
+
+@pytest.mark.parametrize('samples', [
+    [(('c1', 'running'),), (('c2', 'running'),)],            # never stops changing
+    [(('c1', 'removing'),)],                                   # stuck removing
+    [RuntimeError('docker ps: permission denied')],            # unreadable
+])
+def test_an_unsettled_runtime_blocks_the_apply_and_keeps_it_pending(tmp_path, samples):
+    from infer_stack.leasing.backend import RuntimeUnsettled
+
+    db = str(tmp_path / 'ledger.db')
+    shared = _shared()
+    ledger, _ = _fresh(db, shared)
+    ledger.mark_publication_pending(apply_requested=True, interrupted=True)
+    if len(samples) == 2:
+        samples = samples * 100
+    ledger2, ctl2, clock = _settle_ctl(db, shared, samples)
+    with pytest.raises(RuntimeUnsettled):
+        ctl2.apply_now()
+    assert shared['apply_calls'] == 0
+    assert clock.now <= 60.0
+    assert ledger2.publication_pending()['interrupted'] is True
+
+
+def test_no_apply_acquire_never_applies_over_an_older_pending_apply(tmp_path):
+    db = str(tmp_path / 'ledger.db')
+    shared = _shared()
+    ledger, ctl = _fresh(db, shared)
+    ledger.mark_publication_pending(apply_requested=True)
+    out = ctl.acquire('alice', [_vreq('a')], wait=False, apply=False)
+    assert shared['apply_calls'] == 0
+    assert out.reconcile.publication_pending is True
+    assert ledger.publication_pending()['apply_requested'] is True
+
+
+def test_no_apply_rollback_never_applies_over_an_older_pending_apply(tmp_path):
+    from infer_stack.leasing.backend import PlacementError
+
+    db = str(tmp_path / 'ledger.db')
+    shared = _shared()
+    ledger, ctl = _fresh(db, shared, _NoRoomBackend)
+    ledger.mark_publication_pending(apply_requested=True)
+    with pytest.raises(PlacementError):
+        ctl.acquire('alice', [_vreq('big')], wait=False, apply=False)
+    assert shared['apply_calls'] == 0
 
 
 # -- rollback ----------------------------------------------------------------
@@ -450,3 +548,55 @@ def test_marker_apply_request_only_turns_on_and_clear_refuses_older_versions(tmp
     assert ledger.clear_publication_pending(first['version']) is False
     assert ledger.clear_publication_pending(second['version']) is True
     assert ledger.publication_pending() is None
+
+
+# -- rollback never evicts on a failed look (strict residency) ---------------
+
+
+def _warm_then_failed_acquire(tmp_path, residency):
+    from infer_stack.leasing.backend import PlacementError
+
+    shared = _shared()
+
+    class Backend(_NoRoomBackend):
+        pass
+
+    Backend.residency = lambda self: residency(self)
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared, Backend)
+    warm = ctl.acquire('alice', [_vreq('m')], wait=False)
+    ctl.release(warm.lease.id)
+    shared['realized'] = set()        # observe() now says "nothing" (as on a docker error)
+    with pytest.raises(PlacementError):
+        ctl.acquire('bob', [_vreq('m'), _vreq('big')], wait=False)
+    return ledger.get_deployment(warm.deployments[0].id)
+
+
+def test_rollback_does_not_evict_a_warm_deployment_when_residency_is_unknown(tmp_path):
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.leasing.residency import ResidencyUnknown
+
+    def unknown(backend):
+        raise ResidencyUnknown('docker ps failed')
+
+    assert _warm_then_failed_acquire(tmp_path, unknown).state == DeploymentState.IDLE
+
+
+def test_rollback_keeps_a_deployment_that_has_a_container(tmp_path):
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.leasing.residency import Container, Residency
+
+    def any_id(backend):
+        class Everything(Residency):
+            def containers(self, deployment_id):
+                return (Container('c1', deployment_id, 'exited'),)
+        return Everything({})
+
+    assert _warm_then_failed_acquire(tmp_path, any_id).state == DeploymentState.IDLE
+
+
+def test_rollback_evicts_a_deployment_with_definitely_no_container(tmp_path):
+    from infer_stack.leasing import DeploymentState
+    from infer_stack.leasing.residency import Residency
+
+    got = _warm_then_failed_acquire(tmp_path, lambda backend: Residency({}))
+    assert got.state == DeploymentState.STOPPED

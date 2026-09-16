@@ -244,14 +244,23 @@ class SqliteStore:
     #                    which must not start just because something reopened;
     #                    once True it stays True until cleared
 
-    def mark_publication_pending(self, *, apply_requested: bool) -> dict:
-        """Record that desired state is changing; return the marker written."""
+    def mark_publication_pending(
+        self, *, apply_requested: bool, interrupted: bool = False
+    ) -> dict:
+        """Record that desired state is changing; return the marker written.
+
+        Both flags only ever turn on until the marker is cleared.
+        ``interrupted`` records that an apply was killed mid-flight, so the
+        runtime may still be changing underneath the next one.
+        """
         with self.transaction():
             current = self._read_publication_pending()
             marker = {
                 'version': (current['version'] if current else 0) + 1,
                 'apply_requested': bool(apply_requested)
                 or bool(current and current['apply_requested']),
+                'interrupted': bool(interrupted)
+                or bool(current and current['interrupted']),
             }
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('publication_pending', ?) "
@@ -283,6 +292,7 @@ class SqliteStore:
         return {
             'version': int(marker['version']),
             'apply_requested': bool(marker['apply_requested']),
+            'interrupted': bool(marker.get('interrupted', False)),
         }
 
     # -- leases ------------------------------------------------------------

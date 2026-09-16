@@ -2792,3 +2792,32 @@ up that changes nothing is fast, so I accepted it, but under a burst of N
 acquires each caller waits behind up to N-1 others. If host runs show lock wait
 dominating, the fix is to skip the apply when the render is byte-identical to
 the last successful one. That should not come back as coalescing.
+
+## 2026-09-16 19:48:53 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT reviewed 5e7e5a4 and found three correctness issues and two
+smaller ones. The user relayed the review; fix them without redesigning.
+
+**What I did.**
+- **Failed apply during acquire.** It now releases the lease in the ledger
+  (render only, no apply) and re-raises. GPT leaned towards keeping the lease on
+  a timeout; I chose one rule for every failure, so a caller never holds a lease
+  it cannot see.
+- **`--no-apply` paths never apply.**
+- **Interrupted applies.** They set `interrupted` on the marker, and the next
+  apply waits for two identical container samples first.
+- **Rollback eviction** uses strict residency.
+- **`infer-stack apply`** exits 3 while a change stays pending.
+- **Route reconciliation** re-diffs within its deadline.
+- **Out-of-review bug.** The Docker runner starts commands in a new session, so
+  Ctrl-C never reached `docker compose`, which kept running. It now kills the
+  group on any interrupt. The new test fails without the fix.
+
+**Reflection.** Issue 2 is the kind of bug I should have caught myself. I wrote
+"render-only paths never apply" in the summary, and tested `reconcile(apply=False)`,
+but not the acquire branch that shares the same rule. The claim and the test
+covered different code. The settle check is deliberately weaker than P8's
+quiescence; its blind spots are written up in known-limitations rather than
+papered over.

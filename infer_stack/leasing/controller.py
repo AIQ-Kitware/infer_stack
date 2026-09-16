@@ -35,6 +35,11 @@ from .models import Deployment, DeploymentState, EndpointRequest, Lease
 
 KEEP_WARM = 'keep-warm'
 
+#: After an interrupted apply, how long to wait for the runtime to stop changing
+#: before applying again, and how often to sample it. Held under the lock.
+SETTLE_DEADLINE_S = 60.0
+SETTLE_INTERVAL_S = 2.0
+
 # One cross-process lock, beside the ledger. It serialises every desired-state
 # publication: the ledger mutation, the render, and the apply of that exact
 # render (see Controller._publish). Reentrant (acquire->rollback nests). The
@@ -505,8 +510,17 @@ class Controller:
         if not marker['apply_requested']:
             rec.publication_pending = True    # staged; never applied here
             return rec
+        if marker['interrupted']:
+            self._wait_for_settled_runtime()
         before = set(self.backend.observe())
-        ok = apply_fn()
+        try:
+            ok = apply_fn()
+        except BaseException:
+            # A killed or failed client does not stop work the daemon already
+            # started: the next apply must first wait for the runtime to settle.
+            self.ledger.mark_publication_pending(apply_requested=True, interrupted=True)
+            rec.publication_pending = True
+            raise
         after = set(self.backend.observe())
         rec.realized = sorted(set(rec.realized) | (after - before))
         rec.torn_down = sorted(set(rec.torn_down) | (before - after))
@@ -521,6 +535,43 @@ class Controller:
         self.ledger.clear_publication_pending(marker['version'])
         rec.publication_pending = False
         return rec
+
+    def _wait_for_settled_runtime(self) -> None:
+        """Block (bounded) until two consecutive runtime samples are identical.
+
+        Called before applying on top of an interrupted apply. A sample that
+        cannot be read, a container still ``removing``, or a runtime that keeps
+        changing past :data:`SETTLE_DEADLINE_S` raises
+        :class:`~infer_stack.leasing.backend.RuntimeUnsettled` and leaves the
+        change pending. Backends without ``settle_snapshot`` (KubeAI's apply is
+        declarative server-side) skip the check.
+        """
+        from .backend import RuntimeUnsettled
+
+        snapshot = getattr(self.backend, 'settle_snapshot', None)
+        if snapshot is None:
+            return
+        deadline = self.clock() + SETTLE_DEADLINE_S
+        previous = None
+        while True:
+            try:
+                current = snapshot()
+            except Exception as ex:  # noqa: BLE001 - unreadable is unsettled
+                raise RuntimeUnsettled(
+                    f'cannot read the runtime after an interrupted apply: {ex}; '
+                    'the change stays pending'
+                ) from ex
+            busy = any(state == 'removing' for _, state in current)
+            if previous is not None and current == previous and not busy:
+                return
+            if self.clock() + SETTLE_INTERVAL_S > deadline:
+                raise RuntimeUnsettled(
+                    'the runtime was still changing after an interrupted apply '
+                    f'(waited {SETTLE_DEADLINE_S:g}s); the change stays pending -- '
+                    'retry with `infer-stack apply`'
+                )
+            previous = current
+            self.sleep(SETTLE_INTERVAL_S)
 
     def _publish(self) -> ReconcileResult:
         """Render, then apply per the marker (caller holds the lock)."""
@@ -591,6 +642,26 @@ class Controller:
             self.sleep(interval)
             pairs = pending
 
+    def _never_ran(self, deployment_ids: list[str]) -> list[str]:
+        """Which of these deployments definitely have no container at all.
+
+        Uses strict residency where the backend has it: a deployment with any
+        container, in any state, is kept, and if Docker cannot be read nothing
+        is reported (so nothing warm is ever evicted on a failed look). Backends
+        without residency fall back to ``observe()``.
+        """
+        residency = getattr(self.backend, 'residency', None)
+        if residency is None:
+            running = set(self.backend.observe())
+            return [gid for gid in deployment_ids if gid not in running]
+        from .residency import ResidencyUnknown
+
+        try:
+            snap = residency()
+        except ResidencyUnknown:
+            return []
+        return [gid for gid in deployment_ids if not snap.containers(gid)]
+
     def _rollback_acquire(self, lease_id: str, *, apply: bool) -> ReconcileResult | None:
         """Roll a failed acquire back and publish the result, under the lock.
 
@@ -601,6 +672,10 @@ class Controller:
         set -- and an unplaceable one would be re-planned, and re-fail, on every
         future render), then re-renders and applies per the marker, tearing
         down anything of this lease an earlier apply brought up.
+
+        With ``apply=False`` the rollback only renders: it never applies, even
+        if an apply is already pending (a ``--no-apply`` acquire, or a rollback
+        right after a failed apply whose runtime state is unknown).
 
         Best-effort after the ledger change: the original failure must surface,
         not a failure of this cleanup. Anything that did not publish stays
@@ -613,15 +688,12 @@ class Controller:
             self._mark_pending(apply=apply)
             rel = self.ledger.release(lease_id)
             if rel.idled_deployment_ids:
-                running = set(self.backend.observe())
-                never_ran = [
-                    gid for gid in rel.idled_deployment_ids
-                    if gid not in running
-                ]
+                never_ran = self._never_ran(list(rel.idled_deployment_ids))
                 if never_ran:
                     self.ledger.evict_idle(never_ran)
             try:
-                return self._publish()
+                rec = self._render()
+                return self._apply_pending(rec) if apply else rec
             except ConvergeAborted:
                 # The rollback render normally diffs clean, but an operator can
                 # still decline an unrelated swept-in change.
@@ -629,6 +701,26 @@ class Controller:
             except Exception as ex:  # noqa: BLE001 - see docstring
                 logger.warning('rollback publication failed; it stays pending: {!r}', ex)
                 return None
+
+    def _apply_admitted(
+        self, rec: ReconcileResult, lease_id: str, *, apply: bool
+    ) -> ReconcileResult:
+        """Apply a placed acquire's render (caller holds the lock).
+
+        ``apply=False`` never applies, even over an older pending apply. If the
+        apply raises, the lease is released in the ledger (re-rendered, not
+        re-applied, since the runtime state is unknown) and the error re-raised,
+        so a caller never loses the ID of a lease that is still ACTIVE. The
+        release stays pending and the next apply publishes it.
+        """
+        if not apply:
+            rec.publication_pending = True
+            return rec
+        try:
+            return self._apply_pending(rec)
+        except BaseException:
+            self._rollback_acquire(lease_id, apply=False)
+            raise
 
     # -- thin acquire / release -------------------------------------------
 
@@ -701,7 +793,7 @@ class Controller:
             requested = {g.id for g in result.deployments}
             unplaced = requested & set(rec.unplaced)
             if not unplaced:
-                rec = self._apply_pending(rec)
+                rec = self._apply_admitted(rec, result.lease.id, apply=apply)
         if unplaced and wait_for_placement and apply:
             # Never queue for capacity that cannot exist. Re-plan this lease's
             # deployments ALONE on an idle host: if they do not fit there, no
@@ -732,7 +824,7 @@ class Controller:
                     rec = self._render()
                     unplaced = requested & set(rec.unplaced)
                     if not unplaced:
-                        rec = self._apply_pending(rec)
+                        rec = self._apply_admitted(rec, result.lease.id, apply=True)
         if unplaced:
             self._rollback_acquire(result.lease.id, apply=apply)
             reasons = [

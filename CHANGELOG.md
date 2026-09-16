@@ -2,6 +2,30 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Failed applies no longer leak leases or overlap daemon work
+
+Fixes found in review of the serialised-publication change:
+
+- **No hidden lease on a failed acquire.** If Docker fails or times out while
+  an acquire is applying, the lease is released in the ledger and the error is
+  re-raised. The rollback re-renders but does not apply again, since runtime
+  state is unknown; the release stays pending.
+- **`--no-apply` never applies**, even when an earlier operation left an apply
+  pending. This covers both the acquire and its rollback.
+- **Settle before retrying.** An interrupted apply marks the pending change
+  `interrupted`. The next apply first waits, bounded, for the project's
+  containers to stop changing, and refuses (`RuntimeUnsettled`) if they do not.
+- **Rollback eviction uses strict residency.** It no longer uses `observe()`, so
+  a Docker error during rollback can no longer evict a warm keep-warm
+  deployment. Only a deployment with definitely no container is evicted.
+- **`infer-stack apply` reports pending changes.** It exits 3, and reports
+  `publication_pending` in `--json`, when the apply did not fully take effect.
+- **Route failures are retried.** Reconciliation re-diffs and retries failed
+  admin-API calls until the route set verifies or its deadline passes.
+- **Ctrl-C stops Docker too.** An interrupted Docker command now has its
+  process group killed; it runs in its own session, so it previously kept
+  running.
+
 ### Render and apply are serialised under one lock, gated by a durable pending marker
 
 Every desired-state change (acquire, release, evict, gc, rollback, `apply`) now

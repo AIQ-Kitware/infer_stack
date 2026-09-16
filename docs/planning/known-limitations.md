@@ -143,6 +143,27 @@ state without starting anything. It is still part of that desired state, so the
 `acquire`, `release` or `infer-stack apply`. There is no "declared, but startable
 only by an explicit apply" state, and adding one is out of scope.
 
+### Applies run one at a time and are not coalesced (current)
+
+Every desired-state change renders and applies under one host-wide lock, so a
+burst of N concurrent acquires runs N `docker compose up`s one after another.
+Each caller can wait behind the others. An `up` with nothing to change is fast.
+If lock wait becomes the bottleneck, skip an apply whose render is identical to
+the last successful one; do not reintroduce a separate apply lock.
+
+### Recovery after an interrupted apply is a settle check, not full quiescence (current)
+
+A timed-out or interrupted apply marks the pending change `interrupted`. Before
+the next apply, the controller waits (at most 60 s) until two consecutive
+samples of the project's containers show the same ids and states and none is
+`removing`. If the runtime cannot be read, or does not settle, the apply is
+refused and the change stays pending.
+
+This sees only container ids and states. Daemon work that has not yet changed
+either (an image pull, a container create still in flight) is invisible to it.
+The per-state recovery rules for `created`, `removing` and `restarting`
+containers are part of selective apply (plan step P8).
+
 ### Known fault: idle keep-warm deployments can starve new leases (current)
 
 An idle keep-warm deployment still claims GPUs during placement, ordered by

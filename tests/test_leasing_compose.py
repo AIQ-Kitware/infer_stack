@@ -1619,3 +1619,38 @@ def test_default_docker_run_kills_the_whole_process_group_on_timeout(tmp_path):
         _time.sleep(0.05)
     else:
         pytest.fail(f'child {child} of the timed-out command is still alive')
+
+
+def test_default_docker_run_kills_the_process_group_when_interrupted(tmp_path):
+    # The command runs in its own session, so Ctrl-C never reaches it: without an
+    # explicit kill, an interrupted `docker compose up` keeps running unattended.
+    import os
+    import signal
+    import threading
+    import time as _time
+
+    from infer_stack.leasing.compose import _default_docker_run
+
+    pidfile = tmp_path / 'child.pid'
+
+    def interrupt_soon():
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            _time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=interrupt_soon, daemon=True).start()
+    with pytest.raises(KeyboardInterrupt):
+        _default_docker_run(
+            ['sh', '-c', f'sleep 60 & echo $! > {pidfile}; wait'], timeout=30,
+        )
+    child = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail(f'child {child} of the interrupted command is still alive')

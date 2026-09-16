@@ -1350,18 +1350,26 @@ def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, text=True, start_new_session=True,
     )
-    try:
-        out, _ = proc.communicate(timeout=bound)
-    except subprocess.TimeoutExpired:
+    def kill_group():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         proc.communicate()
+
+    try:
+        out, _ = proc.communicate(timeout=bound)
+    except subprocess.TimeoutExpired:
+        kill_group()
         raise BackendTimeout(
             f'{" ".join(args)} did not finish within {bound:g}s and was killed; '
             'runtime state is unknown until observed again'
         ) from None
+    except BaseException:
+        # Ctrl-C reaches only our process group; the command runs in its own
+        # session, so without this it would keep running unattended.
+        kill_group()
+        raise
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, args, output=out)
     return out
@@ -2194,7 +2202,8 @@ class ComposeBackend(ConvergeScaffold):
         endpoint) to ``litellm_routes.json``; this is the apply half. List the
         gateway's current models, add the missing routes and delete the ones no
         longer desired -- through the admin API, with **no** container restart --
-        then list again to verify the result.
+        then list again to verify the result, re-diffing and retrying failed
+        calls until the set matches or the budget runs out.
 
         Properties this relies on:
 
@@ -2223,46 +2232,45 @@ class ComposeBackend(ConvergeScaffold):
             for r in self._desired_routes()
             if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
         }
-        current = self._list_managed_routes(deadline=deadline, delay=delay)
-        if current is None:
-            logger.warning(
-                'dynamic routing: gateway not reachable within {:g}s to reconcile '
-                'routes; leaving it for the next converge', deadline_s,
-            )
-            return False
-        to_add = [desired[i] for i in desired if i not in current]
-        to_delete = [i for i in current if i not in desired]
-        ok = True
-        for route in to_add:
-            ok &= self._post_route(
-                '/model/new', route, route.get('model_name'), deadline=deadline,
-            )
-        for rid in to_delete:
-            # ok_if_missing: with a shared gateway, another converge may have
-            # deleted this route already; "not found in db" means the desired
-            # end-state (route gone) is reached, so don't treat it as an error.
-            ok &= self._post_route(
-                '/model/delete', {'id': rid}, rid, ok_if_missing=True,
-                deadline=deadline,
-            )
-        if to_add or to_delete:
+        rounds = 0
+        while True:
+            current = self._list_managed_routes(deadline=deadline, delay=delay)
+            if current is None:
+                logger.warning(
+                    'dynamic routing: route set not reconciled and verified within '
+                    '{:g}s; leaving it for the next apply', deadline_s,
+                )
+                return False
+            to_add = [desired[i] for i in desired if i not in current]
+            to_delete = [i for i in current if i not in desired]
+            if not (to_add or to_delete):
+                return True            # this listing is the verification
+            if rounds:
+                logger.info('dynamic routing: route set still differs; retrying')
+            rounds += 1
+            ok = True
+            for route in to_add:
+                ok &= self._post_route(
+                    '/model/new', route, route.get('model_name'), deadline=deadline,
+                )
+            for rid in to_delete:
+                # ok_if_missing: with a shared gateway, another converge may have
+                # deleted this route already; "not found in db" means the desired
+                # end-state (route gone) is reached, so don't treat it as an error.
+                ok &= self._post_route(
+                    '/model/delete', {'id': rid}, rid, ok_if_missing=True,
+                    deadline=deadline,
+                )
             logger.info(
                 'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
                 len(to_add), len(to_delete), len(desired),
             )
-        if not ok:
-            return False
-        if not (to_add or to_delete):
-            return True
-        final = self._list_managed_routes(deadline=deadline, delay=delay)
-        if final != set(desired):
-            logger.warning(
-                'dynamic routing: route set did not verify within {:g}s '
-                '(expected {} managed route(s), saw {})',
-                deadline_s, len(desired), 'none' if final is None else len(final),
-            )
-            return False
-        return True
+            if not ok:
+                # A transient admin-API failure: spend the rest of the budget
+                # re-diffing rather than giving up with most of it unused.
+                if deadline - self._clock() <= delay:
+                    return False
+                self._sleep(delay)
 
     def _list_managed_routes(
         self, *, deadline: float, delay: float
@@ -2345,6 +2353,30 @@ class ComposeBackend(ConvergeScaffold):
             )
             return False
         return True
+
+    def settle_snapshot(self) -> tuple[tuple[str, str], ...]:
+        """Every container of this Compose project as sorted ``(id, state)`` pairs.
+
+        Used after an interrupted apply to wait until the daemon has finished
+        work a killed client started. Covers infrastructure (gateway, database)
+        as well as deployments. Raises ``ResidencyUnknown`` if Docker cannot be
+        read.
+        """
+        try:
+            out = self.run([
+                'docker', 'ps', '-a', '--no-trunc',
+                '--filter', f'label={COMPOSE_PROJECT_LABEL}={self.project}',
+                '--format', '{{.ID}} {{.State}}',
+            ])
+        except Exception as ex:  # noqa: BLE001 - unknown, never "empty"
+            raise ResidencyUnknown(f'docker ps failed: {ex}') from ex
+        pairs = []
+        for line in (out or '').splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise ResidencyUnknown(f'unexpected docker ps line: {line!r}')
+            pairs.append((parts[0], parts[1].lower()))
+        return tuple(sorted(pairs))
 
     def residency(self) -> Residency:
         """Strict snapshot of this project's deployment containers and their GPUs.

@@ -931,10 +931,9 @@ class ApplyCLI(_ApprovalMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
         try:
-            # apply_now() FORCES the docker up even if the generation has not
-            # advanced -- this is the "re-sync after a manual edit / backend
-            # hiccup" button, so it must heal drift (the coalesced reconcile path
-            # would skip an up when desired == applied).
+            # apply_now() always runs the docker up and publishes anything
+            # pending -- this is the "re-sync after a manual edit / backend
+            # hiccup" button, so it must heal drift.
             rec = controller.apply_now()
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
@@ -949,19 +948,28 @@ class ApplyCLI(_ApprovalMixin):
                     timeout=float(config.timeout),
                     interval=float(config.interval),
                 )
+        # Exit 3: the apply ran but did not fully take effect (e.g. gateway
+        # routes did not verify); the change stays pending.
+        pending_exit = 3 if rec.publication_pending else None
         if config.json:
             print(json.dumps({
-                'applied': True,
+                'applied': not rec.publication_pending,
+                'publication_pending': rec.publication_pending,
                 'realized': rec.realized,
                 'torn_down': rec.torn_down,
                 'placement': rec.assignments,
                 'unplaced': rec.unplaced,
                 'ready': None if result is None else result.ready,
             }, indent=2))
+            if pending_exit:
+                return pending_exit
             return 0 if (result is None or result.ready) else 2
         print(
             f'applied: {len(rec.realized)} started, {len(rec.torn_down)} stopped'
         )
+        if rec.publication_pending:
+            print('  ! the apply did not fully take effect; the change is still '
+                  'pending -- retry `infer-stack apply`')
         for gid in rec.realized:
             print(f'  + {gid}')
         for gid in rec.torn_down:
@@ -972,8 +980,8 @@ class ApplyCLI(_ApprovalMixin):
             print('  not ready (timed out)')
             for gid, ep in result.pending:
                 print(f'    pending: {ep} ({gid})')
-            return 2
-        return 0
+            return pending_exit or 2
+        return pending_exit or 0
 
 
 def _declined_exit() -> SystemExit:

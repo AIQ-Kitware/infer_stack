@@ -38,6 +38,14 @@ class BackendTimeout(RuntimeError):
     """
 
 
+class RuntimeUnsettled(RuntimeError):
+    """The runtime was still changing (or unreadable) after an interrupted apply.
+
+    Raised instead of starting another apply on top of work a killed client
+    left in flight. The change stays pending; retry once the runtime settles.
+    """
+
+
 class ConvergeAborted(Exception):
     """A backend's ``converge`` was declined by the user (diff not approved).
 
