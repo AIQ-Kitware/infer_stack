@@ -708,3 +708,24 @@ deployment is omitted from the plan, the render skips deployments without an
 assignment (`compose.py:1099`, `1118`), and the next
 `up -d --remove-orphans` (`compose.py:2054`) would remove its container. The
 degraded rule has to stop that.
+
+---
+
+## Review round 4 (2026-09-16): plan revision 1 reviewed
+
+The second reviewer read plan revision 1 (`5244229`) and accepted its
+required/optional/admission model, but found the render/apply layer beneath it
+too weak for its invariants. Seven findings; all were accepted after
+re-verification, and the plan is now at **revision 2**. Its §0 lists each finding
+and its disposition. The most important, recorded here because it is a bug in
+current code independent of keep-warm:
+
+**Pre-existing generation race [code, re-verified].** `acquire` bumps the desired
+generation when it commits the ledger, then renders, under `_global_lock`
+(`controller.py:699`). `_ensure_applied` holds only the apply lock
+(`controller.py:516`); it snapshots `desired_generation()` (519), applies the file
+on disk, and marks that generation applied (523). An applier running between the
+commit and the file write applies the old project and marks the new generation
+covered. The acquirer then skips its apply, and its deployment never starts. The
+symptom is a readiness timeout with nothing wrong in any log. Plan step P2
+(render generations, apply exactly one published bundle) addresses it.
