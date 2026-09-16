@@ -654,3 +654,57 @@ under pressure, the teardown barrier, and no PENDING state. **Still to settle
 before a plan:** A (should optional residency require that the deployment is
 running?), B/F (what the physical-placement source of truth is), and E (behaviour
 when an admitted deployment becomes unplaceable).
+
+---
+
+## Review round 3 (2026-09-16): open items settled; plan written
+
+The second reviewer re-checked against `e751676`, a merge of other work with no
+leasing changes since `a02c730`, and settled the three open items. Each point
+was re-verified by this author. The implementation plan is
+[`plan-keep-warm-admission-2026-09-16.md`](plan-keep-warm-admission-2026-09-16.md).
+
+**Settled.**
+
+- **A = yes:** optional keep-warm residency requires a container that is actually
+  resident. This generalises existing intent rather than inventing it.
+  `_rollback_acquire` already says "keep-warm only means something for a
+  deployment that came up" and evicts idled deployments that never ran
+  (`controller.py:612-637`, re-verified).
+- **B/F = a strict physical-residency snapshot from Docker:** deployment identity
+  from the `infer-stack.deployment` label, which every vLLM and Ollama service
+  already carries (`compose.py:352`, `413`), and GPUs from the container's actual
+  device reservation. Not the sidecar, and not by changing `observe()`, whose
+  empty-on-error result is a tested contract
+  (`test_observe_tolerates_unreadable_compose_file`, `test_leasing_compose.py:494`).
+  Note the existing contradiction: the service-naming docstring
+  (`compose.py:161`) says `observe()` correlates containers by that label, but
+  `observe()` actually maps names through the sidecar.
+- **E = admitted-but-degraded:** an admitted LIVE deployment whose allocation
+  becomes impossible stays admitted and surfaced. Its failure must not silently
+  revoke its lease, and must not block unrelated releases.
+
+**Corrections to earlier rounds.**
+
+- **E's Slurm example was wrong.** Pins are validated against the **full**
+  physical pool, deliberately ignoring the calling job's `allowed_gpus`
+  (`placement.py:250-258` and `pin_pool_set`). A different job's allow-list cannot
+  invalidate an established allocation, and the plan must preserve that. Genuine
+  invalidation is: a GPU physically disappearing, a global `reserved` change, or
+  runtime state inconsistent with the committed allocation.
+- **"Won't come back after a reboot" was overstated.** Services render with
+  `restart: unless-stopped` (`compose.py:351`, `412`), so a container that
+  survives a reboot is restarted by Docker. Only a displaced, removed container
+  stays gone, and that is the intended outcome.
+
+**A new instance of B found while planning.** `_rollback_acquire` decides
+"never ran" with the lenient `observe()`. On a transient Docker error that
+returns `set()`, so a rollback would **evict every deployment the release
+idled**, including warm residents that were running fine. The plan replaces this
+with the strict snapshot.
+
+**Current behaviour under E (reviewer, re-verified):** an unplaceable LIVE
+deployment is omitted from the plan, the render skips deployments without an
+assignment (`compose.py:1099`, `1118`), and the next
+`up -d --remove-orphans` (`compose.py:2054`) would remove its container. The
+degraded rule has to stop that.
