@@ -479,3 +479,44 @@ def test_post_timeout_is_capped_by_the_remaining_deadline(tmp_path):
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
     be._reconcile_routes(deadline_s=10.0)
     assert seen and all(t <= 10.0 - 4.0 for t in seen)   # never the default 30 s
+
+
+# -- apply() reports whether routes took effect (gates the publication marker) --
+
+
+def test_apply_returns_false_when_routes_do_not_verify(tmp_path):
+    time = FakeTime()
+    be = _timed_backend(tmp_path, UnreachableGateway(time), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be.apply() is False
+
+
+def test_apply_returns_true_once_routes_verify(tmp_path):
+    be = make_backend(tmp_path, RecordingGateway())
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be.apply() is True
+
+
+def test_apply_uses_the_short_deadline_when_the_gateway_was_already_up(tmp_path):
+    from infer_stack.leasing.compose import (
+        ROUTE_RECONCILE_BOOTSTRAP_S,
+        ROUTE_RECONCILE_STEADY_S,
+    )
+
+    time = FakeTime()
+    be = _timed_backend(tmp_path, UnreachableGateway(time), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+
+    assert be.apply() is False                 # bootstrap: gateway was not running
+    assert ROUTE_RECONCILE_STEADY_S < time.now <= ROUTE_RECONCILE_BOOTSTRAP_S
+
+    time.now = 0.0
+    assert be.apply() is False                 # steady: the first up started it
+    assert time.now <= ROUTE_RECONCILE_STEADY_S
+
+
+def test_apply_returns_false_for_an_unreadable_render(tmp_path):
+    be = make_backend(tmp_path, RecordingGateway())
+    be.compose_file.parent.mkdir(parents=True, exist_ok=True)
+    be.compose_file.write_text('services: [unclosed\n')
+    assert be.apply() is False

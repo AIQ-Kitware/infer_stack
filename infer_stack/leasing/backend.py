@@ -99,8 +99,8 @@ class ConvergeBackend(Backend, Protocol):
 
     A backend exposing these drives the render/apply split: the controller
     calls ``converge(desired, apply=False)`` inside the render lock (fast,
-    writes on-disk state only) and ``apply()`` under the separate apply lock
-    (slow, coalesced across processes via the ledger generation). After a
+    writes on-disk state only) and then ``apply()`` in the same lock hold
+    (slow, bounded; see :meth:`Controller._apply_pending`). After a
     converge the controller reads the three ``last_*`` attributes:
 
     * ``last_unplaced`` — desired deployment ids the render/placement could not
@@ -123,8 +123,13 @@ class ConvergeBackend(Backend, Protocol):
         """Render the desired set to backend state; optionally apply it."""
         ...
 
-    def apply(self) -> None:
-        """Converge reality to the last render (idempotent, slow half)."""
+    def apply(self) -> bool | None:
+        """Converge reality to the last render (idempotent, slow half).
+
+        Return ``False`` if the apply did not fully take effect (the controller
+        keeps the change pending and retries); ``True`` or ``None`` otherwise.
+        Raise on backend failure, which also leaves the change pending.
+        """
         ...
 
 

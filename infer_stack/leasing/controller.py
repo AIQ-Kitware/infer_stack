@@ -35,14 +35,11 @@ from .models import Deployment, DeploymentState, EndpointRequest, Lease
 
 KEEP_WARM = 'keep-warm'
 
-# Two cross-process locks, beside the ledger:
-#  - render lock: serializes the fast read-modify-write (sqlite ledger mutation +
-#    placement + compose-file render). Reentrant (acquire->render nests).
-#  - apply lock: serializes the slow `docker compose up` and doubles as the
-#    coalescing wait-queue (see Controller._ensure_applied). Split from render so
-#    a second caller can render while the first is still applying.
+# One cross-process lock, beside the ledger. It serialises every desired-state
+# publication: the ledger mutation, the render, and the apply of that exact
+# render (see Controller._publish). Reentrant (acquire->rollback nests). The
+# readiness wait and the admission-queue sleep stay outside it.
 LOCK_FILENAME = '.leasing.lock'
-APPLY_LOCK_FILENAME = '.apply.lock'
 
 
 class LeaseLockError(RuntimeError):
@@ -73,6 +70,10 @@ class ReconcileResult:
     assignments: dict[str, list[int]] = field(default_factory=dict)
     # False when reconcile only rendered the on-disk state (no docker up/down).
     applied: bool = True
+    # True when a publication marker is still set after this operation: the
+    # desired state was staged (--no-apply, render) or its apply did not fully
+    # succeed. The next applying operation, or `infer-stack apply`, publishes it.
+    publication_pending: bool = False
 
 
 @dataclass
@@ -139,7 +140,6 @@ class Controller:
         self.sleep = sleep
         self.reclaim_default = reclaim_default
         self._lock_path = self._resolve_lock_path()
-        self._apply_lock_path = self._resolve_apply_lock_path()
         # Intra-process serialization (reentrant for nested acquire->reconcile in
         # one thread; blocks other threads, e.g. the TUI's converge-while-monitor).
         self._tlock = threading.RLock()
@@ -155,10 +155,6 @@ class Controller:
         state to guard, so the lock degrades to a no-op.
         """
         return self._lock_beside_ledger(LOCK_FILENAME)
-
-    def _resolve_apply_lock_path(self) -> Path | None:
-        """Where the apply (coalescing) lock lives: beside the shared ledger db."""
-        return self._lock_beside_ledger(APPLY_LOCK_FILENAME)
 
     def _lock_beside_ledger(self, filename: str) -> Path | None:
         path = getattr(getattr(self.ledger, 'store', None), 'path', None)
@@ -316,7 +312,7 @@ class Controller:
 
     @contextlib.contextmanager
     def _global_lock(self):
-        """Serialize the RENDER critical section, single-writer.
+        """Serialize desired-state publication, single-writer.
 
         Every verb that mutates shared state — ``acquire``/``release``/``gc``/
         ``evict`` — does a read-modify-write: a sqlite ledger write (``BEGIN
@@ -326,10 +322,10 @@ class Controller:
         the other just moved. So the second caller must **block here before it
         touches sqlite**, not fail.
 
-        Held only for the FAST render. The slow ``docker compose up`` is applied
-        afterward under the separate :meth:`_apply_lock` (coalesced), so a second
-        caller can render while the first is still applying. NOT held during the
-        readiness wait or the admission-queue sleep either.
+        Also held for the apply of that render (:meth:`_publish`), so no render
+        can change the files an apply is reading. Backend calls under it are
+        bounded (see ``compose.DOCKER_TIMEOUT_*``). NOT held during the readiness
+        wait or the admission-queue sleep.
 
         Reentrant within a thread (nested ``acquire``->``_render`` is one flock),
         serialized across threads via ``_tlock``, and across processes via an
@@ -360,35 +356,6 @@ class Controller:
                         self._flock_handle = None
         finally:
             self._tlock.release()
-
-    @contextlib.contextmanager
-    def _apply_lock(self):
-        """Serialize ``docker compose up`` across processes (the apply queue).
-
-        A fresh ``flock`` handle per call: ``flock(LOCK_EX)`` blocks until the
-        current applier finishes, so waiters form a natural queue. Whoever wakes
-        first re-checks ``applied_generation`` (in :meth:`_ensure_applied`) and
-        either finds itself already covered or does the one apply for the batch.
-        Auto-released if the holder dies (crash-safe; a redundant idempotent apply
-        is the worst case). Distinct file from the render lock and never nested
-        inside it, so the two cannot deadlock.
-        """
-        if self._apply_lock_path is None:
-            yield
-            return
-        handle = self._open_flock(self._apply_lock_path)
-        if handle is None:
-            raise LeaseLockError(
-                self._diagnose_lock_failure(self._apply_lock_path)
-            )
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            finally:
-                handle.close()
 
     # -- reconcile ---------------------------------------------------------
 
@@ -444,10 +411,9 @@ class Controller:
 
         The caller MUST hold :meth:`_global_lock`. For a converge-style backend
         (Compose) this writes the compose project (placement + files) but does
-        not ``docker compose up`` -- that is the separate, coalesced apply step
-        (:meth:`_ensure_applied`). A per-deployment ``realize``/``teardown``
-        backend has no such split, so it realizes here (old behavior); those
-        backends expose no ``apply`` and ``_ensure_applied`` is a no-op for them.
+        not ``docker compose up`` -- that is :meth:`_apply_pending`, under the
+        same lock hold. A per-deployment ``realize``/``teardown`` backend has no
+        such split, so it realizes here; those backends expose no ``apply``.
         """
         self.ledger.sweep()
         desired = self.desired_deployments()
@@ -495,79 +461,97 @@ class Controller:
                     result.torn_down.append(gid)
         return result
 
-    def _ensure_applied(
-        self, g_target: int, rec: ReconcileResult | None = None
-    ) -> None:
-        """Coalesced apply: ensure an apply reflecting desired-gen ``g_target``
-        has run, then return — without re-applying if someone already covered us.
+    # -- serialised publication --------------------------------------------
+    #
+    # Every desired-state mutation, under one _global_lock hold:
+    #   1. record intent: set (or extend) the durable publication marker;
+    #   2. mutate the ledger;
+    #   3. render from the ledger;
+    #   4. if the marker requests an apply, apply that exact render;
+    #   5. clear the marker only after the whole apply succeeded (in dynamic
+    #      routing mode, including verified routes).
+    # A crash or failure anywhere leaves the marker set, and the next applying
+    # operation re-renders and applies the whole pending desired state.
 
-        See :mod:`infer_stack.leasing.store` for the generation contract. One
-        apply satisfies every waiter that rendered before it; a late render
-        (``g_target`` advanced during an in-flight apply) takes the apply-lock
-        next and re-applies. The snapshot ``g`` is read *before* the apply so it
-        is a guaranteed-covered floor (a render that lands mid-apply is handled by
-        the next iteration, never silently dropped). Backends without ``apply``
-        (realize/teardown, null) applied during render, so this is a no-op.
+    def _mark_pending(self, *, apply: bool) -> dict:
+        """Record that desired state is about to change (caller holds the lock).
+
+        Written before the ledger mutation, so a crash between the two leaves at
+        worst a redundant marker, never a mutation without one. ``apply`` only
+        ever turns ``apply_requested`` on: a staged change never cancels an
+        apply already requested (promotion, see the plan's D23).
         """
+        return self.ledger.mark_publication_pending(apply_requested=apply)
+
+    def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
+        """Apply the last render if the marker requests it; clear on success.
+
+        The caller holds :meth:`_global_lock` and has just rendered. Backend
+        exceptions propagate with the marker still set. A backend ``apply`` that
+        returns ``False`` did not fully take effect: the marker stays, the
+        result says so, and the operation carries on.
+        """
+        from .._log import logger
+
+        marker = self.ledger.publication_pending()
+        if marker is None:
+            return rec
         apply_fn = getattr(self.backend, 'apply', None)
         if apply_fn is None:
-            return
-        while self.ledger.applied_generation() < g_target:
-            with self._apply_lock():
-                if self.ledger.applied_generation() >= g_target:
-                    break  # an applier we queued behind already covered us
-                g = self.ledger.desired_generation()  # floor snapshot BEFORE up
-                before = set(self.backend.observe())
-                apply_fn()
-                after = set(self.backend.observe())
-                self.ledger.set_applied_generation(g)
-                if rec is not None:
-                    rec.realized = sorted(set(rec.realized) | (after - before))
-                    rec.torn_down = sorted(set(rec.torn_down) | (before - after))
-                    rec.applied = True
-                break  # g >= g_target, so we are now covered
+            # realize/teardown backends applied during the render itself.
+            self.ledger.clear_publication_pending(marker['version'])
+            rec.publication_pending = False
+            return rec
+        if not marker['apply_requested']:
+            rec.publication_pending = True    # staged; never applied here
+            return rec
+        before = set(self.backend.observe())
+        ok = apply_fn()
+        after = set(self.backend.observe())
+        rec.realized = sorted(set(rec.realized) | (after - before))
+        rec.torn_down = sorted(set(rec.torn_down) | (before - after))
+        rec.applied = True
+        if ok is False:
+            rec.publication_pending = True
+            logger.warning(
+                'apply did not fully take effect; the change stays pending and '
+                'the next acquire/release or `infer-stack apply` retries it'
+            )
+            return rec
+        self.ledger.clear_publication_pending(marker['version'])
+        rec.publication_pending = False
+        return rec
+
+    def _publish(self) -> ReconcileResult:
+        """Render, then apply per the marker (caller holds the lock)."""
+        return self._apply_pending(self._render())
 
     def reconcile(self, *, apply: bool = True) -> ReconcileResult:
         """Render the ledger's desired state, then (if ``apply``) bring it up.
 
-        Render runs under :meth:`_global_lock`; the apply is coalesced under
-        :meth:`_ensure_applied` (separate apply-lock), so renders are not blocked
-        by another caller's slow ``docker compose up``. ``apply=False`` stages the
-        on-disk project without bringing it up (the "see what would execute" path).
+        ``apply=False`` is the render-only path (``infer-stack render``): it
+        writes the on-disk project and never applies, even if an apply is
+        pending. ``apply=True`` requests an apply and publishes the whole
+        pending desired state.
         """
         with self._global_lock():
-            rec = self._render()
-            g_target = self.ledger.desired_generation()
-        if apply:
-            self._ensure_applied(g_target, rec)
-        return rec
+            if not apply:
+                # The render sweeps, which can change desired state: record it
+                # as staged (this never requests an apply).
+                self._mark_pending(apply=False)
+                rec = self._render()
+                rec.publication_pending = True
+                return rec
+            self._mark_pending(apply=True)
+            return self._publish()
 
     def apply_now(self) -> ReconcileResult:
-        """Render, then FORCE an apply even if the generation has not advanced.
+        """Render and apply unconditionally: the manual ``infer-stack apply``.
 
-        This is the manual ``infer-stack apply``: reconcile reality to the
-        rendered desired state unconditionally (drift healing — re-up a container
-        that died out-of-band). The automatic acquire/release path uses the
-        coalesced :meth:`_ensure_applied` instead, which skips a redundant apply.
+        Heals drift (re-ups a container that died out-of-band) and publishes
+        anything pending, including leases staged with ``--no-apply``.
         """
-        with self._global_lock():
-            rec = self._render()
-        apply_fn = getattr(self.backend, 'apply', None)
-        if apply_fn is not None:
-            with self._apply_lock():
-                # Floor snapshot BEFORE the up, like _ensure_applied: a render
-                # that lands mid-apply changed files this apply never read, so
-                # publishing the post-apply generation would mark it covered
-                # and its deployment would never be brought up.
-                g = self.ledger.desired_generation()
-                before = set(self.backend.observe())
-                apply_fn()
-                after = set(self.backend.observe())
-                self.ledger.set_applied_generation(g)
-                rec.realized = sorted(set(rec.realized) | (after - before))
-                rec.torn_down = sorted(set(rec.torn_down) | (before - after))
-                rec.applied = True
-        return rec
+        return self.reconcile(apply=True)
 
     # -- readiness ---------------------------------------------------------
 
@@ -607,25 +591,26 @@ class Controller:
             self.sleep(interval)
             pairs = pending
 
-    def _rollback_acquire(self, lease_id: str) -> int:
-        """Roll a failed acquire back under the render lock.
+    def _rollback_acquire(self, lease_id: str, *, apply: bool) -> ReconcileResult | None:
+        """Roll a failed acquire back and publish the result, under the lock.
 
         Releases the lease, evicts any deployment the release idled that is not
         actually running (keep-warm only means something for a deployment that
         came up: a pre-existing warm deployment this lease merely coalesced onto
         stays resident, but a never-ran one would pin a phantom in the desired
-        set — and an unplaceable one would be re-planned, and re-fail, on every
-        future render), then re-renders so the on-disk project matches the
-        ledger before the lock drops. That last step is the generation contract:
-        release/evict bump the desired generation, and a concurrent
-        ``_ensure_applied`` waiter snapshots it and applies whatever is on
-        disk — which must therefore no longer contain the rolled-back
-        deployment. Returns the post-rollback desired generation so the caller
-        can coalesce a teardown apply.
+        set -- and an unplaceable one would be re-planned, and re-fail, on every
+        future render), then re-renders and applies per the marker, tearing
+        down anything of this lease an earlier apply brought up.
+
+        Best-effort after the ledger change: the original failure must surface,
+        not a failure of this cleanup. Anything that did not publish stays
+        pending behind the marker.
         """
+        from .._log import logger
         from .backend import ConvergeAborted
 
         with self._global_lock():
+            self._mark_pending(apply=apply)
             rel = self.ledger.release(lease_id)
             if rel.idled_deployment_ids:
                 running = set(self.backend.observe())
@@ -635,13 +620,15 @@ class Controller:
                 ]
                 if never_ran:
                     self.ledger.evict_idle(never_ran)
-            # Best-effort: the rollback render normally diffs clean (the
-            # deployment never reached disk, or leaves it), but an operator can
-            # still decline an unrelated swept-in change — no worse than not
-            # rendering, and the original failure must surface, not this.
-            with contextlib.suppress(ConvergeAborted):
-                self._render()
-            return self.ledger.desired_generation()
+            try:
+                return self._publish()
+            except ConvergeAborted:
+                # The rollback render normally diffs clean, but an operator can
+                # still decline an unrelated swept-in change.
+                return None
+            except Exception as ex:  # noqa: BLE001 - see docstring
+                logger.warning('rollback publication failed; it stays pending: {!r}', ex)
+                return None
 
     # -- thin acquire / release -------------------------------------------
 
@@ -691,29 +678,30 @@ class Controller:
         """
         from .backend import ConvergeAborted, PlacementError
 
-        # Ledger write + RENDER under the render lock, so a second caller blocks
-        # here before touching sqlite rather than racing BEGIN IMMEDIATE. The slow
-        # apply (docker compose up) is coalesced under the SEPARATE apply lock, and
-        # the readiness wait + admission-queue sleep stay OUTSIDE both -- so a
-        # second caller can render while this one is still applying/waiting.
+        # Intent, ledger write, render and (once placed) apply all under one lock
+        # hold, so a second caller blocks before touching sqlite and no render
+        # can change the files this apply reads. The readiness wait and the
+        # admission-queue sleep stay OUTSIDE the lock.
         with self._global_lock():
+            self._mark_pending(apply=apply)
             result = self.ledger.acquire(
                 owner, requests, ttl_seconds=ttl_seconds
             )
             try:
                 rec = self._render()
             except ConvergeAborted:
-                # The operator declined the compose changes — don't leave the
+                # The operator declined the compose changes -- don't leave the
                 # just-created lease dangling in the ledger.
-                self._rollback_acquire(result.lease.id)
+                self._rollback_acquire(result.lease.id, apply=apply)
                 raise
             # If a deployment this lease just requested could not be placed (e.g. no
-            # free GPU), either queue for one (wait_for_placement) or — the default —
+            # free GPU), either queue for one (wait_for_placement) or -- the default --
             # roll the lease back and report the planner's reason, so the deployment
             # never lingers as a phantom ``live`` with nothing behind it.
             requested = {g.id for g in result.deployments}
             unplaced = requested & set(rec.unplaced)
-            g_target = self.ledger.desired_generation()
+            if not unplaced:
+                rec = self._apply_pending(rec)
         if unplaced and wait_for_placement and apply:
             # Never queue for capacity that cannot exist. Re-plan this lease's
             # deployments ALONE on an idle host: if they do not fit there, no
@@ -727,8 +715,7 @@ class Controller:
             # e.g. a 4-GPU model plus a 1-GPU extractor on a 4-GPU host.
             infeasible = self._infeasible_alone(result.deployments, requested)
             if infeasible:
-                g_rollback = self._rollback_acquire(result.lease.id)
-                self._ensure_applied(g_rollback)
+                self._rollback_acquire(result.lease.id, apply=apply)
                 raise PlacementError(sorted(infeasible.keys()),
                                      sorted(infeasible.values()))
             p_timeout = timeout if placement_timeout is None else placement_timeout
@@ -741,24 +728,19 @@ class Controller:
                 # Re-render under the lock: each retry sweeps (reclaiming a crashed
                 # job's TTL-expired lease) and re-plans against the freed GPUs.
                 with self._global_lock():
+                    self._mark_pending(apply=True)   # the render sweeps
                     rec = self._render()
                     unplaced = requested & set(rec.unplaced)
-                    g_target = self.ledger.desired_generation()
+                    if not unplaced:
+                        rec = self._apply_pending(rec)
         if unplaced:
-            g_rollback = self._rollback_acquire(result.lease.id)
-            if apply:
-                # Tear down anything of ours a concurrent apply brought up
-                # (coalesced; a no-op when applied_gen already covers it).
-                self._ensure_applied(g_rollback)
+            self._rollback_acquire(result.lease.id, apply=apply)
             reasons = [
                 e
                 for e in rec.placement_errors
                 if any(e.startswith(gid) for gid in unplaced)
             ]
             raise PlacementError(sorted(unplaced), reasons)
-        # Coalesced apply (bring the rendered project up), OUTSIDE the render lock.
-        if apply:
-            self._ensure_applied(g_target, rec)
         deployments = [self.ledger.get_deployment(g.id) for g in result.deployments]
         deployments = [g for g in deployments if g is not None]
         wait_result = None
@@ -789,10 +771,9 @@ class Controller:
     def release(self, lease_id: str) -> ReleaseOutcome:
         """Release a lease and converge (tearing down per reclaim policy)."""
         with self._global_lock():
+            self._mark_pending(apply=True)
             rel = self.ledger.release(lease_id)
-            rec = self._render()
-            g_target = self.ledger.desired_generation()
-        self._ensure_applied(g_target, rec)
+            rec = self._publish()
         return ReleaseOutcome(
             idled_deployment_ids=rel.idled_deployment_ids, reconcile=rec
         )
@@ -806,11 +787,10 @@ class Controller:
         """
         ids = None if deployment_ids is None else list(deployment_ids)
         with self._global_lock():
+            self._mark_pending(apply=True)
             self.ledger.sweep()
             evicted = self.ledger.evict_idle(ids)
-            rec = self._render()
-            g_target = self.ledger.desired_generation()
-        self._ensure_applied(g_target, rec)
+            rec = self._publish()
         return EvictOutcome(evicted_deployment_ids=evicted, reconcile=rec)
 
     def gc(self, *, evict_idle: bool = False) -> GcOutcome:
@@ -827,11 +807,10 @@ class Controller:
         reclaimed.
         """
         with self._global_lock():
+            self._mark_pending(apply=True)
             swept = self.ledger.sweep()
             evicted = self.ledger.evict_idle(None) if evict_idle else []
-            rec = self._render()
-            g_target = self.ledger.desired_generation()
-        self._ensure_applied(g_target, rec)
+            rec = self._publish()
         return GcOutcome(
             expired_lease_ids=list(swept.expired_lease_ids),
             idled_deployment_ids=list(swept.idled_deployment_ids),

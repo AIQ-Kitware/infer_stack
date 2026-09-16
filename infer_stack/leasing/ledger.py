@@ -302,7 +302,17 @@ class Ledger:
         now = self.clock()
         return self.store.list_leases(), self.store.list_deployments(now=now)
 
-    # -- generation (coalesced-apply coordination, see store + controller) --
+    # -- generation (legacy, see store; superseded by the publication marker) --
+
+    def mark_publication_pending(self, *, apply_requested: bool) -> dict:
+        """See :meth:`SqliteStore.mark_publication_pending`."""
+        return self.store.mark_publication_pending(apply_requested=apply_requested)
+
+    def publication_pending(self) -> dict | None:
+        return self.store.publication_pending()
+
+    def clear_publication_pending(self, version: int) -> bool:
+        return self.store.clear_publication_pending(version)
 
     def desired_generation(self) -> int:
         return self.store.desired_generation()

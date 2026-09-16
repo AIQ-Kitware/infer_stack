@@ -1304,6 +1304,10 @@ DOCKER_TIMEOUT_PULL = 3600.0       # pull, manifest inspect, in-container model 
 #: gateway waits on Postgres health and runs DB migrations); it preserves the
 #: previous 90 x 2 s listing retry.
 ROUTE_RECONCILE_BOOTSTRAP_S = 180.0
+#: Budget when the gateway was already running before this apply (steady state).
+#: Short, because the controller holds its host-wide lock while applying; on
+#: expiry the change stays pending and the next applying operation retries.
+ROUTE_RECONCILE_STEADY_S = 20.0
 
 
 def _docker_timeout(args: list[str]) -> float:
@@ -2102,46 +2106,68 @@ class ComposeBackend(ConvergeScaffold):
         self.apply()
         return plan
 
-    def apply(self) -> None:
-        """Bring the already-rendered compose project up (``docker compose up -d``).
+    def apply(self) -> bool:
+        """Bring the already-rendered compose project up; return whether it fully succeeded.
 
         Reads the on-disk compose file last written by :meth:`converge` (render)
-        and applies it — it does NOT re-render. Deliberately does **not** take the
-        converge (render) lock: the controller serializes and coalesces applies
-        via its apply-lock + the ledger generation, and taking the render lock
-        here would re-serialize renders against this slow step (the whole point of
-        the split). Idempotent — a no-op when reality already matches the file,
-        which is what makes coalescing safe (a redundant apply costs ~nothing).
+        and applies it -- it does NOT re-render. The controller serialises render
+        and apply under its host-wide lock, so the file cannot change underneath
+        this call. Idempotent: a no-op when reality already matches the file.
+
+        Returns ``False`` when the apply did not fully take effect, so the
+        controller keeps the change pending and retries it:
+
+        * the rendered file cannot be read;
+        * in dynamic-routing mode, the gateway's routes could not be reconciled
+          and verified within budget. The budget is short when the gateway was
+          already running (steady state), and long when this apply is bringing
+          it up (bootstrap: it waits on Postgres health and runs DB migrations).
+
+        Docker failures and timeouts raise, and leave the change pending too.
         """
         from .._log import logger
 
         if not self.compose_file.exists():
-            return
+            return True
         try:
             doc = yaml.safe_load(self.compose_file.read_text()) or {}
-        except Exception:  # noqa: BLE001 - a torn/old file must not brick apply
-            return
+        except Exception:  # noqa: BLE001 - reported as "not applied", never raised
+            logger.warning('apply: rendered compose file is unreadable; change stays pending')
+            return False
         services = doc.get('services') or {}
         if services:
+            dynamic = bool(self.litellm and self.dynamic_routing)
+            gateway_was_up = dynamic and self._service_running('litellm')
             logger.info(
                 'docker compose up -d ({} service(s): {})',
                 len(services), ', '.join(sorted(services)),
             )
             self._compose(['up', '-d', '--remove-orphans'])
-            if self.litellm and self.dynamic_routing:
+            if dynamic:
                 # Apply the rendered desired route set to the now-running gateway
                 # via the admin API (the dynamic-routing half of apply).
-                self._reconcile_routes()
-        else:
-            # Nothing at all to run — only reachable with the gateway off
-            # (litellm=False) and zero models, since the front door otherwise
-            # keeps the project non-empty. `docker compose up` errors with "no
-            # service selected" on a services-less file, so tear the project down
-            # instead (`down` works on the empty file). With the gateway on,
-            # releasing every model lands in the `up` branch above and leaves the
-            # front door standing; `stack down` is the way to take everything off.
-            logger.info('no services desired -> docker compose down')
-            self._compose(['down', '--remove-orphans'])
+                return self._reconcile_routes(
+                    deadline_s=ROUTE_RECONCILE_STEADY_S if gateway_was_up
+                    else ROUTE_RECONCILE_BOOTSTRAP_S,
+                )
+            return True
+        # Nothing at all to run -- only reachable with the gateway off
+        # (litellm=False) and zero models, since the front door otherwise
+        # keeps the project non-empty. `docker compose up` errors with "no
+        # service selected" on a services-less file, so tear the project down
+        # instead (`down` works on the empty file). With the gateway on,
+        # releasing every model lands in the `up` branch above and leaves the
+        # front door standing; `stack down` is the way to take everything off.
+        logger.info('no services desired -> docker compose down')
+        self._compose(['down', '--remove-orphans'])
+        return True
+
+    def _service_running(self, service: str) -> bool:
+        """Whether a compose service of this project is running (best-effort)."""
+        try:
+            return service in _parse_ps(self._compose(['ps', '--format', 'json']))
+        except Exception:  # noqa: BLE001 - unknown -> treat as a bootstrap (long budget)
+            return False
 
     # -- dynamic routing (admin API) --------------------------------------
 

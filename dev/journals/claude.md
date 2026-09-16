@@ -2749,3 +2749,46 @@ to prevent. Uncertainty: the shape was verified on the guest's Docker, not the
 serving host's; the plan's V1/V2 still need a host check before P1 is called done.
 I also moved `DEPLOYMENT_LABEL` to the new module and re-export it from
 `compose.py`, so there is one definition beside the code that reads it back.
+
+## 2026-09-16 19:36:13 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT declared P2 ready with the revision-7a amendments. The user
+wants agreed steps implemented directly on `dev/0.7.1` while review continues.
+
+**What I did.**
+- **Store.** Added a `publication_pending` marker: version and `apply_requested`.
+  The requested flag only ever turns on.
+- **Controller.** Every mutator now marks intent, mutates, renders and applies
+  under `_global_lock`. The marker is cleared only when `apply()` does not
+  return `False`. `_ensure_applied`, `_apply_lock` and the generation reads are
+  gone.
+- **Compose.** `ComposeBackend.apply()` now returns the route result, with a
+  steady-state deadline of 20 s when LiteLLM was already running and 180 s
+  otherwise.
+- **Tests.** Rewrote the coalescing tests as crash-window, staged-lease,
+  failed-apply and rollback tests.
+
+**Choices worth reviewing.**
+1. **Recovery happens on the next applying operation**, not on every lock
+   entry. Each applying operation renders and applies the whole pending state,
+   so an extra recovery pass would only apply twice. Render-only paths
+   (`infer-stack render`, the render inside a `--no-apply` acquire) never apply
+   a pending marker, which keeps plan test 13 literal.
+2. **Render-only paths still write a staged marker**, because the render sweeps
+   and a sweep can change desired state.
+3. **An apply that returns `False` does not fail the acquire.** The lease is
+   admitted and its change is durably pending (I1). The readiness wait decides
+   whether the caller gets a working endpoint. A raised backend error still
+   propagates.
+4. **`approved_digest` is not implemented yet.** Nothing can set it before
+   `config publish` (P4) exists, and the profile persistence it compares
+   against is a later P2 step.
+
+**Reflection.** The simplification cost something real: concurrent acquires now
+each run a `docker compose up`, one after another, instead of sharing one. An
+up that changes nothing is fast, so I accepted it, but under a burst of N
+acquires each caller waits behind up to N-1 others. If host runs show lock wait
+dominating, the fix is to skip the apply when the render is byte-identical to
+the last successful one. That should not come back as coalescing.

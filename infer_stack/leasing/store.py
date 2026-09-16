@@ -179,10 +179,11 @@ class SqliteStore:
                 self._conn.execute('ROLLBACK')
                 raise
 
-    # -- generation (coalesced-apply coordination) -------------------------
+    # -- generation (legacy; unused by the controller) ----------------------
     #
-    # Two monotonic counters in `meta` let separate processes coalesce the slow
-    # `docker compose up` step (see Controller._ensure_applied):
+    # Superseded by the publication marker below, which the controller uses to
+    # serialise render and apply. The counters are still bumped and kept so an
+    # older reader of the same ledger does not break. Their original meaning:
     #   desired_gen  bumped whenever a mutation changes the desired set (a new
     #                deployment, an idled/evicted/expired one). Captured by an
     #                acquirer right after it renders -> "the generation my change
@@ -227,6 +228,62 @@ class SqliteStore:
                 'WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)',
                 (str(int(gen)),),
             )
+
+    # -- publication marker (serialised publication) -----------------------
+    #
+    # One row in `meta` records that the desired state has changed and has not
+    # yet been fully applied. It is written BEFORE the ledger mutation it
+    # announces (intent first), so a crash at any later point leaves it set, and
+    # the next applying operation re-renders from the ledger and applies. A crash
+    # between writing it and the mutation costs one redundant, idempotent apply.
+    #
+    #   version          bumped on every mark; a clear names the version it
+    #                    applied, so a newer mark is never cleared by an older
+    #                    apply (defensive: callers serialise under one lock)
+    #   apply_requested  False only for staged changes (`acquire --no-apply`),
+    #                    which must not start just because something reopened;
+    #                    once True it stays True until cleared
+
+    def mark_publication_pending(self, *, apply_requested: bool) -> dict:
+        """Record that desired state is changing; return the marker written."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            marker = {
+                'version': (current['version'] if current else 0) + 1,
+                'apply_requested': bool(apply_requested)
+                or bool(current and current['apply_requested']),
+            }
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('publication_pending', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(marker, sort_keys=True),),
+            )
+        return marker
+
+    def publication_pending(self) -> dict | None:
+        """The pending marker, or ``None`` when every change has been applied."""
+        return self._read_publication_pending()
+
+    def clear_publication_pending(self, version: int) -> bool:
+        """Clear the marker if it is not newer than ``version``; True if cleared."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current['version'] > int(version):
+                return False
+            self._conn.execute("DELETE FROM meta WHERE key = 'publication_pending'")
+        return True
+
+    def _read_publication_pending(self) -> dict | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'publication_pending'"
+        ).fetchone()
+        if not row:
+            return None
+        marker = json.loads(row['value'])
+        return {
+            'version': int(marker['version']),
+            'apply_requested': bool(marker['apply_requested']),
+        }
 
     # -- leases ------------------------------------------------------------
 

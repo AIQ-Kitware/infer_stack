@@ -2,6 +2,37 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Render and apply are serialised under one lock, gated by a durable pending marker
+
+Every desired-state change (acquire, release, evict, gc, rollback, `apply`) now
+runs as one publication under the controller's host-wide lock. It records a
+`publication_pending` marker before touching the ledger, mutates the ledger,
+renders, applies that exact render, and clears the marker only once the whole
+apply has succeeded. In dynamic-routing mode that includes verified gateway
+routes.
+
+This replaces the separate apply lock and the generation-based coalescing. There,
+a render could rewrite the compose file while another process's `docker compose
+up` was reading it, and an apply that failed or was killed left no record. Now:
+
+- **Crashes and failures stay pending.** A crash, a Docker timeout, or routes
+  that do not verify leave the marker set. The next applying operation, or
+  `infer-stack apply`, re-renders and applies the whole pending desired state.
+- **Compose `apply()` returns whether it fully took effect.** Route
+  reconciliation gets 20 s when the gateway was already running and 180 s when
+  the apply is bringing it up. `ReconcileResult.publication_pending` reports a
+  change that is still pending.
+- **Staged leases stay staged.** `acquire --no-apply` and `infer-stack render`
+  never apply. A later applying operation still applies the whole pending
+  state, including staged leases, as before.
+- **Applies no longer run concurrently.** They are also no longer coalesced:
+  concurrent acquires each apply in turn. Each apply is bounded (see below), and
+  one is a no-op when nothing changed.
+
+The legacy `desired_gen`/`applied_gen` counters are still maintained but no
+longer read. This is part of step P2 of
+`dev/tmp/plan-keep-warm-admission-2026-09-16.md`.
+
 ### Docker commands are time-bounded; route reconciliation is deadline-bound and reports success
 
 Every Docker command run by the Compose backend now has a wall-clock bound
