@@ -1263,6 +1263,36 @@ def test_tui_logs_stream_from_injected_source():
     _run(scenario)
 
 
+def test_tui_compacts_registered_litellm_traceback():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    p = 'litellm-1 | '
+    lines = [
+        p + 'Traceback (most recent call last):\n',
+        p + '  File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1298, in _wrap_create_connection\n',
+        p + '  File "/usr/lib/python3.13/site-packages/aiohappyeyeballs/impl.py", line 122, in start_connection\n',
+        p + '  File "uvloop/loop.pyx", line 2633, in sock_connect\n',
+        p + "ConnectionRefusedError: [Errno 111] Connect call failed ('172.18.0.4', 8000)\n",
+    ]
+
+    async def scenario():
+        app = InferStackTUI(
+            controller, catalog, interval=999,
+            proc_factory=lambda svc: _FakeProc(lines),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            text = '\n'.join(app._log_lines)
+            assert 'Traceback (most recent call last):' not in text
+            assert '  File "' not in text
+            assert 'ConnectionRefusedError: [Errno 111]' in text
+
+    _run(scenario)
+
+
 def test_tui_observe_is_throttled_between_ledger_ticks():
     """The expensive observe()/plan() view is cached between ledger polls and
     only refreshed once observe_interval has elapsed."""
