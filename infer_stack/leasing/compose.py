@@ -2340,6 +2340,7 @@ class ComposeBackend(ConvergeScaffold):
                 # present, never started).
                 'fingerprints': fingerprints,
                 'degraded': list(plan.degraded),
+                'displaced': list(plan.displaced),
                 'optional_services': sorted(
                     svc for svc, gid in rendered.services.items() if gid in optional
                 ),

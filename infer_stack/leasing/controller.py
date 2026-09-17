@@ -644,6 +644,83 @@ class Controller:
             self.ledger.set_network_config({'subnet': subnet})
             return self._publish()
 
+    def observe_state(self) -> dict:
+        """A read-only health view for ``leases`` / ``status`` (plan step P10).
+
+        Never writes: TTL expiry is virtual, residency is a Docker read. Each
+        deployment gets one condition:
+
+        * ``unknown``: Docker could not be read;
+        * ``ambiguous``: more than one container claims it;
+        * ``degraded``: LIVE, but its committed GPUs are no longer valid (it is
+          neither started nor removed until its lease is released);
+        * ``displaced``: an idle keep-warm model that yielded its GPUs;
+        * ``unresolved``: LIVE from before allocations, with no unique container;
+        * ``running`` / ``not-running``: whether its single container serves.
+        """
+        from .profile import profile_drift
+        from .residency import ResidencyUnknown
+
+        leases, deployments = self.ledger.status(virtual_expiry=True)
+        sidecar = {}
+        loader = getattr(self.backend, '_load_sidecar', None)
+        if loader is not None:
+            try:
+                sidecar = loader() or {}
+            except Exception:  # noqa: BLE001 - a view must always render
+                sidecar = {}
+        residency, residency_error = None, None
+        if callable(getattr(self.backend, 'residency', None)):
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown as ex:
+                residency_error = str(ex)
+        degraded = set(sidecar.get('degraded') or ())
+        displaced = set(sidecar.get('displaced') or ())
+        rows = []
+        for g in deployments:
+            if g.state not in (DeploymentState.LIVE, DeploymentState.IDLE):
+                continue
+            if residency is None and residency_error is not None:
+                condition = 'unknown'
+            elif residency is not None and residency.ambiguous(g.id):
+                condition = 'ambiguous'
+            elif g.id in degraded and g.state == DeploymentState.LIVE:
+                condition = 'degraded'
+            elif g.id in displaced and g.state == DeploymentState.IDLE:
+                condition = 'displaced'
+            elif (g.state == DeploymentState.LIVE and g.assigned_gpus is None
+                  and self._admission_mode() and residency is not None
+                  and residency.resident(g.id) is None):
+                condition = 'unresolved'
+            elif residency is not None:
+                condition = 'running' if residency.resident(g.id) else 'not-running'
+            else:
+                condition = None
+            rows.append({'id': g.id, 'state': g.state, 'condition': condition,
+                         'assigned_gpus': g.assigned_gpus})
+        adopted = self.ledger.adopted_containers() or {}
+        orphans = [] if residency is None else [
+            {'id': c.container_id, 'service': c.service, 'state': c.state}
+            for c in residency.all_containers()
+            if not c.labelled and c.container_id not in adopted
+        ]
+        drift = []
+        stored = self.ledger.profile()
+        if stored is not None and self._invocation_profile is not None:
+            drift = profile_drift(stored, self._invocation_profile)
+        return {
+            'publication_pending': self.ledger.publication_pending(),
+            'residency_error': residency_error,
+            'deployments': rows,
+            'orphans': orphans,
+            'profile_drift': drift,
+            'network': self.ledger.network_config(),
+            'addresses': self.ledger.service_addresses(),
+            'expired_unswept': [le.id for le in leases if le.state == LeaseState.EXPIRED
+                                and (self.ledger.get_lease(le.id).state == LeaseState.ACTIVE)],
+        }
+
     def _prune_adopted(self, residency) -> dict:
         """The adopted-container table, minus containers that no longer exist."""
         adopted = self.ledger.adopted_containers()
@@ -794,6 +871,10 @@ class Controller:
                 reasons.extend(why or [f'{gid}: could not be rendered'])
         allocations = {gid: list(plan.assignments.get(gid, [])) for gid in overlay.deployments
                        if gid in overlay.created or gid in overlay.revived}
+        if reasons:
+            holders = self._gpu_holders(plan)
+            if holders:
+                reasons.append('GPUs held by admitted demand: ' + '; '.join(holders))
         if not reasons:
             # Approval happens now, before anything is committed; the render
             # after the commit produces the same files and does not ask again.
@@ -801,6 +882,21 @@ class Controller:
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
         return allocations, reasons
+
+    def _gpu_holders(self, plan) -> list[str]:
+        """``GPU n: deployment (owner, ...)`` for every GPU placed in ``plan``."""
+        leases, _ = self.ledger.status()
+        owners: dict[str, set[str]] = {}
+        for le in leases:
+            if le.state == LeaseState.ACTIVE:
+                for gid in le.deployment_ids:
+                    owners.setdefault(gid, set()).add(le.owner)
+        out = []
+        for gid, gpus in sorted(plan.assignments.items(), key=lambda kv: kv[1]):
+            if gpus and gid in owners:
+                out.append(f'GPU {",".join(map(str, gpus))}: {gid} '
+                           f'(owner {", ".join(sorted(owners[gid]))})')
+        return out
 
     def _unresolved_allocations(self, *, exclude: set[str] = frozenset()) -> list[str]:
         from .placement import required_gpu_count

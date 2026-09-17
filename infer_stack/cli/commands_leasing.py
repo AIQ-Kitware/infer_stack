@@ -1716,6 +1716,22 @@ def _placement_view(controller):
     except Exception:  # noqa: BLE001 - status must never crash
         pass
     assignments: dict[str, list[int]] = {}
+    if controller._admission_mode():
+        # Committed allocations, and idle residents' physical GPUs; the
+        # legacy planner view would show placements admission would not make.
+        _, deployments = controller.ledger.status(virtual_expiry=True)
+        for g in deployments:
+            if g.assigned_gpus is not None:
+                assignments[g.id] = list(g.assigned_gpus)
+        try:
+            residency = backend.residency()
+            for g in deployments:
+                c = residency.resident(g.id)
+                if g.id not in assignments and c is not None:
+                    assignments[g.id] = list(c.gpus)
+        except Exception:  # noqa: BLE001
+            pass
+        return observed, assignments
     plan = getattr(backend, 'plan', None)
     if plan is not None:
         try:
@@ -1853,6 +1869,7 @@ class LeasesCLI(_LeasingCommonMixin):
         controller = _open_controller(config)
         leases, deployments = controller.ledger.status(virtual_expiry=True)
         observed, assignments = _placement_view(controller)
+        health = controller.observe_state()
         if config.json:
             print(
                 json.dumps(
@@ -1879,6 +1896,7 @@ class LeasesCLI(_LeasingCommonMixin):
                             }
                             for g in deployments
                         ],
+                        'health': health,
                     },
                     indent=2,
                 )
@@ -1891,7 +1909,37 @@ class LeasesCLI(_LeasingCommonMixin):
             _print_leases_rich(leases, deployments, observed, assignments, console)
         else:
             _print_leases_plain(leases, deployments, observed, assignments)
+        _print_health(health)
         return 0
+
+
+def _print_health(health: dict) -> None:
+    """The conditions worth an operator's attention, one line each."""
+    lines = []
+    marker = health.get('publication_pending')
+    if marker:
+        kind = 'apply requested' if marker.get('apply_requested') else 'staged'
+        extra = ', interrupted' if marker.get('interrupted') else ''
+        extra += ', approval guard' if marker.get('approved_digest') else ''
+        lines.append(f'pending change: {kind}{extra} (`infer-stack apply` publishes it)')
+    if health.get('residency_error'):
+        lines.append(f'residency UNKNOWN: {health["residency_error"]}')
+    for row in health.get('deployments') or []:
+        if row['condition'] in {'unknown', 'ambiguous', 'degraded', 'displaced',
+                                'unresolved', 'not-running'}:
+            lines.append(f'{row["condition"].upper()}: {row["id"]} ({row["state"]})')
+    for orphan in health.get('orphans') or []:
+        lines.append(f'ORPHAN: {orphan["id"][:12]} {orphan["service"]} '
+                     '(`infer-stack gc --orphans`)')
+    if health.get('profile_drift'):
+        lines.append('settings differ from the published profile: '
+                     + ', '.join(health['profile_drift']))
+    for lease_id in health.get('expired_unswept') or []:
+        lines.append(f'expired (not yet reclaimed): {lease_id}')
+    if lines:
+        print('health:')
+        for line in lines:
+            print(f'  {line}')
 
 
 def _secret_env_path() -> Path:

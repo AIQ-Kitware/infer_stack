@@ -2,6 +2,28 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Health view: degraded, displaced, unresolved, orphans, pending changes (P10)
+
+- **`infer-stack leases`** now ends with a `health:` block, and `--json`
+  includes a `health` object. It is read-only: it never writes the ledger. It
+  reports:
+  - the pending change (staged or apply requested, interrupted, approval
+    guard);
+  - unknown residency;
+  - each deployment's condition: `ambiguous`, `degraded`, `displaced`,
+    `unresolved` or `not-running`;
+  - orphan containers;
+  - profile drift;
+  - the stable address table;
+  - leases that have expired but not yet been reclaimed.
+- **Degraded deployments end to end.** A LIVE deployment whose committed GPUs
+  are no longer valid is reported `degraded`, is neither started nor removed,
+  and refuses coalescing; releasing its lease makes it removable.
+- **Refusals name the contested GPUs.** An admission refusal lists which
+  admitted deployments hold which GPUs, and their owners.
+- **GPU column.** In admission mode, `leases` shows committed allocations and
+  resident GPUs rather than a hypothetical legacy plan.
+
 ### `config publish` pre-pulls images; approved renders are guarded (P4)
 
 - **Pre-pull.** `config publish` pulls every image the new profile references
