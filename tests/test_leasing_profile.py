@@ -422,3 +422,64 @@ def test_a_crash_while_publishing_leaves_the_old_profile_and_no_unguarded_marker
     del store._write_marker
     assert written and written[0]['ui'] is False     # the profile had been written...
     assert ledger.profile() == before                # ...and rolled back with the marker
+
+
+def test_a_publish_that_never_commits_leaves_no_append_only_state(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    before = ledger.profile()
+    registry = ctl.backend._registry_file
+    registry_before = registry.read_text() if registry.exists() else None
+
+    def crash(*args, **kw):
+        raise KeyboardInterrupt('killed before the profile transaction')
+
+    ledger.store.publish_profile = crash
+    candidate = {**before, 'catalogs': [cat('alpha'), cat('beta')]}
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() == before
+    after = registry.read_text() if registry.exists() else None
+    assert after == registry_before and 'beta' not in (after or '')
+    assert ledger.service_addresses() == {}
+
+
+def test_fingerprints_hash_only_the_env_values_a_service_interpolates(tmp_path):
+    from infer_stack.leasing.compose import stamp_fingerprints
+
+    env = tmp_path / '.env'
+    doc = lambda: {'services': {'m': {'image': 'x', 'environment': {'HF_TOKEN': '${HF_TOKEN:-}'}}}}  # noqa: E731
+    env.write_text('HF_TOKEN=a\nOPENAI_BASE_URL=u1\n')
+    first = stamp_fingerprints(doc(), files={}, env_file=env)
+    env.write_text('HF_TOKEN=a\nOPENAI_BASE_URL=u2\n')
+    assert stamp_fingerprints(doc(), files={}, env_file=env) == first      # unrelated key
+    env.write_text('HF_TOKEN=b\nOPENAI_BASE_URL=u2\n')
+    assert stamp_fingerprints(doc(), files={}, env_file=env) != first      # the used one
+
+
+def test_env_writes_hold_the_publication_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    from infer_stack.cli import commands_leasing as cl
+
+    from infer_stack.leasing import default_ledger_path
+
+    lock = default_ledger_path().parent / '.leasing.lock'      # the isolated data root
+    held = []
+
+    def write(path, values):
+        handle = open(lock, 'a')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(False)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            held.append(True)
+        finally:
+            handle.close()
+
+    monkeypatch.setattr(cl, 'write_env_file', write)
+    monkeypatch.setattr(cl, '_secret_env_path', lambda: tmp_path / '.env')
+    assert cl.EnvCLI.main(argv=['HF_TOKEN=x']) == 0
+    assert held == [True]

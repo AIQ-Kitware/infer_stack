@@ -352,10 +352,14 @@ def stamp_fingerprints(
         >>> stamp_fingerprints(doc, files={})['a'] != fps['a']
         True
     """
+    import re
+
     by_path = {str(Path(p)): text for p, text in files.items()}
-    env_text = None
+    env_values: dict[str, str] = {}
     if env_file is not None and Path(env_file).exists():
-        env_text = Path(env_file).read_text()
+        from ..env_utils import parse_env_file
+
+        env_values = parse_env_file(Path(env_file))
     out: dict[str, str] = {}
     for name, svc in (compose.get('services') or {}).items():
         labels = dict(svc.get('labels') or {})
@@ -369,8 +373,12 @@ def stamp_fingerprints(
                 text = Path(source).read_text(errors='replace')
             if text is not None:
                 material.append(hashlib.sha256(text.encode('utf-8')).hexdigest())
-        if env_text is not None and '${' in material[0]:
-            material.append(hashlib.sha256(env_text.encode('utf-8')).hexdigest())
+        # Only the variables this stanza interpolates: an unrelated key in the
+        # managed .env must not recreate the service.
+        referenced = sorted(set(re.findall(r'\$\{([A-Za-z_][A-Za-z0-9_]*)', material[0])))
+        if referenced:
+            values = json.dumps({k: env_values.get(k) for k in referenced}, sort_keys=True)
+            material.append(hashlib.sha256(values.encode('utf-8')).hexdigest())
         fingerprint = hashlib.sha256('\x00'.join(material).encode('utf-8')).hexdigest()[:16]
         svc.setdefault('labels', {})[FINGERPRINT_LABEL] = fingerprint
         out[name] = fingerprint
@@ -2592,6 +2600,23 @@ class ComposeBackend(ConvergeScaffold):
                     raise ApplyAborted(
                         f'an unmanaged container {c.container_id[:12]} holds address '
                         f'{address} of {name!r}; see `infer-stack gc --orphans`'
+                    )
+        if networks:
+            # Preflight a subnet change BEFORE removing anything: a foreign
+            # attachment would otherwise take the stack down and only then abort.
+            from .network import NETWORK_NAME
+
+            spec = networks.get(NETWORK_NAME) or {}
+            wanted_subnet = next((c.get('subnet') for c in
+                                  (spec.get('ipam') or {}).get('config') or []), None)
+            state = self._network_state(NETWORK_NAME) if wanted_subnet else None
+            if state is not None and state[0] != wanted_subnet:
+                foreign = [cid for cid in state[1] if cid not in departing_ids]
+                if foreign:
+                    raise ApplyAborted(
+                        f'network {NETWORK_NAME} must move from {state[0]} to '
+                        f'{wanted_subnet}, but {len(foreign)} container(s) not managed '
+                        f'for removal are attached ({", ".join(c[:12] for c in foreign)})'
                     )
         if orphans:
             logger.warning(

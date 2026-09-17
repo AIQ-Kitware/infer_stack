@@ -1220,13 +1220,17 @@ def test_tui_model_cached_label(tmp_path):
     assert InferStackTUI._cached_label('', hub) == '-'
 
 
-def test_tui_compose_control_runs_up(tmp_path):
+def test_tui_up_applies_through_the_controller(tmp_path):
+    """The Up action is `infer-stack apply` (serialised, selective), never a raw
+    `docker compose up --remove-orphans`."""
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
     compose_file = tmp_path / 'docker-compose.yml'
     compose_file.write_text('services: {}\n')
     calls = []
+    applied = []
+    controller.apply_now = lambda: applied.append(1) or type('R', (), {'publication_pending': False})()
 
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
@@ -1242,7 +1246,8 @@ def test_tui_compose_control_runs_up(tmp_path):
             await pilot.pause()
 
     _run(scenario)
-    assert calls and calls[0][:2] == ['docker', 'compose'] and 'up' in calls[0]
+    assert applied == [1]
+    assert not any('up' in c for c in calls)
 
 
 def test_tui_logs_stream_from_injected_source():

@@ -2,6 +2,26 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Publication side effects, `.env` races, raw controls (review)
+
+- **`config publish` previews purely.** On Compose it now previews the
+  candidate in memory, commits the profile and its approved digest, and only
+  then renders for real. A crash before the commit can no longer leave
+  candidate routes in the append-only route registry, or candidate addresses
+  in the address table.
+- **`infer-stack env KEY=VALUE`** now takes the publication lock and replaces
+  the file atomically. A render in progress sees one consistent `.env`, and
+  concurrent writers no longer lose each other's keys.
+- **Fingerprints** hash only the `.env` variables a service interpolates, so
+  an unrelated key no longer recreates it.
+- **The TUI's Up button** now runs `apply` through the controller, instead of
+  a raw `docker compose up --remove-orphans`. `stack up`/`stack down` are
+  documented as raw escape hatches.
+- **`status` and the TUI's served-endpoint view** show TTL expiry virtually.
+- **A subnet change** checks for foreign containers attached to the old
+  network before removing anything, so it cannot take the stack down and then
+  abort.
+
 ### Approval digests and subnet changes (review)
 
 - **`config publish`** writes the profile and its pending marker (with the

@@ -195,6 +195,14 @@ the live set. Adding or removing a model renumbers the others' ports, which
 changes their fingerprints, so selective apply recreates them. Behind the
 gateway (the default) upstreams publish no host port, and this does not happen.
 
+### `stack up` and `stack down` are raw Compose escape hatches (design boundary)
+
+`infer-stack stack up`/`stack down` (and the TUI's Down button) run
+`docker compose up -d --remove-orphans` / `down` directly. They bypass the
+publication lock, ownership, selective apply and the GPU barrier, and they do
+not touch leases. Use `infer-stack apply` (the TUI's Up button) to bring the
+desired state up safely.
+
 ### The Docker target is the local default daemon (design boundary)
 
 infer-stack does not inherit `DOCKER_HOST`, and runs every Docker command with

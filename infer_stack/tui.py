@@ -1963,14 +1963,27 @@ class InferStackTUI(App):
         if self._compose_target() is None:
             self._status('nothing rendered yet — acquire a model first')
             return
-        self._status('docker compose up… (output in the Logs tab)')
-        self._do_compose(['up', '-d', '--remove-orphans'], 'up')
+        self._status('apply… (output in the Logs tab)')
+        self._do_apply()
+
+    @work(thread=True, exclusive=True, group='mutate')
+    def _do_apply(self) -> None:
+        # Through the controller: serialised with every other publisher, and
+        # applied selectively behind the GPU barrier (never a raw
+        # `up --remove-orphans`).
+        try:
+            rec = self.controller.apply_now()
+            msg = ('apply done' if not rec.publication_pending
+                   else 'apply did not fully take effect; still pending')
+        except Exception as ex:  # noqa: BLE001
+            msg = f'apply failed: {ex}'
+        self._after_mutation(msg)
 
     def action_compose_down(self) -> None:
         if self._compose_target() is None:
             self._status('nothing rendered yet — nothing to bring down')
             return
-        self._status('docker compose down…')
+        self._status('docker compose down (raw: bypasses leases; releases nothing)…')
         self._do_compose(['down', '--remove-orphans'], 'down')
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -1999,7 +2012,7 @@ class InferStackTUI(App):
 
     def _served_endpoints(self) -> set[str]:
         try:
-            leases, _ = self.controller.ledger.status()
+            leases, _ = self.controller.ledger.status(virtual_expiry=True)
         except Exception:  # noqa: BLE001
             return set()
         served: set[str] = set()

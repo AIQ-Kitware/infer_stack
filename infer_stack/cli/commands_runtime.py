@@ -108,7 +108,7 @@ def _leasing_status() -> dict[str, Any]:
     if not path.exists():
         return out
     try:
-        leases, deployments = Ledger(SqliteStore(str(path))).status()
+        leases, deployments = Ledger(SqliteStore(str(path))).status(virtual_expiry=True)
     except Exception:  # noqa: BLE001
         return out
     active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)

@@ -2193,7 +2193,13 @@ class EnvCLI(_PathOverridesMixin):
             key = key.strip()
             if not key:
                 raise SystemExit('env: empty key in KEY=VALUE')
-            write_env_file(env_path, {key: value})
+            # Under the controller's publication lock: a render/apply in progress
+            # must read one consistent .env (its fingerprints hash the values
+            # Compose will interpolate), and concurrent writers must not lose
+            # each other's keys.
+            controller = Controller(Ledger(SqliteStore(str(default_ledger_path()))), NullBackend())
+            with controller._global_lock():
+                write_env_file(env_path, {key: value})
             print(f'set {key} ({env_path})')
             return 0
 

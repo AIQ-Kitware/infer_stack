@@ -1646,6 +1646,29 @@ class Controller:
                         f'container(s) exist for {", ".join(running[:3])}; '
                         '`infer-stack evict --all` first'
                     )
+            if self._admission_mode():
+                # A PURE preview first: the real render persists append-only
+                # state (route registry, addresses), which must not happen for
+                # a candidate whose publication has not committed.
+                previous = self._applied_profile
+                use(profile)
+                try:
+                    residency = self.backend.residency()
+                    self._prepare_network()
+                    desired, inputs = self._admission_view(residency)
+                    self.backend.preview(desired, inputs, approve=True)
+                except BaseException:
+                    if previous is not None:
+                        use(previous)
+                    raise
+                self.ledger.store.publish_profile(
+                    profile, approved_digest=self.backend.last_preview_digest)
+                self._profile_error = None
+                self._applied_profile = profile
+                self._invocation_profile = profile
+                self._profile_drift_warned = False
+                return self._publish()
+            # Backends without a preview (KubeAI): render, then commit.
             # No implicit profile here: on a fresh ledger a declined preview
             # must leave neither a profile nor a marker behind.
             existed = self.ledger.publication_pending() is not None

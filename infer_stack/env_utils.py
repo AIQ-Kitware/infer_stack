@@ -94,4 +94,10 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
         text += '\n'
 
     print(f'Write .env to {path}')
-    path.write_text(text, encoding='utf-8')
+    # Atomic replace: Docker Compose (or a fingerprint) must never read a
+    # half-written file.
+    import os
+
+    tmp = path.with_name(f'{path.name}.tmp')
+    tmp.write_text(text, encoding='utf-8')
+    os.replace(tmp, path)

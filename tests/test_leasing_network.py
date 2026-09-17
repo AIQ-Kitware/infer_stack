@@ -204,6 +204,9 @@ def test_a_foreign_container_on_the_old_network_blocks_the_subnet_change(tmp_pat
     acquire(ctl, 'one')                                      # the network now exists
     cid = docker.add_container('foreign', labels={}, project='someone-else')
     docker.containers[cid]['networks'] = [NETWORK_NAME]
-    with pytest.raises(ApplyAborted, match='still attached'):
+    before = {i for i, c in docker.containers.items() if i != cid}
+    with pytest.raises(ApplyAborted, match='are attached'):
         ctl.network_migrate('10.123.46.0/28', force=True)
     assert ledger.publication_pending()['apply_requested'] is True   # retried later
+    # Preflighted before anything destructive: the stack is still up.
+    assert {i for i, c in docker.containers.items() if i != cid} == before
