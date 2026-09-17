@@ -2484,6 +2484,10 @@ class ConfigPublishCLI(_ApprovalMixin):
         help='Catalog files to publish as one union (default: --catalog, or the '
         'default-path catalog).',
     )
+    pull = scfg.Value(
+        True, isflag=True,
+        help='Pre-pull every image the profile references (default; --no-pull skips).',
+    )
     json = scfg.Value(False, isflag=True)
 
     @classmethod
@@ -2514,6 +2518,20 @@ class ConfigPublishCLI(_ApprovalMixin):
         try:
             if profile.get('catalogs'):
                 CatalogUnion.from_sources(profile['catalogs'])   # conflicts
+            pull = getattr(controller.backend, 'pull_images', None)
+            if config.pull and pull is not None and profile.get('backend') == 'compose':
+                # Outside the lock, before anything is published: a steady-state
+                # apply must never wait on a registry, and a missing image must
+                # refuse the publication rather than break the next apply.
+                images = dict(profile.get('images') or {})
+                saved = dict(controller.backend.images)
+                controller.backend.images = {**saved, **images}
+                try:
+                    pull()
+                except Exception as ex:  # noqa: BLE001
+                    raise SystemExit(f'config publish: image pull failed, nothing published: {ex}')
+                finally:
+                    controller.backend.images = saved
             rec = controller.publish_profile(profile)
         except (ProfileMismatch, CatalogError) as ex:
             raise SystemExit(f'config publish: {ex}')

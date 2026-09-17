@@ -319,7 +319,7 @@ class SqliteStore:
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
-        placement_context: dict | None = None,
+        placement_context: dict | None = None, approved_digest: str | None = None,
     ) -> dict:
         """Record that desired state is changing; return the marker written.
 
@@ -339,6 +339,8 @@ class SqliteStore:
                 or bool(current and current['interrupted']),
                 'placement_context': placement_context if placement_context is not None
                 else (current['placement_context'] if current else None),
+                'approved_digest': approved_digest if approved_digest is not None
+                else (current['approved_digest'] if current else None),
             }
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('publication_pending', ?) "
@@ -372,6 +374,7 @@ class SqliteStore:
             'apply_requested': bool(marker['apply_requested']),
             'interrupted': bool(marker.get('interrupted', False)),
             'placement_context': marker.get('placement_context'),
+            'approved_digest': marker.get('approved_digest'),
         }
 
     def clear_placement_context(self) -> None:

@@ -186,6 +186,9 @@ class Controller:
         # first mutation, not here: `config publish` must still be able to
         # open a controller in order to switch backends.
         self._profile_error: Exception | None = None
+        # Set only by apply_now(): the operator explicitly re-approves a render
+        # that differs from an earlier approved digest.
+        self._explicit_apply = False
         from .profile import ProfileMismatch
 
         try:
@@ -913,6 +916,17 @@ class Controller:
         if not marker['apply_requested']:
             rec.publication_pending = True    # staged; never applied here
             return rec
+        approved = marker.get('approved_digest')
+        rendered = getattr(self.backend, 'last_planned_digest', None)
+        if approved and rendered and rendered != approved and not self._explicit_apply:
+            from .profile import ProfileMismatch
+
+            rec.publication_pending = True
+            raise ProfileMismatch(
+                'the rendered state differs from what was approved at publication '
+                '(e.g. infer-stack was upgraded in between); review and approve it '
+                'with `infer-stack apply`'
+            )
         if marker['interrupted']:
             self._wait_for_settled_runtime()
         before = set(self.backend.observe())
@@ -1007,9 +1021,14 @@ class Controller:
         """Render and apply unconditionally: the manual ``infer-stack apply``.
 
         Heals drift (re-ups a container that died out-of-band) and publishes
-        anything pending, including leases staged with ``--no-apply``.
+        anything pending, including leases staged with ``--no-apply``. It is
+        also the explicit approval that clears an approved-digest mismatch.
         """
-        return self.reconcile(apply=True)
+        self._explicit_apply = True
+        try:
+            return self.reconcile(apply=True)
+        finally:
+            self._explicit_apply = False
 
     # -- readiness ---------------------------------------------------------
 
@@ -1513,6 +1532,9 @@ class Controller:
                     self.ledger.clear_publication_pending(marker['version'])
                 raise
             self.ledger.set_profile(profile)
+            digest = getattr(self.backend, 'last_planned_digest', None)
+            if digest:
+                self.ledger.mark_publication_pending(apply_requested=True, approved_digest=digest)
             self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile

@@ -463,12 +463,12 @@ class Ledger:
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
-        placement_context: dict | None = None,
+        placement_context: dict | None = None, approved_digest: str | None = None,
     ) -> dict:
         """See :meth:`SqliteStore.mark_publication_pending`."""
         return self.store.mark_publication_pending(
             apply_requested=apply_requested, interrupted=interrupted,
-            placement_context=placement_context,
+            placement_context=placement_context, approved_digest=approved_digest,
         )
 
     def clear_placement_context(self) -> None:

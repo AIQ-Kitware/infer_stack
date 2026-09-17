@@ -2005,6 +2005,30 @@ class ComposeBackend(ConvergeScaffold):
 
     #: Digest of files an admission preview already had approved.
     _preapproved: str | None = None
+    #: Digest of the files the last render produced (approved-digest guard).
+    last_planned_digest: str | None = None
+
+    def pull_images(self) -> list[str]:
+        """Pull every image the current render inputs reference; return them.
+
+        ``config publish`` calls this so steady-state applies, which run under
+        the host-wide lock, never wait on a registry.
+        """
+        from .._log import logger
+
+        wanted = {'vllm': self.images['vllm']}
+        if self.litellm:
+            wanted['litellm'] = self.images['litellm']
+            if self.dynamic_routing:
+                wanted['postgres'] = self.images['postgres']
+        if self.ui:
+            wanted['open_webui'] = self.images['open_webui']
+        if self.reverse_proxy:
+            wanted['nginx'] = self.images['nginx']
+        for image in sorted(set(wanted.values())):
+            logger.info('docker pull {}', image)
+            self.run(['docker', 'pull', image])
+        return sorted(set(wanted.values()))
 
     def _approve_changes(self, planned: dict) -> None:
         if self._preapproved is not None and self._planned_digest(planned) == self._preapproved:
@@ -2294,6 +2318,7 @@ class ComposeBackend(ConvergeScaffold):
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
 
+            self.last_planned_digest = self._planned_digest(planned)
             self._approve_changes(planned)  # may raise ConvergeAborted
             # Only after approval: persist new addresses and the merged route
             # registry, then the files.

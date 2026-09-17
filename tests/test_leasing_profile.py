@@ -330,3 +330,51 @@ def test_config_publish_cli_publishes_a_union_and_rejects_conflicts(tmp_path, mo
     assert len(Ledger(SqliteStore(db)).profile()['catalogs']) == 2
     with pytest.raises(SystemExit, match='defined differently'):
         cl.ConfigPublishCLI.main(argv=['--ledger', db, str(fa), str(fc), '--yes'])
+
+
+# -- P4: approved digest and image pre-pull ------------------------------------------------
+
+
+def test_a_render_differing_from_the_approved_one_fails_closed_until_apply(tmp_path):   # 18
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    # A publication was approved, then (say) infer-stack was upgraded before it applied.
+    ledger.mark_publication_pending(apply_requested=True, approved_digest='digest-of-old-renderer')
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()
+    assert ledger.publication_pending()['approved_digest'] == 'digest-of-old-renderer'
+    ctl.apply_now()                                   # the explicit re-approval
+    assert ledger.publication_pending() is None
+
+
+def test_publish_pulls_images_first_and_a_failed_pull_publishes_nothing(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    pulled = []
+
+    class Pulls(ComposeBackend):
+        def pull_images(self):
+            pulled.append(dict(self.images))
+            if fail:
+                raise RuntimeError('manifest unknown')
+            return []
+
+    def make_backend(config, *, interactive=False):
+        return Pulls(state_dir=state, inventory=simulate_inventory('4x80'), run=FakeDocker(),
+                     http=FakeHttp(state), images=IMAGES, ports=PORTS, state=STATE)
+
+    monkeypatch.setattr(cl, '_make_backend', make_backend)
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    fail = True
+    with pytest.raises(SystemExit, match='image pull failed'):
+        cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes'])
+    assert Ledger(SqliteStore(db)).profile() is None
+    fail = False
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
+    assert len(pulled) == 2
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes', '--no-pull']) == 0
+    assert len(pulled) == 2

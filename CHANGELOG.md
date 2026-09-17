@@ -2,6 +2,17 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `config publish` pre-pulls images; approved renders are guarded (P4)
+
+- **Pre-pull.** `config publish` pulls every image the new profile references
+  before publishing, outside the lock, so steady-state applies never wait on a
+  registry. A failed pull publishes nothing; `--no-pull` skips the step.
+- **Approved-digest guard.** A publication records the digest of the render
+  the operator approved. If a later process renders something different
+  before that change is applied (for example infer-stack was upgraded in
+  between), the apply is refused and the change stays pending until
+  `infer-stack apply` re-approves it explicitly.
+
 ### Selective apply waits for health and for removals (review)
 
 - **Health-conditioned dependencies.** `up --no-deps` skips Compose's
