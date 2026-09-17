@@ -691,14 +691,13 @@ def test_a_reviving_renew_waits_for_an_in_flight_apply(tmp_path):
 
 
 def test_no_code_mutates_the_ledger_around_the_controller():
-    # Read-path sweeps are removed in a later P2 step; add `sweep` here then.
     import pathlib
     import re
 
     import infer_stack
 
     root = pathlib.Path(infer_stack.__file__).parent
-    pattern = re.compile(r'ledger\.(renew|release|evict_idle|prune|acquire)\(')
+    pattern = re.compile(r'ledger\.(renew|release|evict_idle|prune|acquire|sweep)\(')
     offenders = [
         f'{path.relative_to(root)}:{m.group(0)}'
         for path in root.rglob('*.py')

@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `routes seed` and `routes prune` publish through the controller
+
+Both commands used to write the route registry and then reconcile as two
+separate steps, outside the controller's lock. They now run as one serialised
+mutation through `Controller.publish_change`. `prune` still previews and
+confirms outside the lock. Under the lock it recomputes, and drops only routes
+that were confirmed and are still unneeded. Both report `publication_pending`
+in `--json`, and exit 3 if the apply did not fully take effect.
+
 ### Read-only views no longer write the ledger
 
 `leases`, `wait`, `measure`, `evict`'s target lookup, `apply --wait`'s view,

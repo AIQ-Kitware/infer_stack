@@ -992,3 +992,32 @@ def test_read_only_views_show_ttl_expiry_without_writing_the_ledger(env, capsys,
     assert digest() == before                                # ...never written
     leases, _ = Ledger(SqliteStore(env.db)).status()
     assert leases[0].state == 'active'
+
+
+def test_routes_seed_and_prune_publish_through_the_controller(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli.commands_leasing import RoutesPruneCLI, RoutesSeedCLI
+    from infer_stack.leasing import Controller
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    cat = tmp_path / 'a.yaml'
+    cat.write_text(yaml.safe_dump(_one_endpoint_catalog('alpha')))
+    _patch_backend(monkeypatch, state)
+    calls = []
+    real = Controller.publish_change
+
+    def spy(self, change):
+        calls.append(self._flock_depth)
+        # The registry must not be written before the controller runs the change.
+        before = (state / 'litellm_registry.json').exists()
+        result = real(self, change)
+        calls.append(before)
+        return result
+
+    monkeypatch.setattr(Controller, 'publish_change', spy)
+    assert RoutesSeedCLI.main(argv=['--ledger', db, str(cat), '--json']) == 0
+    assert calls == [0, False]
+    assert RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json']) == 0
+    from infer_stack.leasing import Ledger, SqliteStore
+    assert Ledger(SqliteStore(db)).publication_pending() is None

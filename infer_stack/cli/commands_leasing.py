@@ -2249,16 +2249,19 @@ class RoutesPruneCLI(_ApprovalMixin):
         controller = _open_controller(config, interactive=False)
         backend = _require_compose_backend(controller)
 
-        controller.ledger.sweep()
-        desired = controller.desired_deployments()
-        plan = backend.plan(desired)
-        keep: dict = {}
-        if backend.catalog is not None:
-            keep.update(_registry_incoming_from_catalog(backend.catalog))
-        keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+        def prune_plan() -> tuple[dict, dict, list[str]]:
+            desired = controller.desired_deployments()
+            plan = backend.plan(desired)
+            keep: dict = {}
+            if backend.catalog is not None:
+                keep.update(_registry_incoming_from_catalog(backend.catalog))
+            keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+            current = backend._load_route_registry().get('entries', {})
+            return current, keep, sorted(set(current) - set(keep))
 
-        current = backend._load_route_registry()
-        dropped = sorted(set(current.get('entries', {})) - set(keep))
+        # Preview outside the lock (the prompt must not hold it); the change
+        # itself is recomputed under the lock below.
+        _, keep, dropped = prune_plan()
         if not dropped:
             print('routes prune: nothing to drop (registry already minimal)')
             return 0
@@ -2277,21 +2280,35 @@ class RoutesPruneCLI(_ApprovalMixin):
             if not ok:
                 raise SystemExit('aborted: registry not pruned')
 
-        with backend._converge_lock():
-            backend._atomic_write(
-                backend._registry_file, _dump_route_registry(pruned)
-            )
+        confirmed = set(dropped)
+
+        def change():
+            # Under the lock: drop only routes that were confirmed AND are still
+            # unneeded now; anything that became needed meanwhile is kept. (No
+            # sweep: an expired-but-unswept deployment only keeps its routes.)
+            current, _, still = prune_plan()
+            drop = sorted(confirmed & set(still))
+            entries = {k: v for k, v in current.items() if k not in drop}
+            with backend._converge_lock():
+                backend._atomic_write(
+                    backend._registry_file,
+                    _dump_route_registry(
+                        {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}),
+                )
+            return drop, sorted(entries)
+
         try:
-            controller.reconcile(apply=True)
+            (dropped, kept), rec = controller.publish_change(change)
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
 
         if config.json:
-            print(json.dumps({'dropped': dropped, 'kept': sorted(keep)}, indent=2))
+            print(json.dumps({'dropped': dropped, 'kept': kept,
+                              'publication_pending': rec.publication_pending}, indent=2))
         else:
             print(f'routes prune: dropped {len(dropped)} route(s), '
-                  f'kept {len(keep)}')
-        return 0
+                  f'kept {len(kept)}')
+        return 3 if rec.publication_pending else 0
 
 
 class RoutesSeedCLI(_ApprovalMixin):
@@ -2346,24 +2363,27 @@ class RoutesSeedCLI(_ApprovalMixin):
                 'routes seed: the named catalog(s) resolved no routable endpoints'
             )
 
-        before = set(backend._load_route_registry().get('entries', {}))
-        backend.merge_route_registry(incoming)
+        def change():
+            before = set(backend._load_route_registry().get('entries', {}))
+            backend.merge_route_registry(incoming)
+            return sorted(set(incoming) - before)
+
         try:
-            controller.reconcile(apply=True)
+            added, rec = controller.publish_change(change)
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
-        added = sorted(set(incoming) - before)
 
         if config.json:
             print(json.dumps(
-                {'merged': sorted(incoming), 'added': added}, indent=2
+                {'merged': sorted(incoming), 'added': added,
+                 'publication_pending': rec.publication_pending}, indent=2
             ))
         else:
             print(
                 f'routes seed: merged {len(incoming)} route(s) '
                 f'({len(added)} new): {", ".join(added) or "(all already present)"}'
             )
-        return 0
+        return 3 if rec.publication_pending else 0
 
 
 class RoutesModalCLI(scfg.ModalCLI):

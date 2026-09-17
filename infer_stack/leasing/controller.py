@@ -932,6 +932,20 @@ class Controller:
             rec = self._publish()
         return ReleaseLeasesOutcome(released, missing, idled, list(evicted), rec)
 
+    def publish_change(self, change: Callable[[], object]) -> tuple[object, ReconcileResult]:
+        """Run ``change`` and publish, as one serialised desired-state mutation.
+
+        For changes to backend state that the render reads (the route registry,
+        via ``routes seed`` / ``routes prune``). ``change`` runs under the lock
+        after the marker is set, so a crash leaves it pending like any other
+        mutation. Returns ``(change's result, reconcile result)``.
+        """
+        with self._global_lock():
+            self._mark_pending(apply=True)
+            result = change()
+            rec = self._publish()
+        return result, rec
+
     def prune(self) -> tuple[int, int]:
         """Forget released/expired leases and stopped deployments, under the lock.
 
