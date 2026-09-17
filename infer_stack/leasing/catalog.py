@@ -272,6 +272,11 @@ class Catalog:
             models=models, endpoints=endpoints, hosts=hosts, bundles=bundles
         )
         catalog.validate()
+        # The mapping it was parsed from, so it can be published into a profile
+        # (see leasing/profile.py). Not a dataclass field: equality ignores it.
+        import copy
+
+        catalog.source = copy.deepcopy(data)
         return catalog
 
     @classmethod

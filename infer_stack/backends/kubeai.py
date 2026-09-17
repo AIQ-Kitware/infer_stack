@@ -368,6 +368,30 @@ class KubeaiBackend(ConvergeScaffold):
         self.apply()
         return None
 
+    def render_profile(self) -> dict:
+        """This backend's render inputs, as a publishable profile."""
+        from ..leasing.profile import PROFILE_VERSION
+
+        return {
+            'version': PROFILE_VERSION,
+            'backend': 'kubeai',
+            'namespace': self.namespace,
+            'base_url': self.base_url,
+            'resource_profile': self.default_resource_profile,
+        }
+
+    def use_profile(self, profile: dict) -> None:
+        if profile.get('backend') != 'kubeai':
+            from ..leasing.profile import ProfileMismatch
+
+            raise ProfileMismatch(
+                f"the published profile is for the {profile.get('backend')!r} backend; "
+                'run `infer-stack config publish` to change backends'
+            )
+        self.namespace = profile['namespace']
+        self.base_url = profile['base_url']
+        self.default_resource_profile = profile['resource_profile']
+
     def apply(self) -> None:
         """Converge the cluster to the last render: apply + prune.
 

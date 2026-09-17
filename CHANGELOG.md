@@ -2,6 +2,32 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Renders use a published profile; `infer-stack config publish`
+
+Lease operations no longer render from each caller's flags and settings.
+
+- **Frozen on first use.** The first mutation against a ledger freezes a
+  profile. It holds backend, project, gateway, UI, dynamic routing,
+  display-GPU policy, reverse proxy (a BYO nginx config is snapshotted by
+  content), image pins, ports, state paths, and the catalog union. Later
+  operations, including recoveries by other processes, render from it, and
+  warn once when their own settings differ.
+- **Acquire checks the published catalog.** An endpoint missing from the
+  published catalog union, or defined differently there, is refused before
+  anything is written, naming `config publish`. The CLI resolves endpoint names
+  from the published union, so a runbook can acquire any published endpoint
+  whatever `--catalog` it passes.
+- **`infer-stack config publish [catalog ...]`** replaces the profile, previews
+  the diff, and publishes. It merges several catalogs into one union
+  (identical definitions deduplicated, conflicting ones refused), and works
+  only while no lease is active and no deployment container exists.
+- **`--allowed-gpus` stays per caller.** An acquire stores it with its pending
+  change. If the acquire dies before its first render, the next operation
+  places that deployment within the original caller's GPUs.
+- **Upgrading.** On an existing host the next lease operation freezes the
+  current settings and catalog. If runbooks use different catalogs, run
+  `infer-stack config publish` with all of them while the stack is idle.
+
 ### Docker commands run with an explicit environment
 
 Every Docker command infer-stack runs now gets an allow-listed environment:

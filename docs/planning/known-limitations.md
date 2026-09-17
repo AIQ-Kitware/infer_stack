@@ -83,14 +83,28 @@ Publish catalog endpoints and global settings (gateway, UI, dynamic routing,
 reverse proxy, image pins) **before** a workload starts acquiring and releasing
 leases. Editing them while leases churn is not a supported operation.
 
-- Today every command reloads the catalog and settings (current), so a change
-  can take effect in the middle of a workload, including through an unrelated
-  `release`.
-- The redesign freezes them into a published profile that changes only through
-  an explicit publication.
+- **Frozen on the first operation (current).** The first lease operation
+  against a ledger freezes its resolved settings and catalog into a published
+  profile. Every later operation renders from that profile and warns if its own
+  flags or settings differ.
+- **Several runbooks' catalogs.** To acquire from more than one catalog on one
+  host, publish their union before leasing starts:
+  `infer-stack config publish a.yaml b.yaml`. A name defined differently in
+  two catalogs is refused.
+- **Changing the profile.** `config publish` works only while no lease is
+  active and no deployment container exists. Publishing while leases are live
+  is plan step P4.
 
 Hot catalog mutation, and merging a live catalog with a published one, are out
-of scope.
+of scope. `allowed_gpus` is not part of the profile: it stays per caller.
+
+### A queued acquire's GPU scope is not kept while it waits (current)
+
+An acquire records its `--allowed-gpus` scope with the pending change, and the
+next operation uses it if the acquire died before its first render. The scope is
+cleared after that first render, so an acquire that is *queued* for capacity
+(`--queue`) and then dies can later be placed by another caller within that
+caller's scope. Durable queued admission is plan step P6.
 
 ### Admission is first-come, not fair (design boundary)
 

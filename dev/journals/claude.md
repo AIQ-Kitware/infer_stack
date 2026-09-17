@@ -2852,3 +2852,44 @@ check outside the lock. The overlap test first failed for a reason unrelated to
 the lock: the other thread's sweep expired the lapsed lease before the renew
 ran. Real heartbeats that arrive after a sweep hit the same thing, and correctly
 get "re-acquire".
+
+## 2026-09-16 20:29:06 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** Finish P2 with the initial profile and the explicit Compose
+environment, after GPT reviewed my proposal. The user decided that concurrent
+catalogs must work, and that `HF_TOKEN` is taken from the managed `.env` only
+when the user puts it there.
+
+**What I did.** Two commits.
+- **Explicit Docker environment.** It covers the backend, `stack` commands and
+  the TUI; the TUI had its own unbounded runner, which now uses the shared one.
+- **The profile** (`leasing/profile.py`):
+  - `CatalogUnion` with strict conflicts;
+  - freezing on the first mutation in `Controller._sync_profile`, with one
+    drift warning per process;
+  - acquire validation before any write;
+  - `placement_context` in the marker for crashed acquires;
+  - a BYO nginx config snapshot;
+  - `Controller.publish_profile` plus `infer-stack config publish`, which
+    refuse unless quiescent.
+
+**Choices worth reviewing.**
+1. **Drift is judged per key.** For catalogs, "the invocation's catalog is a
+   subset of the union" counts as no drift, so each runbook passing its own
+   `--catalog` stays quiet.
+2. **A stack published without a catalog accepts any request**, as legacy
+   per-deployment routing. It is deterministic because those routes come from
+   the ledger.
+3. **The placement context is cleared right after the acquire's first
+   render**, not when the acquire finally places. A queued acquire that dies
+   loses its scope; that is documented as a P6 limitation.
+4. **`config publish` checks quiescence with virtual expiry before marking.**
+   That way a refused publish leaves no marker behind.
+
+**Reflection.** GPT's catch on `allowed_gpus` was the important one, and my
+proposal had it wrong. I listed it as a render input because the backend
+constructor takes it, without asking whose decision it is. The constructor's
+signature is a poor guide to what is host configuration. I checked who sets
+each input only after being told.

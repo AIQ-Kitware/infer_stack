@@ -244,14 +244,32 @@ class SqliteStore:
     #                    which must not start just because something reopened;
     #                    once True it stays True until cleared
 
+    def profile(self) -> dict | None:
+        """The published render profile, or ``None`` before the first mutation."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'profile'"
+        ).fetchone()
+        return json.loads(row['value']) if row else None
+
+    def set_profile(self, profile: dict) -> None:
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(profile, sort_keys=True),),
+            )
+
     def mark_publication_pending(
-        self, *, apply_requested: bool, interrupted: bool = False
+        self, *, apply_requested: bool, interrupted: bool = False,
+        placement_context: dict | None = None,
     ) -> dict:
         """Record that desired state is changing; return the marker written.
 
         Both flags only ever turn on until the marker is cleared.
         ``interrupted`` records that an apply was killed mid-flight, so the
         runtime may still be changing underneath the next one.
+        ``placement_context`` (an acquire's admission scope, e.g. its
+        ``allowed_gpus``) replaces any stored one; ``None`` keeps it.
         """
         with self.transaction():
             current = self._read_publication_pending()
@@ -261,6 +279,8 @@ class SqliteStore:
                 or bool(current and current['apply_requested']),
                 'interrupted': bool(interrupted)
                 or bool(current and current['interrupted']),
+                'placement_context': placement_context if placement_context is not None
+                else (current['placement_context'] if current else None),
             }
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('publication_pending', ?) "
@@ -293,7 +313,20 @@ class SqliteStore:
             'version': int(marker['version']),
             'apply_requested': bool(marker['apply_requested']),
             'interrupted': bool(marker.get('interrupted', False)),
+            'placement_context': marker.get('placement_context'),
         }
+
+    def clear_placement_context(self) -> None:
+        """Forget a pending acquire's scope once its render has pinned placement."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current['placement_context'] is None:
+                return
+            current['placement_context'] = None
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
+                (json.dumps(current, sort_keys=True),),
+            )
 
     # -- leases ------------------------------------------------------------
 

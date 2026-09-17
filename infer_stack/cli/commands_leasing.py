@@ -342,6 +342,21 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
         raise SystemExit(f'invalid catalog {path}: {ex}')
 
 
+def _requests_catalog(controller, config):
+    """The catalog endpoint names resolve against.
+
+    Once a profile is published, that is its catalog union (so a runbook can
+    acquire any published endpoint, whichever ``--catalog`` it passes).
+    Before, or when nothing was published, it is the invocation's catalog.
+    """
+    from ..leasing.profile import CatalogUnion
+
+    published = getattr(controller.backend, 'catalog', None)
+    if isinstance(published, CatalogUnion):
+        return published
+    return _load_catalog(config)
+
+
 def _resolve(catalog, names, *, sharing=None):
     try:
         return catalog.resolve_names(names, sharing=sharing)
@@ -588,6 +603,7 @@ def _emit_acquire(config, controller, outcome) -> int:
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     from .._log import logger
     from ..leasing.backend import ConvergeAborted, PlacementError
+    from ..leasing.profile import ProfileMismatch
 
     render_only = not bool(getattr(config, 'apply', True))
     # Staging (--no-apply) is non-destructive (no docker up), so don't gate it
@@ -605,7 +621,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         requests = [reservation_request(reserve_gpus)]
         names = [f'{reserve_gpus} gpu(s)']
     else:
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         names = _collect_names(config.names)
         if not names:
             raise SystemExit('give at least one endpoint or bundle name')
@@ -632,6 +648,8 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         )
     except ConvergeAborted:
         raise SystemExit('aborted: compose changes not applied (no lease kept)')
+    except ProfileMismatch as ex:
+        raise SystemExit(f'acquire: {ex}')
     except PlacementError as ex:
         lines = ['could not place every requested endpoint (no lease kept):']
         lines += [f'  {r}' for r in ex.reasons] or [
@@ -1356,7 +1374,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 'measure needs the compose backend '
                 '(the engine container log is the measurement source).'
             )
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         name = config.endpoint
         request = catalog.resolve_names([name])[0]
         if request.engine != 'vllm':
@@ -1585,8 +1603,10 @@ class RunCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
+        from ..leasing.profile import ProfileMismatch
+
         controller = _open_controller(config)
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         names = _collect_names(config.endpoint)
         command = list(config.command or [])
         if not names:
@@ -1594,15 +1614,18 @@ class RunCLI(_LeasingCommonMixin):
         if not command:
             raise SystemExit('run: give a command after --')
         requests = _resolve(catalog, names)
-        outcome = controller.acquire(
-            config.owner or _default_owner(),
-            requests,
-            ttl_seconds=_parse_duration(config.ttl),
-            wait=True,
-            timeout=float(config.timeout),
-            interval=float(config.interval),
-            wait_for_placement=bool(getattr(config, 'queue', False)),
-        )
+        try:
+            outcome = controller.acquire(
+                config.owner or _default_owner(),
+                requests,
+                ttl_seconds=_parse_duration(config.ttl),
+                wait=True,
+                timeout=float(config.timeout),
+                interval=float(config.interval),
+                wait_for_placement=bool(getattr(config, 'queue', False)),
+            )
+        except ProfileMismatch as ex:
+            raise SystemExit(f'run: {ex}')
         if outcome.wait is not None and not outcome.wait.ready:
             # The controller already released the lease on timeout
             # (released_on_timeout); just surface why we're not running.
@@ -2383,6 +2406,74 @@ class RoutesSeedCLI(_ApprovalMixin):
                 f'routes seed: merged {len(incoming)} route(s) '
                 f'({len(added)} new): {", ".join(added) or "(all already present)"}'
             )
+        return 3 if rec.publication_pending else 0
+
+
+class ConfigPublishCLI(_ApprovalMixin):
+    """Publish the render profile: settings, image pins and the catalog union.
+
+    Every lease operation renders from the published profile, never from the
+    caller's own flags or settings; the first operation froze one implicitly.
+    This replaces it, and only while the stack is quiescent (no active lease,
+    no deployment container). Pass every catalog that runbooks sharing this
+    host will use: endpoints are merged, identical definitions deduplicated,
+    and a name defined differently in two catalogs is refused.
+
+    Examples:
+        infer-stack config publish --catalog a.yaml
+        infer-stack config publish a.yaml b.yaml --ui --yes
+    """
+
+    __command__ = 'publish'
+
+    catalogs = scfg.Value(
+        [], nargs='*', position=1, type=str,
+        help='Catalog files to publish as one union (default: --catalog, or the '
+        'default-path catalog).',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import CatalogUnion, ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        render_profile = getattr(controller.backend, 'render_profile', None)
+        if render_profile is None:
+            raise SystemExit('config publish: this backend has no render profile')
+        # The profile this invocation resolves to, before the backend was
+        # switched to the published one (see Controller._sync_profile).
+        profile = controller._invocation_profile or render_profile()
+        paths = _collect_names(config.catalogs)
+        if paths:
+            sources = []
+            for raw in paths:
+                path = Path(raw).expanduser()
+                if not path.exists():
+                    raise SystemExit(f'catalog not found: {path}')
+                try:
+                    sources.append(Catalog.load(path).source)
+                except CatalogError as ex:
+                    raise SystemExit(f'invalid catalog {path}: {ex}')
+            profile = {**profile, 'catalogs': sources}
+        try:
+            if profile.get('catalogs'):
+                CatalogUnion.from_sources(profile['catalogs'])   # conflicts
+            rec = controller.publish_profile(profile)
+        except (ProfileMismatch, CatalogError) as ex:
+            raise SystemExit(f'config publish: {ex}')
+        except ConvergeAborted:
+            raise SystemExit('aborted: profile not published')
+        n = len(profile.get('catalogs') or [])
+        if config.json:
+            print(json.dumps({'published': True, 'catalogs': n,
+                              'publication_pending': rec.publication_pending}, indent=2))
+        else:
+            print(f'published the render profile ({profile.get("backend")}, {n} catalog(s))')
+            if rec.publication_pending:
+                print('  ! the apply did not fully take effect; retry `infer-stack apply`')
         return 3 if rec.publication_pending else 0
 
 

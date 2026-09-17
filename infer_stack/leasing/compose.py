@@ -1512,6 +1512,8 @@ class ComposeBackend(ConvergeScaffold):
         self.reverse_proxy = reverse_proxy
         self.reverse_proxy_port = reverse_proxy_port
         self.reverse_proxy_config = reverse_proxy_config
+        # Set by use_profile(): the published proxy config content.
+        self._profile_proxy_text: str | None = None
         # Retained for API/CLI compatibility but no longer consulted: probe_ready
         # always verifies a real generation now (the only trustworthy readiness).
         self.require_generation = require_generation
@@ -2387,6 +2389,130 @@ class ComposeBackend(ConvergeScaffold):
             )
             return False
         return True
+
+    # -- published profile (see leasing/profile.py) ---------------------------
+
+    REVERSE_PROXY_SNAPSHOT = 'reverse-proxy.conf'
+
+    def render_profile(self) -> dict[str, Any]:
+        """This backend's current render inputs, as a publishable profile.
+
+        ``allowed_gpus`` is deliberately absent: it is per-caller admission
+        scope, not host configuration. A BYO reverse-proxy config is captured
+        by content, so editing the file later cannot change a recovery.
+        """
+        from .profile import PROFILE_VERSION, catalog_sources
+
+        config_text = None
+        if self.reverse_proxy_config:
+            if self._profile_proxy_text is not None:
+                config_text = self._profile_proxy_text
+            else:
+                path = Path(self.reverse_proxy_config).expanduser()
+                try:
+                    config_text = path.read_text()
+                except OSError as ex:
+                    raise RuntimeError(
+                        f'reverse-proxy config {path} is unreadable: {ex}'
+                    ) from ex
+        return {
+            'version': PROFILE_VERSION,
+            'backend': 'compose',
+            'project': self.project,
+            'litellm': bool(self.litellm),
+            'ui': bool(self.ui),
+            'dynamic_routing': bool(self.dynamic_routing),
+            'skip_display': bool(self.skip_display),
+            'reverse_proxy': {
+                'enabled': bool(self.reverse_proxy),
+                'port': int(self.reverse_proxy_port),
+                'config_text': config_text,
+            },
+            'images': dict(sorted(self.images.items())),
+            'ports': dict(sorted(self.ports.items())),
+            'state': dict(sorted(self.state.items())),
+            'catalogs': catalog_sources(self.catalog),
+        }
+
+    def use_profile(self, profile: dict[str, Any]) -> None:
+        """Render from ``profile`` from now on, instead of this process's settings."""
+        from .profile import CatalogUnion
+
+        if profile.get('backend') != 'compose':
+            from .profile import ProfileMismatch
+
+            raise ProfileMismatch(
+                f"the published profile is for the {profile.get('backend')!r} backend; "
+                'run `infer-stack config publish` to change backends'
+            )
+        self.project = profile['project']
+        self.litellm = profile['litellm']
+        self.ui = profile['ui']
+        self.dynamic_routing = profile['dynamic_routing']
+        self.skip_display = profile['skip_display']
+        proxy = profile['reverse_proxy']
+        self.reverse_proxy = proxy['enabled']
+        self.reverse_proxy_port = proxy['port']
+        self._profile_proxy_text = proxy.get('config_text')
+        if self._profile_proxy_text is not None:
+            snapshot = self.state_dir / self.REVERSE_PROXY_SNAPSHOT
+            if not snapshot.exists() or snapshot.read_text() != self._profile_proxy_text:
+                self._ensure_state_dir()
+                self._atomic_write(snapshot, self._profile_proxy_text)
+            self.reverse_proxy_config = str(snapshot)
+        else:
+            self.reverse_proxy_config = None
+        self.images = dict(profile['images'])
+        self.ports = dict(profile['ports'])
+        self.state = dict(profile['state'])
+        sources = profile.get('catalogs') or []
+        self.catalog = CatalogUnion.from_sources(sources) if sources else None
+
+    def placement_context(self) -> dict[str, Any] | None:
+        """This caller's admission scope, stored with a pending acquire."""
+        if self.allowed_gpus is None:
+            return None
+        return {'allowed_gpus': list(self.allowed_gpus)}
+
+    def placement_scope(self, context: dict[str, Any] | None):
+        """Temporarily render with another caller's admission scope."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            saved = self.allowed_gpus
+            if context and 'allowed_gpus' in context:
+                self.allowed_gpus = context['allowed_gpus']
+            try:
+                yield
+            finally:
+                self.allowed_gpus = saved
+
+        return scope()
+
+    def validate_requests(self, requests) -> None:
+        """Refuse requests the published catalog union does not define identically."""
+        from .models import RESERVED_ENGINE
+        from .profile import CatalogUnion, ProfileMismatch
+
+        union = self.catalog
+        if not isinstance(union, CatalogUnion):
+            return          # no published catalog: legacy per-deployment routes
+        for req in requests:
+            if req.engine == RESERVED_ENGINE:
+                continue
+            if req.endpoint not in union.endpoints:
+                raise ProfileMismatch(
+                    f'endpoint {req.endpoint!r} is not in the published catalog; '
+                    'publish it first with `infer-stack config publish --catalog ...` '
+                    '(while no leases are active)'
+                )
+            if not union.request_matches(req):
+                raise ProfileMismatch(
+                    f'endpoint {req.endpoint!r} differs from its published definition '
+                    '(the catalog changed since it was published); run '
+                    '`infer-stack config publish` while no leases are active'
+                )
 
     def settle_snapshot(self) -> tuple[tuple[str, str], ...]:
         """Every container of this Compose project as sorted ``(id, state)`` pairs.

@@ -172,6 +172,13 @@ class Controller:
         self._tlock = threading.RLock()
         self._flock_handle = None
         self._flock_depth = 0
+        # Published profile (see leasing/profile.py): this process's own
+        # resolved settings, captured before the backend is switched to the
+        # published copy, and the copy the backend currently renders from.
+        self._invocation_profile: dict | None = None
+        self._applied_profile: dict | None = None
+        self._profile_drift_warned = False
+        self._sync_profile(create=False)
 
     # -- cross-process lock ------------------------------------------------
 
@@ -500,15 +507,80 @@ class Controller:
     # A crash or failure anywhere leaves the marker set, and the next applying
     # operation re-renders and applies the whole pending desired state.
 
-    def _mark_pending(self, *, apply: bool) -> dict:
+    def _sync_profile(self, *, create: bool) -> None:
+        """Make the backend render from the published profile.
+
+        With ``create`` (every mutation, under the lock), a ledger without a
+        profile gets this invocation's resolved settings frozen as the initial
+        one. Settings that differ from the published profile are ignored, with
+        one warning per process. Backends without a profile (null, test fakes)
+        are left alone.
+        """
+        from .._log import logger
+        from .profile import profile_drift
+
+        render = getattr(self.backend, 'render_profile', None)
+        use = getattr(self.backend, 'use_profile', None)
+        read = getattr(self.ledger, 'profile', None)
+        if render is None or use is None or read is None:
+            return
+        stored = read()
+        if stored is None and not create:
+            return
+        if self._invocation_profile is None:
+            self._invocation_profile = render()
+        if stored is None:
+            stored = self._invocation_profile
+            self.ledger.set_profile(stored)
+            logger.info(
+                'Froze the initial render profile ({} backend, {} catalog(s)); '
+                'change it with `infer-stack config publish` while no leases are active',
+                stored.get('backend'), len(stored.get('catalogs') or []),
+            )
+        elif not self._profile_drift_warned:
+            drift = profile_drift(stored, self._invocation_profile)
+            if drift:
+                self._profile_drift_warned = True
+                logger.warning(
+                    'Settings differ from the published profile ({}); rendering '
+                    'from the published profile. Change it with `infer-stack '
+                    'config publish` while no leases are active.', ', '.join(drift),
+                )
+        if stored != self._applied_profile:
+            use(stored)
+            self._applied_profile = stored
+
+    def _mark_pending(
+        self, *, apply: bool, placement_context: dict | None = None,
+    ) -> dict:
         """Record that desired state is about to change (caller holds the lock).
 
         Written before the ledger mutation, so a crash between the two leaves at
         worst a redundant marker, never a mutation without one. ``apply`` only
         ever turns ``apply_requested`` on: a staged change never cancels an
         apply already requested (promotion, see the plan's D23).
+
+        If an earlier acquire died between committing and its first render, its
+        placement scope is still in the marker: render once with that scope
+        first, so its deployment is placed where that caller was allowed.
         """
-        return self.ledger.mark_publication_pending(apply_requested=apply)
+        self._sync_profile(create=True)
+        current = self.ledger.publication_pending()
+        if current and current.get('placement_context'):
+            self._render_in_scope(current['placement_context'])
+        return self.ledger.mark_publication_pending(
+            apply_requested=apply, placement_context=placement_context,
+        )
+
+    def _render_in_scope(self, context: dict) -> None:
+        """Render with another caller's admission scope, then forget the scope."""
+        from .backend import ConvergeAborted
+
+        scope = getattr(self.backend, 'placement_scope', None)
+        if scope is not None:
+            with scope(context), contextlib.suppress(ConvergeAborted):
+                self._render()
+        self.ledger.clear_placement_context()
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
         """Apply the last render if the marker requests it; clear on success.
@@ -797,12 +869,23 @@ class Controller:
         # can change the files this apply reads. The readiness wait and the
         # admission-queue sleep stay OUTSIDE the lock.
         with self._global_lock():
-            self._mark_pending(apply=apply)
+            self._sync_profile(create=True)
+            validate = getattr(self.backend, 'validate_requests', None)
+            if validate is not None:
+                validate(requests)          # before anything is written
+            context = getattr(self.backend, 'placement_context', lambda: None)()
+            self._mark_pending(apply=apply, placement_context=context)
             result = self.ledger.acquire(
                 owner, requests, ttl_seconds=ttl_seconds
             )
             try:
-                rec = self._render()
+                try:
+                    rec = self._render()
+                finally:
+                    # Rendered (placement pinned) or about to roll back: either
+                    # way a recovery no longer needs this caller's scope.
+                    if context is not None:
+                        self.ledger.clear_placement_context()
             except ConvergeAborted:
                 # The operator declined the compose changes -- don't leave the
                 # just-created lease dangling in the ledger.
@@ -945,6 +1028,60 @@ class Controller:
             result = change()
             rec = self._publish()
         return result, rec
+
+    def publish_profile(self, profile: dict) -> ReconcileResult:
+        """Replace the published profile and publish, while the stack is quiescent.
+
+        Refuses (:class:`~infer_stack.leasing.profile.ProfileMismatch`) with any
+        ACTIVE lease or any deployment container, including warm idle ones:
+        changing render inputs under a running workload is out of scope until
+        live publication (plan step P4). The new profile's render is previewed
+        through the backend's usual diff approval before the profile is stored;
+        a declined or failed render stores nothing.
+        """
+        from .profile import ProfileMismatch
+        from .residency import ResidencyUnknown
+
+        use = getattr(self.backend, 'use_profile', None)
+        if use is None:
+            raise ProfileMismatch('this backend has no publishable profile')
+        with self._global_lock():
+            leases, _ = self.ledger.status(virtual_expiry=True)
+            active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+            if active:
+                raise ProfileMismatch(
+                    f'config publish needs a quiescent stack: {len(active)} active '
+                    f'lease(s) ({", ".join(active[:3])}); release them first'
+                )
+            residency = getattr(self.backend, 'residency', None)
+            if residency is not None:
+                try:
+                    snap = residency()
+                except ResidencyUnknown as ex:
+                    raise ProfileMismatch(
+                        f'config publish cannot confirm the stack is quiescent: {ex}'
+                    ) from ex
+                running = sorted({c.deployment_id for c in snap.all_containers()})
+                if running:
+                    raise ProfileMismatch(
+                        'config publish needs a quiescent stack: deployment '
+                        f'container(s) exist for {", ".join(running[:3])}; '
+                        '`infer-stack evict --all` first'
+                    )
+            self._mark_pending(apply=True)
+            previous = self._applied_profile
+            use(profile)
+            try:
+                rec = self._render()
+            except BaseException:
+                if previous is not None:
+                    use(previous)
+                raise
+            self.ledger.set_profile(profile)
+            self._applied_profile = profile
+            self._invocation_profile = profile
+            self._profile_drift_warned = False
+            return self._apply_pending(rec)
 
     def prune(self) -> tuple[int, int]:
         """Forget released/expired leases and stopped deployments, under the lock.

@@ -581,6 +581,9 @@ class ConfigEditCLI(_PathOverridesMixin):
         return 0
 
 
+from .commands_leasing import ConfigPublishCLI  # noqa: E402
+
+
 class ConfigModalCLI(scfg.ModalCLI):
     """Inspect + manage infer-stack configuration (paths + durable settings)."""
 
@@ -592,3 +595,4 @@ class ConfigModalCLI(scfg.ModalCLI):
     set = ConfigSetCLI
     get = ConfigGetCLI
     edit = ConfigEditCLI
+    publish = ConfigPublishCLI
