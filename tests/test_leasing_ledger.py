@@ -38,6 +38,26 @@ def _id_factory():
     return factory
 
 
+def test_store_finalizer_closes_sqlite_connection_without_resource_warning(tmp_path):
+    import gc
+    import warnings
+
+    def open_and_drop_store():
+        SqliteStore(tmp_path / 'finalizer.db')
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', ResourceWarning)
+        open_and_drop_store()
+        gc.collect()
+
+    leaked = [
+        w for w in caught
+        if isinstance(w.message, ResourceWarning)
+        and 'unclosed database' in str(w.message)
+    ]
+    assert leaked == []
+
+
 @pytest.fixture
 def ledger():
     return Ledger(

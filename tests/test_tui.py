@@ -1045,7 +1045,7 @@ def test_tui_api_tester_respects_completions_protocol():
 def test_tui_api_lists_only_ready_models():
     from textual.widgets import Select
 
-    from infer_stack.tui import InferStackTUI
+    from infer_stack.tui import SELECT_BLANK, InferStackTUI
 
     controller, catalog = _ctx()
 
@@ -1057,7 +1057,7 @@ def test_tui_api_lists_only_ready_models():
             # NullBackend observes nothing running -> no ready models listed,
             # even though the catalog has endpoints.
             assert app._ready_endpoints == []
-            assert app.query_one('#api-model', Select).value is Select.NULL
+            assert app.query_one('#api-model', Select).value is SELECT_BLANK
 
     _run(scenario)
 

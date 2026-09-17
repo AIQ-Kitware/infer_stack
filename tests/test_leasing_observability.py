@@ -56,9 +56,12 @@ def test_the_health_view_never_writes(tmp_path):
     ledger.clock.now += 100                        # expired, unswept
     watcher = sqlite3.connect(str(tmp_path / 'ledger.db'))
     before = watcher.execute('PRAGMA data_version').fetchone()[0]
-    state = ctl.observe_state()
-    assert state['expired_unswept']
-    assert watcher.execute('PRAGMA data_version').fetchone()[0] == before
+    try:
+        state = ctl.observe_state()
+        assert state['expired_unswept']
+        assert watcher.execute('PRAGMA data_version').fetchone()[0] == before
+    finally:
+        watcher.close()
 
 
 def test_a_refusal_names_the_contested_gpus_and_their_holders(tmp_path):

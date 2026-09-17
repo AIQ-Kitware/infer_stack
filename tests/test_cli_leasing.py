@@ -1001,14 +1001,17 @@ def test_read_only_views_show_ttl_expiry_without_writing_the_ledger(env, capsys,
     def digest():
         return watcher.execute('PRAGMA data_version').fetchone()[0]
 
-    before = digest()
-    data = _leases_json(env, capsys)
-    assert data['leases'][0]['state'] == 'expired'           # shown...
-    assert data['deployments'][0]['state'] == 'idle'
-    WaitCLI.main(argv=['--ledger', env.db, '--timeout', '0'])
-    assert digest() == before                                # ...never written
-    leases, _ = Ledger(SqliteStore(env.db)).status()
-    assert leases[0].state == 'active'
+    try:
+        before = digest()
+        data = _leases_json(env, capsys)
+        assert data['leases'][0]['state'] == 'expired'       # shown...
+        assert data['deployments'][0]['state'] == 'idle'
+        WaitCLI.main(argv=['--ledger', env.db, '--timeout', '0'])
+        assert digest() == before                            # ...never written
+        leases, _ = Ledger(SqliteStore(env.db)).status()
+        assert leases[0].state == 'active'
+    finally:
+        watcher.close()
 
 
 def test_routes_seed_and_prune_publish_through_the_controller(tmp_path, monkeypatch, capsys):

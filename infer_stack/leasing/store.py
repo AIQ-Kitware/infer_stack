@@ -185,7 +185,29 @@ class SqliteStore:
                     raise
 
     def close(self) -> None:
+        """Close the owned sqlite connection. Safe to call more than once."""
         self._conn.close()
+
+    def __enter__(self) -> 'SqliteStore':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Python 3.13 warns when a sqlite3.Connection reaches GC unclosed.
+        # SqliteStore owns its connection, so make that ownership real even
+        # for short-lived CLI/read-only helpers that do not need an explicit
+        # lifecycle block. Explicit close()/context-manager use remains
+        # preferable where a deterministic boundary is convenient.
+        conn = getattr(self, '_conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                # Finalizers must never turn interpreter shutdown into an
+                # unraisable exception. Normal close() still surfaces errors.
+                pass
 
     # -- transactions ------------------------------------------------------
 

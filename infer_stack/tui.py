@@ -77,6 +77,17 @@ ENGINE_SERVICES = '\x00engines'
 GATEWAY_SERVICE_HINT = 'litellm'
 
 
+# Textual renamed the blank Select sentinel from ``NULL`` to ``BLANK``.
+# Keep the TUI compatible with both API generations instead of pinning the
+# entire project to one Textual minor release. Identity comparison is required
+# because the sentinel is not a user value.
+SELECT_BLANK = getattr(Select, 'BLANK', getattr(Select, 'NULL', None))
+
+
+def _select_is_blank(value: object) -> bool:
+    return value is SELECT_BLANK
+
+
 def is_gateway_service(name: str) -> bool:
     """Is this compose service the LiteLLM gateway rather than an engine?"""
     return GATEWAY_SERVICE_HINT in str(name).lower()
@@ -285,7 +296,7 @@ class _AddEndpointScreen(ModalScreen):
             if model_opts:
                 yield Select(model_opts, prompt='model…', id='e-model',
                              value=cur_model if cur_model in self._models
-                             else Select.NULL)
+                             else SELECT_BLANK)
             else:
                 yield Input(value=cur_model or '', placeholder='model name',
                             id='e-model-text')
@@ -339,7 +350,7 @@ class _AddEndpointScreen(ModalScreen):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == 'e-engine':
-            engine = 'vllm' if event.value is Select.NULL else str(event.value)
+            engine = 'vllm' if _select_is_blank(event.value) else str(event.value)
             self._show_engine(engine)
 
     def _show_engine(self, engine: str) -> None:
@@ -366,7 +377,7 @@ class _AddEndpointScreen(ModalScreen):
             return
         try:
             value = self.query_one('#e-model', Select).value
-            model = '' if value is Select.NULL else str(value)
+            model = '' if _select_is_blank(value) else str(value)
         except Exception:  # noqa: BLE001 - free-text fallback when no models yet
             model = self.query_one('#e-model-text', Input).value.strip()
         if not model:
@@ -1057,7 +1068,7 @@ class InferStackTUI(App):
             return
         self._ready_endpoints = names
         select = self.query_one('#api-model', Select)
-        current = None if select.value is Select.NULL else select.value
+        current = None if _select_is_blank(select.value) else select.value
         select.set_options([(n, n) for n in names])
         if current in names:
             select.value = current
@@ -1509,7 +1520,7 @@ class InferStackTUI(App):
             return
         if event.select.id != 'logsvc':
             return
-        service = '' if event.value is Select.NULL else str(event.value)
+        service = '' if _select_is_blank(event.value) else str(event.value)
         if service != self._log_service:
             self._log_service = service
             self._restart_logs(service)
@@ -2368,7 +2379,7 @@ class InferStackTUI(App):
 
     def _selected_api_model(self) -> str | None:
         value = self.query_one('#api-model', Select).value
-        return None if value is Select.NULL else str(value)
+        return None if _select_is_blank(value) else str(value)
 
     def action_api_send(self) -> None:
         model = self._selected_api_model()
