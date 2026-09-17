@@ -938,8 +938,7 @@ class ApplyCLI(_ApprovalMixin):
             raise SystemExit('aborted: compose changes not applied')
         result = None
         if config.wait:
-            controller.ledger.sweep()
-            _, deployments = controller.ledger.status()
+            _, deployments = controller.ledger.status(virtual_expiry=True)
             live = [g for g in deployments if g.state == DeploymentState.LIVE]
             if live:
                 result = controller.wait_ready(
@@ -1085,8 +1084,7 @@ def _resolve_idle_targets(controller, names: list[str]) -> tuple[list[str], list
 
     Returns ``(target_deployment_ids, unmatched_names)``.
     """
-    controller.ledger.sweep()
-    _, deployments = controller.ledger.status()
+    _, deployments = controller.ledger.status(virtual_expiry=True)
     idle = [g for g in deployments if g.state == DeploymentState.IDLE]
     wanted = set(names)
     targets, matched = [], set()
@@ -1247,8 +1245,7 @@ class WaitCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        controller.ledger.sweep()
-        _, deployments = controller.ledger.status()
+        _, deployments = controller.ledger.status(virtual_expiry=True)
         live = [g for g in deployments if g.state == DeploymentState.LIVE]
         names = _collect_names(config.names)
         if names:
@@ -1368,8 +1365,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 f'({name} is {request.engine}).'
             )
 
-        controller.ledger.sweep()
-        _, deployments = controller.ledger.status()
+        _, deployments = controller.ledger.status(virtual_expiry=True)
         live = [
             g for g in deployments
             if g.state == DeploymentState.LIVE
@@ -1779,8 +1775,7 @@ class LeasesCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        controller.ledger.sweep()  # materialize TTL expiry for an accurate view
-        leases, deployments = controller.ledger.status()
+        leases, deployments = controller.ledger.status(virtual_expiry=True)
         observed, assignments = _placement_view(controller)
         if config.json:
             print(
@@ -2133,8 +2128,7 @@ def _require_compose_backend(controller):
 
 def _live_endpoints(controller) -> set[str]:
     """Endpoint aliases served by a currently-live deployment (for annotation)."""
-    controller.ledger.sweep()
-    _, deployments = controller.ledger.status()
+    _, deployments = controller.ledger.status(virtual_expiry=True)
     return {
         ep
         for g in deployments

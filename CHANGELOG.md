@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Read-only views no longer write the ledger
+
+`leases`, `wait`, `measure`, `evict`'s target lookup, `apply --wait`'s view,
+route annotation and TUI polling used to call `sweep()`, which writes TTL
+expiry into the ledger outside the controller's lock. They now read
+`Ledger.status(virtual_expiry=True)` instead. It reports a lease past its TTL
+as `expired`, and a deployment left without a protecting lease as `idle`,
+without writing either. Expiry is recorded only by controller operations,
+including `gc`.
+
 ### Releases and cleanup go through the controller
 
 `infer-stack release` (single, `--all`, `--evict`) and the TUI's release,

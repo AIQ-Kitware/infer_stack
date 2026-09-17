@@ -297,10 +297,35 @@ class Ledger:
             deployment_states=(DeploymentState.STOPPED,),
         )
 
-    def status(self) -> tuple[list[Lease], list[Deployment]]:
-        """Snapshot for ``infer-stack status`` (leases, deployments-with-demand)."""
+    def status(
+        self, *, virtual_expiry: bool = False
+    ) -> tuple[list[Lease], list[Deployment]]:
+        """Snapshot for ``infer-stack status`` (leases, deployments-with-demand).
+
+        ``virtual_expiry`` shows TTL expiry without writing it: an ACTIVE lease
+        past its TTL is reported EXPIRED, and a LIVE deployment with no
+        protecting lease is reported IDLE -- what :meth:`sweep` would record.
+        Read-only views use it; only controller operations sweep.
+        """
+        import dataclasses
+
         now = self.clock()
-        return self.store.list_leases(), self.store.list_deployments(now=now)
+        leases = self.store.list_leases()
+        deployments = self.store.list_deployments(now=now)
+        if virtual_expiry:
+            leases = [
+                dataclasses.replace(le, state=LeaseState.EXPIRED)
+                if le.state == LeaseState.ACTIVE and not le.is_protecting(now)
+                else le
+                for le in leases
+            ]
+            deployments = [
+                dataclasses.replace(g, state=DeploymentState.IDLE)
+                if g.state == DeploymentState.LIVE and g.demand == 0
+                else g
+                for g in deployments
+            ]
+        return leases, deployments
 
     # -- generation (legacy, see store; superseded by the publication marker) --
 

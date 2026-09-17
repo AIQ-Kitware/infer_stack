@@ -1097,8 +1097,7 @@ class InferStackTUI(App):
         expensive ``ps`` / nvidia-smi calls stop.
         """
         try:
-            self.controller.ledger.sweep()
-            leases, deployments = self.controller.ledger.status()
+            leases, deployments = self.controller.ledger.status(virtual_expiry=True)
             # The always-on expense was re-running observe()/plan() (a
             # `docker compose ps` + placement compute) on *every* tick. The
             # ledger above is cheap and drives the visible refresh; the docker
@@ -1184,8 +1183,7 @@ class InferStackTUI(App):
         compose ps` (which used to freeze the very first frame)."""
         self._sync_pane_state()
         try:
-            self.controller.ledger.sweep()
-            leases, deployments = self.controller.ledger.status()
+            leases, deployments = self.controller.ledger.status(virtual_expiry=True)
         except Exception as ex:  # noqa: BLE001 - first paint must not crash mount
             self._status(f'refresh error: {ex}')
             return
