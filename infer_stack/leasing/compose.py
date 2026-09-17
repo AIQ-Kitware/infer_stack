@@ -206,6 +206,51 @@ class SelectiveApplyOutcome:
     orphans: list[str]
 
 
+def profile_images(profile: dict[str, Any]) -> list[str]:
+    """Every image a Compose profile can need, so publication pulls them all.
+
+    Infrastructure images for what the profile enables, plus the engine image
+    of every endpoint reachable from its published catalogs, including
+    per-endpoint image overrides. With no catalog any vLLM request is possible,
+    so the default vLLM image is included.
+
+    Example:
+        >>> p = {'images': {'vllm': 'v', 'ollama': 'o', 'litellm': 'l', 'postgres': 'p',
+        ...                 'open_webui': 'w', 'nginx': 'n'},
+        ...      'litellm': True, 'dynamic_routing': True, 'ui': False,
+        ...      'reverse_proxy': {'enabled': False}, 'catalogs': []}
+        >>> profile_images(p)
+        ['l', 'p', 'v']
+    """
+    from .profile import CatalogUnion
+
+    images = profile['images']
+    wanted: set[str] = set()
+    if profile.get('litellm'):
+        wanted.add(images['litellm'])
+        if profile.get('dynamic_routing'):
+            wanted.add(images['postgres'])
+        if (profile.get('reverse_proxy') or {}).get('enabled'):
+            wanted.add(images['nginx'])
+    if profile.get('ui'):
+        wanted.add(images['open_webui'])
+    sources = profile.get('catalogs') or []
+    if not sources:
+        wanted.add(images['vllm'])
+        return sorted(wanted)
+    union = CatalogUnion.from_sources(sources)
+    for name in union.endpoints:
+        try:
+            req = union.resolve_endpoint(name)
+        except Exception:  # noqa: BLE001 - an unresolvable endpoint serves nothing
+            continue
+        if req.engine == 'vllm':      # same sources the render uses
+            wanted.add((req.spec.get('runtime') or {}).get('image') or images['vllm'])
+        elif req.engine == 'ollama':
+            wanted.add(req.spec.get('image') or images['ollama'])
+    return sorted(wanted)
+
+
 def _network_name() -> str:
     from .network import NETWORK_NAME
 
@@ -1940,9 +1985,10 @@ class ComposeBackend(ConvergeScaffold):
         then does not ask again as long as it produces the same files.
         """
         docs = self._render_documents(list(desired), placement)
+        self.last_preview_digest = self._planned_digest(docs['planned'])
         if approve:
             self._approve_changes(docs['planned'])
-            self._preapproved = self._planned_digest(docs['planned'])
+            self._preapproved = self.last_preview_digest
         return docs['plan'], docs['rendered']
 
     def _render_documents(self, desired: list[Deployment], placement) -> dict[str, Any]:
@@ -2007,28 +2053,17 @@ class ComposeBackend(ConvergeScaffold):
     _preapproved: str | None = None
     #: Digest of the files the last render produced (approved-digest guard).
     last_planned_digest: str | None = None
+    #: Digest of the files the last preview produced.
+    last_preview_digest: str | None = None
 
-    def pull_images(self) -> list[str]:
-        """Pull every image the current render inputs reference; return them.
-
-        ``config publish`` calls this so steady-state applies, which run under
-        the host-wide lock, never wait on a registry.
-        """
+    def pull_images(self, images) -> list[str]:
+        """Pull ``images``; ``config publish`` passes :func:`profile_images`."""
         from .._log import logger
 
-        wanted = {'vllm': self.images['vllm']}
-        if self.litellm:
-            wanted['litellm'] = self.images['litellm']
-            if self.dynamic_routing:
-                wanted['postgres'] = self.images['postgres']
-        if self.ui:
-            wanted['open_webui'] = self.images['open_webui']
-        if self.reverse_proxy:
-            wanted['nginx'] = self.images['nginx']
-        for image in sorted(set(wanted.values())):
+        for image in sorted(set(images)):
             logger.info('docker pull {}', image)
             self.run(['docker', 'pull', image])
-        return sorted(set(wanted.values()))
+        return sorted(set(images))
 
     def _approve_changes(self, planned: dict) -> None:
         if self._preapproved is not None and self._planned_digest(planned) == self._preapproved:

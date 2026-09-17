@@ -127,3 +127,58 @@ def test_an_unmanaged_holder_of_a_service_address_blocks_it(tmp_path):          
     docker.add_container('squatter', labels={}, ips=['10.123.45.2'])
     with pytest.raises(ApplyAborted, match='holds address'):
         acquire(ctl, 'one')
+
+
+def test_a_declined_migration_changes_nothing(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    ledger, ctl, _ = make(tmp_path)
+    ctl.network_migrate(SUBNET)
+    acquire(ctl, 'one')
+    table = ledger.service_addresses()
+
+    def decline(planned):
+        raise ConvergeAborted('no')
+
+    ctl.backend._approve_changes = decline
+    with pytest.raises(ConvergeAborted):
+        ctl.network_migrate('10.123.46.0/28', force=True)
+    assert ledger.network_config() == {'subnet': SUBNET}
+    assert ledger.service_addresses() == table
+    assert ledger.publication_pending() is None
+
+
+def test_subnet_switch_and_address_reset_are_one_transaction(tmp_path):
+    from infer_stack.leasing import Ledger, SqliteStore
+
+    store = SqliteStore(str(tmp_path / 'l.db'))
+    ledger = Ledger(store)
+    ledger.set_network_config({'subnet': SUBNET})
+    ledger.add_service_addresses({'a': '10.123.45.2'})
+    real = store._write_marker
+
+    def crash(**kw):
+        raise KeyboardInterrupt('killed inside the transaction')
+
+    store._write_marker = crash
+    with pytest.raises(KeyboardInterrupt):
+        store.migrate_network(subnet='10.123.46.0/28', reset_addresses=True, approved_digest='d')
+    store._write_marker = real
+    assert ledger.network_config() == {'subnet': SUBNET}          # all or nothing
+    assert ledger.service_addresses() == {'a': '10.123.45.2'}
+
+
+def test_remigrating_ignores_the_route_our_own_network_creates(monkeypatch):
+    import infer_stack.leasing.network as net
+
+    class Routes:
+        stdout = '10.123.45.0/28 dev br-abc proto kernel scope link\n'
+
+    monkeypatch.setattr(net.subprocess, 'run', lambda *a, **k: Routes())
+
+    def run(args, **kw):
+        if args[:3] == ['docker', 'network', 'ls']:
+            return 'n1\n'
+        return json.dumps([{'Name': NETWORK_NAME, 'IPAM': {'Config': [{'Subnet': SUBNET}]}}])
+
+    assert overlapping_subnets(SUBNET, run) == []

@@ -189,6 +189,7 @@ class Controller:
         # Set only by apply_now(): the operator explicitly re-approves a render
         # that differs from an earlier approved digest.
         self._explicit_apply = False
+        self._admission_digest: str | None = None
         from .profile import ProfileMismatch
 
         try:
@@ -637,11 +638,25 @@ class Controller:
             if clash:
                 raise ProfileMismatch(f'subnet {subnet} overlaps: {"; ".join(clash)}')
             current = self.ledger.network_config()
-            self._mark_pending(apply=True)
-            if current is not None and current['subnet'] != subnet:
-                with self.ledger.store.transaction():
-                    self.ledger.store._conn.execute('DELETE FROM service_addresses')
-            self.ledger.set_network_config({'subnet': subnet})
+            reset = current is not None and current['subnet'] != subnet
+            # Preview the migrated render and take approval BEFORE any write:
+            # a declined migration must leave the subnet and addresses as they were.
+            self._sync_profile(create=True)
+            residency = self.backend.residency()
+            saved = self.backend.network
+            self.backend.network = {
+                'subnet': subnet,
+                'addresses': {} if reset else self.ledger.service_addresses(),
+            }
+            try:
+                desired, inputs = self._admission_view(residency)
+                self.backend.preview(desired, inputs, approve=True)
+            finally:
+                self.backend.network = saved
+            self.ledger.store.migrate_network(
+                subnet=subnet, reset_addresses=reset,
+                approved_digest=getattr(self.backend, 'last_preview_digest', None),
+            )
             return self._publish()
 
     def observe_state(self) -> dict:
@@ -859,7 +874,11 @@ class Controller:
         # aliases it would change).
         for gid in overlay.deployments:
             if gid in unresolved:
-                continue          # already LIVE and unresolved: not re-placed, not new
+                reasons.append(
+                    f'deployment {gid} is an unresolved pre-allocation deployment and '
+                    'cannot accept new demand; release its existing lease first'
+                )
+                continue
             if gid in plan.degraded:
                 reasons.append(f'{gid}: its GPUs are no longer available')
             elif gid not in plan.assignments:
@@ -875,10 +894,14 @@ class Controller:
             holders = self._gpu_holders(plan)
             if holders:
                 reasons.append('GPUs held by admitted demand: ' + '; '.join(holders))
+        self._admission_digest = None
         if not reasons:
             # Approval happens now, before anything is committed; the render
             # after the commit produces the same files and does not ask again.
+            # Its digest goes into the pending marker, so a recovery after a
+            # crash (and perhaps an upgrade) cannot apply something else.
             self.backend.preview(desired, inputs, approve=True)
+            self._admission_digest = getattr(self.backend, 'last_preview_digest', None)
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
         return allocations, reasons
@@ -1038,6 +1061,10 @@ class Controller:
                 apply_requested=True, interrupted=not isinstance(ex, ApplyAborted))
             rec.publication_pending = True
             raise
+        if approved:
+            # The approved render reached Docker; a retry for routes (or any
+            # later change) renders from newer state and needs no re-approval.
+            self.ledger.store.clear_approved_digest()
         after = set(self.backend.observe())
         rec.realized = sorted(set(rec.realized) | (after - before))
         rec.torn_down = sorted(set(rec.torn_down) | (before - after))
@@ -1422,6 +1449,9 @@ class Controller:
                     # scope needs recording for recovery.
                     context = None
                     self._mark_pending(apply=apply)
+                    if self._admission_digest:
+                        self.ledger.mark_publication_pending(
+                            apply_requested=apply, approved_digest=self._admission_digest)
                     try:
                         result = self.ledger.acquire(
                             owner, requests, ttl_seconds=ttl_seconds,
@@ -1690,6 +1720,9 @@ class Controller:
                 if reasons:
                     raise PlacementError(list(overlay.revived), reasons)
                 self._mark_pending(apply=True)
+                if self._admission_digest:
+                    self.ledger.mark_publication_pending(
+                        apply_requested=True, approved_digest=self._admission_digest)
                 renewed = self.ledger.renew(
                     lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
                 rec = self._publish()

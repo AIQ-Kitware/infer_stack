@@ -76,10 +76,14 @@ def overlapping_subnets(subnet: str, run) -> list[str]:
     """Docker networks and host routes that overlap ``subnet`` (preflight)."""
     net = ipaddress.ip_network(subnet)
     found = []
+    own: set = set()           # our own network's subnets, and so its host routes
     ids = [i for i in (run(['docker', 'network', 'ls', '-q']) or '').split() if i]
     if ids:
         for item in json.loads(run(['docker', 'network', 'inspect', *ids]) or '[]'):
             if item.get('Name') == NETWORK_NAME:
+                for cfg in ((item.get('IPAM') or {}).get('Config') or []):
+                    if cfg.get('Subnet') and ':' not in cfg['Subnet']:
+                        own.add(ipaddress.ip_network(cfg['Subnet'], strict=False))
                 continue
             for cfg in ((item.get('IPAM') or {}).get('Config') or []):
                 other = cfg.get('Subnet')
@@ -95,7 +99,10 @@ def overlapping_subnets(subnet: str, run) -> list[str]:
         if first in ('default', '') or '/' not in first:
             continue
         try:
-            if net.overlaps(ipaddress.ip_network(first, strict=False)):
+            route = ipaddress.ip_network(first, strict=False)
+            if route in own:
+                continue           # the route our own network creates
+            if net.overlaps(route):
                 found.append(f'host route {first}')
         except ValueError:
             continue

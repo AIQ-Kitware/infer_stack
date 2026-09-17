@@ -64,7 +64,8 @@ render is identical to the last success.
 
 ```bash
 infer-stack acquire <endpoint> --no-wait --yes &   # while its first `up` runs:
-sleep 3; pkill -INT -f 'infer-stack acquire'       # interrupt during create/start
+pid=$!
+sleep 3; kill -INT "$pid"                          # only THIS acquire, not anyone else's
 infer-stack leases                                  # expect: pending change, interrupted
 infer-stack apply --yes                             # waits for a settled runtime, then applies
 docker ps -a --filter label=com.docker.compose.project=infer-stack \

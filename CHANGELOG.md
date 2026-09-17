@@ -2,6 +2,29 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Migration and publication fixes (review)
+
+- **Unresolved legacy deployments.** A LIVE deployment from before allocations
+  that is still unresolved can no longer accept a new lease by coalescing; the
+  acquire is refused, naming it. Renewing its existing lease still works.
+- **`network migrate`** previews the migrated render and takes approval before
+  writing anything. It then switches the subnet, resets the address table and
+  marks the change pending in one transaction, with the approved digest. A
+  crash can no longer leave the old subnet with an empty address table, which
+  could have given a service another service's address.
+- **Crash-safe acquire approval.** The approved render's digest is now stored
+  in the pending marker before the lease commits, so a recovery after a crash
+  (or an upgrade) cannot silently apply a different render. The digest is
+  dropped once the approved render reaches Docker, so a route-verification
+  retry does not need re-approval.
+- **`config publish` pre-pull** derives its image set from the candidate
+  profile and its catalogs: infrastructure images the candidate enables, the
+  engine image of every published endpoint, and per-endpoint image overrides
+  (including Ollama).
+- **Re-running `network migrate`** on its current subnet no longer reports the
+  host route of infer-stack's own network as an overlap.
+- **Ledger transactions** also roll back on `KeyboardInterrupt`.
+
 ### Health view: degraded, displaced, unresolved, orphans, pending changes (P10)
 
 - **`infer-stack leases`** now ends with a `health:` block, and `--json`

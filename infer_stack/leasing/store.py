@@ -203,7 +203,9 @@ class SqliteStore:
             try:
                 yield self._conn
                 self._conn.execute('COMMIT')
-            except Exception:
+            except BaseException:
+                # Also on KeyboardInterrupt: never leave a half-done write open
+                # on this connection for the next statement to commit.
                 self._conn.execute('ROLLBACK')
                 raise
 
@@ -330,6 +332,15 @@ class SqliteStore:
         ``allowed_gpus``) replaces any stored one; ``None`` keeps it.
         """
         with self.transaction():
+            return self._write_marker(
+                apply_requested=apply_requested, interrupted=interrupted,
+                placement_context=placement_context, approved_digest=approved_digest,
+            )
+
+    def _write_marker(self, *, apply_requested, interrupted=False,
+                      placement_context=None, approved_digest=None) -> dict:
+        """The marker upsert; the caller holds a :meth:`transaction`."""
+        if True:
             current = self._read_publication_pending()
             marker = {
                 'version': (current['version'] if current else 0) + 1,
@@ -348,6 +359,36 @@ class SqliteStore:
                 (json.dumps(marker, sort_keys=True),),
             )
         return marker
+
+    def clear_approved_digest(self) -> None:
+        """The approved render was applied; later renders need no re-approval."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current.get('approved_digest') is None:
+                return
+            current['approved_digest'] = None
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
+                (json.dumps(current, sort_keys=True),),
+            )
+
+    def migrate_network(self, *, subnet: str, reset_addresses: bool,
+                        approved_digest: str | None) -> None:
+        """Switch subnet, reset addresses and mark the change pending, atomically.
+
+        A crash leaves either the old subnet with its address table, or the new
+        subnet with an empty one -- never the old subnet with addresses lost,
+        which could hand a service's address to another service.
+        """
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('network_config', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps({'subnet': subnet}, sort_keys=True),),
+            )
+            if reset_addresses:
+                self._conn.execute('DELETE FROM service_addresses')
+            self._write_marker(apply_requested=True, approved_digest=approved_digest)
 
     def publication_pending(self) -> dict | None:
         """The pending marker, or ``None`` when every change has been applied."""

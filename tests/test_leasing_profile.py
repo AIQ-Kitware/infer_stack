@@ -355,8 +355,8 @@ def test_publish_pulls_images_first_and_a_failed_pull_publishes_nothing(tmp_path
     pulled = []
 
     class Pulls(ComposeBackend):
-        def pull_images(self):
-            pulled.append(dict(self.images))
+        def pull_images(self, images):
+            pulled.append(list(images))
             if fail:
                 raise RuntimeError('manifest unknown')
             return []
@@ -378,3 +378,24 @@ def test_publish_pulls_images_first_and_a_failed_pull_publishes_nothing(tmp_path
     assert len(pulled) == 2
     assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes', '--no-pull']) == 0
     assert len(pulled) == 2
+
+
+def test_prepull_uses_the_candidate_profile_and_its_catalog_images():
+    from infer_stack.leasing.compose import profile_images
+
+    images = {'vllm': 'vllm:d', 'ollama': 'ollama:d', 'litellm': 'l', 'postgres': 'p',
+              'open_webui': 'w', 'nginx': 'n'}
+    catalog = {
+        'models': {'m': {'source': 'hf://org/m'}},
+        'runtime_hosts': {'oh': {'engine': 'ollama'}},
+        'endpoints': {
+            'custom': {'engine': 'vllm', 'model': 'm', 'runtime': {'image': 'vllm:custom'}},
+            'tag': {'engine': 'ollama', 'model': 'llama3:8b', 'host': 'oh'},
+        },
+    }
+    candidate = {'images': images, 'litellm': True, 'dynamic_routing': False, 'ui': True,
+                 'reverse_proxy': {'enabled': False}, 'catalogs': [catalog]}
+    got = profile_images(candidate)
+    assert 'w' in got                           # UI turned on by the candidate
+    assert 'vllm:custom' in got and 'ollama:d' in got
+    assert 'p' not in got and 'n' not in got

@@ -373,3 +373,30 @@ def test_a_render_failure_after_commit_leaves_no_active_lease(tmp_path):
     with pytest.raises(ResidencyUnknown):
         acquire(ctl, 'one')
     assert [le.state for le in ledger.status()[0]] == [LeaseState.RELEASED]
+
+
+def test_a_new_lease_cannot_coalesce_onto_an_unresolved_legacy_deployment(tmp_path):
+    ledger, ctl, _ = make(tmp_path, gpus='4x80')
+    old = _legacy_row(ledger, 'one')                          # no allocation, no container
+    ctl.gc()
+    with pytest.raises(PlacementError, match='unresolved pre-allocation'):
+        acquire(ctl, 'one')                                   # would coalesce onto it
+    assert len(ledger.status()[0]) == 1
+    # Renewing the existing legacy lease is still allowed.
+    assert ctl.renew(old.lease.id, ttl_seconds=60).lease is not None
+
+
+def test_the_admission_approval_digest_is_durable_before_the_commit(tmp_path):
+    ledger, ctl, _ = make(tmp_path)
+    seen = {}
+    real = ledger.acquire
+
+    def spy(*args, **kw):
+        seen['marker'] = ledger.publication_pending()
+        return real(*args, **kw)
+
+    ledger.acquire = spy
+    acquire(ctl, 'one')
+    assert seen['marker']['approved_digest']
+    assert seen['marker']['approved_digest'] == ctl.backend.last_planned_digest
+    assert ledger.publication_pending() is None

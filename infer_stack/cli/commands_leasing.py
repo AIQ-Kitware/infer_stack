@@ -2570,16 +2570,14 @@ class ConfigPublishCLI(_ApprovalMixin):
             if config.pull and pull is not None and profile.get('backend') == 'compose':
                 # Outside the lock, before anything is published: a steady-state
                 # apply must never wait on a registry, and a missing image must
-                # refuse the publication rather than break the next apply.
-                images = dict(profile.get('images') or {})
-                saved = dict(controller.backend.images)
-                controller.backend.images = {**saved, **images}
+                # refuse the publication rather than break the next apply. The
+                # image set comes from the CANDIDATE profile and its catalogs.
+                from ..leasing.compose import profile_images
+
                 try:
-                    pull()
+                    pull(profile_images(profile))
                 except Exception as ex:  # noqa: BLE001
                     raise SystemExit(f'config publish: image pull failed, nothing published: {ex}')
-                finally:
-                    controller.backend.images = saved
             rec = controller.publish_profile(profile)
         except (ProfileMismatch, CatalogError) as ex:
             raise SystemExit(f'config publish: {ex}')
