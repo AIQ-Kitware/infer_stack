@@ -93,7 +93,7 @@ leases. Editing them while leases churn is not a supported operation.
   two catalogs is refused.
 - **Changing the profile.** `config publish` works only while no lease is
   active and no deployment container exists. Publishing while leases are live
-  is plan step P4.
+  is not supported.
 
 Hot catalog mutation, and merging a live catalog with a published one, are out
 of scope. `allowed_gpus` is not part of the profile: it stays per caller.
@@ -167,8 +167,9 @@ only by an explicit apply" state, and adding one is out of scope.
 ### Applies run one at a time and are not coalesced (current)
 
 Every desired-state change renders and applies under one host-wide lock, so a
-burst of N concurrent acquires runs N `docker compose up`s one after another.
-Each caller can wait behind the others. An `up` with nothing to change is fast.
+burst of N concurrent acquires runs N selective applies one after another. Each
+caller can wait behind the others. An apply with nothing to change only reads
+residency.
 If lock wait becomes the bottleneck, skip an apply whose render is identical to
 the last successful one; do not reintroduce a separate apply lock.
 
@@ -183,8 +184,9 @@ refused and the change stays pending.
 
 This sees only container ids and states. Daemon work that has not yet changed
 either (an image pull, a container create still in flight) is invisible to it.
-The per-state recovery rules for `created`, `removing` and `restarting`
-containers are part of selective apply (plan step P8).
+Selective apply then treats what it finds by state: a `created` container is
+replaced, a `removing` one aborts the apply (the change stays pending), and a
+`restarting` one is left to Docker.
 
 ### Without the gateway, model host ports shift with the live set (current)
 

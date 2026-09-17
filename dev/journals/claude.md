@@ -2942,3 +2942,41 @@ is the same mistake as `allowed_gpus` in the profile: carrying a mechanism
 over without re-deriving its authority. Removing pins from admission mode then
 broke the scoped crash recovery, which relied on pins. Making that recovery
 commit a hard allocation is the honest form of what it did before.
+
+## 2026-09-16 21:23:46 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** `/goal finish the plan`, with GPT reviews relayed as they
+arrive.
+
+**What I did.**
+- **Plan steps.**
+  - **P7:** stable addresses behind `network migrate`, and `network check`.
+  - **P8:** tests 39-49 against a container-level Docker fake.
+  - **P4 remainder:** pre-pull, and the approved-digest guard.
+  - **P10:** health view, degraded end to end, GPU holders named in refusals.
+- **Review fixes from two GPT rounds.**
+  - Approval moved before commit.
+  - Unresolved rows are never placed.
+  - Adoption was unreachable; it now runs.
+  - Selective apply waits for `service_healthy` dependencies, which
+    `--no-deps` skipped, and confirms removals.
+- **Records.**
+  - The plan now has an implementation record (§8.1) with its deviations.
+  - The host runbook is `dev/tmp/host-verification-2026-09-16.md`, with a
+    Docker-only script.
+  - The script's non-GPU checks were run on the guest daemon.
+
+**Reflection.**
+- **The review lag.** One review arrived for a commit (`2a5f6fe`) whose
+  blockers had already been fixed. Checking the commit it named before
+  re-fixing saved rework; the fourth point in it was new and real.
+- **The most instructive bug.** The `_adopt_existing` call sat after a
+  `return`. No test failed because nothing exercised adoption. The P8 commit
+  message itself said "tests follow", and that gap is exactly where the dead
+  code hid.
+- **Host ports.** Without a gateway they shift with the live set. That predates
+  this work, but fingerprints made it visible, so it is now documented.
+- **Honest scope.** Everything here is verified against fakes. Real-daemon
+  timing, health, and GPU handoff are still unverified.

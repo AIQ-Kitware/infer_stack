@@ -2,8 +2,9 @@
 
 - **Date:** 2026-09-16 · **Revision 7a** (consolidated and self-contained; §0.1 records the review of revision 7)
 - **Author:** Claude Opus 5 (1M context), `claude-opus-5[1m]`
-- **Status:** plan for review. **P1 is implemented** on `dev/0.7.1` (`675315c`);
-  nothing else is written.
+- **Status:** **P1-P10 are implemented** on `dev/0.7.1` (see §8.1 for commits and
+  the deviations taken during implementation). Host verification (§7) is
+  outstanding: `host-verification-2026-09-16.md` has the runbook.
 - **The central decision in this revision, D22 (serialised publication), is
   adopted provisionally.** It is confirmed by host measurement V15 (§7). If V15
   shows serialisation is too slow for real per-shard churn, revision 6 (`be6c89d`)
@@ -664,6 +665,45 @@ One-time, explicit, on upgrade:
 | **P8** | Residency extension, labels and fingerprints, ownership, selective apply **replacing P2's apply**, barrier, interrupted-apply quiescence (§4.11), `gc --orphans`, adoption migration (§4.1, §4.7). Tests 21, 38-49, 53 | no `--remove-orphans` |
 | **P9** | Idle keep-warm becomes optional and resident-only | **fixes the incident** |
 | **P10** | DEGRADED end to end and observability (§4.13) | |
+
+### 8.1 Implementation record
+
+| step | commits | notes |
+|---|---|---|
+| P1 | `675315c` | residency later extended to the whole project (P8) |
+| P2 | `2b1e6db`, `5e7e5a4`, `4765a68`, `e652a8f`, `8f3ed15`, `7071340`, `f7a8855`, `db00247`, `ba0a7c7`, `e587c8e` | the minimal `config publish` (quiescent only) landed here; backend-kind changes are refused |
+| P3 | `293d440` | admission mode ignores soft pins (review) |
+| P4 | `ba0a7c7`, `bfaad9a` | pre-pull and the approved-digest guard; publishing while leases are live is **not** implemented (see deviations) |
+| P5, P6, P9 | `6d7897a`, `716b04b` | approval runs in the preview, before commit |
+| P7 | `2a1e1fc` | opt-in via `network migrate`; `network check` |
+| P8 | `2a5f6fe`, `071aa45`, `418f734` | health-conditioned dependencies awaited; removals confirmed |
+| P10 | `92cec88` | health view in `leases` |
+
+**Deviations and decisions taken while implementing** (each reviewed by the
+second model as it landed):
+
+- **Admission mode is capability-gated.** It applies to backends with strict
+  residency and an in-memory preview (Compose). KubeAI and the null backend
+  keep the earlier semantics: idle keep-warm stays desired, and the lease
+  commits before its render.
+- **Recovery is by the next applying operation**, not at every lock entry.
+  Render-only paths never apply.
+- **`config publish` works only while quiescent** (no ACTIVE lease, no
+  deployment container). Changing the profile under live leases (P4's "live"
+  part) is not implemented and is recorded in known limitations.
+- **`allowed_gpus` is not in the profile.** It is per-caller admission scope.
+- **Catalogs are a published union** with strict conflicts, and an unpublished
+  `--catalog` is refused.
+- **`HF_TOKEN`** reaches Compose only from the managed `.env`.
+- **`DOCKER_CONTEXT`** is forced to `default`.
+- **Unresolved legacy LIVE rows** are never placed or allocated; they block new
+  allocation until released.
+- **Network addressing is opt-in.** Stacks keep dynamic addresses until
+  `network migrate`. A settings-level subnet mismatch check was not added:
+  the subnet changes only through `network migrate --subnet`.
+- **Settle check, not full quiescence.** Interrupted-apply recovery is the P2
+  settle check (two identical container samples). Selective apply then handles
+  `created` (replaced), `removing` (abort), and `restarting` (kept).
 
 **If V15 fails:** P2 remains correct as a transitional mechanism. Reinstate
 revision 6's bundle and activation design in place of P2's "final" status. Nothing
