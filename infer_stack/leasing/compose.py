@@ -1911,33 +1911,73 @@ class ComposeBackend(ConvergeScaffold):
             **keywords,
         )
 
-    def preview(self, desired: list[Deployment], placement=None):
-        """Place and render ``desired`` in memory; write nothing.
+    def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
+        """Place and render ``desired`` exactly as :meth:`converge` would; write nothing.
 
         Returns ``(plan, rendered)``. Admission uses it to decide, before any
-        commit, whether a candidate lease is placeable **and** renderable.
+        commit, whether a candidate lease is placeable **and** renderable. With
+        ``approve``, the operator is shown the resulting diff now (raising
+        :class:`ConvergeAborted` on decline); the render that follows the commit
+        then does not ask again as long as it produces the same files.
         """
-        desired = list(desired)
+        docs = self._render_documents(list(desired), placement)
+        if approve:
+            self._approve_changes(docs['planned'])
+            self._preapproved = self._planned_digest(docs['planned'])
+        return docs['plan'], docs['rendered']
+
+    def _render_documents(self, desired: list[Deployment], placement) -> dict[str, Any]:
+        """Placement, render, generated files and fingerprints, in memory."""
         plan = self.plan(desired, placement)
+        if self.litellm and self.dynamic_routing:
+            # The DB secret must exist before rendering, so docker compose
+            # --env-file can interpolate ${LITELLM_DB_PASSWORD} at apply time.
+            self.db_password()
         route_registry = None
         if self.litellm and not self.dynamic_routing:
-            existing = self._load_route_registry()
-            incoming: dict[str, dict[str, Any]] = {}
-            if self.catalog is not None:
-                incoming.update(_registry_incoming_from_catalog(self.catalog))
-            incoming.update(_registry_incoming_from_deployments(desired, plan.assignments))
-            route_registry, _ = _merge_route_registry(existing, incoming)
+            # Unconditional in static-superset mode: `self.catalog` may be None;
+            # the incoming set is then deployments-only, and the render still
+            # comes from the accumulated registry, so a catalog-less converge
+            # cannot strip routes or blip.
+            route_registry = self._merged_route_registry(desired, plan.assignments)
         rendered = render_compose(
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
-            litellm_master_key='preview' if self.litellm else None,
+            litellm_master_key=self.master_key() if self.litellm else None,
             ui=self.ui, ui_port=self.ui_port, reverse_proxy=self.reverse_proxy,
             reverse_proxy_port=self.reverse_proxy_port,
             reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
             project=self.project, catalog=self.catalog,
             route_registry=route_registry, dynamic_routing=self.dynamic_routing,
         )
-        return plan, rendered
+        planned: dict[Path, str] = {}
+        if rendered.litellm_config is not None:
+            planned[self.state_dir / LITELLM_CONFIG_FILENAME] = rendered.litellm_config
+        if rendered.nginx_config is not None:
+            planned[self.state_dir / NGINX_CONFIG_FILENAME] = rendered.nginx_config
+        if rendered.litellm_routes is not None:
+            planned[self._routes_file] = json.dumps(rendered.litellm_routes, indent=2)
+        fingerprints = stamp_fingerprints(
+            rendered.compose, files=planned, env_file=self._env_path,
+        )
+        planned[self.compose_file] = yaml.safe_dump(rendered.compose, sort_keys=False)
+        return {'plan': plan, 'rendered': rendered, 'planned': planned,
+                'fingerprints': fingerprints, 'route_registry': route_registry}
+
+    @staticmethod
+    def _planned_digest(planned: dict) -> str:
+        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
+        return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+    #: Digest of files an admission preview already had approved.
+    _preapproved: str | None = None
+
+    def _approve_changes(self, planned: dict) -> None:
+        if self._preapproved is not None and self._planned_digest(planned) == self._preapproved:
+            self._preapproved = None
+            return
+        self._preapproved = None
+        super()._approve_changes(planned)
 
     def plan_on_idle_host(self, desired: list[Deployment]):
         """Placement for ``desired`` alone, as if nothing else were running.
@@ -2105,15 +2145,10 @@ class ComposeBackend(ConvergeScaffold):
             )
         return data
 
-    def _update_route_registry(
+    def _merged_route_registry(
         self, desired: list[Deployment], assignments: dict[str, list[int]]
     ) -> dict[str, Any]:
-        """Load, merge the invoking catalog (if any) + all live deployments,
-        persist iff changed, and return the merged registry.
-
-        Called under the converge flock (:meth:`_converge_lock`), so the
-        read-merge-write is race-safe against concurrent converges from other
-        runbooks with no new locking."""
+        """The route registry merged with the catalog and ``desired``, in memory."""
         from .._log import logger
 
         existing = self._load_route_registry()
@@ -2123,28 +2158,36 @@ class ComposeBackend(ConvergeScaffold):
         # `desired` spans all runbooks via the shared ledger, so this keeps every
         # live cross-runbook deployment routable (and, via persistence, routable
         # past release).
-        incoming.update(
-            _registry_incoming_from_deployments(desired, assignments)
-        )
+        incoming.update(_registry_incoming_from_deployments(desired, assignments))
         merged, warnings = _merge_route_registry(existing, incoming)
         for w in warnings:
             logger.warning('  route registry: {}', w)
-        if merged != existing:
-            prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
-            added = sorted(set(merged['entries']) - set(prior))
-            updated = sorted(
-                k for k in merged['entries']
-                if k in prior and merged['entries'][k] != prior[k]
-            )
-            if added:
-                logger.info('  route registry: +{} route(s): {}',
-                            len(added), ', '.join(added))
-            if updated:
-                logger.info('  route registry: updated route(s): {}',
-                            ', '.join(updated))
-            self._atomic_write(
-                self._registry_file, _dump_route_registry(merged)
-            )
+        return merged
+
+    def _save_route_registry(self, merged: dict[str, Any]) -> None:
+        """Persist a merged registry if it changed (under the converge flock)."""
+        from .._log import logger
+
+        existing = self._load_route_registry()
+        if merged == existing:
+            return
+        prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
+        added = sorted(set(merged['entries']) - set(prior))
+        updated = sorted(
+            k for k in merged['entries'] if k in prior and merged['entries'][k] != prior[k]
+        )
+        if added:
+            logger.info('  route registry: +{} route(s): {}', len(added), ', '.join(added))
+        if updated:
+            logger.info('  route registry: updated route(s): {}', ', '.join(updated))
+        self._atomic_write(self._registry_file, _dump_route_registry(merged))
+
+    def _update_route_registry(
+        self, desired: list[Deployment], assignments: dict[str, list[int]]
+    ) -> dict[str, Any]:
+        """Merge and persist the route registry; return it (kept for callers)."""
+        merged = self._merged_route_registry(desired, assignments)
+        self._save_route_registry(merged)
         return merged
 
     def merge_route_registry(
@@ -2191,7 +2234,9 @@ class ComposeBackend(ConvergeScaffold):
                 len(desired),
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            plan = self.plan(desired, placement)
+            docs = self._render_documents(desired, placement)
+            plan, rendered, planned = docs['plan'], docs['rendered'], docs['planned']
+            fingerprints = docs['fingerprints']
             self.last_assignments = dict(plan.assignments)
             self.last_displaced = list(plan.displaced)
             self.last_degraded = list(plan.degraded)
@@ -2204,43 +2249,6 @@ class ComposeBackend(ConvergeScaffold):
                 # contradicts a declared min_vram_gib): never fail the plan,
                 # never be silent either.
                 logger.warning('  placement: {}', note)
-            if self.litellm and self.dynamic_routing:
-                # Persist the DB secret to the sidecar .env *before* rendering, so
-                # docker compose --env-file can interpolate ${LITELLM_DB_PASSWORD}
-                # into the postgres + litellm services at apply time.
-                self.db_password()
-            route_registry = None
-            if self.litellm and not self.dynamic_routing:
-                # Unconditional in static-superset mode: `self.catalog` may be
-                # None (a bare release/gc with no discoverable config dir) — the
-                # incoming set is then deployments-only, and the render still
-                # comes from the accumulated registry, so a catalog-less converge
-                # cannot strip routes or blip. This retires the legacy
-                # per-deployment `_litellm_model_list` branch from the backend
-                # path entirely (it survives in render_compose for direct callers).
-                route_registry = self._update_route_registry(
-                    desired, plan.assignments
-                )
-            rendered = render_compose(
-                desired,
-                plan.assignments,
-                images=self.images,
-                ports=self.ports,
-                state=self.state,
-                litellm=self.litellm,
-                litellm_port=self.litellm_port,
-                litellm_master_key=self.master_key() if self.litellm else None,
-                ui=self.ui,
-                ui_port=self.ui_port,
-                reverse_proxy=self.reverse_proxy,
-                reverse_proxy_port=self.reverse_proxy_port,
-                reverse_proxy_config=self.reverse_proxy_config,
-                aux_dir=self.state_dir,
-                project=self.project,
-                catalog=self.catalog,
-                route_registry=route_registry,
-                dynamic_routing=self.dynamic_routing,
-            )
             # A deployment the render excluded (service-name collision) is as
             # undeliverable as an unplaced one: fold it into last_unplaced /
             # last_errors so acquire fails loudly and rolls the lease back.
@@ -2252,43 +2260,14 @@ class ComposeBackend(ConvergeScaffold):
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
 
-            planned: dict[Path, str] = {}
-            if rendered.litellm_config is not None:
-                planned[self.state_dir / LITELLM_CONFIG_FILENAME] = (
-                    rendered.litellm_config
-                )
-            if rendered.nginx_config is not None:
-                planned[self.state_dir / NGINX_CONFIG_FILENAME] = (
-                    rendered.nginx_config
-                )
-            routes_text = (
-                json.dumps(rendered.litellm_routes, indent=2)
-                if rendered.litellm_routes is not None
-                else None
-            )
-            if routes_text is not None:
-                planned[self._routes_file] = routes_text
-            fingerprints = stamp_fingerprints(
-                rendered.compose, files=planned, env_file=self._env_path,
-            )
-            compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
-            planned[self.compose_file] = compose_text
             self._approve_changes(planned)  # may raise ConvergeAborted
-
-            if rendered.litellm_config is not None:
-                self._atomic_write(
-                    self.state_dir / LITELLM_CONFIG_FILENAME,
-                    rendered.litellm_config,
-                )
-            if rendered.nginx_config is not None:
-                self._atomic_write(
-                    self.state_dir / NGINX_CONFIG_FILENAME, rendered.nginx_config
-                )
-            if routes_text is not None:
-                # The rendered desired route set for the running gateway (applied
-                # via the admin API in apply() -> _reconcile_routes).
-                self._atomic_write(self._routes_file, routes_text)
-            self._atomic_write(self.compose_file, compose_text)
+            # Only after approval: persist the merged route registry, then the files.
+            if docs['route_registry'] is not None:
+                self._save_route_registry(docs['route_registry'])
+            for path, text in planned.items():
+                if path != self.compose_file:
+                    self._atomic_write(path, text)
+            self._atomic_write(self.compose_file, planned[self.compose_file])
             optional = set((placement.optional_hints if placement is not None else {}))
             self._save_sidecar({
                 'assignments': plan.assignments,

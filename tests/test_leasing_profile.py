@@ -120,7 +120,7 @@ def test_union_rejects_conflicts_and_deduplicates_identical_definitions():
         CatalogUnion.from_sources(bundles)
 
 
-def test_recovery_places_a_crashed_acquire_within_its_own_gpus(tmp_path):
+def test_a_crashed_unallocated_acquire_is_never_placed_by_another_caller(tmp_path):
     a = Catalog.from_dict(cat('alpha'))
     ledger, ctl = controller(tmp_path, catalog=a, allowed_gpus=[3])
     ctl.gc()
@@ -131,8 +131,12 @@ def test_recovery_places_a_crashed_acquire_within_its_own_gpus(tmp_path):
     # A different caller, allowed only GPU 0, runs the next operation.
     _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
     ctl2.gc()
+    # Admission-mode acquires commit allocations with the lease, so this row can
+    # only come from pre-allocation code: it stays unresolved and is never
+    # placed at all -- in particular not on the other caller's GPU 0.
     sidecar = json.loads((tmp_path / 'state' / 'leasing-compose-state.json').read_text())
-    assert sidecar['assignments'][res.deployments[0].id] == [3]
+    assert res.deployments[0].id not in sidecar['assignments']
+    assert ledger.get_deployment(res.deployments[0].id).assigned_gpus is None
     assert ledger.publication_pending() is None
 
 

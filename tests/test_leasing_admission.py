@@ -133,8 +133,8 @@ def test_two_processes_contend_for_the_last_gpu_and_exactly_one_wins(tmp_path): 
 
 def test_a_placed_but_unrenderable_candidate_never_creates_a_lease(tmp_path):     # 32
     class Unrenderable(ComposeBackend):
-        def preview(self, desired, placement=None):
-            plan, rendered = super().preview(desired, placement)
+        def preview(self, desired, placement=None, **kw):
+            plan, rendered = super().preview(desired, placement, **kw)
             rendered.unrenderable = [g.id for g in desired]
             rendered.errors = ['service name collision']
             return plan, rendered
@@ -163,7 +163,9 @@ def test_a_ledger_change_between_preview_and_commit_retries(tmp_path):          
     calls = []
 
     class Racy(ComposeBackend):
-        def preview(self, desired, placement=None):
+        def preview(self, desired, placement=None, **kw):
+            if kw.get('approve'):
+                return super().preview(desired, placement, **kw)
             calls.append(1)
             if len(calls) == 1:
                 store = SqliteStore(str(tmp_path / 'ledger.db'))
@@ -248,23 +250,110 @@ def test_renew_slow_path_readmits_and_loses_to_an_expired_lease(tmp_path):
 # -- migration backfill (tests 53-55) ---------------------------------------------------
 
 
-def test_backfill_adopts_running_deployments_and_reservations_stay_unresolved(tmp_path):
-    from infer_stack.leasing.models import reservation_request
+def _legacy_row(ledger, name, **kw):
+    """A LIVE deployment committed by pre-allocation code: no assigned_gpus."""
+    return ledger.acquire('legacy', CAT.resolve_names([name]), **kw)
+
+
+def test_upgrade_adopts_the_unique_running_container_of_a_legacy_deployment(tmp_path):
+    from infer_stack.leasing.residency import DEPLOYMENT_LABEL
 
     ledger, ctl, docker = make(tmp_path, gpus='4x80')
-    # A ledger from before allocations: commit leases without them, render legacy-style.
-    old = ledger.acquire('legacy', CAT.resolve_names(['one']))
-    reserved = ledger.acquire('legacy', [reservation_request(1)])
-    ctl.apply_now()        # the containers exist now, as on an upgraded host
-    ctl.gc()               # the next render adopts them
+    old = _legacy_row(ledger, 'one')
     gid = old.deployments[0].id
-    assert ledger.get_deployment(gid).assigned_gpus is not None       # adopted
-    rid = reserved.deployments[0].id
-    assert ledger.get_deployment(rid).assigned_gpus is None           # unresolved
+    # A container from before ownership labels: Compose service label only.
+    docker.add_container('vllm-one', labels={DEPLOYMENT_LABEL: gid}, device_ids=[2])
+    ctl.gc()
+    assert ledger.get_deployment(gid).assigned_gpus == [2]
+    assert list(ledger.adopted_containers()) == [c for c in docker.containers
+                                                 if docker.containers[c]['service'] == 'vllm-one']
+    assert len(docker.containers) == 1                        # adoption recreated nothing
+    acquire(ctl, 'two')                                       # nothing unresolved
+
+
+@pytest.mark.parametrize('containers', [0, 2])
+def test_unresolved_legacy_deployment_is_never_freshly_placed(tmp_path, containers):
+    from infer_stack.leasing.residency import DEPLOYMENT_LABEL
+
+    ledger, ctl, docker = make(tmp_path, gpus='4x80')
+    old = _legacy_row(ledger, 'one')
+    gid = old.deployments[0].id
+    for i in range(containers):                               # none, or ambiguous duplicates
+        docker.add_container(f'dup{i}', labels={DEPLOYMENT_LABEL: gid}, device_ids=[3])
+    ctl.gc()
+    assert ledger.get_deployment(gid).assigned_gpus is None
+    assert gid not in (ctl.backend._load_sidecar().get('assignments') or {})
     with pytest.raises(PlacementError, match='no committed allocation'):
         acquire(ctl, 'two')
-    ctl.release(reserved.lease.id)                                    # release resolves
+    ctl.release(old.lease.id)                                 # release resolves
     acquire(ctl, 'two')
+
+
+def test_reservation_from_before_allocations_blocks_until_released(tmp_path):
+    from infer_stack.leasing.models import reservation_request
+
+    ledger, ctl, _ = make(tmp_path, gpus='4x80')
+    reserved = ledger.acquire('legacy', [reservation_request(1)])
+    ctl.gc()
+    assert ledger.get_deployment(reserved.deployments[0].id).assigned_gpus is None
+    with pytest.raises(PlacementError, match='no committed allocation'):
+        acquire(ctl, 'two')
+    ctl.release(reserved.lease.id)
+    acquire(ctl, 'two')
+
+
+def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    cat = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        # Same model and public name: `b` coalesces onto `a`'s deployment.
+        'endpoints': {'a': {'engine': 'vllm', 'model': 'm', 'public_name': 'shared'},
+                      'b': {'engine': 'vllm', 'model': 'm', 'public_name': 'shared'}},
+    })
+    ledger, ctl, _ = make(tmp_path)
+    ctl.backend.catalog = None
+    first = ctl.acquire('x', cat.resolve_names(['a']), wait=False)
+    gid = first.deployments[0].id
+    served = dict(ledger.get_deployment(gid).served)
+    registry = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+
+    def decline(planned):
+        raise ConvergeAborted('no')
+
+    ctl.backend._approve_changes = decline
+    with pytest.raises(ConvergeAborted):
+        ctl.acquire('y', cat.resolve_names(['b']), wait=False)    # would add alias b
+    assert len(ledger.status()[0]) == 1
+    assert ledger.get_deployment(gid).served == served
+    now = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    assert now == registry
+
+
+def test_a_coalescing_candidate_that_makes_its_deployment_unrenderable_is_refused(tmp_path):
+    class Breaks(ComposeBackend):
+        def preview(self, desired, placement=None, **kw):
+            plan, rendered = super().preview(desired, placement, **kw)
+            live = [g.id for g in desired if len(g.served) > 1]
+            if live:
+                rendered.unrenderable = set(live)
+                rendered.errors = ['alias collision']
+            return plan, rendered
+
+    cat = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        # Same model and public name: `b` coalesces onto `a`'s deployment.
+        'endpoints': {'a': {'engine': 'vllm', 'model': 'm', 'public_name': 'shared'},
+                      'b': {'engine': 'vllm', 'model': 'm', 'public_name': 'shared'}},
+    })
+    ledger, ctl, _ = make(tmp_path, backend_cls=Breaks)
+    ctl.backend.catalog = None
+    first = ctl.acquire('x', cat.resolve_names(['a']), wait=False)
+    before = ledger.get_deployment(first.deployments[0].id).served
+    with pytest.raises(PlacementError, match='alias collision'):
+        ctl.acquire('y', cat.resolve_names(['b']), wait=False)
+    assert ledger.get_deployment(first.deployments[0].id).served == before
+    assert len(ledger.status()[0]) == 1
 
 
 def test_a_render_failure_after_commit_leaves_no_active_lease(tmp_path):

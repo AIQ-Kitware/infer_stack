@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Admission fixes (review): approval before commit; unresolved rows are never placed
+
+- **The diff is approved before anything is committed.** The admission preview
+  renders exactly the files the post-commit render will write and asks for
+  approval then; the render after the commit does not ask again. A declined
+  acquire leaves no lease, no added alias on a shared deployment, and no route
+  registry change. The registry is now persisted only after approval.
+- **Every claimed deployment is checked.** Admission refuses a candidate if any
+  deployment it claims is unplaced or unrenderable, including an existing one
+  it only coalesces onto.
+- **Unresolved legacy deployments are never placed.** A LIVE deployment from
+  before allocations, with no unique running container, is neither freshly
+  placed nor given an allocation; it only blocks new allocations until
+  released. Crash recovery in admission mode no longer commits allocations.
+- **Adoption now runs.** Migration adoption of pre-label containers was
+  unreachable (it sat after a `return`), and runs now.
+
 ### Admission: committed allocations, atomic acquires, optional warm residency
 
 For the Compose backend, this fixes the incident where idle keep-warm models

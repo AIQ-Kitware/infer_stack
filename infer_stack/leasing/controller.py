@@ -490,7 +490,7 @@ class Controller:
                 # in one shot (no separate apply()); accept that here.
                 converge(desired)
             after = set(self.backend.observe())
-            return ReconcileResult(
+            rec = ReconcileResult(
                 realized=sorted(after - before),
                 torn_down=sorted(before - after),
                 unplaced=sorted(
@@ -508,6 +508,7 @@ class Controller:
             )
             if placement is not None:
                 self._adopt_existing(residency)
+            return rec
         desired_ids = {g.id for g in desired}
         actual = self.backend.observe()
         result = ReconcileResult()
@@ -566,17 +567,24 @@ class Controller:
 
         _, deployments = self.ledger.status()
         by_id = {g.id: g for g in deployments}
+        fresh: set[str] = set()
         if overlay is not None:
             by_id.update(overlay.deployments)
+            fresh = set(overlay.created) | set(overlay.revived)
         required: dict[str, Deployment] = {}
         hard: dict[str, list[int]] = {}
         hints: dict[str, list[int]] = {}
         optional: list[Deployment] = []
         for gid, deployment in by_id.items():
             if deployment.state == DeploymentState.LIVE:
-                required[gid] = deployment
                 if deployment.assigned_gpus is not None:
+                    required[gid] = deployment
                     hard[gid] = list(deployment.assigned_gpus)
+                elif gid in fresh:
+                    required[gid] = deployment      # the candidate: a new placement
+                # else: unresolved (a LIVE row from before allocations with no
+                # unique container). Never freshly placed; it blocks new
+                # allocation until released (see _admit).
             elif deployment.state == DeploymentState.IDLE:
                 if deployment.spec.get('reclaim', self.reclaim_default) != KEEP_WARM:
                     continue
@@ -719,12 +727,16 @@ class Controller:
             overlay.deployments[gid].assigned_gpus = gpus
         desired, inputs = self._admission_view(residency, overlay=overlay)
         plan, rendered = self.backend.preview(desired, inputs)
-        for gid, gpus in adopted.items():
-            overlay.deployments[gid].assigned_gpus = None   # committed below, not here
         reasons = []
-        for gid in [*need, *adopted]:
+        unresolved = set(self._unresolved_allocations())
+        # EVERY deployment the candidate claims must be placed and renderable,
+        # including an existing one it only coalesces onto (whose served
+        # aliases it would change).
+        for gid in overlay.deployments:
+            if gid in unresolved:
+                continue          # already LIVE and unresolved: not re-placed, not new
             if gid in plan.degraded:
-                reasons.append(f'{gid}: its resident GPUs are no longer available')
+                reasons.append(f'{gid}: its GPUs are no longer available')
             elif gid not in plan.assignments:
                 why = [e for e in plan.errors if e.startswith(gid)]
                 reasons.extend(why or [f'{gid}: could not be placed'])
@@ -734,6 +746,12 @@ class Controller:
                 reasons.extend(why or [f'{gid}: could not be rendered'])
         allocations = {gid: list(plan.assignments.get(gid, [])) for gid in overlay.deployments
                        if gid in overlay.created or gid in overlay.revived}
+        if not reasons:
+            # Approval happens now, before anything is committed; the render
+            # after the commit produces the same files and does not ask again.
+            self.backend.preview(desired, inputs, approve=True)
+        for gid in adopted:
+            overlay.deployments[gid].assigned_gpus = None   # committed with the lease
         return allocations, reasons
 
     def _unresolved_allocations(self, *, exclude: set[str] = frozenset()) -> list[str]:
@@ -826,13 +844,6 @@ class Controller:
         if scope is not None:
             with scope(context):
                 rec = self._render()
-            if self._admission_mode():
-                # Soft pins do not survive in admission mode, so commit what
-                # this render placed for LIVE deployments that had no
-                # allocation (the crashed acquire's).
-                for gid in self._unresolved_allocations():
-                    if gid in rec.assignments:
-                        self.ledger.set_allocation(gid, rec.assignments[gid])
         self.ledger.clear_placement_context()
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
@@ -1247,8 +1258,10 @@ class Controller:
                 overlay = self.ledger.plan_acquire(requests)
                 allocations, reasons = self._admit(overlay, residency)
                 if not reasons:
-                    context = getattr(self.backend, 'placement_context', lambda: None)()
-                    self._mark_pending(apply=apply, placement_context=context)
+                    # Allocations are committed with the lease, so no placement
+                    # scope needs recording for recovery.
+                    context = None
+                    self._mark_pending(apply=apply)
                     try:
                         result = self.ledger.acquire(
                             owner, requests, ttl_seconds=ttl_seconds,
