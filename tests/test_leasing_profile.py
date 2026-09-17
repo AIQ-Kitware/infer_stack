@@ -169,16 +169,36 @@ def test_a_different_backend_kind_is_refused(tmp_path):
         other.gc()                         # refused on the first mutation...
 
 
-def test_config_publish_can_switch_backends_while_quiescent(tmp_path):
+def test_config_publish_refuses_to_change_the_backend_kind(tmp_path):
     from infer_stack.backends.kubeai import KubeaiBackend
 
     ledger, ctl = controller(tmp_path)
     ctl.gc()
     kube = KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True, run=lambda args: '')
-    other = Controller(ledger, kube)         # ...but opening still works
-    other.publish_profile(kube.render_profile())
-    assert ledger.profile()['backend'] == 'kubeai'
-    other.gc()
+    other = Controller(ledger, kube)          # opening still works
+    with pytest.raises(ProfileMismatch, match='not supported'):
+        other.publish_profile(kube.render_profile())
+    assert ledger.profile()['backend'] == 'compose'
+
+
+def test_explicit_missing_or_broken_catalog_is_an_error_after_publishing(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cl, '_make_backend',
+                        lambda config, *, interactive=False: backend(state))
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
+    with pytest.raises(SystemExit, match='catalog not found'):
+        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog',
+                                 str(tmp_path / 'typo.yaml'), '--no-wait', '--yes'])
+    broken = tmp_path / 'broken.yaml'
+    broken.write_text('endpoints: {e: {engine: nope}}\n')
+    with pytest.raises(SystemExit, match='invalid catalog'):
+        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog', str(broken),
+                                 '--no-wait', '--yes'])
 
 
 @pytest.mark.parametrize('failure', ['declined', 'raises'])

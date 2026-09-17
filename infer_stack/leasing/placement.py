@@ -72,6 +72,15 @@ class GpuPlan:
         return not self.errors
 
 
+@dataclass
+class PlacementInputs:
+    """Admission-mode planner inputs (see :func:`plan_placement`)."""
+
+    required_ids: set[str] = field(default_factory=set)
+    hard: dict[str, list[int]] = field(default_factory=dict)
+    optional_hints: dict[str, list[int]] = field(default_factory=dict)
+
+
 def available_indices(
     inventory: dict[str, Any],
     *,
@@ -250,8 +259,9 @@ def plan_placement(
        against the full physical pool, ignoring ``allowed_gpus``. One that is
        no longer valid is reported in ``degraded`` and never re-placed.
     2. Required deployments without a hard allocation (``required_ids``) are
-       placed next: valid ``pinned`` GPUs, then explicit placement, then fit
-       within ``allowed_gpus``. Creation order is only a tie-break.
+       placed next, as new placements: explicit placement, then fit within
+       ``allowed_gpus``. ``pinned`` is ignored in this mode. Creation order is
+       only a tie-break.
     3. Optional residents (``optional_hints``: an idle keep-warm deployment's
        physical GPUs) keep those GPUs if still free, and are otherwise
        ``displaced``. They are never newly fit.
@@ -321,6 +331,11 @@ def plan_placement(
     ordered = _sorted(deployments)
 
     if required_ids is not None or hard is not None or optional_hints is not None:
+        # Committed allocations replace soft pins entirely: a required
+        # deployment without one is a NEW placement and must stay inside
+        # allowed_gpus, which a pin (validated against the whole host) would
+        # let it escape.
+        pinned = {}
         hard = hard or {}
         required_ids = set(required_ids or ())
         optional_hints = optional_hints or {}

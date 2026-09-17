@@ -1536,6 +1536,8 @@ class ComposeBackend(ConvergeScaffold):
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
+        self.last_displaced: list[str] = []  # optional residents that yielded
+        self.last_degraded: list[str] = []   # invalid committed allocations
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
         # VRAM facts (docs/planning/vram-aware-placement.md Phase 3): the
         # measured-requirement overlay + a per-process cache of weight-bytes
@@ -1774,7 +1776,7 @@ class ComposeBackend(ConvergeScaffold):
         cmd += ['-p', self.project, '-f', str(self.compose_file)]
         return self.run([*cmd, *args])
 
-    def plan(self, desired: list[Deployment]):
+    def plan(self, desired: list[Deployment], placement=None):
         """Compute GPU placement for ``desired`` without writing or applying.
 
         Read-only and side-effect free: it honors the persisted pins, so the
@@ -1785,6 +1787,15 @@ class ComposeBackend(ConvergeScaffold):
         pinned = self._load_sidecar().get('assignments', {})
         desired = list(desired)
         self._enrich_placement(desired)
+        keywords = {}
+        if placement is not None:
+            # Admission mode: committed allocations and residency decide; the
+            # sidecar's pins only keep unresolved LIVE deployments stable.
+            keywords = dict(
+                required_ids=set(placement.required_ids),
+                hard=dict(placement.hard),
+                optional_hints=dict(placement.optional_hints),
+            )
         return plan_placement(
             desired,
             self.inventory,
@@ -1792,7 +1803,36 @@ class ComposeBackend(ConvergeScaffold):
             reserved=self.reserved,
             pinned=pinned,
             skip_display=self.skip_display,
+            **keywords,
         )
+
+    def preview(self, desired: list[Deployment], placement=None):
+        """Place and render ``desired`` in memory; write nothing.
+
+        Returns ``(plan, rendered)``. Admission uses it to decide, before any
+        commit, whether a candidate lease is placeable **and** renderable.
+        """
+        desired = list(desired)
+        plan = self.plan(desired, placement)
+        route_registry = None
+        if self.litellm and not self.dynamic_routing:
+            existing = self._load_route_registry()
+            incoming: dict[str, dict[str, Any]] = {}
+            if self.catalog is not None:
+                incoming.update(_registry_incoming_from_catalog(self.catalog))
+            incoming.update(_registry_incoming_from_deployments(desired, plan.assignments))
+            route_registry, _ = _merge_route_registry(existing, incoming)
+        rendered = render_compose(
+            desired, plan.assignments, images=self.images, ports=self.ports,
+            state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
+            litellm_master_key='preview' if self.litellm else None,
+            ui=self.ui, ui_port=self.ui_port, reverse_proxy=self.reverse_proxy,
+            reverse_proxy_port=self.reverse_proxy_port,
+            reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
+            project=self.project, catalog=self.catalog,
+            route_registry=route_registry, dynamic_routing=self.dynamic_routing,
+        )
+        return plan, rendered
 
     def plan_on_idle_host(self, desired: list[Deployment]):
         """Placement for ``desired`` alone, as if nothing else were running.
@@ -2026,7 +2066,7 @@ class ComposeBackend(ConvergeScaffold):
                 )
         return merged
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
+    def converge(self, desired: list[Deployment], *, apply: bool = True, placement=None):
         """Place + render the desired union, then optionally apply it.
 
         The work splits into *render* (decide placement, write the
@@ -2046,8 +2086,10 @@ class ComposeBackend(ConvergeScaffold):
                 len(desired),
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            plan = self.plan(desired)
+            plan = self.plan(desired, placement)
             self.last_assignments = dict(plan.assignments)
+            self.last_displaced = list(plan.displaced)
+            self.last_degraded = list(plan.degraded)
             for gid, gpus in sorted(plan.assignments.items()):
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
             for err in plan.errors:
@@ -2099,7 +2141,8 @@ class ComposeBackend(ConvergeScaffold):
             # last_errors so acquire fails loudly and rolls the lease back.
             self.last_errors = list(plan.errors) + list(rendered.errors)
             self.last_unplaced = {
-                g.id for g in desired if g.id not in plan.assignments
+                g.id for g in desired
+                if g.id not in plan.assignments and g.id not in plan.displaced
             } | set(rendered.unrenderable)
             for err in rendered.errors:
                 logger.warning('  render: {}', err)

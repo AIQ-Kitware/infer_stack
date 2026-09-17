@@ -98,13 +98,20 @@ leases. Editing them while leases churn is not a supported operation.
 Hot catalog mutation, and merging a live catalog with a published one, are out
 of scope. `allowed_gpus` is not part of the profile: it stays per caller.
 
-### A queued acquire's GPU scope is not kept while it waits (current)
+Changing the backend kind (Compose to KubeAI or back) is not supported by
+`config publish`. Its quiescence check can only see the new backend's
+resources, so the old one's would be left running unseen. Tear the old stack
+down and start a new ledger for the new backend.
 
-An acquire records its `--allowed-gpus` scope with the pending change, and the
-next operation uses it if the acquire died before its first render. The scope is
-cleared after that first render, so an acquire that is *queued* for capacity
-(`--queue`) and then dies can later be placed by another caller within that
-caller's scope. Durable queued admission is plan step P6.
+### A queued acquire holds nothing while it waits (current, by design)
+
+With the Compose backend an acquire is admitted atomically: its lease and its
+GPU allocations are committed together, or nothing is. A queued (`--queue`)
+acquire that has not been admitted yet has written nothing, so it holds no GPU
+and has no place in line (see "Admission is first-come" below).
+
+Backends without strict residency (KubeAI, the null backend) keep the earlier
+behaviour: the lease is committed first and placed by the render.
 
 ### Admission is first-come, not fair (design boundary)
 
@@ -187,32 +194,25 @@ context use`. Every operation and every recovery therefore talks to the local
 default daemon. Driving a remote or non-default daemon would need the target
 recorded in the published profile, and is out of scope.
 
-### Known fault: a failed acquire can leave a leaseless warm candidate (current)
+### Idle keep-warm residency is optional and never started (current, Compose)
 
-When an acquire fails and rolls back, a deployment it created is evicted only if
-strict residency shows it has no container. If Docker cannot be read, nothing
-is evicted, because evicting on a failed look could discard a genuinely warm
-model. But idle keep-warm deployments are still part of the desired set, so the
-next successful apply starts that deployment with no lease behind it.
+With the Compose backend, an idle keep-warm deployment is a placement candidate
+only while its container is uniquely resident. It keeps its GPUs while nothing
+needs them, yields them to any admitted demand (it is then *displaced*, and its
+container removed by the next apply), and is never started by infer-stack.
+Displaced models are not re-warmed. This fixed the fault where idle residents
+starved new leases.
 
-- Workaround: `infer-stack evict <deployment>`.
-- Fixed by plan step P9, where idle keep-warm deployments are kept only if
-  already resident and are never started. The regression
-  `test_transitional_unknown_residency_rollback_keeps_an_idle_candidate`
-  records today's behaviour and must be inverted then.
-
-### Known fault: idle keep-warm deployments can starve new leases (current)
-
-An idle keep-warm deployment still claims GPUs during placement, ordered by
-creation time rather than by demand. A new request can therefore wait out its
-whole admission timeout while every GPU is physically empty. This is being fixed
-in the leasing redesign.
-
-**Workaround:** before a batch run, evict idle deployments it will not reuse:
-
-```bash
-infer-stack evict <alias> [<alias> ...]
-```
+- **Deployments from before allocations existed.** A LIVE deployment in such a
+  ledger adopts the GPUs of its running container on the first render. If it
+  has no single running container (for example a GPU reservation, which runs
+  nothing), it stays *unresolved*: it keeps working, but no new GPU is
+  allocated to anyone until its lease is released.
+- **Other backends.** On backends without strict residency (KubeAI, null),
+  idle keep-warm deployments stay in the desired set, as before. A failed
+  acquire whose rollback cannot read residency can then leave a leaseless idle
+  candidate that the next apply starts (workaround: `infer-stack evict
+  <deployment>`).
 
 ### Known fault: the gateway can route a model's traffic to another container (current)
 

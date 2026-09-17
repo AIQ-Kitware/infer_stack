@@ -79,6 +79,10 @@ class ReconcileResult:
     # desired state was staged (--no-apply, render) or its apply did not fully
     # succeed. The next applying operation, or `infer-stack apply`, publishes it.
     publication_pending: bool = False
+    # Admission mode: idle keep-warm residents that yielded their GPUs, and
+    # LIVE deployments whose committed allocation is no longer valid.
+    displaced: list[str] = field(default_factory=list)
+    degraded: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -459,7 +463,16 @@ class Controller:
         such split, so it realizes here; those backends expose no ``apply``.
         """
         self.ledger.sweep()
-        desired = self.desired_deployments()
+        placement = None
+        if self._admission_mode():
+            # Residency decides which idle keep-warm deployments are candidates
+            # at all; unknown residency fails the render (the change stays
+            # pending) rather than guessing which warm models exist.
+            residency = self.backend.residency()
+            self._backfill_allocations(residency)
+            desired, placement = self._admission_view(residency)
+        else:
+            desired = self.desired_deployments()
         # Bound once rather than probed with hasattr: the capability check is
         # the same, and the bound method keeps its type instead of narrowing
         # to `object` the way an attribute reached through hasattr does.
@@ -467,7 +480,10 @@ class Controller:
         if converge is not None:
             before = set(self.backend.observe())
             try:
-                converge(desired, apply=False)
+                if placement is not None:
+                    converge(desired, apply=False, placement=placement)
+                else:
+                    converge(desired, apply=False)
             except TypeError:
                 # Legacy converge(desired) with no apply kwarg renders+applies
                 # in one shot (no separate apply()); accept that here.
@@ -486,6 +502,8 @@ class Controller:
                     getattr(self.backend, 'last_assignments', {}) or {}
                 ),
                 applied=False,
+                displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
+                degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
             )
         desired_ids = {g.id for g in desired}
         actual = self.backend.observe()
@@ -515,6 +533,150 @@ class Controller:
     #      routing mode, including verified routes).
     # A crash or failure anywhere leaves the marker set, and the next applying
     # operation re-renders and applies the whole pending desired state.
+
+    # -- admission (plan steps P5, P6, P9) ------------------------------------
+    #
+    # Backends with strict residency and an in-memory preview (Compose) get
+    # admission semantics:
+    #   * a LIVE deployment holds a committed allocation (assigned_gpus);
+    #   * an IDLE keep-warm deployment is only an optional candidate, and only
+    #     while it is uniquely resident; it yields its GPUs to demand and is
+    #     never started;
+    #   * an acquire is previewed in memory (placement AND render) and commits
+    #     its lease together with its allocations, or commits nothing.
+    # Other backends (KubeAI, where the cluster schedules; test fakes) keep the
+    # previous behaviour.
+
+    def _admission_mode(self) -> bool:
+        return all(
+            callable(getattr(self.backend, name, None))
+            for name in ('residency', 'preview', 'converge')
+        )
+
+    def _admission_view(self, residency, *, overlay=None):
+        """``(desired deployments, PlacementInputs)`` for a render or preview.
+
+        ``overlay`` (an :class:`~infer_stack.leasing.ledger.AcquireOverlay`)
+        adds a candidate acquire on top of the ledger, without writing it.
+        """
+        from .placement import PlacementInputs
+
+        _, deployments = self.ledger.status()
+        by_id = {g.id: g for g in deployments}
+        if overlay is not None:
+            by_id.update(overlay.deployments)
+        required: dict[str, Deployment] = {}
+        hard: dict[str, list[int]] = {}
+        hints: dict[str, list[int]] = {}
+        optional: list[Deployment] = []
+        for gid, deployment in by_id.items():
+            if deployment.state == DeploymentState.LIVE:
+                required[gid] = deployment
+                if deployment.assigned_gpus is not None:
+                    hard[gid] = list(deployment.assigned_gpus)
+            elif deployment.state == DeploymentState.IDLE:
+                if deployment.spec.get('reclaim', self.reclaim_default) != KEEP_WARM:
+                    continue
+                resident = residency.resident(gid) if residency is not None else None
+                if resident is not None and not resident.all_gpus:
+                    hints[gid] = list(resident.gpus)
+                    optional.append(deployment)
+        inputs = PlacementInputs(
+            required_ids=set(required), hard=hard, optional_hints=hints,
+        )
+        return [*required.values(), *optional], inputs
+
+    def _backfill_allocations(self, residency) -> list[str]:
+        """Adopt allocations for LIVE deployments that predate them.
+
+        A LIVE deployment with no committed allocation adopts the GPUs of its
+        unique warm container. One with no container, several, or unmappable
+        GPUs stays unresolved: it keeps running where it is, but no new GPU is
+        allocated to anyone until it is released. Returns the unresolved ids.
+        """
+        from .placement import required_gpu_count
+
+        unresolved = []
+        _, deployments = self.ledger.status()
+        for deployment in deployments:
+            if deployment.state != DeploymentState.LIVE or deployment.assigned_gpus is not None:
+                continue
+            if required_gpu_count(deployment) == 0:
+                self.ledger.set_allocation(deployment.id, [])
+                continue
+            resident = residency.resident(deployment.id)
+            if resident is not None and not resident.all_gpus and resident.gpus:
+                self.ledger.set_allocation(deployment.id, list(resident.gpus))
+            else:
+                unresolved.append(deployment.id)
+        return unresolved
+
+    def _admit(self, overlay, residency):
+        """Decide an acquire in memory: ``(allocations, reasons)``.
+
+        ``reasons`` empty means admissible, and ``allocations`` are the GPUs to
+        commit for the candidate's new and revived deployments. Nothing is
+        written here.
+        """
+        from .placement import required_gpu_count
+
+        adopted: dict[str, list[int]] = {}
+        need: list[str] = []
+        for gid, deployment in overlay.deployments.items():
+            fresh = gid in overlay.created or gid in overlay.revived
+            if not fresh:
+                continue
+            if required_gpu_count(deployment) == 0:
+                continue
+            resident = residency.resident(gid) if (
+                residency is not None and gid in overlay.revived) else None
+            if resident is not None and not resident.all_gpus and resident.gpus:
+                adopted[gid] = list(resident.gpus)      # IDLE->LIVE keeps its GPUs
+            else:
+                need.append(gid)
+        if residency is None and (need or adopted):
+            return {}, [
+                'Docker residency is unknown, so only requests that need no new '
+                'GPU are admitted; retry when `docker ps` works'
+            ]
+        if need:
+            unresolved = self._unresolved_allocations(exclude=set(overlay.deployments))
+            if unresolved:
+                return {}, [
+                    'no new GPU is allocated while LIVE deployments have no '
+                    f'committed allocation ({", ".join(unresolved[:3])}); '
+                    'release their leases to resolve'
+                ]
+        for gid, gpus in adopted.items():
+            overlay.deployments[gid].assigned_gpus = gpus
+        desired, inputs = self._admission_view(residency, overlay=overlay)
+        plan, rendered = self.backend.preview(desired, inputs)
+        for gid, gpus in adopted.items():
+            overlay.deployments[gid].assigned_gpus = None   # committed below, not here
+        reasons = []
+        for gid in [*need, *adopted]:
+            if gid in plan.degraded:
+                reasons.append(f'{gid}: its resident GPUs are no longer available')
+            elif gid not in plan.assignments:
+                why = [e for e in plan.errors if e.startswith(gid)]
+                reasons.extend(why or [f'{gid}: could not be placed'])
+            elif gid in set(rendered.unrenderable):
+                why = [e for e in rendered.errors if gid in e] or [
+                    f'{gid}: could not be rendered ({e})' for e in rendered.errors]
+                reasons.extend(why or [f'{gid}: could not be rendered'])
+        allocations = {gid: list(plan.assignments.get(gid, [])) for gid in overlay.deployments
+                       if gid in overlay.created or gid in overlay.revived}
+        return allocations, reasons
+
+    def _unresolved_allocations(self, *, exclude: set[str] = frozenset()) -> list[str]:
+        from .placement import required_gpu_count
+
+        _, deployments = self.ledger.status()
+        return [
+            g.id for g in deployments
+            if g.state == DeploymentState.LIVE and g.assigned_gpus is None
+            and g.id not in exclude and required_gpu_count(g) > 0
+        ]
 
     def _sync_profile(self, *, create: bool) -> None:
         """Make the backend render from the published profile.
@@ -595,7 +757,14 @@ class Controller:
         scope = getattr(self.backend, 'placement_scope', None)
         if scope is not None:
             with scope(context):
-                self._render()
+                rec = self._render()
+            if self._admission_mode():
+                # Soft pins do not survive in admission mode, so commit what
+                # this render placed for LIVE deployments that had no
+                # allocation (the crashed acquire's).
+                for gid in self._unresolved_allocations():
+                    if gid in rec.assignments:
+                        self.ledger.set_allocation(gid, rec.assignments[gid])
         self.ledger.clear_placement_context()
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
@@ -880,6 +1049,16 @@ class Controller:
         """
         from .backend import ConvergeAborted, PlacementError
 
+        if self._admission_mode():
+            result, rec = self._acquire_by_admission(
+                owner, requests, ttl_seconds=ttl_seconds, apply=apply,
+                wait_for_placement=wait_for_placement,
+                placement_timeout=timeout if placement_timeout is None else placement_timeout,
+                placement_interval=interval if placement_interval is None else placement_interval,
+            )
+            return self._finish_acquire(result, rec, apply=apply, wait=wait,
+                                        timeout=timeout, interval=interval)
+
         # Intent, ledger write, render and (once placed) apply all under one lock
         # hold, so a second caller blocks before touching sqlite and no render
         # can change the files this apply reads. The readiness wait and the
@@ -954,6 +1133,101 @@ class Controller:
                 if any(e.startswith(gid) for gid in unplaced)
             ]
             raise PlacementError(sorted(unplaced), reasons)
+        return self._finish_acquire(result, rec, apply=apply, wait=wait,
+                                    timeout=timeout, interval=interval)
+
+    def _acquire_by_admission(
+        self, owner, requests, *, ttl_seconds, apply, wait_for_placement,
+        placement_timeout, placement_interval,
+    ):
+        """Admission-mode acquire: preview in memory, commit only if admissible.
+
+        Each attempt runs under the lock: sweep (itself a published mutation),
+        observe residency, overlay the request on the ledger, and preview
+        placement and render. An admissible attempt commits the lease with its
+        allocations and publishes; an inadmissible one writes nothing, and a
+        queued caller sleeps outside the lock and tries again.
+        """
+        from .backend import ConvergeAborted, PlacementError
+        from .ledger import AdmissionConflict
+        from .residency import ResidencyUnknown
+
+        deadline = self.clock() + placement_timeout
+        checked_feasible = False
+        while True:
+            with self._global_lock():
+                self._sync_profile(create=True)
+                validate = getattr(self.backend, 'validate_requests', None)
+                if validate is not None:
+                    validate(requests)
+                leases, _ = self.ledger.status(virtual_expiry=True)
+                if any(le.state == LeaseState.EXPIRED and
+                       self.ledger.get_lease(le.id).state == LeaseState.ACTIVE
+                       for le in leases):
+                    # Maintenance sweep: TTL expiry is a desired-state change.
+                    self._mark_pending(apply=True)
+                    self.ledger.sweep()
+                    self._publish()
+                try:
+                    residency = self.backend.residency()
+                except ResidencyUnknown:
+                    residency = None
+                overlay = self.ledger.plan_acquire(requests)
+                allocations, reasons = self._admit(overlay, residency)
+                if not reasons:
+                    context = getattr(self.backend, 'placement_context', lambda: None)()
+                    self._mark_pending(apply=apply, placement_context=context)
+                    try:
+                        result = self.ledger.acquire(
+                            owner, requests, ttl_seconds=ttl_seconds,
+                            overlay=overlay, allocations=allocations,
+                        )
+                    except AdmissionConflict:
+                        continue            # the ledger moved; preview again
+                    try:
+                        try:
+                            rec = self._render()
+                        finally:
+                            if context is not None:
+                                self.ledger.clear_placement_context()
+                    except ConvergeAborted:
+                        self._rollback_acquire(result.lease.id, apply=apply)
+                        raise
+                    except BaseException:
+                        # e.g. residency became unreadable between preview and
+                        # render: never leave a lease the caller cannot see.
+                        self._rollback_acquire(result.lease.id, apply=False)
+                        raise
+                    requested = {g.id for g in result.deployments}
+                    unplaced = requested & set(rec.unplaced)
+                    if unplaced:
+                        # Admitted by preview but not placed by the render: the
+                        # two disagree, which must never be silent.
+                        self._rollback_acquire(result.lease.id, apply=apply)
+                        raise PlacementError(sorted(unplaced), [
+                            e for e in rec.placement_errors
+                            if any(e.startswith(g) for g in unplaced)
+                        ] or ['admission preview and render disagreed'])
+                    rec = self._apply_admitted(rec, result.lease.id, apply=apply)
+                    return result, rec
+                blocked = sorted(
+                    gid for gid in overlay.deployments
+                    if gid in overlay.created or gid in overlay.revived
+                )
+            if not (wait_for_placement and apply):
+                raise PlacementError(blocked, reasons)
+            if not checked_feasible:
+                checked_feasible = True
+                infeasible = self._infeasible_alone(
+                    list(overlay.deployments.values()), set(blocked))
+                if infeasible:
+                    raise PlacementError(sorted(infeasible), sorted(infeasible.values()))
+            if self.clock() + placement_interval > deadline:
+                raise PlacementError(blocked, reasons)
+            self.sleep(placement_interval)
+
+    def _finish_acquire(self, result, rec, *, apply, wait, timeout, interval) -> AcquireOutcome:
+        """Readiness wait (outside the lock) and the outcome, for both paths."""
         deployments = [self.ledger.get_deployment(g.id) for g in result.deployments]
         deployments = [g for g in deployments if g is not None]
         wait_result = None
@@ -1061,6 +1335,15 @@ class Controller:
         use = getattr(self.backend, 'use_profile', None)
         if use is None:
             raise ProfileMismatch('this backend has no publishable profile')
+        stored = self.ledger.profile()
+        if stored is not None and stored.get('backend') != profile.get('backend'):
+            # The quiescence check below can only see the NEW backend's
+            # resources, so the old backend's would be left running unseen.
+            raise ProfileMismatch(
+                f"changing the backend ({stored.get('backend')} -> "
+                f"{profile.get('backend')}) is not supported by config publish; "
+                'tear the old stack down and use a new ledger for the new backend'
+            )
         with self._global_lock():
             leases, _ = self.ledger.status(virtual_expiry=True)
             active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
@@ -1117,13 +1400,51 @@ class Controller:
     def renew(self, lease_id: str, *, ttl_seconds: float | None) -> RenewOutcome:
         """Extend a lease's TTL; publish if that revives an idle deployment.
 
-        Every renew is serialised under the lock, because a renew of an ACTIVE
-        lease whose deployment went IDLE makes it LIVE again, which changes the
-        desired state. A TTL-only renew (nothing to revive) takes no marker and
-        runs no apply; under the lock nothing else can idle a deployment between
-        the check and the renew. (A lock-free TTL-only fast path is plan step P5.)
+        **Fast path, lock-free:** an ACTIVE lease whose deployments are all LIVE
+        only has its TTL and heartbeat updated, in one SQLite transaction that
+        re-checks that condition. It changes no desired state and publishes
+        nothing.
+
+        **Slow path, under the lock:** a deployment went IDLE, so the renew is a
+        desired-state change. In admission mode it is re-admitted: the IDLE
+        deployment adopts its resident GPUs, or is placed fresh; if neither is
+        possible the renew fails with :class:`PlacementError` and writes
+        nothing. The lease is re-validated as ACTIVE under the lock first.
         """
+        from .backend import PlacementError
+
+        fast = self.ledger.renew_if_live(lease_id, ttl_seconds=ttl_seconds)
+        if fast is not False:
+            return RenewOutcome(fast, [])
         with self._global_lock():
+            if self._admission_mode():
+                lease = self.ledger.get_lease(lease_id)
+                if lease is None or lease.state != LeaseState.ACTIVE:
+                    return RenewOutcome(None, [])
+                from .residency import ResidencyUnknown
+
+                try:
+                    residency = self.backend.residency()
+                except ResidencyUnknown:
+                    residency = None
+                overlay = self.ledger.plan_acquire([])
+                for gid in dict.fromkeys(lease.deployment_ids):
+                    deployment = self.ledger.get_deployment(gid)
+                    if deployment is not None and deployment.state == DeploymentState.IDLE:
+                        deployment.state = DeploymentState.LIVE
+                        overlay.deployments[gid] = deployment
+                        overlay.revived.append(gid)
+                if not overlay.revived:
+                    return RenewOutcome(
+                        self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
+                allocations, reasons = self._admit(overlay, residency)
+                if reasons:
+                    raise PlacementError(list(overlay.revived), reasons)
+                self._mark_pending(apply=True)
+                renewed = self.ledger.renew(
+                    lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
+                rec = self._publish()
+                return RenewOutcome(renewed, list(overlay.revived), rec)
             lease = self.ledger.get_lease(lease_id)
             reviving = []
             if lease is not None and lease.state == LeaseState.ACTIVE:

@@ -137,6 +137,7 @@ class SqliteStore:
         # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
         # first-open race as the WAL switch, so retry it too.
         self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
+        self._retry_locked(self._add_missing_columns)
         # Stamp the version idempotently rather than SELECT-then-INSERT. That
         # read-then-write was a TOCTOU across processes: two CLIs opening the
         # same fresh ledger both saw no row, both inserted, and the loser died
@@ -155,6 +156,27 @@ class SqliteStore:
                 (str(SCHEMA_VERSION),),
             )
         )
+
+    #: Columns added after the first schema, as (table, column, declaration).
+    _ADDED_COLUMNS = (
+        ('deployments', 'assigned_gpus', 'TEXT'),
+    )
+
+    def _add_missing_columns(self) -> None:
+        """Add columns newer code needs to an older ledger (nullable, so safe).
+
+        Two processes can race here; a duplicate-column error from the loser
+        is the desired end state.
+        """
+        for table, column, decl in self._ADDED_COLUMNS:
+            have = {r['name'] for r in self._conn.execute(f'PRAGMA table_info({table})')}
+            if column in have:
+                continue
+            try:
+                self._conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+            except sqlite3.OperationalError as ex:
+                if 'duplicate column' not in str(ex).lower():
+                    raise
 
     def close(self) -> None:
         self._conn.close()
@@ -201,6 +223,8 @@ class SqliteStore:
             'ON CONFLICT(key) DO UPDATE SET '
             'value = CAST(meta.value AS INTEGER) + 1'
         )
+        # Every demand-changing mutation is also an admission-state change.
+        self.bump_admission_state_version()
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'desired_gen'"
         ).fetchone()
@@ -485,8 +509,8 @@ class SqliteStore:
     def insert_deployment(self, deployment: Deployment) -> None:
         self._conn.execute(
             'INSERT INTO deployments(id, compat_key, engine, sharing, capacity,'
-            ' spec, served, state, created_at, updated_at)'
-            ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' spec, served, state, created_at, updated_at, assigned_gpus)'
+            ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 deployment.id,
                 deployment.compat_key,
@@ -498,14 +522,43 @@ class SqliteStore:
                 deployment.state,
                 deployment.created_at,
                 deployment.updated_at,
+                None if deployment.assigned_gpus is None
+                else _dumps(list(deployment.assigned_gpus)),
             ),
         )
 
     def set_deployment_state(self, deployment_id: str, state: str, updated_at: float) -> None:
+        # Leaving LIVE releases the committed allocation in the same statement.
         self._conn.execute(
-            'UPDATE deployments SET state = ?, updated_at = ? WHERE id = ?',
-            (state, updated_at, deployment_id),
+            'UPDATE deployments SET state = ?, updated_at = ?,'
+            " assigned_gpus = CASE WHEN ? = 'live' THEN assigned_gpus ELSE NULL END"
+            ' WHERE id = ?',
+            (state, updated_at, state, deployment_id),
         )
+
+    def set_deployment_allocation(
+        self, deployment_id: str, gpus: list[int] | None
+    ) -> None:
+        """Commit (or clear) a LIVE deployment's GPU allocation."""
+        self._conn.execute(
+            'UPDATE deployments SET assigned_gpus = ? WHERE id = ?',
+            (None if gpus is None else _dumps([int(g) for g in gpus]), deployment_id),
+        )
+
+    def bump_admission_state_version(self) -> int:
+        """Increment ``admission_state_version``; call inside :meth:`transaction`."""
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('admission_state_version', '1') "
+            'ON CONFLICT(key) DO UPDATE SET '
+            'value = CAST(meta.value AS INTEGER) + 1'
+        )
+        return self.admission_state_version()
+
+    def admission_state_version(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'admission_state_version'"
+        ).fetchone()
+        return int(row['value']) if row else 0
 
     def update_deployment_served(
         self, deployment_id: str, served: dict[str, Any], updated_at: float
@@ -581,4 +634,5 @@ class SqliteStore:
             state=row['state'],
             created_at=row['created_at'],
             updated_at=row['updated_at'],
+            assigned_gpus=_loads(row['assigned_gpus']) if row['assigned_gpus'] else None,
         )

@@ -73,3 +73,9 @@ def test_omitting_the_keywords_is_identical_to_today():
     again = plan_placement(deps, INV, pinned={'b': [0]}, required_ids=None,
                            hard=None, optional_hints=None)
     assert base == again and base.degraded == [] and base.displaced == []
+
+
+def test_unallocated_required_deployment_ignores_pins_outside_allowed_gpus():
+    plan = plan_placement([dep('new')], INV, allowed_gpus=[0], required_ids={'new'},
+                          hard={}, pinned={'new': [1]})
+    assert plan.assignments == {'new': [0]}

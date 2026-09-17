@@ -360,9 +360,16 @@ def _requests_catalog(controller, config):
 
     published = getattr(controller.backend, 'catalog', None)
     if isinstance(published, CatalogUnion):
-        try:
+        explicit = (
+            getattr(config, 'catalog', None)
+            or os.environ.get('INFER_STACK_CATALOG', '').strip()
+        )
+        if explicit or _catalog_path(config).exists():
+            # A catalog the caller named (or the default one, when present)
+            # must load: a typo'd path or a broken file is an error, never a
+            # silent fall-back to the published union.
             invocation = _load_catalog(config)
-        except SystemExit:
+        else:
             invocation = None          # no catalog of its own: the union decides
         try:
             check_invocation_catalog(published, invocation)
@@ -1567,7 +1574,15 @@ class RenewCLI(_LeasingCommonMixin):
             raise SystemExit('renew: give a lease id or --env-file')
         # Through the controller: a renew can revive an idle deployment, which
         # is a desired-state change and must be serialised with applies.
-        outcome = controller.renew(sid, ttl_seconds=_parse_duration(config.ttl))
+        from ..leasing.backend import PlacementError
+
+        try:
+            outcome = controller.renew(sid, ttl_seconds=_parse_duration(config.ttl))
+        except PlacementError as ex:
+            raise SystemExit(
+                f'renew: {sid} needs its idle deployment(s) back, and they cannot be '
+                f'admitted now: {ex}'
+            )
         if outcome.lease is None:
             raise SystemExit(
                 f'renew: no active lease {sid} (unknown, released, or already '

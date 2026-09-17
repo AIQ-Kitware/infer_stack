@@ -69,11 +69,22 @@ class FakeDocker:
     def __init__(self):
         self.running: list[str] = []
         self.calls: list[list[str]] = []
+        self.compose_file = None
+        self.project = 'infer-stack'
 
     def __call__(self, args: list[str]) -> str:
         self.calls.append(args)
         compose_file = args[args.index('-f') + 1] if '-f' in args else None
+        from fake_docker_state import answer_residency
+
+        reply = answer_residency(args, compose_file=self.compose_file,
+                                 running=self.running, project=self.project)
+        if reply is not None:
+            return reply
         if 'up' in args:
+            self.compose_file = args[args.index('-f') + 1]
+            if '-p' in args:
+                self.project = args[args.index('-p') + 1]
             data = yaml.safe_load(Path(compose_file).read_text()) or {}
             self.running = sorted((data.get('services') or {}).keys())
             return ''

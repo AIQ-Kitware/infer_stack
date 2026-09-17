@@ -744,13 +744,13 @@ def test_release_all_releases_every_active_lease_in_one_apply(tmp_path):
 
 
 def test_transitional_unknown_residency_rollback_keeps_an_idle_candidate(tmp_path):
-    """Records CURRENT behaviour, which plan step P9 changes.
+    """Behaviour of backends WITHOUT admission mode (no preview), kept by design.
 
     A brand-new acquire fails; rollback cannot read residency, so it refuses to
-    evict (the safe direction). Until P9 makes IDLE keep-warm deployments
-    optional and resident-only, the desired set still contains that IDLE
-    deployment, so a later successful apply starts it with no lease behind it.
-    After P9 this test must assert the deployment is never started.
+    evict (the safe direction). On such backends the desired set still contains
+    that IDLE deployment, so a later apply starts it with no lease behind it.
+    Admission-mode backends (Compose) never commit a failed acquire and never
+    start idle deployments: see tests/test_leasing_admission.py.
     """
     from infer_stack.leasing import DeploymentState
     from infer_stack.leasing.backend import PlacementError

@@ -46,6 +46,33 @@ def default_ledger_path() -> Path:
     return data_root() / 'leasing' / 'ledger.db'
 
 
+class AdmissionConflict(RuntimeError):
+    """The ledger changed between an acquire's preview and its commit; retry."""
+
+
+@dataclass
+class AcquireOverlay:
+    """What an acquire *would* do, computed without writing (admission preview).
+
+    One copy of the coalescing rules: :meth:`Ledger.acquire` commits exactly
+    these decisions, so a preview and its commit cannot disagree.
+    """
+
+    now: float
+    # (request, deployment id) in request order.
+    claims: list[tuple[EndpointRequest, str]]
+    # New deployments, not yet in the store.
+    created: dict[str, Deployment]
+    # Existing IDLE deployments this acquire makes LIVE again.
+    revived: list[str]
+    # Existing deployments whose served map this acquire extends.
+    served_updates: dict[str, dict]
+    # Every deployment the lease claims, as it will be after the commit.
+    deployments: dict[str, Deployment]
+    # The admission state the preview was computed against.
+    state_version: int
+
+
 @dataclass
 class AcquireResult:
     """What :meth:`Ledger.acquire` returns to the reconciler.
@@ -122,23 +149,90 @@ class Ledger:
 
     # -- public API --------------------------------------------------------
 
+    def plan_acquire(self, requests: list[EndpointRequest]) -> AcquireOverlay:
+        """Decide how ``requests`` would coalesce, without writing anything."""
+        import copy
+
+        now = self.clock()
+        state_version = self.store.admission_state_version()
+        view: dict[str, Deployment] = {}
+        created: dict[str, Deployment] = {}
+        revived: list[str] = []
+        served_updates: dict[str, dict] = {}
+        claims: list[tuple[EndpointRequest, str]] = []
+        for req in requests:
+            chosen = None
+            if req.sharing != Sharing.DEDICATED:
+                stored = self.store.deployments_by_compat(
+                    req.compat_key, sharing=Sharing.SHARED,
+                    states=(DeploymentState.LIVE, DeploymentState.IDLE),
+                )
+                pending = [
+                    g for g in created.values()
+                    if g.compat_key == req.compat_key and g.sharing == Sharing.SHARED
+                ]
+                for candidate in [*stored, *pending]:
+                    current = view.get(candidate.id) or copy.deepcopy(candidate)
+                    if capacity_satisfies(current.capacity, req.capacity):
+                        chosen = current
+                        break
+            if chosen is None:
+                chosen = Deployment(
+                    id=self.id_factory('grp'), compat_key=req.compat_key,
+                    engine=req.engine, sharing=req.sharing,
+                    capacity=dict(req.capacity), spec=dict(req.spec),
+                    served={req.endpoint: dict(req.served)},
+                    state=DeploymentState.LIVE, created_at=now, updated_at=now,
+                )
+                created[chosen.id] = chosen
+            else:
+                if chosen.state == DeploymentState.IDLE:
+                    chosen.state = DeploymentState.LIVE
+                    chosen.assigned_gpus = None
+                    revived.append(chosen.id)
+                if chosen.served.get(req.endpoint) != req.served:
+                    chosen.served = {**chosen.served, req.endpoint: dict(req.served)}
+                    if chosen.id not in created:
+                        served_updates[chosen.id] = chosen.served
+            view[chosen.id] = chosen
+            claims.append((req, chosen.id))
+        return AcquireOverlay(
+            now=now, claims=claims, created=created, revived=revived,
+            served_updates=served_updates,
+            deployments={gid: view[gid] for gid in dict.fromkeys(g for _, g in claims)},
+            state_version=state_version,
+        )
+
     def acquire(
         self,
         owner: str,
         requests: list[EndpointRequest],
         *,
         ttl_seconds: float | None = None,
+        overlay: AcquireOverlay | None = None,
+        allocations: dict[str, list[int]] | None = None,
     ) -> AcquireResult:
         """Create a lease and coalesce its endpoints onto deployment deployments.
 
         ``ttl_seconds=None`` is an infinite (standing) lease — the shape the
         legacy ``switch <profile>`` maps onto.
+
+        With ``overlay`` (from :meth:`plan_acquire`) the previewed decisions are
+        committed as they are, together with ``allocations`` (deployment id ->
+        GPUs), in one transaction. If the admission state changed since the
+        preview, :class:`AdmissionConflict` is raised and nothing is written.
         """
-        now = self.clock()
         lease_id = self.id_factory('lease')
-        expires_at = None if ttl_seconds is None else now + ttl_seconds
         deployment_ids: list[str] = []
         with self.store.transaction():
+            if overlay is None:
+                overlay = self.plan_acquire(requests)
+            elif self.store.admission_state_version() != overlay.state_version:
+                raise AdmissionConflict(
+                    'the ledger changed between admission preview and commit'
+                )
+            now = overlay.now
+            expires_at = None if ttl_seconds is None else now + ttl_seconds
             self.store.insert_lease(
                 lease_id=lease_id,
                 owner=owner,
@@ -147,15 +241,22 @@ class Ledger:
                 expires_at=expires_at,
                 heartbeat_at=now,
             )
-            for req in requests:
-                deployment = self._find_or_create_deployment(req, now)
+            for deployment in overlay.created.values():
+                self.store.insert_deployment(deployment)
+            for gid in overlay.revived:
+                self.store.set_deployment_state(gid, DeploymentState.LIVE, now)
+            for gid, served in overlay.served_updates.items():
+                self.store.update_deployment_served(gid, served, now)
+            for gid, gpus in (allocations or {}).items():
+                self.store.set_deployment_allocation(gid, gpus)
+            for req, gid in overlay.claims:
                 self.store.insert_claim(
                     lease_id=lease_id,
                     endpoint=req.endpoint,
-                    deployment_id=deployment.id,
+                    deployment_id=gid,
                     kind='reserved-gpu' if is_reservation(req) else 'endpoint',
                 )
-                deployment_ids.append(deployment.id)
+                deployment_ids.append(gid)
             # Every acquire bumps the desired generation, even when it coalesces
             # onto an already-live deployment: this is the signal that the caller
             # needs an apply to have run including its claim (and it heals drift —
@@ -188,7 +289,10 @@ class Ledger:
                 self.store.bump_desired_generation()
         return ReleaseResult(idled_deployment_ids=idled)
 
-    def renew(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None:
+    def renew(
+        self, lease_id: str, *, ttl_seconds: float | None,
+        allocations: dict[str, list[int]] | None = None,
+    ) -> Lease | None:
         """Extend (or make infinite) a lease's protection window.
 
         Only an ACTIVE lease renews; a RELEASED/EXPIRED one returns ``None``
@@ -224,8 +328,36 @@ class Ledger:
                         gid, DeploymentState.LIVE, now
                     )
                     revived.append(gid)
+            for gid, gpus in (allocations or {}).items():
+                if gid in revived:
+                    self.store.set_deployment_allocation(gid, gpus)
             if revived:  # demand is back -> an apply must run to re-up them
                 self.store.bump_desired_generation()
+        return self.store.get_lease(lease_id)
+
+    def renew_if_live(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None | bool:
+        """The lock-free renew fast path: TTL only, when nothing needs admission.
+
+        Returns the renewed lease when the lease is ACTIVE and every deployment
+        it claims is already LIVE (so the renew changes no desired state), ``None``
+        when the lease is unknown or not ACTIVE, and ``False`` -- having written
+        nothing -- when some deployment is not LIVE and the caller must take the
+        slow path under the controller's lock.
+        """
+        now = self.clock()
+        with self.store.transaction():
+            lease = self.store.get_lease(lease_id)
+            if lease is None or lease.state != LeaseState.ACTIVE:
+                return None
+            for gid in dict.fromkeys(lease.deployment_ids):
+                deployment = self.store.get_deployment(gid)
+                if deployment is None or deployment.state != DeploymentState.LIVE:
+                    return False
+            self.store.renew_lease(
+                lease_id, ttl_seconds=ttl_seconds,
+                expires_at=None if ttl_seconds is None else now + ttl_seconds,
+                heartbeat_at=now,
+            )
         return self.store.get_lease(lease_id)
 
     def sweep(self) -> SweepResult:
@@ -363,6 +495,15 @@ class Ledger:
     def set_applied_generation(self, gen: int) -> None:
         self.store.set_applied_generation(gen)
 
+    def set_allocation(self, deployment_id: str, gpus: list[int] | None) -> None:
+        """Commit a LIVE deployment's GPU allocation (e.g. adopted from residency)."""
+        with self.store.transaction():
+            self.store.set_deployment_allocation(deployment_id, gpus)
+            self.store.bump_admission_state_version()
+
+    def admission_state_version(self) -> int:
+        return self.store.admission_state_version()
+
     def get_lease(self, lease_id: str) -> Lease | None:
         return self.store.get_lease(lease_id)
 
@@ -370,53 +511,6 @@ class Ledger:
         return self.store.get_deployment(deployment_id, now=self.clock())
 
     # -- internals ---------------------------------------------------------
-
-    def _find_or_create_deployment(
-        self, req: EndpointRequest, now: float
-    ) -> Deployment:
-        if req.sharing == Sharing.DEDICATED:
-            return self._create_deployment(req, now)
-        candidates = self.store.deployments_by_compat(
-            req.compat_key,
-            sharing=Sharing.SHARED,
-            states=(DeploymentState.LIVE, DeploymentState.IDLE),
-        )
-        for deployment in candidates:
-            if capacity_satisfies(deployment.capacity, req.capacity):
-                if deployment.state == DeploymentState.IDLE:
-                    self.store.set_deployment_state(
-                        deployment.id, DeploymentState.LIVE, now
-                    )
-                self._merge_served(deployment, req, now)
-                return self.store.get_deployment(deployment.id) or deployment
-        return self._create_deployment(req, now)
-
-    def _create_deployment(
-        self, req: EndpointRequest, now: float
-    ) -> Deployment:
-        deployment = Deployment(
-            id=self.id_factory('grp'),
-            compat_key=req.compat_key,
-            engine=req.engine,
-            sharing=req.sharing,
-            capacity=dict(req.capacity),
-            spec=dict(req.spec),
-            served={req.endpoint: dict(req.served)},
-            state=DeploymentState.LIVE,
-            created_at=now,
-            updated_at=now,
-        )
-        self.store.insert_deployment(deployment)
-        return deployment
-
-    def _merge_served(
-        self, deployment: Deployment, req: EndpointRequest, now: float
-    ) -> None:
-        """Add an endpoint (e.g. a new Ollama tag) to a coalesced deployment."""
-        served = dict(deployment.served)
-        if served.get(req.endpoint) != req.served:
-            served[req.endpoint] = dict(req.served)
-            self.store.update_deployment_served(deployment.id, served, now)
 
     def _idle_deployments(self, deployment_ids: list[str], now: float) -> list[str]:
         idled: list[str] = []

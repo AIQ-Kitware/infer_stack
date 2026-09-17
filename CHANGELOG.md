@@ -2,6 +2,41 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Admission: committed allocations, atomic acquires, optional warm residency
+
+For the Compose backend, this fixes the incident where idle keep-warm models
+starved new leases while GPUs sat empty. It covers plan steps P5, P6 and P9.
+
+- **Hard allocations.** A LIVE deployment holds a committed allocation, the new
+  `deployments.assigned_gpus` column, added to existing ledgers automatically.
+  The allocation is released in the same transaction as any transition out of
+  LIVE.
+- **Atomic admission.** An acquire is previewed in memory, both placement and
+  render, against the ledger, strict residency and the published profile. The
+  lease and its allocations are committed together, or nothing is written.
+  - A queued caller that is not yet admitted holds nothing.
+  - Two callers racing for the last GPU cannot both win.
+  - A ledger change between preview and commit makes the acquire retry.
+  - While Docker residency is unknown, only requests needing no new GPU are
+    admitted.
+- **Optional warm residency.** An idle keep-warm deployment is only a
+  candidate while its container is uniquely resident. It yields its GPUs to
+  demand (reported as `displaced`), and is never started.
+- **Reuse.** Making an idle deployment LIVE again adopts its resident
+  container's GPUs, or places it fresh.
+- **Renew.** When every deployment is already LIVE, renew is lock-free and
+  TTL-only. Otherwise the lease is re-admitted under the lock, and the renew
+  fails explicitly if that is impossible.
+- **Upgrade.** LIVE deployments without an allocation adopt their running
+  container's GPUs. Ones that cannot (for example GPU reservations) stay
+  unresolved and block new allocations until released.
+- **Planner.** In admission mode it ignores soft sidecar pins, so a new
+  placement stays within `--allowed-gpus`.
+- **CLI catalogs.** A `--catalog` (or `INFER_STACK_CATALOG`) the caller names
+  that is missing or invalid is an error, even once a catalog union is
+  published.
+- **`config publish` refuses to change the backend kind.**
+
 ### Profile publication fixes (review)
 
 - **`config publish` on a fresh ledger** no longer freezes the invocation's

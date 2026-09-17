@@ -2893,3 +2893,52 @@ proposal had it wrong. I listed it as a render input because the backend
 constructor takes it, without asking whose decision it is. The constructor's
 signature is a poor guide to what is host configuration. I checked who sets
 each input only after being told.
+
+## 2026-09-16 20:49:04 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** `/goal finish the plan`. GPT reviews arrive mid-stream and
+are folded in as they come.
+
+**What I did.**
+- **P3.** Planner keywords.
+- **GPT review round.** Five fixes:
+  - fresh-ledger publish atomicity;
+  - `DOCKER_CONTEXT=default`;
+  - a declined recovery render keeps the placement scope;
+  - edited catalogs are refused;
+  - the KubeAI catalog is frozen into the profile.
+- **Admission core (P5, P6, P9).** Admission mode applies only to backends
+  with `residency` and `preview`, which is Compose today:
+  - `assigned_gpus`;
+  - a single-copy `Ledger.plan_acquire` overlay, committed as-is with an
+    `admission_state_version` guard;
+  - `Controller._admit`, which previews in memory;
+  - renders built from LIVE + uniquely resident IDLE keep-warm deployments;
+  - renew fast and slow paths;
+  - backfill.
+- **Second GPT review.** Three fixes: pins are ignored in admission mode,
+  explicitly named broken catalogs are errors, and backend switching is
+  refused.
+- **Tests.** The compose test fakes now answer `docker ps -a` and
+  `docker inspect` from their running set (`tests/fake_docker_state.py`).
+
+**Choices worth reviewing.**
+1. **Approval runs after the commit.** The render diff approval still happens
+   after the lease commit, rolling back on decline, rather than before it. The
+   plan's intent is that approval holds no SQLite write lock (test 33), which
+   holds.
+2. **Unknown residency fails renders.** In admission mode an unreadable
+   residency fails the render (the change stays pending) rather than guessing
+   which warm models exist.
+3. **Unresolved deployments block new allocations**, per the plan. That is harsh
+   for standing GPU reservations made before the upgrade: operators must
+   release them once.
+
+**Reflection.** GPT's pin bug was real, and it came from reusing the legacy
+pinned step inside admission mode without asking what a pin means there. That
+is the same mistake as `allowed_gpus` in the profile: carrying a mechanism
+over without re-deriving its authority. Removing pins from admission mode then
+broke the scoped crash recovery, which relied on pins. Making that recovery
+commit a hard allocation is the honest form of what it did before.
