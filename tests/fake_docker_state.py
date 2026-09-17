@@ -28,6 +28,7 @@ class ComposeFake:
         self.compose_file = None
         self.project = 'infer-stack'
         self.started: list[list[str]] = []     # service batches per `up`
+        self.initial_health = 'healthy'        # health a new healthchecked container reports
 
     # Existing tests read `running` as the list of running service names.
     @property
@@ -68,6 +69,8 @@ class ComposeFake:
                 out.append({'Id': cid, 'State': {'Status': c['state']},
                             'Config': {'Labels': c['labels']},
                             'HostConfig': {'DeviceRequests': requests},
+                            **({'State': {'Status': c['state'], 'Health': {'Status': c['health']}}}
+                               if c.get('health') else {}),
                             'NetworkSettings': {'Networks': {
                                 'n': {'IPAddress': ip} for ip in c.get('ips', [])}}})
             return json.dumps(out)
@@ -127,7 +130,9 @@ class ComposeFake:
                 c['state'] = 'running'
                 return
             del self.containers[cid]                      # compose recreates on change
-        self.add_container(name, labels=labels, device_ids=device_ids)
+        cid = self.add_container(name, labels=labels, device_ids=device_ids)
+        if svc.get('healthcheck'):
+            self.containers[cid]['health'] = self.initial_health
 
 
 def answer_residency(args, *, compose_file, running, project):  # pragma: no cover - legacy

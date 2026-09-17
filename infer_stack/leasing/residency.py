@@ -93,6 +93,9 @@ class Container:
     labelled: bool = False
     #: IPv4 addresses on the container's networks.
     ips: tuple[str, ...] = ()
+    #: Docker healthcheck status (``healthy``, ``starting``, ``unhealthy``), or
+    #: empty when the container defines no healthcheck.
+    health: str = ''
 
     @property
     def warm(self) -> bool:
@@ -218,6 +221,7 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
             service=str(labels.get(SERVICE_LABEL) or labels.get(COMPOSE_SERVICE_LABEL) or ''),
             fingerprint=str(labels.get(FINGERPRINT_LABEL) or ''),
             labelled=bool(labels.get(SERVICE_LABEL) and labels.get(FINGERPRINT_LABEL)),
+            health=str(((item.get('State') or {}).get('Health') or {}).get('Status') or ''),
             ips=tuple(sorted(
                 str(n.get('IPAddress')) for n in
                 (((item.get('NetworkSettings') or {}).get('Networks')) or {}).values()

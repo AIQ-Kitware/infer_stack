@@ -174,3 +174,39 @@ def test_gc_orphans_removes_exactly_the_reported_containers(tmp_path):          
     removed = ctl.remove_orphans(lambda found: True)
     assert [c.container_id for c in removed] == [c.container_id for c in seen] == [stray]
     assert stray not in be.run.containers
+
+
+def test_a_health_conditioned_dependency_is_awaited_before_its_dependent(tmp_path):
+    from test_leasing_dynamic_routing import RecordingGateway
+
+    be = backend(tmp_path, litellm=True, dynamic_routing=True, http=RecordingGateway())
+    fake = be.run
+    fake.initial_health = 'starting'
+    probes = []
+
+    def sleep(seconds):
+        probes.append(seconds)
+        for c in fake.containers.values():
+            if c['service'] == 'postgres-litellm' and len(probes) >= 3:
+                c['health'] = 'healthy'
+
+    be._sleep = sleep
+    be.converge([vllm('a')])
+    assert len(probes) >= 3                           # it waited for postgres health
+    order = [s for batch in fake.started for s in batch]
+    assert order.index('postgres-litellm') < order.index('litellm')
+
+
+def test_an_unhealthy_dependency_aborts_within_its_deadline(tmp_path):
+    from infer_stack.leasing.compose import APPLY_HEALTH_WAIT_S
+    from test_leasing_dynamic_routing import RecordingGateway
+
+    be = backend(tmp_path, litellm=True, dynamic_routing=True, http=RecordingGateway())
+    be.run.initial_health = 'starting'
+    now = [0.0]
+    be._clock = lambda: now[0]
+    be._sleep = lambda s: now.__setitem__(0, now[0] + s)
+    with pytest.raises(ApplyAborted, match='healthy'):
+        be.converge([vllm('a')])
+    assert now[0] <= APPLY_HEALTH_WAIT_S
+    assert 'litellm' not in {c['service'] for c in be.run.containers.values()}

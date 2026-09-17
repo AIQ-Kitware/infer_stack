@@ -225,6 +225,19 @@ def _stanza_gpus(service: dict[str, Any]) -> list[int]:
     return out
 
 
+#: Bounds for selective apply's waits under the controller's lock.
+APPLY_REMOVAL_WAIT_S = 60.0
+APPLY_HEALTH_WAIT_S = 180.0
+
+
+def _depends_on(service: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``depends_on`` as ``{service: {condition...}}`` for list and map forms."""
+    deps = service.get('depends_on') or {}
+    if isinstance(deps, list):
+        return {d: {} for d in deps}
+    return {d: dict(v or {}) for d, v in deps.items()}
+
+
 def _dependency_levels(services: dict[str, Any], names: list[str]) -> list[list[str]]:
     """Group ``names`` into start order: each level depends only on earlier ones.
 
@@ -2372,6 +2385,16 @@ class ComposeBackend(ConvergeScaffold):
     #: {service, fingerprint}. Set by the controller from the ledger.
     adopted: dict[str, dict[str, str]] = {}
 
+    def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
+        """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""
+        deadline = self._clock() + deadline_s
+        while True:
+            if predicate(self.residency()):
+                return
+            if self._clock() + interval > deadline:
+                raise ApplyAborted(f'timed out after {deadline_s:g}s waiting for {what}')
+            self._sleep(interval)
+
     def selective_apply(self, services, fingerprints, *, degraded=frozenset(),
                         optional=frozenset()):
         """Make the project match the render, touching only what differs.
@@ -2477,10 +2500,35 @@ class ComposeBackend(ConvergeScaffold):
             logger.info('apply: removing {} container(s): {}', len(departing),
                         ', '.join(f'{key(c)[0]}' for c in departing))
             self.run(['docker', 'rm', '-f', *[c.container_id for c in departing]])
+            # The barrier: confirm they are really gone before anything starts
+            # on their GPUs or addresses.
+            self._wait_until(
+                lambda snap: not ({c.container_id for c in snap.all_containers()}
+                                  & departing_ids),
+                deadline_s=APPLY_REMOVAL_WAIT_S,
+                what='removed containers to disappear',
+            )
         paused = [c for c in keep if c.state == 'paused' and key(c)[0] not in optional]
         if paused:
             self.run(['docker', 'unpause', *[c.container_id for c in paused]])
         for level in _dependency_levels(services, to_start):
+            # `--no-deps` keeps unrelated services untouched but also skips
+            # Compose's `condition: service_healthy`, so wait for it here.
+            healthy_deps = sorted({
+                dep for name in level
+                for dep, cond in _depends_on(services[name]).items()
+                if cond.get('condition') == 'service_healthy'
+            })
+            if healthy_deps:
+                logger.info('apply: waiting for {} to be healthy', ', '.join(healthy_deps))
+                self._wait_until(
+                    lambda snap, deps=healthy_deps: all(
+                        any(c.service == dep and c.health == 'healthy'
+                            for c in snap.all_containers())
+                        for dep in deps),
+                    deadline_s=APPLY_HEALTH_WAIT_S,
+                    what=f'{", ".join(healthy_deps)} to become healthy',
+                )
             logger.info('docker compose up -d --no-deps {}', ' '.join(level))
             self._compose(['up', '-d', '--no-deps', *level])
         return SelectiveApplyOutcome(

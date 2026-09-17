@@ -2,6 +2,17 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Selective apply waits for health and for removals (review)
+
+- **Health-conditioned dependencies.** `up --no-deps` skips Compose's
+  `depends_on: condition: service_healthy`, so selective apply now waits
+  (bounded, 180 s) for such a dependency, for example Postgres before the
+  dynamic-routing gateway, to report healthy before starting its dependent,
+  and aborts with the change pending otherwise.
+- **Removals are confirmed.** After removing containers, the apply confirms
+  from strict residency that they are gone (bounded, 60 s) before starting
+  anything on their GPUs or addresses.
+
 ### Stable per-service addresses: `infer-stack network migrate` and `network check` (P7)
 
 - **`network migrate --subnet <cidr>`.** Puts the project on one named
