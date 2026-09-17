@@ -1,0 +1,570 @@
+The git_well Module
+===================
+
+
+|Pypi| |PypiDownloads| |GithubActions| |Codecov|  |ReadTheDocs|
+
++------------------+----------------------------------------------+
+| Read the docs    | https://python-git-well.readthedocs.io       |
++------------------+----------------------------------------------+
+| Github           | https://github.com/Erotemic/git_well         |
++------------------+----------------------------------------------+
+| Pypi             | https://pypi.org/project/git_well            |
++------------------+----------------------------------------------+
+
+Git Well is a collection of git command line tools and is also a Python
+module.
+
+Installing this module installs the ``git-well`` command, which is a modal CLI
+into several new git commands. These git commands are also exposed as
+standalone "git" executables.
+
+In other words after you:
+
+.. code:: bash
+
+   pip install git-well
+
+To get CLI argument completion install `autocomplete
+<https://pypi.org/project/argcomplete/>`_, and you can enable global
+auto-completion
+
+.. code:: bash
+
+    pip install argcomplete
+    mkdir -p ~/.bash_completion.d
+    activate-global-python-argcomplete --dest ~/.bash_completion.d
+    source ~/.bash_completion.d/python-argcomplete
+
+And add this to your .bashrc
+
+.. code:: bash
+
+    if [ -f "$HOME/.bash_completion.d/python-argcomplete" ]; then
+        # shellcheck disable=SC1091
+        source "$HOME"/.bash_completion.d/python-argcomplete
+    fi
+
+
+NOTE: if you know of a way to make this easier please let me know!
+
+
+Then you can run
+
+.. code:: bash
+
+   # Show all the commands exposed by this repo.
+   git well --help
+
+   git well sync --help
+
+   # OR
+
+   git sync
+
+
+Top Level CLI:
+
+.. code::
+
+    usage: git-well [-h] {squash_streaks,branch_upgrade,sync,branch_cleanup,track_upstream,rebase_add_continue,remote_protocol,discover_remote} ...
+
+    options:
+      -h, --help            show this help message and exit
+
+    commands:
+      {squash_streaks,branch_upgrade,sync,branch_cleanup,track_upstream,rebase_add_continue,remote_protocol,discover_remote}
+                            specify a command to run
+        squash_streaks      Squashes consecutive commits that meet a specified criteiron.
+        branch_upgrade      Upgrade to the latest "dev" branch. I.e. search for the branch
+        sync                Sync a git repo with a remote server via ssh
+        branch_cleanup      Cleanup branches that have been merged into main.
+        track_upstream      Set the branch upstream with sensible defaults if possible.
+        rebase_add_continue
+                            A single step to make rebasing easier.
+        remote_protocol     Helper to change a remote from https to ssh / git for a specific user /
+        discover_remote     Attempt to discover a ssh remote based on an ssh host.
+
+
+
+
+The tools in this module are derived from:
+
+* https://github.com/Erotemic/git-sync
+* https://github.com/Erotemic/local/tree/main/git_tools
+
+
+
+Archiving pull-request review state
+-----------------------------------
+
+``git archive-source`` normally archives the committed checkout and the
+history reachable from the current ``HEAD``. When reviewing a pull request
+from a contributor fork, use ``--all-branches`` to also preserve every local
+branch and every remote-tracking branch that has already been fetched into the
+superproject repository:
+
+.. code:: bash
+
+   git remote add contributor git@github.com:contributor/project.git
+   git fetch contributor
+   git archive-source --all-branches
+
+The archive operation itself does not contact ``origin``, ``contributor``, or
+any other configured remote. It copies the locally cached ``refs/heads/*`` and
+``refs/remotes/*`` state, so the unpacked archive can run commands such as
+``git branch --all``, ``git log contributor/topic``, and
+``git diff main...contributor/topic`` even if the original fork is no longer
+reachable. The archived working tree remains detached at the exact original
+``HEAD`` commit. ``--all-branches`` is opt-in, applies to the superproject,
+honors positive ``--depth`` values from each included branch tip, and cannot
+be combined with source-only ``--depth 0`` archives.
+
+Repository-specific archivers can extend the same staging machinery through
+the Python API. Prepare hooks may add generated payloads to the committed
+checkout, while validation hooks run after git-well writes its metadata and
+immediately before serialization:
+
+.. code:: python
+
+   from git_well.git_archive_source import archive_source
+
+   def prepare(context):
+       report = context.archive_root / 'PROJECT_ARCHIVE_REPORT.txt'
+       report.write_text('project-specific report\n')
+       context.add_generated_excludes('PROJECT_ARCHIVE_REPORT.txt')
+
+   def validate(context):
+       assert context.manifest_path.exists()
+
+   archive_source(
+       repo_dpath='.',
+       depth=100,
+       prepare=prepare,
+       validate=validate,
+   )
+
+For workflows that need direct control, ``stage_source_archive()`` exposes the
+same context manager before metadata finalization and archive writing. These
+extension points are programmatic only; the command-line interface does not
+execute arbitrary hooks.
+
+Incremental source archives
+---------------------------
+
+History-bearing source archives can also be used as bases for small incremental
+updates. First create a normal full archive, then make one or more descendant
+commits and request a patch against the closest compatible full archive recorded
+by git-well:
+
+.. code:: bash
+
+   git-well archive_source . -o project-base.tar.gz
+   # make and commit changes
+   git-well archive_source . --patch auto -o project-update.tar.gz
+
+Patch mode requires the superproject ``.git`` directory. Source-only
+``--depth 0`` archives are not supported as bases or targets. The initial patch
+implementation intentionally supports the clear descendant-history case only:
+the base and target must use the same superproject history depth and the same
+``--all-branches`` policy. ``patch=auto`` chooses the compatible recorded full
+archive whose HEAD is closest to the target HEAD. An explicit full archive path
+may be passed instead of ``auto``.
+
+Repository-specific Python wrappers use the same mechanism. Prepare and
+validation hooks still see a complete target staging tree; git-well computes the
+incremental transport only after validation, so generated payloads are included
+without requiring patch-specific hooks:
+
+.. code:: python
+
+   archive_source(
+       repo_dpath='.',
+       depth=100,
+       patch='auto',
+       prepare=prepare,
+       validate=validate,
+   )
+
+Git bundles transport new repository objects while a residual filesystem overlay
+transports generated hook payloads and other non-Git differences. Patch archives
+contain ``GIT_WELL_SOURCE_PATCH.json`` with the exact base archive SHA-256 and a
+standalone ``APPLY_SOURCE_PATCH.py``. The standalone applier uses only the Python
+standard library plus the ``git`` executable, so a recipient does not need
+git-well installed. Extract the patch archive and run the script beside its
+manifest:
+
+.. code:: bash
+
+   python APPLY_SOURCE_PATCH.py /path/to/project-base.tar.gz /path/to/output
+
+The script verifies the exact base archive, applies superproject and submodule Git
+bundles plus residual deletions/overlays, verifies the resulting repository HEADs,
+and prints the reconstructed target source root. Installed callers use the same
+implementation through ``git_well.archive_source_patch.apply_source_patch``.
+
+
+Bounded active history with Git epochs
+--------------------------------------
+
+``git epoch`` periodically moves an exact retired Git epoch into a separate
+history-store repository and replaces the active branch with a new root commit
+that represents the same checkout. Ordinary clones then receive only the
+current epoch, while the archived commits keep their original object IDs,
+merge topology, tags, trees, and blobs.
+
+Initialize a repository without changing its active refs:
+
+.. code:: bash
+
+   git epoch init --repository ambition \
+       --history-store ../ambition-history.git \
+       --config-only
+
+For a remote history store, also write a committed clone-visible locator before
+planning the first rollover. The history-store ID is stable even if the archive
+URL later moves:
+
+.. code:: bash
+
+   git epoch init --repository ambition \
+       --history-store git@github.com:Erotemic/ambition-history.git \
+       --history-store-id ambition-history \
+       --public-history-url https://github.com/Erotemic/ambition-history.git \
+       --public-history-browse-url https://github.com/Erotemic/ambition-history \
+       --config-only
+   git add .git-epoch.yaml
+   git commit -m "Record Git epoch history location"
+
+A checkpoint using a remote history store refuses to proceed until this file is
+committed and agrees with the local repository/store identity.
+
+For managed submodules, initialize the child repositories as well and classify
+each superproject occurrence before a recursive checkpoint:
+
+.. code:: bash
+
+   git epoch configure-submodule renderer epoch --repository renderer
+   git epoch configure-submodule third_party/upstream external
+
+Before touching production remotes, the same workflow can be rehearsed against
+disposable local bare remotes. ``sandbox create`` clones the current checked-out
+state, removes non-sandbox remotes from those clones, and records the original
+URLs only as metadata. ``sandbox publish`` rechecks containment immediately
+before rewriting refs:
+
+.. code:: bash
+
+   SANDBOX_DPATH=$(mktemp -d "${TMPDIR:-/tmp}/git-well-epoch-sandbox.XXXXXX")
+   git epoch sandbox create --recursive --all-submodules=epoch \
+       --output "$SANDBOX_DPATH"
+   git epoch sandbox run "$SANDBOX_DPATH" --bundle
+
+The staged ``sandbox plan``, ``sandbox apply``, ``sandbox publish``, and
+``sandbox verify`` commands expose the same phases when the rehearsal should be
+inspected between steps. Verification fresh-clones every repository using only
+sandbox remotes and composes those clones at the translated gitlinks. Git admin
+directories are kept flat and separate from the recursive worktree, avoiding
+platform path growth while still checking the combined parent/submodule tree.
+
+Use ``git epoch stats`` to inspect the physical local history store and each
+archived epoch. The report separates shared-store bytes from standalone bundle
+bytes because epochs can share Git objects. In a sandbox, ``sandbox stats`` also
+reports active bare-remote sizes and the recursive fresh-clone size; add
+``--source-archive`` to build and measure the same full-history ``tar.gz`` shape
+used by ``archive_source``:
+
+.. code:: bash
+
+   git epoch sandbox stats "$SANDBOX_DPATH"
+   git epoch sandbox stats "$SANDBOX_DPATH" --source-archive
+
+Run ``git epoch gc`` from a managed sandbox worktree when you also want to
+measure repacking savings. It reports before/after file bytes and allocated
+filesystem bytes, then deep-verifies the archive after packing.
+
+A checkpoint can be split into an inspectable, resumable preparation and a
+separate publication step. Keep the plan outside the worktree so writing it
+does not make the checkpoint immediately dirty:
+
+.. code:: bash
+
+   CUTOVER_DPATH="$HOME/ambition-epoch-cutover"
+   mkdir -p "$CUTOVER_DPATH"
+   PLAN="$CUTOVER_DPATH/checkpoint.yaml"
+
+   git epoch plan --recursive --bundle -o "$PLAN"
+   git epoch apply "$PLAN"
+   git epoch inspect
+   git epoch publish --plan "$PLAN"
+
+``apply``, ``publish``, and deep verification print elapsed-time progress to
+stderr by default while keeping their YAML result on stdout. Pass ``--quiet``
+when scripting without progress output. Archive refs are pushed per repository
+in one atomic batch, and deep verification fetches each repository's archived
+refs in one batch before one ``git fsck``.
+
+``apply`` archives and verifies the retiring epoch before any active branch is
+rewritten. Until ``publish`` succeeds, manifest entries are marked
+``prepared``. Use ``git epoch abort --plan "$PLAN"`` to discard a prepared
+transaction before any successor branch has been adopted.
+
+After publication, verify the archive and reconstruct archaeology checkouts as
+needed:
+
+.. code:: bash
+
+   git epoch verify --deep
+   git epoch reconstruct --recursive -o ../ambition-history-view
+
+Publication also maintains a human-facing ``main`` branch in the history store
+and mirrors committed archived branches/tags under ``archive/...`` refs. The
+canonical machine authorities remain ``refs/meta/main`` and ``refs/epochs/...``.
+For a history store created by an older git-epoch version, backfill those
+browsing views idempotently with:
+
+.. code:: bash
+
+   git epoch history-sync
+
+A normal clone of the history repository can then browse archived branches
+without custom refspecs. ``main`` contains a generated ``README.md`` and
+``archive-index.yaml`` explaining the store and mapping the canonical refs to
+the browsing refs.
+
+Once publication and verification are complete, an existing active checkout may
+still contain unreachable retired objects through its reflog. ``compact``
+validates the published lineage, expires only unreachable reflog entries, runs
+``git gc --prune=now``, and reports before/after Git-directory sizes:
+
+.. code:: bash
+
+   git epoch compact --recursive
+
+Reconstruction fetches the exact archived commits and creates local
+``refs/replace`` objects that connect each successor root to its recorded
+predecessor. The archived commit objects themselves are not rewritten.
+
+A successor root records immutable lineage and the logical history-store ID,
+not a machine-local archive path. ``.git-epoch.yaml`` supplies the movable public
+locator. A fresh clone can therefore explain its split history immediately:
+
+.. code:: bash
+
+   git epoch status
+   git epoch inspect
+
+``status`` does not contact the public archive when local attachment is absent.
+``inspect`` and ``reconstruct`` may use the committed public locator read-only.
+To create machine-local management state, validate and attach the archive:
+
+.. code:: bash
+
+   git epoch attach
+
+Maintainers may override the public fetch URL with a writable/local endpoint
+while keeping the same logical store identity:
+
+.. code:: bash
+
+   git epoch attach --history-store git@github.com:Erotemic/ambition-history.git
+
+Attachment verifies the public locator, successor-root trailers, archive
+manifest, successor commit/tree, and predecessor commit/tree before writing
+``.git/epoch/config.yaml``.
+
+Version one intentionally requires SHA-1 repositories and a clean single
+worktree. By default checkpoint planning refuses extra active branches because
+they would keep the retired epoch reachable. Maintainers can explicitly use
+``--retire-extra-branches`` to archive those branch tips under their original
+names and delete the auxiliary active refs atomically during publication. See
+``docs/planning/git_epoch.md`` for the data model, safety invariants, recursive
+submodule semantics, and deferred scope.
+
+
+Tracking large files with IPFS
+------------------------------
+
+``git-well`` also exposes an experimental ``git ipfs`` helper for keeping
+large payloads out of Git while tracking reproducible IPFS CIDs in small
+``*.ipfs`` sidecar files.  There is intentionally no repository-local IPFS
+store and no required ``git ipfs init`` step: Kubo still owns its normal
+``$IPFS_PATH`` repository, while Git only tracks small sidecar metadata.
+
+The minimum supported Kubo version is **0.37.0**.  This is the first Kubo
+release with ``ipfs add --pin-name``, which ``git ipfs add --name`` uses to
+assign a human-readable name at import time.
+
+The intended happy path is:
+
+.. code:: bash
+
+   git ipfs doctor
+   git ipfs add data/ --name my-data
+   git commit -m "Track data with IPFS"
+
+When you know the peer that is likely to provide the content, record it during
+add:
+
+.. code:: bash
+
+   git ipfs add data/ --name my-data --suggested-peers 12D3KooW...
+
+A collaborator can then materialize the payloads with:
+
+.. code:: bash
+
+   git clone <repo-url>
+   cd <repo>
+   git ipfs doctor
+   git ipfs pull
+
+The sidecar stores the CID, relative path, object kind, byte size, and the
+CID-affecting import settings.  Volatile local details such as mtimes, command
+elapsed time, and machine-specific cache state are intentionally left out of
+the committed sidecar so repeated runs stay reviewable.
+
+Sidecar schema v1
+~~~~~~~~~~~~~~~~~
+
+The ``schema_version: 1`` contract is intentionally small and YAML-first.
+Unknown fields should be ignored by readers, and fields that are not needed to
+materialize content should be treated as advisory.  This keeps hand-written
+sidecars easy to review and gives future versions room to add optional metadata
+without breaking old repositories.
+
+.. code:: yaml
+
+   schema_version: 1
+   type: ipfs-sidecar
+   cid: bafy...
+   rel_path: data
+   kind: directory
+   size_bytes: 123456
+   num_files: 42
+   pin_name: my-data
+   import:
+     recursive: true
+     cid_version: 1
+     raw_leaves: false
+   suggested_peers:
+     - 12D3KooW...
+     - /ip4/203.0.113.10/tcp/4001/p2p/12D3KooW...
+
+Required fields for materialization are ``cid`` and ``rel_path``.  The
+``import`` mapping records options that affect CID reproducibility.
+``pin_name``, sizes, counts, and ``suggested_peers`` are useful metadata, but a
+reader should still be able to pull content without them.
+
+Sidecars may include peer hints.  Bare peer IDs are useful hints when routing
+can discover addresses; full multiaddrs are more reliable when known.
+``git ipfs pull`` makes a best-effort attempt to connect to ``suggested_peers``
+before downloading.  Peer hints can also be inspected or connected manually:
+
+.. code:: bash
+
+   git ipfs peers
+   git ipfs peers --connect
+
+To make the data retrievable by others, configure a Kubo remote pinning service
+and push sidecar CIDs:
+
+.. code:: bash
+
+   ipfs pin remote service add <service-name> <endpoint> <key>
+   git ipfs push --service <service-name>
+
+Useful inspection commands:
+
+.. code:: bash
+
+   git ipfs status
+   git ipfs status --full
+   git ipfs export --emit_bash
+
+Dogfood checklist
+~~~~~~~~~~~~~~~~~
+
+When changing this workflow, test it on a scratch branch with a small real
+payload before publishing the change:
+
+.. code:: bash
+
+   git ipfs doctor
+   mkdir -p .git-well-ipfs-smoke
+   printf 'hello from git ipfs\n' > .git-well-ipfs-smoke/payload.txt
+   git ipfs add .git-well-ipfs-smoke --name git-well-ipfs-smoke
+   git status --short .gitignore .git-well-ipfs-smoke.ipfs
+   rm -rf .git-well-ipfs-smoke
+   git ipfs pull .git-well-ipfs-smoke.ipfs
+   git ipfs status .git-well-ipfs-smoke.ipfs
+
+The helper script ``dev/ipfs_dogfood_smoke.sh`` runs the same smoke flow and
+accepts an optional peer hint as its second argument.
+
+Troubleshooting
+~~~~~~~~~~~~~~~
+
+``git ipfs doctor`` is the first command to run when retrieval is confusing.
+Common failure modes are reported with actionable hints:
+
+* ``ipfs`` is missing from ``PATH``: install Kubo >= 0.37.0.
+* The Kubo repo is missing: run ``ipfs init`` for Kubo itself.  This does not
+  create anything inside the Git repository.
+* The daemon/API is offline: start ``ipfs daemon`` or check ``IPFS_PATH``.
+* Retrieval cannot find a CID: check that someone is pinning the content, then
+  try ``git ipfs peers --connect`` or add more specific ``suggested_peers``.
+* Named pins fail: upgrade to Kubo >= 0.37.0 or omit ``--name``.
+
+
+Use Cases
+---------
+
+Have you ever run into this error when you run ``git pull``?
+
+.. code::
+
+    There is no tracking information for the current branch.
+    Please specify which branch you want to merge with.
+    See git-pull(1) for details.
+
+        git pull <remote> <branch>
+
+    If you wish to set tracking information for this branch you can do so with:
+
+        git branch --set-upstream-to=origin/<branch> the_current_branch
+
+I find this a huge pain because it can't even be bothered to fill in `<branch>` so you have to munge the command to type:
+
+.. code::
+
+        git branch --set-upstream-to=origin/the_current_branch the_current_branch
+
+
+I get why they did this, the branch on the remote might have a different name.
+But... it usually doesn't. That's why I implemented ``git-well track-upstream``.
+
+
+Running this instead will detect if you are in the simple case and just do it
+for you. Otherwise it will enumerate your options and ask you to pick one.
+
+I've found this command to prevent so much disruption that instaling git-well
+install ``git track-upstream`` as its own command.
+
+
+
+
+.. |Pypi| image:: https://img.shields.io/pypi/v/git_well.svg
+    :target: https://pypi.python.org/pypi/git_well
+
+.. |PypiDownloads| image:: https://img.shields.io/pypi/dm/git_well.svg
+    :target: https://pypistats.org/packages/git_well
+
+.. |GithubActions| image:: https://github.com/Erotemic/git_well/actions/workflows/tests.yml/badge.svg?branch=main
+    :target: https://github.com/Erotemic/git_well/actions?query=branch%3Amain
+
+.. |Codecov| image:: https://codecov.io/github/Erotemic/git_well/badge.svg?branch=main&service=github
+    :target: https://codecov.io/github/Erotemic/git_well?branch=main
+
+.. |ReadTheDocs| image:: https://readthedocs.org/projects/python-git_well/badge/?version=latest
+    :target: http://python-git-well.readthedocs.io/en/latest/
