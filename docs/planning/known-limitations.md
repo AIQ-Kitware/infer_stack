@@ -221,16 +221,21 @@ starved new leases.
   candidate that the next apply starts (workaround: `infer-stack evict
   <deployment>`).
 
-### Known fault: the gateway can route a model's traffic to another container (current)
+### Known fault: the gateway can route a model's traffic to another container (until `network migrate`)
 
 When a model's container is removed and another container receives its IP
 address, the LiteLLM gateway can keep a pooled connection to that address and
 send the removed model's requests to the other model indefinitely, while traffic
 continues. This was reproduced: every request over 11 minutes was misrouted,
-although Docker DNS was correct. The fix, stable per-service addresses, is in
-the leasing redesign.
+although Docker DNS was correct.
 
-**Mitigations until then:**
+**Fix:** `infer-stack network migrate --subnet <cidr>` (while no leases are
+active; it recreates every container once) puts every service on a fixed subnet
+at an address no other service ever receives. `infer-stack network check`
+reports a routing fault distinctly from "not ready". Stacks that have not been
+migrated keep Docker's dynamic addresses.
+
+**Mitigations on a stack that is not migrated:**
 
 - avoid recreating a `stop`-policy model seconds after another container was
   removed;

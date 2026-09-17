@@ -2530,6 +2530,82 @@ class ConfigPublishCLI(_ApprovalMixin):
         return 3 if rec.publication_pending else 0
 
 
+class NetworkMigrateCLI(_ApprovalMixin):
+    """Move the stack to stable per-service addresses on a fixed subnet.
+
+    Every service gets a static address that no other service will ever
+    receive, which prevents the gateway from routing one model's traffic to a
+    container that inherited another's IP. Recreates every container once
+    (including the gateway), so it is refused while leases are active unless
+    ``--force``. A subnet overlapping an existing Docker network or host route
+    is rejected.
+    """
+
+    __command__ = 'migrate'
+
+    subnet = scfg.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
+    force = scfg.Value(False, isflag=True, help='Migrate even with active leases.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not config.subnet:
+            raise SystemExit('network migrate: --subnet is required')
+        controller = _open_controller(config, interactive=True)
+        if not callable(getattr(controller.backend, 'residency', None)):
+            raise SystemExit('network migrate needs the compose backend')
+        try:
+            rec = controller.network_migrate(config.subnet, force=bool(config.force))
+        except ProfileMismatch as ex:
+            raise SystemExit(f'network migrate: {ex}')
+        except ConvergeAborted:
+            raise SystemExit('aborted: network not migrated')
+        table = controller.ledger.service_addresses()
+        print(f'network migrate: {len(table)} service address(es) on {config.subnet}')
+        for service, ip in sorted(table.items()):
+            print(f'  {ip:<15} {service}')
+        return 3 if rec.publication_pending else 0
+
+
+class NetworkCheckCLI(_LeasingCommonMixin):
+    """Probe every model upstream by name from inside the gateway's network.
+
+    Distinguishes a routing fault (the name answers with ANOTHER model: the
+    stale-address misroute) from an upstream that is simply not ready.
+    """
+
+    __command__ = 'check'
+
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        check = getattr(controller.backend, 'upstream_check', None)
+        if check is None:
+            raise SystemExit('network check needs the compose backend')
+        result = check()
+        if config.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for service, row in result.items():
+                print(f'  {row["status"]:<14} {service} (expects {row["expected"]})')
+        return 4 if any(r['status'] == 'routing-fault' for r in result.values()) else 0
+
+
+class NetworkModalCLI(scfg.ModalCLI):
+    """Stable per-service addressing (migrate) and the upstream routing check."""
+
+    __command__ = 'network'
+
+    migrate = NetworkMigrateCLI
+    check = NetworkCheckCLI
+
+
 class RoutesModalCLI(scfg.ModalCLI):
     """Inspect + manage the LiteLLM route registry (static-superset mode).
 

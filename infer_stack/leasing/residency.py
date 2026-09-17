@@ -91,6 +91,8 @@ class Container:
     fingerprint: str = ''
     #: Carries both infer-stack ownership labels (service and fingerprint).
     labelled: bool = False
+    #: IPv4 addresses on the container's networks.
+    ips: tuple[str, ...] = ()
 
     @property
     def warm(self) -> bool:
@@ -216,6 +218,11 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
             service=str(labels.get(SERVICE_LABEL) or labels.get(COMPOSE_SERVICE_LABEL) or ''),
             fingerprint=str(labels.get(FINGERPRINT_LABEL) or ''),
             labelled=bool(labels.get(SERVICE_LABEL) and labels.get(FINGERPRINT_LABEL)),
+            ips=tuple(sorted(
+                str(n.get('IPAddress')) for n in
+                (((item.get('NetworkSettings') or {}).get('Networks')) or {}).values()
+                if isinstance(n, dict) and n.get('IPAddress')
+            )),
         )
         if deployment_id:
             grouped.setdefault(deployment_id, []).append(container)

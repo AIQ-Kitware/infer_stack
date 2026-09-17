@@ -48,6 +48,7 @@ from .commands_leasing import (
     MeasureCLI,
     ReleaseCLI,
     RenewCLI,
+    NetworkModalCLI,
     RoutesModalCLI,
     RunCLI,
     TestCLI,
@@ -133,6 +134,7 @@ class ManageCLI(scfg.ModalCLI):
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
     routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
+    network = NetworkModalCLI  # stable per-service addresses + upstream routing check
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
     test = TestCLI  # smoke-test a served endpoint through the front door
     measure = MeasureCLI  # measure an endpoint's real VRAM requirement (placement.min_vram_gib)

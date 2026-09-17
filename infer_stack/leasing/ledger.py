@@ -477,6 +477,19 @@ class Ledger:
     def profile(self) -> dict | None:
         return self.store.profile()
 
+    def network_config(self) -> dict | None:
+        """``{'subnet': ...}`` once `network migrate` has run, else ``None``."""
+        return self.store.meta_json('network_config')
+
+    def set_network_config(self, config: dict) -> None:
+        self.store.set_meta_json('network_config', config)
+
+    def service_addresses(self) -> dict[str, str]:
+        return self.store.service_addresses()
+
+    def add_service_addresses(self, table: dict[str, str]) -> None:
+        self.store.add_service_addresses(table)
+
     def adopted_containers(self) -> dict | None:
         """Containers adopted at migration (id -> {service, fingerprint}), or
         ``None`` if adoption has not run on this ledger yet."""

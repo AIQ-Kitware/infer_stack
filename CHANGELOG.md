@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Stable per-service addresses: `infer-stack network migrate` and `network check` (P7)
+
+- **`network migrate --subnet <cidr>`.** Puts the project on one named
+  network with a fixed IPAM subnet, and every service on a static address.
+  - Addresses live in an append-only ledger table: a service keeps its address
+    across recreation, and no other service ever receives it. Allocation skips
+    the network, gateway (`.1`) and broadcast addresses.
+  - A subnet overlapping an existing Docker network or host route is rejected.
+  - Every container is recreated once, so the command is refused while leases
+    are active unless `--force`.
+  - This fixes the reproduced gateway misroute after container recreation.
+- **Address holders.** An unmanaged container holding a service's address
+  aborts the apply.
+- **`network check`.** Probes each model upstream by name from inside the
+  gateway (`docker exec` with `python3`), and reports `healthy`, `not-ready` or
+  `routing-fault`. It exits 4 on a routing fault.
+
 ### Selective apply: ownership labels, fingerprints, GPU barrier (P8)
 
 The Compose backend no longer runs `docker compose up -d --remove-orphans`.

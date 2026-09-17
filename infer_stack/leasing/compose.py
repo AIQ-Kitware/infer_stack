@@ -206,6 +206,12 @@ class SelectiveApplyOutcome:
     orphans: list[str]
 
 
+def _network_name() -> str:
+    from .network import NETWORK_NAME
+
+    return NETWORK_NAME
+
+
 def _stanza_gpus(service: dict[str, Any]) -> list[int]:
     devices = (((service.get('deploy') or {}).get('resources') or {})
                .get('reservations') or {}).get('devices') or []
@@ -1950,6 +1956,13 @@ class ComposeBackend(ConvergeScaffold):
             project=self.project, catalog=self.catalog,
             route_registry=route_registry, dynamic_routing=self.dynamic_routing,
         )
+        addresses = None
+        if self.network is not None:
+            from .network import allocate, stamp_network
+
+            addresses = allocate(self.network['subnet'], self.network['addresses'],
+                                 (rendered.compose.get('services') or {}).keys())
+            stamp_network(rendered.compose, self.network['subnet'], addresses)
         planned: dict[Path, str] = {}
         if rendered.litellm_config is not None:
             planned[self.state_dir / LITELLM_CONFIG_FILENAME] = rendered.litellm_config
@@ -1962,7 +1975,15 @@ class ComposeBackend(ConvergeScaffold):
         )
         planned[self.compose_file] = yaml.safe_dump(rendered.compose, sort_keys=False)
         return {'plan': plan, 'rendered': rendered, 'planned': planned,
-                'fingerprints': fingerprints, 'route_registry': route_registry}
+                'fingerprints': fingerprints, 'route_registry': route_registry,
+                'addresses': addresses}
+
+    #: Stable addressing (plan step P7), set by the controller once
+    #: `network migrate` has run: ``{'subnet': ..., 'addresses': {service: ip}}``.
+    network: dict[str, Any] | None = None
+    #: Called with the full address table after an approved render, to persist
+    #: newly allocated addresses (append-only).
+    on_addresses: Any = None
 
     @staticmethod
     def _planned_digest(planned: dict) -> str:
@@ -2261,7 +2282,10 @@ class ComposeBackend(ConvergeScaffold):
                 logger.warning('  render: {}', err)
 
             self._approve_changes(planned)  # may raise ConvergeAborted
-            # Only after approval: persist the merged route registry, then the files.
+            # Only after approval: persist new addresses and the merged route
+            # registry, then the files.
+            if docs['addresses'] is not None and self.on_addresses is not None:
+                self.on_addresses(docs['addresses'])
             if docs['route_registry'] is not None:
                 self._save_route_registry(docs['route_registry'])
             for path, text in planned.items():
@@ -2433,6 +2457,16 @@ class ComposeBackend(ConvergeScaffold):
                             f'GPU {gpu} is held by kept service {key(c)[0]!r} but '
                             f'rendered for {name!r}'
                         )
+        for name in to_start:
+            address = ((services[name].get('networks') or {}).get(_network_name()) or {}).get('ipv4_address')
+            if not address:
+                continue
+            for c in containers:
+                if address in c.ips and key(c) is None:
+                    raise ApplyAborted(
+                        f'an unmanaged container {c.container_id[:12]} holds address '
+                        f'{address} of {name!r}; see `infer-stack gc --orphans`'
+                    )
         if orphans:
             logger.warning(
                 'apply: {} unmanaged container(s) in the project left alone ({}); '
@@ -2743,6 +2777,37 @@ class ComposeBackend(ConvergeScaffold):
         from .profile import validate_requests_against
 
         validate_requests_against(self.catalog, requests)
+
+    def upstream_check(self) -> dict[str, dict[str, Any]]:
+        """Probe each model upstream by name from inside the gateway's network.
+
+        Returns ``{service: {'deployment', 'expected', 'status', 'answer'}}``
+        with status ``healthy``, ``not-ready`` or ``routing-fault`` (the name
+        answers, but with another model: the misroute signature). The gateway
+        image has ``python3`` and no ``curl``.
+        """
+        from .network import UPSTREAM_CHECK_SCRIPT, classify_upstream
+
+        doc = yaml.safe_load(self.compose_file.read_text()) if self.compose_file.exists() else {}
+        services = (doc or {}).get('services') or {}
+        by_service = self._load_sidecar().get('services') or {}
+        out: dict[str, dict[str, Any]] = {}
+        for name, gid in sorted(by_service.items()):
+            svc = services.get(name) or {}
+            expected = next((a.split('=', 1)[1] for a in svc.get('command') or []
+                             if str(a).startswith('--served-model-name=')), None)
+            if expected is None:
+                continue
+            url = f'http://{name}:{VLLM_CONTAINER_PORT}/v1/models'
+            try:
+                raw = self._compose(['exec', '-T', LITELLM_SERVICE, 'python3', '-c',
+                                     UPSTREAM_CHECK_SCRIPT, url])
+                answer = json.loads(raw.strip().splitlines()[-1])
+            except Exception as ex:  # noqa: BLE001 - reported, never raised
+                answer = {'error': str(ex)}
+            out[name] = {'deployment': gid, 'expected': expected,
+                         'status': classify_upstream(expected, answer), 'answer': answer}
+        return out
 
     def settle_snapshot(self) -> tuple[tuple[str, str], ...]:
         """Every container of this Compose project as sorted ``(id, state)`` pairs.

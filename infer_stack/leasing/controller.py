@@ -470,6 +470,7 @@ class Controller:
             # pending) rather than guessing which warm models exist.
             residency = self.backend.residency()
             self._backfill_allocations(residency)
+            self._prepare_network()
             desired, placement = self._admission_view(residency)
             self.backend.adopted = self._prune_adopted(residency)
         else:
@@ -596,6 +597,49 @@ class Controller:
             required_ids=set(required), hard=hard, optional_hints=hints,
         )
         return [*required.values(), *optional], inputs
+
+    def _prepare_network(self) -> None:
+        """Give the backend the stable-address table, once a network is migrated."""
+        config = self.ledger.network_config()
+        if config is None:
+            self.backend.network = None
+            return
+        self.backend.network = {
+            'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()}
+        self.backend.on_addresses = self.ledger.add_service_addresses
+
+    def network_migrate(self, subnet: str, *, force: bool = False) -> ReconcileResult:
+        """``infer-stack network migrate``: move the project to stable addresses.
+
+        Operator-invoked. Refused while any lease is ACTIVE unless ``force``,
+        because every container, the gateway included, is recreated once.
+        Rejects a subnet that overlaps an existing Docker network or host
+        route. Changing an already-migrated subnet reassigns every address.
+        """
+        import ipaddress
+
+        from .network import overlapping_subnets
+        from .profile import ProfileMismatch
+
+        subnet = str(ipaddress.ip_network(subnet))
+        with self._global_lock():
+            leases, _ = self.ledger.status(virtual_expiry=True)
+            active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+            if active and not force:
+                raise ProfileMismatch(
+                    f'network migrate recreates every container; {len(active)} lease(s) '
+                    'are active (release them, or pass --force)'
+                )
+            clash = overlapping_subnets(subnet, self.backend.run)
+            if clash:
+                raise ProfileMismatch(f'subnet {subnet} overlaps: {"; ".join(clash)}')
+            current = self.ledger.network_config()
+            self._mark_pending(apply=True)
+            if current is not None and current['subnet'] != subnet:
+                with self.ledger.store.transaction():
+                    self.ledger.store._conn.execute('DELETE FROM service_addresses')
+            self.ledger.set_network_config({'subnet': subnet})
+            return self._publish()
 
     def _prune_adopted(self, residency) -> dict:
         """The adopted-container table, minus containers that no longer exist."""
@@ -725,6 +769,7 @@ class Controller:
                 ]
         for gid, gpus in adopted.items():
             overlay.deployments[gid].assigned_gpus = gpus
+        self._prepare_network()
         desired, inputs = self._admission_view(residency, overlay=overlay)
         plan, rendered = self.backend.preview(desired, inputs)
         reasons = []

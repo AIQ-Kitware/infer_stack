@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS claims (
     kind TEXT NOT NULL DEFAULT 'endpoint'
 );
 
+-- Append-only: a service keeps its address; no other service ever receives it.
+CREATE TABLE IF NOT EXISTS service_addresses (
+    service TEXT PRIMARY KEY,
+    ipv4 TEXT NOT NULL UNIQUE
+);
+
 CREATE INDEX IF NOT EXISTS idx_claims_lease ON claims(lease_id);
 CREATE INDEX IF NOT EXISTS idx_claims_deployment ON claims(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_deployments_compat ON deployments(compat_key);
@@ -279,6 +285,22 @@ class SqliteStore:
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
                 (key, json.dumps(value, sort_keys=True)),
             )
+
+    def service_addresses(self) -> dict[str, str]:
+        rows = self._conn.execute('SELECT service, ipv4 FROM service_addresses').fetchall()
+        return {r['service']: r['ipv4'] for r in rows}
+
+    def add_service_addresses(self, table: dict[str, str]) -> None:
+        """Insert new (service, ipv4) rows; existing rows are never changed."""
+        with self.transaction():
+            current = self.service_addresses()
+            for service, ip in table.items():
+                if service in current:
+                    if current[service] != ip:
+                        raise ValueError(f'service {service!r} already has {current[service]}')
+                    continue
+                self._conn.execute(
+                    'INSERT INTO service_addresses(service, ipv4) VALUES (?, ?)', (service, ip))
 
     def profile(self) -> dict | None:
         """The published render profile, or ``None`` before the first mutation."""

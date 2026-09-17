@@ -41,13 +41,14 @@ class ComposeFake:
         self.containers = {i: c for i, c in self.containers.items() if c['service'] in keep}
 
     def add_container(self, service, *, labels=None, state='running', device_ids=(),
-                      project=None, cid=None):
+                      project=None, cid=None, ips=()):
         cid = cid or f'{service}-{next(_ids)}'
         labels = dict(labels or {})
         labels.setdefault(COMPOSE_PROJECT_LABEL, project or self.project)
         labels.setdefault(COMPOSE_SERVICE_LABEL, service)
         self.containers[cid] = {'service': service, 'labels': labels, 'state': state,
-                                'device_ids': [str(d) for d in device_ids]}
+                                'device_ids': [str(d) for d in device_ids],
+                                'ips': list(ips)}
         return cid
 
     def __call__(self, args, **_):
@@ -66,7 +67,9 @@ class ComposeFake:
                             if c['device_ids'] else None)
                 out.append({'Id': cid, 'State': {'Status': c['state']},
                             'Config': {'Labels': c['labels']},
-                            'HostConfig': {'DeviceRequests': requests}})
+                            'HostConfig': {'DeviceRequests': requests},
+                            'NetworkSettings': {'Networks': {
+                                'n': {'IPAddress': ip} for ip in c.get('ips', [])}}})
             return json.dumps(out)
         if args[:3] == ['docker', 'rm', '-f']:
             for cid in args[3:]:
