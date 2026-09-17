@@ -1332,10 +1332,11 @@ def _docker_timeout(args: list[str]) -> float:
 
 
 #: Caller environment variables Docker commands may inherit. Everything else,
-#: notably ``HF_TOKEN``, ``DOCKER_HOST`` and ``DOCKER_CONTEXT``, is dropped: a
-#: variable exported in one caller's shell must not change what Compose
-#: interpolates (``${HF_TOKEN:-}`` would otherwise override the managed
-#: ``.env``) or which daemon a recovery talks to.
+#: notably ``HF_TOKEN`` and ``DOCKER_HOST``, is dropped: a variable exported in
+#: one caller's shell must not change what Compose interpolates
+#: (``${HF_TOKEN:-}`` would otherwise override the managed ``.env``) or which
+#: daemon a recovery talks to. ``DOCKER_CONTEXT`` is then forced to
+#: ``default``, because ``$HOME/.docker/config.json`` can select another.
 DOCKER_ENV_ALLOWLIST = (
     'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR',
     'XDG_RUNTIME_DIR', 'TERM',
@@ -1346,14 +1347,17 @@ def docker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
     """The explicit process environment for every Docker command infer-stack runs.
 
     Example:
-        >>> env = docker_environment({'PATH': '/bin', 'HF_TOKEN': 'x', 'DOCKER_HOST': 'tcp://y'})
+        >>> env = docker_environment({'PATH': '/bin', 'HF_TOKEN': 'x', 'DOCKER_HOST': 'tcp://y',
+        ...                           'DOCKER_CONTEXT': 'remote'})
         >>> env
-        {'PATH': '/bin'}
+        {'PATH': '/bin', 'DOCKER_CONTEXT': 'default'}
     """
     import os
 
     source = os.environ if environ is None else environ
-    return {k: source[k] for k in DOCKER_ENV_ALLOWLIST if k in source}
+    env = {k: source[k] for k in DOCKER_ENV_ALLOWLIST if k in source}
+    env['DOCKER_CONTEXT'] = 'default'
+    return env
 
 
 def _default_docker_run(
@@ -2492,27 +2496,9 @@ class ComposeBackend(ConvergeScaffold):
 
     def validate_requests(self, requests) -> None:
         """Refuse requests the published catalog union does not define identically."""
-        from .models import RESERVED_ENGINE
-        from .profile import CatalogUnion, ProfileMismatch
+        from .profile import validate_requests_against
 
-        union = self.catalog
-        if not isinstance(union, CatalogUnion):
-            return          # no published catalog: legacy per-deployment routes
-        for req in requests:
-            if req.engine == RESERVED_ENGINE:
-                continue
-            if req.endpoint not in union.endpoints:
-                raise ProfileMismatch(
-                    f'endpoint {req.endpoint!r} is not in the published catalog; '
-                    'publish it first with `infer-stack config publish --catalog ...` '
-                    '(while no leases are active)'
-                )
-            if not union.request_matches(req):
-                raise ProfileMismatch(
-                    f'endpoint {req.endpoint!r} differs from its published definition '
-                    '(the catalog changed since it was published); run '
-                    '`infer-stack config publish` while no leases are active'
-                )
+        validate_requests_against(self.catalog, requests)
 
     def settle_snapshot(self) -> tuple[tuple[str, str], ...]:
         """Every container of this Compose project as sorted ``(id, state)`` pairs.

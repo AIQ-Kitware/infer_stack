@@ -2,6 +2,22 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Profile publication fixes (review)
+
+- **`config publish` on a fresh ledger** no longer freezes the invocation's
+  settings first. A declined or failed preview now leaves no profile and no
+  pending marker.
+- **A declined recovery render keeps the crashed acquire's GPU scope.**
+  Previously the scope was cleared anyway, so a later caller could place that
+  deployment within its own GPUs.
+- **The CLI refuses a catalog that is not one of the published sources** (new,
+  or edited since publishing), instead of resolving names against the old
+  published definitions.
+- **KubeAI** now freezes its catalog union into the profile too.
+- **Switching backends:** a profile for another backend kind is reported on the
+  first mutation rather than when the controller opens, so
+  `config publish` can switch backends while quiescent.
+
 ### Planner admission mode (keywords only; no caller uses it yet)
 
 `plan_placement` accepts `required_ids`, `hard` and `optional_hints`. Committed
@@ -47,8 +63,9 @@ log follower. It affects existing setups:
 - **`HF_TOKEN`.** An exported `HF_TOKEN` no longer reaches Compose.
   `${HF_TOKEN:-}` resolves only from the managed `.env`; set it with
   `infer-stack env HF_TOKEN=hf_...`.
-- **Docker daemon.** `DOCKER_HOST` and `DOCKER_CONTEXT` are not inherited, so a
-  caller's shell cannot point one operation at a different daemon.
+- **Docker daemon.** `DOCKER_HOST` is not inherited and `DOCKER_CONTEXT` is
+  forced to `default`, so neither a caller's shell nor `docker context use` can
+  point one operation at a different daemon.
 - **`stack` commands** now pass the managed `.env` as `--env-file`, as the
   backend does.
 - **TUI.** Its Docker runner is now the same bounded runner as the CLI, instead

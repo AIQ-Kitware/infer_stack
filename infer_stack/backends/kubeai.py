@@ -368,9 +368,12 @@ class KubeaiBackend(ConvergeScaffold):
         self.apply()
         return None
 
+    #: The published catalog union (set by the CLI, then by use_profile).
+    catalog = None
+
     def render_profile(self) -> dict:
         """This backend's render inputs, as a publishable profile."""
-        from ..leasing.profile import PROFILE_VERSION
+        from ..leasing.profile import PROFILE_VERSION, catalog_sources
 
         return {
             'version': PROFILE_VERSION,
@@ -378,7 +381,13 @@ class KubeaiBackend(ConvergeScaffold):
             'namespace': self.namespace,
             'base_url': self.base_url,
             'resource_profile': self.default_resource_profile,
+            'catalogs': catalog_sources(self.catalog),
         }
+
+    def validate_requests(self, requests) -> None:
+        from ..leasing.profile import validate_requests_against
+
+        validate_requests_against(self.catalog, requests)
 
     def use_profile(self, profile: dict) -> None:
         if profile.get('backend') != 'kubeai':
@@ -388,9 +397,13 @@ class KubeaiBackend(ConvergeScaffold):
                 f"the published profile is for the {profile.get('backend')!r} backend; "
                 'run `infer-stack config publish` to change backends'
             )
+        from ..leasing.profile import CatalogUnion
+
         self.namespace = profile['namespace']
         self.base_url = profile['base_url']
         self.default_resource_profile = profile['resource_profile']
+        sources = profile.get('catalogs') or []
+        self.catalog = CatalogUnion.from_sources(sources) if sources else None
 
     def apply(self) -> None:
         """Converge the cluster to the last render: apply + prune.

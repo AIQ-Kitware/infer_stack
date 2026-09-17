@@ -191,3 +191,49 @@ def profile_drift(published: dict[str, Any], invocation: dict[str, Any]) -> list
         if published.get(key) != invocation.get(key):
             drift.append(key)
     return drift
+
+
+def validate_requests_against(union: Any, requests) -> None:
+    """Refuse requests a published catalog union does not define identically.
+
+    ``union`` of ``None`` (nothing published) accepts everything. Reservations
+    are not catalog endpoints and always pass.
+    """
+    from .models import RESERVED_ENGINE
+
+    if not isinstance(union, CatalogUnion):
+        return
+    for req in requests:
+        if req.engine == RESERVED_ENGINE:
+            continue
+        if req.endpoint not in union.endpoints:
+            raise ProfileMismatch(
+                f'endpoint {req.endpoint!r} is not in the published catalog; '
+                'publish it first with `infer-stack config publish <catalog> ...` '
+                '(while no leases are active)'
+            )
+        if not union.request_matches(req):
+            raise ProfileMismatch(
+                f'endpoint {req.endpoint!r} differs from its published definition '
+                '(the catalog changed since it was published); run '
+                '`infer-stack config publish` while no leases are active'
+            )
+
+
+def check_invocation_catalog(union: Any, catalog: Any) -> None:
+    """Refuse a caller's catalog that is not one of the published sources.
+
+    Resolving names from the published union while the caller passed an edited
+    catalog would silently serve the old definitions. The rule is "publish
+    first", so an unpublished catalog is an error, not a warning.
+    """
+    if not isinstance(union, CatalogUnion) or catalog is None:
+        return
+    source = getattr(catalog, 'source', None)
+    if source is None or canonical_digest(source) in set(union.digests):
+        return
+    raise ProfileMismatch(
+        'this catalog is not part of the published profile (it is new or was '
+        'edited since publishing); run `infer-stack config publish` with every '
+        'catalog this host serves, while no leases are active'
+    )

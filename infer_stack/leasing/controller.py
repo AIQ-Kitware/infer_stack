@@ -178,7 +178,16 @@ class Controller:
         self._invocation_profile: dict | None = None
         self._applied_profile: dict | None = None
         self._profile_drift_warned = False
-        self._sync_profile(create=False)
+        # A published profile for another backend kind is reported on the
+        # first mutation, not here: `config publish` must still be able to
+        # open a controller in order to switch backends.
+        self._profile_error: Exception | None = None
+        from .profile import ProfileMismatch
+
+        try:
+            self._sync_profile(create=False)
+        except ProfileMismatch as ex:
+            self._profile_error = ex
 
     # -- cross-process lock ------------------------------------------------
 
@@ -524,6 +533,8 @@ class Controller:
         read = getattr(self.ledger, 'profile', None)
         if render is None or use is None or read is None:
             return
+        if create and self._profile_error is not None:
+            raise self._profile_error
         stored = read()
         if stored is None and not create:
             return
@@ -552,6 +563,7 @@ class Controller:
 
     def _mark_pending(
         self, *, apply: bool, placement_context: dict | None = None,
+        create_profile: bool = True,
     ) -> dict:
         """Record that desired state is about to change (caller holds the lock).
 
@@ -564,7 +576,8 @@ class Controller:
         placement scope is still in the marker: render once with that scope
         first, so its deployment is placed where that caller was allowed.
         """
-        self._sync_profile(create=True)
+        if create_profile:
+            self._sync_profile(create=True)
         current = self.ledger.publication_pending()
         if current and current.get('placement_context'):
             self._render_in_scope(current['placement_context'])
@@ -573,12 +586,15 @@ class Controller:
         )
 
     def _render_in_scope(self, context: dict) -> None:
-        """Render with another caller's admission scope, then forget the scope."""
-        from .backend import ConvergeAborted
+        """Render with another caller's admission scope, then forget the scope.
 
+        The scope is cleared only after a render that succeeded (and so pinned
+        the placement). A declined or failed render propagates and keeps it,
+        so no later caller can place that deployment within its own scope.
+        """
         scope = getattr(self.backend, 'placement_scope', None)
         if scope is not None:
-            with scope(context), contextlib.suppress(ConvergeAborted):
+            with scope(context):
                 self._render()
         self.ledger.clear_placement_context()
 
@@ -1068,7 +1084,10 @@ class Controller:
                         f'container(s) exist for {", ".join(running[:3])}; '
                         '`infer-stack evict --all` first'
                     )
-            self._mark_pending(apply=True)
+            # No implicit profile here: on a fresh ledger a declined preview
+            # must leave neither a profile nor a marker behind.
+            existed = self.ledger.publication_pending() is not None
+            marker = self._mark_pending(apply=True, create_profile=False)
             previous = self._applied_profile
             use(profile)
             try:
@@ -1076,8 +1095,11 @@ class Controller:
             except BaseException:
                 if previous is not None:
                     use(previous)
+                if not existed:
+                    self.ledger.clear_publication_pending(marker['version'])
                 raise
             self.ledger.set_profile(profile)
+            self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile
             self._profile_drift_warned = False

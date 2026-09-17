@@ -181,11 +181,11 @@ containers are part of selective apply (plan step P8).
 
 ### The Docker target is the local default daemon (design boundary)
 
-infer-stack does not inherit `DOCKER_HOST` or `DOCKER_CONTEXT` from the caller,
-so every operation and every recovery talks to the same daemon. A Docker
-context selected in `~/.docker/config.json` still applies. Driving a remote or
-non-default daemon would need the target recorded in the published profile,
-and is out of scope.
+infer-stack does not inherit `DOCKER_HOST`, and runs every Docker command with
+`DOCKER_CONTEXT=default`, which overrides a context selected with `docker
+context use`. Every operation and every recovery therefore talks to the local
+default daemon. Driving a remote or non-default daemon would need the target
+recorded in the published profile, and is out of scope.
 
 ### Known fault: a failed acquire can leave a leaseless warm candidate (current)
 

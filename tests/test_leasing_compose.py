@@ -1668,7 +1668,7 @@ def test_docker_commands_do_not_inherit_hf_token_or_docker_target(monkeypatch):
         ['sh', '-c', 'echo ${HF_TOKEN:-none} ${DOCKER_HOST:-none} ${DOCKER_CONTEXT:-none} ${PATH:+path}'],
         timeout=10,
     )
-    assert out.split() == ['none', 'none', 'none', 'path']
+    assert out.split() == ['none', 'none', 'default', 'path']
 
 
 def test_default_docker_run_can_redirect_stderr_lines():

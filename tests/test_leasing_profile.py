@@ -164,8 +164,74 @@ def test_a_different_backend_kind_is_refused(tmp_path):
 
     ledger, ctl = controller(tmp_path)
     ctl.gc()
+    other = Controller(ledger, KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True))
     with pytest.raises(ProfileMismatch, match='compose'):
-        Controller(ledger, KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True))
+        other.gc()                         # refused on the first mutation...
+
+
+def test_config_publish_can_switch_backends_while_quiescent(tmp_path):
+    from infer_stack.backends.kubeai import KubeaiBackend
+
+    ledger, ctl = controller(tmp_path)
+    ctl.gc()
+    kube = KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True, run=lambda args: '')
+    other = Controller(ledger, kube)         # ...but opening still works
+    other.publish_profile(kube.render_profile())
+    assert ledger.profile()['backend'] == 'kubeai'
+    other.gc()
+
+
+@pytest.mark.parametrize('failure', ['declined', 'raises'])
+def test_publish_on_a_fresh_ledger_that_does_not_complete_stores_nothing(tmp_path, failure):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    ledger, ctl = controller(tmp_path, catalog=Catalog.from_dict(cat('alpha')))
+
+    def fail(planned):
+        raise ConvergeAborted('no') if failure == 'declined' else RuntimeError('boom')
+
+    ctl.backend._approve_changes = fail
+    candidate = {**ctl.backend.render_profile(), 'catalogs': [cat('alpha'), cat('beta')]}
+    with pytest.raises((ConvergeAborted, RuntimeError)):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() is None
+    assert ledger.publication_pending() is None
+
+
+def test_a_declined_recovery_render_keeps_the_crashed_acquires_scope(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    ledger.mark_publication_pending(apply_requested=True,
+                                    placement_context={'allowed_gpus': [3]})
+    ledger.acquire('x', a.resolve_names(['alpha']))
+    _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
+
+    def decline(planned):
+        raise ConvergeAborted('no')
+
+    ctl2.backend._approve_changes = decline
+    with pytest.raises(ConvergeAborted):
+        ctl2.gc()
+    assert ledger.publication_pending()['placement_context'] == {'allowed_gpus': [3]}
+
+
+def test_cli_refuses_an_edited_catalog_instead_of_serving_old_definitions(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cl, '_make_backend',
+                        lambda config, *, interactive=False: backend(state))
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
+    f.write_text(yaml.safe_dump(cat('alpha', runtime={'max_model_len': 1024})))
+    with pytest.raises(SystemExit, match='not part of the published profile'):
+        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog', str(f),
+                                 '--no-wait', '--yes'])
 
 
 # -- config publish (quiescent only) ----------------------------------------------

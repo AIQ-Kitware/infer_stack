@@ -266,7 +266,7 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'kubeai':
         from ..backends.kubeai import KubeaiBackend
 
-        return KubeaiBackend(
+        backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
             base_url=get_setting('kubeai_base_url') or None,
@@ -274,6 +274,11 @@ def _make_backend(config, *, interactive: bool = False):
             or None,
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
         )
+        try:
+            backend.catalog = _load_catalog(config)   # frozen into the profile
+        except SystemExit:
+            backend.catalog = None
+        return backend
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI. '
         'Use --backend null, compose, or kubeai.'
@@ -345,14 +350,24 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
 def _requests_catalog(controller, config):
     """The catalog endpoint names resolve against.
 
-    Once a profile is published, that is its catalog union (so a runbook can
-    acquire any published endpoint, whichever ``--catalog`` it passes).
-    Before, or when nothing was published, it is the invocation's catalog.
+    Once a profile is published, that is its catalog union, so a runbook can
+    acquire any published endpoint. The invocation's own catalog must then be
+    one of the published sources: an edited or new catalog is refused rather
+    than silently resolved against old definitions. Before anything is
+    published, it is the invocation's catalog.
     """
-    from ..leasing.profile import CatalogUnion
+    from ..leasing.profile import CatalogUnion, ProfileMismatch, check_invocation_catalog
 
     published = getattr(controller.backend, 'catalog', None)
     if isinstance(published, CatalogUnion):
+        try:
+            invocation = _load_catalog(config)
+        except SystemExit:
+            invocation = None          # no catalog of its own: the union decides
+        try:
+            check_invocation_catalog(published, invocation)
+        except ProfileMismatch as ex:
+            raise SystemExit(str(ex))
         return published
     return _load_catalog(config)
 
