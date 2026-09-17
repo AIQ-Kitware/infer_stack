@@ -163,6 +163,32 @@ def test_reverse_proxy_config_is_snapshotted(tmp_path):
     assert str(snapshot) in json.dumps(compose(ctl2))
 
 
+def test_candidate_reverse_proxy_snapshot_is_not_written_before_commit(tmp_path):
+    conf = tmp_path / 'nginx.conf'
+    conf.write_text('events {}\n# v1\n')
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(
+        tmp_path, catalog=a, reverse_proxy=True, reverse_proxy_config=str(conf)
+    )
+    ctl.gc()
+    snapshot = tmp_path / 'state' / 'reverse-proxy.conf'
+    assert snapshot.read_text().endswith('# v1\n')
+    before = ledger.profile()
+    candidate = {
+        **before,
+        'reverse_proxy': {**before['reverse_proxy'], 'config_text': 'events {}\n# v2\n'},
+    }
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt('killed before profile commit')
+
+    ledger.store.publish_profile = crash
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() == before
+    assert snapshot.read_text().endswith('# v1\n')
+
+
 def test_a_different_backend_kind_is_refused(tmp_path):
     from infer_stack.backends.kubeai import KubeaiBackend
 
@@ -274,6 +300,28 @@ def test_publish_replaces_the_profile_when_quiescent(tmp_path):
     assert 'open-webui' not in compose(ctl)['services']
     b = Catalog.from_dict(cat('beta'))
     ctl.acquire('y', b.resolve_names(['beta']), wait=False)      # now published
+
+
+def test_publish_previews_the_same_post_expiry_state_it_applies(tmp_path):
+    """Virtual quiescence and the post-commit sweep must render identically."""
+    from infer_stack.leasing.models import LeaseState
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    out = ctl.acquire('x', a.resolve_names(['alpha']), ttl_seconds=60, wait=False)
+    # Model disappeared out of band; the lease expired but no controller operation
+    # has materialized sweep() yet.  This is the exact config-publish crash window.
+    ctl.backend.run.containers.clear()
+    now = ledger.clock()
+    with ledger.store.transaction():
+        ledger.store.renew_lease(
+            out.lease.id, ttl_seconds=1, expires_at=now - 1, heartbeat_at=now - 2
+        )
+    candidate = {**ledger.profile(), 'ui': False}
+    rec = ctl.publish_profile(candidate)
+    assert rec.publication_pending is False
+    assert ledger.profile() == candidate
+    assert ledger.get_lease(out.lease.id).state == LeaseState.EXPIRED
 
 
 def test_publish_refuses_with_an_active_lease(tmp_path):

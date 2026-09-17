@@ -885,9 +885,10 @@ def _route_id(deployment_id: str, endpoint: str) -> str:
     """Deterministic LiteLLM model id for one (deployment, endpoint) route.
 
     Stable across converges, so route reconcile (:meth:`ComposeBackend.
-    _reconcile_routes`) is a pure set-diff: the same logical route always has the
-    same id (added once, never churned), and a route that drops out of the
-    desired set is deleted by exactly this id. The ``isr-`` prefix marks it
+    _reconcile_routes`) can identify one logical route across renders.  A route
+    whose id disappears is deleted by exactly this id; a route whose id remains
+    but whose observable routing semantics drifted is replaced under the same id.
+    The ``isr-`` prefix marks it
     infer-stack-managed so reconcile never deletes a model someone added by hand.
     """
     digest = hashlib.sha256(f'{deployment_id}|{endpoint}'.encode()).hexdigest()
@@ -2031,6 +2032,12 @@ class ComposeBackend(ConvergeScaffold):
                                  (rendered.compose.get('services') or {}).keys())
             stamp_network(rendered.compose, self.network['subnet'], addresses)
         planned: dict[Path, str] = {}
+        if (
+            self.reverse_proxy
+            and self._profile_proxy_text is not None
+            and self.reverse_proxy_config is not None
+        ):
+            planned[Path(self.reverse_proxy_config)] = self._profile_proxy_text
         if rendered.litellm_config is not None:
             planned[self.state_dir / LITELLM_CONFIG_FILENAME] = rendered.litellm_config
         if rendered.nginx_config is not None:
@@ -2698,8 +2705,8 @@ class ComposeBackend(ConvergeScaffold):
         endpoint) to ``litellm_routes.json``; this is the apply half. List the
         gateway's current models, add the missing routes and delete the ones no
         longer desired -- through the admin API, with **no** container restart --
-        then list again to verify the result, re-diffing and retrying failed
-        calls until the set matches or the budget runs out.
+        then list again to verify both ids and routing semantics, re-diffing and
+        retrying failed calls until the table matches or the budget runs out.
 
         Properties this relies on:
 
@@ -2728,6 +2735,8 @@ class ComposeBackend(ConvergeScaffold):
             for r in self._desired_routes()
             if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
         }
+        desired_semantics = {rid: self._route_semantics(route)
+                             for rid, route in desired.items()}
         rounds = 0
         while True:
             current = self._list_managed_routes(deadline=deadline, delay=delay)
@@ -2737,18 +2746,21 @@ class ComposeBackend(ConvergeScaffold):
                     '{:g}s; leaving it for the next apply', deadline_s,
                 )
                 return False
-            to_add = [desired[i] for i in desired if i not in current]
-            to_delete = [i for i in current if i not in desired]
+            mismatched = sorted(
+                rid for rid in desired.keys() & current.keys()
+                if desired_semantics[rid] != current[rid]
+            )
+            to_add_ids = sorted((desired.keys() - current.keys()) | set(mismatched))
+            to_delete = sorted((current.keys() - desired.keys()) | set(mismatched))
+            to_add = [desired[rid] for rid in to_add_ids]
             if not (to_add or to_delete):
                 return True            # this listing is the verification
             if rounds:
                 logger.info('dynamic routing: route set still differs; retrying')
             rounds += 1
             ok = True
-            for route in to_add:
-                ok &= self._post_route(
-                    '/model/new', route, route.get('model_name'), deadline=deadline,
-                )
+            # A same-id semantic drift must be removed before it can be re-added;
+            # model/new is not an update API on every LiteLLM release.
             for rid in to_delete:
                 # ok_if_missing: with a shared gateway, another converge may have
                 # deleted this route already; "not found in db" means the desired
@@ -2757,9 +2769,14 @@ class ComposeBackend(ConvergeScaffold):
                     '/model/delete', {'id': rid}, rid, ok_if_missing=True,
                     deadline=deadline,
                 )
+            for route in to_add:
+                ok &= self._post_route(
+                    '/model/new', route, route.get('model_name'), deadline=deadline,
+                )
             logger.info(
-                'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
-                len(to_add), len(to_delete), len(desired),
+                'dynamic routing: +{} route(s), -{} route(s), ~{} replacement(s) '
+                '(now {} desired)',
+                len(to_add), len(to_delete), len(mismatched), len(desired),
             )
             if not ok:
                 # A transient admin-API failure: spend the rest of the budget
@@ -2768,10 +2785,27 @@ class ComposeBackend(ConvergeScaffold):
                     return False
                 self._sleep(delay)
 
+    @staticmethod
+    def _route_semantics(route: dict[str, Any]) -> dict[str, Any]:
+        """Observable route fields infer-stack owns and must verify.
+
+        LiteLLM's model-info response contains additional database/runtime fields
+        and may redact credentials.  The public alias, upstream model, and
+        upstream base URL are the routing semantics infer-stack can both set and
+        reliably observe.  A matching managed id with different values here is
+        drift and is replaced, not accepted as healthy.
+        """
+        params = route.get('litellm_params') or {}
+        return {
+            'model_name': route.get('model_name'),
+            'model': params.get('model'),
+            'api_base': params.get('api_base'),
+        }
+
     def _list_managed_routes(
         self, *, deadline: float, delay: float
-    ) -> set[str] | None:
-        """Ids of infer-stack-managed routes currently on the gateway.
+    ) -> dict[str, dict[str, Any]] | None:
+        """Observable semantics of infer-stack-managed gateway routes.
 
         Retries while the gateway is unreachable, until ``deadline`` (a value of
         ``self._clock``). Each request's own timeout is capped by the time left.
@@ -2791,12 +2825,12 @@ class ComposeBackend(ConvergeScaffold):
             except Exception:  # noqa: BLE001 - the gateway may still be starting
                 resp = None
             if resp is not None and getattr(resp, 'status_code', 0) == 200:
-                ids: set[str] = set()
+                routes: dict[str, dict[str, Any]] = {}
                 for m in (resp.json().get('data') or []):
                     rid = (m.get('model_info') or {}).get('id')
                     if isinstance(rid, str) and rid.startswith(ROUTE_ID_PREFIX):
-                        ids.add(rid)
-                return ids
+                        routes[rid] = self._route_semantics(m)
+                return routes
             if deadline - self._clock() <= delay:
                 return None
             self._sleep(delay)
@@ -2915,11 +2949,14 @@ class ComposeBackend(ConvergeScaffold):
         self.reverse_proxy_port = proxy['port']
         self._profile_proxy_text = proxy.get('config_text')
         if self._profile_proxy_text is not None:
-            snapshot = self.state_dir / self.REVERSE_PROXY_SNAPSHOT
-            if not snapshot.exists() or snapshot.read_text() != self._profile_proxy_text:
-                self._ensure_state_dir()
-                self._atomic_write(snapshot, self._profile_proxy_text)
-            self.reverse_proxy_config = str(snapshot)
+            # Applying a candidate profile must be pure: config-publish preview
+            # can call use_profile() and then be declined or crash.  Point the
+            # render at the stable managed path now; _render_documents() adds
+            # the bytes to its planned files so converge writes them only after
+            # approval.
+            self.reverse_proxy_config = str(
+                self.state_dir / self.REVERSE_PROXY_SNAPSHOT
+            )
         else:
             self.reverse_proxy_config = None
         self.images = dict(profile['images'])

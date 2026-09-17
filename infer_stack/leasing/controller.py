@@ -562,7 +562,9 @@ class Controller:
             for name in ('residency', 'preview', 'converge')
         )
 
-    def _admission_view(self, residency, *, overlay=None):
+    def _admission_view(
+        self, residency, *, overlay=None, virtual_expiry: bool = False
+    ):
         """``(desired deployments, PlacementInputs)`` for a render or preview.
 
         ``overlay`` (an :class:`~infer_stack.leasing.ledger.AcquireOverlay`)
@@ -570,7 +572,7 @@ class Controller:
         """
         from .placement import PlacementInputs
 
-        _, deployments = self.ledger.status()
+        _, deployments = self.ledger.status(virtual_expiry=virtual_expiry)
         by_id = {g.id: g for g in deployments}
         fresh: set[str] = set()
         if overlay is not None:
@@ -649,7 +651,9 @@ class Controller:
                 'addresses': {} if reset else self.ledger.service_addresses(),
             }
             try:
-                desired, inputs = self._admission_view(residency)
+                desired, inputs = self._admission_view(
+                    residency, virtual_expiry=True
+                )
                 self.backend.preview(desired, inputs, approve=True)
             finally:
                 self.backend.network = saved
@@ -1655,7 +1659,9 @@ class Controller:
                 try:
                     residency = self.backend.residency()
                     self._prepare_network()
-                    desired, inputs = self._admission_view(residency)
+                    desired, inputs = self._admission_view(
+                        residency, virtual_expiry=True
+                    )
                     self.backend.preview(desired, inputs, approve=True)
                 except BaseException:
                     if previous is not None:

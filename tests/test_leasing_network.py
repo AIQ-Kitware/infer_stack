@@ -60,6 +60,23 @@ def test_an_overlapping_subnet_fails_preflight(tmp_path):
     assert ledger.network_config() is None
 
 
+def test_migrate_previews_the_same_post_expiry_state_it_applies(tmp_path):
+    from infer_stack.leasing.models import LeaseState
+
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one', ttl_seconds=60)
+    docker.containers.clear()
+    now = ledger.clock()
+    with ledger.store.transaction():
+        ledger.store.renew_lease(
+            out.lease.id, ttl_seconds=1, expires_at=now - 1, heartbeat_at=now - 2
+        )
+    rec = ctl.network_migrate(SUBNET)
+    assert rec.publication_pending is False
+    assert ledger.network_config() == {'subnet': SUBNET}
+    assert ledger.get_lease(out.lease.id).state == LeaseState.EXPIRED
+
+
 def test_a_service_keeps_its_address_and_no_other_service_receives_it(tmp_path):   # 57
     ledger, ctl, _ = make(tmp_path)
     ctl.network_migrate(SUBNET)

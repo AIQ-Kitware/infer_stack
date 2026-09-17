@@ -86,10 +86,10 @@ class RecordingGateway:
 
     def get(self, url, **kw):
         if url.endswith('/v1/model/info'):
-            data = [
-                {'model_name': e['model_name'], 'model_info': {'id': i}}
-                for i, e in self.models.items()
-            ]
+            # LiteLLM returns the route semantics as well as model_info.id.
+            # Preserve them so reconciliation tests can catch same-id drift,
+            # rather than accidentally testing only membership.
+            data = [json.loads(json.dumps(e)) for e in self.models.values()]
             return FakeResp(200, {'data': data})
         return FakeResp(404, {'detail': 'not found'})
 
@@ -224,6 +224,23 @@ def make_backend(tmp_path, http, *, spec='4x80'):
         images=IMAGES, ports=PORTS, state=STATE,
         ui=False, dynamic_routing=True,
     )
+
+
+def test_reconcile_replaces_same_id_route_with_wrong_semantics(tmp_path):
+    """A managed id is identity, not proof that its routing payload is right."""
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    gw = RecordingGateway()
+    be = make_backend(tmp_path, gw)
+    be.converge([a], apply=True)
+    rid = _route_id(a.id, 'smol')
+    assert gw.models[rid]['litellm_params']['model'] == 'openai/smol'
+
+    # Simulate DB drift / an earlier endpoint definition with the same stable id.
+    gw.models[rid]['litellm_params']['model'] = 'ollama/wrong-tag'
+    before = len(gw.calls)
+    assert be._reconcile_routes() is True
+    assert gw.models[rid]['litellm_params']['model'] == 'openai/smol'
+    assert gw.calls[before:] == [('delete', rid), ('new', rid)]
 
 
 def test_converge_writes_routes_file_and_reconciles(tmp_path):

@@ -456,6 +456,23 @@ def test_env_set_read_list_roundtrip(tmp_path, monkeypatch):
     assert 'export HF_TOKEN=hf_demo' in out and 'export OTHER=x' in out
 
 
+def test_env_refuses_runtime_secret_change_while_a_lease_is_active(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+    from infer_stack.leasing import Ledger, SqliteStore, default_ledger_path
+    from infer_stack.leasing.models import reservation_request
+
+    ledger = Ledger(SqliteStore(str(default_ledger_path())))
+    ledger.acquire('owner', [reservation_request(1)])
+
+    with pytest.raises(SystemExit, match='affects running services'):
+        EnvCLI.main(argv=['HF_TOKEN=new'])
+    # Client-only values do not alter a service fingerprint and remain writable.
+    assert EnvCLI.main(argv=['OPENAI_BASE_URL=https://gw.example/v1']) == 0
+
+
 def test_env_prints_path_first(tmp_path, monkeypatch):
     import contextlib
     import io

@@ -35,6 +35,7 @@ from ..leasing import (
     Controller,
     DeploymentState,
     Ledger,
+    LeaseState,
     NullBackend,
     Sharing,
     SqliteStore,
@@ -55,6 +56,15 @@ from .options import _AllowedGpusMixin, _DisplayGpuMixin, _PathOverridesMixin
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+# Managed .env values that participate in rendered service behaviour.  Changing
+# one while a lease is active would make a later unrelated publication recreate
+# serving containers with a new fingerprint.  Treat them as configuration-time
+# state; client-only values such as OPENAI_BASE_URL may still change freely.
+_SERVICE_ENV_KEYS = frozenset({
+    'HF_TOKEN', 'LITELLM_MASTER_KEY', 'LITELLM_DB_PASSWORD',
+})
 
 
 def _default_owner() -> str:
@@ -2197,8 +2207,18 @@ class EnvCLI(_PathOverridesMixin):
             # must read one consistent .env (its fingerprints hash the values
             # Compose will interpolate), and concurrent writers must not lose
             # each other's keys.
-            controller = Controller(Ledger(SqliteStore(str(default_ledger_path()))), NullBackend())
+            ledger = Ledger(SqliteStore(str(default_ledger_path())))
+            controller = Controller(ledger, NullBackend())
             with controller._global_lock():
+                if key in _SERVICE_ENV_KEYS:
+                    leases, _ = ledger.status(virtual_expiry=True)
+                    active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+                    if active:
+                        raise SystemExit(
+                            f'env: {key} affects running services and cannot change '
+                            f'while {len(active)} lease(s) are active; release them '
+                            'first'
+                        )
                 write_env_file(env_path, {key: value})
             print(f'set {key} ({env_path})')
             return 0
