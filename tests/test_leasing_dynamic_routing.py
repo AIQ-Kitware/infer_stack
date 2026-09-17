@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from fake_docker_state import ComposeFake
+
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import ComposeBackend, render_compose
 from infer_stack.leasing.compose import (
@@ -59,40 +61,8 @@ def dep(gid, *, served='smol', endpoint=None, hf='org/smol', tp=1,
     )
 
 
-class FakeDocker:
+class FakeDocker(ComposeFake):
     """Stateful docker compose stand-in: ``up`` reflects the compose file."""
-
-    def __init__(self):
-        self.running: list[str] = []
-        self.calls: list[list[str]] = []
-        self.compose_file = None
-        self.project = 'infer-stack'
-
-    def __call__(self, args: list[str]) -> str:
-        self.calls.append(args)
-        compose_file = args[args.index('-f') + 1] if '-f' in args else None
-        from fake_docker_state import answer_residency
-
-        reply = answer_residency(args, compose_file=self.compose_file,
-                                 running=self.running, project=self.project)
-        if reply is not None:
-            return reply
-        if 'up' in args:
-            self.compose_file = args[args.index('-f') + 1]
-            if '-p' in args:
-                self.project = args[args.index('-p') + 1]
-            data = yaml.safe_load(Path(compose_file).read_text()) or {}
-            self.running = sorted((data.get('services') or {}).keys())
-            return ''
-        if 'down' in args:
-            self.running = []
-            return ''
-        if 'ps' in args:
-            return json.dumps(
-                [{'Service': s, 'State': 'running'} for s in self.running]
-            )
-        return ''
-
 
 class FakeResp:
     def __init__(self, status, payload):

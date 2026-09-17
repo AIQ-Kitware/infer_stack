@@ -48,8 +48,13 @@ from typing import Any
 
 #: Label every infer-stack model service carries (rendered in ``compose.py``).
 DEPLOYMENT_LABEL = 'infer-stack.deployment'
-#: Label Docker Compose puts on every container of a project.
+#: Labels every rendered service carries: its service name, and a behavioural
+#: fingerprint that changes only when the service's behaviour does.
+SERVICE_LABEL = 'infer-stack.service'
+FINGERPRINT_LABEL = 'infer-stack.fingerprint'
+#: Labels Docker Compose puts on every container of a project.
 COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
+COMPOSE_SERVICE_LABEL = 'com.docker.compose.service'
 
 #: Container states that hold, or will reclaim on their own, a warm model: the
 #: process is up, is being restarted by Docker's restart policy, or is paused
@@ -71,6 +76,7 @@ class Container:
     """One deployment container as Docker reports it."""
 
     container_id: str
+    #: Empty for infrastructure (gateway, database, UI, proxy).
     deployment_id: str
     state: str
     #: Physical GPU indices from the container's device reservation. Empty for a
@@ -79,6 +85,12 @@ class Container:
     #: True when the reservation could not be mapped to indices; the container
     #: is then conservatively treated as occupying every GPU.
     all_gpus: bool = False
+    #: Compose service name (``infer-stack.service``, else Compose's own label).
+    service: str = ''
+    #: ``infer-stack.fingerprint``; empty on a container rendered before labels.
+    fingerprint: str = ''
+    #: Carries both infer-stack ownership labels (service and fingerprint).
+    labelled: bool = False
 
     @property
     def warm(self) -> bool:
@@ -97,6 +109,9 @@ class Residency:
     """
 
     by_deployment: dict[str, tuple[Container, ...]] = field(default_factory=dict)
+    #: Project containers that belong to no deployment (infrastructure, or
+    #: containers without infer-stack labels at all).
+    others: tuple[Container, ...] = ()
 
     def containers(self, deployment_id: str) -> tuple[Container, ...]:
         """Every container carrying this deployment's label, in any state."""
@@ -119,15 +134,13 @@ class Residency:
 
     def occupants(self, gpu: int) -> tuple[Container, ...]:
         """Every container, in any state, whose reservation includes ``gpu``."""
-        return tuple(
-            c
-            for group in self.by_deployment.values()
-            for c in group
-            if c.occupies(gpu)
-        )
+        return tuple(c for c in self.all_containers() if c.occupies(gpu))
 
     def all_containers(self) -> tuple[Container, ...]:
-        return tuple(c for group in self.by_deployment.values() for c in group)
+        return (
+            *(c for group in self.by_deployment.values() for c in group),
+            *self.others,
+        )
 
 
 def _gpus_from_device_requests(requests: Any) -> tuple[tuple[int, ...], bool]:
@@ -164,9 +177,10 @@ def _gpus_from_device_requests(requests: Any) -> tuple[tuple[int, ...], bool]:
 def residency_from_inspect(raw: str, *, project: str) -> Residency:
     """Build a :class:`Residency` from ``docker inspect`` JSON output.
 
-    Containers outside ``project`` or without a deployment label are ignored,
-    even if a caller's listing let them through. Raises :class:`ResidencyUnknown`
-    on output that is not a JSON array of container objects.
+    Containers outside ``project`` are ignored, even if a caller's listing let
+    them through. Containers of the project without a deployment label are kept
+    in :attr:`Residency.others`. Raises :class:`ResidencyUnknown` on output
+    that is not a JSON array of container objects.
     """
     try:
         data = json.loads(raw or '[]')
@@ -175,37 +189,42 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
     if not isinstance(data, list):
         raise ResidencyUnknown('docker inspect output is not a JSON array')
     grouped: dict[str, list[Container]] = {}
+    others: list[Container] = []
     for item in data:
         if not isinstance(item, dict):
             raise ResidencyUnknown('docker inspect returned a non-object entry')
         labels = ((item.get('Config') or {}).get('Labels')) or {}
         if labels.get(COMPOSE_PROJECT_LABEL) != project:
             continue
-        deployment_id = labels.get(DEPLOYMENT_LABEL)
-        if not deployment_id:
-            continue
+        deployment_id = labels.get(DEPLOYMENT_LABEL) or ''
         container_id = item.get('Id')
         state = (item.get('State') or {}).get('Status')
         if not container_id or not state:
             raise ResidencyUnknown(
-                f'docker inspect entry for deployment {deployment_id!r} '
+                f'docker inspect entry for {deployment_id or "a project container"!r} '
                 'lacks an Id or State.Status'
             )
         gpus, all_gpus = _gpus_from_device_requests(
             (item.get('HostConfig') or {}).get('DeviceRequests')
         )
-        grouped.setdefault(deployment_id, []).append(
-            Container(
-                container_id=str(container_id),
-                deployment_id=str(deployment_id),
-                state=str(state).lower(),
-                gpus=gpus,
-                all_gpus=all_gpus,
-            )
+        container = Container(
+            container_id=str(container_id),
+            deployment_id=str(deployment_id),
+            state=str(state).lower(),
+            gpus=gpus,
+            all_gpus=all_gpus,
+            service=str(labels.get(SERVICE_LABEL) or labels.get(COMPOSE_SERVICE_LABEL) or ''),
+            fingerprint=str(labels.get(FINGERPRINT_LABEL) or ''),
+            labelled=bool(labels.get(SERVICE_LABEL) and labels.get(FINGERPRINT_LABEL)),
         )
+        if deployment_id:
+            grouped.setdefault(deployment_id, []).append(container)
+        else:
+            others.append(container)
     return Residency(
         {
             gid: tuple(sorted(found, key=lambda c: c.container_id))
             for gid, found in grouped.items()
-        }
+        },
+        tuple(sorted(others, key=lambda c: c.container_id)),
     )

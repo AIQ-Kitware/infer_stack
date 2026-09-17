@@ -55,7 +55,9 @@ from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
 from .models import Deployment, is_reservation
 from .placement import plan_placement
-from .residency import (  # DEPLOYMENT_LABEL lives beside the code that reads it back
+from .residency import (  # labels live beside the code that reads them back
+    FINGERPRINT_LABEL,
+    SERVICE_LABEL,
     COMPOSE_PROJECT_LABEL,
     DEPLOYMENT_LABEL,
     Residency,
@@ -192,6 +194,57 @@ def ollama_service_name(deployment: Deployment) -> str:
     return ollama_service_name_for(host)
 
 
+class ApplyAborted(RuntimeError):
+    """Selective apply refused to act; the change stays pending."""
+
+
+@dataclass
+class SelectiveApplyOutcome:
+    kept_services: set[str]
+    removed: list[str]
+    started: list[str]
+    orphans: list[str]
+
+
+def _stanza_gpus(service: dict[str, Any]) -> list[int]:
+    devices = (((service.get('deploy') or {}).get('resources') or {})
+               .get('reservations') or {}).get('devices') or []
+    out = []
+    for dev in devices:
+        for raw in dev.get('device_ids') or []:
+            try:
+                out.append(int(raw))
+            except ValueError:
+                pass
+    return out
+
+
+def _dependency_levels(services: dict[str, Any], names: list[str]) -> list[list[str]]:
+    """Group ``names`` into start order: each level depends only on earlier ones.
+
+    Example:
+        >>> svcs = {'db': {}, 'gw': {'depends_on': {'db': {}}}, 'm': {}}
+        >>> _dependency_levels(svcs, ['gw', 'db', 'm'])
+        [['db', 'm'], ['gw']]
+    """
+    pending = list(dict.fromkeys(names))
+    started: set[str] = set()
+    levels = []
+    while pending:
+        level = []
+        for name in pending:
+            deps = services.get(name, {}).get('depends_on') or []
+            deps = set(deps) & set(pending)
+            if deps <= started:
+                level.append(name)
+        if not level:                      # a cycle: start the rest together
+            level = list(pending)
+        levels.append(sorted(level))
+        started.update(level)
+        pending = [n for n in pending if n not in started]
+    return levels
+
+
 @dataclass
 class RenderedCompose:
     compose: dict[str, Any]
@@ -209,6 +262,55 @@ class RenderedCompose:
     # deployment silently never getting a container.
     unrenderable: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
+
+
+def stamp_fingerprints(
+    compose: dict[str, Any], *, files: dict[Path, str], env_file: Path | None = None,
+) -> dict[str, str]:
+    """Label every service with a behavioural fingerprint; return service -> fingerprint.
+
+    The fingerprint is ``sha256(canonical stanza without the fingerprint label ||
+    sha256 of each generated file the service bind-mounts)``, plus the managed
+    ``.env`` when the stanza interpolates from it. It changes exactly when the
+    service's behaviour does: an unchanged fingerprint keeps a container, a
+    changed one makes selective apply recreate it. (A per-render label would
+    recreate everything on every apply.)
+
+    ``files`` holds content about to be written (path -> text); a mounted file
+    that is not in it is read from disk if it exists.
+
+    Example:
+        >>> doc = {'services': {'a': {'image': 'x', 'labels': {}}}}
+        >>> fps = stamp_fingerprints(doc, files={})
+        >>> doc['services']['a']['labels'][FINGERPRINT_LABEL] == fps['a']
+        True
+        >>> doc['services']['a']['image'] = 'y'
+        >>> stamp_fingerprints(doc, files={})['a'] != fps['a']
+        True
+    """
+    by_path = {str(Path(p)): text for p, text in files.items()}
+    env_text = None
+    if env_file is not None and Path(env_file).exists():
+        env_text = Path(env_file).read_text()
+    out: dict[str, str] = {}
+    for name, svc in (compose.get('services') or {}).items():
+        labels = dict(svc.get('labels') or {})
+        labels.pop(FINGERPRINT_LABEL, None)
+        stanza = {**svc, 'labels': labels}
+        material = [json.dumps(stanza, sort_keys=True, default=str)]
+        for volume in svc.get('volumes') or []:
+            source = str(volume).split(':', 1)[0] if isinstance(volume, str) else ''
+            text = by_path.get(str(Path(source))) if source else None
+            if text is None and source and Path(source).is_file():
+                text = Path(source).read_text(errors='replace')
+            if text is not None:
+                material.append(hashlib.sha256(text.encode('utf-8')).hexdigest())
+        if env_text is not None and '${' in material[0]:
+            material.append(hashlib.sha256(env_text.encode('utf-8')).hexdigest())
+        fingerprint = hashlib.sha256('\x00'.join(material).encode('utf-8')).hexdigest()[:16]
+        svc.setdefault('labels', {})[FINGERPRINT_LABEL] = fingerprint
+        out[name] = fingerprint
+    return out
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -1280,6 +1382,9 @@ def render_compose(
                 ).hexdigest()[:12],
             )
 
+    for name, svc in services.items():
+        svc.setdefault('labels', {})[SERVICE_LABEL] = name
+
     return RenderedCompose(
         compose={'name': project, 'services': services},
         services=service_map,
@@ -2147,8 +2252,7 @@ class ComposeBackend(ConvergeScaffold):
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
 
-            compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
-            planned: dict[Path, str] = {self.compose_file: compose_text}
+            planned: dict[Path, str] = {}
             if rendered.litellm_config is not None:
                 planned[self.state_dir / LITELLM_CONFIG_FILENAME] = (
                     rendered.litellm_config
@@ -2164,6 +2268,11 @@ class ComposeBackend(ConvergeScaffold):
             )
             if routes_text is not None:
                 planned[self._routes_file] = routes_text
+            fingerprints = stamp_fingerprints(
+                rendered.compose, files=planned, env_file=self._env_path,
+            )
+            compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
+            planned[self.compose_file] = compose_text
             self._approve_changes(planned)  # may raise ConvergeAborted
 
             if rendered.litellm_config is not None:
@@ -2180,9 +2289,20 @@ class ComposeBackend(ConvergeScaffold):
                 # via the admin API in apply() -> _reconcile_routes).
                 self._atomic_write(self._routes_file, routes_text)
             self._atomic_write(self.compose_file, compose_text)
-            self._save_sidecar(
-                {'assignments': plan.assignments, 'services': rendered.services}
-            )
+            optional = set((placement.optional_hints if placement is not None else {}))
+            self._save_sidecar({
+                'assignments': plan.assignments,
+                'services': rendered.services,
+                # Selective apply (see apply()): what each service must look
+                # like, which deployments are degraded (never started or
+                # removed), and which services are optional residents (kept if
+                # present, never started).
+                'fingerprints': fingerprints,
+                'degraded': list(plan.degraded),
+                'optional_services': sorted(
+                    svc for svc, gid in rendered.services.items() if gid in optional
+                ),
+            })
             services = rendered.compose.get('services')
             if not apply:
                 logger.info(
@@ -2226,32 +2346,134 @@ class ComposeBackend(ConvergeScaffold):
             logger.warning('apply: rendered compose file is unreadable; change stays pending')
             return False
         services = doc.get('services') or {}
-        if services:
-            dynamic = bool(self.litellm and self.dynamic_routing)
-            gateway_was_up = dynamic and self._service_running('litellm')
-            logger.info(
-                'docker compose up -d ({} service(s): {})',
-                len(services), ', '.join(sorted(services)),
+        sidecar = self._load_sidecar()
+        fingerprints = sidecar.get('fingerprints')
+        if fingerprints is None or set(fingerprints) != set(services):
+            # A render from before fingerprints: re-render (any mutation) first.
+            logger.warning('apply: the render predates fingerprints; re-render, then apply')
+            return False
+        dynamic = bool(self.litellm and self.dynamic_routing)
+        outcome = self.selective_apply(
+            services, fingerprints,
+            degraded=set(sidecar.get('degraded') or ()),
+            optional=set(sidecar.get('optional_services') or ()),
+        )
+        if dynamic and 'litellm' in services:
+            return self._reconcile_routes(
+                deadline_s=ROUTE_RECONCILE_STEADY_S if 'litellm' in outcome.kept_services
+                else ROUTE_RECONCILE_BOOTSTRAP_S,
             )
-            self._compose(['up', '-d', '--remove-orphans'])
-            if dynamic:
-                # Apply the rendered desired route set to the now-running gateway
-                # via the admin API (the dynamic-routing half of apply).
-                return self._reconcile_routes(
-                    deadline_s=ROUTE_RECONCILE_STEADY_S if gateway_was_up
-                    else ROUTE_RECONCILE_BOOTSTRAP_S,
-                )
-            return True
-        # Nothing at all to run -- only reachable with the gateway off
-        # (litellm=False) and zero models, since the front door otherwise
-        # keeps the project non-empty. `docker compose up` errors with "no
-        # service selected" on a services-less file, so tear the project down
-        # instead (`down` works on the empty file). With the gateway on,
-        # releasing every model lands in the `up` branch above and leaves the
-        # front door standing; `stack down` is the way to take everything off.
-        logger.info('no services desired -> docker compose down')
-        self._compose(['down', '--remove-orphans'])
         return True
+
+    #: Service-level ownership adopted at migration: container id ->
+    #: {service, fingerprint}. Set by the controller from the ledger.
+    adopted: dict[str, dict[str, str]] = {}
+
+    def selective_apply(self, services, fingerprints, *, degraded=frozenset(),
+                        optional=frozenset()):
+        """Make the project match the render, touching only what differs.
+
+        * **keep** a managed container whose (service, fingerprint) is wanted,
+          is the only one with that key, and is running, restarting or paused;
+        * **remove** other managed containers, except those of degraded
+          deployments;
+        * **report** unmanaged containers (orphans), never remove them;
+        * **start** each service with no kept container, except optional
+          residents, which are never started;
+        * **barrier**: nothing starts on a GPU still occupied by another
+          container. A managed occupant is removed first; an unmanaged or
+          degraded one aborts the apply.
+
+        Services start with ``up -d --no-deps``, dependency level by level, so
+        a fresh dynamic stack brings Postgres up before the gateway. Raises
+        :class:`ApplyAborted` (the change stays pending) on ambiguity, a
+        blocked GPU, or a container still being removed.
+        """
+        from .._log import logger
+
+        res = self.residency()
+        adopted = dict(self.adopted or {})
+        wanted = {name: fingerprints[name] for name in services}
+
+        def key(c):
+            if c.labelled:
+                return (c.service, c.fingerprint)
+            if c.container_id in adopted:
+                info = adopted[c.container_id]
+                return (info['service'], info['fingerprint'])
+            return None
+
+        containers = res.all_containers()
+        managed = [c for c in containers if key(c) is not None]
+        orphans = [c for c in containers if key(c) is None]
+        by_key: dict[tuple, list] = {}
+        for c in managed:
+            by_key.setdefault(key(c), []).append(c)
+        for name, fp in wanted.items():
+            if len(by_key.get((name, fp), ())) > 1:
+                raise ApplyAborted(
+                    f'service {name!r} has {len(by_key[(name, fp)])} containers with its '
+                    'wanted configuration; refusing to guess which one serves'
+                )
+        keep = [
+            c for c in managed
+            if wanted.get(key(c)[0]) == key(c)[1]
+            and c.state in {'running', 'restarting', 'paused'}
+        ]
+        kept_ids = {c.container_id for c in keep}
+        kept_services = {key(c)[0] for c in keep}
+        departing = [
+            c for c in managed
+            if c.container_id not in kept_ids and c.deployment_id not in degraded
+        ]
+        for c in departing:
+            if c.state == 'removing':
+                raise ApplyAborted(
+                    f'container {c.container_id[:12]} ({key(c)[0]}) is still being '
+                    'removed; retry when it is gone'
+                )
+        to_start = [
+            name for name in services
+            if name not in kept_services and name not in optional
+        ]
+        departing_ids = {c.container_id for c in departing}
+        for name in to_start:
+            for gpu in _stanza_gpus(services[name]):
+                for c in res.occupants(gpu):
+                    if c.container_id in kept_ids or c.container_id in departing_ids:
+                        continue
+                    who = 'an unmanaged' if key(c) is None else 'a degraded'
+                    raise ApplyAborted(
+                        f'{who} container {c.container_id[:12]} occupies GPU {gpu} '
+                        f'needed by {name!r}' + (
+                            '; see `infer-stack gc --orphans`' if key(c) is None else '')
+                    )
+                for c in res.occupants(gpu):
+                    if c.container_id in kept_ids and key(c)[0] != name:
+                        raise ApplyAborted(
+                            f'GPU {gpu} is held by kept service {key(c)[0]!r} but '
+                            f'rendered for {name!r}'
+                        )
+        if orphans:
+            logger.warning(
+                'apply: {} unmanaged container(s) in the project left alone ({}); '
+                '`infer-stack gc --orphans` removes them',
+                len(orphans), ', '.join(c.container_id[:12] for c in orphans),
+            )
+        if departing:
+            logger.info('apply: removing {} container(s): {}', len(departing),
+                        ', '.join(f'{key(c)[0]}' for c in departing))
+            self.run(['docker', 'rm', '-f', *[c.container_id for c in departing]])
+        paused = [c for c in keep if c.state == 'paused' and key(c)[0] not in optional]
+        if paused:
+            self.run(['docker', 'unpause', *[c.container_id for c in paused]])
+        for level in _dependency_levels(services, to_start):
+            logger.info('docker compose up -d --no-deps {}', ' '.join(level))
+            self._compose(['up', '-d', '--no-deps', *level])
+        return SelectiveApplyOutcome(
+            kept_services=kept_services, removed=[c.container_id for c in departing],
+            started=list(to_start), orphans=[c.container_id for c in orphans],
+        )
 
     def _service_running(self, service: str) -> bool:
         """Whether a compose service of this project is running (best-effort)."""
@@ -2585,7 +2807,6 @@ class ComposeBackend(ConvergeScaffold):
             listing = self.run([
                 'docker', 'ps', '-a', '--no-trunc',
                 '--filter', f'label={COMPOSE_PROJECT_LABEL}={self.project}',
-                '--filter', f'label={DEPLOYMENT_LABEL}',
                 '--format', '{{.ID}}',
             ])
         except Exception as ex:  # noqa: BLE001 - any failure is "unknown", never "empty"

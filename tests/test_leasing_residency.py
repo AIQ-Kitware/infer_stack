@@ -104,13 +104,20 @@ def test_unmappable_reservation_is_treated_as_every_gpu(requests):
 # -- scoping and ambiguity (plan tests 39, 41) ------------------------------
 
 
-def test_other_projects_and_unlabelled_containers_are_ignored():
+def test_other_projects_are_ignored_and_infrastructure_is_listed():   # plan test 38
+    infra = container('gw', None, device_ids=())
+    infra['Config']['Labels'].update({
+        'infer-stack.service': 'litellm', 'infer-stack.fingerprint': 'abc'})
     res = snap(
         container('mine', 'grp-a'),
         container('theirs', 'grp-a', project='someone-else'),
         container('nolabel', None),
+        infra,
     )
-    assert [c.container_id for c in res.all_containers()] == ['mine']
+    assert [c.container_id for c in res.all_containers()] == ['mine', 'gw', 'nolabel']
+    gw = res.others[0]
+    assert (gw.service, gw.fingerprint, gw.labelled, gw.deployment_id) == ('litellm', 'abc', True, '')
+    assert res.others[1].labelled is False
 
 
 def test_duplicate_deployment_containers_are_kept_and_ambiguous():
@@ -175,13 +182,12 @@ def backend(tmp_path, run):
                           run=run, project=PROJECT)
 
 
-def test_residency_lists_by_both_labels_in_every_state(tmp_path):
+def test_residency_lists_the_whole_project_in_every_state(tmp_path):
     docker = ScriptedDocker([container('c1', 'grp-a', device_ids=('1',))])
     res = backend(tmp_path, docker).residency()
     ps = docker.calls[0]
     assert ps[:4] == ['docker', 'ps', '-a', '--no-trunc']
     assert f'label={COMPOSE_PROJECT_LABEL}={PROJECT}' in ps
-    assert f'label={DEPLOYMENT_LABEL}' in ps
     assert docker.calls[1] == ['docker', 'inspect', 'c1']
     assert res.resident('grp-a').gpus == (1,)
 

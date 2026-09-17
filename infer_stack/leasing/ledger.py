@@ -477,6 +477,14 @@ class Ledger:
     def profile(self) -> dict | None:
         return self.store.profile()
 
+    def adopted_containers(self) -> dict | None:
+        """Containers adopted at migration (id -> {service, fingerprint}), or
+        ``None`` if adoption has not run on this ledger yet."""
+        return self.store.meta_json('adopted_containers')
+
+    def set_adopted_containers(self, adopted: dict) -> None:
+        self.store.set_meta_json('adopted_containers', adopted)
+
     def set_profile(self, profile: dict) -> None:
         self.store.set_profile(profile)
 

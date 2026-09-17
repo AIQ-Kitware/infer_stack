@@ -1223,6 +1223,11 @@ class GcCLI(_ApprovalMixin):
         help='Also tear down idle keep-warm deployments (like `evict --all`), '
         'not just leaked/expired demand.',
     )
+    orphans = scfg.Value(
+        False, isflag=True,
+        help='Instead: remove containers in the project that infer-stack does not '
+        'manage (listed and confirmed first; --yes skips the prompt).',
+    )
     json = scfg.Value(False, isflag=True)
 
     @classmethod
@@ -1231,6 +1236,24 @@ class GcCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
+        if config.orphans:
+            if not callable(getattr(controller.backend, 'residency', None)):
+                raise SystemExit('gc --orphans needs the compose backend')
+
+            def confirm(found):
+                print(f'gc --orphans: {len(found)} unmanaged container(s):')
+                for c in found:
+                    print(f'  {c.container_id[:12]}  {c.service or "?"}  {c.state}')
+                if config.yes or not sys.stdin.isatty():
+                    return bool(config.yes)
+                return input('remove them? [y/N] ').strip().lower() in {'y', 'yes'}
+
+            removed = controller.remove_orphans(confirm)
+            if config.json:
+                print(json.dumps({'removed': [c.container_id for c in removed]}, indent=2))
+            else:
+                print(f'gc --orphans: removed {len(removed)} container(s)')
+            return 0
         try:
             outcome = controller.gc(evict_idle=bool(config.evict))
         except ConvergeAborted:

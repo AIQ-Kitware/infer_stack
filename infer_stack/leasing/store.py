@@ -268,6 +268,18 @@ class SqliteStore:
     #                    which must not start just because something reopened;
     #                    once True it stays True until cleared
 
+    def meta_json(self, key: str, default=None):
+        row = self._conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+        return json.loads(row['value']) if row else default
+
+    def set_meta_json(self, key: str, value) -> None:
+        with self.transaction():
+            self._conn.execute(
+                'INSERT INTO meta(key, value) VALUES (?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (key, json.dumps(value, sort_keys=True)),
+            )
+
     def profile(self) -> dict | None:
         """The published render profile, or ``None`` before the first mutation."""
         row = self._conn.execute(

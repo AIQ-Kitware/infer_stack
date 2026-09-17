@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from fake_docker_state import ComposeFake
+
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import (
     Catalog,
@@ -63,40 +65,8 @@ def ollama(gid, *, tag='m:1b', t=0.0):
     )
 
 
-class FakeDocker:
+class FakeDocker(ComposeFake):
     """Stateful docker compose stand-in: `up` reflects the compose file."""
-
-    def __init__(self):
-        self.running: list[str] = []
-        self.calls: list[list[str]] = []
-        self.compose_file = None
-        self.project = 'infer-stack'
-
-    def __call__(self, args: list[str]) -> str:
-        self.calls.append(args)
-        compose_file = args[args.index('-f') + 1] if '-f' in args else None
-        from fake_docker_state import answer_residency
-
-        reply = answer_residency(args, compose_file=self.compose_file,
-                                 running=self.running, project=self.project)
-        if reply is not None:
-            return reply
-        if 'up' in args:
-            self.compose_file = args[args.index('-f') + 1]
-            if '-p' in args:
-                self.project = args[args.index('-p') + 1]
-            data = yaml.safe_load(Path(compose_file).read_text()) or {}
-            self.running = sorted((data.get('services') or {}).keys())
-            return ''
-        if 'down' in args:
-            self.running = []
-            return ''
-        if 'ps' in args:
-            return json.dumps(
-                [{'Service': s, 'State': 'running'} for s in self.running]
-            )
-        return ''
-
 
 class FakeResp:
     def __init__(self, status, payload):
@@ -417,8 +387,9 @@ def test_converge_to_empty_keeps_the_front_door(tmp_path):
     fake = be.run
     fake.calls.clear()
     be.converge([])                        # last model released
-    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
-    assert 'up' in verbs and 'down' not in verbs   # front door stays up
+    assert not any('down' in c for c in fake.calls)  # front door stays up
+    assert set(fake.running) == {'litellm', 'open-webui'}   # kept, not restarted
+    assert not any('up' in c for c in fake.calls)
     # no model deployments running, but the compose project still has the gateway/UI
     assert be.observe() == set()
     compose = yaml.safe_load(be.compose_file.read_text())
@@ -426,15 +397,16 @@ def test_converge_to_empty_keeps_the_front_door(tmp_path):
 
 
 def test_converge_to_empty_downs_when_gateway_off(tmp_path):
-    """With no gateway (litellm=False), an empty desired set has nothing to run,
-    so converge `down`s rather than `up`-ing a services-less file."""
+    """With no gateway (litellm=False), an empty desired set has nothing to run:
+    selective apply removes the managed model container and starts nothing."""
     be = make_backend(tmp_path, litellm=False)
     be.converge([vllm('a', t=0)])
     fake = be.run
     fake.calls.clear()
     be.converge([])
-    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
-    assert 'down' in verbs and 'up' not in verbs
+    assert fake.running == []
+    assert any(c[:3] == ['docker', 'rm', '-f'] for c in fake.calls)
+    assert not any('up' in c for c in fake.calls)
 
 
 def test_render_reverse_proxy(tmp_path):
@@ -507,7 +479,7 @@ def test_observe_tolerates_unreadable_compose_file(tmp_path):
     # propagate it (else acquire bricks before converge can overwrite the file).
     class RaisingPs(FakeDocker):
         def __call__(self, args):
-            if 'ps' in args:
+            if args[:2] == ['docker', 'compose'] and 'ps' in args:
                 raise RuntimeError('compose schema error on a stale file')
             return super().__call__(args)
 

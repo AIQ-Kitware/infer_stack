@@ -471,6 +471,7 @@ class Controller:
             residency = self.backend.residency()
             self._backfill_allocations(residency)
             desired, placement = self._admission_view(residency)
+            self.backend.adopted = self._prune_adopted(residency)
         else:
             desired = self.desired_deployments()
         # Bound once rather than probed with hasattr: the capability check is
@@ -505,6 +506,8 @@ class Controller:
                 displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
                 degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
             )
+            if placement is not None:
+                self._adopt_existing(residency)
         desired_ids = {g.id for g in desired}
         actual = self.backend.observe()
         result = ReconcileResult()
@@ -585,6 +588,71 @@ class Controller:
             required_ids=set(required), hard=hard, optional_hints=hints,
         )
         return [*required.values(), *optional], inputs
+
+    def _prune_adopted(self, residency) -> dict:
+        """The adopted-container table, minus containers that no longer exist."""
+        adopted = self.ledger.adopted_containers()
+        if not adopted:
+            return {}
+        present = {c.container_id for c in residency.all_containers()}
+        kept = {cid: info for cid, info in adopted.items() if cid in present}
+        if kept != adopted:
+            self.ledger.set_adopted_containers(kept)
+        return kept
+
+    def _adopt_existing(self, residency) -> None:
+        """One-time migration: adopt project containers from before ownership labels.
+
+        Runs after the first admission-mode render on a ledger. A container
+        without infer-stack's service and fingerprint labels is adopted, with
+        the fingerprint of this render, if it is infrastructure the render
+        still has, or a deployment container whose deployment is LIVE on the
+        same GPUs or is an idle resident. Adopted containers are kept until
+        their service's fingerprint changes; the first recreation stamps the
+        labels. Anything else stays an orphan: reported, never removed
+        implicitly. Adoption recreates nothing.
+        """
+        if self.ledger.adopted_containers() is not None:
+            return
+        fingerprints = self.backend._load_sidecar().get('fingerprints') or {}
+        services = self.backend._load_sidecar().get('services') or {}
+        _, deployments = self.ledger.status()
+        by_id = {g.id: g for g in deployments}
+        adopted = {}
+        for c in residency.all_containers():
+            if c.labelled or c.service not in fingerprints:
+                continue
+            if c.deployment_id:
+                deployment = by_id.get(c.deployment_id)
+                if deployment is None or services.get(c.service) != c.deployment_id:
+                    continue
+                live_here = (deployment.state == DeploymentState.LIVE
+                             and list(c.gpus) == list(deployment.assigned_gpus or []))
+                resident = (deployment.state == DeploymentState.IDLE
+                            and residency.resident(c.deployment_id) is not None)
+                if not (live_here or resident):
+                    continue
+            adopted[c.container_id] = {
+                'service': c.service, 'fingerprint': fingerprints[c.service]}
+        self.ledger.set_adopted_containers(adopted)
+        self.backend.adopted = adopted
+
+    def remove_orphans(self, confirm: Callable[[list], bool]) -> list:
+        """``gc --orphans``: remove the project's unmanaged containers, with consent.
+
+        Takes a strict snapshot under the lock, lists containers infer-stack
+        neither labelled nor adopted, and removes exactly those if ``confirm``
+        (shown the list) returns True. Returns the removed containers.
+        """
+        with self._global_lock():
+            residency = self.backend.residency()
+            adopted = self.ledger.adopted_containers() or {}
+            orphans = [c for c in residency.all_containers()
+                       if not c.labelled and c.container_id not in adopted]
+            if not orphans or not confirm(orphans):
+                return []
+            self.backend.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
+            return orphans
 
     def _backfill_allocations(self, residency) -> list[str]:
         """Adopt allocations for LIVE deployments that predate them.
@@ -794,10 +862,14 @@ class Controller:
         before = set(self.backend.observe())
         try:
             ok = apply_fn()
-        except BaseException:
+        except BaseException as ex:
+            from .compose import ApplyAborted
+
             # A killed or failed client does not stop work the daemon already
             # started: the next apply must first wait for the runtime to settle.
-            self.ledger.mark_publication_pending(apply_requested=True, interrupted=True)
+            # A refusal (ApplyAborted) started nothing, so it needs no settling.
+            self.ledger.mark_publication_pending(
+                apply_requested=True, interrupted=not isinstance(ex, ApplyAborted))
             rec.publication_pending = True
             raise
         after = set(self.backend.observe())
@@ -1360,7 +1432,8 @@ class Controller:
                     raise ProfileMismatch(
                         f'config publish cannot confirm the stack is quiescent: {ex}'
                     ) from ex
-                running = sorted({c.deployment_id for c in snap.all_containers()})
+                running = sorted({c.deployment_id for c in snap.all_containers()
+                                  if c.deployment_id})
                 if running:
                     raise ProfileMismatch(
                         'config publish needs a quiescent stack: deployment '
