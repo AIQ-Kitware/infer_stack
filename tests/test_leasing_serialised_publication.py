@@ -690,20 +690,55 @@ def test_a_reviving_renew_waits_for_an_in_flight_apply(tmp_path):
     assert ledger.get_deployment(gid).state == 'live'
 
 
-def test_no_cli_or_tui_code_renews_around_the_controller():
+def test_no_code_mutates_the_ledger_around_the_controller():
+    # Read-path sweeps are removed in a later P2 step; add `sweep` here then.
     import pathlib
     import re
 
     import infer_stack
 
     root = pathlib.Path(infer_stack.__file__).parent
+    pattern = re.compile(r'ledger\.(renew|release|evict_idle|prune|acquire)\(')
     offenders = [
-        str(path.relative_to(root))
+        f'{path.relative_to(root)}:{m.group(0)}'
         for path in root.rglob('*.py')
         if path.name not in {'ledger.py', 'controller.py'}
-        and re.search(r'ledger\.renew\(', path.read_text())
+        for m in pattern.finditer(path.read_text())
     ]
     assert offenders == []
+
+
+def test_release_leases_publishes_a_batch_once(tmp_path):
+    shared = _shared()
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared)
+    a = ctl.acquire('alice', [_vreq('a')], wait=False).lease.id
+    b = ctl.acquire('bob', [_vreq('b')], wait=False).lease.id
+    calls = shared['apply_calls']
+    out = ctl.release_leases([a, b, 'lease-nope'], evict=True)
+    assert out.released_lease_ids == [a, b]
+    assert out.missing_lease_ids == ['lease-nope']
+    assert len(out.evicted_deployment_ids) == 2
+    assert shared['apply_calls'] == calls + 1
+    assert shared['realized'] == set()
+    assert ledger.publication_pending() is None
+
+
+def test_release_leases_of_only_unknown_ids_changes_nothing(tmp_path):
+    shared = _shared()
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared)
+    out = ctl.release_leases(['lease-nope'])
+    assert out.missing_lease_ids == ['lease-nope'] and out.reconcile is None
+    assert shared['apply_calls'] == 0 and ledger.publication_pending() is None
+
+
+def test_release_all_releases_every_active_lease_in_one_apply(tmp_path):
+    shared = _shared()
+    ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared)
+    ids = [ctl.acquire(o, [_vreq(o)], wait=False).lease.id for o in ('x', 'y')]
+    calls = shared['apply_calls']
+    out = ctl.release_leases(None, evict=True)
+    assert sorted(out.released_lease_ids) == sorted(ids)
+    assert shared['apply_calls'] == calls + 1 and shared['realized'] == set()
 
 
 # -- transitional: rollback under unknown residency keeps a phantom warm candidate --

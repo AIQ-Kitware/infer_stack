@@ -2457,13 +2457,8 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_release(self, ids: list[str]) -> None:
         try:
-            if len(ids) == 1:
-                self.controller.release(ids[0])
-            else:
-                # Release every selected lease in the ledger, then converge once.
-                for sid in ids:
-                    self.controller.ledger.release(sid)
-                self.controller.reconcile()
+            # One publication for the whole selection.
+            self.controller.release_leases(ids)
             self._lease_sel.clear()
             msg = f'released {len(ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
@@ -2473,13 +2468,8 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_release_all(self) -> None:
         try:
-            self.controller.ledger.sweep()
-            leases, _ = self.controller.ledger.status()
-            active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
-            for sid in active:
-                self.controller.ledger.release(sid)
-            self.controller.reconcile()
-            msg = f'released {len(active)} lease(s)'
+            out = self.controller.release_leases(None)
+            msg = f'released {len(out.released_lease_ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
             msg = f'release --all failed: {ex}'
         self._after_mutation(msg)
@@ -2516,7 +2506,7 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_cleanup(self) -> None:
         try:
-            n_leases, n_deployments = self.controller.ledger.prune()
+            n_leases, n_deployments = self.controller.prune()
             msg = (f'cleaned up {n_leases} released/expired lease(s) + '
                    f'{n_deployments} stopped deployment(s)')
         except Exception as ex:  # noqa: BLE001

@@ -34,7 +34,6 @@ from ..leasing import (
     ComposeBackend,
     Controller,
     DeploymentState,
-    LeaseState,
     Ledger,
     NullBackend,
     Sharing,
@@ -1030,44 +1029,42 @@ class ReleaseCLI(_ApprovalMixin):
         if config.all:
             if config.lease or config.env_file:
                 raise SystemExit('release: --all takes no lease/--env-file')
-            controller.ledger.sweep()
-            leases, _ = controller.ledger.status()
-            released = [le.id for le in leases if le.state == LeaseState.ACTIVE]
-            for sid in released:
-                controller.ledger.release(sid)
-            evicted: list[str] = []
-            if config.evict:
-                evicted = controller.ledger.evict_idle(None)  # every idle deployment
+            targets = None
         else:
             sid = _resolve_lease(config)
             if not sid:
                 raise SystemExit(
                     'release: give a lease id, --env-file, or --all'
                 )
-            rel = controller.ledger.release(sid)
-            if not rel.found:
-                raise SystemExit(f'release: no such lease: {sid}')
-            released = [sid]
-            evicted = []
-            if config.evict:
-                evicted = controller.ledger.evict_idle(rel.idled_deployment_ids)
+            targets = [sid]
 
-        # One converge for the whole command -> at most one diff prompt.
+        # One publication for the whole command -> at most one diff prompt.
         try:
-            rec = controller.reconcile()
+            out = controller.release_leases(targets, evict=bool(config.evict))
         except ConvergeAborted:
             raise _declined_exit()
-        return _emit_release(config, released, sorted(rec.torn_down), evicted)
+        if out.missing_lease_ids:
+            raise SystemExit(f'release: no such lease: {out.missing_lease_ids[0]}')
+        # A single named lease is reported even when it was already released
+        # (idempotent release; a cleanup trap may fire twice).
+        released = targets if targets is not None else out.released_lease_ids
+        rec = out.reconcile
+        return _emit_release(
+            config, released, sorted(rec.torn_down) if rec else [],
+            out.evicted_deployment_ids,
+            pending=bool(rec and rec.publication_pending),
+        )
 
 
-def _emit_release(config, released, torn_down, evicted) -> int:
+def _emit_release(config, released, torn_down, evicted, *, pending=False) -> int:
     if config.json:
         print(json.dumps({
             'released': released,
             'torn_down': torn_down,
             'evicted': evicted,
+            'publication_pending': pending,
         }, indent=2))
-        return 0
+        return 3 if pending else 0
     if not released:
         print('no active leases to release')
     else:
@@ -1076,6 +1073,10 @@ def _emit_release(config, released, torn_down, evicted) -> int:
             print(f'  {sid}')
     for gid in torn_down:
         print(f'  torn down: {gid}')
+    if pending:
+        print('  ! the apply did not fully take effect; the change is still '
+              'pending -- retry `infer-stack apply`')
+        return 3
     return 0
 
 

@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Releases and cleanup go through the controller
+
+`infer-stack release` (single, `--all`, `--evict`) and the TUI's release,
+release-all and cleanup actions now use `Controller.release_leases` and
+`Controller.prune`. A batch still releases in one publication, so there is at
+most one diff prompt. The CLI and TUI previously changed the ledger directly and
+reconciled afterwards, outside the lock. `release` now reports
+`publication_pending` in `--json`, and exits 3 if the apply did not fully take
+effect.
+
 ### `renew` goes through the controller
 
 `infer-stack renew` now calls `Controller.renew`, under the host-wide lock. A

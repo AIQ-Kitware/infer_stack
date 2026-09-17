@@ -106,6 +106,18 @@ class ReleaseOutcome:
 
 
 @dataclass
+class ReleaseLeasesOutcome:
+    # Leases this call moved to RELEASED (already-released ones are not listed).
+    released_lease_ids: list[str]
+    # Requested ids that do not exist in the ledger at all.
+    missing_lease_ids: list[str]
+    idled_deployment_ids: list[str]
+    evicted_deployment_ids: list[str]
+    # None when nothing changed, so nothing was rendered or applied.
+    reconcile: ReconcileResult | None = None
+
+
+@dataclass
 class RenewOutcome:
     # None when the lease is unknown or no longer ACTIVE.
     lease: Lease | None
@@ -879,6 +891,55 @@ class Controller:
         return ReleaseOutcome(
             idled_deployment_ids=rel.idled_deployment_ids, reconcile=rec
         )
+
+    def release_leases(
+        self, lease_ids: Iterable[str] | None = None, *, evict: bool = False,
+    ) -> ReleaseLeasesOutcome:
+        """Release several leases (``None``: every ACTIVE one) in one publication.
+
+        One render and one apply for the whole batch, so an interactive backend
+        asks at most once. ``evict`` also tears down, now, the deployments the
+        release idled -- or, with ``lease_ids=None``, every idle deployment --
+        overriding keep-warm. Ids that do not exist are reported, not raised;
+        if nothing at all would change, no marker is taken and nothing applies.
+        """
+        with self._global_lock():
+            if lease_ids is None:
+                self._mark_pending(apply=True)
+                self.ledger.sweep()
+                leases, _ = self.ledger.status()
+                ids = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+                missing: list[str] = []
+            else:
+                requested = list(dict.fromkeys(lease_ids))
+                missing = [s for s in requested if self.ledger.get_lease(s) is None]
+                ids = [s for s in requested if s not in missing]
+                if not ids:
+                    return ReleaseLeasesOutcome([], missing, [], [])
+                self._mark_pending(apply=True)
+            released, idled = [], []
+            for sid in ids:
+                rel = self.ledger.release(sid)
+                if not rel.already_released:
+                    released.append(sid)
+                idled.extend(rel.idled_deployment_ids)
+            idled = list(dict.fromkeys(idled))
+            evicted: list[str] = []
+            if evict and lease_ids is None:
+                evicted = self.ledger.evict_idle(None)     # every idle deployment
+            elif evict and idled:
+                evicted = self.ledger.evict_idle(idled)
+            rec = self._publish()
+        return ReleaseLeasesOutcome(released, missing, idled, list(evicted), rec)
+
+    def prune(self) -> tuple[int, int]:
+        """Forget released/expired leases and stopped deployments, under the lock.
+
+        Not a desired-state change (none of those are desired), so no marker and
+        no apply. Serialised because an acquire may reuse a STOPPED deployment row.
+        """
+        with self._global_lock():
+            return self.ledger.prune()
 
     def renew(self, lease_id: str, *, ttl_seconds: float | None) -> RenewOutcome:
         """Extend a lease's TTL; publish if that revives an idle deployment.
