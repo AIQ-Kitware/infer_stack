@@ -2,6 +2,35 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Selective apply: ownership labels, fingerprints, GPU barrier (P8)
+
+The Compose backend no longer runs `docker compose up -d --remove-orphans`.
+
+- **Labels.** Every rendered service carries `infer-stack.service` and a
+  behavioural `infer-stack.fingerprint`. The fingerprint covers the canonical
+  stanza, the generated files the service mounts, and the managed `.env` when
+  the stanza interpolates from it.
+- **What an apply does.**
+  - It keeps a managed container whose (service, fingerprint) is wanted, is
+    unique, and is running, restarting or paused. A required paused container
+    is unpaused; an optional one stays paused.
+  - It removes other managed containers, except those of degraded deployments.
+  - It reports containers it does not manage (orphans), and never removes them
+    implicitly.
+  - It starts only missing, non-optional services, with `up -d --no-deps`, level
+    by level in dependency order.
+- **GPU barrier.** Nothing is started on a GPU while another container holds
+  it. A managed occupant is removed first; an unmanaged or degraded one aborts
+  the apply (the change stays pending). So do duplicate containers for a wanted
+  service, and a container still being removed.
+- **Upgrade.** Containers from before the labels are adopted once, when they
+  match infrastructure in the render or a LIVE/resident deployment on the same
+  GPUs. Adoption recreates nothing.
+- **Orphans.** `infer-stack gc --orphans` lists unmanaged project containers
+  and removes exactly those, after confirmation or with `--yes`.
+- **Residency** now lists the whole project, infrastructure included, with each
+  container's service, fingerprint and ownership.
+
 ### Admission fixes (review): approval before commit; unresolved rows are never placed
 
 - **The diff is approved before anything is committed.** The admission preview

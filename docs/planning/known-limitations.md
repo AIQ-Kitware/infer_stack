@@ -186,6 +186,13 @@ either (an image pull, a container create still in flight) is invisible to it.
 The per-state recovery rules for `created`, `removing` and `restarting`
 containers are part of selective apply (plan step P8).
 
+### Without the gateway, model host ports shift with the live set (current)
+
+With `litellm` off, each model publishes a host port assigned by its position in
+the live set. Adding or removing a model renumbers the others' ports, which
+changes their fingerprints, so selective apply recreates them. Behind the
+gateway (the default) upstreams publish no host port, and this does not happen.
+
 ### The Docker target is the local default daemon (design boundary)
 
 infer-stack does not inherit `DOCKER_HOST`, and runs every Docker command with
