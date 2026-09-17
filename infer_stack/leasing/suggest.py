@@ -265,6 +265,10 @@ def suggest_catalog(
     for rank, model in enumerate(fitting):
         models[model.name] = {'source': f'hf://{model.hf_model_id}'}
         endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
+        if model.min_vram_gib_per_replica > 0:
+            endpoint['placement'] = {
+                'min_vram_gib': model.min_vram_gib_per_replica,
+            }
         runtime = derive_runtime(model, gpus)
         if runtime:
             endpoint['runtime'] = runtime
