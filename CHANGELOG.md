@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Planner admission mode (keywords only; no caller uses it yet)
+
+`plan_placement` accepts `required_ids`, `hard` and `optional_hints`. Committed
+allocations are validated against the whole physical pool; an invalid one is
+reported in `degraded` and never re-placed. Required deployments are placed
+next. Optional idle residents keep their GPUs only if still free, and are
+otherwise reported in `displaced`; they are never newly placed. Without the
+keywords, plans are unchanged. This is step P3 of the admission plan.
+
 ### Renders use a published profile; `infer-stack config publish`
 
 Lease operations no longer render from each caller's flags and settings.
