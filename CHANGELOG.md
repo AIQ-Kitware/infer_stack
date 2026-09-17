@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### TUI GPU pinning and Qwen3-8B suggestions
+
+- **Endpoint GPU affinity is directly editable in the TUI.** vLLM endpoints
+  can opt into an exact `placement.gpu_indices` override, while `auto` keeps
+  the existing VRAM-aware scheduler. Pins are validated against tp×pp×dp,
+  shown in the endpoint table, and kept distinct in deployment compatibility.
+- **`suggest from my GPUs` includes `Qwen/Qwen3-8B`.** The curated entry uses
+  the Hugging Face model's 8.2B / ~16.38-GB weight metadata, a conservative
+  24-GiB serving floor, and the native 32K context profile.
+
 ### Publication side effects, `.env` races, raw controls (review)
 
 - **`config publish` previews purely.** On Compose it now previews the

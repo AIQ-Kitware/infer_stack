@@ -41,6 +41,8 @@ Schema (all sections optional except as referenced)::
         # guided OOM error; the weight-bytes floor (Phase 3) clamps unsound
         # guesses.
         #   placement: {min_vram_gib: 24}
+        # Optional exact local override (normally set from the TUI):
+        #   placement: {gpu_indices: [1]}
       qwen-small:
         engine: ollama
         host: local-ollama
@@ -129,8 +131,9 @@ class EndpointSpec:
     # /chat/completions, 'completions' hits /completions. A completions-only
     # model never answers a chat probe, so this must match how it is served.
     protocol: str = 'chat'
-    # Placement eligibility constraints (vllm only; validated in errors()).
-    # Today: {'min_vram_gib': float} — see docs/planning/vram-aware-placement.md.
+    # Placement constraints / operator overrides (vllm only; validated in
+    # errors()). ``min_vram_gib`` is the portable eligibility declaration;
+    # ``gpu_indices`` is an optional exact local pin from the TUI/CLI.
     placement: dict[str, Any] = field(default_factory=dict)
 
 
@@ -167,7 +170,7 @@ def _parse_protocol(value: Any) -> str:
 #: Keys the endpoint-level ``placement`` block accepts. Deliberately strict —
 #: an unknown key is a typo (min_vram_gb) that would otherwise silently mean
 #: "no constraint", which on a heterogeneous host means an OOM later.
-PLACEMENT_KEYS = frozenset({'min_vram_gib'})
+PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices'})
 
 
 def _placement_errors(ep: EndpointSpec) -> list[str]:
@@ -196,6 +199,44 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
                 f"endpoint '{ep.name}': placement.min_vram_gib must be a "
                 f"positive number of GiB, got {value!r}"
             )
+    indices = ep.placement.get('gpu_indices')
+    if indices is not None:
+        if not isinstance(indices, list) or not indices:
+            errors.append(
+                f"endpoint '{ep.name}': placement.gpu_indices must be a "
+                "non-empty list of GPU indices (omit it for auto placement)"
+            )
+        elif any(
+            not isinstance(i, int) or isinstance(i, bool) or i < 0
+            for i in indices
+        ):
+            errors.append(
+                f"endpoint '{ep.name}': placement.gpu_indices must contain "
+                f"only non-negative integers, got {indices!r}"
+            )
+        elif len(indices) != len(set(indices)):
+            errors.append(
+                f"endpoint '{ep.name}': placement.gpu_indices contains "
+                f"duplicates: {indices!r}"
+            )
+        else:
+            rt = ep.runtime
+            try:
+                sizes = [
+                    int(rt.get('tensor_parallel_size', 1) or 1),
+                    int(rt.get('pipeline_parallel_size', 1) or 1),
+                    int(rt.get('data_parallel_size', 1) or 1),
+                ]
+            except (TypeError, ValueError):
+                sizes = []
+            if sizes and all(n > 0 for n in sizes):
+                required = sizes[0] * sizes[1] * sizes[2]
+                if len(indices) != required:
+                    errors.append(
+                        f"endpoint '{ep.name}': placement.gpu_indices has "
+                        f"{len(indices)} GPU(s), but its tp*pp*dp runtime "
+                        f"requires exactly {required}"
+                    )
     return errors
 
 
@@ -423,6 +464,7 @@ class Catalog:
         model = self.models[ep.model]
         rt = ep.runtime
         served_name = ep.served_name or ep.name
+        gpu_indices = ep.placement.get('gpu_indices')
         structural = vllm_structural(
             model_ref=model.source,
             revision=model.revision,
@@ -437,6 +479,7 @@ class Catalog:
             lora_adapters=rt.get('lora_adapters'),
             attention_backend=rt.get('attention_backend'),
             served_name=served_name,
+            gpu_indices=gpu_indices,
         )
         capacity: dict[str, Any] = {}
         if rt.get('max_model_len') is not None:
@@ -456,11 +499,10 @@ class Catalog:
             'reclaim': ep.reclaim,
         }
         if ep.placement:
-            # Placement eligibility (min_vram_gib) rides the spec, NOT the
-            # structural compat key: it describes where the deployment may
-            # land, not what process it is. Same-model endpoints should
-            # declare the same number (the first request's spec wins on
-            # coalesce). Only set when non-empty so existing catalogs keep
+            # Portable eligibility (min_vram_gib) is not deployment identity,
+            # but an explicit gpu_indices override is (threaded into the
+            # structural key above). Both ride the spec so the placer can
+            # enforce them. Only set when non-empty so existing catalogs keep
             # byte-identical specs.
             spec['placement'] = dict(ep.placement)
         served = {

@@ -61,7 +61,7 @@ from .cli.commands_leasing import (
     _placement_view,
     _running_label,
 )
-from .leasing import LeaseState
+from .leasing import DeploymentState, LeaseState
 from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
@@ -389,6 +389,9 @@ class _AddEndpointScreen(ModalScreen):
         result: dict[str, Any] = {
             'name': self._edit_name or name or None,
             'model': model, 'engine': engine, 'reclaim': reclaim,
+            # Placement has a dedicated editor (GPU pin) and may also carry
+            # min_vram_gib.  Preserve it across an unrelated endpoint edit.
+            'placement': dict(self._entry.get('placement') or {}),
         }
         try:
             if engine == 'vllm':
@@ -415,6 +418,138 @@ class _AddEndpointScreen(ModalScreen):
 
     def _v(self, wid: str) -> str:
         return self.query_one(f'#{wid}', Input).value
+
+
+class _GpuPinScreen(ModalScreen):
+    """Set an endpoint's exact local GPU affinity, or return it to auto."""
+
+    CSS = """
+    _GpuPinScreen { align: center middle; }
+    #dialog {
+        width: 72; height: auto; max-height: 90%; padding: 1 2;
+        border: round $accent; background: $surface;
+    }
+    #dialog .hint { color: $text-muted; margin: 0 0 1 0; }
+    #dialog Select, #dialog Input { margin: 0 0 1 0; }
+    #pin-error { color: $error; height: auto; }
+    #pin-buttons { height: auto; align-horizontal: right; margin: 1 0 0 0; }
+    #pin-buttons Button { margin: 0 0 0 2; }
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        required_gpu_count: int,
+        inventory: dict[str, Any],
+        current: list[int] | None,
+    ) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+        self._required = max(1, int(required_gpu_count))
+        self._gpus = sorted(
+            inventory.get('gpus', []), key=lambda g: int(g.get('index', 0))
+        )
+        self._current = list(current or [])
+
+    @staticmethod
+    def _gpu_label(gpu: dict[str, Any]) -> str:
+        idx = int(gpu.get('index', 0))
+        name = str(gpu.get('name') or 'GPU')
+        mem = gpu.get('memory_gib')
+        mem_label = f' · {float(mem):g} GiB' if mem is not None else ''
+        display = ' · display active' if gpu.get('display_active') else ''
+        return f'GPU {idx} · {name}{mem_label}{display}'
+
+    def compose(self) -> ComposeResult:
+        plural = '' if self._required == 1 else 's'
+        with Vertical(id='dialog'):
+            yield Label(f'GPU pin · {self._endpoint}', classes='title')
+            yield Static(
+                f'This endpoint requires {self._required} GPU{plural}. '
+                'Auto keeps normal VRAM-aware placement; a pin is an exact '
+                'local operator override.',
+                classes='hint',
+            )
+            if self._required == 1 and self._gpus:
+                options = [('Auto — let infer-stack choose', 'auto')]
+                options.extend((self._gpu_label(g), str(g['index'])) for g in self._gpus)
+                detected = {int(g['index']) for g in self._gpus}
+                if self._current and self._current[0] not in detected:
+                    idx = self._current[0]
+                    options.append((f'GPU {idx} · not currently detected', str(idx)))
+                value = str(self._current[0]) if self._current else 'auto'
+                yield Select(
+                    options, value=value, allow_blank=False, id='pin-one-gpu'
+                )
+            else:
+                if self._gpus:
+                    yield Static(
+                        '\n'.join(self._gpu_label(g) for g in self._gpus),
+                        classes='hint',
+                    )
+                value = ','.join(str(i) for i in self._current)
+                yield Input(
+                    value=value,
+                    placeholder=(
+                        f'comma-separated {self._required} indices, or auto'
+                    ),
+                    id='pin-many-gpu',
+                )
+            yield Static('', id='pin-error')
+            with Horizontal(id='pin-buttons'):
+                yield Button('Cancel', id='cancel')
+                yield Button('Save GPU pin', variant='primary', id='ok')
+
+    def _indices(self) -> list[int] | None:
+        if self._required == 1 and self._gpus:
+            raw = self.query_one('#pin-one-gpu', Select).value
+            if _select_is_blank(raw) or str(raw) == 'auto':
+                return None
+            return [int(str(raw))]
+        raw = self.query_one('#pin-many-gpu', Input).value.strip().lower()
+        if not raw or raw == 'auto':
+            return None
+        parts = raw.replace(',', ' ').split()
+        return [int(p) for p in parts]
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == 'cancel':
+            self.dismiss(None)
+            return
+        try:
+            indices = self._indices()
+        except ValueError:
+            self.query_one('#pin-error', Static).update(
+                'GPU indices must be non-negative integers.'
+            )
+            return
+        if indices is not None:
+            if any(i < 0 for i in indices):
+                self.query_one('#pin-error', Static).update(
+                    'GPU indices must be non-negative integers.'
+                )
+                return
+            if len(indices) != self._required:
+                self.query_one('#pin-error', Static).update(
+                    f'Choose exactly {self._required} GPU(s) for this runtime.'
+                )
+                return
+            if len(set(indices)) != len(indices):
+                self.query_one('#pin-error', Static).update(
+                    'Choose each GPU at most once.'
+                )
+                return
+            detected = {int(g['index']) for g in self._gpus}
+            # When inventory is available, catch typos before writing config.
+            # With no nvidia-smi result, numeric entry remains possible so a
+            # remote/containerized deployment can still be configured.
+            missing = [i for i in indices if detected and i not in detected]
+            if missing and indices != self._current:
+                self.query_one('#pin-error', Static).update(
+                    f'GPU(s) not detected on this host: {missing}'
+                )
+                return
+        self.dismiss({'gpu_indices': indices})
 
 
 class _ConfirmScreen(ModalScreen):
@@ -564,6 +699,7 @@ class InferStackTUI(App):
         Binding('g', 'suggest', 'Suggest', show=False),
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
+        Binding('p', 'pin_gpu', 'GPU pin', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
         Binding('c', 'toggle_docker', 'Toggle docker', show=False),
@@ -689,6 +825,7 @@ class InferStackTUI(App):
                     yield Button('Acquire', id='btn-acquire', variant='primary')
                     yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
+                    yield Button('GPU pin', id='btn-pin-gpu')
                     yield Button('Remove', id='btn-remove-endpoint')
                 with Horizontal(id='suggest-actions'):
                     yield Button('✨  Suggest from my GPUs', id='btn-suggest')
@@ -868,7 +1005,7 @@ class InferStackTUI(App):
         for sel, title in titles.items():
             self.query_one(sel).border_title = title
         self.query_one('#endpoints', DataTable).add_columns(
-            'endpoint', 'model', 'engine', 'reclaim'
+            'endpoint', 'model', 'engine', 'gpu', 'reclaim'
         )
         self.query_one('#models', DataTable).add_columns(
             'model', 'source', 'quant', 'cached'
@@ -1015,9 +1152,12 @@ class InferStackTUI(App):
         self._endpoint_names = []
         for name in sorted(self.catalog.endpoints):
             ep = self.catalog.endpoints[name]
+            indices = (getattr(ep, 'placement', {}) or {}).get('gpu_indices')
+            gpu = ','.join(str(i) for i in indices) if indices else 'auto'
             eps.add_row(
                 name, getattr(ep, 'model', '') or '-',
                 getattr(ep, 'engine', '') or '-',
+                gpu,
                 str(getattr(ep, 'reclaim', '') or '-'),
             )
             self._endpoint_names.append(name)
@@ -1865,6 +2005,7 @@ class InferStackTUI(App):
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
             'btn-edit-endpoint': self.action_edit_endpoint,
+            'btn-pin-gpu': self.action_pin_gpu,
             'btn-remove-endpoint': self.action_remove_endpoint,
             'btn-remove-model': self.action_remove_model,
             'btn-api-send': self.action_api_send,
@@ -2139,6 +2280,8 @@ class InferStackTUI(App):
             entry['runtime'] = runtime
         if result.get('reclaim'):
             entry['reclaim'] = {'policy': result['reclaim']}
+        if result.get('placement'):
+            entry['placement'] = dict(result['placement'])
         return entry
 
     def _on_add_endpoint(self, result: dict | None) -> None:
@@ -2162,6 +2305,111 @@ class InferStackTUI(App):
             self._status(f'save endpoint failed: {ex}')
             return
         self._reload_catalog()
+
+    def action_pin_gpu(self) -> None:
+        """Open the exact-GPU override editor for the selected vLLM endpoint."""
+        name = self._selected('endpoints', self._endpoint_names)
+        if not name:
+            self._status('select an endpoint to pin to a GPU')
+            return
+        if not self.catalog_path:
+            self._status('no catalog path — launch the TUI with a catalog to edit')
+            return
+        ep = self.catalog.endpoints.get(name)
+        if ep is None:
+            self._status(f'endpoint {name} is no longer in the catalog')
+            return
+        if getattr(ep, 'engine', '') != 'vllm':
+            self._status(
+                'Ollama GPU affinity belongs to its runtime host; edit the host '
+                'placement instead'
+            )
+            return
+        if name in self._served_endpoints():
+            self._status(f'{name} is actively served — release it before repinning')
+            return
+        self._status(f'inspecting GPUs for {name}…')
+        self._prepare_gpu_pin(name)
+
+    @work(thread=True, exclusive=True, group='gpu-pin')
+    def _prepare_gpu_pin(self, name: str) -> None:
+        try:
+            from .hardware import detect_inventory
+            inventory = detect_inventory()
+        except Exception:  # noqa: BLE001 - numeric fallback remains usable
+            inventory = {'gpu_count': 0, 'gpus': []}
+        self.call_from_thread(self._show_gpu_pin, name, inventory)
+
+    def _show_gpu_pin(self, name: str, inventory: dict[str, Any]) -> None:
+        ep = self.catalog.endpoints.get(name)
+        if ep is None:
+            self._status(f'endpoint {name} is no longer in the catalog')
+            return
+        rt = getattr(ep, 'runtime', {}) or {}
+        required = 1
+        for key in (
+            'tensor_parallel_size', 'pipeline_parallel_size', 'data_parallel_size'
+        ):
+            required *= max(1, int(rt.get(key, 1) or 1))
+        current = (getattr(ep, 'placement', {}) or {}).get('gpu_indices')
+        self.push_screen(
+            _GpuPinScreen(name, required, inventory, current),
+            lambda result: self._on_pin_gpu(name, result),
+        )
+
+    def _on_pin_gpu(self, name: str, result: dict | None) -> None:
+        if result is None:
+            self._status('GPU pin unchanged')
+            return
+        if name in self._served_endpoints():
+            self._status(f'{name} became active — release it before repinning')
+            return
+        self._status(f'updating GPU pin for {name}…')
+        self._apply_gpu_pin(name, result.get('gpu_indices'))
+
+    @work(thread=True, exclusive=True, group='mutate')
+    def _apply_gpu_pin(self, name: str, indices: list[int] | None) -> None:
+        try:
+            from .cli.commands_catalog import _load_raw, _save_raw
+
+            data = _load_raw(self.catalog_path)
+            entry = data['endpoints'].get(name)
+            if entry is None:
+                self._after_mutation(f'endpoint {name} is no longer in the catalog')
+                return
+            placement = dict(entry.get('placement') or {})
+            old = placement.get('gpu_indices')
+            new = list(indices) if indices else None
+            if old == new:
+                self._after_mutation('GPU pin unchanged')
+                return
+
+            # Capture resident stale deployments before the compat key changes.
+            _, deployments = self.controller.ledger.status(virtual_expiry=True)
+            stale = [
+                g.id for g in deployments
+                if g.state == DeploymentState.IDLE and name in g.served
+            ]
+
+            if new is None:
+                placement.pop('gpu_indices', None)
+            else:
+                placement['gpu_indices'] = new
+            if placement:
+                entry['placement'] = placement
+            else:
+                entry.pop('placement', None)
+            _save_raw(self.catalog_path, data)
+
+            evicted = 0
+            if stale:
+                evicted = len(self.controller.evict(stale).evicted_deployment_ids)
+            self.call_from_thread(self._reload_catalog)
+            label = 'auto' if new is None else ','.join(str(i) for i in new)
+            tail = f'; evicted {evicted} stale idle deployment(s)' if evicted else ''
+            self._after_mutation(f'{name} GPU pin → {label}{tail}')
+        except Exception as ex:  # noqa: BLE001
+            self._after_mutation(f'GPU pin update failed: {ex}')
 
     def action_remove_endpoint(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)

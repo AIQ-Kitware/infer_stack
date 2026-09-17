@@ -19,11 +19,16 @@ def _gpu(index, mem, name='GPU', display=False):
 def test_builtin_pool_is_nonempty_and_real():
     pool = builtin_pool()
     assert pool, 'the shipped suggestion pool should not be empty'
-    # the current-generation families (real, released 2026) are carried over
+    # the shipped Qwen/Gemma families are represented in the curated pool
     families = {m.family for m in pool.values()}
-    assert {'qwen3.5', 'qwen3.6', 'gemma4'} <= families
+    assert {'qwen3', 'qwen3.5', 'qwen3.6', 'gemma4'} <= families
     # ...with the real Hugging Face ids, not slugs
     assert pool['qwen3.5-9b'].hf_model_id == 'Qwen/Qwen3.5-9B'
+    qwen3 = pool['qwen3-8b']
+    assert qwen3.hf_model_id == 'Qwen/Qwen3-8B'
+    assert qwen3.memory_class_gib == 16
+    assert qwen3.min_vram_gib_per_replica == 24
+    assert qwen3.context_window == 32768
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
@@ -48,7 +53,7 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     # should be suggested; the ones needing a bigger/second GPU should not.
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
     models = suggest_catalog(inv)['models']
-    fits = {'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
+    fits = {'qwen3-8b', 'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
             'qwen3.6-35b-a3b-fp8', 'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b',
             'gemma4-31b'}
     too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
@@ -77,8 +82,17 @@ def test_suggested_catalog_roundtrips_through_catalog():
 def test_fit_filter_tracks_gpu_size():
     one_small = suggest_catalog(simulate_inventory('1x16'))['models']
     assert 'qwen2.5-7b' in one_small        # 16 GiB model fits a 16 GiB GPU
+    assert 'qwen3-8b' not in one_small      # 24 GiB serving floor
     assert 'gpt-oss-20b' not in one_small    # 40 GiB model does not
     assert 'qwen2.5-72b' not in one_small    # needs two GPUs
+
+
+def test_qwen3_8b_suggestion_uses_huggingface_model_id():
+    out = suggest_catalog(simulate_inventory('1x24'))
+    assert out['models']['qwen3-8b']['source'] == 'hf://Qwen/Qwen3-8B'
+    ep = out['endpoints']['qwen3-8b']
+    assert ep['placement']['min_vram_gib'] == 24
+    assert ep['runtime']['max_model_len'] == 32768
 
 
 def test_derive_runtime_clamps_len_and_sizes_utilization():

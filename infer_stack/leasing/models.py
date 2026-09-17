@@ -97,6 +97,9 @@ VLLM_STRUCTURAL_FIELDS = (
     'trust_remote_code',
     'lora_adapters',
     'served_name',
+    # Optional: present only for an operator-pinned endpoint. Keeping it absent
+    # for auto placement preserves the compatibility key of existing catalogs.
+    'gpu_indices',
 )
 
 # For Ollama the coalescing unit is the *daemon*, so the structural identity is
@@ -166,9 +169,10 @@ def vllm_structural(
     lora_adapters: list[str] | None = None,
     attention_backend: str | None = None,
     served_name: str | None = None,
+    gpu_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     """Build the structural dict for a vLLM endpoint (one process per model)."""
-    return {
+    structural = {
         'engine': 'vllm',
         'model_ref': model_ref,
         'revision': revision,
@@ -187,6 +191,13 @@ def vllm_structural(
         'attention_backend': attention_backend,
         'served_name': served_name or model_ref,
     }
+    if gpu_indices:
+        # An explicit pin is part of deployment identity: changing auto -> GPU 1
+        # must not revive an idle deployment that is still resident on GPU 0.
+        # Do not emit an empty key for auto placement; old compatibility hashes
+        # stay stable for every catalog that does not opt into pinning.
+        structural['gpu_indices'] = [int(i) for i in gpu_indices]
+    return structural
 
 
 def ollama_structural(

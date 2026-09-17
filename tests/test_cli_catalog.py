@@ -50,6 +50,26 @@ def test_add_model_endpoint_roundtrips_and_validates(tmp_path):
     assert ep.reclaim == 'keep-warm'
 
 
+def test_endpoint_add_exact_gpu_pin_merges_with_vram_placement(tmp_path):
+    ModelAddCLI.main(argv=['m', '--source', 'hf://org/M', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=[
+        'chat', '--model', 'm', '--tensor-parallel', '2',
+        '--min-vram-gib', '24', '--gpu', '0', '2', *_opts(tmp_path),
+    ])
+    ep = Catalog.load(cat_path(tmp_path)).endpoints['chat']
+    assert ep.placement == {'min_vram_gib': 24.0, 'gpu_indices': [0, 2]}
+
+
+def test_endpoint_add_rejects_wrong_gpu_pin_count(tmp_path):
+    ModelAddCLI.main(argv=['m', '--source', 'hf://org/M', *_opts(tmp_path)])
+    with pytest.raises(SystemExit) as exc:
+        EndpointAddCLI.main(argv=[
+            'chat', '--model', 'm', '--tensor-parallel', '2',
+            '--gpu', '0', *_opts(tmp_path),
+        ])
+    assert 'requires exactly 2' in str(exc.value)
+
+
 def test_endpoint_name_defaults_to_model(tmp_path):
     # No NAME given -> the endpoint alias defaults to `{model}-1`, so the served
     # alias / Open WebUI label is tied to the model.

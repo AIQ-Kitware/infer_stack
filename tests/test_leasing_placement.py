@@ -9,8 +9,8 @@ from infer_stack.leasing import plan_placement
 from infer_stack.leasing.models import Deployment, DeploymentState
 
 
-def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None, vram=None, floor=None,
-         t=0.0):
+def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None,
+         placement_gpu_indices=None, vram=None, floor=None, t=0.0):
     runtime = {'tensor_parallel_size': tp,
                'pipeline_parallel_size': pp,
                'data_parallel_size': dp}
@@ -22,6 +22,8 @@ def vllm(gid, *, tp=1, pp=1, dp=1, gpu_indices=None, vram=None, floor=None,
         placement['min_vram_gib'] = vram
     if floor is not None:
         placement['floor_vram_gib'] = floor
+    if placement_gpu_indices is not None:
+        placement['gpu_indices'] = placement_gpu_indices
     if placement:
         spec['placement'] = placement
     return Deployment(
@@ -317,10 +319,15 @@ def test_explicit_indices_win_over_declaration_with_warning():
     # An operator's explicit gpu_indices is an override, not a bug — honored,
     # but warned about when it contradicts the declared requirement.
     plan = plan_placement(
-        [vllm('a', gpu_indices=[1], vram=24)], inv('48,16')
+        [vllm('a', placement_gpu_indices=[1], vram=24)], inv('48,16')
     )
     assert plan.assignments == {'a': [1]}
     assert any('a' in w and '24' in w for w in plan.warnings)
+
+
+def test_legacy_runtime_gpu_indices_remain_supported():
+    plan = plan_placement([vllm('a', gpu_indices=[2])], inv('4x80'))
+    assert plan.assignments == {'a': [2]}
 
 
 def test_best_fit_ties_break_by_index():

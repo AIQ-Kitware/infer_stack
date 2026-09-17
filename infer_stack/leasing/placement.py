@@ -161,12 +161,17 @@ def weight_shard_count(deployment: Deployment) -> int:
 def explicit_indices(deployment: Deployment) -> list[int] | None:
     """Indices a deployment pins explicitly, or ``None`` if it wants first-fit.
 
-    Ollama daemons always pin (possibly to ``[]`` for CPU); a vLLM deployment pins
-    only if its runtime carries ``gpu_indices``.
+    Ollama daemons always pin (possibly to ``[]`` for CPU).  vLLM endpoints use
+    ``placement.gpu_indices`` for the supported operator-facing exact pin.  The
+    older ``runtime.gpu_indices`` spelling remains a read-only compatibility
+    fallback for catalogs written before endpoint placement owned this knob.
     """
     spec = deployment.spec
     if spec.get('engine') == OLLAMA:
         return [int(i) for i in (spec.get('gpu_indices') or [])]
+    placement = spec.get('placement', {}) or {}
+    if placement.get('gpu_indices'):
+        return [int(i) for i in placement['gpu_indices']]
     runtime = spec.get('runtime', {}) or {}
     if runtime.get('gpu_indices'):
         return [int(i) for i in runtime['gpu_indices']]

@@ -288,6 +288,7 @@ def test_tui_endpoint_action_buttons_fit_the_sidebar():
             await pilot.pause()
             sb = app.query_one('#sidebar').region
             for bid in ('#btn-acquire', '#btn-add-endpoint', '#btn-edit-endpoint',
+                        '#btn-pin-gpu',
                         '#btn-remove-endpoint'):
                 r = app.query_one(bid).region
                 assert r.width > 0 and r.x >= sb.x and \
@@ -599,6 +600,12 @@ def test_tui_endpoint_entry_data_parallel_and_ollama():
     assert v['runtime']['enable_prefix_caching'] is True
     assert v['runtime']['max_num_seqs'] == 64
 
+    pinned = InferStackTUI._endpoint_entry({
+        'model': 'm', 'engine': 'vllm',
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [1]},
+    })
+    assert pinned['placement'] == {'min_vram_gib': 24, 'gpu_indices': [1]}
+
     o = InferStackTUI._endpoint_entry({
         'model': 'qwen', 'engine': 'ollama', 'host': 'oll',
         'ollama_runtime': 'num_ctx=8192 keep_alive=5m',
@@ -688,6 +695,83 @@ def test_tui_edit_blocked_while_served(tmp_path):
             app.action_edit_endpoint()
             await pilot.pause()
             assert 'served' in str(app.query_one('#status').render())
+
+    _run(scenario)
+
+
+def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
+    import yaml
+    from textual.widgets import DataTable, Select
+
+    from infer_stack.tui import InferStackTUI, _GpuPinScreen
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    old = controller.acquire('me', catalog.resolve_names(['qwen-coder']))
+    old_gid = old.lease.deployment_ids[0]
+    controller.release(old.lease.id)  # leave a keep-warm idle deployment behind
+    inventory = {
+        'gpu_count': 2,
+        'gpus': [
+            {'index': 0, 'name': 'Big GPU', 'memory_gib': 48,
+             'display_active': False},
+            {'index': 1, 'name': 'Small GPU', 'memory_gib': 24,
+             'display_active': False},
+        ],
+    }
+
+    async def scenario():
+        app = InferStackTUI(
+            controller, catalog, interval=999, proc_factory=lambda svc: None,
+            catalog_path=str(catalog_path),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._show_gpu_pin('qwen-coder', inventory)
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, _GpuPinScreen)
+            screen.query_one('#pin-one-gpu', Select).value = '1'
+            await pilot.click('#ok')
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            ep = app.catalog.endpoints['qwen-coder']
+            assert ep.placement['gpu_indices'] == [1]
+            assert controller.ledger.get_deployment(old_gid).state == 'stopped'
+            table = app.query_one('#endpoints', DataTable)
+            columns = [str(c.label) for c in table.columns.values()]
+            assert 'gpu' in columns
+
+    _run(scenario)
+    on_disk = yaml.safe_load(catalog_path.read_text())
+    assert on_disk['endpoints']['qwen-coder']['placement']['gpu_indices'] == [1]
+
+
+def test_tui_gpu_pin_blocked_while_served(tmp_path):
+    import yaml
+    from textual.widgets import DataTable
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    controller.acquire('me', catalog.resolve_names(['qwen-coder']))
+
+    async def scenario():
+        app = InferStackTUI(
+            controller, catalog, interval=999, proc_factory=lambda svc: None,
+            catalog_path=str(catalog_path),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one('#endpoints', DataTable).move_cursor(row=0)
+            app.action_pin_gpu()
+            await pilot.pause()
+            assert 'release it before repinning' in str(
+                app.query_one('#status').render()
+            )
 
     _run(scenario)
 
