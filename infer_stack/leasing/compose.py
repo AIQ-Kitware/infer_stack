@@ -1331,7 +1331,35 @@ def _docker_timeout(args: list[str]) -> float:
     return DOCKER_TIMEOUT_QUERY
 
 
-def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str:
+#: Caller environment variables Docker commands may inherit. Everything else,
+#: notably ``HF_TOKEN``, ``DOCKER_HOST`` and ``DOCKER_CONTEXT``, is dropped: a
+#: variable exported in one caller's shell must not change what Compose
+#: interpolates (``${HF_TOKEN:-}`` would otherwise override the managed
+#: ``.env``) or which daemon a recovery talks to.
+DOCKER_ENV_ALLOWLIST = (
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR',
+    'XDG_RUNTIME_DIR', 'TERM',
+)
+
+
+def docker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The explicit process environment for every Docker command infer-stack runs.
+
+    Example:
+        >>> env = docker_environment({'PATH': '/bin', 'HF_TOKEN': 'x', 'DOCKER_HOST': 'tcp://y'})
+        >>> env
+        {'PATH': '/bin'}
+    """
+    import os
+
+    source = os.environ if environ is None else environ
+    return {k: source[k] for k in DOCKER_ENV_ALLOWLIST if k in source}
+
+
+def _default_docker_run(
+    args: list[str], *, timeout: float | None = None,
+    stderr_lines: Callable[[str], None] | None = None,
+) -> str:
     """Run a docker command and return stdout, bounded in wall-clock time.
 
     Same contract as ``subprocess.check_output(args, text=True)`` -- stdout is
@@ -1349,6 +1377,8 @@ def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str
     bound = _docker_timeout(args) if timeout is None else timeout
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, text=True, start_new_session=True,
+        env=docker_environment(),
+        stderr=subprocess.PIPE if stderr_lines is not None else None,
     )
     def kill_group():
         try:
@@ -1358,7 +1388,7 @@ def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str
         proc.communicate()
 
     try:
-        out, _ = proc.communicate(timeout=bound)
+        out, err = proc.communicate(timeout=bound)
     except subprocess.TimeoutExpired:
         kill_group()
         raise BackendTimeout(
@@ -1370,8 +1400,12 @@ def _default_docker_run(args: list[str], *, timeout: float | None = None) -> str
         # session, so without this it would keep running unattended.
         kill_group()
         raise
+    if stderr_lines is not None:
+        for line in (err or '').splitlines():
+            if line.strip():
+                stderr_lines(line.rstrip())
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, args, output=out)
+        raise subprocess.CalledProcessError(proc.returncode, args, output=out, stderr=err)
     return out
 
 

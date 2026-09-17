@@ -165,6 +165,14 @@ either (an image pull, a container create still in flight) is invisible to it.
 The per-state recovery rules for `created`, `removing` and `restarting`
 containers are part of selective apply (plan step P8).
 
+### The Docker target is the local default daemon (design boundary)
+
+infer-stack does not inherit `DOCKER_HOST` or `DOCKER_CONTEXT` from the caller,
+so every operation and every recovery talks to the same daemon. A Docker
+context selected in `~/.docker/config.json` still applies. Driving a remote or
+non-default daemon would need the target recorded in the published profile,
+and is out of scope.
+
 ### Known fault: a failed acquire can leave a leaseless warm candidate (current)
 
 When an acquire fails and rolls back, a deployment it created is evicted only if

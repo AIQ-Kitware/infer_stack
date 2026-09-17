@@ -26,6 +26,12 @@ from .options import _PathOverridesMixin
 # ---------------------------------------------------------------------------
 
 
+def _docker_env() -> dict[str, str]:
+    from ..leasing.compose import docker_environment
+
+    return docker_environment()
+
+
 def _leasing_compose_file() -> Path:
     from ..leasing.compose import COMPOSE_FILENAME
 
@@ -56,9 +62,13 @@ def _day2_compose_base(config, command: str) -> list[str]:
             f'Bring a model up first, e.g. `infer-stack acquire <endpoint>`.'
             f'{hint}'
         )
-    return [
-        'docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file)
-    ]
+    base = ['docker', 'compose']
+    # The same managed .env the backend passes, so `stack up` interpolates the
+    # master key, DB password and HF_TOKEN from it (never the caller's shell).
+    env_file = compose_file.parent / '.env'
+    if env_file.exists():
+        base += ['--env-file', str(env_file)]
+    return [*base, '-p', LEASING_PROJECT, '-f', str(compose_file)]
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +147,7 @@ def _running_services() -> set[str] | None:
         proc = subprocess.run(
             ['docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file),
              'ps', '--services', '--filter', 'status=running'],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, env=_docker_env(),
         )
     except Exception:  # noqa: BLE001 - status must never fail on this
         return None
@@ -399,6 +409,7 @@ def _run_compacted_follow(cmd: list[str]) -> int:
         text=True,
         errors='replace',
         bufsize=1,
+        env=_docker_env(),
     )
     try:
         if proc.stdout is None:  # pragma: no cover - PIPE guarantees stdout
@@ -468,7 +479,7 @@ class LogsCLI(_ComposeWrapperBase):
         # added; ``--raw`` is also available for interactive LiteLLM debugging.
         if compact:
             return _run_compacted_follow(cmd)
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class PsCLI(_ComposeWrapperBase):
@@ -498,7 +509,7 @@ class PsCLI(_ComposeWrapperBase):
         if config.quiet:
             cmd.append('--quiet')
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class RestartCLI(_ComposeWrapperBase):
@@ -513,7 +524,7 @@ class RestartCLI(_ComposeWrapperBase):
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class PullCLI(_ComposeWrapperBase):
@@ -531,7 +542,7 @@ class PullCLI(_ComposeWrapperBase):
         if config.ignore_pull_failures:
             cmd.append('--ignore-pull-failures')
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StartCLI(_ComposeWrapperBase):
@@ -542,7 +553,7 @@ class StartCLI(_ComposeWrapperBase):
         config = cls.cli(argv=argv, data=kwargs)
         cmd = _day2_compose_base(config, 'start') + ['start']
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StopCLI(_ComposeWrapperBase):
@@ -557,7 +568,7 @@ class StopCLI(_ComposeWrapperBase):
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StackDownCLI(_ComposeWrapperBase):
@@ -577,7 +588,7 @@ class StackDownCLI(_ComposeWrapperBase):
         cmd = _day2_compose_base(config, 'down') + ['down', '--remove-orphans']
         if config.volumes:
             cmd.append('--volumes')
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StackUpCLI(_ComposeWrapperBase):
@@ -594,7 +605,7 @@ class StackUpCLI(_ComposeWrapperBase):
         config = cls.cli(argv=argv, data=kwargs)
         cmd = _day2_compose_base(config, 'up') + ['up', '-d', '--remove-orphans']
         cmd.extend(config.services or [])
-        return int(subprocess.run(cmd).returncode)
+        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StackModalCLI(scfg.ModalCLI):

@@ -1654,3 +1654,27 @@ def test_default_docker_run_kills_the_process_group_when_interrupted(tmp_path):
         _time.sleep(0.05)
     else:
         pytest.fail(f'child {child} of the interrupted command is still alive')
+
+
+def test_docker_commands_do_not_inherit_hf_token_or_docker_target(monkeypatch):
+    # ${HF_TOKEN:-} must resolve from the managed .env only, and a caller's
+    # DOCKER_HOST/DOCKER_CONTEXT must not redirect a recovery to another daemon.
+    from infer_stack.leasing.compose import _default_docker_run
+
+    monkeypatch.setenv('HF_TOKEN', 'hf_from_shell')
+    monkeypatch.setenv('DOCKER_HOST', 'tcp://elsewhere:2375')
+    monkeypatch.setenv('DOCKER_CONTEXT', 'other')
+    out = _default_docker_run(
+        ['sh', '-c', 'echo ${HF_TOKEN:-none} ${DOCKER_HOST:-none} ${DOCKER_CONTEXT:-none} ${PATH:+path}'],
+        timeout=10,
+    )
+    assert out.split() == ['none', 'none', 'none', 'path']
+
+
+def test_default_docker_run_can_redirect_stderr_lines():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    seen = []
+    out = _default_docker_run(['sh', '-c', 'echo out; echo err1 >&2; echo err2 >&2'],
+                              timeout=10, stderr_lines=seen.append)
+    assert out.strip() == 'out' and seen == ['err1', 'err2']

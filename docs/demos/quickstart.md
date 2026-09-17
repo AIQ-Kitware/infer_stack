@@ -42,10 +42,11 @@ After setup, all state and generated artifacts live under
 
 - Docker with the NVIDIA container runtime (`nvidia-smi` visible inside containers).
 - `infer-stack` installed in your Python environment.
-- A Hugging Face token in your shell for gated models:
+- A Hugging Face token for gated models, stored in the managed `.env`.
+  Compose never reads `HF_TOKEN` from your shell:
 
 ```bash
-export HF_TOKEN=hf_...
+infer-stack env HF_TOKEN=hf_...
 ```
 
 The first profile in this guide, `gpt2-single`, is public and does not need

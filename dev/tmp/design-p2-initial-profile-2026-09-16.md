@@ -143,3 +143,28 @@ C. **Implicit creation.** Is profile creation on the first mutation acceptable
 
 D. **Scope.** Is a quiescent-only `config publish` in P2 acceptable, with live
    publish kept for P4?
+
+## Resolutions (after review)
+
+- **A. Catalogs.** The profile holds a *published union* of catalogs, merged on
+  resolved endpoints, bundles and route rows. An identical definition in several
+  catalogs is deduplicated; the same name defined differently is a hard
+  `config publish` conflict. There is no hot merge during leasing: a
+  `--catalog` outside the published set changes nothing, and an acquire for an
+  endpoint missing from the union (or resolving differently) fails, naming
+  `config publish`.
+- **B. HF_TOKEN.** Read only from the managed `.env`, and only if the user put
+  it there (`infer-stack env HF_TOKEN=...`). There is no seeding and no
+  scraping, and the caller's shell `HF_TOKEN` never reaches Compose.
+- **C. Creation.** Implicit, on the first mutation.
+- **D. Publishing.** `config publish` works only when the stack is quiescent,
+  in P2.
+- **`allowed_gpus` is NOT in the profile.** It is per-caller admission scope
+  (Slurm). An acquire stores it as `placement_context` in the pending marker. If
+  a process dies between commit and first render, the next operation first
+  renders once with that context (which pins the placement), then proceeds.
+- **Reverse-proxy config.** At profile creation or publish, a BYO nginx config
+  is snapshotted into the profile, and renders use a managed copy.
+- **Docker target.** `DOCKER_HOST` and `DOCKER_CONTEXT` are not inherited: the
+  target is the default local daemon. Supporting other contexts would need the
+  target itself in the profile (out of scope).

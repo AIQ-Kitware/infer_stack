@@ -127,9 +127,11 @@ class _DockerLogProc:
             cmd.extend(str(s) for s in service)
         elif service:
             cmd.append(str(service))
+        from .leasing.compose import docker_environment
+
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, env=docker_environment(),
         )
 
     @property
@@ -925,18 +927,17 @@ class InferStackTUI(App):
         if not hasattr(backend, 'run'):
             return
 
+        from .leasing.compose import _default_docker_run
+
         def quiet_run(args: list[str]) -> str:
-            proc = subprocess.run(args, capture_output=True, text=True)
+            # Same bounded, explicit-environment runner as the CLI; only stderr
+            # is redirected to the logs pane.
             noisy = not any(a == 'ps' for a in args)
-            if noisy:
-                for line in (proc.stderr or '').splitlines():
-                    if line.strip():
-                        self.call_from_thread(self._append_log, line.rstrip())
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    proc.returncode, args, proc.stdout, proc.stderr
-                )
-            return proc.stdout
+            sink = (
+                (lambda line: self.call_from_thread(self._append_log, line))
+                if noisy else (lambda line: None)
+            )
+            return _default_docker_run(args, stderr_lines=sink)
 
         backend.run = quiet_run
 

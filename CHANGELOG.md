@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Docker commands run with an explicit environment
+
+Every Docker command infer-stack runs now gets an allow-listed environment:
+`PATH`, `HOME`, `USER`, `LOGNAME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR` and
+`TERM`. This covers the backend, the `stack` commands, and the TUI's runner and
+log follower. It affects existing setups:
+
+- **`HF_TOKEN`.** An exported `HF_TOKEN` no longer reaches Compose.
+  `${HF_TOKEN:-}` resolves only from the managed `.env`; set it with
+  `infer-stack env HF_TOKEN=hf_...`.
+- **Docker daemon.** `DOCKER_HOST` and `DOCKER_CONTEXT` are not inherited, so a
+  caller's shell cannot point one operation at a different daemon.
+- **`stack` commands** now pass the managed `.env` as `--env-file`, as the
+  backend does.
+- **TUI.** Its Docker runner is now the same bounded runner as the CLI, instead
+  of an unbounded `subprocess.run`.
+
 ### `routes seed` and `routes prune` publish through the controller
 
 Both commands used to write the route registry and then reconcile as two
