@@ -1235,6 +1235,9 @@ class Controller:
 
         with self._global_lock():
             self._mark_pending(apply=apply)
+            # The approved admission is being compensated away: its digest no
+            # longer describes the pending desired state.
+            self.ledger.store.clear_approved_digest()
             rel = self.ledger.release(lease_id)
             if rel.idled_deployment_ids:
                 never_ran = self._never_ran(list(rel.idled_deployment_ids))
@@ -1449,13 +1452,13 @@ class Controller:
                     # scope needs recording for recovery.
                     context = None
                     self._mark_pending(apply=apply)
-                    if self._admission_digest:
-                        self.ledger.mark_publication_pending(
-                            apply_requested=apply, approved_digest=self._admission_digest)
                     try:
                         result = self.ledger.acquire(
                             owner, requests, ttl_seconds=ttl_seconds,
                             overlay=overlay, allocations=allocations,
+                            # Nothing is applied for --no-apply, so there is no
+                            # approval to guard; staged state stays discardable.
+                            approved_digest=self._admission_digest if apply else None,
                         )
                     except AdmissionConflict:
                         continue            # the ledger moved; preview again
@@ -1657,10 +1660,8 @@ class Controller:
                 if not existed:
                     self.ledger.clear_publication_pending(marker['version'])
                 raise
-            self.ledger.set_profile(profile)
-            digest = getattr(self.backend, 'last_planned_digest', None)
-            if digest:
-                self.ledger.mark_publication_pending(apply_requested=True, approved_digest=digest)
+            self.ledger.store.publish_profile(
+                profile, approved_digest=getattr(self.backend, 'last_planned_digest', None))
             self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile

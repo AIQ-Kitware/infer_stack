@@ -2434,6 +2434,7 @@ class ComposeBackend(ConvergeScaffold):
             services, fingerprints,
             degraded=set(sidecar.get('degraded') or ()),
             optional=set(sidecar.get('optional_services') or ()),
+            networks=doc.get('networks') or {},
         )
         if dynamic and 'litellm' in services:
             return self._reconcile_routes(
@@ -2456,8 +2457,49 @@ class ComposeBackend(ConvergeScaffold):
                 raise ApplyAborted(f'timed out after {deadline_s:g}s waiting for {what}')
             self._sleep(interval)
 
+    def _network_state(self, name: str) -> tuple[str | None, list[str]] | None:
+        """``(subnet, attached container ids)`` of a Docker network, or ``None`` if absent."""
+        found = (self.run(['docker', 'network', 'ls', '-q', '--filter', f'name=^{name}$'])
+                 or '').split()
+        if not found:
+            return None
+        info = json.loads(self.run(['docker', 'network', 'inspect', name]) or '[]')
+        item = info[0] if info else {}
+        configs = ((item.get('IPAM') or {}).get('Config') or [])
+        subnet = next((c.get('Subnet') for c in configs if c.get('Subnet')), None)
+        return subnet, sorted((item.get('Containers') or {}).keys())
+
+    def _reconcile_network(self, networks: dict[str, Any]) -> None:
+        """Recreate the fixed network when its actual subnet differs from the render.
+
+        Runs after departing containers are confirmed gone. Compose never
+        changes an existing network's IPAM, so a subnet migration must remove
+        the old network first; any container still attached (unmanaged, or a
+        degraded deployment's) blocks it. Checked on every apply, so an
+        interrupted migration is completed by the next one.
+        """
+        from .._log import logger
+        from .network import NETWORK_NAME
+
+        spec = networks.get(NETWORK_NAME)
+        if not spec:
+            return
+        wanted = next((c.get('subnet') for c in (spec.get('ipam') or {}).get('config') or []), None)
+        state = self._network_state(NETWORK_NAME)
+        if state is None or wanted is None or state[0] == wanted:
+            return
+        actual, attached = state
+        if attached:
+            raise ApplyAborted(
+                f'network {NETWORK_NAME} must move from {actual} to {wanted}, but '
+                f'{len(attached)} container(s) are still attached '
+                f'({", ".join(c[:12] for c in attached)}); remove them first'
+            )
+        logger.info('apply: recreating network {} ({} -> {})', NETWORK_NAME, actual, wanted)
+        self.run(['docker', 'network', 'rm', NETWORK_NAME])
+
     def selective_apply(self, services, fingerprints, *, degraded=frozenset(),
-                        optional=frozenset()):
+                        optional=frozenset(), networks=None):
         """Make the project match the render, touching only what differs.
 
         * **keep** a managed container whose (service, fingerprint) is wanted,
@@ -2569,6 +2611,8 @@ class ComposeBackend(ConvergeScaffold):
                 deadline_s=APPLY_REMOVAL_WAIT_S,
                 what='removed containers to disappear',
             )
+        if networks:
+            self._reconcile_network(networks)
         paused = [c for c in keep if c.state == 'paused' and key(c)[0] not in optional]
         if paused:
             self.run(['docker', 'unpause', *[c.container_id for c in paused]])

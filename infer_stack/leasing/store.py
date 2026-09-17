@@ -361,7 +361,8 @@ class SqliteStore:
         return marker
 
     def clear_approved_digest(self) -> None:
-        """The approved render was applied; later renders need no re-approval."""
+        """The approved render was applied, or deliberately abandoned (a
+        rollback); the digest no longer describes the pending state."""
         with self.transaction():
             current = self._read_publication_pending()
             if current is None or current.get('approved_digest') is None:
@@ -371,6 +372,18 @@ class SqliteStore:
                 "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
                 (json.dumps(current, sort_keys=True),),
             )
+
+    def publish_profile(self, profile: dict, *, approved_digest: str | None) -> None:
+        """Write the profile and its pending marker (with the approved digest)
+        in one transaction, so a crash cannot leave a published profile whose
+        approval nothing records."""
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(profile, sort_keys=True),),
+            )
+            self._write_marker(apply_requested=True, approved_digest=approved_digest)
 
     def migrate_network(self, *, subnet: str, reset_addresses: bool,
                         approved_digest: str | None) -> None:

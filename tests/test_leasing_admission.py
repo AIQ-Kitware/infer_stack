@@ -386,17 +386,49 @@ def test_a_new_lease_cannot_coalesce_onto_an_unresolved_legacy_deployment(tmp_pa
     assert ctl.renew(old.lease.id, ttl_seconds=60).lease is not None
 
 
-def test_the_admission_approval_digest_is_durable_before_the_commit(tmp_path):
+def test_the_admission_approval_digest_is_committed_with_the_lease(tmp_path):
     ledger, ctl, _ = make(tmp_path)
     seen = {}
     real = ledger.acquire
 
     def spy(*args, **kw):
-        seen['marker'] = ledger.publication_pending()
-        return real(*args, **kw)
+        assert (ledger.publication_pending() or {}).get('approved_digest') is None
+        out = real(*args, **kw)
+        seen['marker'] = ledger.publication_pending()     # same transaction as the lease
+        return out
 
     ledger.acquire = spy
     acquire(ctl, 'one')
     assert seen['marker']['approved_digest']
     assert seen['marker']['approved_digest'] == ctl.backend.last_planned_digest
+    assert ledger.publication_pending() is None
+
+
+def test_a_staged_acquire_records_no_digest_and_release_discards_it(tmp_path):
+    ledger, ctl, docker = make(tmp_path)
+    staged = acquire(ctl, 'one', apply=False)
+    assert ledger.publication_pending()['approved_digest'] is None
+    ctl.release_leases([staged.lease.id], evict=True)          # must not hit a digest mismatch
+    assert ledger.publication_pending() is None and docker.containers == {}
+
+
+def test_a_failed_apply_rollback_drops_the_admission_digest(tmp_path):
+    from infer_stack.leasing.backend import BackendTimeout
+
+    ledger, ctl, docker = make(tmp_path)
+    real = ctl.backend.apply
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise BackendTimeout('up timed out')
+        return real()
+
+    ctl.backend.apply = flaky
+    ctl.backend.settle_snapshot = lambda: ()
+    with pytest.raises(BackendTimeout):
+        acquire(ctl, 'one')
+    assert ledger.publication_pending()['approved_digest'] is None
+    acquire(ctl, 'two')                                          # an ordinary publisher proceeds
     assert ledger.publication_pending() is None

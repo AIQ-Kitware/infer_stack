@@ -182,3 +182,28 @@ def test_remigrating_ignores_the_route_our_own_network_creates(monkeypatch):
         return json.dumps([{'Name': NETWORK_NAME, 'IPAM': {'Config': [{'Subnet': SUBNET}]}}])
 
     assert overlapping_subnets(SUBNET, run) == []
+
+
+def test_changing_the_subnet_recreates_the_docker_network(tmp_path):
+    ledger, ctl, docker = make(tmp_path)
+    ctl.network_migrate(SUBNET)
+    acquire(ctl, 'one')
+    assert docker.networks == {NETWORK_NAME: SUBNET}
+    ctl.network_migrate('10.123.46.0/28', force=True)
+    assert docker.networks == {NETWORK_NAME: '10.123.46.0/28'}
+    table, _ = addresses(ctl)
+    assert all(ip.startswith('10.123.46.') for ip in table.values())
+    assert docker.running                                   # services are back
+
+
+def test_a_foreign_container_on_the_old_network_blocks_the_subnet_change(tmp_path):
+    from infer_stack.leasing.compose import ApplyAborted
+
+    ledger, ctl, docker = make(tmp_path)
+    ctl.network_migrate(SUBNET)
+    acquire(ctl, 'one')                                      # the network now exists
+    cid = docker.add_container('foreign', labels={}, project='someone-else')
+    docker.containers[cid]['networks'] = [NETWORK_NAME]
+    with pytest.raises(ApplyAborted, match='still attached'):
+        ctl.network_migrate('10.123.46.0/28', force=True)
+    assert ledger.publication_pending()['apply_requested'] is True   # retried later

@@ -399,3 +399,26 @@ def test_prepull_uses_the_candidate_profile_and_its_catalog_images():
     assert 'w' in got                           # UI turned on by the candidate
     assert 'vllm:custom' in got and 'ollama:d' in got
     assert 'p' not in got and 'n' not in got
+
+
+def test_a_crash_while_publishing_leaves_the_old_profile_and_no_unguarded_marker(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.gc()
+    before = ledger.profile()
+    store = ledger.store
+    real = store._write_marker
+    written = []
+
+    def crash(**kw):
+        if kw.get('approved_digest'):                 # the write paired with the profile
+            written.append(ledger.profile())
+            raise KeyboardInterrupt('killed between profile and marker')
+        return real(**kw)
+
+    store._write_marker = crash
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile({**before, 'ui': False})
+    del store._write_marker
+    assert written and written[0]['ui'] is False     # the profile had been written...
+    assert ledger.profile() == before                # ...and rolled back with the marker

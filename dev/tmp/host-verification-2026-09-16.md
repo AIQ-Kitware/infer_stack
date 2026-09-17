@@ -85,6 +85,9 @@ infer-stack network check                                   # every upstream: he
 
 - **V11:** time the gateway's downtime during `migrate` (every container is
   recreated once), for example by polling `/v1/models`.
+- **Subnet change:** run `network migrate --subnet <another free /24> --yes`
+  again, then check that `docker network inspect infer-stack-net` shows the new
+  subnet and that `network check` is healthy.
 - **V9:** `network check` itself exercises `docker exec <gateway> python3`.
 
 ### Test 60: the misroute reproduction, re-run with stable addresses

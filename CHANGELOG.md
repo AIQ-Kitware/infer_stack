@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Approval digests and subnet changes (review)
+
+- **`config publish`** writes the profile and its pending marker (with the
+  approved digest) in one transaction. A crash can no longer leave a published
+  profile whose approval nothing records.
+- **The approved digest now always describes the pending state.**
+  - `acquire --no-apply` records none, so a staged lease stays discardable by
+    `release`.
+  - A rollback of a failed acquire drops the digest of the state it abandons.
+  - An acquire's digest is written in the same transaction as its lease.
+- **Changing an already-migrated subnet** now recreates the Docker network.
+  Compose never changes an existing network's IPAM, so once the old containers
+  are confirmed gone the apply removes `infer-stack-net`, and Compose recreates
+  it on the new subnet. A container still attached blocks it, with the change
+  left pending. This is checked on every apply, so an interrupted migration
+  completes later.
+
 ### Migration and publication fixes (review)
 
 - **Unresolved legacy deployments.** A LIVE deployment from before allocations

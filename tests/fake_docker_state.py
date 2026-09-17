@@ -29,6 +29,7 @@ class ComposeFake:
         self.project = 'infer-stack'
         self.started: list[list[str]] = []     # service batches per `up`
         self.initial_health = 'healthy'        # health a new healthchecked container reports
+        self.networks: dict[str, str] = {}     # name -> subnet (persist like the daemon's)
 
     # Existing tests read `running` as the list of running service names.
     @property
@@ -74,6 +75,24 @@ class ComposeFake:
                             'NetworkSettings': {'Networks': {
                                 'n': {'IPAddress': ip} for ip in c.get('ips', [])}}})
             return json.dumps(out)
+        if args[:3] == ['docker', 'network', 'ls']:
+            name = args[args.index('--filter') + 1].split('=^', 1)[1].rstrip('$') \
+                if '--filter' in args else None
+            return '\n'.join(n for n in self.networks if name in (None, n))
+        if args[:3] == ['docker', 'network', 'inspect']:
+            out = []
+            for name in args[3:]:
+                attached = {cid: {} for cid, c in self.containers.items()
+                            if name in c.get('networks', ())}
+                out.append({'Name': name, 'IPAM': {'Config': [{'Subnet': self.networks[name]}]},
+                            'Containers': attached})
+            return json.dumps(out)
+        if args[:3] == ['docker', 'network', 'rm']:
+            for name in args[3:]:
+                if any(name in c.get('networks', ()) for c in self.containers.values()):
+                    raise RuntimeError(f'network {name} has active endpoints')
+                self.networks.pop(name, None)
+            return ''
         if args[:3] == ['docker', 'rm', '-f']:
             for cid in args[3:]:
                 self.containers.pop(cid, None)
@@ -95,6 +114,12 @@ class ComposeFake:
             self.project = args[args.index('-p') + 1]
         if 'up' in args:
             services = self._services()
+            for name, spec in (self._doc().get('networks') or {}).items():
+                subnet = ((spec.get('ipam') or {}).get('config') or [{}])[0].get('subnet')
+                if name in self.networks and self.networks[name] != subnet:
+                    # The daemon does: compose will not change an existing network.
+                    raise RuntimeError(f'network {name} exists with a different subnet')
+                self.networks[name] = subnet
             named = [a for a in args[args.index('up') + 1:] if not a.startswith('-')]
             targets = named or list(services)
             self.started.append(list(targets))
@@ -112,10 +137,13 @@ class ComposeFake:
                                for c in self.containers.values()])
         return ''
 
-    def _services(self):
+    def _doc(self):
         if not self.compose_file or not Path(self.compose_file).exists():
             return {}
-        return (yaml.safe_load(Path(self.compose_file).read_text()) or {}).get('services') or {}
+        return yaml.safe_load(Path(self.compose_file).read_text()) or {}
+
+    def _services(self):
+        return self._doc().get('services') or {}
 
     def _up_service(self, name, svc):
         labels = dict(svc.get('labels') or {})
@@ -131,6 +159,7 @@ class ComposeFake:
                 return
             del self.containers[cid]                      # compose recreates on change
         cid = self.add_container(name, labels=labels, device_ids=device_ids)
+        self.containers[cid]['networks'] = list((svc.get('networks') or {}).keys())
         if svc.get('healthcheck'):
             self.containers[cid]['health'] = self.initial_health
 

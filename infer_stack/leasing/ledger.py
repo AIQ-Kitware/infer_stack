@@ -211,6 +211,7 @@ class Ledger:
         ttl_seconds: float | None = None,
         overlay: AcquireOverlay | None = None,
         allocations: dict[str, list[int]] | None = None,
+        approved_digest: str | None = None,
     ) -> AcquireResult:
         """Create a lease and coalesce its endpoints onto deployment deployments.
 
@@ -249,6 +250,10 @@ class Ledger:
                 self.store.update_deployment_served(gid, served, now)
             for gid, gpus in (allocations or {}).items():
                 self.store.set_deployment_allocation(gid, gpus)
+            if approved_digest is not None:
+                # In the same transaction as the lease: the digest can never
+                # describe a candidate that was not committed.
+                self.store._write_marker(apply_requested=True, approved_digest=approved_digest)
             for req, gid in overlay.claims:
                 self.store.insert_claim(
                     lease_id=lease_id,
