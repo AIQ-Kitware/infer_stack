@@ -77,11 +77,23 @@ ENGINE_SERVICES = '\x00engines'
 GATEWAY_SERVICE_HINT = 'litellm'
 
 
-# Textual renamed the blank Select sentinel from ``NULL`` to ``BLANK``.
-# Keep the TUI compatible with both API generations instead of pinning the
+# Textual renamed the blank Select sentinel between API generations (``NULL``
+# and ``BLANK``). Keep the TUI compatible with both instead of pinning the
 # entire project to one Textual minor release. Identity comparison is required
 # because the sentinel is not a user value.
-SELECT_BLANK = getattr(Select, 'BLANK', getattr(Select, 'NULL', None))
+#
+# Presence alone is not enough: Textual 8.x keeps ``Select.BLANK`` as the
+# deprecated *boolean* ``False`` while the real sentinel is ``Select.NULL``,
+# and assigning ``False`` raises ``InvalidSelectValueError``. So take the first
+# candidate that is an actual sentinel object rather than a bool.
+SELECT_BLANK = next(
+    (
+        candidate
+        for candidate in (getattr(Select, 'NULL', None), getattr(Select, 'BLANK', None))
+        if candidate is not None and not isinstance(candidate, bool)
+    ),
+    None,
+)
 
 
 def _select_is_blank(value: object) -> bool:
