@@ -1707,14 +1707,15 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
 
 
 def test_tui_reports_button_handler_failures(tmp_path):
-    """A failing action must say so: status bar, Logs pane, and a traceback file.
+    """A failing action must be impossible to miss: a sticky status line, the
+    TUI log tab (turned red, with a count), a toast, and a file on disk.
 
     Textual runs handlers on its own message pump, so an uncaught exception
     otherwise leaves the click looking like it did nothing at all.
     """
-    from textual.widgets import Button, Static
+    from textual.widgets import Button, Static, TabbedContent
 
-    from infer_stack.tui import InferStackTUI
+    from infer_stack.tui import APP_LOG_TAB_TITLE, InferStackTUI
 
     controller, catalog = _ctx()
     seen = {}
@@ -1730,16 +1731,29 @@ def test_tui_reports_button_handler_failures(tmp_path):
 
             app.action_edit_endpoint = boom
             app.on_button_pressed(Button.Pressed(Button(id='btn-edit-endpoint')))
-            await pilot.pause()
+            for _ in range(5):                      # survives refresh ticks
+                await pilot.pause()
             seen['status'] = str(app.query_one('#status', Static).render())
-            seen['log'] = '\n'.join(app._log_lines)
+            seen['applog'] = '\n'.join(app._app_log_lines)
+            seen['docker'] = '\n'.join(app._log_lines)
+            tabs = app.query_one('#top', TabbedContent)
+            seen['label'] = str(tabs.get_tab('tab-applog').label)
             seen['path'] = app.error_log_path()
+            app.action_show_app_log()
+            for _ in range(3):
+                await pilot.pause()
+            seen['active'] = tabs.active
 
     _run(scenario)
     assert 'RuntimeError: editor exploded' in seen['status']
-    assert 'btn-edit-endpoint failed' in seen['status']
-    assert 'editor exploded' in seen['log'] and 'Traceback' in seen['log']
+    assert APP_LOG_TAB_TITLE in seen['status']          # says where to look
+    assert 'btn-edit-endpoint pressed' in seen['applog']
+    assert 'editor exploded' in seen['applog'] and 'Traceback' in seen['applog']
+    assert '⚠' in seen['label'] and '(1)' in seen['label']   # rendered red
+    assert 'editor exploded' not in seen['docker']      # never in the docker logs
     assert seen['path'].exists() and 'editor exploded' in seen['path'].read_text()
+    assert str(seen['path']) in seen['applog']          # the file is discoverable
+    assert seen['active'] == 'tab-applog'
 
 
 def test_tui_reports_background_worker_failures(tmp_path):
@@ -1765,12 +1779,33 @@ def test_tui_reports_background_worker_failures(tmp_path):
                            name='endpoint editor', exit_on_error=False)
             for _ in range(200):                      # until the ERROR state lands
                 await pilot.pause()
-                if 'failed' in str(app.query_one('#status', Static).render()):
+                if app._app_log_errors:
                     break
             seen['status'] = str(app.query_one('#status', Static).render())
-            seen['log'] = '\n'.join(app._log_lines)
+            seen['applog'] = '\n'.join(app._app_log_lines)
 
     _run(scenario)
     assert 'ValueError: no inventory for you' in seen['status']
-    assert 'failed' in seen['status']
-    assert 'no inventory for you' in seen['log']
+    assert 'endpoint editor failed' in seen['applog']
+
+
+def test_tui_log_records_what_an_action_decided(tmp_path):
+    """An action that declines to act must say why in the TUI log, so 'nothing
+    happened' is never the whole story."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.catalog_path = None                   # the editor has nowhere to write
+            app.action_edit_endpoint()
+            await pilot.pause()
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'no catalog path' in seen['applog']

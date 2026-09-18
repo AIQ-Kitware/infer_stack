@@ -2,21 +2,25 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-### The TUI reports its own failures
+### The TUI reports its own failures, in a `TUI log` tab of its own
 
 A failing action used to look like nothing happened: Textual runs actions and
 background workers on its own message pump, so an exception reached no
 terminal, and the TUI had no handler for worker failures.
 
-Now every failure is reported in three places:
-
-- the status bar, with the exception type and message, held for 20 s;
-- the Logs pane, with the full traceback;
-- `<data root>/tui-errors.log`, appended with a timestamp, for post-mortem.
-
-This covers button handlers and all 16 background workers (the catalog editor,
-acquire, release, the API probes). A worker cancelled because another action
-in its group started now says so, instead of looking dead.
+- **A `TUI log` tab**, separate from the docker Logs pane (which streams
+  container output and sits inside a collapsed section). It records what the
+  TUI did, every status message, and every failure with its traceback, and it
+  names the file each error is also appended to.
+- **An error is impossible to miss:** the tab label turns red with a count
+  (`⚠ TUI log (2)`), a toast appears, and the status line keeps the message
+  instead of being wiped by the next refresh. Press `l` for the tab.
+- **`<data root>/tui-errors.log`** keeps tracebacks for after the TUI exits.
+- This covers button handlers and all 16 background workers (the catalog
+  editor, acquire, release, the API probes). A worker cancelled because
+  another action in its group started now says so, instead of looking dead.
+- An action that declines to act (no catalog path, endpoint actively served)
+  logs that reason, so "nothing happened" is never the whole story.
 
 ### Restore the three-step leasing UX; isolate TUI log streams
 

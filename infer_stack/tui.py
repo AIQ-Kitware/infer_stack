@@ -86,6 +86,9 @@ GATEWAY_SERVICE_HINT = 'litellm'
 # deprecated *boolean* ``False`` while the real sentinel is ``Select.NULL``,
 # and assigning ``False`` raises ``InvalidSelectValueError``. So take the first
 # candidate that is an actual sentinel object rather than a bool.
+#: Title of the tab that shows what the TUI itself did, and its errors.
+APP_LOG_TAB_TITLE = 'TUI log'
+
 SELECT_BLANK = next(
     (
         candidate
@@ -724,6 +727,8 @@ class InferStackTUI(App):
     BINDINGS = [
         # Truly global controls stay in the footer.
         ('r', 'refresh', 'Refresh'),
+        # Global on purpose: an error can happen while any tab is in front.
+        ('l', 'show_app_log', 'TUI log'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
         # Pane-scoped actions: keys still work, but they live as buttons under
@@ -814,7 +819,9 @@ class InferStackTUI(App):
         # still yield buffered lines while a replacement stream is already
         # visible; only the current generation is allowed to append.
         self._log_generation = 0
-        self._log_lines: list[str] = []  # mirror of the log pane, for tests
+        self._log_lines: list[str] = []  # mirror of the docker log pane, for tests
+        self._app_log_lines: list[str] = []  # mirror of the TUI log pane, for tests
+        self._app_log_errors = 0
         self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
         self._log_h = 16      # resizable via - + or dragging #hsplit
@@ -850,8 +857,24 @@ class InferStackTUI(App):
                 yield from self._compose_ui_settings()
             with TabPane('Settings', id='tab-settings'):
                 yield from self._compose_settings()
+            with TabPane(APP_LOG_TAB_TITLE, id='tab-applog'):
+                yield from self._compose_app_log()
         yield Static('', id='status')
         yield Footer()
+
+    def _compose_app_log(self) -> ComposeResult:
+        """The TUI's own event log: what it did, and every failure.
+
+        Deliberately separate from the docker Logs pane (that one streams the
+        containers' output, and lives inside a collapsed section). This tab is
+        the place to look when a click seems to do nothing.
+        """
+        yield Static(
+            f'What the TUI itself did, and every error. Also appended to '
+            f'{self.error_log_path()}', classes='hint',
+        )
+        yield RichLog(id='applog', highlight=False, markup=True,
+                      max_lines=4000, wrap=True)
 
     def _compose_dashboard(self) -> ComposeResult:
         with Horizontal(id='body'):
@@ -1834,6 +1857,53 @@ class InferStackTUI(App):
         self._log_lines.append(line)
         self.query_one('#logs', RichLog).write(line)
 
+    # -- the TUI's own log -------------------------------------------------
+
+    def app_log(self, message: str, *, level: str = 'info') -> None:
+        """Record what the TUI did. Errors also colour the tab and raise a toast.
+
+        Everything the user triggers goes here, so an action that decided to do
+        nothing says why instead of looking broken.
+        """
+        stamp = time.strftime('%H:%M:%S')
+        self._app_log_lines.append(f'{stamp} {level}: {message}')
+        colour = {'error': 'red', 'warn': 'yellow'}.get(level)
+        body = f'[{colour}]{message}[/{colour}]' if colour else message
+        try:
+            self.query_one('#applog', RichLog).write(f'[dim]{stamp}[/dim] {body}')
+        except Exception:  # noqa: BLE001 - before mount, or during teardown
+            pass
+        if level == 'error':
+            self._app_log_errors += 1
+            self._mark_app_log_tab()
+            try:
+                self.notify(f'{message}\n\nPress `l` for the {APP_LOG_TAB_TITLE} tab.',
+                            title='infer-stack error', severity='error', timeout=15.0)
+            except Exception:  # noqa: BLE001 - notifications are a bonus
+                pass
+
+    def _mark_app_log_tab(self) -> None:
+        """Turn the tab red with a count, so an error is visible from any tab."""
+        try:
+            tab = self.query_one('#top', TabbedContent).get_tab('tab-applog')
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        tab.label = (
+            f'[b red]⚠ {APP_LOG_TAB_TITLE} ({self._app_log_errors})[/b red]'
+            if self._app_log_errors else APP_LOG_TAB_TITLE
+        )
+
+    def action_show_app_log(self) -> None:
+        """Jump to the TUI log (what the status line and the toast point at)."""
+        self.query_one('#top', TabbedContent).active = 'tab-applog'
+        # Focus follows the tab: otherwise the still-focused dashboard table
+        # pulls the active tab straight back to the dashboard.
+        self.query_one('#applog', RichLog).focus()
+
+    def action_clear_app_log_errors(self) -> None:
+        self._app_log_errors = 0
+        self._mark_app_log_tab()
+
     # -- error reporting ---------------------------------------------------
     #
     # Textual runs actions and background workers on its own message pump: an
@@ -1859,14 +1929,11 @@ class InferStackTUI(App):
             where = f' (traceback: {path})'
         except OSError:
             where = ''
-        self._status(f'{what}: {detail}{where}', sticky_for=20.0)
-        try:
-            self._append_log(f'[error] {what}: {detail}')
-            for line in traceback.format_exception(type(ex), ex, ex.__traceback__):
-                for part in line.rstrip().splitlines():
-                    self._append_log(f'  {part}')
-        except Exception:  # noqa: BLE001 - reporting must never raise
-            pass
+        self._status(f'{what}: {detail} — see the {APP_LOG_TAB_TITLE} tab', sticky_for=30.0)
+        self.app_log(f'{what}: {detail}{where}', level='error')
+        for line in traceback.format_exception(type(ex), ex, ex.__traceback__):
+            for part in line.rstrip().splitlines():
+                self.app_log(f'    {part}')
 
     def on_worker_state_changed(self, event) -> None:
         """Surface background-worker failures and cancellations.
@@ -1911,7 +1978,23 @@ class InferStackTUI(App):
 
     # -- helpers + actions -------------------------------------------------
 
+    #: Passive cursor/relationship hints; not worth logging as events.
+    _HINT_PREFIXES = ('lease ', 'deployment ', 'endpoint ', 'model ', 'select ')
+
     def _status(self, message: str, *, sticky_for: float = 0.0) -> None:
+        # Status text is transient and easy to miss; keep a copy in the TUI log.
+        if not message.startswith(tuple(self._HINT_PREFIXES)):
+            self._app_log_lines.append(f'{time.strftime("%H:%M:%S")} status: {message}')
+            try:
+                self.query_one('#applog', RichLog).write(
+                    f'[dim]{time.strftime("%H:%M:%S")} status:[/dim] {message}')
+            except Exception:  # noqa: BLE001 - before mount
+                pass
+        # A sticky message (an error) owns the bar until it expires: the refresh
+        # loop and passive hints would otherwise wipe it within a second, which
+        # is how failures came to look like nothing had happened at all.
+        if sticky_for <= 0 and time.monotonic() < self._status_sticky_until:
+            return
         if sticky_for > 0:
             self._status_sticky_until = max(
                 self._status_sticky_until, time.monotonic() + sticky_for
@@ -2159,12 +2242,15 @@ class InferStackTUI(App):
             'btn-compose-up': self.action_compose_up,
             'btn-compose-down': self.action_compose_down,
         }
-        handler = handlers.get(event.button.id or '')
-        if handler:
-            try:
-                handler()
-            except Exception as ex:  # noqa: BLE001 - a button must never fail in silence
-                self._report_error(f'{event.button.id or "button"} failed', ex)
+        button = event.button.id or 'button'
+        handler = handlers.get(button)
+        if handler is None:
+            return
+        self.app_log(f'{button} pressed')
+        try:
+            handler()
+        except Exception as ex:  # noqa: BLE001 - a button must never fail in silence
+            self._report_error(f'{button} failed', ex)
 
     def _on_apply_ui_settings(self) -> None:
         from .paths import load_tui_settings, save_tui_settings
