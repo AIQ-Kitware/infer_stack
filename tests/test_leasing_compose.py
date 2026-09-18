@@ -218,6 +218,44 @@ def test_render_vllm_attention_backend_reaches_environment_not_command():
     assert not any('attention' in a.lower() for a in svc['command'])
 
 
+def test_render_hyperqwen_3090_recipe_uses_prepared_single_user_launcher():
+    deployment = vllm(
+        'grp-q38',
+        hf='dbirks/Qwen3.8-27B-W4A16-AutoRound',
+        served='local-qwen38',
+        max_len=65536,
+    )
+    deployment.spec['runtime'].update({
+        'serve_recipe': 'hyperqwen-3090-single',
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+        'gpu_memory_utilization': 0.93,
+        'enable_prefix_caching': True,
+    })
+    rc = render_compose(
+        [deployment], {'grp-q38': [3]}, images=IMAGES, ports=PORTS,
+        state={**STATE, 'runtime': '/cache/runtime'},
+    )
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    assert svc['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
+    assert svc['command'] == ['single']
+    assert svc['environment'] == {
+        'HF_TOKEN': '${HF_TOKEN:-}',
+        'PORT': '8000',
+        'SPEC': 'dflash2',
+        'PREFIX_CACHE': '1',
+        'MAX_LEN': '65536',
+        'GPU_UTIL': '0.93',
+        'EXTRA_ARGS': '--served-model-name=local-qwen38',
+    }
+    assert svc['volumes'] == [
+        '/cache/runtime/hyperqwen/qwen3.8-27b/models:/app/models',
+        '/cache/runtime/hyperqwen/qwen3.8-27b/cache:/cache',
+    ]
+    devs = svc['deploy']['resources']['reservations']['devices'][0]
+    assert devs['device_ids'] == ['3']
+    assert svc['healthcheck']['test'][-1] == 'http://localhost:8000/health'
+
+
 def test_render_reports_service_name_collisions():
     """Regression: two live deployments sharing a served name rendered to ONE
     compose service (dict overwrite) — the earlier deployment's container never

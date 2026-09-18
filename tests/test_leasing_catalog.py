@@ -298,6 +298,30 @@ def test_explicit_gpu_pin_reaches_spec_and_is_structural():
     assert 'gpu_indices' not in auto.structural
 
 
+def test_vllm_serve_recipe_is_structural_and_reaches_spec():
+    plain_data = _one_vllm()
+    recipe_data = _one_vllm()
+    recipe_data['endpoints']['e']['runtime'] = {
+        'serve_recipe': 'hyperqwen-3090-single',
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+    }
+    plain = Catalog.from_dict(plain_data).resolve_endpoint('e')
+    recipe = Catalog.from_dict(recipe_data).resolve_endpoint('e')
+    assert recipe.spec['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
+    assert recipe.structural['serve_recipe'] == 'hyperqwen-3090-single'
+    assert recipe.compat_key != plain.compat_key
+    # Stock vLLM keeps the old structural shape/hashes when no recipe is set.
+    assert 'serve_recipe' not in plain.structural
+
+
+def test_unknown_vllm_serve_recipe_is_rejected():
+    data = _one_vllm()
+    data['endpoints']['e']['runtime'] = {'serve_recipe': 'typo-recipe'}
+    with pytest.raises(CatalogError) as exc:
+        Catalog.from_dict(data)
+    assert 'unknown runtime.serve_recipe' in str(exc.value)
+
+
 def test_gpu_pin_count_matches_runtime_parallelism():
     data = _one_vllm({'min_vram_gib': 24, 'gpu_indices': [0, 2]})
     data['endpoints']['e']['runtime'] = {'tensor_parallel_size': 2}

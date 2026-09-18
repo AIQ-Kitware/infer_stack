@@ -8,6 +8,7 @@ from infer_stack.leasing.suggest import (
     builtin_pool,
     derive_runtime,
     fits_on,
+    migrate_known_suggestion_aliases,
     suggest_catalog,
 )
 
@@ -21,14 +22,23 @@ def test_builtin_pool_is_nonempty_and_real():
     assert pool, 'the shipped suggestion pool should not be empty'
     # the shipped Qwen/Gemma families are represented in the curated pool
     families = {m.family for m in pool.values()}
-    assert {'qwen3', 'qwen3.5', 'qwen3.6', 'gemma4'} <= families
+    assert {'qwen3.8', 'qwen3.5', 'qwen3.6', 'gemma4'} <= families
     # ...with the real Hugging Face ids, not slugs
     assert pool['qwen3.5-9b'].hf_model_id == 'Qwen/Qwen3.5-9B'
-    qwen3 = pool['qwen3-8b']
-    assert qwen3.hf_model_id == 'Qwen/Qwen3-8B'
-    assert qwen3.memory_class_gib == 16
-    assert qwen3.min_vram_gib_per_replica == 24
-    assert qwen3.context_window == 32768
+    # The generic name is intentionally not reused for a third-party quantized
+    # derivative: it remains available for the official Qwen/Qwen3.8-27B.
+    assert 'qwen3.8-27b' not in pool
+    qwen38 = pool['qwen3.8-27b-dbirks-hyperqwen']
+    assert qwen38.hf_model_id == 'dbirks/Qwen3.8-27B-W4A16-AutoRound'
+    assert qwen38.family == 'qwen3.8'
+    assert qwen38.memory_class_gib == 20
+    assert qwen38.min_vram_gib_per_replica == 24
+    assert qwen38.context_window == 262144
+    assert qwen38.gpu_name_hints == ['rtx 3090']
+    assert qwen38.defaults['max_model_len'] == 65536
+    assert qwen38.defaults['gpu_memory_utilization'] == 0.93
+    assert qwen38.defaults['serve_recipe'] == 'hyperqwen-3090-single'
+    assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
@@ -53,7 +63,8 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     # should be suggested; the ones needing a bigger/second GPU should not.
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
     models = suggest_catalog(inv)['models']
-    fits = {'qwen3-8b', 'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
+    fits = {'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-0.8b', 'qwen3.5-2b',
+            'qwen3.5-4b', 'qwen3.5-9b',
             'qwen3.6-35b-a3b-fp8', 'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b',
             'gemma4-31b'}
     too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
@@ -82,17 +93,74 @@ def test_suggested_catalog_roundtrips_through_catalog():
 def test_fit_filter_tracks_gpu_size():
     one_small = suggest_catalog(simulate_inventory('1x16'))['models']
     assert 'qwen2.5-7b' in one_small        # 16 GiB model fits a 16 GiB GPU
-    assert 'qwen3-8b' not in one_small      # 24 GiB serving floor
+    assert 'qwen3.8-27b-dbirks-hyperqwen' not in one_small   # 24 GiB serving floor
     assert 'gpt-oss-20b' not in one_small    # 40 GiB model does not
     assert 'qwen2.5-72b' not in one_small    # needs two GPUs
 
 
-def test_qwen3_8b_suggestion_uses_huggingface_model_id():
-    out = suggest_catalog(simulate_inventory('1x24'))
-    assert out['models']['qwen3-8b']['source'] == 'hf://Qwen/Qwen3-8B'
-    ep = out['endpoints']['qwen3-8b']
-    assert ep['placement']['min_vram_gib'] == 24
-    assert ep['runtime']['max_model_len'] == 32768
+def test_qwen38_27b_suggestion_uses_measured_3090_hyperqwen_recipe():
+    inv = {'gpu_count': 2, 'gpus': [
+        _gpu(0, 48, name='NVIDIA RTX 8000'),
+        _gpu(3, 24, name='NVIDIA GeForce RTX 3090'),
+    ]}
+    out = suggest_catalog(inv)
+    assert out['models']['qwen3.8-27b-dbirks-hyperqwen']['source'] == (
+        'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound'
+    )
+    ep = out['endpoints']['qwen3.8-27b-dbirks-hyperqwen']
+    # The recipe is measured for a 3090. Preserve that hardware match into the
+    # generated catalog instead of letting the later best-fit placer choose the
+    # unrelated 48-GiB card.
+    assert ep['placement'] == {'min_vram_gib': 24, 'gpu_indices': [3]}
+    assert ep['runtime'] == {
+        'max_model_len': 65536,
+        'gpu_memory_utilization': 0.93,
+        'enable_prefix_caching': True,
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+        'serve_recipe': 'hyperqwen-3090-single',
+    }
+
+
+def test_qwen38_27b_recipe_is_not_suggested_on_an_unmeasured_24gib_gpu():
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA RTX A5000')]}
+    assert 'qwen3.8-27b-dbirks-hyperqwen' not in suggest_catalog(inv)['models']
+
+
+def test_old_dbirks_qwen38_suggestion_name_migrates_without_touching_official():
+    old = {
+        'models': {
+            'qwen3.8-27b': {
+                'source': 'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound',
+            },
+        },
+        'endpoints': {
+            'qwen3.8-27b': {
+                'engine': 'vllm',
+                'model': 'qwen3.8-27b',
+                'runtime': {'serve_recipe': 'hyperqwen-3090-single'},
+                'placement': {'gpu_indices': [1]},
+            },
+        },
+    }
+    renamed = migrate_known_suggestion_aliases(old)
+    assert renamed
+    new = 'qwen3.8-27b-dbirks-hyperqwen'
+    assert set(old['models']) == {new}
+    assert set(old['endpoints']) == {new}
+    assert old['endpoints'][new]['model'] == new
+    assert old['endpoints'][new]['placement'] == {'gpu_indices': [1]}
+
+    official = {
+        'models': {'qwen3.8-27b': {'source': 'hf://Qwen/Qwen3.8-27B'}},
+        'endpoints': {
+            'qwen3.8-27b': {
+                'engine': 'vllm',
+                'model': 'qwen3.8-27b',
+            },
+        },
+    }
+    assert migrate_known_suggestion_aliases(official) == []
+    assert 'qwen3.8-27b' in official['models']
 
 
 def test_derive_runtime_clamps_len_and_sizes_utilization():

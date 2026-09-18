@@ -282,7 +282,10 @@ class CatalogSuggestCLI(
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..hardware import detect_inventory
-        from ..leasing.suggest import suggest_catalog
+        from ..leasing.suggest import (
+            migrate_known_suggestion_aliases,
+            suggest_catalog,
+        )
         from .commands_leasing import _resolve_skip_display
         from .context import effective_inventory
 
@@ -326,6 +329,7 @@ class CatalogSuggestCLI(
         # --apply: additive merge into the catalog (keep existing entries).
         path = _catalog_path(config)
         data = _load_raw(path)
+        migrated = migrate_known_suggestion_aliases(data)
         added: list[str] = []
         skipped: list[str] = []
         for section in ('models', 'endpoints'):
@@ -337,6 +341,8 @@ class CatalogSuggestCLI(
                 added.append(f'{section[:-1]}:{name}')
         _save_raw(path, data, dry_run=False)
         print(f'merged suggestion into {path}  ({hw})')
+        if migrated:
+            print(f'  renamed prior suggestion: {", ".join(migrated)}')
         if added:
             print(f'  added: {", ".join(added)}')
         if skipped:

@@ -315,6 +315,42 @@ def test_suggest_apply_is_additive_and_idempotent(tmp_path):
     assert 'mine' in cat.models                       # hand-added entry preserved
 
 
+def test_suggest_apply_renames_old_dbirks_qwen38_identity(tmp_path):
+    # A short-lived suggestion-pool revision emitted this third-party quantized
+    # recipe under the same name we want to reserve for the official checkpoint.
+    # Applying suggestions upgrades only that exact generated signature.
+    old = {
+        'models': {
+            'qwen3.8-27b': {
+                'source': 'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound',
+            },
+        },
+        'endpoints': {
+            'qwen3.8-27b': {
+                'engine': 'vllm',
+                'model': 'qwen3.8-27b',
+                'placement': {'min_vram_gib': 24, 'gpu_indices': [0]},
+                'runtime': {
+                    'max_model_len': 65536,
+                    'gpu_memory_utilization': 0.93,
+                    'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+                    'serve_recipe': 'hyperqwen-3090-single',
+                },
+            },
+        },
+    }
+    (tmp_path / 'catalog.yaml').write_text(yaml.safe_dump(old, sort_keys=False))
+    CatalogSuggestCLI.main(
+        argv=['--simulate-hardware', '1x24', '--apply', *_opts(tmp_path)]
+    )
+    cat = Catalog.load(cat_path(tmp_path))
+    new = 'qwen3.8-27b-dbirks-hyperqwen'
+    assert new in cat.models and new in cat.endpoints
+    assert 'qwen3.8-27b' not in cat.models
+    assert 'qwen3.8-27b' not in cat.endpoints
+    assert cat.endpoints[new].model == new
+
+
 def test_suggest_no_fit_writes_nothing(tmp_path, capsys):
     # A box too small for any pooled model: a friendly note, no file, no crash.
     CatalogSuggestCLI.main(

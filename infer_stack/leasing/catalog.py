@@ -29,6 +29,10 @@ Schema (all sections optional except as referenced)::
         # endpoint (GPU count is appended automatically from tp*pp*dp); falls
         # back to `config set kubeai_resource_profile <name>`.
         #   runtime: {resource_profile: nvidia-gpu-rtx-4090, ...}
+        # Named non-stock vLLM launcher/preparation recipe. Recipes are a
+        # closed set validated by infer-stack; today HyperQwen's measured 3090
+        # single-user path is Compose-only.
+        #   runtime: {serve_recipe: hyperqwen-3090-single, ...}
         sharing: {mode: shared-compatible}
         reclaim: {policy: keep-warm}
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
@@ -70,6 +74,7 @@ import yaml
 from .models import (
     EndpointRequest,
     Sharing,
+    VLLM_SERVE_RECIPES,
     ollama_structural,
     vllm_structural,
 )
@@ -240,6 +245,24 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
     return errors
 
 
+def _runtime_errors(ep: EndpointSpec) -> list[str]:
+    """Validate named runtime recipes that have backend-specific semantics."""
+    recipe = ep.runtime.get('serve_recipe')
+    if recipe is None:
+        return []
+    if ep.engine != VLLM:
+        return [
+            f"endpoint '{ep.name}': runtime.serve_recipe is only supported "
+            f"on vllm endpoints (engine is '{ep.engine}')"
+        ]
+    if recipe not in VLLM_SERVE_RECIPES:
+        return [
+            f"endpoint '{ep.name}': unknown runtime.serve_recipe {recipe!r} "
+            f"(supported: {sorted(VLLM_SERVE_RECIPES)})"
+        ]
+    return []
+
+
 @dataclass
 class Catalog:
     """A parsed, validated serving catalog."""
@@ -365,6 +388,7 @@ class Catalog:
                     f"endpoint '{ep.name}' has unknown engine '{ep.engine}'"
                 )
             errors.extend(_placement_errors(ep))
+            errors.extend(_runtime_errors(ep))
         for bundle, members in self.bundles.items():
             for member in members:
                 if member not in self.endpoints:
@@ -480,6 +504,7 @@ class Catalog:
             attention_backend=rt.get('attention_backend'),
             served_name=served_name,
             gpu_indices=gpu_indices,
+            serve_recipe=rt.get('serve_recipe'),
         )
         capacity: dict[str, Any] = {}
         if rt.get('max_model_len') is not None:
