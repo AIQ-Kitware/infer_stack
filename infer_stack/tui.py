@@ -1834,6 +1834,61 @@ class InferStackTUI(App):
         self._log_lines.append(line)
         self.query_one('#logs', RichLog).write(line)
 
+    # -- error reporting ---------------------------------------------------
+    #
+    # Textual runs actions and background workers on its own message pump: an
+    # exception there does not reach a terminal, so without this the UI just
+    # does nothing and says nothing. Every failure goes to three places: the
+    # status bar (seen), the Logs pane (kept), and a file (post-mortem).
+
+    def error_log_path(self) -> Path:
+        from .paths import data_root
+
+        return data_root() / 'tui-errors.log'
+
+    def _report_error(self, what: str, ex: BaseException) -> None:
+        import traceback
+
+        detail = f'{type(ex).__name__}: {ex}'
+        path = self.error_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} {what}\n')
+                traceback.print_exception(type(ex), ex, ex.__traceback__, file=handle)
+            where = f' (traceback: {path})'
+        except OSError:
+            where = ''
+        self._status(f'{what}: {detail}{where}', sticky_for=20.0)
+        try:
+            self._append_log(f'[error] {what}: {detail}')
+            for line in traceback.format_exception(type(ex), ex, ex.__traceback__):
+                for part in line.rstrip().splitlines():
+                    self._append_log(f'  {part}')
+        except Exception:  # noqa: BLE001 - reporting must never raise
+            pass
+
+    def on_worker_state_changed(self, event) -> None:
+        """Surface background-worker failures and cancellations.
+
+        Without this, an exception inside any `@work(thread=True)` handler --
+        the catalog editor, acquire, release, the API probes -- leaves the UI
+        silent: the click appears to do nothing at all.
+        """
+        from textual.worker import WorkerState
+
+        worker = event.worker
+        name = worker.name or worker.group or 'worker'
+        if event.state is WorkerState.ERROR:
+            error = getattr(worker, 'error', None)
+            if error is not None:
+                self._report_error(f'{name} failed', error)
+            else:
+                self._status(f'{name} failed (no exception recorded)', sticky_for=20.0)
+        elif event.state is WorkerState.CANCELLED and worker.group == 'catalog-editor':
+            # Exclusive workers cancel each other; say so rather than looking dead.
+            self._status(f'{name} was cancelled (another {worker.group} action started)')
+
     # -- docker tab / collapse plumbing ------------------------------------
 
     def on_tabbed_content_tab_activated(
@@ -2106,7 +2161,10 @@ class InferStackTUI(App):
         }
         handler = handlers.get(event.button.id or '')
         if handler:
-            handler()
+            try:
+                handler()
+            except Exception as ex:  # noqa: BLE001 - a button must never fail in silence
+                self._report_error(f'{event.button.id or "button"} failed', ex)
 
     def _on_apply_ui_settings(self) -> None:
         from .paths import load_tui_settings, save_tui_settings
@@ -2333,9 +2391,13 @@ class InferStackTUI(App):
             inventory = detect_inventory()
         except Exception:  # noqa: BLE001 - editor remains usable with numeric pins
             inventory = {'gpu_count': 0, 'gpus': []}
-        self.call_from_thread(
-            self._show_endpoint_editor, name, entry, inventory
-        )
+        try:
+            self.call_from_thread(
+                self._show_endpoint_editor, name, entry, inventory
+            )
+        except Exception as ex:  # noqa: BLE001 - never leave Edit looking dead
+            self.call_from_thread(
+                self._report_error, f'endpoint editor for {name or "new endpoint"}', ex)
 
     def _show_endpoint_editor(
         self, name: str | None, entry: dict, inventory: dict[str, Any]

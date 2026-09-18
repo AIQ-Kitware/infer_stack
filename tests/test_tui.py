@@ -1704,3 +1704,73 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             assert target is None and 'all services' in label
 
     _run(scenario)
+
+
+def test_tui_reports_button_handler_failures(tmp_path):
+    """A failing action must say so: status bar, Logs pane, and a traceback file.
+
+    Textual runs handlers on its own message pump, so an uncaught exception
+    otherwise leaves the click looking like it did nothing at all.
+    """
+    from textual.widgets import Button, Static
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def boom():
+                raise RuntimeError('editor exploded')
+
+            app.action_edit_endpoint = boom
+            app.on_button_pressed(Button.Pressed(Button(id='btn-edit-endpoint')))
+            await pilot.pause()
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['log'] = '\n'.join(app._log_lines)
+            seen['path'] = app.error_log_path()
+
+    _run(scenario)
+    assert 'RuntimeError: editor exploded' in seen['status']
+    assert 'btn-edit-endpoint failed' in seen['status']
+    assert 'editor exploded' in seen['log'] and 'Traceback' in seen['log']
+    assert seen['path'].exists() and 'editor exploded' in seen['path'].read_text()
+
+
+def test_tui_reports_background_worker_failures(tmp_path):
+    """The same for a thread worker: the catalog editor runs in one, so a
+    failure there used to be entirely silent."""
+    from textual.widgets import Static
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def failing():
+                raise ValueError('no inventory for you')
+
+            app.run_worker(failing, thread=True, group='catalog-editor',
+                           name='endpoint editor', exit_on_error=False)
+            for _ in range(200):                      # until the ERROR state lands
+                await pilot.pause()
+                if 'failed' in str(app.query_one('#status', Static).render()):
+                    break
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['log'] = '\n'.join(app._log_lines)
+
+    _run(scenario)
+    assert 'ValueError: no inventory for you' in seen['status']
+    assert 'failed' in seen['status']
+    assert 'no inventory for you' in seen['log']
