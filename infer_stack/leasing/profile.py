@@ -1,4 +1,4 @@
-"""The published profile: every non-ledger render input, frozen in the ledger.
+"""The recovery snapshot: every non-ledger render input frozen in the ledger.
 
 Without it, each command rebuilt the backend from its own flags, settings, the
 installed package's image pins and whatever ``--catalog`` it was given. Two
@@ -7,9 +7,12 @@ projects from the same ledger. With serialised publication, a recovery
 re-renders, and could then recreate unrelated services.
 
 The first controller mutation against a ledger with no profile freezes that
-invocation's resolved settings. Later operations render from the stored copy
-and warn when their own settings differ. ``infer-stack config publish`` replaces
-it while the stack is quiescent.
+invocation's resolved settings. Later operations render from the stored copy.
+For the ordinary ``config init -> catalog suggest --apply -> acquire`` workflow,
+acquire advances this snapshot automatically: compatible catalog additions are
+merged into a live epoch, and a quiescent stack adopts the current invocation
+profile wholesale. ``infer-stack config publish`` remains an advanced explicit
+pre-seed/preview operation; it is not a required third configuration step.
 
 Not in the profile:
 
@@ -55,7 +58,7 @@ class CatalogConflict(CatalogError):
 
 
 class ProfileMismatch(RuntimeError):
-    """A request or backend does not match the published profile."""
+    """A request or backend does not match the active recovery snapshot."""
 
 
 def canonical_digest(data: Any) -> str:
@@ -173,7 +176,7 @@ def catalog_sources(catalog: Any) -> list[dict[str, Any]]:
 
 
 def profile_drift(published: dict[str, Any], invocation: dict[str, Any]) -> list[str]:
-    """Keys where this invocation's settings differ from the published profile.
+    """Keys where this invocation's settings differ from the recovery snapshot.
 
     Catalogs drift only when the invocation names one that is not part of the
     published union; naming a subset is the normal multi-runbook case.
@@ -193,6 +196,35 @@ def profile_drift(published: dict[str, Any], invocation: dict[str, Any]) -> list
     return drift
 
 
+def merge_catalog_sources(
+    published: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Append compatible catalog snapshots, deduplicated by content.
+
+    This is the live-epoch catalog rule: an acquire may add definitions without
+    mutating any definition the recovery snapshot already knows.  Building the
+    union is the semantic conflict check -- if an incoming endpoint/bundle/route
+    resolves differently, :class:`CatalogConflict` is raised before anything is
+    written.
+
+    The snapshots are intentionally retained rather than replacing the old
+    source while workloads are resident.  Once the stack is quiescent the next
+    acquire replaces the profile wholesale with the current user configuration,
+    compacting this history back to the authoritative source(s).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in [*(published or []), *(incoming or [])]:
+        digest = canonical_digest(source)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        out.append(dict(source or {}))
+    # Validate the semantic union now, before a controller persists it.
+    CatalogUnion.from_sources(out)
+    return out
+
+
 def validate_requests_against(union: Any, requests) -> None:
     """Refuse requests a published catalog union does not define identically.
 
@@ -208,24 +240,27 @@ def validate_requests_against(union: Any, requests) -> None:
             continue
         if req.endpoint not in union.endpoints:
             raise ProfileMismatch(
-                f'endpoint {req.endpoint!r} is not in the published catalog; '
-                'publish it first with `infer-stack config publish <catalog> ...` '
-                '(while no leases are active)'
+                f'endpoint {req.endpoint!r} is not in the active recovery snapshot. '
+                'Acquire normally imports compatible additions from the current '
+                'catalog automatically; if this persists, the catalog conflicts '
+                'with definitions already frozen for resident workloads'
             )
         if not union.request_matches(req):
             raise ProfileMismatch(
-                f'endpoint {req.endpoint!r} differs from its published definition '
-                '(the catalog changed since it was published); run '
-                '`infer-stack config publish` while no leases are active'
+                f'endpoint {req.endpoint!r} differs from the definition frozen for '
+                'the active leasing epoch. Quiesce the managed stack (release/evict '
+                'resident deployments), then retry; the next acquire adopts the '
+                'current user catalog automatically'
             )
 
 
 def check_invocation_catalog(union: Any, catalog: Any) -> None:
-    """Refuse a caller's catalog that is not one of the published sources.
+    """Compatibility helper for callers that explicitly require a seeded union.
 
-    Resolving names from the published union while the caller passed an edited
-    catalog would silently serve the old definitions. The rule is "publish
-    first", so an unpublished catalog is an error, not a warning.
+    The ordinary acquire path no longer uses this gate: it resolves from the
+    current user catalog and advances the recovery snapshot automatically.
+    Advanced multi-runbook code may still use this helper when it specifically
+    wants to require membership in a pre-seeded union.
     """
     if not isinstance(union, CatalogUnion) or catalog is None:
         return
@@ -233,7 +268,7 @@ def check_invocation_catalog(union: Any, catalog: Any) -> None:
     if source is None or canonical_digest(source) in set(union.digests):
         return
     raise ProfileMismatch(
-        'this catalog is not part of the published profile (it is new or was '
-        'edited since publishing); run `infer-stack config publish` with every '
-        'catalog this host serves, while no leases are active'
+        'this catalog differs from the active recovery snapshot. Ordinary acquire '
+        'adopts compatible catalog additions automatically; use explicit profile '
+        'publication only for advanced multi-catalog pre-seeding'
     )

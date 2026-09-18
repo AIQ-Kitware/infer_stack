@@ -77,31 +77,40 @@ Items marked **(current)** describe today's code. Items marked **(design
 boundary)** constrain the leasing redesign in that plan and apply to future work
 too.
 
-### Catalog and configuration are fixed during a leasing epoch (design boundary)
+### User config is authoritative; the recovery snapshot is internal
 
-Publish catalog endpoints and global settings (gateway, UI, dynamic routing,
-reverse proxy, image pins) **before** a workload starts acquiring and releasing
-leases. Editing them while leases churn is not a supported operation.
+The primary workflow is `config init -> catalog suggest --apply -> acquire`.
+There is no required `config publish` step in ordinary use. See
+[ADR 0001](../adr/0001-user-config-is-authoritative.md).
 
-- **Frozen on the first operation (current).** The first lease operation
-  against a ledger freezes its resolved settings and catalog into a published
-  profile. Every later operation renders from that profile and warns if its own
-  flags or settings differ.
-- **Several runbooks' catalogs.** To acquire from more than one catalog on one
-  host, publish their union before leasing starts:
-  `infer-stack config publish a.yaml b.yaml`. A name defined differently in
-  two catalogs is refused.
-- **Changing the profile.** `config publish` works only while no lease is
-  active and no deployment container exists. Publishing while leases are live
-  is not supported.
+For crash-safe recovery, leasing still persists a frozen render snapshot. The
+controller advances it automatically on acquire under the publication lock:
 
-Hot catalog mutation, and merging a live catalog with a published one, are out
-of scope. `allowed_gpus` is not part of the profile: it stays per caller.
+- **Quiescent stack.** With no active lease and no managed deployment
+  container, the next acquire adopts the current user settings and catalog
+  wholesale.
+- **Compatible catalog additions while live.** New endpoint/bundle/route
+  definitions can be merged into the active snapshot without changing any
+  definition already frozen for resident workloads. This is the normal
+  "suggest/edit, then acquire another model" path.
+- **Conflicting edits while live.** Redefining a frozen endpoint/bundle/route
+  cannot be adopted into the same leasing epoch. Quiesce the managed stack
+  (release/evict resident deployments) and retry; the next acquire adopts
+  current config automatically.
+- **Global render settings while live.** Gateway/UI/project/image-pin and other
+  global render changes stay frozen for the active epoch. Compatible catalog
+  additions may still proceed. Once the stack is quiescent, the next acquire
+  adopts the global changes automatically.
+- **Several runbooks' catalogs.** `infer-stack config publish a.yaml b.yaml`
+  remains available as an advanced pre-seeding operation. A later runbook whose
+  catalog is already a subset of that union does not compact sibling catalogs
+  away.
 
-Changing the backend kind (Compose to KubeAI or back) is not supported by
-`config publish`. Its quiescence check can only see the new backend's
-resources, so the old one's would be left running unseen. Tear the old stack
-down and start a new ledger for the new backend.
+`allowed_gpus` remains per caller rather than part of the recovery snapshot.
+Changing backend kind (Compose to KubeAI or back) still requires tearing down
+the old backend first; automatic snapshot advancement never crosses backend
+kinds.
+
 
 ### A queued acquire holds nothing while it waits (current, by design)
 

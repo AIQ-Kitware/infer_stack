@@ -37,7 +37,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.coordinate import Coordinate
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
@@ -98,11 +98,66 @@ def engine_services(names) -> list[str]:
     return [n for n in names if not is_gateway_service(n)]
 
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
-# Two endpoint clicks within this window (on the same row) count as a
-# double-click and acquire it; a lone click only highlights. Keeps a stray
-# click from bringing an endpoint up — or bringing it up twice.
-DOUBLE_CLICK_SECS = 0.4
 DEFAULT_THEME = 'textual-dark'
+
+
+class _EndpointTable(DataTable):
+    """Catalog table with deliberate endpoint activation gestures.
+
+    Cell metadata gives us the exact row without screen-coordinate hit testing.
+    Real terminal events normally carry Textual's click ``chain`` value, but the
+    test Pilot intentionally bypasses the App click-chain upgrader.  Keep a tiny
+    row-local timing fallback so two quick clicks on the same rendered row behave
+    identically in tests and in terminals that don't report a native chain.
+    """
+
+    def _row_from_event(self, event: events.Click) -> int | None:
+        try:
+            row = event.style.meta.get('row', -1)
+        except Exception:  # noqa: BLE001 - off-content clicks have no cell meta
+            return None
+        return row if isinstance(row, int) and row >= 0 else None
+
+    def on_click(self, event: events.Click) -> None:
+        row = self._row_from_event(event)
+        if row is None or getattr(event, 'button', 1) != 1:
+            return
+        if not (0 <= row < len(self.app._endpoint_names)):
+            return
+        name = self.app._endpoint_names[row]
+        ctrl = getattr(event, 'ctrl', False) or getattr(event, 'meta', False)
+        if ctrl:
+            self._last_click_name = None
+            self._last_click_at = 0.0
+            event.prevent_default()
+            self.app._open_endpoint_row(row)
+            return
+
+        now = time.monotonic()
+        last_name = getattr(self, '_last_click_name', None)
+        last_at = getattr(self, '_last_click_at', 0.0)
+        threshold = float(getattr(self.app, 'CLICK_CHAIN_TIME_THRESHOLD', 0.5))
+        native_double = getattr(event, 'chain', 1) >= 2
+        timed_double = name == last_name and (now - last_at) <= threshold
+        if native_double or timed_double:
+            # Key the gesture on endpoint identity, not row index: a refresh may
+            # reorder the table between clicks. Reset after activation so a
+            # third click starts fresh; _start_acquire is a second fire guard.
+            self._last_click_name = None
+            self._last_click_at = 0.0
+            event.prevent_default()
+            self.app._activate_endpoint_row(row)
+            return
+        self._last_click_name = name
+        self._last_click_at = now
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == 'enter':
+            # Enter is activation in this table.  Prevent DataTable's own select
+            # action from also posting RowSelected and double-firing the acquire.
+            event.prevent_default()
+            event.stop()
+            self.app._activate_endpoint_row(self.cursor_row)
 
 
 # A warm alternative palette, kept registered (selectable from the command
@@ -237,18 +292,20 @@ class _AddModelScreen(ModalScreen):
 class _AddEndpointScreen(ModalScreen):
     """Wizard: add or edit an endpoint (the served API name clients ask for).
 
-    Exposes the runtime knobs that matter for serving — tensor-parallel size,
-    max model length, GPU memory fraction, raw extra vLLM args (where data
-    parallelism etc. go), and the reclaim policy — mirroring
-    ``catalog endpoint add``. Pass ``entry``/``name`` to edit an existing one.
+    Exposes the runtime knobs that matter for serving, including exact GPU
+    affinity.  ``auto`` keeps normal VRAM-aware placement; a comma-separated
+    list is an explicit physical-GPU override.  Pass ``entry``/``name`` to edit
+    an existing endpoint.  Fields this wizard does not own are preserved when
+    editing, which is important for specialized recipes such as HyperQwen.
     """
 
     CSS = """
     _AddEndpointScreen { align: center middle; }
     #dialog {
-        width: 78; max-height: 90%; height: auto; padding: 1 2;
-        border: round $accent; background: $surface; overflow-y: auto;
+        width: 78; height: 90%; max-height: 42; padding: 1 2;
+        border: round $accent; background: $surface; overflow: hidden;
     }
+    #endpoint-form { height: 1fr; padding: 0 1 0 0; }
     #dialog .hint { color: $text-muted; margin: 0 0 1 0; }
     #dialog Label { margin: 1 0 0 0; color: $text-muted; }
     #dialog Input, #dialog Select { margin: 0 0 1 0; }
@@ -257,16 +314,47 @@ class _AddEndpointScreen(ModalScreen):
     #vllm-opts, #ollama-opts { height: auto; }
     """
 
-    def __init__(self, models: list[str], *, name: str | None = None,
-                 entry: dict | None = None):
+    def __init__(
+        self,
+        models: list[str],
+        *,
+        name: str | None = None,
+        entry: dict | None = None,
+        inventory: dict[str, Any] | None = None,
+    ):
         super().__init__()
         self._models = models
         self._edit_name = name
         self._entry = entry or {}
+        self._gpus = sorted(
+            (inventory or {}).get('gpus', []),
+            key=lambda g: int(g.get('index', 0)),
+        )
 
     def _rt(self, key):
         val = (self._entry.get('runtime') or {}).get(key)
         return '' if val is None else str(val)
+
+    def _gpu_pin_value(self) -> str:
+        indices = (self._entry.get('placement') or {}).get('gpu_indices') or []
+        return ','.join(str(i) for i in indices) if indices else 'auto'
+
+    def _gpu_hint(self) -> str:
+        lead = (
+            'auto lets infer-stack choose.  To pin, enter physical indices such '
+            'as 1 or 0,2.'
+        )
+        if not self._gpus:
+            return lead
+        rows = []
+        for gpu in self._gpus:
+            idx = int(gpu.get('index', 0))
+            name = str(gpu.get('name') or 'GPU')
+            mem = gpu.get('memory_gib')
+            mem_label = f' · {float(mem):g} GiB' if mem is not None else ''
+            display = ' · display active' if gpu.get('display_active') else ''
+            rows.append(f'GPU {idx}: {name}{mem_label}{display}')
+        return lead + '\n' + '\n'.join(rows)
 
     def compose(self) -> ComposeResult:
         editing = self._edit_name is not None
@@ -280,66 +368,77 @@ class _AddEndpointScreen(ModalScreen):
             reclaim = reclaim_spec or ''
         cur_model = self._entry.get('model')
         cur_engine = self._entry.get('engine', 'vllm')
+        prefix_value = ''
+        if 'enable_prefix_caching' in rt:
+            prefix_value = 'on' if rt.get('enable_prefix_caching') else 'off'
         with Vertical(id='dialog'):
             yield Label('Edit endpoint' if editing else 'Add an endpoint',
                         classes='title')
             yield Static(
                 'The served name clients / Open WebUI request. Pick a model and '
-                'engine; the runtime knobs size it on the GPU(s).', classes='hint',
+                'engine; the runtime knobs size and place it on the GPU(s).',
+                classes='hint',
             )
-            yield Label('name')
-            yield Input(value=self._edit_name or '',
-                        placeholder='optional — defaults to <model>-N',
-                        id='e-name', disabled=editing)
-            yield Label('model')
-            model_opts = [(m, m) for m in self._models]
-            if model_opts:
-                yield Select(model_opts, prompt='model…', id='e-model',
-                             value=cur_model if cur_model in self._models
-                             else SELECT_BLANK)
-            else:
-                yield Input(value=cur_model or '', placeholder='model name',
-                            id='e-model-text')
-            yield Label('engine')
-            yield Select([('vllm', 'vllm'), ('ollama', 'ollama')],
-                         value=cur_engine, allow_blank=False, id='e-engine')
-            with Vertical(id='vllm-opts'):
-                yield Label('tensor-parallel size  (GPUs per replica)')
-                yield Input(value=self._rt('tensor_parallel_size'),
-                            placeholder='int, e.g. 2', id='e-tp')
-                yield Label('data-parallel size  (replicas across GPUs)')
-                yield Input(value=self._rt('data_parallel_size'),
-                            placeholder='int, e.g. 2', id='e-dp')
-                yield Label('max model len  (context window, tokens)')
-                yield Input(value=self._rt('max_model_len'),
-                            placeholder='int, e.g. 8192', id='e-mml')
-                yield Label('GPU memory utilization  (0-1, per GPU)')
-                yield Input(value=self._rt('gpu_memory_utilization'),
-                            placeholder='float, e.g. 0.9', id='e-gpu')
-                yield Label('max concurrent sequences')
-                yield Input(value=self._rt('max_num_seqs'),
-                            placeholder='int, optional', id='e-seqs')
-                yield Label('prefix caching')
-                yield Select([('default', ''), ('on', 'on'), ('off', 'off')],
-                             value='on' if rt.get('enable_prefix_caching') else '',
-                             allow_blank=False, id='e-prefix')
-                yield Label('extra vLLM args  (raw flags — dtype etc. go here)')
-                yield Input(value=extra_str,
-                            placeholder='--dtype=half --enforce-eager',
-                            id='e-extra')
-            with Vertical(id='ollama-opts'):
-                yield Label('host  (runtime host name from the catalog)')
-                yield Input(value=self._entry.get('host', ''),
-                            placeholder='e.g. ollama-local', id='e-host')
-                yield Label('extra runtime  (KEY=VALUE, space-separated)')
-                yield Input(value=self._kv_str(rt),
-                            placeholder='num_ctx=8192 keep_alive=5m', id='e-orun')
-            yield Label('reclaim policy  (when idle)')
-            yield Select(
-                [('default', ''), ('keep-warm', 'keep-warm'), ('stop', 'stop'),
-                 ('scale-to-zero', 'scale-to-zero')],
-                value=reclaim or '', allow_blank=False, id='e-reclaim',
-            )
+            # Keep Save/Cancel permanently visible. The form itself scrolls on
+            # short terminals; adding GPU placement made the old all-in-one
+            # dialog taller than the viewport and left Save unreachable.
+            with VerticalScroll(id='endpoint-form'):
+                yield Label('name')
+                yield Input(value=self._edit_name or '',
+                            placeholder='optional — defaults to <model>-N',
+                            id='e-name', disabled=editing)
+                yield Label('model')
+                model_opts = [(m, m) for m in self._models]
+                if model_opts:
+                    yield Select(model_opts, prompt='model…', id='e-model',
+                                 value=cur_model if cur_model in self._models
+                                 else SELECT_BLANK)
+                else:
+                    yield Input(value=cur_model or '', placeholder='model name',
+                                id='e-model-text')
+                yield Label('engine')
+                yield Select([('vllm', 'vllm'), ('ollama', 'ollama')],
+                             value=cur_engine, allow_blank=False, id='e-engine')
+                with Vertical(id='vllm-opts'):
+                    yield Label('tensor-parallel size  (GPUs per replica)')
+                    yield Input(value=self._rt('tensor_parallel_size'),
+                                placeholder='int, e.g. 2', id='e-tp')
+                    yield Label('data-parallel size  (replicas across GPUs)')
+                    yield Input(value=self._rt('data_parallel_size'),
+                                placeholder='int, e.g. 2', id='e-dp')
+                    yield Label('max model len  (context window, tokens)')
+                    yield Input(value=self._rt('max_model_len'),
+                                placeholder='int, e.g. 8192', id='e-mml')
+                    yield Label('GPU memory utilization  (0-1, per GPU)')
+                    yield Input(value=self._rt('gpu_memory_utilization'),
+                                placeholder='float, e.g. 0.9', id='e-gpu')
+                    yield Label('GPU placement  (auto or exact physical indices)')
+                    yield Static(self._gpu_hint(), classes='hint')
+                    yield Input(value=self._gpu_pin_value(),
+                                placeholder='auto, 1, or 0,2', id='e-gpu-pin')
+                    yield Label('max concurrent sequences')
+                    yield Input(value=self._rt('max_num_seqs'),
+                                placeholder='int, optional', id='e-seqs')
+                    yield Label('prefix caching')
+                    yield Select([('default', ''), ('on', 'on'), ('off', 'off')],
+                                 value=prefix_value, allow_blank=False, id='e-prefix')
+                    yield Label('extra vLLM args  (raw flags — dtype etc. go here)')
+                    yield Input(value=extra_str,
+                                placeholder='--dtype=half --enforce-eager',
+                                id='e-extra')
+                with Vertical(id='ollama-opts'):
+                    yield Label('host  (runtime host name from the catalog)')
+                    yield Input(value=self._entry.get('host', ''),
+                                placeholder='e.g. ollama-local', id='e-host')
+                    yield Label('extra runtime  (KEY=VALUE, space-separated)')
+                    yield Input(value=self._kv_str(rt),
+                                placeholder='num_ctx=8192 keep_alive=5m', id='e-orun')
+                yield Label('reclaim policy  (when idle)')
+                yield Select(
+                    [('default', ''), ('keep-warm', 'keep-warm'), ('stop', 'stop'),
+                     ('scale-to-zero', 'scale-to-zero')],
+                    value=reclaim or '', allow_blank=False, id='e-reclaim',
+                )
             with Horizontal(id='buttons'):
                 yield Button('Cancel', id='cancel')
                 yield Button('Save' if editing else 'Add endpoint',
@@ -371,6 +470,38 @@ class _AddEndpointScreen(ModalScreen):
         raw = raw.strip()
         return cast(raw) if raw else None
 
+    @staticmethod
+    def _parse_gpu_indices(raw: str) -> list[int] | None:
+        raw = raw.strip().lower()
+        if not raw or raw == 'auto':
+            return None
+        parts = raw.replace(',', ' ').split()
+        indices = [int(part) for part in parts]
+        if any(i < 0 for i in indices):
+            raise ValueError('GPU indices must be non-negative')
+        if len(indices) != len(set(indices)):
+            raise ValueError('GPU indices must be unique')
+        return indices
+
+    def _required_gpu_count(
+        self, tensor_parallel: int | None, data_parallel: int | None
+    ) -> int:
+        old_rt = self._entry.get('runtime') or {}
+        pipeline = int(old_rt.get('pipeline_parallel_size', 1) or 1)
+        return (
+            max(1, tensor_parallel or 1)
+            * max(1, data_parallel or 1)
+            * max(1, pipeline)
+        )
+
+    def _error(self, message: str) -> None:
+        # The first label is the title; using a notification keeps validation
+        # text visible without repurposing an unrelated field label.
+        try:
+            self.notify(message, severity='error')
+        except Exception:  # noqa: BLE001 - compatibility fallback
+            self.query_one(Label).update(message)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == 'cancel':
             self.dismiss(None)
@@ -381,175 +512,72 @@ class _AddEndpointScreen(ModalScreen):
         except Exception:  # noqa: BLE001 - free-text fallback when no models yet
             model = self.query_one('#e-model-text', Input).value.strip()
         if not model:
-            self.query_one(Label).update('pick (or type) a model')
+            self._error('pick (or type) a model')
             return
         name = self.query_one('#e-name', Input).value.strip()
         engine = str(self.query_one('#e-engine', Select).value or 'vllm')
         reclaim = str(self.query_one('#e-reclaim', Select).value or '')
         result: dict[str, Any] = {
             'name': self._edit_name or name or None,
-            'model': model, 'engine': engine, 'reclaim': reclaim,
-            # Placement has a dedicated editor (GPU pin) and may also carry
-            # min_vram_gib.  Preserve it across an unrelated endpoint edit.
-            'placement': dict(self._entry.get('placement') or {}),
+            'model': model,
+            'engine': engine,
+            'reclaim': reclaim,
+            # Keep the raw entry so the writer can preserve fields this wizard
+            # does not expose (serve_recipe/image/protocol/sharing/etc.).
+            'base_entry': dict(self._entry),
         }
         try:
             if engine == 'vllm':
+                tensor_parallel = self._num(self._v('e-tp'), int)
+                data_parallel = self._num(self._v('e-dp'), int)
+                placement = (
+                    dict(self._entry.get('placement') or {})
+                    if self._entry.get('engine', 'vllm') == 'vllm' else {}
+                )
+                indices = self._parse_gpu_indices(self._v('e-gpu-pin'))
+                required = self._required_gpu_count(tensor_parallel, data_parallel)
+                if indices is not None and len(indices) != required:
+                    raise ValueError(
+                        f'GPU pin needs exactly {required} index/indices for '
+                        'tp×pp×dp'
+                    )
+                detected = {int(g['index']) for g in self._gpus}
+                current = (self._entry.get('placement') or {}).get('gpu_indices')
+                missing = [
+                    i for i in (indices or []) if detected and i not in detected
+                ]
+                if missing and indices != current:
+                    raise ValueError(f'GPU(s) not detected on this host: {missing}')
+                if indices is None:
+                    placement.pop('gpu_indices', None)
+                else:
+                    placement['gpu_indices'] = indices
                 result.update({
-                    'tensor_parallel': self._num(self._v('e-tp'), int),
-                    'data_parallel': self._num(self._v('e-dp'), int),
+                    'tensor_parallel': tensor_parallel,
+                    'data_parallel': data_parallel,
                     'max_model_len': self._num(self._v('e-mml'), int),
                     'gpu_mem': self._num(self._v('e-gpu'), float),
                     'max_num_seqs': self._num(self._v('e-seqs'), int),
                     'prefix_caching': str(
                         self.query_one('#e-prefix', Select).value or ''),
                     'extra_args': self._v('e-extra'),
+                    'placement': placement,
                 })
             else:
                 result.update({
                     'host': self._v('e-host'),
                     'ollama_runtime': self._v('e-orun'),
+                    'placement': {},
                 })
-        except ValueError:
-            self.query_one(Label).update(
-                'parallel sizes / max-len / seqs must be ints, gpu-mem a float')
+        except ValueError as ex:
+            self._error(str(ex) or (
+                'parallel sizes / max-len / seqs must be ints, gpu-mem a float'
+            ))
             return
         self.dismiss(result)
 
     def _v(self, wid: str) -> str:
         return self.query_one(f'#{wid}', Input).value
-
-
-class _GpuPinScreen(ModalScreen):
-    """Set an endpoint's exact local GPU affinity, or return it to auto."""
-
-    CSS = """
-    _GpuPinScreen { align: center middle; }
-    #dialog {
-        width: 72; height: auto; max-height: 90%; padding: 1 2;
-        border: round $accent; background: $surface;
-    }
-    #dialog .hint { color: $text-muted; margin: 0 0 1 0; }
-    #dialog Select, #dialog Input { margin: 0 0 1 0; }
-    #pin-error { color: $error; height: auto; }
-    #pin-buttons { height: auto; align-horizontal: right; margin: 1 0 0 0; }
-    #pin-buttons Button { margin: 0 0 0 2; }
-    """
-
-    def __init__(
-        self,
-        endpoint: str,
-        required_gpu_count: int,
-        inventory: dict[str, Any],
-        current: list[int] | None,
-    ) -> None:
-        super().__init__()
-        self._endpoint = endpoint
-        self._required = max(1, int(required_gpu_count))
-        self._gpus = sorted(
-            inventory.get('gpus', []), key=lambda g: int(g.get('index', 0))
-        )
-        self._current = list(current or [])
-
-    @staticmethod
-    def _gpu_label(gpu: dict[str, Any]) -> str:
-        idx = int(gpu.get('index', 0))
-        name = str(gpu.get('name') or 'GPU')
-        mem = gpu.get('memory_gib')
-        mem_label = f' · {float(mem):g} GiB' if mem is not None else ''
-        display = ' · display active' if gpu.get('display_active') else ''
-        return f'GPU {idx} · {name}{mem_label}{display}'
-
-    def compose(self) -> ComposeResult:
-        plural = '' if self._required == 1 else 's'
-        with Vertical(id='dialog'):
-            yield Label(f'GPU pin · {self._endpoint}', classes='title')
-            yield Static(
-                f'This endpoint requires {self._required} GPU{plural}. '
-                'Auto keeps normal VRAM-aware placement; a pin is an exact '
-                'local operator override.',
-                classes='hint',
-            )
-            if self._required == 1 and self._gpus:
-                options = [('Auto — let infer-stack choose', 'auto')]
-                options.extend((self._gpu_label(g), str(g['index'])) for g in self._gpus)
-                detected = {int(g['index']) for g in self._gpus}
-                if self._current and self._current[0] not in detected:
-                    idx = self._current[0]
-                    options.append((f'GPU {idx} · not currently detected', str(idx)))
-                value = str(self._current[0]) if self._current else 'auto'
-                yield Select(
-                    options, value=value, allow_blank=False, id='pin-one-gpu'
-                )
-            else:
-                if self._gpus:
-                    yield Static(
-                        '\n'.join(self._gpu_label(g) for g in self._gpus),
-                        classes='hint',
-                    )
-                value = ','.join(str(i) for i in self._current)
-                yield Input(
-                    value=value,
-                    placeholder=(
-                        f'comma-separated {self._required} indices, or auto'
-                    ),
-                    id='pin-many-gpu',
-                )
-            yield Static('', id='pin-error')
-            with Horizontal(id='pin-buttons'):
-                yield Button('Cancel', id='cancel')
-                yield Button('Save GPU pin', variant='primary', id='ok')
-
-    def _indices(self) -> list[int] | None:
-        if self._required == 1 and self._gpus:
-            raw = self.query_one('#pin-one-gpu', Select).value
-            if _select_is_blank(raw) or str(raw) == 'auto':
-                return None
-            return [int(str(raw))]
-        raw = self.query_one('#pin-many-gpu', Input).value.strip().lower()
-        if not raw or raw == 'auto':
-            return None
-        parts = raw.replace(',', ' ').split()
-        return [int(p) for p in parts]
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == 'cancel':
-            self.dismiss(None)
-            return
-        try:
-            indices = self._indices()
-        except ValueError:
-            self.query_one('#pin-error', Static).update(
-                'GPU indices must be non-negative integers.'
-            )
-            return
-        if indices is not None:
-            if any(i < 0 for i in indices):
-                self.query_one('#pin-error', Static).update(
-                    'GPU indices must be non-negative integers.'
-                )
-                return
-            if len(indices) != self._required:
-                self.query_one('#pin-error', Static).update(
-                    f'Choose exactly {self._required} GPU(s) for this runtime.'
-                )
-                return
-            if len(set(indices)) != len(indices):
-                self.query_one('#pin-error', Static).update(
-                    'Choose each GPU at most once.'
-                )
-                return
-            detected = {int(g['index']) for g in self._gpus}
-            # When inventory is available, catch typos before writing config.
-            # With no nvidia-smi result, numeric entry remains possible so a
-            # remote/containerized deployment can still be configured.
-            missing = [i for i in indices if detected and i not in detected]
-            if missing and indices != self._current:
-                self.query_one('#pin-error', Static).update(
-                    f'GPU(s) not detected on this host: {missing}'
-                )
-                return
-        self.dismiss({'gpu_indices': indices})
 
 
 class _ConfirmScreen(ModalScreen):
@@ -699,7 +727,6 @@ class InferStackTUI(App):
         Binding('g', 'suggest', 'Suggest', show=False),
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
-        Binding('p', 'pin_gpu', 'GPU pin', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
         Binding('c', 'toggle_docker', 'Toggle docker', show=False),
@@ -771,6 +798,10 @@ class InferStackTUI(App):
         self._service_options: list[str] = []
         self._log_service: str = ENGINE_SERVICES
         self._log_proc: Any = None
+        # Monotonic stream identity. A terminated docker-compose process may
+        # still yield buffered lines while a replacement stream is already
+        # visible; only the current generation is allowed to append.
+        self._log_generation = 0
         self._log_lines: list[str] = []  # mirror of the log pane, for tests
         self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
@@ -787,13 +818,12 @@ class InferStackTUI(App):
         # from the live deployment payload so the API tab probes the surface a
         # completions-only model actually serves (see _protocol_for).
         self._ready_protocols: dict[str, str] = {}
-        # Bringing an endpoint up needs a deliberate double-click (or Enter) so
-        # a stray single click never acquires. Track the last endpoint click for
-        # double-click detection, and whether a pending RowSelected came from the
-        # keyboard (Enter) rather than the mouse.
-        self._select_via_key = False
-        self._last_ep_click_row: int | None = None
-        self._last_ep_click_at = 0.0
+        # Guard against duplicate activation while an acquire worker is already
+        # publishing the selected endpoint (double-click + button, impatient re-click, etc.).
+        self._acquire_inflight: set[str] = set()
+        # Row-highlight messages are informational hints; don't let a refresh
+        # immediately erase the result of a mutation the user just requested.
+        self._status_sticky_until = 0.0
 
     # -- layout ------------------------------------------------------------
 
@@ -819,13 +849,13 @@ class InferStackTUI(App):
                     'serve it, or Suggest a set sized to your GPUs.', classes='desc',
                 )
                 yield Static('', id='catalog-help')
-                yield DataTable(id='endpoints', cursor_type='row',
-                                zebra_stripes=True)
+                yield _EndpointTable(id='endpoints', cursor_type='row',
+                                     zebra_stripes=True)
                 with Horizontal(id='endpoint-actions'):
-                    yield Button('Acquire', id='btn-acquire', variant='primary')
+                    yield Button('Acquire', id='btn-acquire', variant='primary',
+                                 action='app.acquire')
                     yield Button('Add', id='btn-add-endpoint')
                     yield Button('Edit', id='btn-edit-endpoint')
-                    yield Button('GPU pin', id='btn-pin-gpu')
                     yield Button('Remove', id='btn-remove-endpoint')
                 with Horizontal(id='suggest-actions'):
                     yield Button('✨  Suggest from my GPUs', id='btn-suggest')
@@ -1234,6 +1264,11 @@ class InferStackTUI(App):
         try:
             from .leasing import Catalog
             self.catalog = Catalog.load(self.catalog_path)
+            update_catalog = getattr(
+                self.controller, 'set_invocation_catalog', None
+            )
+            if update_catalog is not None:
+                update_catalog(self.catalog)
         except Exception as ex:  # noqa: BLE001
             self._status(f'catalog reload failed: {ex}')
             return
@@ -1328,6 +1363,29 @@ class InferStackTUI(App):
         """Synchronous collect + render (also what tests rely on)."""
         self._sync_pane_state()
         self._render(self._collect())
+
+    def _refresh_ledger_snapshot(self) -> None:
+        """Refresh cheap ledger-backed tables without polling Docker.
+
+        Mutation completion runs on the UI thread.  Repaint the new lease /
+        deployment rows before publishing the mutation status, so DataTable's
+        RowHighlighted messages cannot immediately overwrite a useful
+        ``acquired … lease …`` result with a relationship hint.  The normal
+        background refresh still follows to update observed/running state.
+        """
+        try:
+            leases, deployments = self.controller.ledger.status(
+                virtual_expiry=True
+            )
+        except Exception:  # noqa: BLE001 - mutation result is still useful
+            return
+        self._last_leases = leases
+        self._last_deployments = deployments
+        self._fill_leases(leases)
+        self._fill_deployments(
+            deployments, self._observed, self._assignments, leases
+        )
+        self._update_summary(leases, deployments, self._observed)
 
     def _first_paint(self) -> None:
         """Paint immediately from cheap in-memory ledger state, then kick the
@@ -1681,13 +1739,19 @@ class InferStackTUI(App):
         return factory
 
     def _restart_logs(self, service: str) -> None:
-        self._terminate_logs()
+        # Invalidate the old worker *before* terminating its subprocess. Docker
+        # may have buffered output ready even after SIGTERM; without a stream
+        # generation those stale lines can appear under the newly selected
+        # service (the observed LiteLLM-in-vLLM-pane failure).
+        self._log_generation += 1
+        generation = self._log_generation
+        self._stop_log_proc()
         log = self.query_one('#logs', RichLog)
         log.clear()
         self._log_lines = []
         target, label = self._resolve_log_target(service)
         log.write(f'— following logs: {label} —')
-        self._stream_logs(target)
+        self._stream_logs(target, generation)
 
     def _resolve_log_target(self, service: str):
         """(what to hand `docker compose logs`, what to show the user).
@@ -1707,7 +1771,7 @@ class InferStackTUI(App):
             return None, 'all services'
         return service, service
 
-    def _terminate_logs(self) -> None:
+    def _stop_log_proc(self) -> None:
         proc, self._log_proc = self._log_proc, None
         if proc is not None:
             try:
@@ -1715,20 +1779,44 @@ class InferStackTUI(App):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _terminate_logs(self) -> None:
+        # Collapse/unmount also invalidates any worker whose proc has not even
+        # finished spawning yet.  It will self-terminate when it notices the
+        # stale generation below.
+        self._log_generation += 1
+        self._stop_log_proc()
+
     @work(thread=True, exclusive=True, group='logs')
-    def _stream_logs(self, service: str | None) -> None:
+    def _stream_logs(self, service, generation: int) -> None:
         proc = self._proc_factory(service)
         if proc is None:
             self.call_from_thread(
-                self._append_log, '(no compose project yet — acquire a model)'
+                self._append_log_if_current, generation,
+                '(no compose project yet — acquire a model)'
             )
+            return
+        if generation != self._log_generation:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
             return
         self._log_proc = proc
         try:
             for line in compact_litellm_tracebacks(proc.stdout):
-                self.call_from_thread(self._append_log, line.rstrip('\n'))
+                self.call_from_thread(
+                    self._append_log_if_current, generation, line.rstrip('\n')
+                )
         except Exception:  # noqa: BLE001 - stream ends when the proc dies
             pass
+        finally:
+            if generation == self._log_generation and self._log_proc is proc:
+                self._log_proc = None
+
+    def _append_log_if_current(self, generation: int, line: str) -> None:
+        if generation != self._log_generation:
+            return
+        self._append_log(line)
 
     def _append_log(self, line: str) -> None:
         self._log_lines.append(line)
@@ -1756,8 +1844,17 @@ class InferStackTUI(App):
 
     # -- helpers + actions -------------------------------------------------
 
-    def _status(self, message: str) -> None:
+    def _status(self, message: str, *, sticky_for: float = 0.0) -> None:
+        if sticky_for > 0:
+            self._status_sticky_until = max(
+                self._status_sticky_until, time.monotonic() + sticky_for
+            )
         self.query_one('#status', Static).update(message)
+
+    def _status_hint(self, message: str) -> None:
+        """Publish passive cursor/relationship help unless a result is fresh."""
+        if time.monotonic() >= self._status_sticky_until:
+            self._status(message)
 
     def _copy(self, text: str) -> bool:
         """Copy to the system clipboard. Prefer OS tools (reliable on a desktop:
@@ -1867,24 +1964,50 @@ class InferStackTUI(App):
         self._repaint_marks(tid)
         self._status(f'{len(sel)} checked in {tid} (space/ctrl-click toggles)')
 
+    def _start_acquire(self, name: str) -> None:
+        if name in self._acquire_inflight:
+            self._status(f'{name} is already being acquired')
+            return
+        self._acquire_inflight.add(name)
+        self._status(
+            f'acquiring {name}… (the lease should appear immediately; '
+            'engine output appears in the logs pane)'
+        )
+        self._do_acquire(name)
+
     def action_acquire(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
             self._status('select an endpoint in the catalog to acquire')
             return
-        self._status(f'acquiring {name}… (docker output appears in the logs pane)')
-        self._do_acquire(name)
+        self._start_acquire(name)
+
+    def _activate_endpoint_row(self, row: int) -> None:
+        """Activate the endpoint under a keyboard/double-click gesture."""
+        if not (0 <= row < len(self._endpoint_names)):
+            return
+        table = self.query_one('#endpoints', DataTable)
+        table.move_cursor(row=row)
+        self._start_acquire(self._endpoint_names[row])
+
+    def _open_endpoint_row(self, row: int) -> None:
+        """Ctrl/Cmd+click target from :class:`_EndpointTable`."""
+        if 0 <= row < len(self._endpoint_names):
+            self.query_one('#endpoints', DataTable).move_cursor(row=row)
+            self._open_endpoint(self._endpoint_names[row])
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # Enter on the endpoints table acquires that endpoint. A mouse click
-        # also raises RowSelected (when the clicked row is already the cursor),
-        # but we deliberately do NOT acquire on it — a lone click must not bring
-        # an endpoint up. The mouse path acquires only on a double-click, handled
-        # in on_mouse_down. `_select_via_key` distinguishes the two (set by
-        # on_key for Enter, cleared by on_mouse_down for any click).
-        if event.data_table.id == 'endpoints' and self._select_via_key:
-            self._select_via_key = False
-            self.action_acquire()
+        # Endpoint activation is handled by _EndpointTable (Enter and click
+        # chain == 2).  DataTable's ordinary single-click RowSelected remains a
+        # pure selection gesture and only explains the available activation.
+        if event.data_table.id == 'endpoints':
+            row = event.cursor_row
+            if 0 <= row < len(self._endpoint_names):
+                self._status_hint(
+                    f'{self._endpoint_names[row]} selected — '
+                    'double-click, press Enter, or click Acquire to start'
+                )
+            return
 
     def on_data_table_row_highlighted(
         self, event: DataTable.RowHighlighted
@@ -1899,7 +2022,7 @@ class InferStackTUI(App):
             held = {g.id: g.demand for g in self._last_deployments}
             n = max((held.get(gid, 0) for gid in le.deployment_ids), default=0)
             others = f' (1 of {n} lease(s) on it)' if n > 1 else ''
-            self._status(f'lease {le.id} → deployment {deps}{others}')
+            self._status_hint(f'lease {le.id} → deployment {deps}{others}')
         elif tid == 'deployments' and 0 <= row < len(self._last_deployments):
             g = self._last_deployments[row]
             owners = [
@@ -1907,7 +2030,7 @@ class InferStackTUI(App):
                 if g.id in le.deployment_ids and le.state == LeaseState.ACTIVE
             ]
             who = ', '.join(owners) or '—'
-            self._status(
+            self._status_hint(
                 f'deployment {g.id} ← held by {g.demand} lease(s): {who}'
             )
 
@@ -1924,53 +2047,6 @@ class InferStackTUI(App):
             node = getattr(node, 'parent', None)
         return None
 
-    def on_key(self, event: events.Key) -> None:
-        # Mark that a pending endpoint RowSelected came from a deliberate Enter
-        # (not a mouse click), so it acquires on a single press. Passive: we
-        # never stop the event, so the DataTable's own Enter handling still runs.
-        if event.key == 'enter' and getattr(self.focused, 'id', None) == 'endpoints':
-            self._select_via_key = True
-
-    def on_mouse_down(self, event: events.MouseDown) -> None:
-        # Endpoint bring-up is gated on a double-click here (the App never sees a
-        # plain Click on a DataTable cell — the table stops it — but mouse-down
-        # still bubbles up). A lone click only highlights; two clicks on the same
-        # row within DOUBLE_CLICK_SECS acquire it.
-        self._select_via_key = False  # a mouse interaction is not a keyboard select
-        if self._zone_at(event.screen_x, event.screen_y) != 'endpoints':
-            self._last_ep_click_row = None
-            return
-        # Row under the pointer, straight from the rendered cell metadata
-        # (scroll-independent; -1 for the header, absent off the rows).
-        try:
-            row = event.style.meta.get('row')
-        except Exception:  # noqa: BLE001
-            row = None
-        if not isinstance(row, int) or not (0 <= row < len(self._endpoint_names)):
-            self._last_ep_click_row = None
-            return
-        # Ctrl/Cmd+click opens the served endpoint in the browser (never acquires).
-        if getattr(event, 'ctrl', False) or getattr(event, 'meta', False):
-            self._last_ep_click_row = None
-            self._open_endpoint(self._endpoint_names[row])
-            return
-        now = time.monotonic()
-        if (row == self._last_ep_click_row
-                and now - self._last_ep_click_at <= DOUBLE_CLICK_SECS):
-            self._last_ep_click_row = None
-            name = self._endpoint_names[row]
-            self._status(
-                f'acquiring {name}… (docker output appears in the logs pane)'
-            )
-            self._do_acquire(name)
-        else:
-            self._last_ep_click_row = row
-            self._last_ep_click_at = now
-            self._status(
-                f'{self._endpoint_names[row]} selected — '
-                'double-click or press Enter to acquire'
-            )
-
     def on_click(self, event: events.Click) -> None:
         # A Click on a DataTable cell is stopped by the table, so this only fires
         # for the leases/deployments multi-select shim and the api-urls zone.
@@ -1986,15 +2062,14 @@ class InferStackTUI(App):
             self._click_select(zone, table.cursor_row, shift=shift, ctrl=ctrl)
             return
 
-        # Ctrl+click the API URLs -> open Open WebUI. (Endpoint ctrl+click is
-        # handled in on_mouse_down, since the table swallows the Click there.)
+        # Ctrl+click the API URLs -> open Open WebUI. Endpoint ctrl+click is
+        # handled by _EndpointTable before DataTable's default click action.
         if ctrl and zone == 'api-urls':
             self.action_open_webui()
             event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
-            'btn-acquire': self.action_acquire,
             'btn-release': self.action_release,
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
@@ -2005,7 +2080,6 @@ class InferStackTUI(App):
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
             'btn-edit-endpoint': self.action_edit_endpoint,
-            'btn-pin-gpu': self.action_pin_gpu,
             'btn-remove-endpoint': self.action_remove_endpoint,
             'btn-remove-model': self.action_remove_model,
             'btn-api-send': self.action_api_send,
@@ -2221,9 +2295,8 @@ class InferStackTUI(App):
         if not self.catalog_path:
             self._status('no catalog path — launch the TUI with a catalog to edit')
             return
-        self.push_screen(
-            _AddEndpointScreen(sorted(self.catalog.models)), self._on_add_endpoint
-        )
+        self._status('inspecting GPUs for endpoint editor…')
+        self._prepare_endpoint_editor(None, {})
 
     def action_edit_endpoint(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
@@ -2238,59 +2311,115 @@ class InferStackTUI(App):
             return
         from .cli.commands_catalog import _load_raw
         entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
+        self._status(f'inspecting GPUs for {name} editor…')
+        self._prepare_endpoint_editor(name, entry)
+
+    @work(thread=True, exclusive=True, group='catalog-editor')
+    def _prepare_endpoint_editor(self, name: str | None, entry: dict) -> None:
+        try:
+            from .hardware import detect_inventory
+            inventory = detect_inventory()
+        except Exception:  # noqa: BLE001 - editor remains usable with numeric pins
+            inventory = {'gpu_count': 0, 'gpus': []}
+        self.call_from_thread(
+            self._show_endpoint_editor, name, entry, inventory
+        )
+
+    def _show_endpoint_editor(
+        self, name: str | None, entry: dict, inventory: dict[str, Any]
+    ) -> None:
         self.push_screen(
-            _AddEndpointScreen(sorted(self.catalog.models), name=name, entry=entry),
+            _AddEndpointScreen(
+                sorted(self.catalog.models),
+                name=name,
+                entry=entry,
+                inventory=inventory,
+            ),
             self._on_add_endpoint,
         )
 
     @staticmethod
     def _endpoint_entry(result: dict) -> dict:
-        """Build a catalog endpoint entry from a wizard result (mirrors the CLI).
+        """Build a catalog endpoint entry from the endpoint editor result.
 
-        vLLM and Ollama expose different knobs: vLLM gets the parallelism /
-        context / memory runtime keys (dtype etc. via extra_args), Ollama gets a
-        host plus free-form KEY=VALUE runtime.
+        Editing is patch-like rather than reconstructive: fields the wizard does
+        not expose (for example ``serve_recipe``, ``image``, ``protocol``, or
+        ``sharing``) survive. This is required for specialized serving recipes;
+        opening Edit merely to change the GPU must never downgrade HyperQwen to
+        stock vLLM.
         """
         import shlex
 
-        entry: dict[str, Any] = {'engine': result['engine'],
-                                 'model': result['model']}
-        runtime: dict[str, Any] = {}
-        if result['engine'] == 'vllm':
+        base = dict(result.get('base_entry') or {})
+        old_engine = base.get('engine')
+        engine = result['engine']
+        entry: dict[str, Any] = dict(base)
+        entry['engine'] = engine
+        entry['model'] = result['model']
+
+        runtime: dict[str, Any] = (
+            dict(base.get('runtime') or {}) if old_engine == engine else {}
+        )
+        if engine == 'vllm':
+            entry.pop('host', None)
             keymap = {
                 'tensor_parallel': 'tensor_parallel_size',
                 'data_parallel': 'data_parallel_size',
                 'max_model_len': 'max_model_len',
                 'max_num_seqs': 'max_num_seqs',
             }
+            # These are the runtime fields owned by the form. A blank field is
+            # an explicit return to the engine default; unexposed fields stay.
+            for ck in [*keymap.values(), 'gpu_memory_utilization',
+                       'enable_prefix_caching', 'extra_args']:
+                runtime.pop(ck, None)
             for rk, ck in keymap.items():
                 if result.get(rk) is not None:
                     runtime[ck] = result[rk]
             if result.get('gpu_mem') is not None:
                 runtime['gpu_memory_utilization'] = result['gpu_mem']
             if result.get('prefix_caching') in ('on', 'off'):
-                runtime['enable_prefix_caching'] = result['prefix_caching'] == 'on'
+                runtime['enable_prefix_caching'] = (
+                    result['prefix_caching'] == 'on'
+                )
             if result.get('extra_args'):
                 runtime['extra_args'] = shlex.split(result['extra_args'])
+            placement = dict(result.get('placement') or {})
+            if placement:
+                entry['placement'] = placement
+            else:
+                entry.pop('placement', None)
         else:  # ollama
             if result.get('host'):
                 entry['host'] = result['host']
-            runtime.update(_parse_kv_str(result.get('ollama_runtime', '')))
+            else:
+                entry.pop('host', None)
+            runtime = _parse_kv_str(result.get('ollama_runtime', ''))
+            entry.pop('placement', None)
+
         if runtime:
             entry['runtime'] = runtime
+        else:
+            entry.pop('runtime', None)
         if result.get('reclaim'):
             entry['reclaim'] = {'policy': result['reclaim']}
-        if result.get('placement'):
-            entry['placement'] = dict(result['placement'])
+        else:
+            entry.pop('reclaim', None)
         return entry
 
     def _on_add_endpoint(self, result: dict | None) -> None:
         if not result:
             return
+        self._status('saving endpoint…')
+        self._save_endpoint(result)
+
+    @work(thread=True, exclusive=True, group='mutate')
+    def _save_endpoint(self, result: dict) -> None:
         try:
             from .cli.commands_catalog import (
                 _load_raw,
                 _next_indexed_name,
+                _save_raw,
                 _slug_alias,
             )
             data = _load_raw(self.catalog_path)
@@ -2299,117 +2428,41 @@ class InferStackTUI(App):
                 name = _next_indexed_name(
                     data['endpoints'], _slug_alias(result['model'])
                 )
-            self._write_catalog('endpoints', name, self._endpoint_entry(result))
-            self._status(f'saved endpoint {name} -> {result["model"]}')
-        except Exception as ex:  # noqa: BLE001
-            self._status(f'save endpoint failed: {ex}')
-            return
-        self._reload_catalog()
+            old_entry = data['endpoints'].get(name)
+            new_entry = self._endpoint_entry(result)
+            old_pin = (
+                (old_entry or {}).get('placement') or {}
+            ).get('gpu_indices')
+            new_pin = (new_entry.get('placement') or {}).get('gpu_indices')
 
-    def action_pin_gpu(self) -> None:
-        """Open the exact-GPU override editor for the selected vLLM endpoint."""
-        name = self._selected('endpoints', self._endpoint_names)
-        if not name:
-            self._status('select an endpoint to pin to a GPU')
-            return
-        if not self.catalog_path:
-            self._status('no catalog path — launch the TUI with a catalog to edit')
-            return
-        ep = self.catalog.endpoints.get(name)
-        if ep is None:
-            self._status(f'endpoint {name} is no longer in the catalog')
-            return
-        if getattr(ep, 'engine', '') != 'vllm':
-            self._status(
-                'Ollama GPU affinity belongs to its runtime host; edit the host '
-                'placement instead'
-            )
-            return
-        if name in self._served_endpoints():
-            self._status(f'{name} is actively served — release it before repinning')
-            return
-        self._status(f'inspecting GPUs for {name}…')
-        self._prepare_gpu_pin(name)
+            stale: list[str] = []
+            if old_entry is not None and old_pin != new_pin:
+                _, deployments = self.controller.ledger.status(
+                    virtual_expiry=True
+                )
+                stale = [
+                    g.id for g in deployments
+                    if g.state == DeploymentState.IDLE and name in g.served
+                ]
 
-    @work(thread=True, exclusive=True, group='gpu-pin')
-    def _prepare_gpu_pin(self, name: str) -> None:
-        try:
-            from .hardware import detect_inventory
-            inventory = detect_inventory()
-        except Exception:  # noqa: BLE001 - numeric fallback remains usable
-            inventory = {'gpu_count': 0, 'gpus': []}
-        self.call_from_thread(self._show_gpu_pin, name, inventory)
-
-    def _show_gpu_pin(self, name: str, inventory: dict[str, Any]) -> None:
-        ep = self.catalog.endpoints.get(name)
-        if ep is None:
-            self._status(f'endpoint {name} is no longer in the catalog')
-            return
-        rt = getattr(ep, 'runtime', {}) or {}
-        required = 1
-        for key in (
-            'tensor_parallel_size', 'pipeline_parallel_size', 'data_parallel_size'
-        ):
-            required *= max(1, int(rt.get(key, 1) or 1))
-        current = (getattr(ep, 'placement', {}) or {}).get('gpu_indices')
-        self.push_screen(
-            _GpuPinScreen(name, required, inventory, current),
-            lambda result: self._on_pin_gpu(name, result),
-        )
-
-    def _on_pin_gpu(self, name: str, result: dict | None) -> None:
-        if result is None:
-            self._status('GPU pin unchanged')
-            return
-        if name in self._served_endpoints():
-            self._status(f'{name} became active — release it before repinning')
-            return
-        self._status(f'updating GPU pin for {name}…')
-        self._apply_gpu_pin(name, result.get('gpu_indices'))
-
-    @work(thread=True, exclusive=True, group='mutate')
-    def _apply_gpu_pin(self, name: str, indices: list[int] | None) -> None:
-        try:
-            from .cli.commands_catalog import _load_raw, _save_raw
-
-            data = _load_raw(self.catalog_path)
-            entry = data['endpoints'].get(name)
-            if entry is None:
-                self._after_mutation(f'endpoint {name} is no longer in the catalog')
-                return
-            placement = dict(entry.get('placement') or {})
-            old = placement.get('gpu_indices')
-            new = list(indices) if indices else None
-            if old == new:
-                self._after_mutation('GPU pin unchanged')
-                return
-
-            # Capture resident stale deployments before the compat key changes.
-            _, deployments = self.controller.ledger.status(virtual_expiry=True)
-            stale = [
-                g.id for g in deployments
-                if g.state == DeploymentState.IDLE and name in g.served
-            ]
-
-            if new is None:
-                placement.pop('gpu_indices', None)
-            else:
-                placement['gpu_indices'] = new
-            if placement:
-                entry['placement'] = placement
-            else:
-                entry.pop('placement', None)
-            _save_raw(self.catalog_path, data)
+            data['endpoints'][name] = new_entry
+            _save_raw(self.catalog_path, data)  # validates before publication
 
             evicted = 0
             if stale:
-                evicted = len(self.controller.evict(stale).evicted_deployment_ids)
+                evicted = len(
+                    self.controller.evict(stale).evicted_deployment_ids
+                )
             self.call_from_thread(self._reload_catalog)
-            label = 'auto' if new is None else ','.join(str(i) for i in new)
-            tail = f'; evicted {evicted} stale idle deployment(s)' if evicted else ''
-            self._after_mutation(f'{name} GPU pin → {label}{tail}')
+            tail = (
+                f'; evicted {evicted} stale idle deployment(s)'
+                if evicted else ''
+            )
+            self._after_mutation(
+                f'saved endpoint {name} -> {result["model"]}{tail}'
+            )
         except Exception as ex:  # noqa: BLE001
-            self._after_mutation(f'GPU pin update failed: {ex}')
+            self._after_mutation(f'save endpoint failed: {ex}')
 
     def action_remove_endpoint(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
@@ -2464,7 +2517,10 @@ class InferStackTUI(App):
     def _do_suggest(self) -> None:
         try:
             from .hardware import detect_inventory
-            from .leasing.suggest import suggest_catalog
+            from .leasing.suggest import (
+                migrate_known_suggestion_aliases,
+                suggest_catalog,
+            )
             inventory = detect_inventory()
             frag = suggest_catalog(inventory, reserve_display_gpu='auto')
             if not frag.get('models'):
@@ -2474,6 +2530,7 @@ class InferStackTUI(App):
                 return
             from .cli.commands_catalog import _load_raw, _save_raw
             data = _load_raw(self.catalog_path)
+            migrated = migrate_known_suggestion_aliases(data)
             added = 0
             for sec in ('models', 'endpoints'):
                 for nm, val in frag.get(sec, {}).items():
@@ -2482,7 +2539,10 @@ class InferStackTUI(App):
                         added += 1
             _save_raw(self.catalog_path, data)
             self.call_from_thread(self._reload_catalog)
-            self._after_mutation(f'suggested catalog merged ({added} new entries)')
+            rename = f'; renamed {len(migrated)} prior suggestion(s)' if migrated else ''
+            self._after_mutation(
+                f'suggested catalog merged ({added} new entries{rename})'
+            )
         except Exception as ex:  # noqa: BLE001
             self._after_mutation(f'suggest failed: {ex}')
 
@@ -2717,13 +2777,23 @@ class InferStackTUI(App):
     def _do_acquire(self, name: str) -> None:
         try:
             requests = self.catalog.resolve_names([name])
-            self.controller.acquire(
+            outcome = self.controller.acquire(
                 'manual', requests, ttl_seconds=None, wait=False, apply=True
             )
-            msg = f'acquiring {name}'
+            msg = (
+                f'acquired {name} — lease {outcome.lease.id}; '
+                'engine may still be loading'
+            )
         except Exception as ex:  # noqa: BLE001
             msg = f'acquire {name} failed: {ex}'
-        self._after_mutation(msg)
+        self.call_from_thread(self._finish_acquire, name, msg)
+
+    def _finish_acquire(self, name: str, message: str) -> None:
+        """Clear the click guard and publish an acquire's actual outcome."""
+        self._acquire_inflight.discard(name)
+        self._refresh_ledger_snapshot()
+        self._status(message, sticky_for=2.0)
+        self.action_refresh()
 
     @work(thread=True, exclusive=True, group='mutate')
     def _do_release(self, ids: list[str]) -> None:

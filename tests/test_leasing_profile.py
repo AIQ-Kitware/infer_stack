@@ -75,28 +75,52 @@ def test_drift_is_warned_once(tmp_path):
     finally:
         logger.remove(handle)
         logger.disable('infer_stack')
-    warnings = [m for m in seen if 'published profile' in m]
+    warnings = [m for m in seen if 'active recovery snapshot' in m]
     assert len(warnings) == 1 and 'ui' in warnings[0]
 
 
-def test_acquire_outside_the_published_catalog_is_refused_before_writing(tmp_path):
+def test_acquire_auto_adopts_current_catalog_when_quiescent(tmp_path):
     a = Catalog.from_dict(cat('alpha'))
     b = Catalog.from_dict(cat('beta'))
     ledger, ctl = controller(tmp_path, catalog=a)
     ctl.gc()                                              # freezes {alpha}
     _, ctl2 = controller(tmp_path, catalog=b)
-    with pytest.raises(ProfileMismatch, match='config publish'):
-        ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
-    assert ledger.status()[0] == [] and ledger.publication_pending() is None
+    out = ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
+    assert out.lease.endpoints == ['beta']
+    assert set(ctl2.backend.catalog.endpoints) == {'beta'}
+    assert ledger.publication_pending() is None
 
 
-def test_a_changed_definition_is_refused(tmp_path):
+def test_acquire_auto_merges_compatible_catalog_addition_while_live(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    b = Catalog.from_dict(cat('beta'))
+    _, ctl = controller(tmp_path, catalog=a)
+    ctl.acquire('alpha-owner', a.resolve_names(['alpha']), wait=False)
+
+    # A second ordinary runbook adds beta. No config-publish step: acquire
+    # extends the internal recovery snapshot while preserving alpha's frozen
+    # definition and the live deployment.
+    _, ctl2 = controller(tmp_path, catalog=b)
+    out = ctl2.acquire('beta-owner', b.resolve_names(['beta']), wait=False)
+    assert out.lease.endpoints == ['beta']
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
+
+
+def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path):
     a = Catalog.from_dict(cat('alpha'))
     changed = Catalog.from_dict(cat('alpha', runtime={'max_model_len': 1024}))
     _, ctl = controller(tmp_path, catalog=a)
-    ctl.gc()
-    with pytest.raises(ProfileMismatch, match='differs'):
-        ctl.acquire('x', changed.resolve_names(['alpha']), wait=False)
+    old = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+
+    _, ctl2 = controller(tmp_path, catalog=changed)
+    with pytest.raises(ProfileMismatch, match='active leasing epoch'):
+        ctl2.acquire('y', changed.resolve_names(['alpha']), wait=False)
+
+    ctl.release_leases([old.lease.id], evict=True)
+    _, ctl3 = controller(tmp_path, catalog=changed)
+    out = ctl3.acquire('y', changed.resolve_names(['alpha']), wait=False)
+    assert out.lease.endpoints == ['alpha']
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
 
 
 def test_union_of_catalogs_serves_either_runbook(tmp_path):
@@ -268,20 +292,38 @@ def test_a_declined_recovery_render_keeps_the_crashed_acquires_scope(tmp_path):
     assert ledger.publication_pending()['placement_context'] == {'allowed_gpus': [3]}
 
 
-def test_cli_refuses_an_edited_catalog_instead_of_serving_old_definitions(tmp_path, monkeypatch):
+def test_cli_catalog_edit_then_acquire_needs_no_publish_step(tmp_path, monkeypatch):
     from infer_stack.cli import commands_leasing as cl
 
     state = tmp_path / 'state'
-    monkeypatch.setattr(cl, '_make_backend',
-                        lambda config, *, interactive=False: backend(state))
+    def make_backend(config, *, interactive=False):
+        try:
+            catalog = cl._load_catalog(config)
+        except SystemExit:
+            catalog = None
+        return backend(state, catalog=catalog)
+
+    monkeypatch.setattr(cl, '_make_backend', make_backend)
     db = str(tmp_path / 'ledger.db')
     f = tmp_path / 'a.yaml'
     f.write_text(yaml.safe_dump(cat('alpha')))
-    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
-    f.write_text(yaml.safe_dump(cat('alpha', runtime={'max_model_len': 1024})))
-    with pytest.raises(SystemExit, match='not part of the published profile'):
-        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog', str(f),
-                                 '--no-wait', '--yes'])
+    assert cl.AcquireCLI.main(
+        argv=['alpha', '--ledger', db, '--catalog', str(f), '--no-wait', '--yes']
+    ) == 0
+
+    # Extend the same user catalog while alpha is live. This is the primary UX:
+    # edit/suggest -> acquire, with no explicit profile publication command.
+    data = cat('alpha')
+    data['models']['b'] = {'source': 'hf://org/beta'}
+    data['endpoints']['beta'] = {'engine': 'vllm', 'model': 'b'}
+    f.write_text(yaml.safe_dump(data))
+    assert cl.AcquireCLI.main(
+        argv=['beta', '--ledger', db, '--catalog', str(f), '--no-wait', '--yes']
+    ) == 0
+    profile = Ledger(SqliteStore(db)).profile()
+    assert set(CatalogUnion.from_sources(profile['catalogs']).endpoints) == {
+        'alpha', 'beta'
+    }
 
 
 # -- config publish (quiescent only) ----------------------------------------------

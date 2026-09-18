@@ -288,7 +288,6 @@ def test_tui_endpoint_action_buttons_fit_the_sidebar():
             await pilot.pause()
             sb = app.query_one('#sidebar').region
             for bid in ('#btn-acquire', '#btn-add-endpoint', '#btn-edit-endpoint',
-                        '#btn-pin-gpu',
                         '#btn-remove-endpoint'):
                 r = app.query_one(bid).region
                 assert r.width > 0 and r.x >= sb.x and \
@@ -488,6 +487,9 @@ def test_tui_pane_scoped_action_buttons():
             await pilot.click('#btn-acquire')
             await app.workers.wait_for_complete()
             await pilot.pause()
+            assert not app._acquire_inflight
+            status = str(app.query_one('#status').render())
+            assert 'acquired qwen-coder' in status and 'lease ' in status
 
     _run(scenario)
     leases, _ = controller.ledger.status()
@@ -616,7 +618,7 @@ def test_tui_endpoint_entry_data_parallel_and_ollama():
 
 
 def test_tui_endpoint_wizard_is_engine_adaptive_and_labeled():
-    from textual.widgets import Label, Select
+    from textual.widgets import Input, Label, Select
 
     from infer_stack.tui import InferStackTUI, _AddEndpointScreen
 
@@ -634,10 +636,12 @@ def test_tui_endpoint_wizard_is_engine_adaptive_and_labeled():
             assert screen.query_one('#vllm-opts').display is True
             assert screen.query_one('#ollama-opts').display is False
             assert screen.query_one('#e-dp')        # data-parallel field exists
+            assert screen.query_one('#e-gpu-pin', Input).value == 'auto'
             # fields are labeled (the "blank page" complaint)
             labels = [str(lbl.render()) for lbl in screen.query(Label)]
             assert any('tensor-parallel' in x for x in labels)
             assert any('data-parallel' in x for x in labels)
+            assert any('GPU placement' in x for x in labels)
             # switching engine swaps the field groups
             screen.query_one('#e-engine', Select).value = 'ollama'
             await pilot.pause()
@@ -667,6 +671,7 @@ def test_tui_add_endpoint_writes_advanced_params(tmp_path):
                 'tensor_parallel': 2, 'max_model_len': None, 'gpu_mem': None,
                 'extra_args': '', 'reclaim': '',
             })
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
     _run(scenario)
@@ -701,9 +706,9 @@ def test_tui_edit_blocked_while_served(tmp_path):
 
 def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
     import yaml
-    from textual.widgets import DataTable, Select
+    from textual.widgets import DataTable, Input
 
-    from infer_stack.tui import InferStackTUI, _GpuPinScreen
+    from infer_stack.tui import InferStackTUI, _AddEndpointScreen
 
     controller, catalog = _ctx()
     catalog_path = tmp_path / 'catalog.yaml'
@@ -728,11 +733,14 @@ def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
         )
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._show_gpu_pin('qwen-coder', inventory)
+            raw = yaml.safe_load(catalog_path.read_text())
+            app._show_endpoint_editor(
+                'qwen-coder', raw['endpoints']['qwen-coder'], inventory
+            )
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, _GpuPinScreen)
-            screen.query_one('#pin-one-gpu', Select).value = '1'
+            assert isinstance(screen, _AddEndpointScreen)
+            screen.query_one('#e-gpu-pin', Input).value = '1'
             await pilot.click('#ok')
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -748,32 +756,41 @@ def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
     assert on_disk['endpoints']['qwen-coder']['placement']['gpu_indices'] == [1]
 
 
-def test_tui_gpu_pin_blocked_while_served(tmp_path):
-    import yaml
-    from textual.widgets import DataTable
-
+def test_tui_endpoint_edit_preserves_specialized_recipe_and_changes_gpu_pin():
     from infer_stack.tui import InferStackTUI
 
-    controller, catalog = _ctx()
-    catalog_path = tmp_path / 'catalog.yaml'
-    catalog_path.write_text(yaml.safe_dump(CATALOG))
-    controller.acquire('me', catalog.resolve_names(['qwen-coder']))
-
-    async def scenario():
-        app = InferStackTUI(
-            controller, catalog, interval=999, proc_factory=lambda svc: None,
-            catalog_path=str(catalog_path),
-        )
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.query_one('#endpoints', DataTable).move_cursor(row=0)
-            app.action_pin_gpu()
-            await pilot.pause()
-            assert 'release it before repinning' in str(
-                app.query_one('#status').render()
-            )
-
-    _run(scenario)
+    base = {
+        'engine': 'vllm',
+        'model': 'q38',
+        'protocol': 'chat',
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [0]},
+        'runtime': {
+            'serve_recipe': 'hyperqwen-3090-single',
+            'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+            'pipeline_parallel_size': 1,
+            'max_model_len': 65536,
+        },
+    }
+    entry = InferStackTUI._endpoint_entry({
+        'name': 'q38-hq',
+        'model': 'q38',
+        'engine': 'vllm',
+        'base_entry': base,
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [1]},
+        'tensor_parallel': None,
+        'data_parallel': None,
+        'max_model_len': 65536,
+        'gpu_mem': None,
+        'max_num_seqs': None,
+        'prefix_caching': '',
+        'extra_args': '',
+        'reclaim': '',
+    })
+    assert entry['placement'] == {'min_vram_gib': 24, 'gpu_indices': [1]}
+    assert entry['protocol'] == 'chat'
+    assert entry['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
+    assert entry['runtime']['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
+    assert entry['runtime']['pipeline_parallel_size'] == 1
 
 
 def test_tui_remove_endpoint_writes_catalog(tmp_path):
@@ -1598,6 +1615,63 @@ def test_gateway_services_are_excluded_from_the_default_log_view():
     # real service name.
     assert ENGINE_SERVICES != ALL_SERVICES
     assert ENGINE_SERVICES not in names
+
+
+def test_named_log_process_scopes_docker_compose_to_that_service(monkeypatch):
+    """A named log view must not ask Docker Compose for gateway output."""
+    from infer_stack.tui import _DockerLogProc
+
+    captured = {}
+
+    class _Proc:
+        stdout = iter(())
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured['cmd'] = list(cmd)
+        return _Proc()
+
+    monkeypatch.setattr('subprocess.Popen', fake_popen)
+    service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
+    _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
+
+    cmd = captured['cmd']
+    assert cmd[-1] == service
+    assert 'litellm' not in cmd
+
+
+def test_stale_log_stream_cannot_bleed_into_new_service_selection():
+    """Buffered output from a terminated stream belongs to its old generation.
+
+    Regression: switching from LiteLLM to a named vLLM service could still show
+    LiteLLM lines because the old docker-compose process/worker drained buffered
+    stdout after the pane had already been cleared and relabelled.
+    """
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._log_lines = []
+            app._log_generation = 12
+            app._append_log_if_current(11, 'litellm | stale request spam')
+            assert app._log_lines == []
+            app._append_log_if_current(12, 'vllm-qwen | current engine line')
+            assert app._log_lines == ['vllm-qwen | current engine line']
+
+    _run(scenario)
 
 
 def test_log_target_resolves_the_engines_sentinel_to_service_names():

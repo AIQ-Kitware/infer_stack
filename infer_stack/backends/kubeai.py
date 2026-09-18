@@ -176,6 +176,15 @@ def render_models(
             )
             continue
         runtime = deployment.spec.get('runtime', {}) or {}
+        if runtime.get('serve_recipe'):
+            out.unrenderable.add(deployment.id)
+            out.errors.append(
+                f"{deployment.id}: runtime.serve_recipe="
+                f"{runtime['serve_recipe']!r} is a container launcher/preparation "
+                'recipe supported by the compose backend, not a stock KubeAI '
+                'VLLM Model. Use --backend compose for this endpoint.'
+            )
+            continue
         profile = (
             runtime.get('resource_profile') or default_resource_profile or ''
         )
@@ -394,8 +403,8 @@ class KubeaiBackend(ConvergeScaffold):
             from ..leasing.profile import ProfileMismatch
 
             raise ProfileMismatch(
-                f"the published profile is for the {profile.get('backend')!r} backend; "
-                'run `infer-stack config publish` to change backends'
+                f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
+                'tear down the old backend before switching backend kinds'
             )
         from ..leasing.profile import CatalogUnion
 

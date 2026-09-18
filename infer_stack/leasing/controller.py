@@ -176,15 +176,15 @@ class Controller:
         self._tlock = threading.RLock()
         self._flock_handle = None
         self._flock_depth = 0
-        # Published profile (see leasing/profile.py): this process's own
+        # Recovery snapshot (see leasing/profile.py): this process's own
         # resolved settings, captured before the backend is switched to the
-        # published copy, and the copy the backend currently renders from.
+        # resolved copy, and the snapshot the backend currently renders from.
         self._invocation_profile: dict | None = None
         self._applied_profile: dict | None = None
         self._profile_drift_warned = False
-        # A published profile for another backend kind is reported on the
-        # first mutation, not here: `config publish` must still be able to
-        # open a controller in order to switch backends.
+        # A recovery snapshot for another backend kind is reported on the
+        # first mutation, not here: the advanced explicit publication command
+        # must still be able to open a controller to report the incompatibility.
         self._profile_error: Exception | None = None
         # Set only by apply_now(): the operator explicitly re-approves a render
         # that differs from an earlier approved digest.
@@ -935,14 +935,141 @@ class Controller:
             and g.id not in exclude and required_gpu_count(g) > 0
         ]
 
+    def set_invocation_catalog(self, catalog) -> None:
+        """Update this process's authoritative catalog snapshot.
+
+        Long-lived callers such as the TUI can edit ``catalog.yaml`` without
+        rebuilding the controller.  The backend may already be rendering from
+        the recovery snapshot, so changing ``backend.catalog`` directly would
+        violate the freeze.  Instead update only the invocation profile; the
+        next acquire will adopt it under the publication lock using the same
+        rules as a fresh CLI process.
+        """
+        from .profile import catalog_sources
+
+        render = getattr(self.backend, 'render_profile', None)
+        if render is None:
+            return
+        base = dict(self._invocation_profile or render())
+        base['catalogs'] = catalog_sources(catalog)
+        self._invocation_profile = base
+        self._profile_drift_warned = False
+
+    def _profile_quiescent(self, residency=None) -> bool:
+        """Whether it is safe to replace the recovery snapshot wholesale.
+
+        Match ``config publish``'s meaningful quiescence boundary: no active
+        lease and no managed deployment container.  Gateway/UI containers do
+        not hold an endpoint definition and may be reconciled by the next
+        publication.  If residency is unavailable we conservatively return
+        ``False`` and only compatible catalog additions may advance live.
+        """
+        leases, _ = self.ledger.status(virtual_expiry=True)
+        if any(le.state == LeaseState.ACTIVE for le in leases):
+            return False
+        if residency is None:
+            return False
+        try:
+            return not any(c.deployment_id for c in residency.all_containers())
+        except Exception:  # noqa: BLE001 - unknown residency is not quiescence
+            return False
+
+    def _acquire_profile_candidate(self, *, residency=None) -> dict | None:
+        """Derive an automatic recovery-snapshot advance for an acquire.
+
+        User configuration remains authoritative; the persisted profile is an
+        internal crash-recovery snapshot, not a third configuration surface.
+
+        * Quiescent stack: adopt the invocation profile wholesale.
+        * Live epoch: retain frozen global render settings, but append compatible
+          catalog snapshots so newly suggested/added endpoints can be acquired
+          side by side.  Semantic conflicts fail closed.
+        """
+        from .._log import logger
+        from .profile import (
+            CatalogConflict,
+            ProfileMismatch,
+            merge_catalog_sources,
+            profile_drift,
+        )
+
+        stored = self.ledger.profile()
+        invocation = self._invocation_profile
+        if stored is None or invocation is None or stored == invocation:
+            return None
+        if stored.get('backend') != invocation.get('backend'):
+            raise ProfileMismatch(
+                f"the active recovery snapshot uses {stored.get('backend')!r}, "
+                f"but current config selects {invocation.get('backend')!r}; "
+                'tear down the old backend before switching'
+            )
+        drift = profile_drift(stored, invocation)
+        # A runbook whose catalog is already a subset of an explicitly seeded
+        # union has no drift. Do not compact away sibling runbooks merely
+        # because the stack happens to be quiescent.
+        if not drift:
+            return None
+        if self._profile_quiescent(residency):
+            return invocation
+
+        candidate = dict(stored)
+        try:
+            candidate['catalogs'] = merge_catalog_sources(
+                stored.get('catalogs') or [], invocation.get('catalogs') or []
+            )
+        except CatalogConflict as ex:
+            raise ProfileMismatch(
+                'the current catalog redefines an endpoint/bundle/route that is '
+                'already frozen for the active leasing epoch. Quiesce the managed '
+                'stack (release/evict resident deployments) and retry; the next '
+                'acquire adopts the current user config automatically'
+            ) from ex
+
+        deferred = [
+            key for key in drift if key != 'catalogs'
+        ]
+        if deferred and not self._profile_drift_warned:
+            self._profile_drift_warned = True
+            logger.warning(
+                'Current user settings differ from the active recovery snapshot '
+                '({}); keeping those global settings frozen while workloads are '
+                'resident. Compatible catalog additions still apply now; once the '
+                'stack is quiescent, the next acquire adopts current settings '
+                'automatically.', ', '.join(deferred),
+            )
+        return candidate if candidate != stored else None
+
+    def _use_profile_candidate(self, profile: dict) -> None:
+        use = getattr(self.backend, 'use_profile', None)
+        if use is not None:
+            use(profile)
+
+    def _commit_profile_candidate(self, profile: dict) -> None:
+        """Persist an already-previewed acquire profile without publishing alone.
+
+        The acquire that follows creates the publication marker.  A crash between
+        this write and that marker therefore leaves only newer recovery inputs,
+        never an unrecorded desired-state mutation.  This avoids pairing the
+        acquire's approval digest with a lease that has not committed yet.
+        """
+        self.ledger.set_profile(profile)
+        self._profile_error = None
+        self._applied_profile = profile
+
+    def _restore_stored_profile(self, stored: dict | None) -> None:
+        if stored is None:
+            return
+        self._use_profile_candidate(stored)
+        self._applied_profile = stored
+
     def _sync_profile(self, *, create: bool) -> None:
-        """Make the backend render from the published profile.
+        """Make the backend render from the active recovery snapshot.
 
         With ``create`` (every mutation, under the lock), a ledger without a
-        profile gets this invocation's resolved settings frozen as the initial
-        one. Settings that differ from the published profile are ignored, with
-        one warning per process. Backends without a profile (null, test fakes)
-        are left alone.
+        snapshot gets this invocation's resolved settings frozen as the initial
+        one. Drift is reported once; acquire decides under the same lock whether
+        current user config can advance the snapshot. Backends without a render
+        profile (null, test fakes) are left alone.
         """
         from .._log import logger
         from .profile import profile_drift
@@ -963,8 +1090,8 @@ class Controller:
             stored = self._invocation_profile
             self.ledger.set_profile(stored)
             logger.info(
-                'Froze the initial render profile ({} backend, {} catalog(s)); '
-                'change it with `infer-stack config publish` while no leases are active',
+                'Froze the initial recovery snapshot ({} backend, {} catalog(s)); '
+                'normal acquire advances it automatically from current user config',
                 stored.get('backend'), len(stored.get('catalogs') or []),
             )
         elif not self._profile_drift_warned:
@@ -972,9 +1099,11 @@ class Controller:
             if drift:
                 self._profile_drift_warned = True
                 logger.warning(
-                    'Settings differ from the published profile ({}); rendering '
-                    'from the published profile. Change it with `infer-stack '
-                    'config publish` while no leases are active.', ', '.join(drift),
+                    'Current settings differ from the active recovery snapshot '
+                    '({}); existing workloads continue with the frozen snapshot. '
+                    'Acquire adopts compatible catalog additions automatically and '
+                    'adopts all current settings once the stack is quiescent.',
+                    ', '.join(drift),
                 )
         if stored != self._applied_profile:
             use(stored)
@@ -1342,9 +1471,23 @@ class Controller:
         # admission-queue sleep stay OUTSIDE the lock.
         with self._global_lock():
             self._sync_profile(create=True)
-            validate = getattr(self.backend, 'validate_requests', None)
-            if validate is not None:
-                validate(requests)          # before anything is written
+            stored_profile = self.ledger.profile()
+            candidate_profile = self._acquire_profile_candidate()
+            if candidate_profile is not None:
+                self._use_profile_candidate(candidate_profile)
+            try:
+                validate = getattr(self.backend, 'validate_requests', None)
+                if validate is not None:
+                    validate(requests)      # before desired state is written
+            except BaseException:
+                if candidate_profile is not None:
+                    self._restore_stored_profile(stored_profile)
+                raise
+            if candidate_profile is not None:
+                # The user catalog is authoritative. Persist the compatible
+                # recovery inputs now; the desired-state marker belongs to the
+                # acquire immediately below, not to this snapshot refresh.
+                self._commit_profile_candidate(candidate_profile)
             context = getattr(self.backend, 'placement_context', lambda: None)()
             self._mark_pending(apply=apply, placement_context=context)
             result = self.ledger.acquire(
@@ -1434,9 +1577,7 @@ class Controller:
         while True:
             with self._global_lock():
                 self._sync_profile(create=True)
-                validate = getattr(self.backend, 'validate_requests', None)
-                if validate is not None:
-                    validate(requests)
+                stored_profile = self.ledger.profile()
                 leases, _ = self.ledger.status(virtual_expiry=True)
                 if any(le.state == LeaseState.EXPIRED and
                        self.ledger.get_lease(le.id).state == LeaseState.ACTIVE
@@ -1449,9 +1590,24 @@ class Controller:
                     residency = self.backend.residency()
                 except ResidencyUnknown:
                     residency = None
-                overlay = self.ledger.plan_acquire(requests)
-                allocations, reasons = self._admit(overlay, residency)
+                candidate_profile = self._acquire_profile_candidate(
+                    residency=residency
+                )
+                if candidate_profile is not None:
+                    self._use_profile_candidate(candidate_profile)
+                try:
+                    validate = getattr(self.backend, 'validate_requests', None)
+                    if validate is not None:
+                        validate(requests)
+                    overlay = self.ledger.plan_acquire(requests)
+                    allocations, reasons = self._admit(overlay, residency)
+                except BaseException:
+                    if candidate_profile is not None:
+                        self._restore_stored_profile(stored_profile)
+                    raise
                 if not reasons:
+                    if candidate_profile is not None:
+                        self._commit_profile_candidate(candidate_profile)
                     # Allocations are committed with the lease, so no placement
                     # scope needs recording for recovery.
                     context = None
@@ -1492,6 +1648,8 @@ class Controller:
                         ] or ['admission preview and render disagreed'])
                     rec = self._apply_admitted(rec, result.lease.id, apply=apply)
                     return result, rec
+                if candidate_profile is not None:
+                    self._restore_stored_profile(stored_profile)
                 blocked = sorted(
                     gid for gid in overlay.deployments
                     if gid in overlay.created or gid in overlay.revived

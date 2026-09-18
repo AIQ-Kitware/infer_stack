@@ -358,33 +358,28 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
 
 
 def _requests_catalog(controller, config):
-    """The catalog endpoint names resolve against.
+    """The user catalog endpoint names resolve against.
 
-    Once a profile is published, that is its catalog union, so a runbook can
-    acquire any published endpoint. The invocation's own catalog must then be
-    one of the published sources: an edited or new catalog is refused rather
-    than silently resolved against old definitions. Before anything is
-    published, it is the invocation's catalog.
+    The catalog on disk is the authoritative configuration surface.  The
+    controller's persisted profile is only an internal recovery snapshot and
+    must not become a second catalog the user has to manage.  When a current
+    catalog exists, resolve the requested endpoint from it; acquire will merge
+    compatible additions into the recovery snapshot under the publication lock.
+
+    A published union is only the fallback for advanced runbooks that invoke a
+    lease command without any local/default catalog at all.
     """
-    from ..leasing.profile import CatalogUnion, ProfileMismatch, check_invocation_catalog
+    from ..leasing.profile import CatalogUnion
 
     published = getattr(controller.backend, 'catalog', None)
+    explicit = (
+        getattr(config, 'catalog', None)
+        or os.environ.get('INFER_STACK_CATALOG', '').strip()
+    )
+    path = _catalog_path(config)
+    if explicit or path.exists():
+        return _load_catalog(config)
     if isinstance(published, CatalogUnion):
-        explicit = (
-            getattr(config, 'catalog', None)
-            or os.environ.get('INFER_STACK_CATALOG', '').strip()
-        )
-        if explicit or _catalog_path(config).exists():
-            # A catalog the caller named (or the default one, when present)
-            # must load: a typo'd path or a broken file is an error, never a
-            # silent fall-back to the published union.
-            invocation = _load_catalog(config)
-        else:
-            invocation = None          # no catalog of its own: the union decides
-        try:
-            check_invocation_catalog(published, invocation)
-        except ProfileMismatch as ex:
-            raise SystemExit(str(ex))
         return published
     return _load_catalog(config)
 
@@ -1942,7 +1937,7 @@ def _print_health(health: dict) -> None:
         lines.append(f'ORPHAN: {orphan["id"][:12]} {orphan["service"]} '
                      '(`infer-stack gc --orphans`)')
     if health.get('profile_drift'):
-        lines.append('settings differ from the published profile: '
+        lines.append('settings differ from the active recovery snapshot: '
                      + ', '.join(health['profile_drift']))
     for lease_id in health.get('expired_unswept') or []:
         lines.append(f'expired (not yet reclaimed): {lease_id}')
@@ -2537,18 +2532,21 @@ class RoutesSeedCLI(_ApprovalMixin):
 
 
 class ConfigPublishCLI(_ApprovalMixin):
-    """Publish the render profile: settings, image pins and the catalog union.
+    """Explicitly pre-seed/preview the internal recovery profile.
 
-    Every lease operation renders from the published profile, never from the
-    caller's own flags or settings; the first operation froze one implicitly.
-    This replaces it, and only while the stack is quiescent (no active lease,
-    no deployment container). Pass every catalog that runbooks sharing this
-    host will use: endpoints are merged, identical definitions deduplicated,
-    and a name defined differently in two catalogs is refused.
+    This is an advanced operation, not part of the normal
+    ``config init -> catalog suggest --apply -> acquire`` workflow. Acquire
+    advances the recovery snapshot automatically from current user config.
+
+    Use explicit publication when several independent runbooks should be
+    pre-seeded as one catalog union before any of them acquires, or when an
+    operator deliberately wants a quiescent preview/pre-pull of a future
+    profile. Endpoints are merged, identical definitions deduplicated, and a
+    name defined differently in two catalogs is refused.
 
     Examples:
-        infer-stack config publish --catalog a.yaml
-        infer-stack config publish a.yaml b.yaml --ui --yes
+        infer-stack config publish a.yaml b.yaml --yes
+        infer-stack config publish --catalog a.yaml --ui --yes
     """
 
     __command__ = 'publish'
