@@ -55,6 +55,7 @@ from textual.widgets import (
     TabPane,
 )
 
+from . import __version__
 from .cli.commands_leasing import (
     _gpu_label,
     _lease_ttl,
@@ -627,7 +628,10 @@ class InferStackTUI(App):
     """Monitor + control the leasing stack across panes."""
 
     TITLE = 'infer-stack'
-    SUB_TITLE = 'leasing dashboard'
+    # The running version belongs in the header: a TUI is often the only thing
+    # on screen when someone reports behaviour, and "which version is that?"
+    # is the first question.
+    SUB_TITLE = f'{__version__} · leasing dashboard'
 
     CSS = """
     Screen { layout: vertical; }

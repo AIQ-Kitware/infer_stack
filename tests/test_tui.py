@@ -1809,3 +1809,24 @@ def test_tui_log_records_what_an_action_decided(tmp_path):
 
     _run(scenario)
     assert 'no catalog path' in seen['applog']
+
+
+def test_tui_header_shows_the_running_version():
+    from infer_stack import __version__
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            seen['title'] = app.title
+            seen['sub'] = app.sub_title
+
+    _run(scenario)
+    assert seen['title'] == 'infer-stack'
+    assert seen['sub'].startswith(__version__)      # version, then the description
+    assert 'leasing dashboard' in seen['sub']

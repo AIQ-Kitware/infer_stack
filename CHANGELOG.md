@@ -2,6 +2,11 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The TUI header shows the running version
+
+The header now reads `infer-stack` / `0.7.1 · leasing dashboard`, so a
+screenshot or a bug report says which version produced it.
+
 ### The TUI reports its own failures, in a `TUI log` tab of its own
 
 A failing action used to look like nothing happened: Textual runs actions and
