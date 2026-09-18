@@ -61,10 +61,24 @@ class GpuPlan:
     assignments: dict[str, list[int]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Admission mode only (see plan_placement's keywords):
+    # hard allocations that are no longer valid; never re-placed.
+    degraded: list[str] = field(default_factory=list)
+    # optional residents whose GPUs are now needed or unavailable.
+    displaced: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+@dataclass
+class PlacementInputs:
+    """Admission-mode planner inputs (see :func:`plan_placement`)."""
+
+    required_ids: set[str] = field(default_factory=set)
+    hard: dict[str, list[int]] = field(default_factory=dict)
+    optional_hints: dict[str, list[int]] = field(default_factory=dict)
 
 
 def available_indices(
@@ -147,12 +161,17 @@ def weight_shard_count(deployment: Deployment) -> int:
 def explicit_indices(deployment: Deployment) -> list[int] | None:
     """Indices a deployment pins explicitly, or ``None`` if it wants first-fit.
 
-    Ollama daemons always pin (possibly to ``[]`` for CPU); a vLLM deployment pins
-    only if its runtime carries ``gpu_indices``.
+    Ollama daemons always pin (possibly to ``[]`` for CPU).  vLLM endpoints use
+    ``placement.gpu_indices`` for the supported operator-facing exact pin.  The
+    older ``runtime.gpu_indices`` spelling remains a read-only compatibility
+    fallback for catalogs written before endpoint placement owned this knob.
     """
     spec = deployment.spec
     if spec.get('engine') == OLLAMA:
         return [int(i) for i in (spec.get('gpu_indices') or [])]
+    placement = spec.get('placement', {}) or {}
+    if placement.get('gpu_indices'):
+        return [int(i) for i in placement['gpu_indices']]
     runtime = spec.get('runtime', {}) or {}
     if runtime.get('gpu_indices'):
         return [int(i) for i in runtime['gpu_indices']]
@@ -231,8 +250,29 @@ def plan_placement(
     reserved: list[int] | tuple[int, ...] = (),
     pinned: dict[str, list[int]] | None = None,
     skip_display: bool = False,
+    required_ids: set[str] | None = None,
+    hard: dict[str, list[int]] | None = None,
+    optional_hints: dict[str, list[int]] | None = None,
 ) -> GpuPlan:
     """Assign GPUs to every deployment, or record per-deployment placement errors.
+
+    **Admission mode.** When any of ``required_ids``, ``hard`` or
+    ``optional_hints`` is given, demand decides who gets a GPU, not creation
+    time:
+
+    1. ``hard`` allocations (committed GPUs of LIVE deployments) are validated
+       against the full physical pool, ignoring ``allowed_gpus``. One that is
+       no longer valid is reported in ``degraded`` and never re-placed.
+    2. Required deployments without a hard allocation (``required_ids``) are
+       placed next, as new placements: explicit placement, then fit within
+       ``allowed_gpus``. ``pinned`` is ignored in this mode. Creation order is
+       only a tie-break.
+    3. Optional residents (``optional_hints``: an idle keep-warm deployment's
+       physical GPUs) keep those GPUs if still free, and are otherwise
+       ``displaced``. They are never newly fit.
+
+    Deployments in none of the three are not placed and not errors. With the
+    keywords omitted the planner behaves exactly as before.
 
     Example:
         >>> from infer_stack.hardware import simulate_inventory
@@ -294,6 +334,33 @@ def plan_placement(
             )
 
     ordered = _sorted(deployments)
+
+    if required_ids is not None or hard is not None or optional_hints is not None:
+        # Committed allocations replace soft pins entirely: a required
+        # deployment without one is a NEW placement and must stay inside
+        # allowed_gpus, which a pin (validated against the whole host) would
+        # let it escape.
+        pinned = {}
+        hard = hard or {}
+        required_ids = set(required_ids or ())
+        optional_hints = optional_hints or {}
+        required: list[Deployment] = []
+        optional: list[Deployment] = []
+        for deployment in ordered:
+            if deployment.id in hard:
+                want = [int(i) for i in hard[deployment.id]]
+                if all(i in pin_pool_set for i in want) and not (used & set(want)):
+                    plan.assignments[deployment.id] = want
+                    used.update(want)
+                else:
+                    plan.degraded.append(deployment.id)
+            elif deployment.id in required_ids:
+                required.append(deployment)
+            elif deployment.id in optional_hints:
+                optional.append(deployment)
+        ordered = required
+    else:
+        optional = []
 
     # 1) pinned deployments that are still physically placeable keep their GPUs.
     deferred: list[Deployment] = []
@@ -394,5 +461,14 @@ def plan_placement(
                 indices = free[:count]
         plan.assignments[deployment.id] = indices
         used.update(indices)
+
+    # 4) optional residents (admission mode): stay where they are, or yield.
+    for deployment in optional:
+        want = [int(i) for i in optional_hints[deployment.id]]
+        if all(i in pin_pool_set for i in want) and not (used & set(want)):
+            plan.assignments[deployment.id] = want
+            used.update(want)
+        else:
+            plan.displaced.append(deployment.id)
 
     return plan

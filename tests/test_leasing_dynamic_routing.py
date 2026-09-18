@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from fake_docker_state import ComposeFake
+
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import ComposeBackend, render_compose
 from infer_stack.leasing.compose import (
@@ -59,29 +61,8 @@ def dep(gid, *, served='smol', endpoint=None, hf='org/smol', tp=1,
     )
 
 
-class FakeDocker:
+class FakeDocker(ComposeFake):
     """Stateful docker compose stand-in: ``up`` reflects the compose file."""
-
-    def __init__(self):
-        self.running: list[str] = []
-        self.calls: list[list[str]] = []
-
-    def __call__(self, args: list[str]) -> str:
-        self.calls.append(args)
-        compose_file = args[args.index('-f') + 1] if '-f' in args else None
-        if 'up' in args:
-            data = yaml.safe_load(Path(compose_file).read_text()) or {}
-            self.running = sorted((data.get('services') or {}).keys())
-            return ''
-        if 'down' in args:
-            self.running = []
-            return ''
-        if 'ps' in args:
-            return json.dumps(
-                [{'Service': s, 'State': 'running'} for s in self.running]
-            )
-        return ''
-
 
 class FakeResp:
     def __init__(self, status, payload):
@@ -105,10 +86,10 @@ class RecordingGateway:
 
     def get(self, url, **kw):
         if url.endswith('/v1/model/info'):
-            data = [
-                {'model_name': e['model_name'], 'model_info': {'id': i}}
-                for i, e in self.models.items()
-            ]
+            # LiteLLM returns the route semantics as well as model_info.id.
+            # Preserve them so reconciliation tests can catch same-id drift,
+            # rather than accidentally testing only membership.
+            data = [json.loads(json.dumps(e)) for e in self.models.values()]
             return FakeResp(200, {'data': data})
         return FakeResp(404, {'detail': 'not found'})
 
@@ -243,6 +224,23 @@ def make_backend(tmp_path, http, *, spec='4x80'):
         images=IMAGES, ports=PORTS, state=STATE,
         ui=False, dynamic_routing=True,
     )
+
+
+def test_reconcile_replaces_same_id_route_with_wrong_semantics(tmp_path):
+    """A managed id is identity, not proof that its routing payload is right."""
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    gw = RecordingGateway()
+    be = make_backend(tmp_path, gw)
+    be.converge([a], apply=True)
+    rid = _route_id(a.id, 'smol')
+    assert gw.models[rid]['litellm_params']['model'] == 'openai/smol'
+
+    # Simulate DB drift / an earlier endpoint definition with the same stable id.
+    gw.models[rid]['litellm_params']['model'] = 'ollama/wrong-tag'
+    before = len(gw.calls)
+    assert be._reconcile_routes() is True
+    assert gw.models[rid]['litellm_params']['model'] == 'openai/smol'
+    assert gw.calls[before:] == [('delete', rid), ('new', rid)]
 
 
 def test_converge_writes_routes_file_and_reconciles(tmp_path):
@@ -386,3 +384,158 @@ def test_reconcile_delete_tolerates_already_gone(tmp_path, monkeypatch):
     assert warnings == []  # already gone -> no warning
     be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x')
     assert warnings  # same response without the flag -> warns
+
+
+# -- bounded, reported route reconciliation ----------------------------------
+
+
+class FakeTime:
+    """A clock that only moves when the code under test sleeps or waits."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class UnreachableGateway:
+    """Every admin call fails, and each GET burns its whole timeout."""
+
+    def __init__(self, time):
+        self.time = time
+        self.gets = 0
+
+    def get(self, url, **kw):
+        self.gets += 1
+        self.time.now += kw.get('timeout', 0)
+        raise ConnectionError('gateway down')
+
+    def post(self, url, **kw):
+        raise ConnectionError('gateway down')
+
+
+def _timed_backend(tmp_path, http, time):
+    return ComposeBackend(
+        state_dir=tmp_path, inventory=simulate_inventory('2x80'),
+        run=FakeDocker(), http=http, images=IMAGES, ports=PORTS, state=STATE,
+        ui=False, dynamic_routing=True, sleep=time.sleep, clock=time.clock,
+    )
+
+
+def test_reconcile_reports_success_only_when_routes_verify(tmp_path):
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    gw = RecordingGateway()
+    be = make_backend(tmp_path, gw)
+    be.converge([a], apply=False)
+    assert be._reconcile_routes() is True
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
+    assert be._reconcile_routes() is True     # idempotent: nothing to change, still verified
+
+
+def test_reconcile_against_unreachable_gateway_is_bounded_by_its_deadline(tmp_path):
+    # Listing retries, per-request timeouts and sleeps all share ONE deadline;
+    # a retry count would not bound it (a GET can take 10 s, a POST 30 s).
+    time = FakeTime()
+    gw = UnreachableGateway(time)
+    be = _timed_backend(tmp_path, gw, time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be._reconcile_routes(deadline_s=25.0) is False
+    assert time.now <= 25.0
+    assert gw.gets >= 2                        # it did retry within the budget
+
+
+def test_reconcile_reports_failure_when_a_post_fails(tmp_path):
+    class RejectingGateway(RecordingGateway):
+        def post(self, url, **kw):
+            if url.endswith('/model/new'):
+                return FakeResp(500, {'detail': 'db unavailable'})
+            return super().post(url, **kw)
+
+    time = FakeTime()
+    be = _timed_backend(tmp_path, RejectingGateway(), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be._reconcile_routes(deadline_s=20.0) is False
+    assert time.now <= 20.0
+
+
+def test_a_transient_post_failure_is_retried_within_the_deadline(tmp_path):
+    failures = [1]
+
+    class FlakyGateway(RecordingGateway):
+        def post(self, url, **kw):
+            if url.endswith('/model/new') and failures:
+                failures.pop()
+                return FakeResp(500, {'detail': 'db briefly unavailable'})
+            return super().post(url, **kw)
+
+    time = FakeTime()
+    gw = FlakyGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a = dep('grp-aaaaaa', served='smol')
+    be.converge([a], apply=False)
+    assert be._reconcile_routes(deadline_s=20.0) is True
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
+
+
+def test_post_timeout_is_capped_by_the_remaining_deadline(tmp_path):
+    time = FakeTime()
+    seen = []
+
+    class SlowGateway(RecordingGateway):
+        def get(self, url, **kw):
+            time.now += 4.0                    # a slow but successful listing
+            return super().get(url, **kw)
+
+        def post(self, url, **kw):
+            seen.append(kw['timeout'])
+            return super().post(url, **kw)
+
+    be = _timed_backend(tmp_path, SlowGateway(), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    be._reconcile_routes(deadline_s=10.0)
+    assert seen and all(t <= 10.0 - 4.0 for t in seen)   # never the default 30 s
+
+
+# -- apply() reports whether routes took effect (gates the publication marker) --
+
+
+def test_apply_returns_false_when_routes_do_not_verify(tmp_path):
+    time = FakeTime()
+    be = _timed_backend(tmp_path, UnreachableGateway(time), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be.apply() is False
+
+
+def test_apply_returns_true_once_routes_verify(tmp_path):
+    be = make_backend(tmp_path, RecordingGateway())
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+    assert be.apply() is True
+
+
+def test_apply_uses_the_short_deadline_when_the_gateway_was_already_up(tmp_path):
+    from infer_stack.leasing.compose import (
+        ROUTE_RECONCILE_BOOTSTRAP_S,
+        ROUTE_RECONCILE_STEADY_S,
+    )
+
+    time = FakeTime()
+    be = _timed_backend(tmp_path, UnreachableGateway(time), time)
+    be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
+
+    assert be.apply() is False                 # bootstrap: gateway was not running
+    assert ROUTE_RECONCILE_STEADY_S < time.now <= ROUTE_RECONCILE_BOOTSTRAP_S
+
+    time.now = 0.0
+    assert be.apply() is False                 # steady: the first up started it
+    assert time.now <= ROUTE_RECONCILE_STEADY_S
+
+
+def test_apply_returns_false_for_an_unreadable_render(tmp_path):
+    be = make_backend(tmp_path, RecordingGateway())
+    be.compose_file.parent.mkdir(parents=True, exist_ok=True)
+    be.compose_file.write_text('services: [unclosed\n')
+    assert be.apply() is False

@@ -53,8 +53,17 @@ from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
-from .models import Deployment, is_reservation
+from .models import HYPERQWEN_3090_RECIPE, Deployment, is_reservation
 from .placement import plan_placement
+from .residency import (  # labels live beside the code that reads them back
+    FINGERPRINT_LABEL,
+    SERVICE_LABEL,
+    COMPOSE_PROJECT_LABEL,
+    DEPLOYMENT_LABEL,
+    Residency,
+    ResidencyUnknown,
+    residency_from_inspect,
+)
 
 LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
 VLLM_HOST_PORT_BASE = 18000
@@ -98,7 +107,6 @@ VLLM_DEFAULTS = {
     'max_num_seqs': 256,
 }
 
-DEPLOYMENT_LABEL = 'infer-stack.deployment'
 ENGINE_LABEL = 'infer-stack.engine'
 
 
@@ -157,9 +165,11 @@ def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:
     (:func:`_unique_vllm_service_name`) so same-model dedicated deployments get
     distinct containers/GPUs; the admin-API route table addresses each by name.
 
-    Either way ``observe`` correlates a running container back to its deployment
-    id via the ``infer-stack.deployment`` label, not this name, so the choice of
-    suffix does not affect reconcile bookkeeping.
+    Either way the container carries the ``infer-stack.deployment`` label.
+    :meth:`ComposeBackend.residency` correlates containers to deployments by that
+    label, so the choice of suffix does not affect it. (The lenient
+    :meth:`ComposeBackend.observe` still maps service names through the render
+    sidecar; it is for reporting, not for decisions that touch a GPU.)
     """
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
@@ -184,6 +194,121 @@ def ollama_service_name(deployment: Deployment) -> str:
     return ollama_service_name_for(host)
 
 
+class ApplyAborted(RuntimeError):
+    """Selective apply refused to act; the change stays pending."""
+
+
+@dataclass
+class SelectiveApplyOutcome:
+    kept_services: set[str]
+    removed: list[str]
+    started: list[str]
+    orphans: list[str]
+
+
+def profile_images(profile: dict[str, Any]) -> list[str]:
+    """Every image a Compose profile can need, so publication pulls them all.
+
+    Infrastructure images for what the profile enables, plus the engine image
+    of every endpoint reachable from its published catalogs, including
+    per-endpoint image overrides. With no catalog any vLLM request is possible,
+    so the default vLLM image is included.
+
+    Example:
+        >>> p = {'images': {'vllm': 'v', 'ollama': 'o', 'litellm': 'l', 'postgres': 'p',
+        ...                 'open_webui': 'w', 'nginx': 'n'},
+        ...      'litellm': True, 'dynamic_routing': True, 'ui': False,
+        ...      'reverse_proxy': {'enabled': False}, 'catalogs': []}
+        >>> profile_images(p)
+        ['l', 'p', 'v']
+    """
+    from .profile import CatalogUnion
+
+    images = profile['images']
+    wanted: set[str] = set()
+    if profile.get('litellm'):
+        wanted.add(images['litellm'])
+        if profile.get('dynamic_routing'):
+            wanted.add(images['postgres'])
+        if (profile.get('reverse_proxy') or {}).get('enabled'):
+            wanted.add(images['nginx'])
+    if profile.get('ui'):
+        wanted.add(images['open_webui'])
+    sources = profile.get('catalogs') or []
+    if not sources:
+        wanted.add(images['vllm'])
+        return sorted(wanted)
+    union = CatalogUnion.from_sources(sources)
+    for name in union.endpoints:
+        try:
+            req = union.resolve_endpoint(name)
+        except Exception:  # noqa: BLE001 - an unresolvable endpoint serves nothing
+            continue
+        if req.engine == 'vllm':      # same sources the render uses
+            wanted.add((req.spec.get('runtime') or {}).get('image') or images['vllm'])
+        elif req.engine == 'ollama':
+            wanted.add(req.spec.get('image') or images['ollama'])
+    return sorted(wanted)
+
+
+def _network_name() -> str:
+    from .network import NETWORK_NAME
+
+    return NETWORK_NAME
+
+
+def _stanza_gpus(service: dict[str, Any]) -> list[int]:
+    devices = (((service.get('deploy') or {}).get('resources') or {})
+               .get('reservations') or {}).get('devices') or []
+    out = []
+    for dev in devices:
+        for raw in dev.get('device_ids') or []:
+            try:
+                out.append(int(raw))
+            except ValueError:
+                pass
+    return out
+
+
+#: Bounds for selective apply's waits under the controller's lock.
+APPLY_REMOVAL_WAIT_S = 60.0
+APPLY_HEALTH_WAIT_S = 180.0
+
+
+def _depends_on(service: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``depends_on`` as ``{service: {condition...}}`` for list and map forms."""
+    deps = service.get('depends_on') or {}
+    if isinstance(deps, list):
+        return {d: {} for d in deps}
+    return {d: dict(v or {}) for d, v in deps.items()}
+
+
+def _dependency_levels(services: dict[str, Any], names: list[str]) -> list[list[str]]:
+    """Group ``names`` into start order: each level depends only on earlier ones.
+
+    Example:
+        >>> svcs = {'db': {}, 'gw': {'depends_on': {'db': {}}}, 'm': {}}
+        >>> _dependency_levels(svcs, ['gw', 'db', 'm'])
+        [['db', 'm'], ['gw']]
+    """
+    pending = list(dict.fromkeys(names))
+    started: set[str] = set()
+    levels = []
+    while pending:
+        level = []
+        for name in pending:
+            deps = services.get(name, {}).get('depends_on') or []
+            deps = set(deps) & set(pending)
+            if deps <= started:
+                level.append(name)
+        if not level:                      # a cycle: start the rest together
+            level = list(pending)
+        levels.append(sorted(level))
+        started.update(level)
+        pending = [n for n in pending if n not in started]
+    return levels
+
+
 @dataclass
 class RenderedCompose:
     compose: dict[str, Any]
@@ -201,6 +326,63 @@ class RenderedCompose:
     # deployment silently never getting a container.
     unrenderable: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
+
+
+def stamp_fingerprints(
+    compose: dict[str, Any], *, files: dict[Path, str], env_file: Path | None = None,
+) -> dict[str, str]:
+    """Label every service with a behavioural fingerprint; return service -> fingerprint.
+
+    The fingerprint is ``sha256(canonical stanza without the fingerprint label ||
+    sha256 of each generated file the service bind-mounts)``, plus the managed
+    ``.env`` when the stanza interpolates from it. It changes exactly when the
+    service's behaviour does: an unchanged fingerprint keeps a container, a
+    changed one makes selective apply recreate it. (A per-render label would
+    recreate everything on every apply.)
+
+    ``files`` holds content about to be written (path -> text); a mounted file
+    that is not in it is read from disk if it exists.
+
+    Example:
+        >>> doc = {'services': {'a': {'image': 'x', 'labels': {}}}}
+        >>> fps = stamp_fingerprints(doc, files={})
+        >>> doc['services']['a']['labels'][FINGERPRINT_LABEL] == fps['a']
+        True
+        >>> doc['services']['a']['image'] = 'y'
+        >>> stamp_fingerprints(doc, files={})['a'] != fps['a']
+        True
+    """
+    import re
+
+    by_path = {str(Path(p)): text for p, text in files.items()}
+    env_values: dict[str, str] = {}
+    if env_file is not None and Path(env_file).exists():
+        from ..env_utils import parse_env_file
+
+        env_values = parse_env_file(Path(env_file))
+    out: dict[str, str] = {}
+    for name, svc in (compose.get('services') or {}).items():
+        labels = dict(svc.get('labels') or {})
+        labels.pop(FINGERPRINT_LABEL, None)
+        stanza = {**svc, 'labels': labels}
+        material = [json.dumps(stanza, sort_keys=True, default=str)]
+        for volume in svc.get('volumes') or []:
+            source = str(volume).split(':', 1)[0] if isinstance(volume, str) else ''
+            text = by_path.get(str(Path(source))) if source else None
+            if text is None and source and Path(source).is_file():
+                text = Path(source).read_text(errors='replace')
+            if text is not None:
+                material.append(hashlib.sha256(text.encode('utf-8')).hexdigest())
+        # Only the variables this stanza interpolates: an unrelated key in the
+        # managed .env must not recreate the service.
+        referenced = sorted(set(re.findall(r'\$\{([A-Za-z_][A-Za-z0-9_]*)', material[0])))
+        if referenced:
+            values = json.dumps({k: env_values.get(k) for k in referenced}, sort_keys=True)
+            material.append(hashlib.sha256(values.encode('utf-8')).hexdigest())
+        fingerprint = hashlib.sha256('\x00'.join(material).encode('utf-8')).hexdigest()[:16]
+        svc.setdefault('labels', {})[FINGERPRINT_LABEL] = fingerprint
+        out[name] = fingerprint
+    return out
 
 
 def _gpu_reservation(indices: list[int]) -> dict[str, Any]:
@@ -241,6 +423,10 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'chat_template': runtime.get('chat_template'),
         'trust_remote_code': bool(runtime.get('trust_remote_code', False)),
         'image': runtime.get('image'),
+        # Named launcher/preparation recipes are intentionally distinct from
+        # arbitrary command overrides. The catalog validates the name and the
+        # renderer owns its exact command/env/volume contract.
+        'serve_recipe': runtime.get('serve_recipe'),
         'max_model_len': runtime.get('max_model_len', VLLM_DEFAULTS['max_model_len']),
         'gpu_memory_utilization': runtime.get(
             'gpu_memory_utilization', VLLM_DEFAULTS['gpu_memory_utilization']
@@ -301,8 +487,14 @@ def _vllm_service(
     state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
     simulated = bool(svc.get('simulator'))
+    recipe = svc.get('serve_recipe')
     if simulated:
         command = simulator_args(svc)
+    elif recipe == HYPERQWEN_3090_RECIPE:
+        # HyperQwen's image owns model preparation, patched-vLLM launch flags,
+        # and the DFlash2 drafter. Its entrypoint accepts the mode name rather
+        # than ``vllm serve MODEL ...``.
+        command = ['single']
     else:
         command = [
             deployment.spec['hf_model_id'],
@@ -313,6 +505,21 @@ def _vllm_service(
             *vllm_args(svc),
         ]
     environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
+    if recipe == HYPERQWEN_3090_RECIPE:
+        environment.update({
+            # Match the internal port infer-stack routes to. HyperQwen defaults
+            # to 18020 when run standalone.
+            'PORT': '8000',
+            # HyperQwen's current speed-first one/few-user 3090 profile.
+            'SPEC': 'dflash2',
+            'PREFIX_CACHE': '1' if svc.get('enable_prefix_caching') else '0',
+            'MAX_LEN': str(svc['max_model_len']),
+            'GPU_UTIL': str(svc['gpu_memory_utilization']),
+            # The launcher hardcodes qwen3.8-27b before EXTRA_ARGS. Infer-stack
+            # endpoints are allowed to choose a served alias, so override it
+            # last to keep the LiteLLM upstream model name truthful.
+            'EXTRA_ARGS': f"--served-model-name={svc['served_model_name']}",
+        })
     # Attention backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
     # flag; forward it verbatim when the endpoint sets one (e.g. TORCH_SDPA to
     # match a HuggingFace-eager deployment's numerics).
@@ -358,6 +565,16 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
+    if recipe == HYPERQWEN_3090_RECIPE:
+        # HyperQwen does not use vLLM's standard /root cache layout. Persist
+        # both its prepared ~20 GB model tree and compile/JIT/HF cache so
+        # release/reacquire is a container restart rather than a re-download +
+        # re-quantization + recompile.
+        root = f'{state["runtime"]}/hyperqwen/qwen3.8-27b'
+        service['volumes'] = [
+            f'{root}/models:/app/models',
+            f'{root}/cache:/cache',
+        ]
     # Only publish a host port when there's no gateway to front the upstream.
     # Behind LiteLLM the upstream is internal (reached by compose-network DNS at
     # :8000), and a published port would have to be unique across the live set,
@@ -703,9 +920,10 @@ def _route_id(deployment_id: str, endpoint: str) -> str:
     """Deterministic LiteLLM model id for one (deployment, endpoint) route.
 
     Stable across converges, so route reconcile (:meth:`ComposeBackend.
-    _reconcile_routes`) is a pure set-diff: the same logical route always has the
-    same id (added once, never churned), and a route that drops out of the
-    desired set is deleted by exactly this id. The ``isr-`` prefix marks it
+    _reconcile_routes`) can identify one logical route across renders.  A route
+    whose id disappears is deleted by exactly this id; a route whose id remains
+    but whose observable routing semantics drifted is replaced under the same id.
+    The ``isr-`` prefix marks it
     infer-stack-managed so reconcile never deletes a model someone added by hand.
     """
     digest = hashlib.sha256(f'{deployment_id}|{endpoint}'.encode()).hexdigest()
@@ -1272,6 +1490,9 @@ def render_compose(
                 ).hexdigest()[:12],
             )
 
+    for name, svc in services.items():
+        svc.setdefault('labels', {})[SERVICE_LABEL] = name
+
     return RenderedCompose(
         compose={'name': project, 'services': services},
         services=service_map,
@@ -1283,10 +1504,126 @@ def render_compose(
     )
 
 
-def _default_docker_run(args: list[str]) -> str:
+#: Wall-clock bounds for Docker commands, by kind (seconds). Controller
+#: operations run these under a host-wide lock, so none may be unbounded.
+#: Generous for now: ``up`` may still pull images. Tune from host measurements.
+DOCKER_TIMEOUT_QUERY = 60.0        # ps, inspect, version, images
+DOCKER_TIMEOUT_LIFECYCLE = 300.0   # stop, rm, start, unpause, exec
+DOCKER_TIMEOUT_CONVERGE = 1800.0   # compose up / down
+DOCKER_TIMEOUT_PULL = 3600.0       # pull, manifest inspect, in-container model pulls
+
+#: Budget for reconciling dynamic routes against the gateway: listing, POSTs
+#: and verification together. This default is the bootstrap budget (a fresh
+#: gateway waits on Postgres health and runs DB migrations); it preserves the
+#: previous 90 x 2 s listing retry.
+ROUTE_RECONCILE_BOOTSTRAP_S = 180.0
+#: Budget when the gateway was already running before this apply (steady state).
+#: Short, because the controller holds its host-wide lock while applying; on
+#: expiry the change stays pending and the next applying operation retries.
+ROUTE_RECONCILE_STEADY_S = 20.0
+
+
+def _docker_timeout(args: list[str]) -> float:
+    """Pick the time bound for one ``docker`` invocation from its arguments.
+
+    Example:
+        >>> _docker_timeout(['docker', 'inspect', 'abc'])
+        60.0
+        >>> _docker_timeout(['docker', 'compose', '-p', 'x', '-f', 'y', 'up', '-d'])
+        1800.0
+        >>> _docker_timeout(['docker', 'compose', '-p', 'x', 'exec', '-T', 's', 'ollama', 'pull', 't'])
+        3600.0
+    """
+    words = set(args[1:])
+    if 'pull' in words or 'manifest' in words:
+        return DOCKER_TIMEOUT_PULL
+    if 'up' in words or 'down' in words:
+        return DOCKER_TIMEOUT_CONVERGE
+    if words & {'stop', 'rm', 'start', 'unpause', 'exec', 'kill'}:
+        return DOCKER_TIMEOUT_LIFECYCLE
+    return DOCKER_TIMEOUT_QUERY
+
+
+#: Caller environment variables Docker commands may inherit. Everything else,
+#: notably ``HF_TOKEN`` and ``DOCKER_HOST``, is dropped: a variable exported in
+#: one caller's shell must not change what Compose interpolates
+#: (``${HF_TOKEN:-}`` would otherwise override the managed ``.env``) or which
+#: daemon a recovery talks to. ``DOCKER_CONTEXT`` is then forced to
+#: ``default``, because ``$HOME/.docker/config.json`` can select another.
+DOCKER_ENV_ALLOWLIST = (
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR',
+    'XDG_RUNTIME_DIR', 'TERM',
+)
+
+
+def docker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The explicit process environment for every Docker command infer-stack runs.
+
+    Example:
+        >>> env = docker_environment({'PATH': '/bin', 'HF_TOKEN': 'x', 'DOCKER_HOST': 'tcp://y',
+        ...                           'DOCKER_CONTEXT': 'remote'})
+        >>> env
+        {'PATH': '/bin', 'DOCKER_CONTEXT': 'default'}
+    """
+    import os
+
+    source = os.environ if environ is None else environ
+    env = {k: source[k] for k in DOCKER_ENV_ALLOWLIST if k in source}
+    env['DOCKER_CONTEXT'] = 'default'
+    return env
+
+
+def _default_docker_run(
+    args: list[str], *, timeout: float | None = None,
+    stderr_lines: Callable[[str], None] | None = None,
+) -> str:
+    """Run a docker command and return stdout, bounded in wall-clock time.
+
+    Same contract as ``subprocess.check_output(args, text=True)`` -- stdout is
+    returned, stderr is inherited, a non-zero exit raises ``CalledProcessError``
+    -- plus a time bound. The command runs in its own process group so that, on
+    timeout, the whole group (``docker compose`` spawns children) is killed and
+    :class:`~infer_stack.leasing.backend.BackendTimeout` is raised.
+    """
+    import os
+    import signal
     import subprocess
 
-    return subprocess.check_output(args, text=True)
+    from .backend import BackendTimeout
+
+    bound = _docker_timeout(args) if timeout is None else timeout
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, text=True, start_new_session=True,
+        env=docker_environment(),
+        stderr=subprocess.PIPE if stderr_lines is not None else None,
+    )
+    def kill_group():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+
+    try:
+        out, err = proc.communicate(timeout=bound)
+    except subprocess.TimeoutExpired:
+        kill_group()
+        raise BackendTimeout(
+            f'{" ".join(args)} did not finish within {bound:g}s and was killed; '
+            'runtime state is unknown until observed again'
+        ) from None
+    except BaseException:
+        # Ctrl-C reaches only our process group; the command runs in its own
+        # session, so without this it would keep running unattended.
+        kill_group()
+        raise
+    if stderr_lines is not None:
+        for line in (err or '').splitlines():
+            if line.strip():
+                stderr_lines(line.rstrip())
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args, output=out, stderr=err)
+    return out
 
 
 def _parse_ps(out: str) -> set[str]:
@@ -1355,6 +1692,7 @@ class ComposeBackend(ConvergeScaffold):
         catalog: Any = None,
         dynamic_routing: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.state_dir = Path(state_dir)
         # Constructing a backend must not touch the filesystem fatally. `doctor`
@@ -1391,6 +1729,8 @@ class ComposeBackend(ConvergeScaffold):
         self.reverse_proxy = reverse_proxy
         self.reverse_proxy_port = reverse_proxy_port
         self.reverse_proxy_config = reverse_proxy_config
+        # Set by use_profile(): the published proxy config content.
+        self._profile_proxy_text: str | None = None
         # Retained for API/CLI compatibility but no longer consulted: probe_ready
         # always verifies a real generation now (the only trustworthy readiness).
         self.require_generation = require_generation
@@ -1405,9 +1745,12 @@ class ComposeBackend(ConvergeScaffold):
         # deployments land on distinct GPUs) with no gateway recreation/blip.
         self.dynamic_routing = dynamic_routing
         self._sleep = sleep
+        self._clock = clock
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
+        self.last_displaced: list[str] = []  # optional residents that yielded
+        self.last_degraded: list[str] = []   # invalid committed allocations
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
         # VRAM facts (docs/planning/vram-aware-placement.md Phase 3): the
         # measured-requirement overlay + a per-process cache of weight-bytes
@@ -1646,7 +1989,7 @@ class ComposeBackend(ConvergeScaffold):
         cmd += ['-p', self.project, '-f', str(self.compose_file)]
         return self.run([*cmd, *args])
 
-    def plan(self, desired: list[Deployment]):
+    def plan(self, desired: list[Deployment], placement=None):
         """Compute GPU placement for ``desired`` without writing or applying.
 
         Read-only and side-effect free: it honors the persisted pins, so the
@@ -1657,6 +2000,15 @@ class ComposeBackend(ConvergeScaffold):
         pinned = self._load_sidecar().get('assignments', {})
         desired = list(desired)
         self._enrich_placement(desired)
+        keywords = {}
+        if placement is not None:
+            # Admission mode: committed allocations and residency decide; the
+            # sidecar's pins only keep unresolved LIVE deployments stable.
+            keywords = dict(
+                required_ids=set(placement.required_ids),
+                hard=dict(placement.hard),
+                optional_hints=dict(placement.optional_hints),
+            )
         return plan_placement(
             desired,
             self.inventory,
@@ -1664,7 +2016,111 @@ class ComposeBackend(ConvergeScaffold):
             reserved=self.reserved,
             pinned=pinned,
             skip_display=self.skip_display,
+            **keywords,
         )
+
+    def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
+        """Place and render ``desired`` exactly as :meth:`converge` would; write nothing.
+
+        Returns ``(plan, rendered)``. Admission uses it to decide, before any
+        commit, whether a candidate lease is placeable **and** renderable. With
+        ``approve``, the operator is shown the resulting diff now (raising
+        :class:`ConvergeAborted` on decline); the render that follows the commit
+        then does not ask again as long as it produces the same files.
+        """
+        docs = self._render_documents(list(desired), placement)
+        self.last_preview_digest = self._planned_digest(docs['planned'])
+        if approve:
+            self._approve_changes(docs['planned'])
+            self._preapproved = self.last_preview_digest
+        return docs['plan'], docs['rendered']
+
+    def _render_documents(self, desired: list[Deployment], placement) -> dict[str, Any]:
+        """Placement, render, generated files and fingerprints, in memory."""
+        plan = self.plan(desired, placement)
+        if self.litellm and self.dynamic_routing:
+            # The DB secret must exist before rendering, so docker compose
+            # --env-file can interpolate ${LITELLM_DB_PASSWORD} at apply time.
+            self.db_password()
+        route_registry = None
+        if self.litellm and not self.dynamic_routing:
+            # Unconditional in static-superset mode: `self.catalog` may be None;
+            # the incoming set is then deployments-only, and the render still
+            # comes from the accumulated registry, so a catalog-less converge
+            # cannot strip routes or blip.
+            route_registry = self._merged_route_registry(desired, plan.assignments)
+        rendered = render_compose(
+            desired, plan.assignments, images=self.images, ports=self.ports,
+            state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
+            litellm_master_key=self.master_key() if self.litellm else None,
+            ui=self.ui, ui_port=self.ui_port, reverse_proxy=self.reverse_proxy,
+            reverse_proxy_port=self.reverse_proxy_port,
+            reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
+            project=self.project, catalog=self.catalog,
+            route_registry=route_registry, dynamic_routing=self.dynamic_routing,
+        )
+        addresses = None
+        if self.network is not None:
+            from .network import allocate, stamp_network
+
+            addresses = allocate(self.network['subnet'], self.network['addresses'],
+                                 (rendered.compose.get('services') or {}).keys())
+            stamp_network(rendered.compose, self.network['subnet'], addresses)
+        planned: dict[Path, str] = {}
+        if (
+            self.reverse_proxy
+            and self._profile_proxy_text is not None
+            and self.reverse_proxy_config is not None
+        ):
+            planned[Path(self.reverse_proxy_config)] = self._profile_proxy_text
+        if rendered.litellm_config is not None:
+            planned[self.state_dir / LITELLM_CONFIG_FILENAME] = rendered.litellm_config
+        if rendered.nginx_config is not None:
+            planned[self.state_dir / NGINX_CONFIG_FILENAME] = rendered.nginx_config
+        if rendered.litellm_routes is not None:
+            planned[self._routes_file] = json.dumps(rendered.litellm_routes, indent=2)
+        fingerprints = stamp_fingerprints(
+            rendered.compose, files=planned, env_file=self._env_path,
+        )
+        planned[self.compose_file] = yaml.safe_dump(rendered.compose, sort_keys=False)
+        return {'plan': plan, 'rendered': rendered, 'planned': planned,
+                'fingerprints': fingerprints, 'route_registry': route_registry,
+                'addresses': addresses}
+
+    #: Stable addressing (plan step P7), set by the controller once
+    #: `network migrate` has run: ``{'subnet': ..., 'addresses': {service: ip}}``.
+    network: dict[str, Any] | None = None
+    #: Called with the full address table after an approved render, to persist
+    #: newly allocated addresses (append-only).
+    on_addresses: Any = None
+
+    @staticmethod
+    def _planned_digest(planned: dict) -> str:
+        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
+        return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+    #: Digest of files an admission preview already had approved.
+    _preapproved: str | None = None
+    #: Digest of the files the last render produced (approved-digest guard).
+    last_planned_digest: str | None = None
+    #: Digest of the files the last preview produced.
+    last_preview_digest: str | None = None
+
+    def pull_images(self, images) -> list[str]:
+        """Pull ``images``; ``config publish`` passes :func:`profile_images`."""
+        from .._log import logger
+
+        for image in sorted(set(images)):
+            logger.info('docker pull {}', image)
+            self.run(['docker', 'pull', image])
+        return sorted(set(images))
+
+    def _approve_changes(self, planned: dict) -> None:
+        if self._preapproved is not None and self._planned_digest(planned) == self._preapproved:
+            self._preapproved = None
+            return
+        self._preapproved = None
+        super()._approve_changes(planned)
 
     def plan_on_idle_host(self, desired: list[Deployment]):
         """Placement for ``desired`` alone, as if nothing else were running.
@@ -1832,15 +2288,10 @@ class ComposeBackend(ConvergeScaffold):
             )
         return data
 
-    def _update_route_registry(
+    def _merged_route_registry(
         self, desired: list[Deployment], assignments: dict[str, list[int]]
     ) -> dict[str, Any]:
-        """Load, merge the invoking catalog (if any) + all live deployments,
-        persist iff changed, and return the merged registry.
-
-        Called under the converge flock (:meth:`_converge_lock`), so the
-        read-merge-write is race-safe against concurrent converges from other
-        runbooks with no new locking."""
+        """The route registry merged with the catalog and ``desired``, in memory."""
         from .._log import logger
 
         existing = self._load_route_registry()
@@ -1850,28 +2301,36 @@ class ComposeBackend(ConvergeScaffold):
         # `desired` spans all runbooks via the shared ledger, so this keeps every
         # live cross-runbook deployment routable (and, via persistence, routable
         # past release).
-        incoming.update(
-            _registry_incoming_from_deployments(desired, assignments)
-        )
+        incoming.update(_registry_incoming_from_deployments(desired, assignments))
         merged, warnings = _merge_route_registry(existing, incoming)
         for w in warnings:
             logger.warning('  route registry: {}', w)
-        if merged != existing:
-            prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
-            added = sorted(set(merged['entries']) - set(prior))
-            updated = sorted(
-                k for k in merged['entries']
-                if k in prior and merged['entries'][k] != prior[k]
-            )
-            if added:
-                logger.info('  route registry: +{} route(s): {}',
-                            len(added), ', '.join(added))
-            if updated:
-                logger.info('  route registry: updated route(s): {}',
-                            ', '.join(updated))
-            self._atomic_write(
-                self._registry_file, _dump_route_registry(merged)
-            )
+        return merged
+
+    def _save_route_registry(self, merged: dict[str, Any]) -> None:
+        """Persist a merged registry if it changed (under the converge flock)."""
+        from .._log import logger
+
+        existing = self._load_route_registry()
+        if merged == existing:
+            return
+        prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
+        added = sorted(set(merged['entries']) - set(prior))
+        updated = sorted(
+            k for k in merged['entries'] if k in prior and merged['entries'][k] != prior[k]
+        )
+        if added:
+            logger.info('  route registry: +{} route(s): {}', len(added), ', '.join(added))
+        if updated:
+            logger.info('  route registry: updated route(s): {}', ', '.join(updated))
+        self._atomic_write(self._registry_file, _dump_route_registry(merged))
+
+    def _update_route_registry(
+        self, desired: list[Deployment], assignments: dict[str, list[int]]
+    ) -> dict[str, Any]:
+        """Merge and persist the route registry; return it (kept for callers)."""
+        merged = self._merged_route_registry(desired, assignments)
+        self._save_route_registry(merged)
         return merged
 
     def merge_route_registry(
@@ -1898,7 +2357,7 @@ class ComposeBackend(ConvergeScaffold):
                 )
         return merged
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
+    def converge(self, desired: list[Deployment], *, apply: bool = True, placement=None):
         """Place + render the desired union, then optionally apply it.
 
         The work splits into *render* (decide placement, write the
@@ -1918,8 +2377,12 @@ class ComposeBackend(ConvergeScaffold):
                 len(desired),
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            plan = self.plan(desired)
+            docs = self._render_documents(desired, placement)
+            plan, rendered, planned = docs['plan'], docs['rendered'], docs['planned']
+            fingerprints = docs['fingerprints']
             self.last_assignments = dict(plan.assignments)
+            self.last_displaced = list(plan.displaced)
+            self.last_degraded = list(plan.degraded)
             for gid, gpus in sorted(plan.assignments.items()):
                 logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
             for err in plan.errors:
@@ -1929,89 +2392,44 @@ class ComposeBackend(ConvergeScaffold):
                 # contradicts a declared min_vram_gib): never fail the plan,
                 # never be silent either.
                 logger.warning('  placement: {}', note)
-            if self.litellm and self.dynamic_routing:
-                # Persist the DB secret to the sidecar .env *before* rendering, so
-                # docker compose --env-file can interpolate ${LITELLM_DB_PASSWORD}
-                # into the postgres + litellm services at apply time.
-                self.db_password()
-            route_registry = None
-            if self.litellm and not self.dynamic_routing:
-                # Unconditional in static-superset mode: `self.catalog` may be
-                # None (a bare release/gc with no discoverable config dir) — the
-                # incoming set is then deployments-only, and the render still
-                # comes from the accumulated registry, so a catalog-less converge
-                # cannot strip routes or blip. This retires the legacy
-                # per-deployment `_litellm_model_list` branch from the backend
-                # path entirely (it survives in render_compose for direct callers).
-                route_registry = self._update_route_registry(
-                    desired, plan.assignments
-                )
-            rendered = render_compose(
-                desired,
-                plan.assignments,
-                images=self.images,
-                ports=self.ports,
-                state=self.state,
-                litellm=self.litellm,
-                litellm_port=self.litellm_port,
-                litellm_master_key=self.master_key() if self.litellm else None,
-                ui=self.ui,
-                ui_port=self.ui_port,
-                reverse_proxy=self.reverse_proxy,
-                reverse_proxy_port=self.reverse_proxy_port,
-                reverse_proxy_config=self.reverse_proxy_config,
-                aux_dir=self.state_dir,
-                project=self.project,
-                catalog=self.catalog,
-                route_registry=route_registry,
-                dynamic_routing=self.dynamic_routing,
-            )
             # A deployment the render excluded (service-name collision) is as
             # undeliverable as an unplaced one: fold it into last_unplaced /
             # last_errors so acquire fails loudly and rolls the lease back.
             self.last_errors = list(plan.errors) + list(rendered.errors)
             self.last_unplaced = {
-                g.id for g in desired if g.id not in plan.assignments
+                g.id for g in desired
+                if g.id not in plan.assignments and g.id not in plan.displaced
             } | set(rendered.unrenderable)
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
 
-            compose_text = yaml.safe_dump(rendered.compose, sort_keys=False)
-            planned: dict[Path, str] = {self.compose_file: compose_text}
-            if rendered.litellm_config is not None:
-                planned[self.state_dir / LITELLM_CONFIG_FILENAME] = (
-                    rendered.litellm_config
-                )
-            if rendered.nginx_config is not None:
-                planned[self.state_dir / NGINX_CONFIG_FILENAME] = (
-                    rendered.nginx_config
-                )
-            routes_text = (
-                json.dumps(rendered.litellm_routes, indent=2)
-                if rendered.litellm_routes is not None
-                else None
-            )
-            if routes_text is not None:
-                planned[self._routes_file] = routes_text
+            self.last_planned_digest = self._planned_digest(planned)
             self._approve_changes(planned)  # may raise ConvergeAborted
-
-            if rendered.litellm_config is not None:
-                self._atomic_write(
-                    self.state_dir / LITELLM_CONFIG_FILENAME,
-                    rendered.litellm_config,
-                )
-            if rendered.nginx_config is not None:
-                self._atomic_write(
-                    self.state_dir / NGINX_CONFIG_FILENAME, rendered.nginx_config
-                )
-            if routes_text is not None:
-                # The rendered desired route set for the running gateway (applied
-                # via the admin API in apply() -> _reconcile_routes).
-                self._atomic_write(self._routes_file, routes_text)
-            self._atomic_write(self.compose_file, compose_text)
-            self._save_sidecar(
-                {'assignments': plan.assignments, 'services': rendered.services}
-            )
+            # Only after approval: persist new addresses and the merged route
+            # registry, then the files.
+            if docs['addresses'] is not None and self.on_addresses is not None:
+                self.on_addresses(docs['addresses'])
+            if docs['route_registry'] is not None:
+                self._save_route_registry(docs['route_registry'])
+            for path, text in planned.items():
+                if path != self.compose_file:
+                    self._atomic_write(path, text)
+            self._atomic_write(self.compose_file, planned[self.compose_file])
+            optional = set((placement.optional_hints if placement is not None else {}))
+            self._save_sidecar({
+                'assignments': plan.assignments,
+                'services': rendered.services,
+                # Selective apply (see apply()): what each service must look
+                # like, which deployments are degraded (never started or
+                # removed), and which services are optional residents (kept if
+                # present, never started).
+                'fingerprints': fingerprints,
+                'degraded': list(plan.degraded),
+                'displaced': list(plan.displaced),
+                'optional_services': sorted(
+                    svc for svc, gid in rendered.services.items() if gid in optional
+                ),
+            })
             services = rendered.compose.get('services')
             if not apply:
                 logger.info(
@@ -2026,46 +2444,276 @@ class ComposeBackend(ConvergeScaffold):
         self.apply()
         return plan
 
-    def apply(self) -> None:
-        """Bring the already-rendered compose project up (``docker compose up -d``).
+    def apply(self) -> bool:
+        """Bring the already-rendered compose project up; return whether it fully succeeded.
 
         Reads the on-disk compose file last written by :meth:`converge` (render)
-        and applies it — it does NOT re-render. Deliberately does **not** take the
-        converge (render) lock: the controller serializes and coalesces applies
-        via its apply-lock + the ledger generation, and taking the render lock
-        here would re-serialize renders against this slow step (the whole point of
-        the split). Idempotent — a no-op when reality already matches the file,
-        which is what makes coalescing safe (a redundant apply costs ~nothing).
+        and applies it -- it does NOT re-render. The controller serialises render
+        and apply under its host-wide lock, so the file cannot change underneath
+        this call. Idempotent: a no-op when reality already matches the file.
+
+        Returns ``False`` when the apply did not fully take effect, so the
+        controller keeps the change pending and retries it:
+
+        * the rendered file cannot be read;
+        * in dynamic-routing mode, the gateway's routes could not be reconciled
+          and verified within budget. The budget is short when the gateway was
+          already running (steady state), and long when this apply is bringing
+          it up (bootstrap: it waits on Postgres health and runs DB migrations).
+
+        Docker failures and timeouts raise, and leave the change pending too.
         """
         from .._log import logger
 
         if not self.compose_file.exists():
-            return
+            return True
         try:
             doc = yaml.safe_load(self.compose_file.read_text()) or {}
-        except Exception:  # noqa: BLE001 - a torn/old file must not brick apply
-            return
+        except Exception:  # noqa: BLE001 - reported as "not applied", never raised
+            logger.warning('apply: rendered compose file is unreadable; change stays pending')
+            return False
         services = doc.get('services') or {}
-        if services:
-            logger.info(
-                'docker compose up -d ({} service(s): {})',
-                len(services), ', '.join(sorted(services)),
+        sidecar = self._load_sidecar()
+        fingerprints = sidecar.get('fingerprints')
+        if fingerprints is None or set(fingerprints) != set(services):
+            # A render from before fingerprints: re-render (any mutation) first.
+            logger.warning('apply: the render predates fingerprints; re-render, then apply')
+            return False
+        dynamic = bool(self.litellm and self.dynamic_routing)
+        outcome = self.selective_apply(
+            services, fingerprints,
+            degraded=set(sidecar.get('degraded') or ()),
+            optional=set(sidecar.get('optional_services') or ()),
+            networks=doc.get('networks') or {},
+        )
+        if dynamic and 'litellm' in services:
+            return self._reconcile_routes(
+                deadline_s=ROUTE_RECONCILE_STEADY_S if 'litellm' in outcome.kept_services
+                else ROUTE_RECONCILE_BOOTSTRAP_S,
             )
-            self._compose(['up', '-d', '--remove-orphans'])
-            if self.litellm and self.dynamic_routing:
-                # Apply the rendered desired route set to the now-running gateway
-                # via the admin API (the dynamic-routing half of apply).
-                self._reconcile_routes()
-        else:
-            # Nothing at all to run — only reachable with the gateway off
-            # (litellm=False) and zero models, since the front door otherwise
-            # keeps the project non-empty. `docker compose up` errors with "no
-            # service selected" on a services-less file, so tear the project down
-            # instead (`down` works on the empty file). With the gateway on,
-            # releasing every model lands in the `up` branch above and leaves the
-            # front door standing; `stack down` is the way to take everything off.
-            logger.info('no services desired -> docker compose down')
-            self._compose(['down', '--remove-orphans'])
+        return True
+
+    #: Service-level ownership adopted at migration: container id ->
+    #: {service, fingerprint}. Set by the controller from the ledger.
+    adopted: dict[str, dict[str, str]] = {}
+
+    def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
+        """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""
+        deadline = self._clock() + deadline_s
+        while True:
+            if predicate(self.residency()):
+                return
+            if self._clock() + interval > deadline:
+                raise ApplyAborted(f'timed out after {deadline_s:g}s waiting for {what}')
+            self._sleep(interval)
+
+    def _network_state(self, name: str) -> tuple[str | None, list[str]] | None:
+        """``(subnet, attached container ids)`` of a Docker network, or ``None`` if absent."""
+        found = (self.run(['docker', 'network', 'ls', '-q', '--filter', f'name=^{name}$'])
+                 or '').split()
+        if not found:
+            return None
+        info = json.loads(self.run(['docker', 'network', 'inspect', name]) or '[]')
+        item = info[0] if info else {}
+        configs = ((item.get('IPAM') or {}).get('Config') or [])
+        subnet = next((c.get('Subnet') for c in configs if c.get('Subnet')), None)
+        return subnet, sorted((item.get('Containers') or {}).keys())
+
+    def _reconcile_network(self, networks: dict[str, Any]) -> None:
+        """Recreate the fixed network when its actual subnet differs from the render.
+
+        Runs after departing containers are confirmed gone. Compose never
+        changes an existing network's IPAM, so a subnet migration must remove
+        the old network first; any container still attached (unmanaged, or a
+        degraded deployment's) blocks it. Checked on every apply, so an
+        interrupted migration is completed by the next one.
+        """
+        from .._log import logger
+        from .network import NETWORK_NAME
+
+        spec = networks.get(NETWORK_NAME)
+        if not spec:
+            return
+        wanted = next((c.get('subnet') for c in (spec.get('ipam') or {}).get('config') or []), None)
+        state = self._network_state(NETWORK_NAME)
+        if state is None or wanted is None or state[0] == wanted:
+            return
+        actual, attached = state
+        if attached:
+            raise ApplyAborted(
+                f'network {NETWORK_NAME} must move from {actual} to {wanted}, but '
+                f'{len(attached)} container(s) are still attached '
+                f'({", ".join(c[:12] for c in attached)}); remove them first'
+            )
+        logger.info('apply: recreating network {} ({} -> {})', NETWORK_NAME, actual, wanted)
+        self.run(['docker', 'network', 'rm', NETWORK_NAME])
+
+    def selective_apply(self, services, fingerprints, *, degraded=frozenset(),
+                        optional=frozenset(), networks=None):
+        """Make the project match the render, touching only what differs.
+
+        * **keep** a managed container whose (service, fingerprint) is wanted,
+          is the only one with that key, and is running, restarting or paused;
+        * **remove** other managed containers, except those of degraded
+          deployments;
+        * **report** unmanaged containers (orphans), never remove them;
+        * **start** each service with no kept container, except optional
+          residents, which are never started;
+        * **barrier**: nothing starts on a GPU still occupied by another
+          container. A managed occupant is removed first; an unmanaged or
+          degraded one aborts the apply.
+
+        Services start with ``up -d --no-deps``, dependency level by level, so
+        a fresh dynamic stack brings Postgres up before the gateway. Raises
+        :class:`ApplyAborted` (the change stays pending) on ambiguity, a
+        blocked GPU, or a container still being removed.
+        """
+        from .._log import logger
+
+        res = self.residency()
+        adopted = dict(self.adopted or {})
+        wanted = {name: fingerprints[name] for name in services}
+
+        def key(c):
+            if c.labelled:
+                return (c.service, c.fingerprint)
+            if c.container_id in adopted:
+                info = adopted[c.container_id]
+                return (info['service'], info['fingerprint'])
+            return None
+
+        containers = res.all_containers()
+        managed = [c for c in containers if key(c) is not None]
+        orphans = [c for c in containers if key(c) is None]
+        by_key: dict[tuple, list] = {}
+        for c in managed:
+            by_key.setdefault(key(c), []).append(c)
+        for name, fp in wanted.items():
+            if len(by_key.get((name, fp), ())) > 1:
+                raise ApplyAborted(
+                    f'service {name!r} has {len(by_key[(name, fp)])} containers with its '
+                    'wanted configuration; refusing to guess which one serves'
+                )
+        keep = [
+            c for c in managed
+            if wanted.get(key(c)[0]) == key(c)[1]
+            and c.state in {'running', 'restarting', 'paused'}
+        ]
+        kept_ids = {c.container_id for c in keep}
+        kept_services = {key(c)[0] for c in keep}
+        departing = [
+            c for c in managed
+            if c.container_id not in kept_ids and c.deployment_id not in degraded
+        ]
+        for c in departing:
+            if c.state == 'removing':
+                raise ApplyAborted(
+                    f'container {c.container_id[:12]} ({key(c)[0]}) is still being '
+                    'removed; retry when it is gone'
+                )
+        to_start = [
+            name for name in services
+            if name not in kept_services and name not in optional
+        ]
+        departing_ids = {c.container_id for c in departing}
+        for name in to_start:
+            for gpu in _stanza_gpus(services[name]):
+                for c in res.occupants(gpu):
+                    if c.container_id in kept_ids or c.container_id in departing_ids:
+                        continue
+                    who = 'an unmanaged' if key(c) is None else 'a degraded'
+                    raise ApplyAborted(
+                        f'{who} container {c.container_id[:12]} occupies GPU {gpu} '
+                        f'needed by {name!r}' + (
+                            '; see `infer-stack gc --orphans`' if key(c) is None else '')
+                    )
+                for c in res.occupants(gpu):
+                    if c.container_id in kept_ids and key(c)[0] != name:
+                        raise ApplyAborted(
+                            f'GPU {gpu} is held by kept service {key(c)[0]!r} but '
+                            f'rendered for {name!r}'
+                        )
+        for name in to_start:
+            address = ((services[name].get('networks') or {}).get(_network_name()) or {}).get('ipv4_address')
+            if not address:
+                continue
+            for c in containers:
+                if address in c.ips and key(c) is None:
+                    raise ApplyAborted(
+                        f'an unmanaged container {c.container_id[:12]} holds address '
+                        f'{address} of {name!r}; see `infer-stack gc --orphans`'
+                    )
+        if networks:
+            # Preflight a subnet change BEFORE removing anything: a foreign
+            # attachment would otherwise take the stack down and only then abort.
+            from .network import NETWORK_NAME
+
+            spec = networks.get(NETWORK_NAME) or {}
+            wanted_subnet = next((c.get('subnet') for c in
+                                  (spec.get('ipam') or {}).get('config') or []), None)
+            state = self._network_state(NETWORK_NAME) if wanted_subnet else None
+            if state is not None and state[0] != wanted_subnet:
+                foreign = [cid for cid in state[1] if cid not in departing_ids]
+                if foreign:
+                    raise ApplyAborted(
+                        f'network {NETWORK_NAME} must move from {state[0]} to '
+                        f'{wanted_subnet}, but {len(foreign)} container(s) not managed '
+                        f'for removal are attached ({", ".join(c[:12] for c in foreign)})'
+                    )
+        if orphans:
+            logger.warning(
+                'apply: {} unmanaged container(s) in the project left alone ({}); '
+                '`infer-stack gc --orphans` removes them',
+                len(orphans), ', '.join(c.container_id[:12] for c in orphans),
+            )
+        if departing:
+            logger.info('apply: removing {} container(s): {}', len(departing),
+                        ', '.join(f'{key(c)[0]}' for c in departing))
+            self.run(['docker', 'rm', '-f', *[c.container_id for c in departing]])
+            # The barrier: confirm they are really gone before anything starts
+            # on their GPUs or addresses.
+            self._wait_until(
+                lambda snap: not ({c.container_id for c in snap.all_containers()}
+                                  & departing_ids),
+                deadline_s=APPLY_REMOVAL_WAIT_S,
+                what='removed containers to disappear',
+            )
+        if networks:
+            self._reconcile_network(networks)
+        paused = [c for c in keep if c.state == 'paused' and key(c)[0] not in optional]
+        if paused:
+            self.run(['docker', 'unpause', *[c.container_id for c in paused]])
+        for level in _dependency_levels(services, to_start):
+            # `--no-deps` keeps unrelated services untouched but also skips
+            # Compose's `condition: service_healthy`, so wait for it here.
+            healthy_deps = sorted({
+                dep for name in level
+                for dep, cond in _depends_on(services[name]).items()
+                if cond.get('condition') == 'service_healthy'
+            })
+            if healthy_deps:
+                logger.info('apply: waiting for {} to be healthy', ', '.join(healthy_deps))
+                self._wait_until(
+                    lambda snap, deps=healthy_deps: all(
+                        any(c.service == dep and c.health == 'healthy'
+                            for c in snap.all_containers())
+                        for dep in deps),
+                    deadline_s=APPLY_HEALTH_WAIT_S,
+                    what=f'{", ".join(healthy_deps)} to become healthy',
+                )
+            logger.info('docker compose up -d --no-deps {}', ' '.join(level))
+            self._compose(['up', '-d', '--no-deps', *level])
+        return SelectiveApplyOutcome(
+            kept_services=kept_services, removed=[c.container_id for c in departing],
+            started=list(to_start), orphans=[c.container_id for c in orphans],
+        )
+
+    def _service_running(self, service: str) -> bool:
+        """Whether a compose service of this project is running (best-effort)."""
+        try:
+            return service in _parse_ps(self._compose(['ps', '--format', 'json']))
+        except Exception:  # noqa: BLE001 - unknown -> treat as a bootstrap (long budget)
+            return False
 
     # -- dynamic routing (admin API) --------------------------------------
 
@@ -2083,19 +2731,22 @@ class ComposeBackend(ConvergeScaffold):
             return []
         return data if isinstance(data, list) else []
 
-    def _reconcile_routes(self, *, attempts: int = 90, delay: float = 2.0) -> None:
+    def _reconcile_routes(
+        self, *, deadline_s: float = ROUTE_RECONCILE_BOOTSTRAP_S, delay: float = 2.0,
+    ) -> bool:
         """Make the live gateway's managed routes match the rendered route set.
 
         The render half wrote the desired routes (one per live deployment×
         endpoint) to ``litellm_routes.json``; this is the apply half. List the
-        gateway's current models, then add the missing routes and delete the ones
-        no longer desired — through the admin API, with **no** container restart.
+        gateway's current models, add the missing routes and delete the ones no
+        longer desired -- through the admin API, with **no** container restart --
+        then list again to verify both ids and routing semantics, re-diffing and
+        retrying failed calls until the table matches or the budget runs out.
 
         Properties this relies on:
 
-        * **Idempotent / coalescing-safe.** A redundant apply re-diffs to the
-          same set and does nothing, which is what makes the controller's
-          coalesced apply correct for routes too.
+        * **Idempotent.** A redundant apply re-diffs to the same set and does
+          nothing.
         * **Drift-healing.** Routes lost to a gateway/DB restart reappear in the
           diff and are re-added; stale routes from a prior run (still in the DB)
           are deleted because they're no longer desired.
@@ -2103,71 +2754,121 @@ class ComposeBackend(ConvergeScaffold):
           are ever deleted, so a model added by hand through the UI/API is left
           alone.
 
-        Best-effort: the gateway may still be starting (it waits on Postgres
-        health, then boots — and on first-ever bring-up runs LiteLLM's Prisma DB
-        migrations, which can take a while), so the initial listing is retried
-        generously. A persistent failure is logged and left for the next converge
-        rather than raised — apply must stay non-fatal, like ``docker compose up``.
+        **Bounded and reported.** Everything -- listing retries while the gateway
+        starts, every POST, and the final verification -- shares one wall-clock
+        budget, ``deadline_s``. A retry count alone would not bound it: a listing
+        can take 10 s and a POST 30 s. Returns ``True`` only when the verified
+        managed route set equals the desired set; any failure is logged and
+        returns ``False`` rather than raising, so the caller decides whether an
+        unverified route set blocks anything.
         """
         from .._log import logger
 
+        deadline = self._clock() + max(0.0, deadline_s)
         desired = {
             r['model_info']['id']: r
             for r in self._desired_routes()
             if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
         }
-        current = self._list_managed_routes(attempts=attempts, delay=delay)
-        if current is None:
-            logger.warning(
-                'dynamic routing: gateway not reachable to reconcile routes; '
-                'leaving it for the next converge'
+        desired_semantics = {rid: self._route_semantics(route)
+                             for rid, route in desired.items()}
+        rounds = 0
+        while True:
+            current = self._list_managed_routes(deadline=deadline, delay=delay)
+            if current is None:
+                logger.warning(
+                    'dynamic routing: route set not reconciled and verified within '
+                    '{:g}s; leaving it for the next apply', deadline_s,
+                )
+                return False
+            mismatched = sorted(
+                rid for rid in desired.keys() & current.keys()
+                if desired_semantics[rid] != current[rid]
             )
-            return
-        to_add = [desired[i] for i in desired if i not in current]
-        to_delete = [i for i in current if i not in desired]
-        for route in to_add:
-            self._post_route('/model/new', route, route.get('model_name'))
-        for rid in to_delete:
-            # ok_if_missing: with a shared gateway, another converge may have
-            # deleted this route already; "not found in db" means the desired
-            # end-state (route gone) is reached, so don't treat it as an error.
-            self._post_route(
-                '/model/delete', {'id': rid}, rid, ok_if_missing=True
-            )
-        if to_add or to_delete:
+            to_add_ids = sorted((desired.keys() - current.keys()) | set(mismatched))
+            to_delete = sorted((current.keys() - desired.keys()) | set(mismatched))
+            to_add = [desired[rid] for rid in to_add_ids]
+            if not (to_add or to_delete):
+                return True            # this listing is the verification
+            if rounds:
+                logger.info('dynamic routing: route set still differs; retrying')
+            rounds += 1
+            ok = True
+            # A same-id semantic drift must be removed before it can be re-added;
+            # model/new is not an update API on every LiteLLM release.
+            for rid in to_delete:
+                # ok_if_missing: with a shared gateway, another converge may have
+                # deleted this route already; "not found in db" means the desired
+                # end-state (route gone) is reached, so don't treat it as an error.
+                ok &= self._post_route(
+                    '/model/delete', {'id': rid}, rid, ok_if_missing=True,
+                    deadline=deadline,
+                )
+            for route in to_add:
+                ok &= self._post_route(
+                    '/model/new', route, route.get('model_name'), deadline=deadline,
+                )
             logger.info(
-                'dynamic routing: +{} route(s), -{} route(s) (now {} desired)',
-                len(to_add), len(to_delete), len(desired),
+                'dynamic routing: +{} route(s), -{} route(s), ~{} replacement(s) '
+                '(now {} desired)',
+                len(to_add), len(to_delete), len(mismatched), len(desired),
             )
+            if not ok:
+                # A transient admin-API failure: spend the rest of the budget
+                # re-diffing rather than giving up with most of it unused.
+                if deadline - self._clock() <= delay:
+                    return False
+                self._sleep(delay)
+
+    @staticmethod
+    def _route_semantics(route: dict[str, Any]) -> dict[str, Any]:
+        """Observable route fields infer-stack owns and must verify.
+
+        LiteLLM's model-info response contains additional database/runtime fields
+        and may redact credentials.  The public alias, upstream model, and
+        upstream base URL are the routing semantics infer-stack can both set and
+        reliably observe.  A matching managed id with different values here is
+        drift and is replaced, not accepted as healthy.
+        """
+        params = route.get('litellm_params') or {}
+        return {
+            'model_name': route.get('model_name'),
+            'model': params.get('model'),
+            'api_base': params.get('api_base'),
+        }
 
     def _list_managed_routes(
-        self, *, attempts: int, delay: float
-    ) -> set[str] | None:
-        """Ids of infer-stack-managed routes currently on the gateway.
+        self, *, deadline: float, delay: float
+    ) -> dict[str, dict[str, Any]] | None:
+        """Observable semantics of infer-stack-managed gateway routes.
 
-        Returns ``None`` if the gateway never became reachable within
-        ``attempts`` (so the caller can skip the diff and retry next converge).
+        Retries while the gateway is unreachable, until ``deadline`` (a value of
+        ``self._clock``). Each request's own timeout is capped by the time left.
+        Returns ``None`` if no listing succeeded in time.
         """
-        for attempt in range(max(1, attempts)):
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return None
             resp = None
             try:
                 resp = self.http.get(
                     f'{self._gateway_base()}/v1/model/info',
                     headers=self._auth_headers(),
-                    timeout=10,
+                    timeout=min(10.0, remaining),
                 )
             except Exception:  # noqa: BLE001 - the gateway may still be starting
                 resp = None
             if resp is not None and getattr(resp, 'status_code', 0) == 200:
-                ids: set[str] = set()
+                routes: dict[str, dict[str, Any]] = {}
                 for m in (resp.json().get('data') or []):
                     rid = (m.get('model_info') or {}).get('id')
                     if isinstance(rid, str) and rid.startswith(ROUTE_ID_PREFIX):
-                        ids.add(rid)
-                return ids
-            if attempt < attempts - 1:
-                self._sleep(delay)
-        return None
+                        routes[rid] = self._route_semantics(m)
+                return routes
+            if deadline - self._clock() <= delay:
+                return None
+            self._sleep(delay)
 
     def _post_route(
         self,
@@ -2176,34 +2877,242 @@ class ComposeBackend(ConvergeScaffold):
         label: Any,
         *,
         ok_if_missing: bool = False,
-    ) -> None:
+        deadline: float | None = None,
+    ) -> bool:
         """POST one admin-API call (``/model/new`` or ``/model/delete``).
 
-        Per-call best-effort: a failure is logged and the rest still run; the
-        next converge re-reconciles, so a transient error self-heals.
-        ``ok_if_missing`` swallows a "model not found" response (a delete whose
-        target is already gone has already reached its desired end-state).
+        Returns whether it reached its desired end state. A failure is logged,
+        not raised, so the remaining calls still run. ``ok_if_missing`` accepts a
+        "model not found" response (a delete whose target is already gone).
+        The request timeout is capped by the time left before ``deadline``.
         """
         from .._log import logger
 
+        timeout = 30.0
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                logger.warning(
+                    'dynamic routing: POST {} {} skipped: route deadline passed',
+                    path, label,
+                )
+                return False
+            timeout = min(timeout, remaining)
         try:
             resp = self.http.post(
                 f'{self._gateway_base()}{path}',
                 headers=self._auth_headers(),
                 json=payload,
-                timeout=30,
+                timeout=timeout,
             )
         except Exception as ex:  # noqa: BLE001 - one bad call must not abort apply
             logger.warning('dynamic routing: POST {} {} error: {}', path, label, ex)
-            return
+            return False
         if getattr(resp, 'status_code', 0) >= 300:
             body = str(getattr(resp, 'text', ''))
             if ok_if_missing and 'not found' in body.lower():
-                return
+                return True
             logger.warning(
                 'dynamic routing: POST {} {} -> {} {}',
                 path, label, resp.status_code, body[:200],
             )
+            return False
+        return True
+
+    # -- published profile (see leasing/profile.py) ---------------------------
+
+    REVERSE_PROXY_SNAPSHOT = 'reverse-proxy.conf'
+
+    def render_profile(self) -> dict[str, Any]:
+        """This backend's current render inputs, as a publishable profile.
+
+        ``allowed_gpus`` is deliberately absent: it is per-caller admission
+        scope, not host configuration. A BYO reverse-proxy config is captured
+        by content, so editing the file later cannot change a recovery.
+        """
+        from .profile import PROFILE_VERSION, catalog_sources
+
+        config_text = None
+        if self.reverse_proxy_config:
+            if self._profile_proxy_text is not None:
+                config_text = self._profile_proxy_text
+            else:
+                path = Path(self.reverse_proxy_config).expanduser()
+                try:
+                    config_text = path.read_text()
+                except OSError as ex:
+                    raise RuntimeError(
+                        f'reverse-proxy config {path} is unreadable: {ex}'
+                    ) from ex
+        return {
+            'version': PROFILE_VERSION,
+            'backend': 'compose',
+            'project': self.project,
+            'litellm': bool(self.litellm),
+            'ui': bool(self.ui),
+            'dynamic_routing': bool(self.dynamic_routing),
+            'skip_display': bool(self.skip_display),
+            'reverse_proxy': {
+                'enabled': bool(self.reverse_proxy),
+                'port': int(self.reverse_proxy_port),
+                'config_text': config_text,
+            },
+            'images': dict(sorted(self.images.items())),
+            'ports': dict(sorted(self.ports.items())),
+            'state': dict(sorted(self.state.items())),
+            'catalogs': catalog_sources(self.catalog),
+        }
+
+    def use_profile(self, profile: dict[str, Any]) -> None:
+        """Render from ``profile`` from now on, instead of this process's settings."""
+        from .profile import CatalogUnion
+
+        if profile.get('backend') != 'compose':
+            from .profile import ProfileMismatch
+
+            raise ProfileMismatch(
+                f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
+                'tear down the old backend before switching backend kinds'
+            )
+        self.project = profile['project']
+        self.litellm = profile['litellm']
+        self.ui = profile['ui']
+        self.dynamic_routing = profile['dynamic_routing']
+        self.skip_display = profile['skip_display']
+        proxy = profile['reverse_proxy']
+        self.reverse_proxy = proxy['enabled']
+        self.reverse_proxy_port = proxy['port']
+        self._profile_proxy_text = proxy.get('config_text')
+        if self._profile_proxy_text is not None:
+            # Applying a candidate profile must be pure: config-publish preview
+            # can call use_profile() and then be declined or crash.  Point the
+            # render at the stable managed path now; _render_documents() adds
+            # the bytes to its planned files so converge writes them only after
+            # approval.
+            self.reverse_proxy_config = str(
+                self.state_dir / self.REVERSE_PROXY_SNAPSHOT
+            )
+        else:
+            self.reverse_proxy_config = None
+        self.images = dict(profile['images'])
+        self.ports = dict(profile['ports'])
+        self.state = dict(profile['state'])
+        sources = profile.get('catalogs') or []
+        self.catalog = CatalogUnion.from_sources(sources) if sources else None
+
+    def placement_context(self) -> dict[str, Any] | None:
+        """This caller's admission scope, stored with a pending acquire."""
+        if self.allowed_gpus is None:
+            return None
+        return {'allowed_gpus': list(self.allowed_gpus)}
+
+    def placement_scope(self, context: dict[str, Any] | None):
+        """Temporarily render with another caller's admission scope."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            saved = self.allowed_gpus
+            if context and 'allowed_gpus' in context:
+                self.allowed_gpus = context['allowed_gpus']
+            try:
+                yield
+            finally:
+                self.allowed_gpus = saved
+
+        return scope()
+
+    def validate_requests(self, requests) -> None:
+        """Refuse requests the published catalog union does not define identically."""
+        from .profile import validate_requests_against
+
+        validate_requests_against(self.catalog, requests)
+
+    def upstream_check(self) -> dict[str, dict[str, Any]]:
+        """Probe each model upstream by name from inside the gateway's network.
+
+        Returns ``{service: {'deployment', 'expected', 'status', 'answer'}}``
+        with status ``healthy``, ``not-ready`` or ``routing-fault`` (the name
+        answers, but with another model: the misroute signature). The gateway
+        image has ``python3`` and no ``curl``.
+        """
+        from .network import UPSTREAM_CHECK_SCRIPT, classify_upstream
+
+        doc = yaml.safe_load(self.compose_file.read_text()) if self.compose_file.exists() else {}
+        services = (doc or {}).get('services') or {}
+        by_service = self._load_sidecar().get('services') or {}
+        out: dict[str, dict[str, Any]] = {}
+        for name, gid in sorted(by_service.items()):
+            svc = services.get(name) or {}
+            expected = next((a.split('=', 1)[1] for a in svc.get('command') or []
+                             if str(a).startswith('--served-model-name=')), None)
+            if expected is None:
+                continue
+            url = f'http://{name}:{VLLM_CONTAINER_PORT}/v1/models'
+            try:
+                raw = self._compose(['exec', '-T', LITELLM_SERVICE, 'python3', '-c',
+                                     UPSTREAM_CHECK_SCRIPT, url])
+                answer = json.loads(raw.strip().splitlines()[-1])
+            except Exception as ex:  # noqa: BLE001 - reported, never raised
+                answer = {'error': str(ex)}
+            out[name] = {'deployment': gid, 'expected': expected,
+                         'status': classify_upstream(expected, answer), 'answer': answer}
+        return out
+
+    def settle_snapshot(self) -> tuple[tuple[str, str], ...]:
+        """Every container of this Compose project as sorted ``(id, state)`` pairs.
+
+        Used after an interrupted apply to wait until the daemon has finished
+        work a killed client started. Covers infrastructure (gateway, database)
+        as well as deployments. Raises ``ResidencyUnknown`` if Docker cannot be
+        read.
+        """
+        try:
+            out = self.run([
+                'docker', 'ps', '-a', '--no-trunc',
+                '--filter', f'label={COMPOSE_PROJECT_LABEL}={self.project}',
+                '--format', '{{.ID}} {{.State}}',
+            ])
+        except Exception as ex:  # noqa: BLE001 - unknown, never "empty"
+            raise ResidencyUnknown(f'docker ps failed: {ex}') from ex
+        pairs = []
+        for line in (out or '').splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise ResidencyUnknown(f'unexpected docker ps line: {line!r}')
+            pairs.append((parts[0], parts[1].lower()))
+        return tuple(sorted(pairs))
+
+    def residency(self) -> Residency:
+        """Strict snapshot of this project's deployment containers and their GPUs.
+
+        Unlike :meth:`observe`, this never reports "nothing" for "could not look":
+        any Docker error, or output that cannot be parsed, raises
+        :class:`~infer_stack.leasing.residency.ResidencyUnknown`. Containers are
+        found by label (this Compose project and ``infer-stack.deployment``), in
+        every state, so a container absent from the current render or sidecar is
+        still seen. GPUs come from each container's device reservation. See
+        :mod:`infer_stack.leasing.residency` for the ambiguity rules.
+
+        A container removed between the listing and the inspect makes the inspect
+        fail, which is reported as unknown; the caller retries.
+        """
+        try:
+            listing = self.run([
+                'docker', 'ps', '-a', '--no-trunc',
+                '--filter', f'label={COMPOSE_PROJECT_LABEL}={self.project}',
+                '--format', '{{.ID}}',
+            ])
+        except Exception as ex:  # noqa: BLE001 - any failure is "unknown", never "empty"
+            raise ResidencyUnknown(f'docker ps failed: {ex}') from ex
+        ids = [line.strip() for line in (listing or '').splitlines() if line.strip()]
+        if not ids:
+            return Residency({})
+        try:
+            raw = self.run(['docker', 'inspect', *ids])
+        except Exception as ex:  # noqa: BLE001 - see above
+            raise ResidencyUnknown(f'docker inspect failed: {ex}') from ex
+        return residency_from_inspect(raw, project=self.project)
 
     def observe(self) -> set[str]:
         if not self.compose_file.exists():

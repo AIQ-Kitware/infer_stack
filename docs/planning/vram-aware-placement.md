@@ -74,10 +74,10 @@ Models in play (Qwen3.5 family, fp16 weights): 0.8B ≈ 1.7 GB, 2B ≈ 4.5 GB,
 Today's placer is count-based first-fit **by GPU index** with zero VRAM
 awareness: it would happily assign the 9B to the 16-GiB card (OOM at
 container start), or park the 0.8B on the 48-GiB card and block the 9B behind
-it. The only remedies today are operator pinning
-(`INFER_STACK_ALLOWED_GPUS`, one allow-list per leaser process) or the
-undocumented `runtime: {gpu_indices: [...]}` — both are the operator encoding
-the schedule by hand, which is exactly what the objective forbids.
+it. Automatic VRAM-aware placement is therefore the normal path. Operators can
+also deliberately override it for local debugging / workstation control with
+an exact endpoint pin (`placement: {gpu_indices: [...]}`), but that remains an
+opt-in escape hatch rather than the scheduler's default behavior.
 
 ## Current state (verified 2026-07-17, with citations)
 
@@ -116,9 +116,14 @@ the schedule by hand, which is exactly what the objective forbids.
    per-model-split; it rots and it doesn't transfer between machines. It
    remains valuable as an *operator restriction* on shared hosts (its
    original purpose) and as the SLURM composition path.
-2. **Per-endpoint `runtime: {gpu_indices: [N]}`** — functional but
-   undocumented and unvalidated by `Catalog.errors()`; still manual mapping.
-   Rejected.
+2. **Per-endpoint exact GPU pin.** The historical
+   `runtime: {gpu_indices: [N]}` spelling was functional but undocumented and
+   unvalidated. The supported spelling is now
+   `placement: {gpu_indices: [N]}`: Catalog validates it, the TUI exposes it,
+   and the pin participates in deployment compatibility so repinning cannot
+   revive an idle deployment on the old GPU. Still rejected as the *default*
+   scheduler because it is host-local manual mapping; retained as an explicit
+   operator override.
 3. **SLURM with typed GRES/constraints.** Doesn't dissolve the problem —
    someone still writes "this model needs that GPU type" in every job spec,
    plus a slurmctld/slurmd configuration project for a 2-GPU workstation.
@@ -163,6 +168,11 @@ endpoints:
   vLLM endpoints.
 - **Undeclared ⇒ all GPUs eligible ⇒ exactly today's behavior.** Fully
   backward compatible; nothing in existing catalogs changes meaning.
+- `gpu_indices` is an optional **exact local pin**. Its length must equal
+  `tensor_parallel_size × pipeline_parallel_size × data_parallel_size`; omit
+  it for automatic placement. Unlike `min_vram_gib`, a pin is deployment
+  identity, because changing GPU affinity must not coalesce with or revive a
+  deployment still resident under the old affinity.
 
 ### 2. Planner: eligibility filter + deterministic anti-starvation ordering
 

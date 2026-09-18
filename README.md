@@ -13,6 +13,40 @@
 > (e.g. `infer-stack legacy render`). This README still describes that legacy
 > flow; a leasing-oriented rewrite is pending.
 
+## Primary leasing workflow
+
+The normal user path has three steps and no separate publication phase:
+
+```bash
+infer-stack config init
+infer-stack catalog suggest --apply
+infer-stack acquire <endpoint>
+```
+
+`config.yaml` and `catalog.yaml` are the user configuration. Leasing keeps an
+internal frozen recovery snapshot so a crash cannot re-render committed state
+with different settings, but ordinary `acquire` advances that snapshot
+automatically. Compatible catalog additions can be acquired while other models
+are live; conflicting redefinitions or global setting changes take effect once
+the affected stack is quiescent. `infer-stack config publish` is an advanced
+pre-seeding/preview tool for multi-catalog operators, not a required fourth
+step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
+
+## Related work
+
+- [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
+  and serving stack for running Qwen3.8-27B efficiently on 24-GiB consumer GPUs,
+  with its published tuning and measurements centered on the RTX 3090.
+  infer-stack's `hyperqwen-3090-single` recipe deliberately delegates the
+  requantization, patched-vLLM launcher, speculative decoding, and GPU-level
+  tuning to HyperQwen; infer-stack adds hardware discovery, catalog suggestions,
+  exact GPU affinity, lease lifecycle, and routing around that serving stack.
+  The current 3090 suggestion is named
+  `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
+  `dbirks/Qwen3.8-27B-W4A16-AutoRound` derivative; the unsuffixed
+  `qwen3.8-27b` identity is left available for the official
+  `Qwen/Qwen3.8-27B` checkpoint.
+
 ## Supported platform
 
 `infer-stack` supports **Linux hosts only**. Its process locking, container
@@ -84,11 +118,19 @@ infer-stack ps                              # docker compose ps
 infer-stack ps -a                           # include stopped
 infer-stack logs -f open-webui              # follow one service
 infer-stack logs --tail=200 litellm vllm-*  # tailored backlog
+infer-stack logs -f --raw litellm            # full LiteLLM tracebacks
 infer-stack restart open-webui              # restart specific services
 infer-stack stop                            # stop everything (no remove)
 infer-stack start                           # start back up
 infer-stack pull                            # refresh images
 ```
+
+Interactive ``infer-stack logs -f`` compacts only explicitly registered, known-noisy
+LiteLLM traceback shapes; unknown tracebacks pass through unchanged. Redirected or
+piped output stays raw, and ``--raw`` disables compaction in an interactive follow.
+The compacted CLI path preserves Compose ANSI service colors when attached to a TTY;
+``--no-color`` still disables them. The TUI uses the same conservative compactor when
+LiteLLM logs are visible.
 
 For Ollama model management inside the rendered Ollama service, prefer the
 CLI wrappers:

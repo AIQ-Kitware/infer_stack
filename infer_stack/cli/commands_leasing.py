@@ -34,8 +34,8 @@ from ..leasing import (
     ComposeBackend,
     Controller,
     DeploymentState,
-    LeaseState,
     Ledger,
+    LeaseState,
     NullBackend,
     Sharing,
     SqliteStore,
@@ -56,6 +56,15 @@ from .options import _AllowedGpusMixin, _DisplayGpuMixin, _PathOverridesMixin
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+# Managed .env values that participate in rendered service behaviour.  Changing
+# one while a lease is active would make a later unrelated publication recreate
+# serving containers with a new fingerprint.  Treat them as configuration-time
+# state; client-only values such as OPENAI_BASE_URL may still change freely.
+_SERVICE_ENV_KEYS = frozenset({
+    'HF_TOKEN', 'LITELLM_MASTER_KEY', 'LITELLM_DB_PASSWORD',
+})
 
 
 def _default_owner() -> str:
@@ -267,7 +276,7 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'kubeai':
         from ..backends.kubeai import KubeaiBackend
 
-        return KubeaiBackend(
+        backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
             base_url=get_setting('kubeai_base_url') or None,
@@ -275,6 +284,11 @@ def _make_backend(config, *, interactive: bool = False):
             or None,
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
         )
+        try:
+            backend.catalog = _load_catalog(config)   # frozen into the profile
+        except SystemExit:
+            backend.catalog = None
+        return backend
     raise SystemExit(
         f'backend {name!r} is not implemented in the leasing CLI. '
         'Use --backend null, compose, or kubeai.'
@@ -341,6 +355,33 @@ def _load_catalog_for_tui(config) -> tuple[Catalog, Path]:
         return Catalog.load(path), path
     except CatalogError as ex:
         raise SystemExit(f'invalid catalog {path}: {ex}')
+
+
+def _requests_catalog(controller, config):
+    """The user catalog endpoint names resolve against.
+
+    The catalog on disk is the authoritative configuration surface.  The
+    controller's persisted profile is only an internal recovery snapshot and
+    must not become a second catalog the user has to manage.  When a current
+    catalog exists, resolve the requested endpoint from it; acquire will merge
+    compatible additions into the recovery snapshot under the publication lock.
+
+    A published union is only the fallback for advanced runbooks that invoke a
+    lease command without any local/default catalog at all.
+    """
+    from ..leasing.profile import CatalogUnion
+
+    published = getattr(controller.backend, 'catalog', None)
+    explicit = (
+        getattr(config, 'catalog', None)
+        or os.environ.get('INFER_STACK_CATALOG', '').strip()
+    )
+    path = _catalog_path(config)
+    if explicit or path.exists():
+        return _load_catalog(config)
+    if isinstance(published, CatalogUnion):
+        return published
+    return _load_catalog(config)
 
 
 def _resolve(catalog, names, *, sharing=None):
@@ -589,6 +630,7 @@ def _emit_acquire(config, controller, outcome) -> int:
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     from .._log import logger
     from ..leasing.backend import ConvergeAborted, PlacementError
+    from ..leasing.profile import ProfileMismatch
 
     render_only = not bool(getattr(config, 'apply', True))
     # Staging (--no-apply) is non-destructive (no docker up), so don't gate it
@@ -606,7 +648,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         requests = [reservation_request(reserve_gpus)]
         names = [f'{reserve_gpus} gpu(s)']
     else:
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         names = _collect_names(config.names)
         if not names:
             raise SystemExit('give at least one endpoint or bundle name')
@@ -633,6 +675,8 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         )
     except ConvergeAborted:
         raise SystemExit('aborted: compose changes not applied (no lease kept)')
+    except ProfileMismatch as ex:
+        raise SystemExit(f'acquire: {ex}')
     except PlacementError as ex:
         lines = ['could not place every requested endpoint (no lease kept):']
         lines += [f'  {r}' for r in ex.reasons] or [
@@ -931,17 +975,15 @@ class ApplyCLI(_ApprovalMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
         try:
-            # apply_now() FORCES the docker up even if the generation has not
-            # advanced -- this is the "re-sync after a manual edit / backend
-            # hiccup" button, so it must heal drift (the coalesced reconcile path
-            # would skip an up when desired == applied).
+            # apply_now() always runs the docker up and publishes anything
+            # pending -- this is the "re-sync after a manual edit / backend
+            # hiccup" button, so it must heal drift.
             rec = controller.apply_now()
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
         result = None
         if config.wait:
-            controller.ledger.sweep()
-            _, deployments = controller.ledger.status()
+            _, deployments = controller.ledger.status(virtual_expiry=True)
             live = [g for g in deployments if g.state == DeploymentState.LIVE]
             if live:
                 result = controller.wait_ready(
@@ -949,19 +991,28 @@ class ApplyCLI(_ApprovalMixin):
                     timeout=float(config.timeout),
                     interval=float(config.interval),
                 )
+        # Exit 3: the apply ran but did not fully take effect (e.g. gateway
+        # routes did not verify); the change stays pending.
+        pending_exit = 3 if rec.publication_pending else None
         if config.json:
             print(json.dumps({
-                'applied': True,
+                'applied': not rec.publication_pending,
+                'publication_pending': rec.publication_pending,
                 'realized': rec.realized,
                 'torn_down': rec.torn_down,
                 'placement': rec.assignments,
                 'unplaced': rec.unplaced,
                 'ready': None if result is None else result.ready,
             }, indent=2))
+            if pending_exit:
+                return pending_exit
             return 0 if (result is None or result.ready) else 2
         print(
             f'applied: {len(rec.realized)} started, {len(rec.torn_down)} stopped'
         )
+        if rec.publication_pending:
+            print('  ! the apply did not fully take effect; the change is still '
+                  'pending -- retry `infer-stack apply`')
         for gid in rec.realized:
             print(f'  + {gid}')
         for gid in rec.torn_down:
@@ -972,8 +1023,8 @@ class ApplyCLI(_ApprovalMixin):
             print('  not ready (timed out)')
             for gid, ep in result.pending:
                 print(f'    pending: {ep} ({gid})')
-            return 2
-        return 0
+            return pending_exit or 2
+        return pending_exit or 0
 
 
 def _declined_exit() -> SystemExit:
@@ -1022,44 +1073,42 @@ class ReleaseCLI(_ApprovalMixin):
         if config.all:
             if config.lease or config.env_file:
                 raise SystemExit('release: --all takes no lease/--env-file')
-            controller.ledger.sweep()
-            leases, _ = controller.ledger.status()
-            released = [le.id for le in leases if le.state == LeaseState.ACTIVE]
-            for sid in released:
-                controller.ledger.release(sid)
-            evicted: list[str] = []
-            if config.evict:
-                evicted = controller.ledger.evict_idle(None)  # every idle deployment
+            targets = None
         else:
             sid = _resolve_lease(config)
             if not sid:
                 raise SystemExit(
                     'release: give a lease id, --env-file, or --all'
                 )
-            rel = controller.ledger.release(sid)
-            if not rel.found:
-                raise SystemExit(f'release: no such lease: {sid}')
-            released = [sid]
-            evicted = []
-            if config.evict:
-                evicted = controller.ledger.evict_idle(rel.idled_deployment_ids)
+            targets = [sid]
 
-        # One converge for the whole command -> at most one diff prompt.
+        # One publication for the whole command -> at most one diff prompt.
         try:
-            rec = controller.reconcile()
+            out = controller.release_leases(targets, evict=bool(config.evict))
         except ConvergeAborted:
             raise _declined_exit()
-        return _emit_release(config, released, sorted(rec.torn_down), evicted)
+        if out.missing_lease_ids:
+            raise SystemExit(f'release: no such lease: {out.missing_lease_ids[0]}')
+        # A single named lease is reported even when it was already released
+        # (idempotent release; a cleanup trap may fire twice).
+        released = targets if targets is not None else out.released_lease_ids
+        rec = out.reconcile
+        return _emit_release(
+            config, released, sorted(rec.torn_down) if rec else [],
+            out.evicted_deployment_ids,
+            pending=bool(rec and rec.publication_pending),
+        )
 
 
-def _emit_release(config, released, torn_down, evicted) -> int:
+def _emit_release(config, released, torn_down, evicted, *, pending=False) -> int:
     if config.json:
         print(json.dumps({
             'released': released,
             'torn_down': torn_down,
             'evicted': evicted,
+            'publication_pending': pending,
         }, indent=2))
-        return 0
+        return 3 if pending else 0
     if not released:
         print('no active leases to release')
     else:
@@ -1068,6 +1117,10 @@ def _emit_release(config, released, torn_down, evicted) -> int:
             print(f'  {sid}')
     for gid in torn_down:
         print(f'  torn down: {gid}')
+    if pending:
+        print('  ! the apply did not fully take effect; the change is still '
+              'pending -- retry `infer-stack apply`')
+        return 3
     return 0
 
 
@@ -1076,8 +1129,7 @@ def _resolve_idle_targets(controller, names: list[str]) -> tuple[list[str], list
 
     Returns ``(target_deployment_ids, unmatched_names)``.
     """
-    controller.ledger.sweep()
-    _, deployments = controller.ledger.status()
+    _, deployments = controller.ledger.status(virtual_expiry=True)
     idle = [g for g in deployments if g.state == DeploymentState.IDLE]
     wanted = set(names)
     targets, matched = [], set()
@@ -1176,6 +1228,11 @@ class GcCLI(_ApprovalMixin):
         help='Also tear down idle keep-warm deployments (like `evict --all`), '
         'not just leaked/expired demand.',
     )
+    orphans = scfg.Value(
+        False, isflag=True,
+        help='Instead: remove containers in the project that infer-stack does not '
+        'manage (listed and confirmed first; --yes skips the prompt).',
+    )
     json = scfg.Value(False, isflag=True)
 
     @classmethod
@@ -1184,6 +1241,24 @@ class GcCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
+        if config.orphans:
+            if not callable(getattr(controller.backend, 'residency', None)):
+                raise SystemExit('gc --orphans needs the compose backend')
+
+            def confirm(found):
+                print(f'gc --orphans: {len(found)} unmanaged container(s):')
+                for c in found:
+                    print(f'  {c.container_id[:12]}  {c.service or "?"}  {c.state}')
+                if config.yes or not sys.stdin.isatty():
+                    return bool(config.yes)
+                return input('remove them? [y/N] ').strip().lower() in {'y', 'yes'}
+
+            removed = controller.remove_orphans(confirm)
+            if config.json:
+                print(json.dumps({'removed': [c.container_id for c in removed]}, indent=2))
+            else:
+                print(f'gc --orphans: removed {len(removed)} container(s)')
+            return 0
         try:
             outcome = controller.gc(evict_idle=bool(config.evict))
         except ConvergeAborted:
@@ -1238,8 +1313,7 @@ class WaitCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        controller.ledger.sweep()
-        _, deployments = controller.ledger.status()
+        _, deployments = controller.ledger.status(virtual_expiry=True)
         live = [g for g in deployments if g.state == DeploymentState.LIVE]
         names = _collect_names(config.names)
         if names:
@@ -1350,7 +1424,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 'measure needs the compose backend '
                 '(the engine container log is the measurement source).'
             )
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         name = config.endpoint
         request = catalog.resolve_names([name])[0]
         if request.engine != 'vllm':
@@ -1359,8 +1433,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 f'({name} is {request.engine}).'
             )
 
-        controller.ledger.sweep()
-        _, deployments = controller.ledger.status()
+        _, deployments = controller.ledger.status(virtual_expiry=True)
         live = [
             g for g in deployments
             if g.state == DeploymentState.LIVE
@@ -1527,15 +1600,29 @@ class RenewCLI(_LeasingCommonMixin):
         sid = _resolve_lease(config)
         if not sid:
             raise SystemExit('renew: give a lease id or --env-file')
-        lease = controller.ledger.renew(
-            sid, ttl_seconds=_parse_duration(config.ttl)
-        )
-        if lease is None:
+        # Through the controller: a renew can revive an idle deployment, which
+        # is a desired-state change and must be serialised with applies.
+        from ..leasing.backend import PlacementError
+
+        try:
+            outcome = controller.renew(sid, ttl_seconds=_parse_duration(config.ttl))
+        except PlacementError as ex:
+            raise SystemExit(
+                f'renew: {sid} needs its idle deployment(s) back, and they cannot be '
+                f'admitted now: {ex}'
+            )
+        if outcome.lease is None:
             raise SystemExit(
                 f'renew: no active lease {sid} (unknown, released, or already '
                 'expired — re-acquire instead)'
             )
         print(f'renewed {sid}')
+        if outcome.revived_deployment_ids:
+            print(f'  revived: {", ".join(outcome.revived_deployment_ids)}')
+        if outcome.reconcile is not None and outcome.reconcile.publication_pending:
+            print('  ! the apply did not fully take effect; the change is still '
+                  'pending -- retry `infer-stack apply`')
+            return 3
         return 0
 
 
@@ -1574,8 +1661,10 @@ class RunCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
+        from ..leasing.profile import ProfileMismatch
+
         controller = _open_controller(config)
-        catalog = _load_catalog(config)
+        catalog = _requests_catalog(controller, config)
         names = _collect_names(config.endpoint)
         command = list(config.command or [])
         if not names:
@@ -1583,15 +1672,18 @@ class RunCLI(_LeasingCommonMixin):
         if not command:
             raise SystemExit('run: give a command after --')
         requests = _resolve(catalog, names)
-        outcome = controller.acquire(
-            config.owner or _default_owner(),
-            requests,
-            ttl_seconds=_parse_duration(config.ttl),
-            wait=True,
-            timeout=float(config.timeout),
-            interval=float(config.interval),
-            wait_for_placement=bool(getattr(config, 'queue', False)),
-        )
+        try:
+            outcome = controller.acquire(
+                config.owner or _default_owner(),
+                requests,
+                ttl_seconds=_parse_duration(config.ttl),
+                wait=True,
+                timeout=float(config.timeout),
+                interval=float(config.interval),
+                wait_for_placement=bool(getattr(config, 'queue', False)),
+            )
+        except ProfileMismatch as ex:
+            raise SystemExit(f'run: {ex}')
         if outcome.wait is not None and not outcome.wait.ready:
             # The controller already released the lease on timeout
             # (released_on_timeout); just surface why we're not running.
@@ -1629,6 +1721,22 @@ def _placement_view(controller):
     except Exception:  # noqa: BLE001 - status must never crash
         pass
     assignments: dict[str, list[int]] = {}
+    if controller._admission_mode():
+        # Committed allocations, and idle residents' physical GPUs; the
+        # legacy planner view would show placements admission would not make.
+        _, deployments = controller.ledger.status(virtual_expiry=True)
+        for g in deployments:
+            if g.assigned_gpus is not None:
+                assignments[g.id] = list(g.assigned_gpus)
+        try:
+            residency = backend.residency()
+            for g in deployments:
+                c = residency.resident(g.id)
+                if g.id not in assignments and c is not None:
+                    assignments[g.id] = list(c.gpus)
+        except Exception:  # noqa: BLE001
+            pass
+        return observed, assignments
     plan = getattr(backend, 'plan', None)
     if plan is not None:
         try:
@@ -1764,9 +1872,9 @@ class LeasesCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        controller.ledger.sweep()  # materialize TTL expiry for an accurate view
-        leases, deployments = controller.ledger.status()
+        leases, deployments = controller.ledger.status(virtual_expiry=True)
         observed, assignments = _placement_view(controller)
+        health = controller.observe_state()
         if config.json:
             print(
                 json.dumps(
@@ -1793,6 +1901,7 @@ class LeasesCLI(_LeasingCommonMixin):
                             }
                             for g in deployments
                         ],
+                        'health': health,
                     },
                     indent=2,
                 )
@@ -1805,7 +1914,37 @@ class LeasesCLI(_LeasingCommonMixin):
             _print_leases_rich(leases, deployments, observed, assignments, console)
         else:
             _print_leases_plain(leases, deployments, observed, assignments)
+        _print_health(health)
         return 0
+
+
+def _print_health(health: dict) -> None:
+    """The conditions worth an operator's attention, one line each."""
+    lines = []
+    marker = health.get('publication_pending')
+    if marker:
+        kind = 'apply requested' if marker.get('apply_requested') else 'staged'
+        extra = ', interrupted' if marker.get('interrupted') else ''
+        extra += ', approval guard' if marker.get('approved_digest') else ''
+        lines.append(f'pending change: {kind}{extra} (`infer-stack apply` publishes it)')
+    if health.get('residency_error'):
+        lines.append(f'residency UNKNOWN: {health["residency_error"]}')
+    for row in health.get('deployments') or []:
+        if row['condition'] in {'unknown', 'ambiguous', 'degraded', 'displaced',
+                                'unresolved', 'not-running'}:
+            lines.append(f'{row["condition"].upper()}: {row["id"]} ({row["state"]})')
+    for orphan in health.get('orphans') or []:
+        lines.append(f'ORPHAN: {orphan["id"][:12]} {orphan["service"]} '
+                     '(`infer-stack gc --orphans`)')
+    if health.get('profile_drift'):
+        lines.append('settings differ from the active recovery snapshot: '
+                     + ', '.join(health['profile_drift']))
+    for lease_id in health.get('expired_unswept') or []:
+        lines.append(f'expired (not yet reclaimed): {lease_id}')
+    if lines:
+        print('health:')
+        for line in lines:
+            print(f'  {line}')
 
 
 def _secret_env_path() -> Path:
@@ -1831,6 +1970,39 @@ def _front_door(config) -> tuple[str, str | None]:
     if env_path.exists():
         key = parse_env_file(env_path).get('LITELLM_MASTER_KEY')
     return base_url.rstrip('/'), key
+
+
+def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
+    """The front-door values ``env`` answers without them being stored.
+
+    A base URL is not a secret and has nothing to be read *out* of: it is
+    derived from the configured front-door port. ``_front_door`` is the one
+    function that derives it, and reusing it here is the whole point -- if
+    ``env`` computed its own, a script built from ``env`` could point at a door
+    ``infer-stack test`` never knocked on, and the two would disagree silently.
+
+    ``stored`` is the managed ``.env``, which wins: writing ``OPENAI_BASE_URL``
+    is how you aim a script at a gateway that is not the local front door.
+    THE PORT IS THEN READ BACK OFF THAT URL rather than re-derived, because a
+    port that disagrees with the URL beside it is worse than no port at all --
+    an override to ``:8443`` used to leave ``LITELLM_PORT`` reporting the
+    default, which is exactly the hardcoded-mismatch this command exists to
+    stop. A port explicitly written to the file still wins over both.
+
+    ``LITELLM_PORT`` is omitted when the effective URL names no port: behind a
+    proxy on 80/443 there is nothing to report, and inventing a number is a lie
+    a script would then bake in.
+    """
+    from urllib.parse import urlparse
+
+    base_url = stored.get('OPENAI_BASE_URL')
+    if not base_url:
+        base_url, _ = _front_door(None)
+    entries = {'OPENAI_BASE_URL': base_url}
+    port = urlparse(base_url).port
+    if port is not None:
+        entries['LITELLM_PORT'] = str(port)
+    return entries
 
 
 class TestCLI(_PathOverridesMixin):
@@ -1983,11 +2155,25 @@ class EnvCLI(_PathOverridesMixin):
     \b
       infer-stack env                       # the .env path (source it to load)
       infer-stack env LITELLM_MASTER_KEY    # print one value
+      infer-stack env OPENAI_BASE_URL       # …including the front door
       infer-stack env HF_TOKEN=hf_…         # set one value (merges, before acquire)
       infer-stack env --export              # every entry as `export KEY=value`
 
     The argument is a KEY to read, or ``KEY=VALUE`` to write (writes merge
     non-destructively, so the managed LiteLLM key is preserved).
+
+    Two keys are DERIVED rather than stored -- ``OPENAI_BASE_URL`` and
+    ``LITELLM_PORT`` -- so that everything a client needs comes from one verb
+    and a script never has to hardcode a host and port next to a key it looked
+    up properly::
+
+        export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
+        export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
+
+    They answer before any ``acquire``, because a URL needs no secret to exist.
+    Writing one (``env OPENAI_BASE_URL=…``) pins it: a value in the file always
+    wins over the derived one, which is how you point a script at a gateway
+    that is not the local front door.
     """
 
     __command__ = 'env'
@@ -2012,7 +2198,23 @@ class EnvCLI(_PathOverridesMixin):
             key = key.strip()
             if not key:
                 raise SystemExit('env: empty key in KEY=VALUE')
-            write_env_file(env_path, {key: value})
+            # Under the controller's publication lock: a render/apply in progress
+            # must read one consistent .env (its fingerprints hash the values
+            # Compose will interpolate), and concurrent writers must not lose
+            # each other's keys.
+            ledger = Ledger(SqliteStore(str(default_ledger_path())))
+            controller = Controller(ledger, NullBackend())
+            with controller._global_lock():
+                if key in _SERVICE_ENV_KEYS:
+                    leases, _ = ledger.status(virtual_expiry=True)
+                    active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+                    if active:
+                        raise SystemExit(
+                            f'env: {key} affects running services and cannot change '
+                            f'while {len(active)} lease(s) are active; release them '
+                            'first'
+                        )
+                write_env_file(env_path, {key: value})
             print(f'set {key} ({env_path})')
             return 0
 
@@ -2021,19 +2223,31 @@ class EnvCLI(_PathOverridesMixin):
             print(env_path)
             return 0
 
-        # Read: `env KEY` / `env --export`
-        if not env_path.exists():
-            raise SystemExit(
-                f'no managed env-file at {env_path}; run an `acquire` '
-                'with --backend compose first (or `infer-stack env KEY=VALUE`)'
-            )
-        env = parse_env_file(env_path)
+        # Read: `env KEY` / `env --export`. A stored value always beats the
+        # derived one -- writing the key is how you override the front door.
+        env = parse_env_file(env_path) if env_path.exists() else {}
+        derived = _front_door_env(env)
         if config.arg:
-            if config.arg not in env:
-                raise SystemExit(f'{config.arg!r} not found in {env_path}')
-            print(env[config.arg])
-            return 0
-        for name, value in env.items():
+            if config.arg in env:
+                print(env[config.arg])
+                return 0
+            if config.arg in derived:
+                print(derived[config.arg])
+                return 0
+            if not env_path.exists():
+                raise SystemExit(
+                    f'no managed env-file at {env_path}; run an `acquire` '
+                    'with --backend compose first (or `infer-stack env KEY=VALUE`)'
+                )
+            raise SystemExit(f'{config.arg!r} not found in {env_path}')
+        if not env_path.exists():
+            # The URL still stands on its own; say what is missing on stderr so
+            # `eval "$(infer-stack env --export)"` keeps working regardless.
+            print(
+                f'no managed env-file at {env_path} yet: no secrets to export',
+                file=sys.stderr,
+            )
+        for name, value in {**derived, **env}.items():
             print(f'export {name}={shlex.quote(value)}')
         return 0
 
@@ -2059,8 +2273,7 @@ def _require_compose_backend(controller):
 
 def _live_endpoints(controller) -> set[str]:
     """Endpoint aliases served by a currently-live deployment (for annotation)."""
-    controller.ledger.sweep()
-    _, deployments = controller.ledger.status()
+    _, deployments = controller.ledger.status(virtual_expiry=True)
     return {
         ep
         for g in deployments
@@ -2181,16 +2394,19 @@ class RoutesPruneCLI(_ApprovalMixin):
         controller = _open_controller(config, interactive=False)
         backend = _require_compose_backend(controller)
 
-        controller.ledger.sweep()
-        desired = controller.desired_deployments()
-        plan = backend.plan(desired)
-        keep: dict = {}
-        if backend.catalog is not None:
-            keep.update(_registry_incoming_from_catalog(backend.catalog))
-        keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+        def prune_plan() -> tuple[dict, dict, list[str]]:
+            desired = controller.desired_deployments()
+            plan = backend.plan(desired)
+            keep: dict = {}
+            if backend.catalog is not None:
+                keep.update(_registry_incoming_from_catalog(backend.catalog))
+            keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+            current = backend._load_route_registry().get('entries', {})
+            return current, keep, sorted(set(current) - set(keep))
 
-        current = backend._load_route_registry()
-        dropped = sorted(set(current.get('entries', {})) - set(keep))
+        # Preview outside the lock (the prompt must not hold it); the change
+        # itself is recomputed under the lock below.
+        _, keep, dropped = prune_plan()
         if not dropped:
             print('routes prune: nothing to drop (registry already minimal)')
             return 0
@@ -2209,21 +2425,35 @@ class RoutesPruneCLI(_ApprovalMixin):
             if not ok:
                 raise SystemExit('aborted: registry not pruned')
 
-        with backend._converge_lock():
-            backend._atomic_write(
-                backend._registry_file, _dump_route_registry(pruned)
-            )
+        confirmed = set(dropped)
+
+        def change():
+            # Under the lock: drop only routes that were confirmed AND are still
+            # unneeded now; anything that became needed meanwhile is kept. (No
+            # sweep: an expired-but-unswept deployment only keeps its routes.)
+            current, _, still = prune_plan()
+            drop = sorted(confirmed & set(still))
+            entries = {k: v for k, v in current.items() if k not in drop}
+            with backend._converge_lock():
+                backend._atomic_write(
+                    backend._registry_file,
+                    _dump_route_registry(
+                        {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}),
+                )
+            return drop, sorted(entries)
+
         try:
-            controller.reconcile(apply=True)
+            (dropped, kept), rec = controller.publish_change(change)
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
 
         if config.json:
-            print(json.dumps({'dropped': dropped, 'kept': sorted(keep)}, indent=2))
+            print(json.dumps({'dropped': dropped, 'kept': kept,
+                              'publication_pending': rec.publication_pending}, indent=2))
         else:
             print(f'routes prune: dropped {len(dropped)} route(s), '
-                  f'kept {len(keep)}')
-        return 0
+                  f'kept {len(kept)}')
+        return 3 if rec.publication_pending else 0
 
 
 class RoutesSeedCLI(_ApprovalMixin):
@@ -2278,24 +2508,190 @@ class RoutesSeedCLI(_ApprovalMixin):
                 'routes seed: the named catalog(s) resolved no routable endpoints'
             )
 
-        before = set(backend._load_route_registry().get('entries', {}))
-        backend.merge_route_registry(incoming)
+        def change():
+            before = set(backend._load_route_registry().get('entries', {}))
+            backend.merge_route_registry(incoming)
+            return sorted(set(incoming) - before)
+
         try:
-            controller.reconcile(apply=True)
+            added, rec = controller.publish_change(change)
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
-        added = sorted(set(incoming) - before)
 
         if config.json:
             print(json.dumps(
-                {'merged': sorted(incoming), 'added': added}, indent=2
+                {'merged': sorted(incoming), 'added': added,
+                 'publication_pending': rec.publication_pending}, indent=2
             ))
         else:
             print(
                 f'routes seed: merged {len(incoming)} route(s) '
                 f'({len(added)} new): {", ".join(added) or "(all already present)"}'
             )
-        return 0
+        return 3 if rec.publication_pending else 0
+
+
+class ConfigPublishCLI(_ApprovalMixin):
+    """Explicitly pre-seed/preview the internal recovery profile.
+
+    This is an advanced operation, not part of the normal
+    ``config init -> catalog suggest --apply -> acquire`` workflow. Acquire
+    advances the recovery snapshot automatically from current user config.
+
+    Use explicit publication when several independent runbooks should be
+    pre-seeded as one catalog union before any of them acquires, or when an
+    operator deliberately wants a quiescent preview/pre-pull of a future
+    profile. Endpoints are merged, identical definitions deduplicated, and a
+    name defined differently in two catalogs is refused.
+
+    Examples:
+        infer-stack config publish a.yaml b.yaml --yes
+        infer-stack config publish --catalog a.yaml --ui --yes
+    """
+
+    __command__ = 'publish'
+
+    catalogs = scfg.Value(
+        [], nargs='*', position=1, type=str,
+        help='Catalog files to publish as one union (default: --catalog, or the '
+        'default-path catalog).',
+    )
+    pull = scfg.Value(
+        True, isflag=True,
+        help='Pre-pull every image the profile references (default; --no-pull skips).',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import CatalogUnion, ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        render_profile = getattr(controller.backend, 'render_profile', None)
+        if render_profile is None:
+            raise SystemExit('config publish: this backend has no render profile')
+        # The profile this invocation resolves to, before the backend was
+        # switched to the published one (see Controller._sync_profile).
+        profile = controller._invocation_profile or render_profile()
+        paths = _collect_names(config.catalogs)
+        if paths:
+            sources = []
+            for raw in paths:
+                path = Path(raw).expanduser()
+                if not path.exists():
+                    raise SystemExit(f'catalog not found: {path}')
+                try:
+                    sources.append(Catalog.load(path).source)
+                except CatalogError as ex:
+                    raise SystemExit(f'invalid catalog {path}: {ex}')
+            profile = {**profile, 'catalogs': sources}
+        try:
+            if profile.get('catalogs'):
+                CatalogUnion.from_sources(profile['catalogs'])   # conflicts
+            pull = getattr(controller.backend, 'pull_images', None)
+            if config.pull and pull is not None and profile.get('backend') == 'compose':
+                # Outside the lock, before anything is published: a steady-state
+                # apply must never wait on a registry, and a missing image must
+                # refuse the publication rather than break the next apply. The
+                # image set comes from the CANDIDATE profile and its catalogs.
+                from ..leasing.compose import profile_images
+
+                try:
+                    pull(profile_images(profile))
+                except Exception as ex:  # noqa: BLE001
+                    raise SystemExit(f'config publish: image pull failed, nothing published: {ex}')
+            rec = controller.publish_profile(profile)
+        except (ProfileMismatch, CatalogError) as ex:
+            raise SystemExit(f'config publish: {ex}')
+        except ConvergeAborted:
+            raise SystemExit('aborted: profile not published')
+        n = len(profile.get('catalogs') or [])
+        if config.json:
+            print(json.dumps({'published': True, 'catalogs': n,
+                              'publication_pending': rec.publication_pending}, indent=2))
+        else:
+            print(f'published the render profile ({profile.get("backend")}, {n} catalog(s))')
+            if rec.publication_pending:
+                print('  ! the apply did not fully take effect; retry `infer-stack apply`')
+        return 3 if rec.publication_pending else 0
+
+
+class NetworkMigrateCLI(_ApprovalMixin):
+    """Move the stack to stable per-service addresses on a fixed subnet.
+
+    Every service gets a static address that no other service will ever
+    receive, which prevents the gateway from routing one model's traffic to a
+    container that inherited another's IP. Recreates every container once
+    (including the gateway), so it is refused while leases are active unless
+    ``--force``. A subnet overlapping an existing Docker network or host route
+    is rejected.
+    """
+
+    __command__ = 'migrate'
+
+    subnet = scfg.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
+    force = scfg.Value(False, isflag=True, help='Migrate even with active leases.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not config.subnet:
+            raise SystemExit('network migrate: --subnet is required')
+        controller = _open_controller(config, interactive=True)
+        if not callable(getattr(controller.backend, 'residency', None)):
+            raise SystemExit('network migrate needs the compose backend')
+        try:
+            rec = controller.network_migrate(config.subnet, force=bool(config.force))
+        except ProfileMismatch as ex:
+            raise SystemExit(f'network migrate: {ex}')
+        except ConvergeAborted:
+            raise SystemExit('aborted: network not migrated')
+        table = controller.ledger.service_addresses()
+        print(f'network migrate: {len(table)} service address(es) on {config.subnet}')
+        for service, ip in sorted(table.items()):
+            print(f'  {ip:<15} {service}')
+        return 3 if rec.publication_pending else 0
+
+
+class NetworkCheckCLI(_LeasingCommonMixin):
+    """Probe every model upstream by name from inside the gateway's network.
+
+    Distinguishes a routing fault (the name answers with ANOTHER model: the
+    stale-address misroute) from an upstream that is simply not ready.
+    """
+
+    __command__ = 'check'
+
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config)
+        check = getattr(controller.backend, 'upstream_check', None)
+        if check is None:
+            raise SystemExit('network check needs the compose backend')
+        result = check()
+        if config.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for service, row in result.items():
+                print(f'  {row["status"]:<14} {service} (expects {row["expected"]})')
+        return 4 if any(r['status'] == 'routing-fault' for r in result.values()) else 0
+
+
+class NetworkModalCLI(scfg.ModalCLI):
+    """Stable per-service addressing (migrate) and the upstream routing check."""
+
+    __command__ = 'network'
+
+    migrate = NetworkMigrateCLI
+    check = NetworkCheckCLI
 
 
 class RoutesModalCLI(scfg.ModalCLI):

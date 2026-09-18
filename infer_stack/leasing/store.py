@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS claims (
     kind TEXT NOT NULL DEFAULT 'endpoint'
 );
 
+-- Append-only: a service keeps its address; no other service ever receives it.
+CREATE TABLE IF NOT EXISTS service_addresses (
+    service TEXT PRIMARY KEY,
+    ipv4 TEXT NOT NULL UNIQUE
+);
+
 CREATE INDEX IF NOT EXISTS idx_claims_lease ON claims(lease_id);
 CREATE INDEX IF NOT EXISTS idx_claims_deployment ON claims(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_deployments_compat ON deployments(compat_key);
@@ -137,6 +143,7 @@ class SqliteStore:
         # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
         # first-open race as the WAL switch, so retry it too.
         self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
+        self._retry_locked(self._add_missing_columns)
         # Stamp the version idempotently rather than SELECT-then-INSERT. That
         # read-then-write was a TOCTOU across processes: two CLIs opening the
         # same fresh ledger both saw no row, both inserted, and the loser died
@@ -156,8 +163,51 @@ class SqliteStore:
             )
         )
 
+    #: Columns added after the first schema, as (table, column, declaration).
+    _ADDED_COLUMNS = (
+        ('deployments', 'assigned_gpus', 'TEXT'),
+    )
+
+    def _add_missing_columns(self) -> None:
+        """Add columns newer code needs to an older ledger (nullable, so safe).
+
+        Two processes can race here; a duplicate-column error from the loser
+        is the desired end state.
+        """
+        for table, column, decl in self._ADDED_COLUMNS:
+            have = {r['name'] for r in self._conn.execute(f'PRAGMA table_info({table})')}
+            if column in have:
+                continue
+            try:
+                self._conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+            except sqlite3.OperationalError as ex:
+                if 'duplicate column' not in str(ex).lower():
+                    raise
+
     def close(self) -> None:
+        """Close the owned sqlite connection. Safe to call more than once."""
         self._conn.close()
+
+    def __enter__(self) -> 'SqliteStore':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Python 3.13 warns when a sqlite3.Connection reaches GC unclosed.
+        # SqliteStore owns its connection, so make that ownership real even
+        # for short-lived CLI/read-only helpers that do not need an explicit
+        # lifecycle block. Explicit close()/context-manager use remains
+        # preferable where a deterministic boundary is convenient.
+        conn = getattr(self, '_conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                # Finalizers must never turn interpreter shutdown into an
+                # unraisable exception. Normal close() still surfaces errors.
+                pass
 
     # -- transactions ------------------------------------------------------
 
@@ -175,14 +225,17 @@ class SqliteStore:
             try:
                 yield self._conn
                 self._conn.execute('COMMIT')
-            except Exception:
+            except BaseException:
+                # Also on KeyboardInterrupt: never leave a half-done write open
+                # on this connection for the next statement to commit.
                 self._conn.execute('ROLLBACK')
                 raise
 
-    # -- generation (coalesced-apply coordination) -------------------------
+    # -- generation (legacy; unused by the controller) ----------------------
     #
-    # Two monotonic counters in `meta` let separate processes coalesce the slow
-    # `docker compose up` step (see Controller._ensure_applied):
+    # Superseded by the publication marker below, which the controller uses to
+    # serialise render and apply. The counters are still bumped and kept so an
+    # older reader of the same ledger does not break. Their original meaning:
     #   desired_gen  bumped whenever a mutation changes the desired set (a new
     #                deployment, an idled/evicted/expired one). Captured by an
     #                acquirer right after it renders -> "the generation my change
@@ -200,6 +253,8 @@ class SqliteStore:
             'ON CONFLICT(key) DO UPDATE SET '
             'value = CAST(meta.value AS INTEGER) + 1'
         )
+        # Every demand-changing mutation is also an admission-state change.
+        self.bump_admission_state_version()
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'desired_gen'"
         ).fetchone()
@@ -226,6 +281,188 @@ class SqliteStore:
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value '
                 'WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)',
                 (str(int(gen)),),
+            )
+
+    # -- publication marker (serialised publication) -----------------------
+    #
+    # One row in `meta` records that the desired state has changed and has not
+    # yet been fully applied. It is written BEFORE the ledger mutation it
+    # announces (intent first), so a crash at any later point leaves it set, and
+    # the next applying operation re-renders from the ledger and applies. A crash
+    # between writing it and the mutation costs one redundant, idempotent apply.
+    #
+    #   version          bumped on every mark; a clear names the version it
+    #                    applied, so a newer mark is never cleared by an older
+    #                    apply (defensive: callers serialise under one lock)
+    #   apply_requested  False only for staged changes (`acquire --no-apply`),
+    #                    which must not start just because something reopened;
+    #                    once True it stays True until cleared
+
+    def meta_json(self, key: str, default=None):
+        row = self._conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+        return json.loads(row['value']) if row else default
+
+    def set_meta_json(self, key: str, value) -> None:
+        with self.transaction():
+            self._conn.execute(
+                'INSERT INTO meta(key, value) VALUES (?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (key, json.dumps(value, sort_keys=True)),
+            )
+
+    def service_addresses(self) -> dict[str, str]:
+        rows = self._conn.execute('SELECT service, ipv4 FROM service_addresses').fetchall()
+        return {r['service']: r['ipv4'] for r in rows}
+
+    def add_service_addresses(self, table: dict[str, str]) -> None:
+        """Insert new (service, ipv4) rows; existing rows are never changed."""
+        with self.transaction():
+            current = self.service_addresses()
+            for service, ip in table.items():
+                if service in current:
+                    if current[service] != ip:
+                        raise ValueError(f'service {service!r} already has {current[service]}')
+                    continue
+                self._conn.execute(
+                    'INSERT INTO service_addresses(service, ipv4) VALUES (?, ?)', (service, ip))
+
+    def profile(self) -> dict | None:
+        """The published render profile, or ``None`` before the first mutation."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'profile'"
+        ).fetchone()
+        return json.loads(row['value']) if row else None
+
+    def set_profile(self, profile: dict) -> None:
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(profile, sort_keys=True),),
+            )
+
+    def mark_publication_pending(
+        self, *, apply_requested: bool, interrupted: bool = False,
+        placement_context: dict | None = None, approved_digest: str | None = None,
+    ) -> dict:
+        """Record that desired state is changing; return the marker written.
+
+        Both flags only ever turn on until the marker is cleared.
+        ``interrupted`` records that an apply was killed mid-flight, so the
+        runtime may still be changing underneath the next one.
+        ``placement_context`` (an acquire's admission scope, e.g. its
+        ``allowed_gpus``) replaces any stored one; ``None`` keeps it.
+        """
+        with self.transaction():
+            return self._write_marker(
+                apply_requested=apply_requested, interrupted=interrupted,
+                placement_context=placement_context, approved_digest=approved_digest,
+            )
+
+    def _write_marker(self, *, apply_requested, interrupted=False,
+                      placement_context=None, approved_digest=None) -> dict:
+        """The marker upsert; the caller holds a :meth:`transaction`."""
+        if True:
+            current = self._read_publication_pending()
+            marker = {
+                'version': (current['version'] if current else 0) + 1,
+                'apply_requested': bool(apply_requested)
+                or bool(current and current['apply_requested']),
+                'interrupted': bool(interrupted)
+                or bool(current and current['interrupted']),
+                'placement_context': placement_context if placement_context is not None
+                else (current['placement_context'] if current else None),
+                'approved_digest': approved_digest if approved_digest is not None
+                else (current['approved_digest'] if current else None),
+            }
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('publication_pending', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(marker, sort_keys=True),),
+            )
+        return marker
+
+    def clear_approved_digest(self) -> None:
+        """The approved render was applied, or deliberately abandoned (a
+        rollback); the digest no longer describes the pending state."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current.get('approved_digest') is None:
+                return
+            current['approved_digest'] = None
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
+                (json.dumps(current, sort_keys=True),),
+            )
+
+    def publish_profile(self, profile: dict, *, approved_digest: str | None) -> None:
+        """Write the profile and its pending marker (with the approved digest)
+        in one transaction, so a crash cannot leave a published profile whose
+        approval nothing records."""
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps(profile, sort_keys=True),),
+            )
+            self._write_marker(apply_requested=True, approved_digest=approved_digest)
+
+    def migrate_network(self, *, subnet: str, reset_addresses: bool,
+                        approved_digest: str | None) -> None:
+        """Switch subnet, reset addresses and mark the change pending, atomically.
+
+        A crash leaves either the old subnet with its address table, or the new
+        subnet with an empty one -- never the old subnet with addresses lost,
+        which could hand a service's address to another service.
+        """
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('network_config', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (json.dumps({'subnet': subnet}, sort_keys=True),),
+            )
+            if reset_addresses:
+                self._conn.execute('DELETE FROM service_addresses')
+            self._write_marker(apply_requested=True, approved_digest=approved_digest)
+
+    def publication_pending(self) -> dict | None:
+        """The pending marker, or ``None`` when every change has been applied."""
+        return self._read_publication_pending()
+
+    def clear_publication_pending(self, version: int) -> bool:
+        """Clear the marker if it is not newer than ``version``; True if cleared."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current['version'] > int(version):
+                return False
+            self._conn.execute("DELETE FROM meta WHERE key = 'publication_pending'")
+        return True
+
+    def _read_publication_pending(self) -> dict | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'publication_pending'"
+        ).fetchone()
+        if not row:
+            return None
+        marker = json.loads(row['value'])
+        return {
+            'version': int(marker['version']),
+            'apply_requested': bool(marker['apply_requested']),
+            'interrupted': bool(marker.get('interrupted', False)),
+            'placement_context': marker.get('placement_context'),
+            'approved_digest': marker.get('approved_digest'),
+        }
+
+    def clear_placement_context(self) -> None:
+        """Forget a pending acquire's scope once its render has pinned placement."""
+        with self.transaction():
+            current = self._read_publication_pending()
+            if current is None or current['placement_context'] is None:
+                return
+            current['placement_context'] = None
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
+                (json.dumps(current, sort_keys=True),),
             )
 
     # -- leases ------------------------------------------------------------
@@ -385,8 +622,8 @@ class SqliteStore:
     def insert_deployment(self, deployment: Deployment) -> None:
         self._conn.execute(
             'INSERT INTO deployments(id, compat_key, engine, sharing, capacity,'
-            ' spec, served, state, created_at, updated_at)'
-            ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' spec, served, state, created_at, updated_at, assigned_gpus)'
+            ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 deployment.id,
                 deployment.compat_key,
@@ -398,14 +635,43 @@ class SqliteStore:
                 deployment.state,
                 deployment.created_at,
                 deployment.updated_at,
+                None if deployment.assigned_gpus is None
+                else _dumps(list(deployment.assigned_gpus)),
             ),
         )
 
     def set_deployment_state(self, deployment_id: str, state: str, updated_at: float) -> None:
+        # Leaving LIVE releases the committed allocation in the same statement.
         self._conn.execute(
-            'UPDATE deployments SET state = ?, updated_at = ? WHERE id = ?',
-            (state, updated_at, deployment_id),
+            'UPDATE deployments SET state = ?, updated_at = ?,'
+            " assigned_gpus = CASE WHEN ? = 'live' THEN assigned_gpus ELSE NULL END"
+            ' WHERE id = ?',
+            (state, updated_at, state, deployment_id),
         )
+
+    def set_deployment_allocation(
+        self, deployment_id: str, gpus: list[int] | None
+    ) -> None:
+        """Commit (or clear) a LIVE deployment's GPU allocation."""
+        self._conn.execute(
+            'UPDATE deployments SET assigned_gpus = ? WHERE id = ?',
+            (None if gpus is None else _dumps([int(g) for g in gpus]), deployment_id),
+        )
+
+    def bump_admission_state_version(self) -> int:
+        """Increment ``admission_state_version``; call inside :meth:`transaction`."""
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('admission_state_version', '1') "
+            'ON CONFLICT(key) DO UPDATE SET '
+            'value = CAST(meta.value AS INTEGER) + 1'
+        )
+        return self.admission_state_version()
+
+    def admission_state_version(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'admission_state_version'"
+        ).fetchone()
+        return int(row['value']) if row else 0
 
     def update_deployment_served(
         self, deployment_id: str, served: dict[str, Any], updated_at: float
@@ -481,4 +747,5 @@ class SqliteStore:
             state=row['state'],
             created_at=row['created_at'],
             updated_at=row['updated_at'],
+            assigned_gpus=_loads(row['assigned_gpus']) if row['assigned_gpus'] else None,
         )

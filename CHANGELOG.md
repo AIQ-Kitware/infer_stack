@@ -2,6 +2,524 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Refused TUI actions pop up instead of doing nothing
+
+An action the TUI declines -- `Edit` on an endpoint that is actively served,
+`Acquire` with nothing selected, a catalog action without a catalog path --
+now raises a popup, keeps its message in the status line, and is recorded in
+the `TUI log` tab. Previously it wrote one status line that the next refresh
+tick wiped, so a refusal was indistinguishable from a dead button. This covers
+all 24 refusal paths; the ones that report a failure are logged as errors.
+
+### The TUI header shows the running version
+
+The header now reads `infer-stack` / `0.7.1 · leasing dashboard`, so a
+screenshot or a bug report says which version produced it.
+
+### The TUI reports its own failures, in a `TUI log` tab of its own
+
+A failing action used to look like nothing happened: Textual runs actions and
+background workers on its own message pump, so an exception reached no
+terminal, and the TUI had no handler for worker failures.
+
+- **A `TUI log` tab**, separate from the docker Logs pane (which streams
+  container output and sits inside a collapsed section). It records what the
+  TUI did, every status message, and every failure with its traceback, and it
+  names the file each error is also appended to.
+- **An error is impossible to miss:** the tab label turns red with a count
+  (`⚠ TUI log (2)`), a toast appears, and the status line keeps the message
+  instead of being wiped by the next refresh. Press `l` for the tab.
+- **`<data root>/tui-errors.log`** keeps tracebacks for after the TUI exits.
+- This covers button handlers and all 16 background workers (the catalog
+  editor, acquire, release, the API probes). A worker cancelled because
+  another action in its group started now says so, instead of looking dead.
+- An action that declines to act (no catalog path, endpoint actively served)
+  logs that reason, so "nothing happened" is never the whole story.
+
+### Restore the three-step leasing UX; isolate TUI log streams
+
+- **User config is authoritative again.** The normal workflow is explicitly
+  `config init -> catalog suggest --apply -> acquire`; the persisted leasing
+  profile remains only an internal crash-recovery snapshot. Acquire advances
+  that snapshot automatically instead of requiring a separate `config publish`
+  step.
+- **Compatible catalog additions can join a live epoch.** While models are
+  resident, previously frozen definitions and global render settings remain
+  stable, but new non-conflicting catalog definitions are merged under the
+  publication lock. Conflicting redefinitions wait for release/eviction; once
+  quiescent, the next acquire adopts current user config wholesale.
+- **Explicit `config publish` is advanced-only.** It remains useful to pre-seed
+  several runbook catalogs or preview/pre-pull a profile, but it is no longer a
+  required configuration surface in ordinary operation. ADR 0001 records the
+  invariant.
+- **TUI named-service logs are generation-isolated.** Switching from LiteLLM to
+  a specific vLLM service invalidates the previous follower before clearing the
+  pane. Buffered lines from the terminated worker are discarded, fixing stale
+  LiteLLM output leaking into a vLLM-scoped log view.
+
+### TUI GPU pinning and Qwen3.8-27B on a 3090
+
+- **Endpoint GPU affinity is part of Edit endpoint in the TUI.** vLLM endpoints
+  can opt into an exact `placement.gpu_indices` override there, while `auto`
+  keeps the existing VRAM-aware scheduler. Pins are validated against tp×pp×dp,
+  shown in the endpoint table, and kept distinct in deployment compatibility;
+  there is no separate GPU-pin action to learn.
+- **`suggest from my GPUs` recognizes the measured Qwen3.8-27B/RTX 3090 path.**
+  The official `Qwen/Qwen3.8-27B` metadata supplies the 262K context/27.78B
+  model identity; the runnable source is the ~19.5-GB W4A16 AutoRound body that
+  HyperQwen prepares for a 24-GiB 3090. The suggestion pins the matched 3090,
+  uses HyperQwen's immutable per-commit image, and starts its speed-first
+  DFlash2 + prefix-cache single-user profile at 64K context. Its catalog name
+  is `qwen3.8-27b-dbirks-hyperqwen`; the unsuffixed name is reserved for the
+  official checkpoint rather than conflating the two artifacts.
+- **Endpoint activation is reliable from mouse, keyboard, and Acquire.** The
+  endpoint table uses Textual's native click chain when available and a
+  same-endpoint timing fallback when a driver does not provide one; neither path
+  reconstructs rows from screen coordinates. Enter and the Acquire button use
+  the same acquire action. Mutation results stay visible through the immediate
+  table refresh instead of being replaced by a row-relationship hint.
+- **Endpoint Edit stays usable on short terminals.** The editable fields scroll
+  inside the modal while Save/Cancel stay fixed and visible, including after the
+  GPU-placement field was added.
+- **Named vLLM serve recipes are explicit and compatibility-safe.** The
+  `hyperqwen-3090-single` recipe owns its nonstandard entrypoint, persistent
+  prepared-model/cache mounts, and launch environment. Stock vLLM endpoints
+  keep their existing structural compatibility shape; KubeAI refuses the
+  Compose-only recipe rather than silently rendering the wrong engine command.
+- **HyperQwen is credited as related work.** The README names the upstream
+  project and makes the ownership boundary explicit: HyperQwen provides the
+  3090-specific preparation/runtime tuning; infer-stack provides placement and
+  lifecycle integration around it.
+
+### Publication side effects, `.env` races, raw controls (review)
+
+- **`config publish` previews purely.** On Compose it now previews the
+  candidate in memory, commits the profile and its approved digest, and only
+  then renders for real. A crash before the commit can no longer leave
+  candidate routes in the append-only route registry, or candidate addresses
+  in the address table.
+- **`infer-stack env KEY=VALUE`** now takes the publication lock and replaces
+  the file atomically. A render in progress sees one consistent `.env`, and
+  concurrent writers no longer lose each other's keys.
+- **Fingerprints** hash only the `.env` variables a service interpolates, so
+  an unrelated key no longer recreates it.
+- **The TUI's Up button** now runs `apply` through the controller, instead of
+  a raw `docker compose up --remove-orphans`. `stack up`/`stack down` are
+  documented as raw escape hatches.
+- **`status` and the TUI's served-endpoint view** show TTL expiry virtually.
+- **A subnet change** checks for foreign containers attached to the old
+  network before removing anything, so it cannot take the stack down and then
+  abort.
+
+### Approval digests and subnet changes (review)
+
+- **`config publish`** writes the profile and its pending marker (with the
+  approved digest) in one transaction. A crash can no longer leave a published
+  profile whose approval nothing records.
+- **The approved digest now always describes the pending state.**
+  - `acquire --no-apply` records none, so a staged lease stays discardable by
+    `release`.
+  - A rollback of a failed acquire drops the digest of the state it abandons.
+  - An acquire's digest is written in the same transaction as its lease.
+- **Changing an already-migrated subnet** now recreates the Docker network.
+  Compose never changes an existing network's IPAM, so once the old containers
+  are confirmed gone the apply removes `infer-stack-net`, and Compose recreates
+  it on the new subnet. A container still attached blocks it, with the change
+  left pending. This is checked on every apply, so an interrupted migration
+  completes later.
+
+### Migration and publication fixes (review)
+
+- **Unresolved legacy deployments.** A LIVE deployment from before allocations
+  that is still unresolved can no longer accept a new lease by coalescing; the
+  acquire is refused, naming it. Renewing its existing lease still works.
+- **`network migrate`** previews the migrated render and takes approval before
+  writing anything. It then switches the subnet, resets the address table and
+  marks the change pending in one transaction, with the approved digest. A
+  crash can no longer leave the old subnet with an empty address table, which
+  could have given a service another service's address.
+- **Crash-safe acquire approval.** The approved render's digest is now stored
+  in the pending marker before the lease commits, so a recovery after a crash
+  (or an upgrade) cannot silently apply a different render. The digest is
+  dropped once the approved render reaches Docker, so a route-verification
+  retry does not need re-approval.
+- **`config publish` pre-pull** derives its image set from the candidate
+  profile and its catalogs: infrastructure images the candidate enables, the
+  engine image of every published endpoint, and per-endpoint image overrides
+  (including Ollama).
+- **Re-running `network migrate`** on its current subnet no longer reports the
+  host route of infer-stack's own network as an overlap.
+- **Ledger transactions** also roll back on `KeyboardInterrupt`.
+
+### Health view: degraded, displaced, unresolved, orphans, pending changes (P10)
+
+- **`infer-stack leases`** now ends with a `health:` block, and `--json`
+  includes a `health` object. It is read-only: it never writes the ledger. It
+  reports:
+  - the pending change (staged or apply requested, interrupted, approval
+    guard);
+  - unknown residency;
+  - each deployment's condition: `ambiguous`, `degraded`, `displaced`,
+    `unresolved` or `not-running`;
+  - orphan containers;
+  - profile drift;
+  - the stable address table;
+  - leases that have expired but not yet been reclaimed.
+- **Degraded deployments end to end.** A LIVE deployment whose committed GPUs
+  are no longer valid is reported `degraded`, is neither started nor removed,
+  and refuses coalescing; releasing its lease makes it removable.
+- **Refusals name the contested GPUs.** An admission refusal lists which
+  admitted deployments hold which GPUs, and their owners.
+- **GPU column.** In admission mode, `leases` shows committed allocations and
+  resident GPUs rather than a hypothetical legacy plan.
+
+### `config publish` pre-pulls images; approved renders are guarded (P4)
+
+- **Pre-pull.** `config publish` pulls every image the new profile references
+  before publishing, outside the lock, so steady-state applies never wait on a
+  registry. A failed pull publishes nothing; `--no-pull` skips the step.
+- **Approved-digest guard.** A publication records the digest of the render
+  the operator approved. If a later process renders something different
+  before that change is applied (for example infer-stack was upgraded in
+  between), the apply is refused and the change stays pending until
+  `infer-stack apply` re-approves it explicitly.
+
+### Selective apply waits for health and for removals (review)
+
+- **Health-conditioned dependencies.** `up --no-deps` skips Compose's
+  `depends_on: condition: service_healthy`, so selective apply now waits
+  (bounded, 180 s) for such a dependency, for example Postgres before the
+  dynamic-routing gateway, to report healthy before starting its dependent,
+  and aborts with the change pending otherwise.
+- **Removals are confirmed.** After removing containers, the apply confirms
+  from strict residency that they are gone (bounded, 60 s) before starting
+  anything on their GPUs or addresses.
+
+### Stable per-service addresses: `infer-stack network migrate` and `network check` (P7)
+
+- **`network migrate --subnet <cidr>`.** Puts the project on one named
+  network with a fixed IPAM subnet, and every service on a static address.
+  - Addresses live in an append-only ledger table: a service keeps its address
+    across recreation, and no other service ever receives it. Allocation skips
+    the network, gateway (`.1`) and broadcast addresses.
+  - A subnet overlapping an existing Docker network or host route is rejected.
+  - Every container is recreated once, so the command is refused while leases
+    are active unless `--force`.
+  - This fixes the reproduced gateway misroute after container recreation.
+- **Address holders.** An unmanaged container holding a service's address
+  aborts the apply.
+- **`network check`.** Probes each model upstream by name from inside the
+  gateway (`docker exec` with `python3`), and reports `healthy`, `not-ready` or
+  `routing-fault`. It exits 4 on a routing fault.
+
+### Selective apply: ownership labels, fingerprints, GPU barrier (P8)
+
+The Compose backend no longer runs `docker compose up -d --remove-orphans`.
+
+- **Labels.** Every rendered service carries `infer-stack.service` and a
+  behavioural `infer-stack.fingerprint`. The fingerprint covers the canonical
+  stanza, the generated files the service mounts, and the managed `.env` when
+  the stanza interpolates from it.
+- **What an apply does.**
+  - It keeps a managed container whose (service, fingerprint) is wanted, is
+    unique, and is running, restarting or paused. A required paused container
+    is unpaused; an optional one stays paused.
+  - It removes other managed containers, except those of degraded deployments.
+  - It reports containers it does not manage (orphans), and never removes them
+    implicitly.
+  - It starts only missing, non-optional services, with `up -d --no-deps`, level
+    by level in dependency order.
+- **GPU barrier.** Nothing is started on a GPU while another container holds
+  it. A managed occupant is removed first; an unmanaged or degraded one aborts
+  the apply (the change stays pending). So do duplicate containers for a wanted
+  service, and a container still being removed.
+- **Upgrade.** Containers from before the labels are adopted once, when they
+  match infrastructure in the render or a LIVE/resident deployment on the same
+  GPUs. Adoption recreates nothing.
+- **Orphans.** `infer-stack gc --orphans` lists unmanaged project containers
+  and removes exactly those, after confirmation or with `--yes`.
+- **Residency** now lists the whole project, infrastructure included, with each
+  container's service, fingerprint and ownership.
+
+### Admission fixes (review): approval before commit; unresolved rows are never placed
+
+- **The diff is approved before anything is committed.** The admission preview
+  renders exactly the files the post-commit render will write and asks for
+  approval then; the render after the commit does not ask again. A declined
+  acquire leaves no lease, no added alias on a shared deployment, and no route
+  registry change. The registry is now persisted only after approval.
+- **Every claimed deployment is checked.** Admission refuses a candidate if any
+  deployment it claims is unplaced or unrenderable, including an existing one
+  it only coalesces onto.
+- **Unresolved legacy deployments are never placed.** A LIVE deployment from
+  before allocations, with no unique running container, is neither freshly
+  placed nor given an allocation; it only blocks new allocations until
+  released. Crash recovery in admission mode no longer commits allocations.
+- **Adoption now runs.** Migration adoption of pre-label containers was
+  unreachable (it sat after a `return`), and runs now.
+
+### Admission: committed allocations, atomic acquires, optional warm residency
+
+For the Compose backend, this fixes the incident where idle keep-warm models
+starved new leases while GPUs sat empty. It covers plan steps P5, P6 and P9.
+
+- **Hard allocations.** A LIVE deployment holds a committed allocation, the new
+  `deployments.assigned_gpus` column, added to existing ledgers automatically.
+  The allocation is released in the same transaction as any transition out of
+  LIVE.
+- **Atomic admission.** An acquire is previewed in memory, both placement and
+  render, against the ledger, strict residency and the published profile. The
+  lease and its allocations are committed together, or nothing is written.
+  - A queued caller that is not yet admitted holds nothing.
+  - Two callers racing for the last GPU cannot both win.
+  - A ledger change between preview and commit makes the acquire retry.
+  - While Docker residency is unknown, only requests needing no new GPU are
+    admitted.
+- **Optional warm residency.** An idle keep-warm deployment is only a
+  candidate while its container is uniquely resident. It yields its GPUs to
+  demand (reported as `displaced`), and is never started.
+- **Reuse.** Making an idle deployment LIVE again adopts its resident
+  container's GPUs, or places it fresh.
+- **Renew.** When every deployment is already LIVE, renew is lock-free and
+  TTL-only. Otherwise the lease is re-admitted under the lock, and the renew
+  fails explicitly if that is impossible.
+- **Upgrade.** LIVE deployments without an allocation adopt their running
+  container's GPUs. Ones that cannot (for example GPU reservations) stay
+  unresolved and block new allocations until released.
+- **Planner.** In admission mode it ignores soft sidecar pins, so a new
+  placement stays within `--allowed-gpus`.
+- **CLI catalogs.** A `--catalog` (or `INFER_STACK_CATALOG`) the caller names
+  that is missing or invalid is an error, even once a catalog union is
+  published.
+- **`config publish` refuses to change the backend kind.**
+
+### Profile publication fixes (review)
+
+- **`config publish` on a fresh ledger** no longer freezes the invocation's
+  settings first. A declined or failed preview now leaves no profile and no
+  pending marker.
+- **A declined recovery render keeps the crashed acquire's GPU scope.**
+  Previously the scope was cleared anyway, so a later caller could place that
+  deployment within its own GPUs.
+- **The CLI refuses a catalog that is not one of the published sources** (new,
+  or edited since publishing), instead of resolving names against the old
+  published definitions.
+- **KubeAI** now freezes its catalog union into the profile too.
+- **Switching backends:** a profile for another backend kind is reported on the
+  first mutation rather than when the controller opens, so
+  `config publish` can switch backends while quiescent.
+
+### Planner admission mode (keywords only; no caller uses it yet)
+
+`plan_placement` accepts `required_ids`, `hard` and `optional_hints`. Committed
+allocations are validated against the whole physical pool; an invalid one is
+reported in `degraded` and never re-placed. Required deployments are placed
+next. Optional idle residents keep their GPUs only if still free, and are
+otherwise reported in `displaced`; they are never newly placed. Without the
+keywords, plans are unchanged. This is step P3 of the admission plan.
+
+### Renders use a published profile; `infer-stack config publish`
+
+Lease operations no longer render from each caller's flags and settings.
+
+- **Frozen on first use.** The first mutation against a ledger freezes a
+  profile. It holds backend, project, gateway, UI, dynamic routing,
+  display-GPU policy, reverse proxy (a BYO nginx config is snapshotted by
+  content), image pins, ports, state paths, and the catalog union. Later
+  operations, including recoveries by other processes, render from it, and
+  warn once when their own settings differ.
+- **Acquire checks the published catalog.** An endpoint missing from the
+  published catalog union, or defined differently there, is refused before
+  anything is written, naming `config publish`. The CLI resolves endpoint names
+  from the published union, so a runbook can acquire any published endpoint
+  whatever `--catalog` it passes.
+- **`infer-stack config publish [catalog ...]`** replaces the profile, previews
+  the diff, and publishes. It merges several catalogs into one union
+  (identical definitions deduplicated, conflicting ones refused), and works
+  only while no lease is active and no deployment container exists.
+- **`--allowed-gpus` stays per caller.** An acquire stores it with its pending
+  change. If the acquire dies before its first render, the next operation
+  places that deployment within the original caller's GPUs.
+- **Upgrading.** On an existing host the next lease operation freezes the
+  current settings and catalog. If runbooks use different catalogs, run
+  `infer-stack config publish` with all of them while the stack is idle.
+
+### Docker commands run with an explicit environment
+
+Every Docker command infer-stack runs now gets an allow-listed environment:
+`PATH`, `HOME`, `USER`, `LOGNAME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR` and
+`TERM`. This covers the backend, the `stack` commands, and the TUI's runner and
+log follower. It affects existing setups:
+
+- **`HF_TOKEN`.** An exported `HF_TOKEN` no longer reaches Compose.
+  `${HF_TOKEN:-}` resolves only from the managed `.env`; set it with
+  `infer-stack env HF_TOKEN=hf_...`.
+- **Docker daemon.** `DOCKER_HOST` is not inherited and `DOCKER_CONTEXT` is
+  forced to `default`, so neither a caller's shell nor `docker context use` can
+  point one operation at a different daemon.
+- **`stack` commands** now pass the managed `.env` as `--env-file`, as the
+  backend does.
+- **TUI.** Its Docker runner is now the same bounded runner as the CLI, instead
+  of an unbounded `subprocess.run`.
+
+### `routes seed` and `routes prune` publish through the controller
+
+Both commands used to write the route registry and then reconcile as two
+separate steps, outside the controller's lock. They now run as one serialised
+mutation through `Controller.publish_change`. `prune` still previews and
+confirms outside the lock. Under the lock it recomputes, and drops only routes
+that were confirmed and are still unneeded. Both report `publication_pending`
+in `--json`, and exit 3 if the apply did not fully take effect.
+
+### Read-only views no longer write the ledger
+
+`leases`, `wait`, `measure`, `evict`'s target lookup, `apply --wait`'s view,
+route annotation and TUI polling used to call `sweep()`, which writes TTL
+expiry into the ledger outside the controller's lock. They now read
+`Ledger.status(virtual_expiry=True)` instead. It reports a lease past its TTL
+as `expired`, and a deployment left without a protecting lease as `idle`,
+without writing either. Expiry is recorded only by controller operations,
+including `gc`.
+
+### Releases and cleanup go through the controller
+
+`infer-stack release` (single, `--all`, `--evict`) and the TUI's release,
+release-all and cleanup actions now use `Controller.release_leases` and
+`Controller.prune`. A batch still releases in one publication, so there is at
+most one diff prompt. The CLI and TUI previously changed the ledger directly and
+reconciled afterwards, outside the lock. `release` now reports
+`publication_pending` in `--json`, and exits 3 if the apply did not fully take
+effect.
+
+### `renew` goes through the controller
+
+`infer-stack renew` now calls `Controller.renew`, under the host-wide lock. A
+renew that makes an idle deployment LIVE again is a desired-state change: it
+takes the publication marker and applies. A TTL-only renew takes no marker and
+runs no apply. It could previously run concurrently with another process's
+render and apply. The CLI prints the revived deployments, and exits 3 if their
+apply did not fully take effect.
+
+### Failed applies no longer leak leases or overlap daemon work
+
+Fixes found in review of the serialised-publication change:
+
+- **No hidden lease on a failed acquire.** If Docker fails or times out while
+  an acquire is applying, the lease is released in the ledger and the error is
+  re-raised. The rollback re-renders but does not apply again, since runtime
+  state is unknown; the release stays pending.
+- **`--no-apply` never applies**, even when an earlier operation left an apply
+  pending. This covers both the acquire and its rollback.
+- **Settle before retrying.** An interrupted apply marks the pending change
+  `interrupted`. The next apply first waits, bounded, for the project's
+  containers to stop changing, and refuses (`RuntimeUnsettled`) if they do not.
+- **Rollback eviction uses strict residency.** It no longer uses `observe()`, so
+  a Docker error during rollback can no longer evict a warm keep-warm
+  deployment. Only a deployment with definitely no container is evicted.
+- **`infer-stack apply` reports pending changes.** It exits 3, and reports
+  `publication_pending` in `--json`, when the apply did not fully take effect.
+- **Route failures are retried.** Reconciliation re-diffs and retries failed
+  admin-API calls until the route set verifies or its deadline passes.
+- **Ctrl-C stops Docker too.** An interrupted Docker command now has its
+  process group killed; it runs in its own session, so it previously kept
+  running.
+
+### Render and apply are serialised under one lock, gated by a durable pending marker
+
+Every desired-state change (acquire, release, evict, gc, rollback, `apply`) now
+runs as one publication under the controller's host-wide lock. It records a
+`publication_pending` marker before touching the ledger, mutates the ledger,
+renders, applies that exact render, and clears the marker only once the whole
+apply has succeeded. In dynamic-routing mode that includes verified gateway
+routes.
+
+This replaces the separate apply lock and the generation-based coalescing. There,
+a render could rewrite the compose file while another process's `docker compose
+up` was reading it, and an apply that failed or was killed left no record. Now:
+
+- **Crashes and failures stay pending.** A crash, a Docker timeout, or routes
+  that do not verify leave the marker set. The next applying operation, or
+  `infer-stack apply`, re-renders and applies the whole pending desired state.
+- **Compose `apply()` returns whether it fully took effect.** Route
+  reconciliation gets 20 s when the gateway was already running and 180 s when
+  the apply is bringing it up. `ReconcileResult.publication_pending` reports a
+  change that is still pending.
+- **Staged leases stay staged.** `acquire --no-apply` and `infer-stack render`
+  never apply. A later applying operation still applies the whole pending
+  state, including staged leases, as before.
+- **Applies no longer run concurrently.** They are also no longer coalesced:
+  concurrent acquires each apply in turn. Each apply is bounded (see below), and
+  one is a no-op when nothing changed.
+
+The legacy `desired_gen`/`applied_gen` counters are still maintained but no
+longer read. This is part of step P2 of
+`dev/tmp/plan-keep-warm-admission-2026-09-16.md`.
+
+### Docker commands are time-bounded; route reconciliation is deadline-bound and reports success
+
+Every Docker command run by the Compose backend now has a wall-clock bound
+(queries 60 s, stop/rm/exec 300 s, compose up/down 1800 s, pulls 3600 s). On
+expiry the command's whole process group is killed and `BackendTimeout` is
+raised, rather than the call hanging. These calls will run under the
+controller's host-wide lock (plan step P2), where an unbounded command would
+block every other lease operation.
+
+Dynamic-routing reconciliation now works against one wall-clock budget covering
+listing retries, POSTs and verification, instead of 90 listing attempts whose
+per-request timeouts were not counted. The worst case against an unreachable
+gateway drops from roughly 18 minutes to 180 seconds. When routes change,
+reconciliation lists them again to verify, and `_reconcile_routes` returns
+whether the managed route set matches the desired one. Callers still treat it as
+best-effort for now; gating on the result is part of P2.
+
+### Strict residency: which deployment containers exist, and on which GPUs
+
+`ComposeBackend.residency()` returns a strict snapshot of this project's
+deployment containers, found by the `infer-stack.deployment` label in every
+state, with GPUs read from each container's actual device reservation
+(`HostConfig.DeviceRequests`). It is additive: nothing calls it yet.
+
+It exists because `observe()` is the wrong tool for any decision that stops,
+removes or hands over a GPU. `observe()` returns an empty set when Docker cannot
+be read -- deliberately, so acquire never bricks on a stale compose file -- and it
+maps containers through the render sidecar, which describes what was rendered
+rather than what exists. `residency()` has the opposite contract: a Docker
+failure raises `ResidencyUnknown` and is never "nothing running"; a deployment
+with more than one container is reported as ambiguous with every container kept;
+and a reservation that cannot be mapped to GPU indices is treated as occupying
+every GPU rather than guessed. `observe()` is unchanged.
+
+This is step P1 of `dev/tmp/plan-keep-warm-admission-2026-09-16.md`.
+
+### `env` answers the front door, not just the secrets
+
+`infer-stack env OPENAI_BASE_URL` and `infer-stack env LITELLM_PORT` now work,
+so everything a client needs comes from one verb:
+
+```bash
+export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
+export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
+```
+
+Before this, `env` knew only what was written in the managed `.env`, which is
+secrets. The URL was obtainable only from a lease env-file -- so every script
+that wanted both ended up looking the key up properly and hardcoding
+`http://127.0.0.1:14042/v1` beside it. A hardcoded port is wrong exactly when
+it matters (a second stack, a moved front door) and it is wrong silently.
+
+Both keys are DERIVED, not stored, and they answer before any `acquire`,
+because a URL needs no secret to exist. They come from `_front_door`, the same
+resolution `infer-stack test` uses, so a script built from `env` cannot point
+at a door `test` never knocked on.
+
+A stored value still wins: `infer-stack env OPENAI_BASE_URL=https://gw:8443/v1`
+pins it, which is how you aim a script at a gateway that is not the local front
+door. `LITELLM_PORT` is then read back off that URL rather than re-derived --
+a port disagreeing with the URL printed beside it is worse than no port -- and
+is omitted entirely when the effective URL names none, since behind a proxy on
+80/443 there is nothing to report and a made-up number is one a script would
+bake in.
+
 ### `doctor --gpu` / `--sudo`: why a card looks busy, and who holds it
 
 Twice a GPU has read 100% utilization with ~0 MiB allocated and an empty
@@ -83,7 +601,10 @@ States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
 including cards allocated to another job, and the failure surfaces later as a
 CUDA OOM in whichever job loses.
 
-## [Version 0.7.0] - Unreleased
+## Version 0.7.1 - Unreleased
+
+
+## Version 0.7.0 - Released 2026-08-28
 
 ### TUI: the logs pane defaults to engines, not everything
 

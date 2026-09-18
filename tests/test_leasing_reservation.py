@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import yaml
 
+from fake_docker_state import ComposeFake
+
 from infer_stack.cli.commands_leasing import _descriptor_for
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import (
@@ -43,29 +45,8 @@ PORTS = {'ollama': 11434}
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
 
 
-class FakeDocker:
+class FakeDocker(ComposeFake):
     """Stateful docker-compose stand-in: ``up`` reflects the rendered file."""
-
-    def __init__(self):
-        self.running: list[str] = []
-        self.calls: list[list[str]] = []
-
-    def __call__(self, args: list[str]) -> str:
-        self.calls.append(args)
-        cfile = args[args.index('-f') + 1] if '-f' in args else None
-        if 'up' in args:
-            data = yaml.safe_load(Path(cfile).read_text()) or {}
-            self.running = sorted((data.get('services') or {}).keys())
-            return ''
-        if 'down' in args:
-            self.running = []
-            return ''
-        if 'ps' in args:
-            return json.dumps(
-                [{'Service': s, 'State': 'running'} for s in self.running]
-            )
-        return ''
-
 
 def make_backend(tmp_path, *, spec='2x80', **kw):
     return ComposeBackend(

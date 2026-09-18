@@ -487,6 +487,9 @@ def test_tui_pane_scoped_action_buttons():
             await pilot.click('#btn-acquire')
             await app.workers.wait_for_complete()
             await pilot.pause()
+            assert not app._acquire_inflight
+            status = str(app.query_one('#status').render())
+            assert 'acquired qwen-coder' in status and 'lease ' in status
 
     _run(scenario)
     leases, _ = controller.ledger.status()
@@ -599,6 +602,12 @@ def test_tui_endpoint_entry_data_parallel_and_ollama():
     assert v['runtime']['enable_prefix_caching'] is True
     assert v['runtime']['max_num_seqs'] == 64
 
+    pinned = InferStackTUI._endpoint_entry({
+        'model': 'm', 'engine': 'vllm',
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [1]},
+    })
+    assert pinned['placement'] == {'min_vram_gib': 24, 'gpu_indices': [1]}
+
     o = InferStackTUI._endpoint_entry({
         'model': 'qwen', 'engine': 'ollama', 'host': 'oll',
         'ollama_runtime': 'num_ctx=8192 keep_alive=5m',
@@ -609,7 +618,7 @@ def test_tui_endpoint_entry_data_parallel_and_ollama():
 
 
 def test_tui_endpoint_wizard_is_engine_adaptive_and_labeled():
-    from textual.widgets import Label, Select
+    from textual.widgets import Input, Label, Select
 
     from infer_stack.tui import InferStackTUI, _AddEndpointScreen
 
@@ -627,10 +636,12 @@ def test_tui_endpoint_wizard_is_engine_adaptive_and_labeled():
             assert screen.query_one('#vllm-opts').display is True
             assert screen.query_one('#ollama-opts').display is False
             assert screen.query_one('#e-dp')        # data-parallel field exists
+            assert screen.query_one('#e-gpu-pin', Input).value == 'auto'
             # fields are labeled (the "blank page" complaint)
             labels = [str(lbl.render()) for lbl in screen.query(Label)]
             assert any('tensor-parallel' in x for x in labels)
             assert any('data-parallel' in x for x in labels)
+            assert any('GPU placement' in x for x in labels)
             # switching engine swaps the field groups
             screen.query_one('#e-engine', Select).value = 'ollama'
             await pilot.pause()
@@ -660,6 +671,7 @@ def test_tui_add_endpoint_writes_advanced_params(tmp_path):
                 'tensor_parallel': 2, 'max_model_len': None, 'gpu_mem': None,
                 'extra_args': '', 'reclaim': '',
             })
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
     _run(scenario)
@@ -690,6 +702,95 @@ def test_tui_edit_blocked_while_served(tmp_path):
             assert 'served' in str(app.query_one('#status').render())
 
     _run(scenario)
+
+
+def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
+    import yaml
+    from textual.widgets import DataTable, Input
+
+    from infer_stack.tui import InferStackTUI, _AddEndpointScreen
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    old = controller.acquire('me', catalog.resolve_names(['qwen-coder']))
+    old_gid = old.lease.deployment_ids[0]
+    controller.release(old.lease.id)  # leave a keep-warm idle deployment behind
+    inventory = {
+        'gpu_count': 2,
+        'gpus': [
+            {'index': 0, 'name': 'Big GPU', 'memory_gib': 48,
+             'display_active': False},
+            {'index': 1, 'name': 'Small GPU', 'memory_gib': 24,
+             'display_active': False},
+        ],
+    }
+
+    async def scenario():
+        app = InferStackTUI(
+            controller, catalog, interval=999, proc_factory=lambda svc: None,
+            catalog_path=str(catalog_path),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            raw = yaml.safe_load(catalog_path.read_text())
+            app._show_endpoint_editor(
+                'qwen-coder', raw['endpoints']['qwen-coder'], inventory
+            )
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, _AddEndpointScreen)
+            screen.query_one('#e-gpu-pin', Input).value = '1'
+            await pilot.click('#ok')
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            ep = app.catalog.endpoints['qwen-coder']
+            assert ep.placement['gpu_indices'] == [1]
+            assert controller.ledger.get_deployment(old_gid).state == 'stopped'
+            table = app.query_one('#endpoints', DataTable)
+            columns = [str(c.label) for c in table.columns.values()]
+            assert 'gpu' in columns
+
+    _run(scenario)
+    on_disk = yaml.safe_load(catalog_path.read_text())
+    assert on_disk['endpoints']['qwen-coder']['placement']['gpu_indices'] == [1]
+
+
+def test_tui_endpoint_edit_preserves_specialized_recipe_and_changes_gpu_pin():
+    from infer_stack.tui import InferStackTUI
+
+    base = {
+        'engine': 'vllm',
+        'model': 'q38',
+        'protocol': 'chat',
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [0]},
+        'runtime': {
+            'serve_recipe': 'hyperqwen-3090-single',
+            'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+            'pipeline_parallel_size': 1,
+            'max_model_len': 65536,
+        },
+    }
+    entry = InferStackTUI._endpoint_entry({
+        'name': 'q38-hq',
+        'model': 'q38',
+        'engine': 'vllm',
+        'base_entry': base,
+        'placement': {'min_vram_gib': 24, 'gpu_indices': [1]},
+        'tensor_parallel': None,
+        'data_parallel': None,
+        'max_model_len': 65536,
+        'gpu_mem': None,
+        'max_num_seqs': None,
+        'prefix_caching': '',
+        'extra_args': '',
+        'reclaim': '',
+    })
+    assert entry['placement'] == {'min_vram_gib': 24, 'gpu_indices': [1]}
+    assert entry['protocol'] == 'chat'
+    assert entry['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
+    assert entry['runtime']['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
+    assert entry['runtime']['pipeline_parallel_size'] == 1
 
 
 def test_tui_remove_endpoint_writes_catalog(tmp_path):
@@ -1045,7 +1146,7 @@ def test_tui_api_tester_respects_completions_protocol():
 def test_tui_api_lists_only_ready_models():
     from textual.widgets import Select
 
-    from infer_stack.tui import InferStackTUI
+    from infer_stack.tui import SELECT_BLANK, InferStackTUI
 
     controller, catalog = _ctx()
 
@@ -1057,7 +1158,7 @@ def test_tui_api_lists_only_ready_models():
             # NullBackend observes nothing running -> no ready models listed,
             # even though the catalog has endpoints.
             assert app._ready_endpoints == []
-            assert app.query_one('#api-model', Select).value is Select.NULL
+            assert app.query_one('#api-model', Select).value is SELECT_BLANK
 
     _run(scenario)
 
@@ -1220,13 +1321,17 @@ def test_tui_model_cached_label(tmp_path):
     assert InferStackTUI._cached_label('', hub) == '-'
 
 
-def test_tui_compose_control_runs_up(tmp_path):
+def test_tui_up_applies_through_the_controller(tmp_path):
+    """The Up action is `infer-stack apply` (serialised, selective), never a raw
+    `docker compose up --remove-orphans`."""
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
     compose_file = tmp_path / 'docker-compose.yml'
     compose_file.write_text('services: {}\n')
     calls = []
+    applied = []
+    controller.apply_now = lambda: applied.append(1) or type('R', (), {'publication_pending': False})()
 
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
@@ -1242,7 +1347,8 @@ def test_tui_compose_control_runs_up(tmp_path):
             await pilot.pause()
 
     _run(scenario)
-    assert calls and calls[0][:2] == ['docker', 'compose'] and 'up' in calls[0]
+    assert applied == [1]
+    assert not any('up' in c for c in calls)
 
 
 def test_tui_logs_stream_from_injected_source():
@@ -1259,6 +1365,36 @@ def test_tui_logs_stream_from_injected_source():
             await app.workers.wait_for_complete()     # drain the log stream
             await pilot.pause()
             assert any('ready' in line for line in app._log_lines)
+
+    _run(scenario)
+
+
+def test_tui_compacts_registered_litellm_traceback():
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    p = 'litellm-1 | '
+    lines = [
+        p + 'Traceback (most recent call last):\n',
+        p + '  File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1298, in _wrap_create_connection\n',
+        p + '  File "/usr/lib/python3.13/site-packages/aiohappyeyeballs/impl.py", line 122, in start_connection\n',
+        p + '  File "uvloop/loop.pyx", line 2633, in sock_connect\n',
+        p + "ConnectionRefusedError: [Errno 111] Connect call failed ('172.18.0.4', 8000)\n",
+    ]
+
+    async def scenario():
+        app = InferStackTUI(
+            controller, catalog, interval=999,
+            proc_factory=lambda svc: _FakeProc(lines),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            text = '\n'.join(app._log_lines)
+            assert 'Traceback (most recent call last):' not in text
+            assert '  File "' not in text
+            assert 'ConnectionRefusedError: [Errno 111]' in text
 
     _run(scenario)
 
@@ -1481,6 +1617,63 @@ def test_gateway_services_are_excluded_from_the_default_log_view():
     assert ENGINE_SERVICES not in names
 
 
+def test_named_log_process_scopes_docker_compose_to_that_service(monkeypatch):
+    """A named log view must not ask Docker Compose for gateway output."""
+    from infer_stack.tui import _DockerLogProc
+
+    captured = {}
+
+    class _Proc:
+        stdout = iter(())
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured['cmd'] = list(cmd)
+        return _Proc()
+
+    monkeypatch.setattr('subprocess.Popen', fake_popen)
+    service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
+    _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
+
+    cmd = captured['cmd']
+    assert cmd[-1] == service
+    assert 'litellm' not in cmd
+
+
+def test_stale_log_stream_cannot_bleed_into_new_service_selection():
+    """Buffered output from a terminated stream belongs to its old generation.
+
+    Regression: switching from LiteLLM to a named vLLM service could still show
+    LiteLLM lines because the old docker-compose process/worker drained buffered
+    stdout after the pane had already been cleared and relabelled.
+    """
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._log_lines = []
+            app._log_generation = 12
+            app._append_log_if_current(11, 'litellm | stale request spam')
+            assert app._log_lines == []
+            app._append_log_if_current(12, 'vllm-qwen | current engine line')
+            assert app._log_lines == ['vllm-qwen | current engine line']
+
+    _run(scenario)
+
+
 def test_log_target_resolves_the_engines_sentinel_to_service_names():
     from infer_stack.tui import ALL_SERVICES, ENGINE_SERVICES, InferStackTUI
 
@@ -1511,3 +1704,169 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             assert target is None and 'all services' in label
 
     _run(scenario)
+
+
+def test_tui_reports_button_handler_failures(tmp_path):
+    """A failing action must be impossible to miss: a sticky status line, the
+    TUI log tab (turned red, with a count), a toast, and a file on disk.
+
+    Textual runs handlers on its own message pump, so an uncaught exception
+    otherwise leaves the click looking like it did nothing at all.
+    """
+    from textual.widgets import Button, Static, TabbedContent
+
+    from infer_stack.tui import APP_LOG_TAB_TITLE, InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def boom():
+                raise RuntimeError('editor exploded')
+
+            app.action_edit_endpoint = boom
+            app.on_button_pressed(Button.Pressed(Button(id='btn-edit-endpoint')))
+            for _ in range(5):                      # survives refresh ticks
+                await pilot.pause()
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['applog'] = '\n'.join(app._app_log_lines)
+            seen['docker'] = '\n'.join(app._log_lines)
+            tabs = app.query_one('#top', TabbedContent)
+            seen['label'] = str(tabs.get_tab('tab-applog').label)
+            seen['path'] = app.error_log_path()
+            app.action_show_app_log()
+            for _ in range(3):
+                await pilot.pause()
+            seen['active'] = tabs.active
+
+    _run(scenario)
+    assert 'RuntimeError: editor exploded' in seen['status']
+    assert APP_LOG_TAB_TITLE in seen['status']          # says where to look
+    assert 'btn-edit-endpoint pressed' in seen['applog']
+    assert 'editor exploded' in seen['applog'] and 'Traceback' in seen['applog']
+    assert '⚠' in seen['label'] and '(1)' in seen['label']   # rendered red
+    assert 'editor exploded' not in seen['docker']      # never in the docker logs
+    assert seen['path'].exists() and 'editor exploded' in seen['path'].read_text()
+    assert str(seen['path']) in seen['applog']          # the file is discoverable
+    assert seen['active'] == 'tab-applog'
+
+
+def test_tui_reports_background_worker_failures(tmp_path):
+    """The same for a thread worker: the catalog editor runs in one, so a
+    failure there used to be entirely silent."""
+    from textual.widgets import Static
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def failing():
+                raise ValueError('no inventory for you')
+
+            app.run_worker(failing, thread=True, group='catalog-editor',
+                           name='endpoint editor', exit_on_error=False)
+            for _ in range(200):                      # until the ERROR state lands
+                await pilot.pause()
+                if app._app_log_errors:
+                    break
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'ValueError: no inventory for you' in seen['status']
+    assert 'endpoint editor failed' in seen['applog']
+
+
+def test_tui_log_records_what_an_action_decided(tmp_path):
+    """An action that declines to act must say why in the TUI log, so 'nothing
+    happened' is never the whole story."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.catalog_path = None                   # the editor has nowhere to write
+            app.action_edit_endpoint()
+            await pilot.pause()
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'no catalog path' in seen['applog']
+
+
+def test_tui_header_shows_the_running_version():
+    from infer_stack import __version__
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            seen['title'] = app.title
+            seen['sub'] = app.sub_title
+
+    _run(scenario)
+    assert seen['title'] == 'infer-stack'
+    assert seen['sub'].startswith(__version__)      # version, then the description
+    assert 'leasing dashboard' in seen['sub']
+
+
+def test_tui_refusals_pop_up_instead_of_doing_nothing():
+    """`Edit` on an actively served endpoint must say so in a popup.
+
+    This is the case that looked like a dead button: the refusal was a status
+    line only, and the next refresh tick wiped it.
+    """
+    from textual.widgets import Static
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    out = controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    assert out.lease.endpoints                    # the endpoint is now served
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.catalog_path = 'catalog.yaml'     # editing is otherwise refused earlier
+            notifications = []
+            app.notify = lambda message, **kw: notifications.append((message, kw))
+            app.query_one('#endpoints').focus()
+            app.action_edit_endpoint()
+            for _ in range(5):                    # survives refresh ticks
+                await pilot.pause()
+            seen['notifications'] = notifications
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert seen['notifications'], 'a refused action must raise a popup'
+    message, kwargs = seen['notifications'][0]
+    assert 'actively served' in message and 'release it before editing' in message
+    assert kwargs.get('severity') == 'warning'
+    assert 'actively served' in seen['status']    # and the status line keeps it
+    assert 'warn: ' in seen['applog'] and 'actively served' in seen['applog']

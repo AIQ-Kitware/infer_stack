@@ -2619,3 +2619,364 @@ faulthandler output. The bounded joins mean any remaining variant now reports
 itself instead of hanging, which is the property I would actually rely on.
 Takeaway worth keeping: schema/bootstrap paths run *before* whatever lock the
 design relies on, so they have to be idempotent on their own.
+
+## 2026-09-16 12:15:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, running as Claude
+Code on a guest VM with no GPU. Non-interactive constraints: no docker daemon
+worth using, no live gateway, so everything here was proven by unit tests and
+by driving the CLI against an isolated `INFER_STACK_DATA_DIR`.
+
+**User intent.** Downstream, a harness pulls its inference environment together
+by hand: it looks the master key up properly with `infer-stack env
+LITELLM_MASTER_KEY`, and then writes `http://127.0.0.1:14042/v1` on the next
+line as a literal. Jon's ask was that *all* of it be queried programmatically,
+so a script "just runs" when pasted, and that if infer-stack could not serve the
+url and port, infer-stack should learn to.
+
+**What I found.** It nearly could already. `_front_door(config)` in
+`cli/commands_leasing.py` resolves base-url-plus-key from managed state without
+a backend object or GPU detection — `test` uses it. And `envfile.py` already
+calls this value `OPENAI_BASE_URL` when it writes a lease env-file, so the name
+was the project's own vocabulary, not something I invented. The only thing
+missing was that `env` is a flat dict lookup over the secrets file, and a URL is
+not a secret, so it lived nowhere `env` could see.
+
+**The design choice.** Two options: a new verb (`infer-stack url`) or derived
+keys inside `env`. I took derived keys, for the reason the `env` docstring
+already argues for itself — "there's nothing to hide behind a separate verb; one
+`env` does it all". The value of the feature is that a script names ONE command
+twice; a second verb would have split that again. `OPENAI_BASE_URL` and
+`LITELLM_PORT` now answer even with no `.env` on disk, because a URL needs no
+secret to exist, and that is the case that matters: you want the URL *before*
+the first acquire.
+
+I reused `_front_door` rather than re-deriving. That is the whole point rather
+than mere tidiness — if `env` computed its own URL, a script built from `env`
+could address a door `infer-stack test` never knocked on, and they would
+disagree with no symptom until a run failed.
+
+**The bug my own test caught.** First cut derived the port independently of the
+URL. Then I exercised the override path and saw
+`OPENAI_BASE_URL=https://gw:8443/v1` sitting next to `LITELLM_PORT=14042` — a
+mismatch in the output of the one command whose entire job is to stop people
+hardcoding mismatched pairs. The port is now read back off the *effective* URL,
+and omitted when that URL names none (behind a proxy on 80/443 there is nothing
+to report, and a made-up number is precisely the thing a script would bake in).
+Worth recording that I only saw this because I ran the override case by hand
+before writing its test; the happy path looked perfect.
+
+**Tradeoffs / what might break.** `env --export` with no `.env` used to be a
+hard error and now prints the derived lines plus a stderr note. I think that is
+strictly better for `eval "$(infer-stack env --export)"`, but it is a behaviour
+change and someone relying on the non-zero exit would notice. Reading a stored
+value still beats the derived one, so nothing that already wrote these keys
+changes meaning. The port resolution inherits `_front_door`'s limitation: it
+trusts the configured default rather than reading the rendered compose project,
+so a stack brought up on a non-default port without the matching setting will be
+reported wrongly — the same way `test` would already be wrong, which is why I
+did not fix it in one place only.
+
+**Confidence.** High on the behaviour: 541 passed / 2 skipped, 18 doctests, and
+the three cases (default, overridden-with-port, overridden-without) driven by
+hand against a scratch data dir. Lower on the ergonomics being *complete* — I
+have not run this against a live gateway, and there may be a third thing scripts
+reach for that I have not noticed. That would show up the first time someone
+tries to paste a real recipe.
+
+**Takeaway.** When a tool makes you look up half a config properly, people
+hardcode the other half — and the hardcoded half is the one that breaks
+silently. The fix is not documentation, it is making the correct call cover the
+whole pair. Corollary: if two commands can each answer "where is the service",
+make one of them call the other, or they will drift apart in exactly the
+situation where being right matters.
+
+## 2026-09-16 16:05:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, on a guest VM with
+read-only mounts of a serving host's catalog, ledger and compose project.
+
+**User intent.** A batch run sat in the admission queue with every GPU empty.
+After diagnosing it, the ask was explicitly *not* to patch: write down what was
+found, what is believed, and what is uncertain, so a different reviewer can
+corroborate it before any fix is planned.
+
+**What I did.** Wrote `dev/tmp/investigation-keep-warm-placement-starvation-2026-09-16.md`.
+In short: idle keep-warm deployments are in the desired set, placement orders by
+pins and creation time with no notion of demand, and the queue waits for capacity
+without ever creating it. So two eleven-day-old idle deployments held three of
+four GPUs *on paper* while nothing ran. A hand eviction unblocked it within one
+retry, which is the cleanest evidence in the report.
+
+**Reflection.** The docstring already promises the fix ("survive idle until
+pressure"); the gap is that nothing implements the pressure, and the only queue
+tests use `reclaim='stop'`, so the interaction was never exercised. The claim I
+trust least is that sidecar pins from never-applied renders, rather than fit
+order, are the proximate cause; the logs cannot tell the two apart, and the
+report says so and proposes the test that would. I stopped myself offering a
+patch mid-incident; that was the right call, since a demand-aware reorder that
+missed the pin path would have looked like a fix and not been one.
+
+## 2026-09-16 18:40:00 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** The keep-warm admission plan is mid-review with a second model;
+the ask was to start implementing whatever is genuinely settled rather than wait.
+Only P1 (strict residency) and P3 (planner keywords) have survived every review
+round unchanged and depend on no open decision, so P1 went first, on its own
+branch so nothing reaches `dev/0.7.1` without the user choosing.
+
+**What I did.** Added `infer_stack/leasing/residency.py` (`Residency`,
+`Container`, `ResidencyUnknown`, `residency_from_inspect`) and
+`ComposeBackend.residency()`. Before writing the parser I created (never started)
+containers from a compose file with a `device_ids` reservation on the guest's
+Docker and read `docker inspect` back, so the `DeviceRequests` shape in the tests
+is observed rather than remembered: `Count: 0, DeviceIDs: ['1','2']`, and `None`
+without a reservation. There is also a real-daemon test that does the same thing
+and skips when `docker info` fails -- the existing `requires_compose` check uses
+`docker compose version`, which succeeds without daemon access and would not
+have skipped where it should.
+
+**Reflection.** The design choice I care most about is refusing to guess. Three
+places invited a guess and each got a fail-closed answer: Docker unreadable
+raises rather than returning empty; two containers for one deployment are kept
+and reported ambiguous rather than one silently winning a dict slot; and a GPU
+reservation that is not a list of indices (`--gpus all`, a count, UUIDs) counts
+as occupying every GPU. Each of those, guessed, becomes a GPU handed to a new
+container while something still holds it -- the exact failure later steps exist
+to prevent. Uncertainty: the shape was verified on the guest's Docker, not the
+serving host's; the plan's V1/V2 still need a host check before P1 is called done.
+I also moved `DEPLOYMENT_LABEL` to the new module and re-export it from
+`compose.py`, so there is one definition beside the code that reads it back.
+
+## 2026-09-16 19:36:13 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT declared P2 ready with the revision-7a amendments. The user
+wants agreed steps implemented directly on `dev/0.7.1` while review continues.
+
+**What I did.**
+- **Store.** Added a `publication_pending` marker: version and `apply_requested`.
+  The requested flag only ever turns on.
+- **Controller.** Every mutator now marks intent, mutates, renders and applies
+  under `_global_lock`. The marker is cleared only when `apply()` does not
+  return `False`. `_ensure_applied`, `_apply_lock` and the generation reads are
+  gone.
+- **Compose.** `ComposeBackend.apply()` now returns the route result, with a
+  steady-state deadline of 20 s when LiteLLM was already running and 180 s
+  otherwise.
+- **Tests.** Rewrote the coalescing tests as crash-window, staged-lease,
+  failed-apply and rollback tests.
+
+**Choices worth reviewing.**
+1. **Recovery happens on the next applying operation**, not on every lock
+   entry. Each applying operation renders and applies the whole pending state,
+   so an extra recovery pass would only apply twice. Render-only paths
+   (`infer-stack render`, the render inside a `--no-apply` acquire) never apply
+   a pending marker, which keeps plan test 13 literal.
+2. **Render-only paths still write a staged marker**, because the render sweeps
+   and a sweep can change desired state.
+3. **An apply that returns `False` does not fail the acquire.** The lease is
+   admitted and its change is durably pending (I1). The readiness wait decides
+   whether the caller gets a working endpoint. A raised backend error still
+   propagates.
+4. **`approved_digest` is not implemented yet.** Nothing can set it before
+   `config publish` (P4) exists, and the profile persistence it compares
+   against is a later P2 step.
+
+**Reflection.** The simplification cost something real: concurrent acquires now
+each run a `docker compose up`, one after another, instead of sharing one. An
+up that changes nothing is fast, so I accepted it, but under a burst of N
+acquires each caller waits behind up to N-1 others. If host runs show lock wait
+dominating, the fix is to skip the apply when the render is byte-identical to
+the last successful one. That should not come back as coalescing.
+
+## 2026-09-16 19:48:53 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT reviewed 5e7e5a4 and found three correctness issues and two
+smaller ones. The user relayed the review; fix them without redesigning.
+
+**What I did.**
+- **Failed apply during acquire.** It now releases the lease in the ledger
+  (render only, no apply) and re-raises. GPT leaned towards keeping the lease on
+  a timeout; I chose one rule for every failure, so a caller never holds a lease
+  it cannot see.
+- **`--no-apply` paths never apply.**
+- **Interrupted applies.** They set `interrupted` on the marker, and the next
+  apply waits for two identical container samples first.
+- **Rollback eviction** uses strict residency.
+- **`infer-stack apply`** exits 3 while a change stays pending.
+- **Route reconciliation** re-diffs within its deadline.
+- **Out-of-review bug.** The Docker runner starts commands in a new session, so
+  Ctrl-C never reached `docker compose`, which kept running. It now kills the
+  group on any interrupt. The new test fails without the fix.
+
+**Reflection.** Issue 2 is the kind of bug I should have caught myself. I wrote
+"render-only paths never apply" in the summary, and tested `reconcile(apply=False)`,
+but not the acquire branch that shares the same rule. The claim and the test
+covered different code. The settle check is deliberately weaker than P8's
+quiescence; its blind spots are written up in known-limitations rather than
+papered over.
+
+## 2026-09-16 19:59:23 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** GPT's second review accepted the fixes. It found `renew` still
+mutating desired state around the controller, and asked for the transitional
+phantom-warm case to be recorded.
+
+**What I did.**
+- **`Controller.renew`.** It runs under the lock. It checks for IDLE
+  deployments to revive first: a TTL-only renew returns without a marker or an
+  apply, while a reviving renew marks, renews and publishes. The CLI uses it.
+  Tests cover:
+  - the revive path;
+  - the TTL-only path;
+  - a reviving renew blocked behind another process's in-flight apply;
+  - a static check that nothing outside `ledger.py`/`controller.py` calls
+    `ledger.renew(`.
+- **Transitional behaviour.** It is recorded as a known fault, with a
+  regression marked for inversion in P9.
+- **Plan.** The P2 row now names `renew`.
+
+**Reflection.** Checking before marking is safe only because the check runs
+under the same lock. Otherwise a concurrent release could idle the deployment
+between check and renew, and the renew would revive it without a marker. I
+wrote that into the docstring so a future fast path in P5 does not move the
+check outside the lock. The overlap test first failed for a reason unrelated to
+the lock: the other thread's sweep expired the lapsed lease before the renew
+ran. Real heartbeats that arrive after a sweep hit the same thing, and correctly
+get "re-acquire".
+
+## 2026-09-16 20:29:06 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** Finish P2 with the initial profile and the explicit Compose
+environment, after GPT reviewed my proposal. The user decided that concurrent
+catalogs must work, and that `HF_TOKEN` is taken from the managed `.env` only
+when the user puts it there.
+
+**What I did.** Two commits.
+- **Explicit Docker environment.** It covers the backend, `stack` commands and
+  the TUI; the TUI had its own unbounded runner, which now uses the shared one.
+- **The profile** (`leasing/profile.py`):
+  - `CatalogUnion` with strict conflicts;
+  - freezing on the first mutation in `Controller._sync_profile`, with one
+    drift warning per process;
+  - acquire validation before any write;
+  - `placement_context` in the marker for crashed acquires;
+  - a BYO nginx config snapshot;
+  - `Controller.publish_profile` plus `infer-stack config publish`, which
+    refuse unless quiescent.
+
+**Choices worth reviewing.**
+1. **Drift is judged per key.** For catalogs, "the invocation's catalog is a
+   subset of the union" counts as no drift, so each runbook passing its own
+   `--catalog` stays quiet.
+2. **A stack published without a catalog accepts any request**, as legacy
+   per-deployment routing. It is deterministic because those routes come from
+   the ledger.
+3. **The placement context is cleared right after the acquire's first
+   render**, not when the acquire finally places. A queued acquire that dies
+   loses its scope; that is documented as a P6 limitation.
+4. **`config publish` checks quiescence with virtual expiry before marking.**
+   That way a refused publish leaves no marker behind.
+
+**Reflection.** GPT's catch on `allowed_gpus` was the important one, and my
+proposal had it wrong. I listed it as a render input because the backend
+constructor takes it, without asking whose decision it is. The constructor's
+signature is a poor guide to what is host configuration. I checked who sets
+each input only after being told.
+
+## 2026-09-16 20:49:04 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** `/goal finish the plan`. GPT reviews arrive mid-stream and
+are folded in as they come.
+
+**What I did.**
+- **P3.** Planner keywords.
+- **GPT review round.** Five fixes:
+  - fresh-ledger publish atomicity;
+  - `DOCKER_CONTEXT=default`;
+  - a declined recovery render keeps the placement scope;
+  - edited catalogs are refused;
+  - the KubeAI catalog is frozen into the profile.
+- **Admission core (P5, P6, P9).** Admission mode applies only to backends
+  with `residency` and `preview`, which is Compose today:
+  - `assigned_gpus`;
+  - a single-copy `Ledger.plan_acquire` overlay, committed as-is with an
+    `admission_state_version` guard;
+  - `Controller._admit`, which previews in memory;
+  - renders built from LIVE + uniquely resident IDLE keep-warm deployments;
+  - renew fast and slow paths;
+  - backfill.
+- **Second GPT review.** Three fixes: pins are ignored in admission mode,
+  explicitly named broken catalogs are errors, and backend switching is
+  refused.
+- **Tests.** The compose test fakes now answer `docker ps -a` and
+  `docker inspect` from their running set (`tests/fake_docker_state.py`).
+
+**Choices worth reviewing.**
+1. **Approval runs after the commit.** The render diff approval still happens
+   after the lease commit, rolling back on decline, rather than before it. The
+   plan's intent is that approval holds no SQLite write lock (test 33), which
+   holds.
+2. **Unknown residency fails renders.** In admission mode an unreadable
+   residency fails the render (the change stays pending) rather than guessing
+   which warm models exist.
+3. **Unresolved deployments block new allocations**, per the plan. That is harsh
+   for standing GPU reservations made before the upgrade: operators must
+   release them once.
+
+**Reflection.** GPT's pin bug was real, and it came from reusing the legacy
+pinned step inside admission mode without asking what a pin means there. That
+is the same mistake as `allowed_gpus` in the profile: carrying a mechanism
+over without re-deriving its authority. Removing pins from admission mode then
+broke the scoped crash recovery, which relied on pins. Making that recovery
+commit a hard allocation is the honest form of what it did before.
+
+## 2026-09-16 21:23:46 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**User intent.** `/goal finish the plan`, with GPT reviews relayed as they
+arrive.
+
+**What I did.**
+- **Plan steps.**
+  - **P7:** stable addresses behind `network migrate`, and `network check`.
+  - **P8:** tests 39-49 against a container-level Docker fake.
+  - **P4 remainder:** pre-pull, and the approved-digest guard.
+  - **P10:** health view, degraded end to end, GPU holders named in refusals.
+- **Review fixes from two GPT rounds.**
+  - Approval moved before commit.
+  - Unresolved rows are never placed.
+  - Adoption was unreachable; it now runs.
+  - Selective apply waits for `service_healthy` dependencies, which
+    `--no-deps` skipped, and confirms removals.
+- **Records.**
+  - The plan now has an implementation record (§8.1) with its deviations.
+  - The host runbook is `dev/tmp/host-verification-2026-09-16.md`, with a
+    Docker-only script.
+  - The script's non-GPU checks were run on the guest daemon.
+
+**Reflection.**
+- **The review lag.** One review arrived for a commit (`2a5f6fe`) whose
+  blockers had already been fixed. Checking the commit it named before
+  re-fixing saved rework; the fourth point in it was new and real.
+- **The most instructive bug.** The `_adopt_existing` call sat after a
+  `return`. No test failed because nothing exercised adoption. The P8 commit
+  message itself said "tests follow", and that gap is exactly where the dead
+  code hid.
+- **Host ports.** Without a gateway they shift with the live set. That predates
+  this work, but fingerprints made it visible, so it is now documented.
+- **Honest scope.** Everything here is verified against fakes. Real-daemon
+  timing, health, and GPU handoff are still unverified.

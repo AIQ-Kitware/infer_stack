@@ -1,0 +1,257 @@
+litellm-1                | 19:24:48 - LiteLLM Proxy:ERROR: common_request_processing.py:1220 - litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - litellm.InternalServerError: InternalServerError: OpenAIException - Connection error.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None LiteLLM Retried: 3 times, LiteLLM Max Retries: 3
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1298, in _wrap_create_connection
+litellm-1                |     sock = await aiohappyeyeballs.start_connection(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<6 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohappyeyeballs/impl.py", line 122, in start_connection
+litellm-1                |     raise first_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohappyeyeballs/impl.py", line 73, in start_connection
+litellm-1                |     sock = await _connect_sock(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<6 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohappyeyeballs/impl.py", line 208, in _connect_sock
+litellm-1                |     await loop.sock_connect(sock, address)
+litellm-1                |   File "uvloop/loop.pyx", line 2633, in sock_connect
+litellm-1                |     await fut
+litellm-1                |   File "uvloop/loop.pyx", line 1108, in uvloop.loop.Loop._sock_connect_cb
+litellm-1                |     raise OSError(err, 'Connect call failed %s' % (address,))
+litellm-1                | ConnectionRefusedError: [Errno 111] Connect call failed ('172.18.0.4', 8000)
+litellm-1                | 
+litellm-1                | The above exception was the direct cause of the following exception:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/custom_httpx/aiohttp_transport.py", line 61, in map_aiohttp_exceptions
+litellm-1                |     yield
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/custom_httpx/aiohttp_transport.py", line 307, in handle_async_request
+litellm-1                |     response = await self._make_aiohttp_request(
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                | INFO:     172.18.0.1:35494 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error
+litellm-1                |     ...<6 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/custom_httpx/aiohttp_transport.py", line 285, in _make_aiohttp_request
+litellm-1                |     response = await client_session.request(**request_kwargs).__aenter__()
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/client.py", line 1510, in __aenter__
+litellm-1                |     self._resp: _RetType = await self._coro
+litellm-1                |                            ^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/client.py", line 779, in _request
+litellm-1                |     resp = await handler(req)
+litellm-1                |            ^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/client.py", line 734, in _connect_and_send_request
+litellm-1                |     conn = await self._connector.connect(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |         req, traces=traces, timeout=real_timeout
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 672, in connect
+litellm-1                |     proto = await self._create_connection(req, traces, timeout)
+litellm-1                |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1239, in _create_connection
+litellm-1                |     _, proto = await self._create_direct_connection(req, traces, timeout)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1611, in _create_direct_connection
+litellm-1                |     raise last_exc
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1580, in _create_direct_connection
+litellm-1                |     transp, proto = await self._wrap_create_connection(
+litellm-1                |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<7 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/aiohttp/connector.py", line 1321, in _wrap_create_connection
+litellm-1                |     raise client_error(req.connection_key, exc) from exc
+litellm-1                | aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host vllm-qwen3-5-27b:8000 ssl:<ssl.SSLContext object at 0x7538ad3efe30> [Connect call failed ('172.18.0.4', 8000)]
+litellm-1                | 
+litellm-1                | The above exception was the direct cause of the following exception:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1604, in request
+litellm-1                |     response = await self._client.send(
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/httpx/_client.py", line 1629, in send
+litellm-1                |     response = await self._send_handling_auth(
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/httpx/_client.py", line 1657, in _send_handling_auth
+litellm-1                |     response = await self._send_handling_redirects(
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/httpx/_client.py", line 1694, in _send_handling_redirects
+litellm-1                |     response = await self._send_single_request(request)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/httpx/_client.py", line 1730, in _send_single_request
+litellm-1                |     response = await transport.handle_async_request(request)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/custom_httpx/aiohttp_transport.py", line 306, in handle_async_request
+litellm-1                |     with map_aiohttp_exceptions():
+litellm-1                |          ~~~~~~~~~~~~~~~~~~~~~~^^
+litellm-1                |   File "/usr/lib/python3.13/contextlib.py", line 162, in __exit__
+litellm-1                |     self.gen.throw(value)
+litellm-1                |     ~~~~~~~~~~~~~~^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/custom_httpx/aiohttp_transport.py", line 75, in map_aiohttp_exceptions
+litellm-1                |     raise mapped_exc(message) from exc
+litellm-1                | httpx.ConnectError: Cannot connect to host vllm-qwen3-5-27b:8000 ssl:<ssl.SSLContext object at 0x7538ad3efe30> [Connect call failed ('172.18.0.4', 8000)]
+litellm-1                | 
+litellm-1                | The above exception was the direct cause of the following exception:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 929, in acompletion
+litellm-1                |     headers, response = await self.make_openai_chat_completion_request(
+litellm-1                |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/logging_utils.py", line 297, in async_wrapper
+litellm-1                |     result = await func(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 460, in make_openai_chat_completion_request
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 437, in make_openai_chat_completion_request
+litellm-1                |     await openai_aclient.chat.completions.with_raw_response.create(
+litellm-1                |         **data, timeout=timeout
+litellm-1                |     )
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_legacy_response.py", line 384, in wrapped
+litellm-1                |     return cast(LegacyAPIResponse[R], await func(*args, **kwargs))
+litellm-1                |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/resources/chat/completions/completions.py", line 2700, in create
+litellm-1                |     return await self._post(
+litellm-1                |            ^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<49 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1884, in post
+litellm-1                |     return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/openai/_base_client.py", line 1636, in request
+litellm-1                |     raise APIConnectionError(request=request) from err
+litellm-1                | openai.APIConnectionError: Connection error.
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 620, in acompletion
+litellm-1                |     response = await init_response
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/llms/openai/openai.py", line 989, in acompletion
+litellm-1                |     raise OpenAIError(
+litellm-1                |     ...<4 lines>...
+litellm-1                |     )
+litellm-1                | litellm.llms.openai.common_utils.OpenAIError: Connection error.
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5508, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 588, in exception_type
+litellm-1                |     raise InternalServerError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.InternalServerError: litellm.InternalServerError: InternalServerError: OpenAIException - Connection error.
+litellm-1                | 
+litellm-1                | During handling of the above exception, another exception occurred:
+litellm-1                | 
+litellm-1                | Traceback (most recent call last):
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/proxy_server.py", line 6768, in chat_completion
+litellm-1                |     result = await base_llm_response_processor.base_process_llm_request(
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<16 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py", line 953, in base_process_llm_request
+litellm-1                |     responses = await llm_responses
+litellm-1                |                 ^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1666, in acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 1642, in acompletion
+litellm-1                |     response = await self.async_function_with_fallbacks(**kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5411, in async_function_with_fallbacks
+litellm-1                |     return await self.async_function_with_fallbacks_common_utils(
+litellm-1                |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     ...<8 lines>...
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5368, in async_function_with_fallbacks_common_utils
+litellm-1                |     raise original_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5402, in async_function_with_fallbacks
+litellm-1                |     response = await self.async_function_with_retries(*args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5665, in async_function_with_retries
+litellm-1                |     raise original_exception
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5594, in async_function_with_retries
+litellm-1                |     response = await self.make_call(original_function, *args, **kwargs)
+litellm-1                |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 5676, in make_call
+litellm-1                |     response = await response
+litellm-1                |                ^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2163, in _acompletion
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/router.py", line 2109, in _acompletion
+litellm-1                |     response = await _response
+litellm-1                |                ^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 2072, in wrapper_async
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/utils.py", line 1892, in wrapper_async
+litellm-1                |     result = await original_function(*args, **kwargs)
+litellm-1                |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/main.py", line 639, in acompletion
+litellm-1                |     raise exception_type(
+litellm-1                |           ~~~~~~~~~~~~~~^
+litellm-1                |         model=model,
+litellm-1                |         ^^^^^^^^^^^^
+litellm-1                |     ...<3 lines>...
+litellm-1                |         extra_kwargs=kwargs,
+litellm-1                |         ^^^^^^^^^^^^^^^^^^^^
+litellm-1                |     )
+litellm-1                |     ^
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 2456, in exception_type
+litellm-1                |     raise e
+litellm-1                |   File "/usr/lib/python3.13/site-packages/litellm/litellm_core_utils/exception_mapping_utils.py", line 588, in exception_type
+litellm-1                |     raise InternalServerError(
+litellm-1                |     ...<5 lines>...
+litellm-1                |     )
+litellm-1                | litellm.exceptions.InternalServerError: litellm.InternalServerError: InternalServerError: OpenAIException - Connection error.. Received Model Group=qwen3.5-27b
+litellm-1                | Available Model Group Fallbacks=None LiteLLM Retried: 3 times, LiteLLM Max Retries: 3
+litellm-1                | INFO:     172.18.0.1:33268 - "GET /v1/models HTTP/1.1" 200 OK
+litellm-1                | INFO:     172.18.0.1:33286 - "GET /v1/models HTTP/1.1" 200 OK

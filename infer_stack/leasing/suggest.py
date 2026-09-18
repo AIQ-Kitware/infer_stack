@@ -2,8 +2,9 @@
 
 The leasing controller reads a hand-built ``catalog.yaml``, but a fresh host
 shouldn't start empty. This module turns *what the server is* (the detected GPU
-inventory) plus *what's worth running* (a curated, hardware-independent pool of
-models) into a concrete, fits-this-box catalog the user can review and merge.
+inventory) plus *what's worth running* (a curated pool of models and, where
+needed, explicitly hardware-gated measured recipes) into a concrete,
+fits-this-box catalog the user can review and merge.
 
 The design is that **seeding is a pure function**
 ``inventory × pool → suggested catalog`` — the same compiler/controller split
@@ -14,8 +15,10 @@ the real entries of the legacy ``default-vllm-models.yaml``).
 
 Two layers, kept apart on purpose:
 
-* :class:`SuggestionModel` — intrinsic, portable model facts (footprint, min
-  per-GPU VRAM, preferred GPU count, context window, sane vLLM defaults).
+* :class:`SuggestionModel` — model facts (footprint, min per-GPU VRAM,
+  preferred GPU count, context window, sane vLLM defaults), plus an optional
+  GPU-name allow-list for a recipe whose performance/fit has only been
+  validated on named hardware.
 * :func:`suggest_catalog` — derives the *server-specific* layer (which models
   fit, what ``max_model_len`` / ``gpu_memory_utilization`` / ``dtype`` to use,
   which one to keep warm) by joining the pool against an inventory dict.
@@ -49,8 +52,15 @@ __all__ = [
     'load_pool',
     'fits_on',
     'derive_runtime',
+    'migrate_known_suggestion_aliases',
     'suggest_catalog',
 ]
+
+
+_OLD_DBIRKS_QWEN38_NAME = 'qwen3.8-27b'
+_DBIRKS_QWEN38_NAME = 'qwen3.8-27b-dbirks-hyperqwen'
+_DBIRKS_QWEN38_SOURCE = 'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound'
+_HYPERQWEN_RECIPE = 'hyperqwen-3090-single'
 
 
 @dataclass
@@ -66,6 +76,10 @@ class SuggestionModel:
     min_vram_gib_per_replica: float = 0.0
     preferred_gpu_count: int = 1
     context_window: int | None = None
+    # Optional hardware allow-list for a measured/tuned serving recipe. These
+    # are case-insensitive substrings of the detected nvidia-smi GPU name. A
+    # portable model leaves the list empty.
+    gpu_name_hints: list[str] = field(default_factory=list)
     defaults: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -84,6 +98,9 @@ class SuggestionModel:
             ),
             preferred_gpu_count=int(spec.get('preferred_gpu_count', 1) or 1),
             context_window=spec.get('context_window'),
+            gpu_name_hints=[
+                str(v).lower() for v in (spec.get('gpu_name_hints') or [])
+            ],
             defaults=dict(spec.get('defaults') or {}),
         )
 
@@ -117,6 +134,43 @@ def _pool_from_dict(data: dict[str, Any]) -> dict[str, SuggestionModel]:
         name: SuggestionModel.from_entry(name, spec or {})
         for name, spec in entries.items()
     }
+
+
+def migrate_known_suggestion_aliases(data: dict[str, Any]) -> list[str]:
+    """Rename obsolete identities emitted by earlier infer-stack suggestions.
+
+    This is deliberately signature-gated. In particular, an unsuffixed
+    ``qwen3.8-27b`` entry is *not* assumed to be ours: it is migrated only when
+    the model source is the dbirks W4A16 derivative, the same-named endpoint
+    uses HyperQwen's recipe, and no other endpoint references the old model.
+    That leaves a user-authored or official ``Qwen/Qwen3.8-27B`` entry alone.
+    """
+    models = data.get('models') or {}
+    endpoints = data.get('endpoints') or {}
+    if _DBIRKS_QWEN38_NAME in models or _DBIRKS_QWEN38_NAME in endpoints:
+        return []
+
+    old_model = models.get(_OLD_DBIRKS_QWEN38_NAME) or {}
+    old_endpoint = endpoints.get(_OLD_DBIRKS_QWEN38_NAME) or {}
+    runtime = old_endpoint.get('runtime') or {}
+    other_refs = [
+        name for name, endpoint in endpoints.items()
+        if name != _OLD_DBIRKS_QWEN38_NAME
+        and endpoint.get('model') == _OLD_DBIRKS_QWEN38_NAME
+    ]
+    if (
+        old_model.get('source') != _DBIRKS_QWEN38_SOURCE
+        or old_endpoint.get('model') != _OLD_DBIRKS_QWEN38_NAME
+        or runtime.get('serve_recipe') != _HYPERQWEN_RECIPE
+        or other_refs
+    ):
+        return []
+
+    models[_DBIRKS_QWEN38_NAME] = models.pop(_OLD_DBIRKS_QWEN38_NAME)
+    migrated_endpoint = endpoints.pop(_OLD_DBIRKS_QWEN38_NAME)
+    migrated_endpoint['model'] = _DBIRKS_QWEN38_NAME
+    endpoints[_DBIRKS_QWEN38_NAME] = migrated_endpoint
+    return [f'{_OLD_DBIRKS_QWEN38_NAME} -> {_DBIRKS_QWEN38_NAME}']
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +207,20 @@ def _gpu_mem(gpu: dict[str, Any]) -> float:
     return float(gpu.get('memory_gib') or 0.0)
 
 
+def _gpu_is_eligible(model: SuggestionModel, gpu: dict[str, Any]) -> bool:
+    if _gpu_mem(gpu) < model.min_vram_gib_per_replica:
+        return False
+    if model.gpu_name_hints:
+        name = str(gpu.get('name') or '').lower()
+        if not any(hint in name for hint in model.gpu_name_hints):
+            return False
+    return True
+
+
 def fits_on(model: SuggestionModel, gpus: list[dict[str, Any]]) -> bool:
     """True iff ``preferred_gpu_count`` GPUs each hold one replica's VRAM."""
-    big_enough = [g for g in gpus if _gpu_mem(g) >= model.min_vram_gib_per_replica]
-    return len(big_enough) >= model.preferred_gpu_count
+    eligible = [g for g in gpus if _gpu_is_eligible(model, g)]
+    return len(eligible) >= model.preferred_gpu_count
 
 
 def _host_gpus(
@@ -169,7 +233,7 @@ def _host_gpus(
     tightest GPU the placer might choose, not the roomiest.
     """
     big_enough = sorted(
-        (g for g in gpus if _gpu_mem(g) >= model.min_vram_gib_per_replica),
+        (g for g in gpus if _gpu_is_eligible(model, g)),
         key=_gpu_mem,
     )
     return big_enough[: model.preferred_gpu_count]
@@ -211,7 +275,12 @@ def derive_runtime(
     if host_mem > 0 and model.min_vram_gib_per_replica > 0:
         footprint = (model.min_vram_gib_per_replica * 1.3) / host_mem
         util = footprint if default_util is None else max(footprint, default_util)
-        util = max(0.2, min(0.92, round(util, 2)))
+        # 0.92 is the generic upper bound, but a measured pool default is
+        # authoritative. In particular HyperQwen's 3090 profile requires
+        # 0.93; applying the generic clamp after max(default, estimate) would
+        # contradict the "never lower the default" rule above.
+        upper = max(0.92, float(default_util or 0.0))
+        util = max(0.2, min(upper, round(util, 2)))
     else:
         util = default_util if default_util is not None else 0.9
     runtime['gpu_memory_utilization'] = util
@@ -221,6 +290,12 @@ def derive_runtime(
 
     if model.defaults.get('enable_prefix_caching'):
         runtime['enable_prefix_caching'] = True
+
+    if model.defaults.get('image'):
+        runtime['image'] = str(model.defaults['image'])
+
+    if model.defaults.get('serve_recipe'):
+        runtime['serve_recipe'] = str(model.defaults['serve_recipe'])
 
     if any(_needs_fp16(g.get('name')) for g in host):
         runtime['extra_args'] = ['--dtype=half']
@@ -265,6 +340,19 @@ def suggest_catalog(
     for rank, model in enumerate(fitting):
         models[model.name] = {'source': f'hf://{model.hf_model_id}'}
         endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
+        if model.min_vram_gib_per_replica > 0:
+            endpoint['placement'] = {
+                'min_vram_gib': model.min_vram_gib_per_replica,
+            }
+        if model.gpu_name_hints:
+            # Hardware-specific recipes are only suggested after a concrete
+            # inventory match. Preserve that decision in the generated
+            # catalog: a later generic best-fit pass must not move the endpoint
+            # onto a different same-size GPU the recipe was never measured on.
+            host = _host_gpus(model, gpus)
+            endpoint.setdefault('placement', {})['gpu_indices'] = [
+                int(g['index']) for g in host
+            ]
         runtime = derive_runtime(model, gpus)
         if runtime:
             endpoint['runtime'] = runtime

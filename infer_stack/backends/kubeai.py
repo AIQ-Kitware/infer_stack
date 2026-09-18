@@ -176,6 +176,15 @@ def render_models(
             )
             continue
         runtime = deployment.spec.get('runtime', {}) or {}
+        if runtime.get('serve_recipe'):
+            out.unrenderable.add(deployment.id)
+            out.errors.append(
+                f"{deployment.id}: runtime.serve_recipe="
+                f"{runtime['serve_recipe']!r} is a container launcher/preparation "
+                'recipe supported by the compose backend, not a stock KubeAI '
+                'VLLM Model. Use --backend compose for this endpoint.'
+            )
+            continue
         profile = (
             runtime.get('resource_profile') or default_resource_profile or ''
         )
@@ -367,6 +376,43 @@ class KubeaiBackend(ConvergeScaffold):
                 return None
         self.apply()
         return None
+
+    #: The published catalog union (set by the CLI, then by use_profile).
+    catalog = None
+
+    def render_profile(self) -> dict:
+        """This backend's render inputs, as a publishable profile."""
+        from ..leasing.profile import PROFILE_VERSION, catalog_sources
+
+        return {
+            'version': PROFILE_VERSION,
+            'backend': 'kubeai',
+            'namespace': self.namespace,
+            'base_url': self.base_url,
+            'resource_profile': self.default_resource_profile,
+            'catalogs': catalog_sources(self.catalog),
+        }
+
+    def validate_requests(self, requests) -> None:
+        from ..leasing.profile import validate_requests_against
+
+        validate_requests_against(self.catalog, requests)
+
+    def use_profile(self, profile: dict) -> None:
+        if profile.get('backend') != 'kubeai':
+            from ..leasing.profile import ProfileMismatch
+
+            raise ProfileMismatch(
+                f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
+                'tear down the old backend before switching backend kinds'
+            )
+        from ..leasing.profile import CatalogUnion
+
+        self.namespace = profile['namespace']
+        self.base_url = profile['base_url']
+        self.default_resource_profile = profile['resource_profile']
+        sources = profile.get('catalogs') or []
+        self.catalog = CatalogUnion.from_sources(sources) if sources else None
 
     def apply(self) -> None:
         """Converge the cluster to the last render: apply + prune.

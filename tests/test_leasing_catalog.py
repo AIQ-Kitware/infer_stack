@@ -277,12 +277,59 @@ def test_absent_placement_keeps_spec_byte_identical():
     assert 'placement' not in req.spec
 
 
-def test_placement_is_not_structural():
+def test_min_vram_placement_is_not_structural():
     # Same model/runtime with different declarations still coalesces: the
     # requirement says where a deployment may LAND, not what process it is.
     a = Catalog.from_dict(_one_vllm({'min_vram_gib': 8})).resolve_endpoint('e')
     b = Catalog.from_dict(_one_vllm({'min_vram_gib': 24})).resolve_endpoint('e')
     assert a.compat_key == b.compat_key
+
+
+def test_explicit_gpu_pin_reaches_spec_and_is_structural():
+    auto = Catalog.from_dict(_one_vllm()).resolve_endpoint('e')
+    pinned = Catalog.from_dict(
+        _one_vllm({'gpu_indices': [1]})
+    ).resolve_endpoint('e')
+    assert pinned.spec['placement'] == {'gpu_indices': [1]}
+    assert pinned.structural['gpu_indices'] == [1]
+    assert auto.compat_key != pinned.compat_key
+    # Auto placement deliberately omits the field so old compatibility hashes
+    # do not change merely because the feature exists.
+    assert 'gpu_indices' not in auto.structural
+
+
+def test_vllm_serve_recipe_is_structural_and_reaches_spec():
+    plain_data = _one_vllm()
+    recipe_data = _one_vllm()
+    recipe_data['endpoints']['e']['runtime'] = {
+        'serve_recipe': 'hyperqwen-3090-single',
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+    }
+    plain = Catalog.from_dict(plain_data).resolve_endpoint('e')
+    recipe = Catalog.from_dict(recipe_data).resolve_endpoint('e')
+    assert recipe.spec['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
+    assert recipe.structural['serve_recipe'] == 'hyperqwen-3090-single'
+    assert recipe.compat_key != plain.compat_key
+    # Stock vLLM keeps the old structural shape/hashes when no recipe is set.
+    assert 'serve_recipe' not in plain.structural
+
+
+def test_unknown_vllm_serve_recipe_is_rejected():
+    data = _one_vllm()
+    data['endpoints']['e']['runtime'] = {'serve_recipe': 'typo-recipe'}
+    with pytest.raises(CatalogError) as exc:
+        Catalog.from_dict(data)
+    assert 'unknown runtime.serve_recipe' in str(exc.value)
+
+
+def test_gpu_pin_count_matches_runtime_parallelism():
+    data = _one_vllm({'min_vram_gib': 24, 'gpu_indices': [0, 2]})
+    data['endpoints']['e']['runtime'] = {'tensor_parallel_size': 2}
+    req = Catalog.from_dict(data).resolve_endpoint('e')
+    assert req.spec['placement'] == {
+        'min_vram_gib': 24,
+        'gpu_indices': [0, 2],
+    }
 
 
 @pytest.mark.parametrize(
@@ -293,6 +340,10 @@ def test_placement_is_not_structural():
         ({'min_vram_gib': 'lots'}, 'positive number'),
         ({'min_vram_gib': True}, 'positive number'),
         ({'min_vram_gb': 24}, 'unknown placement key'),   # the typo case
+        ({'gpu_indices': []}, 'non-empty list'),
+        ({'gpu_indices': [-1]}, 'non-negative integers'),
+        ({'gpu_indices': [True]}, 'non-negative integers'),
+        ({'gpu_indices': [1, 1]}, 'duplicates'),
     ],
 )
 def test_placement_validation_errors(placement, needle):
@@ -305,3 +356,11 @@ def test_placement_rejected_on_ollama_endpoints():
     with pytest.raises(CatalogError) as exc:
         Catalog.from_dict(_one_vllm({'min_vram_gib': 8}, engine='ollama'))
     assert 'only supported on vllm' in str(exc.value)
+
+
+def test_gpu_pin_count_mismatch_is_rejected():
+    data = _one_vllm({'gpu_indices': [0]})
+    data['endpoints']['e']['runtime'] = {'tensor_parallel_size': 2}
+    with pytest.raises(CatalogError) as exc:
+        Catalog.from_dict(data)
+    assert 'requires exactly 2' in str(exc.value)

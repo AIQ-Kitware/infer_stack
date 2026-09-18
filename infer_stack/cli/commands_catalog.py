@@ -282,7 +282,10 @@ class CatalogSuggestCLI(
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..hardware import detect_inventory
-        from ..leasing.suggest import suggest_catalog
+        from ..leasing.suggest import (
+            migrate_known_suggestion_aliases,
+            suggest_catalog,
+        )
         from .commands_leasing import _resolve_skip_display
         from .context import effective_inventory
 
@@ -326,6 +329,7 @@ class CatalogSuggestCLI(
         # --apply: additive merge into the catalog (keep existing entries).
         path = _catalog_path(config)
         data = _load_raw(path)
+        migrated = migrate_known_suggestion_aliases(data)
         added: list[str] = []
         skipped: list[str] = []
         for section in ('models', 'endpoints'):
@@ -337,6 +341,8 @@ class CatalogSuggestCLI(
                 added.append(f'{section[:-1]}:{name}')
         _save_raw(path, data, dry_run=False)
         print(f'merged suggestion into {path}  ({hw})')
+        if migrated:
+            print(f'  renamed prior suggestion: {", ".join(migrated)}')
         if added:
             print(f'  added: {", ".join(added)}')
         if skipped:
@@ -558,8 +564,13 @@ class EndpointAddCLI(_CatalogCommon):
         None, type=float,
         help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
              'planner can pick any eligible free GPU. Declaring this is what '
-             'lets one catalog be correct on every host; the alternative is '
-             'pinning GPU indices, which is not portable.',
+             'lets one catalog be correct on every host.',
+    )
+    gpu = scfg.Value(
+        [], nargs='*', type=int,
+        help='placement.gpu_indices — exact physical GPU index/indices. Omit '
+             'for automatic VRAM-aware placement. This is a local operator '
+             'override and is intentionally less portable than --min-vram-gib.',
     )
     # vLLM runtime conveniences
     max_model_len = scfg.Value(None, type=int)
@@ -620,8 +631,13 @@ class EndpointAddCLI(_CatalogCommon):
             entry['reclaim'] = {'policy': config.reclaim}
         if config.protocol:
             entry['protocol'] = config.protocol
+        placement: dict[str, Any] = {}
         if config.min_vram_gib is not None:
-            entry['placement'] = {'min_vram_gib': config.min_vram_gib}
+            placement['min_vram_gib'] = config.min_vram_gib
+        if config.gpu:
+            placement['gpu_indices'] = list(config.gpu)
+        if placement:
+            entry['placement'] = placement
         # Only guarded for an explicit NAME: a derived name is picked by
         # _next_indexed_name from the free slots, so it never collides.
         if config.name:

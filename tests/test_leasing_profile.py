@@ -1,0 +1,575 @@
+"""The published profile: renders use frozen settings, not each caller's."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import yaml
+
+from infer_stack.leasing import Catalog, Controller, Ledger, SqliteStore
+from infer_stack.leasing.profile import CatalogConflict, CatalogUnion, ProfileMismatch
+from test_leasing_compose import IMAGES, PORTS, STATE, FakeDocker, FakeHttp
+
+from infer_stack.hardware import simulate_inventory
+from infer_stack.leasing.compose import ComposeBackend
+
+
+def cat(endpoint, source=None, **extra):
+    return {
+        'models': {'m': {'source': f'hf://org/{source or endpoint}'}},
+        'endpoints': {endpoint: {'engine': 'vllm', 'model': 'm', **extra}},
+    }
+
+
+def backend(state_dir, *, catalog=None, **kw):
+    return ComposeBackend(
+        state_dir=state_dir, inventory=simulate_inventory('4x80'), run=FakeDocker(),
+        http=FakeHttp(state_dir), images=kw.pop('images', IMAGES), ports=PORTS,
+        state=STATE, catalog=catalog, **kw,
+    )
+
+
+def controller(tmp_path, **kw):
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')))
+    return ledger, Controller(ledger, backend(tmp_path / 'state', **kw))
+
+
+def compose(ctl):
+    return yaml.safe_load(ctl.backend.compose_file.read_text())
+
+
+def test_first_mutation_freezes_the_invocation_settings(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    assert ledger.profile() is None                      # opening freezes nothing
+    out = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+    profile = ledger.profile()
+    assert profile['backend'] == 'compose' and profile['ui'] is True
+    assert 'allowed_gpus' not in profile
+    assert 'open-webui' in compose(ctl)['services']
+
+    # A later caller with different settings and newer image pins renders the same.
+    images = {**IMAGES, 'litellm': 'litellm:someday'}
+    _, ctl2 = controller(tmp_path, catalog=a, ui=False, images=images)
+    ctl2.release(out.lease.id)
+    after = compose(ctl2)
+    assert 'open-webui' in after['services']
+    assert after['services']['litellm']['image'] == IMAGES['litellm']
+    assert ledger.profile() == profile
+
+
+def test_drift_is_warned_once(tmp_path):
+    from infer_stack._log import logger
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.gc()
+    seen = []
+    logger.enable('infer_stack')
+    handle = logger.add(lambda m: seen.append(m.record['message']), level='WARNING')
+    try:
+        _, ctl2 = controller(tmp_path, catalog=a, ui=False)
+        ctl2.gc()
+        ctl2.gc()
+    finally:
+        logger.remove(handle)
+        logger.disable('infer_stack')
+    warnings = [m for m in seen if 'active recovery snapshot' in m]
+    assert len(warnings) == 1 and 'ui' in warnings[0]
+
+
+def test_acquire_auto_adopts_current_catalog_when_quiescent(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    b = Catalog.from_dict(cat('beta'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()                                              # freezes {alpha}
+    _, ctl2 = controller(tmp_path, catalog=b)
+    out = ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
+    assert out.lease.endpoints == ['beta']
+    assert set(ctl2.backend.catalog.endpoints) == {'beta'}
+    assert ledger.publication_pending() is None
+
+
+def test_acquire_auto_merges_compatible_catalog_addition_while_live(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    b = Catalog.from_dict(cat('beta'))
+    _, ctl = controller(tmp_path, catalog=a)
+    ctl.acquire('alpha-owner', a.resolve_names(['alpha']), wait=False)
+
+    # A second ordinary runbook adds beta. No config-publish step: acquire
+    # extends the internal recovery snapshot while preserving alpha's frozen
+    # definition and the live deployment.
+    _, ctl2 = controller(tmp_path, catalog=b)
+    out = ctl2.acquire('beta-owner', b.resolve_names(['beta']), wait=False)
+    assert out.lease.endpoints == ['beta']
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
+
+
+def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    changed = Catalog.from_dict(cat('alpha', runtime={'max_model_len': 1024}))
+    _, ctl = controller(tmp_path, catalog=a)
+    old = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+
+    _, ctl2 = controller(tmp_path, catalog=changed)
+    with pytest.raises(ProfileMismatch, match='active leasing epoch'):
+        ctl2.acquire('y', changed.resolve_names(['alpha']), wait=False)
+
+    ctl.release_leases([old.lease.id], evict=True)
+    _, ctl3 = controller(tmp_path, catalog=changed)
+    out = ctl3.acquire('y', changed.resolve_names(['alpha']), wait=False)
+    assert out.lease.endpoints == ['alpha']
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+
+
+def test_union_of_catalogs_serves_either_runbook(tmp_path):
+    union = CatalogUnion.from_sources([cat('alpha'), cat('beta')])
+    ledger, ctl = controller(tmp_path, catalog=union)
+    ctl.gc()
+    # A runbook that only knows `beta` passes its own catalog: no drift, accepted.
+    b = Catalog.from_dict(cat('beta'))
+    _, ctl2 = controller(tmp_path, catalog=b)
+    ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
+    assert ctl2.backend.catalog.endpoints.keys() == {'alpha', 'beta'}
+
+
+def test_union_rejects_conflicts_and_deduplicates_identical_definitions():
+    assert sorted(CatalogUnion.from_sources([cat('alpha'), cat('alpha')]).endpoints) == ['alpha']
+    with pytest.raises(CatalogConflict):
+        CatalogUnion.from_sources([cat('alpha'), cat('alpha', source='other')])
+    bundles = [{**cat('alpha'), 'bundles': {'b': ['alpha']}},
+               {**cat('alpha'), 'bundles': {'b': []}}]
+    with pytest.raises(CatalogConflict, match='bundle'):
+        CatalogUnion.from_sources(bundles)
+
+
+def test_a_crashed_unallocated_acquire_is_never_placed_by_another_caller(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, allowed_gpus=[3])
+    ctl.gc()
+    # The acquire commits with its scope, then dies before rendering.
+    ledger.mark_publication_pending(apply_requested=True,
+                                    placement_context={'allowed_gpus': [3]})
+    res = ledger.acquire('x', a.resolve_names(['alpha']))
+    # A different caller, allowed only GPU 0, runs the next operation.
+    _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
+    ctl2.gc()
+    # Admission-mode acquires commit allocations with the lease, so this row can
+    # only come from pre-allocation code: it stays unresolved and is never
+    # placed at all -- in particular not on the other caller's GPU 0.
+    sidecar = json.loads((tmp_path / 'state' / 'leasing-compose-state.json').read_text())
+    assert res.deployments[0].id not in sidecar['assignments']
+    assert ledger.get_deployment(res.deployments[0].id).assigned_gpus is None
+    assert ledger.publication_pending() is None
+
+
+def test_an_acquire_clears_its_scope_once_rendered(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, allowed_gpus=[2])
+    ctl.acquire('x', a.resolve_names(['alpha']), wait=False, apply=False)
+    assert ledger.publication_pending()['placement_context'] is None
+
+
+def test_reverse_proxy_config_is_snapshotted(tmp_path):
+    conf = tmp_path / 'nginx.conf'
+    conf.write_text('events {}\n# v1\n')
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, reverse_proxy=True,
+                             reverse_proxy_config=str(conf))
+    ctl.gc()
+    conf.write_text('events {}\n# edited later\n')
+    _, ctl2 = controller(tmp_path, catalog=a, reverse_proxy=True,
+                         reverse_proxy_config=str(conf))
+    ctl2.gc()
+    snapshot = tmp_path / 'state' / 'reverse-proxy.conf'
+    assert snapshot.read_text().endswith('# v1\n')
+    assert str(snapshot) in json.dumps(compose(ctl2))
+
+
+def test_candidate_reverse_proxy_snapshot_is_not_written_before_commit(tmp_path):
+    conf = tmp_path / 'nginx.conf'
+    conf.write_text('events {}\n# v1\n')
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(
+        tmp_path, catalog=a, reverse_proxy=True, reverse_proxy_config=str(conf)
+    )
+    ctl.gc()
+    snapshot = tmp_path / 'state' / 'reverse-proxy.conf'
+    assert snapshot.read_text().endswith('# v1\n')
+    before = ledger.profile()
+    candidate = {
+        **before,
+        'reverse_proxy': {**before['reverse_proxy'], 'config_text': 'events {}\n# v2\n'},
+    }
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt('killed before profile commit')
+
+    ledger.store.publish_profile = crash
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() == before
+    assert snapshot.read_text().endswith('# v1\n')
+
+
+def test_a_different_backend_kind_is_refused(tmp_path):
+    from infer_stack.backends.kubeai import KubeaiBackend
+
+    ledger, ctl = controller(tmp_path)
+    ctl.gc()
+    other = Controller(ledger, KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True))
+    with pytest.raises(ProfileMismatch, match='compose'):
+        other.gc()                         # refused on the first mutation...
+
+
+def test_config_publish_refuses_to_change_the_backend_kind(tmp_path):
+    from infer_stack.backends.kubeai import KubeaiBackend
+
+    ledger, ctl = controller(tmp_path)
+    ctl.gc()
+    kube = KubeaiBackend(state_dir=tmp_path / 'k', assume_yes=True, run=lambda args: '')
+    other = Controller(ledger, kube)          # opening still works
+    with pytest.raises(ProfileMismatch, match='not supported'):
+        other.publish_profile(kube.render_profile())
+    assert ledger.profile()['backend'] == 'compose'
+
+
+def test_explicit_missing_or_broken_catalog_is_an_error_after_publishing(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cl, '_make_backend',
+                        lambda config, *, interactive=False: backend(state))
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
+    with pytest.raises(SystemExit, match='catalog not found'):
+        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog',
+                                 str(tmp_path / 'typo.yaml'), '--no-wait', '--yes'])
+    broken = tmp_path / 'broken.yaml'
+    broken.write_text('endpoints: {e: {engine: nope}}\n')
+    with pytest.raises(SystemExit, match='invalid catalog'):
+        cl.AcquireCLI.main(argv=['alpha', '--ledger', db, '--catalog', str(broken),
+                                 '--no-wait', '--yes'])
+
+
+@pytest.mark.parametrize('failure', ['declined', 'raises'])
+def test_publish_on_a_fresh_ledger_that_does_not_complete_stores_nothing(tmp_path, failure):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    ledger, ctl = controller(tmp_path, catalog=Catalog.from_dict(cat('alpha')))
+
+    def fail(planned):
+        raise ConvergeAborted('no') if failure == 'declined' else RuntimeError('boom')
+
+    ctl.backend._approve_changes = fail
+    candidate = {**ctl.backend.render_profile(), 'catalogs': [cat('alpha'), cat('beta')]}
+    with pytest.raises((ConvergeAborted, RuntimeError)):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() is None
+    assert ledger.publication_pending() is None
+
+
+def test_a_declined_recovery_render_keeps_the_crashed_acquires_scope(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    ledger.mark_publication_pending(apply_requested=True,
+                                    placement_context={'allowed_gpus': [3]})
+    ledger.acquire('x', a.resolve_names(['alpha']))
+    _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
+
+    def decline(planned):
+        raise ConvergeAborted('no')
+
+    ctl2.backend._approve_changes = decline
+    with pytest.raises(ConvergeAborted):
+        ctl2.gc()
+    assert ledger.publication_pending()['placement_context'] == {'allowed_gpus': [3]}
+
+
+def test_cli_catalog_edit_then_acquire_needs_no_publish_step(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    def make_backend(config, *, interactive=False):
+        try:
+            catalog = cl._load_catalog(config)
+        except SystemExit:
+            catalog = None
+        return backend(state, catalog=catalog)
+
+    monkeypatch.setattr(cl, '_make_backend', make_backend)
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    assert cl.AcquireCLI.main(
+        argv=['alpha', '--ledger', db, '--catalog', str(f), '--no-wait', '--yes']
+    ) == 0
+
+    # Extend the same user catalog while alpha is live. This is the primary UX:
+    # edit/suggest -> acquire, with no explicit profile publication command.
+    data = cat('alpha')
+    data['models']['b'] = {'source': 'hf://org/beta'}
+    data['endpoints']['beta'] = {'engine': 'vllm', 'model': 'b'}
+    f.write_text(yaml.safe_dump(data))
+    assert cl.AcquireCLI.main(
+        argv=['beta', '--ledger', db, '--catalog', str(f), '--no-wait', '--yes']
+    ) == 0
+    profile = Ledger(SqliteStore(db)).profile()
+    assert set(CatalogUnion.from_sources(profile['catalogs']).endpoints) == {
+        'alpha', 'beta'
+    }
+
+
+# -- config publish (quiescent only) ----------------------------------------------
+
+
+def test_publish_replaces_the_profile_when_quiescent(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    out = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+    ctl.release_leases([out.lease.id], evict=True)
+
+    new = {**ledger.profile(), 'ui': False,
+           'catalogs': [cat('alpha'), cat('beta')]}
+    ctl.publish_profile(new)
+    assert ledger.profile() == new
+    assert 'open-webui' not in compose(ctl)['services']
+    b = Catalog.from_dict(cat('beta'))
+    ctl.acquire('y', b.resolve_names(['beta']), wait=False)      # now published
+
+
+def test_publish_previews_the_same_post_expiry_state_it_applies(tmp_path):
+    """Virtual quiescence and the post-commit sweep must render identically."""
+    from infer_stack.leasing.models import LeaseState
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    out = ctl.acquire('x', a.resolve_names(['alpha']), ttl_seconds=60, wait=False)
+    # Model disappeared out of band; the lease expired but no controller operation
+    # has materialized sweep() yet.  This is the exact config-publish crash window.
+    ctl.backend.run.containers.clear()
+    now = ledger.clock()
+    with ledger.store.transaction():
+        ledger.store.renew_lease(
+            out.lease.id, ttl_seconds=1, expires_at=now - 1, heartbeat_at=now - 2
+        )
+    candidate = {**ledger.profile(), 'ui': False}
+    rec = ctl.publish_profile(candidate)
+    assert rec.publication_pending is False
+    assert ledger.profile() == candidate
+    assert ledger.get_lease(out.lease.id).state == LeaseState.EXPIRED
+
+
+def test_publish_refuses_with_an_active_lease(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+    before = ledger.profile()
+    with pytest.raises(ProfileMismatch, match='active lease'):
+        ctl.publish_profile({**before, 'ui': not before['ui']})
+    assert ledger.profile() == before and ledger.publication_pending() is None
+
+
+def test_publish_refuses_while_a_deployment_container_exists(tmp_path):
+    from infer_stack.leasing.residency import Container, Residency
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    ctl.backend.residency = lambda: Residency({'grp-warm': (Container('c1', 'grp-warm', 'running'),)})
+    with pytest.raises(ProfileMismatch, match='grp-warm'):
+        ctl.publish_profile({**ledger.profile(), 'ui': False})
+
+
+def test_a_declined_publish_stores_nothing(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.gc()
+    before = ledger.profile()
+
+    def decline(planned):
+        raise ConvergeAborted('declined')
+
+    ctl.backend._approve_changes = decline
+    with pytest.raises(ConvergeAborted):
+        ctl.publish_profile({**before, 'ui': False})
+    assert ledger.profile() == before
+    assert ctl.backend.ui is True
+
+
+def test_config_publish_cli_publishes_a_union_and_rejects_conflicts(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cl, '_make_backend', lambda config, *, interactive=False: backend(state))
+    db = str(tmp_path / 'ledger.db')
+    fa, fb, fc = (tmp_path / n for n in ('a.yaml', 'b.yaml', 'c.yaml'))
+    fa.write_text(yaml.safe_dump(cat('alpha')))
+    fb.write_text(yaml.safe_dump(cat('beta')))
+    fc.write_text(yaml.safe_dump(cat('alpha', source='other')))
+
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(fa), str(fb), '--yes']) == 0
+    assert len(Ledger(SqliteStore(db)).profile()['catalogs']) == 2
+    with pytest.raises(SystemExit, match='defined differently'):
+        cl.ConfigPublishCLI.main(argv=['--ledger', db, str(fa), str(fc), '--yes'])
+
+
+# -- P4: approved digest and image pre-pull ------------------------------------------------
+
+
+def test_a_render_differing_from_the_approved_one_fails_closed_until_apply(tmp_path):   # 18
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    # A publication was approved, then (say) infer-stack was upgraded before it applied.
+    ledger.mark_publication_pending(apply_requested=True, approved_digest='digest-of-old-renderer')
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()
+    assert ledger.publication_pending()['approved_digest'] == 'digest-of-old-renderer'
+    ctl.apply_now()                                   # the explicit re-approval
+    assert ledger.publication_pending() is None
+
+
+def test_publish_pulls_images_first_and_a_failed_pull_publishes_nothing(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_leasing as cl
+
+    state = tmp_path / 'state'
+    pulled = []
+
+    class Pulls(ComposeBackend):
+        def pull_images(self, images):
+            pulled.append(list(images))
+            if fail:
+                raise RuntimeError('manifest unknown')
+            return []
+
+    def make_backend(config, *, interactive=False):
+        return Pulls(state_dir=state, inventory=simulate_inventory('4x80'), run=FakeDocker(),
+                     http=FakeHttp(state), images=IMAGES, ports=PORTS, state=STATE)
+
+    monkeypatch.setattr(cl, '_make_backend', make_backend)
+    db = str(tmp_path / 'ledger.db')
+    f = tmp_path / 'a.yaml'
+    f.write_text(yaml.safe_dump(cat('alpha')))
+    fail = True
+    with pytest.raises(SystemExit, match='image pull failed'):
+        cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes'])
+    assert Ledger(SqliteStore(db)).profile() is None
+    fail = False
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes']) == 0
+    assert len(pulled) == 2
+    assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(f), '--yes', '--no-pull']) == 0
+    assert len(pulled) == 2
+
+
+def test_prepull_uses_the_candidate_profile_and_its_catalog_images():
+    from infer_stack.leasing.compose import profile_images
+
+    images = {'vllm': 'vllm:d', 'ollama': 'ollama:d', 'litellm': 'l', 'postgres': 'p',
+              'open_webui': 'w', 'nginx': 'n'}
+    catalog = {
+        'models': {'m': {'source': 'hf://org/m'}},
+        'runtime_hosts': {'oh': {'engine': 'ollama'}},
+        'endpoints': {
+            'custom': {'engine': 'vllm', 'model': 'm', 'runtime': {'image': 'vllm:custom'}},
+            'tag': {'engine': 'ollama', 'model': 'llama3:8b', 'host': 'oh'},
+        },
+    }
+    candidate = {'images': images, 'litellm': True, 'dynamic_routing': False, 'ui': True,
+                 'reverse_proxy': {'enabled': False}, 'catalogs': [catalog]}
+    got = profile_images(candidate)
+    assert 'w' in got                           # UI turned on by the candidate
+    assert 'vllm:custom' in got and 'ollama:d' in got
+    assert 'p' not in got and 'n' not in got
+
+
+def test_a_crash_while_publishing_leaves_the_old_profile_and_no_unguarded_marker(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.gc()
+    before = ledger.profile()
+    store = ledger.store
+    real = store._write_marker
+    written = []
+
+    def crash(**kw):
+        if kw.get('approved_digest'):                 # the write paired with the profile
+            written.append(ledger.profile())
+            raise KeyboardInterrupt('killed between profile and marker')
+        return real(**kw)
+
+    store._write_marker = crash
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile({**before, 'ui': False})
+    del store._write_marker
+    assert written and written[0]['ui'] is False     # the profile had been written...
+    assert ledger.profile() == before                # ...and rolled back with the marker
+
+
+def test_a_publish_that_never_commits_leaves_no_append_only_state(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.gc()
+    before = ledger.profile()
+    registry = ctl.backend._registry_file
+    registry_before = registry.read_text() if registry.exists() else None
+
+    def crash(*args, **kw):
+        raise KeyboardInterrupt('killed before the profile transaction')
+
+    ledger.store.publish_profile = crash
+    candidate = {**before, 'catalogs': [cat('alpha'), cat('beta')]}
+    with pytest.raises(KeyboardInterrupt):
+        ctl.publish_profile(candidate)
+    assert ledger.profile() == before
+    after = registry.read_text() if registry.exists() else None
+    assert after == registry_before and 'beta' not in (after or '')
+    assert ledger.service_addresses() == {}
+
+
+def test_fingerprints_hash_only_the_env_values_a_service_interpolates(tmp_path):
+    from infer_stack.leasing.compose import stamp_fingerprints
+
+    env = tmp_path / '.env'
+    doc = lambda: {'services': {'m': {'image': 'x', 'environment': {'HF_TOKEN': '${HF_TOKEN:-}'}}}}  # noqa: E731
+    env.write_text('HF_TOKEN=a\nOPENAI_BASE_URL=u1\n')
+    first = stamp_fingerprints(doc(), files={}, env_file=env)
+    env.write_text('HF_TOKEN=a\nOPENAI_BASE_URL=u2\n')
+    assert stamp_fingerprints(doc(), files={}, env_file=env) == first      # unrelated key
+    env.write_text('HF_TOKEN=b\nOPENAI_BASE_URL=u2\n')
+    assert stamp_fingerprints(doc(), files={}, env_file=env) != first      # the used one
+
+
+def test_env_writes_hold_the_publication_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    from infer_stack.cli import commands_leasing as cl
+
+    from infer_stack.leasing import default_ledger_path
+
+    lock = default_ledger_path().parent / '.leasing.lock'      # the isolated data root
+    held = []
+
+    def write(path, values):
+        handle = open(lock, 'a')
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(False)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            held.append(True)
+        finally:
+            handle.close()
+
+    monkeypatch.setattr(cl, 'write_env_file', write)
+    monkeypatch.setattr(cl, '_secret_env_path', lambda: tmp_path / '.env')
+    assert cl.EnvCLI.main(argv=['HF_TOKEN=x']) == 0
+    assert held == [True]

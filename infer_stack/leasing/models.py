@@ -73,6 +73,13 @@ RESERVED_ENGINE = 'reserved'
 # Synthetic endpoint/claim name for a reservation (it serves nothing).
 RESERVED_ENDPOINT = 'reserved-gpu'
 
+# Named vLLM launcher recipes that need more than the stock ``vllm serve``
+# command. Keep this deliberately small and explicit: a typo must not silently
+# fall through to vanilla vLLM with a model that only fits because the recipe
+# prepares/quantizes it first.
+HYPERQWEN_3090_RECIPE = 'hyperqwen-3090-single'
+VLLM_SERVE_RECIPES = frozenset({HYPERQWEN_3090_RECIPE})
+
 
 def is_reservation(obj: Any) -> bool:
     """True if a :class:`Deployment` / :class:`EndpointRequest` is a GPU reservation."""
@@ -97,6 +104,9 @@ VLLM_STRUCTURAL_FIELDS = (
     'trust_remote_code',
     'lora_adapters',
     'served_name',
+    # Optional: present only for an operator-pinned endpoint. Keeping it absent
+    # for auto placement preserves the compatibility key of existing catalogs.
+    'gpu_indices',
 )
 
 # For Ollama the coalescing unit is the *daemon*, so the structural identity is
@@ -166,9 +176,11 @@ def vllm_structural(
     lora_adapters: list[str] | None = None,
     attention_backend: str | None = None,
     served_name: str | None = None,
+    gpu_indices: list[int] | None = None,
+    serve_recipe: str | None = None,
 ) -> dict[str, Any]:
     """Build the structural dict for a vLLM endpoint (one process per model)."""
-    return {
+    structural = {
         'engine': 'vllm',
         'model_ref': model_ref,
         'revision': revision,
@@ -187,6 +199,19 @@ def vllm_structural(
         'attention_backend': attention_backend,
         'served_name': served_name or model_ref,
     }
+    if gpu_indices:
+        # An explicit pin is part of deployment identity: changing auto -> GPU 1
+        # must not revive an idle deployment that is still resident on GPU 0.
+        # Do not emit an empty key for auto placement; old compatibility hashes
+        # stay stable for every catalog that does not opt into pinning.
+        structural['gpu_indices'] = [int(i) for i in gpu_indices]
+    if serve_recipe:
+        # A recipe can change the container entrypoint, preparation pipeline,
+        # quantized artifacts, and runtime defaults. It is therefore process
+        # identity, not merely a placement/capacity hint. Omit the key for the
+        # stock path so existing compatibility hashes remain stable.
+        structural['serve_recipe'] = serve_recipe
+    return structural
 
 
 def ollama_structural(
@@ -323,6 +348,11 @@ class Deployment:
     created_at: float
     updated_at: float
     demand: int = 0
+    # The committed GPU allocation of a LIVE deployment (admission-mode
+    # backends). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
+    # before allocations existed). Cleared in the same transaction as any
+    # transition out of LIVE.
+    assigned_gpus: list[int] | None = None
 
 
 def reservation_request(count: int, *, endpoint: str = RESERVED_ENDPOINT) -> EndpointRequest:

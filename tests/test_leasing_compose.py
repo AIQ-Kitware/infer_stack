@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from fake_docker_state import ComposeFake
+
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import (
     Catalog,
@@ -63,29 +65,8 @@ def ollama(gid, *, tag='m:1b', t=0.0):
     )
 
 
-class FakeDocker:
+class FakeDocker(ComposeFake):
     """Stateful docker compose stand-in: `up` reflects the compose file."""
-
-    def __init__(self):
-        self.running: list[str] = []
-        self.calls: list[list[str]] = []
-
-    def __call__(self, args: list[str]) -> str:
-        self.calls.append(args)
-        compose_file = args[args.index('-f') + 1] if '-f' in args else None
-        if 'up' in args:
-            data = yaml.safe_load(Path(compose_file).read_text()) or {}
-            self.running = sorted((data.get('services') or {}).keys())
-            return ''
-        if 'down' in args:
-            self.running = []
-            return ''
-        if 'ps' in args:
-            return json.dumps(
-                [{'Service': s, 'State': 'running'} for s in self.running]
-            )
-        return ''
-
 
 class FakeResp:
     def __init__(self, status, payload):
@@ -235,6 +216,44 @@ def test_render_vllm_attention_backend_reaches_environment_not_command():
     svc = rc.compose['services'][vllm_service_name(deployment)]
     assert svc['environment']['VLLM_ATTENTION_BACKEND'] == 'TORCH_SDPA'
     assert not any('attention' in a.lower() for a in svc['command'])
+
+
+def test_render_hyperqwen_3090_recipe_uses_prepared_single_user_launcher():
+    deployment = vllm(
+        'grp-q38',
+        hf='dbirks/Qwen3.8-27B-W4A16-AutoRound',
+        served='local-qwen38',
+        max_len=65536,
+    )
+    deployment.spec['runtime'].update({
+        'serve_recipe': 'hyperqwen-3090-single',
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+        'gpu_memory_utilization': 0.93,
+        'enable_prefix_caching': True,
+    })
+    rc = render_compose(
+        [deployment], {'grp-q38': [3]}, images=IMAGES, ports=PORTS,
+        state={**STATE, 'runtime': '/cache/runtime'},
+    )
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    assert svc['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
+    assert svc['command'] == ['single']
+    assert svc['environment'] == {
+        'HF_TOKEN': '${HF_TOKEN:-}',
+        'PORT': '8000',
+        'SPEC': 'dflash2',
+        'PREFIX_CACHE': '1',
+        'MAX_LEN': '65536',
+        'GPU_UTIL': '0.93',
+        'EXTRA_ARGS': '--served-model-name=local-qwen38',
+    }
+    assert svc['volumes'] == [
+        '/cache/runtime/hyperqwen/qwen3.8-27b/models:/app/models',
+        '/cache/runtime/hyperqwen/qwen3.8-27b/cache:/cache',
+    ]
+    devs = svc['deploy']['resources']['reservations']['devices'][0]
+    assert devs['device_ids'] == ['3']
+    assert svc['healthcheck']['test'][-1] == 'http://localhost:8000/health'
 
 
 def test_render_reports_service_name_collisions():
@@ -406,8 +425,9 @@ def test_converge_to_empty_keeps_the_front_door(tmp_path):
     fake = be.run
     fake.calls.clear()
     be.converge([])                        # last model released
-    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
-    assert 'up' in verbs and 'down' not in verbs   # front door stays up
+    assert not any('down' in c for c in fake.calls)  # front door stays up
+    assert set(fake.running) == {'litellm', 'open-webui'}   # kept, not restarted
+    assert not any('up' in c for c in fake.calls)
     # no model deployments running, but the compose project still has the gateway/UI
     assert be.observe() == set()
     compose = yaml.safe_load(be.compose_file.read_text())
@@ -415,15 +435,16 @@ def test_converge_to_empty_keeps_the_front_door(tmp_path):
 
 
 def test_converge_to_empty_downs_when_gateway_off(tmp_path):
-    """With no gateway (litellm=False), an empty desired set has nothing to run,
-    so converge `down`s rather than `up`-ing a services-less file."""
+    """With no gateway (litellm=False), an empty desired set has nothing to run:
+    selective apply removes the managed model container and starts nothing."""
     be = make_backend(tmp_path, litellm=False)
     be.converge([vllm('a', t=0)])
     fake = be.run
     fake.calls.clear()
     be.converge([])
-    verbs = [c[c.index('-f') + 2] if '-f' in c else c[0] for c in fake.calls]
-    assert 'down' in verbs and 'up' not in verbs
+    assert fake.running == []
+    assert any(c[:3] == ['docker', 'rm', '-f'] for c in fake.calls)
+    assert not any('up' in c for c in fake.calls)
 
 
 def test_render_reverse_proxy(tmp_path):
@@ -496,7 +517,7 @@ def test_observe_tolerates_unreadable_compose_file(tmp_path):
     # propagate it (else acquire bricks before converge can overwrite the file).
     class RaisingPs(FakeDocker):
         def __call__(self, args):
-            if 'ps' in args:
+            if args[:2] == ['docker', 'compose'] and 'ps' in args:
                 raise RuntimeError('compose schema error on a stale file')
             return super().__call__(args)
 
@@ -1581,3 +1602,100 @@ def test_plan_declared_beats_measured_overlay(tmp_path):
     plan = be.plan([g])
     # declared 4 GiB -> both cards eligible -> best-fit takes the 16er.
     assert plan.assignments == {'m': [0]}
+
+
+# -- bounded docker commands --------------------------------------------------
+
+
+def test_default_docker_run_returns_stdout_and_raises_on_failure():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    assert _default_docker_run(['sh', '-c', 'echo hello']) == 'hello\n'
+    with pytest.raises(subprocess.CalledProcessError):
+        _default_docker_run(['sh', '-c', 'exit 3'])
+
+
+def test_default_docker_run_kills_the_whole_process_group_on_timeout(tmp_path):
+    # `docker compose` spawns children; killing only the client would leave them
+    # running and, under the controller's host-wide lock, hanging is not an option.
+    import os
+    import time as _time
+
+    from infer_stack.leasing.backend import BackendTimeout
+    from infer_stack.leasing.compose import _default_docker_run
+
+    pidfile = tmp_path / 'child.pid'
+    start = _time.monotonic()
+    with pytest.raises(BackendTimeout):
+        _default_docker_run(
+            ['sh', '-c', f'sleep 60 & echo $! > {pidfile}; wait'], timeout=0.5,
+        )
+    assert _time.monotonic() - start < 10
+    child = int(pidfile.read_text())
+    for _ in range(50):                        # reaped asynchronously
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail(f'child {child} of the timed-out command is still alive')
+
+
+def test_default_docker_run_kills_the_process_group_when_interrupted(tmp_path):
+    # The command runs in its own session, so Ctrl-C never reaches it: without an
+    # explicit kill, an interrupted `docker compose up` keeps running unattended.
+    import os
+    import signal
+    import threading
+    import time as _time
+
+    from infer_stack.leasing.compose import _default_docker_run
+
+    pidfile = tmp_path / 'child.pid'
+
+    def interrupt_soon():
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            _time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=interrupt_soon, daemon=True).start()
+    with pytest.raises(KeyboardInterrupt):
+        _default_docker_run(
+            ['sh', '-c', f'sleep 60 & echo $! > {pidfile}; wait'], timeout=30,
+        )
+    child = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail(f'child {child} of the interrupted command is still alive')
+
+
+def test_docker_commands_do_not_inherit_hf_token_or_docker_target(monkeypatch):
+    # ${HF_TOKEN:-} must resolve from the managed .env only, and a caller's
+    # DOCKER_HOST/DOCKER_CONTEXT must not redirect a recovery to another daemon.
+    from infer_stack.leasing.compose import _default_docker_run
+
+    monkeypatch.setenv('HF_TOKEN', 'hf_from_shell')
+    monkeypatch.setenv('DOCKER_HOST', 'tcp://elsewhere:2375')
+    monkeypatch.setenv('DOCKER_CONTEXT', 'other')
+    out = _default_docker_run(
+        ['sh', '-c', 'echo ${HF_TOKEN:-none} ${DOCKER_HOST:-none} ${DOCKER_CONTEXT:-none} ${PATH:+path}'],
+        timeout=10,
+    )
+    assert out.split() == ['none', 'none', 'default', 'path']
+
+
+def test_default_docker_run_can_redirect_stderr_lines():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    seen = []
+    out = _default_docker_run(['sh', '-c', 'echo out; echo err1 >&2; echo err2 >&2'],
+                              timeout=10, stderr_lines=seen.append)
+    assert out.strip() == 'out' and seen == ['err1', 'err2']
