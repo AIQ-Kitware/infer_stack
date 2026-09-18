@@ -1309,7 +1309,7 @@ class InferStackTUI(App):
             if update_catalog is not None:
                 update_catalog(self.catalog)
         except Exception as ex:  # noqa: BLE001
-            self._status(f'catalog reload failed: {ex}')
+            self._refuse(f'catalog reload failed: {ex}', level='error')
             return
         self._fill_catalog()
 
@@ -1886,6 +1886,23 @@ class InferStackTUI(App):
             except Exception:  # noqa: BLE001 - notifications are a bonus
                 pass
 
+    def _refuse(self, message: str, *, level: str = 'warn') -> None:
+        """Report an action the TUI declined to perform, or that failed.
+
+        A refusal is a result, not silence: it raises a popup, keeps the status
+        line (which the refresh tick would otherwise wipe), and is recorded in
+        the TUI log. Before this, "nothing happened" was indistinguishable from
+        "the button is broken".
+        """
+        self._status(message, sticky_for=15.0)
+        self.app_log(message, level=level)
+        if level != 'error':                      # errors already notify
+            try:
+                self.notify(message, title='infer-stack',
+                            severity='warning', timeout=10.0)
+            except Exception:  # noqa: BLE001 - notifications are a bonus
+                pass
+
     def _mark_app_log_tab(self) -> None:
         """Turn the tab red with a count, so an error is visible from any tab."""
         try:
@@ -2120,7 +2137,7 @@ class InferStackTUI(App):
 
     def _start_acquire(self, name: str) -> None:
         if name in self._acquire_inflight:
-            self._status(f'{name} is already being acquired')
+            self._refuse(f'{name} is already being acquired')
             return
         self._acquire_inflight.add(name)
         self._status(
@@ -2132,7 +2149,7 @@ class InferStackTUI(App):
     def action_acquire(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
-            self._status('select an endpoint in the catalog to acquire')
+            self._refuse('select an endpoint in the catalog to acquire')
             return
         self._start_acquire(name)
 
@@ -2263,10 +2280,10 @@ class InferStackTUI(App):
             ledger = float(self.query_one('#set-ledger-interval', Input).value)
             observe = float(self.query_one('#set-observe-interval', Input).value)
         except ValueError:
-            self._status('poll intervals must be numbers')
+            self._refuse('poll intervals must be numbers')
             return
         if ledger <= 0 or observe <= 0:
-            self._status('poll intervals must be positive')
+            self._refuse('poll intervals must be positive')
             return
         self.ledger_interval = ledger
         self.observe_interval = max(observe, ledger)  # observe never beats ledger
@@ -2305,7 +2322,7 @@ class InferStackTUI(App):
     def action_release(self) -> None:
         ids = self._target_ids('leases', self._lease_ids, self._lease_sel)
         if not ids:
-            self._status('select a lease row (or check rows with space) to release')
+            self._refuse('select a lease row (or check rows with space) to release')
             return
         self._status(f'releasing {len(ids)} lease(s)…')
         self._do_release(ids)
@@ -2347,7 +2364,7 @@ class InferStackTUI(App):
 
     def action_compose_up(self) -> None:
         if self._compose_target() is None:
-            self._status('nothing rendered yet — acquire a model first')
+            self._refuse('nothing rendered yet — acquire a model first')
             return
         self._status('apply… (output in the Logs tab)')
         self._do_apply()
@@ -2367,7 +2384,7 @@ class InferStackTUI(App):
 
     def action_compose_down(self) -> None:
         if self._compose_target() is None:
-            self._status('nothing rendered yet — nothing to bring down')
+            self._refuse('nothing rendered yet — nothing to bring down')
             return
         self._status('docker compose down (raw: bypasses leases; releases nothing)…')
         self._do_compose(['down', '--remove-orphans'], 'down')
@@ -2410,14 +2427,14 @@ class InferStackTUI(App):
     def action_open(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
-            self._status('select an endpoint to open in the browser')
+            self._refuse('select an endpoint to open in the browser')
             return
         self._open_endpoint(name)
 
     def _open_endpoint(self, name: str) -> None:
         url = self._ui_url(name)
         if not url:
-            self._status('no Open WebUI URL (compose backend only)')
+            self._refuse('no Open WebUI URL (compose backend only)')
             return
         served = name in self._served_endpoints()
         opened = False
@@ -2434,7 +2451,7 @@ class InferStackTUI(App):
 
     def action_add_model(self) -> None:
         if not self.catalog_path:
-            self._status('no catalog path — launch the TUI with a catalog to edit')
+            self._refuse('no catalog path — launch the TUI with a catalog to edit')
             return
         self.push_screen(_AddModelScreen(), self._on_add_model)
 
@@ -2447,13 +2464,13 @@ class InferStackTUI(App):
             })
             self._status(f'added model {result["name"]}')
         except Exception as ex:  # noqa: BLE001
-            self._status(f'add model failed: {ex}')
+            self._refuse(f'add model failed: {ex}', level='error')
             return
         self._reload_catalog()
 
     def action_add_endpoint(self) -> None:
         if not self.catalog_path:
-            self._status('no catalog path — launch the TUI with a catalog to edit')
+            self._refuse('no catalog path — launch the TUI with a catalog to edit')
             return
         self._status('inspecting GPUs for endpoint editor…')
         self._prepare_endpoint_editor(None, {})
@@ -2461,13 +2478,13 @@ class InferStackTUI(App):
     def action_edit_endpoint(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name:
-            self._status('select an endpoint to edit')
+            self._refuse('select an endpoint to edit')
             return
         if not self.catalog_path:
-            self._status('no catalog path — launch the TUI with a catalog to edit')
+            self._refuse('no catalog path — launch the TUI with a catalog to edit')
             return
         if name in self._served_endpoints():
-            self._status(f'{name} is actively served — release it before editing')
+            self._refuse(f'{name} is actively served — release it before editing')
             return
         from .cli.commands_catalog import _load_raw
         entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
@@ -2631,10 +2648,10 @@ class InferStackTUI(App):
     def action_remove_endpoint(self) -> None:
         name = self._selected('endpoints', self._endpoint_names)
         if not name or not self.catalog_path:
-            self._status('select an endpoint to remove')
+            self._refuse('select an endpoint to remove')
             return
         if name in self._served_endpoints():
-            self._status(f'{name} is actively served — release it before removing')
+            self._refuse(f'{name} is actively served — release it before removing')
             return
         self.push_screen(
             _ConfirmScreen(f"Remove endpoint '{name}' from the catalog?"),
@@ -2644,7 +2661,7 @@ class InferStackTUI(App):
     def action_remove_model(self) -> None:
         name = self._selected('models', self._model_names)
         if not name or not self.catalog_path:
-            self._status('select a model to remove')
+            self._refuse('select a model to remove')
             return
         self.push_screen(
             _ConfirmScreen(f"Remove model '{name}'? (endpoints using it will "
@@ -2660,7 +2677,7 @@ class InferStackTUI(App):
             _save_raw(self.catalog_path, data)  # validates cross-refs
             self._status(f'removed {section[:-1]} {name}')
         except Exception as ex:  # noqa: BLE001
-            self._status(f'remove failed: {ex}')
+            self._refuse(f'remove failed: {ex}', level='error')
             return
         self._reload_catalog()
 
@@ -2672,7 +2689,7 @@ class InferStackTUI(App):
 
     def action_suggest(self) -> None:
         if not self.catalog_path:
-            self._status('no catalog path — launch the TUI with a catalog to edit')
+            self._refuse('no catalog path — launch the TUI with a catalog to edit')
             return
         self._status('inspecting GPUs and suggesting a catalog…')
         self._do_suggest()
@@ -2856,7 +2873,7 @@ class InferStackTUI(App):
     def action_api_send(self) -> None:
         model = self._selected_api_model()
         if not model:
-            self._status('no ready models to query (acquire one first)')
+            self._refuse('no ready models to query (acquire one first)')
             return
         prompt = (self.query_one('#api-prompt', Input).value.strip()
                   or 'Say hello in one short sentence.')
@@ -2866,7 +2883,7 @@ class InferStackTUI(App):
     def action_api_test_all(self) -> None:
         models = list(self._ready_endpoints)
         if not models:
-            self._status('no ready models to test (acquire one first)')
+            self._refuse('no ready models to test (acquire one first)')
             return
         self._api_log(f'— testing {len(models)} ready model(s) —')
         self._do_api_test_all(models)
@@ -2884,7 +2901,7 @@ class InferStackTUI(App):
     def action_open_webui(self) -> None:
         url = self._openwebui_url()
         if not url:
-            self._status('no Open WebUI URL (compose backend only)')
+            self._refuse('no Open WebUI URL (compose backend only)')
             return
         opened = False
         try:

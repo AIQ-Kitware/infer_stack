@@ -1830,3 +1830,43 @@ def test_tui_header_shows_the_running_version():
     assert seen['title'] == 'infer-stack'
     assert seen['sub'].startswith(__version__)      # version, then the description
     assert 'leasing dashboard' in seen['sub']
+
+
+def test_tui_refusals_pop_up_instead_of_doing_nothing():
+    """`Edit` on an actively served endpoint must say so in a popup.
+
+    This is the case that looked like a dead button: the refusal was a status
+    line only, and the next refresh tick wiped it.
+    """
+    from textual.widgets import Static
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    out = controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    assert out.lease.endpoints                    # the endpoint is now served
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.catalog_path = 'catalog.yaml'     # editing is otherwise refused earlier
+            notifications = []
+            app.notify = lambda message, **kw: notifications.append((message, kw))
+            app.query_one('#endpoints').focus()
+            app.action_edit_endpoint()
+            for _ in range(5):                    # survives refresh ticks
+                await pilot.pause()
+            seen['notifications'] = notifications
+            seen['status'] = str(app.query_one('#status', Static).render())
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert seen['notifications'], 'a refused action must raise a popup'
+    message, kwargs = seen['notifications'][0]
+    assert 'actively served' in message and 'release it before editing' in message
+    assert kwargs.get('severity') == 'warning'
+    assert 'actively served' in seen['status']    # and the status line keeps it
+    assert 'warn: ' in seen['applog'] and 'actively served' in seen['applog']

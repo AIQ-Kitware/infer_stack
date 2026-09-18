@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Refused TUI actions pop up instead of doing nothing
+
+An action the TUI declines -- `Edit` on an endpoint that is actively served,
+`Acquire` with nothing selected, a catalog action without a catalog path --
+now raises a popup, keeps its message in the status line, and is recorded in
+the `TUI log` tab. Previously it wrote one status line that the next refresh
+tick wiped, so a refusal was indistinguishable from a dead button. This covers
+all 24 refusal paths; the ones that report a failure are logged as errors.
+
 ### The TUI header shows the running version
 
 The header now reads `infer-stack` / `0.7.1 · leasing dashboard`, so a
