@@ -54,7 +54,16 @@ PROFILE_VERSION = 1
 
 
 class CatalogConflict(CatalogError):
-    """Two catalogs in one published union define the same name differently."""
+    """Two catalogs in one published union define the same name differently.
+
+    ``names`` carries the colliding names, so a caller can ask the question
+    that decides whether the collision matters: is any of them pinned by a
+    workload that is actually resident?
+    """
+
+    def __init__(self, message: str, names=()):
+        super().__init__(message)
+        self.names = list(names)
 
 
 class ProfileMismatch(RuntimeError):
@@ -96,7 +105,7 @@ class CatalogUnion:
                     if _request_key(self._owner[name], name) != _request_key(cat, name):
                         raise CatalogConflict(
                             f'endpoint {name!r} is defined differently in two '
-                            'published catalogs'
+                            'published catalogs', [name]
                         )
                     continue
                 self._owner[name] = cat
@@ -104,19 +113,22 @@ class CatalogUnion:
             for name, members in cat.bundles.items():
                 if name in self.bundles and self.bundles[name] != list(members):
                     raise CatalogConflict(
-                        f'bundle {name!r} is defined differently in two published catalogs'
+                        f'bundle {name!r} is defined differently in two published catalogs',
+                        [name]
                     )
                 self.bundles[name] = list(members)
             for alias, row in _registry_incoming_from_catalog(cat).items():
                 if alias in routes and routes[alias] != row:
                     raise CatalogConflict(
-                        f'route {alias!r} is defined differently in two published catalogs'
+                        f'route {alias!r} is defined differently in two published catalogs',
+                        [alias]
                     )
                 routes[alias] = row
         clash = sorted(set(self.bundles) & set(self.endpoints))
         if clash:
             raise CatalogConflict(
-                f'{clash[0]!r} is an endpoint in one published catalog and a bundle in another'
+                f'{clash[0]!r} is an endpoint in one published catalog and a bundle in another',
+                clash
             )
 
     @classmethod
@@ -223,6 +235,36 @@ def merge_catalog_sources(
     # Validate the semantic union now, before a controller persists it.
     CatalogUnion.from_sources(out)
     return out
+
+
+def prune_catalog_sources(
+    sources: list[dict[str, Any]], keep: set[str]
+) -> list[dict[str, Any]]:
+    """Snapshot sources reduced to the definitions ``keep`` still pins.
+
+    A frozen snapshot only has to protect what resident workloads are running.
+    Editing an endpoint nothing is serving -- the normal case while iterating
+    with ``catalog endpoint add --force`` -- should not be refused merely
+    because an older snapshot also defined it, so the stale definitions of
+    everything else are dropped before the union is rebuilt.
+    """
+    pruned: list[dict[str, Any]] = []
+    for source in sources or []:
+        endpoints = {
+            name: spec for name, spec in (source.get('endpoints') or {}).items()
+            if name in keep
+        }
+        bundles = {
+            name: members for name, members in (source.get('bundles') or {}).items()
+            if name in keep
+        }
+        if not endpoints and not bundles:
+            continue
+        kept = dict(source)
+        kept['endpoints'] = endpoints
+        kept['bundles'] = bundles
+        pruned.append(kept)
+    return pruned
 
 
 def validate_requests_against(union: Any, requests) -> None:

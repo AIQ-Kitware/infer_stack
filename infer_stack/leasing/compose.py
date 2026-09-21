@@ -2343,8 +2343,15 @@ class ComposeBackend(ConvergeScaffold):
         # identically, so waiting for a second restart only wastes the GPU.
         logs = self.deployment_logs(deployment, tail=200)
         verdict = classify_engine_log(logs)
+        if verdict == 'transient' and container.will_be_restarted:
+            return None                      # a retry is coming, and may work
         if verdict == 'transient':
-            return None
+            # Transient, but nothing will run it again: waiting is as pointless
+            # as for an unrecoverable error, and the cause still belongs in the
+            # message.
+            return (f'engine is not starting (exited with code '
+                    f'{container.exit_code} and will not be restarted)'
+                    f'{_engine_error_summary(logs)}')
         looping = container.restart_count >= CRASH_LOOP_RESTARTS
         if verdict != 'fatal' and not (exited_for_good or looping):
             return None                      # unrecognised: keep today's budget

@@ -3034,3 +3034,17 @@ thresholds: a deterministic error needs one observation, an unexplained one
 needs a budget. (3) Two sessions converged on the same file within minutes --
 the tree had uncommitted work when I started -- so check `git status` in a
 shared checkout before writing, not after.
+
+**Addendum, same session.** The cohort re-run then failed for a second reason,
+and it was mine: my watcher SIGINTs `infer-stack run`, and an interrupt during
+the readiness wait leaked the lease -- `acquire` guarded ConvergeAborted,
+ProfileMismatch and PlacementError but not KeyboardInterrupt. The leaked lease
+kept its deployment LIVE, which `evict --all` will not touch (it reclaims idle
+deployments), and a non-quiescent stack plus a `--force`-edited catalog meant the
+epoch check refused every acquire for 22 minutes. So the second commit wraps the
+wait in try/except BaseException -> release -> re-raise. Two lessons worth
+keeping: a rollback path that handles three named exceptions and not
+KeyboardInterrupt is not a rollback path, since Ctrl-C is the most common way a
+human ends a wait; and when a state machine refuses to make progress, the
+refusal message ("quiesce the stack") named the symptom while the ledger named
+the cause -- one ACTIVE lease from 22 minutes earlier.

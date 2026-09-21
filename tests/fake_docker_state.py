@@ -50,7 +50,8 @@ class ComposeFake:
         labels.setdefault(COMPOSE_SERVICE_LABEL, service)
         self.containers[cid] = {'service': service, 'labels': labels, 'state': state,
                                 'device_ids': [str(d) for d in device_ids],
-                                'ips': list(ips), 'restart_count': 0, 'exit_code': 0}
+                                'ips': list(ips), 'restart_count': 0, 'exit_code': 0,
+                                'restart_policy': '', 'restart_max': 0}
         return cid
 
     def __call__(self, args, **_):
@@ -73,7 +74,10 @@ class ComposeFake:
                 out.append({'Id': cid, 'State': state,
                             'RestartCount': c.get('restart_count', 0),
                             'Config': {'Labels': c['labels']},
-                            'HostConfig': {'DeviceRequests': requests},
+                            'HostConfig': {'DeviceRequests': requests,
+                                           'RestartPolicy': {
+                                               'Name': c.get('restart_policy', ''),
+                                               'MaximumRetryCount': c.get('restart_max', 0)}},
                             'NetworkSettings': {'Networks': {
                                 'n': {'IPAddress': ip} for ip in c.get('ips', [])}}})
             return json.dumps(out)
@@ -162,6 +166,7 @@ class ComposeFake:
             del self.containers[cid]                      # compose recreates on change
         cid = self.add_container(name, labels=labels, device_ids=device_ids)
         self.containers[cid]['networks'] = list((svc.get('networks') or {}).keys())
+        self.containers[cid]['restart_policy'] = str(svc.get('restart') or '')
         if svc.get('healthcheck'):
             self.containers[cid]['health'] = self.initial_health
 

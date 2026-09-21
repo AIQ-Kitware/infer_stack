@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### An interrupted readiness wait releases its lease
+
+Ctrl-C during `acquire`/`run`'s readiness wait left the lease ACTIVE and its
+deployment LIVE. Nothing released it, so the GPU stayed claimed, `evict` could
+not reclaim it (eviction is for *idle* deployments), and because the stack was
+no longer quiescent every later acquire was refused for redefining an endpoint
+frozen by the leasing epoch -- until the TTL expired. Measured on a real host:
+one interrupted `run` blocked all leasing for 22 minutes. An interrupted wait is
+an acquire that did not deliver, so it now rolls back exactly like a timeout.
+
 ### An engine that cannot start fails fast, with its own error
 
 Reported from a real run: a model whose architecture the vLLM build does not

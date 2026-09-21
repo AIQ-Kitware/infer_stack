@@ -958,6 +958,23 @@ class Controller:
         self._invocation_profile = base
         self._profile_drift_warned = False
 
+    def _pinned_endpoints(self, residency=None) -> set[str]:
+        """Endpoint aliases whose definition a resident workload is running.
+
+        LIVE deployments always count; an IDLE keep-warm deployment counts only
+        while its container is actually resident, which is the same rule
+        placement uses. Anything else is free to be redefined.
+        """
+        _, deployments = self.ledger.status(virtual_expiry=True)
+        pinned: set[str] = set()
+        for deployment in deployments:
+            if deployment.state == DeploymentState.LIVE:
+                pinned.update(deployment.served)
+            elif deployment.state == DeploymentState.IDLE and residency is not None:
+                if residency.resident(deployment.id) is not None:
+                    pinned.update(deployment.served)
+        return pinned
+
     def _profile_quiescent(self, residency=None) -> bool:
         """Whether it is safe to replace the recovery snapshot wholesale.
 
@@ -990,6 +1007,7 @@ class Controller:
         """
         from .._log import logger
         from .profile import (
+    prune_catalog_sources,
             CatalogConflict,
             ProfileMismatch,
             merge_catalog_sources,
@@ -1021,12 +1039,24 @@ class Controller:
                 stored.get('catalogs') or [], invocation.get('catalogs') or []
             )
         except CatalogConflict as ex:
-            raise ProfileMismatch(
-                'the current catalog redefines an endpoint/bundle/route that is '
-                'already frozen for the active leasing epoch. Quiesce the managed '
-                'stack (release/evict resident deployments) and retry; the next '
-                'acquire adopts the current user config automatically'
-            ) from ex
+            # Only definitions a resident workload is actually running have to
+            # stay frozen. Redefining anything else -- the normal case while
+            # iterating with `catalog endpoint add --force` -- drops the stale
+            # definition instead of refusing every acquire on the host.
+            pinned = self._pinned_endpoints(residency)
+            try:
+                candidate['catalogs'] = merge_catalog_sources(
+                    prune_catalog_sources(stored.get('catalogs') or [], pinned),
+                    invocation.get('catalogs') or [],
+                )
+            except CatalogConflict as pinned_ex:
+                blocked = sorted(set(pinned_ex.names) & pinned) or sorted(pinned_ex.names)
+                raise ProfileMismatch(
+                    f'the current catalog redefines {", ".join(repr(b) for b in blocked)}, '
+                    'which a resident deployment is running. Release or evict it '
+                    f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
+                    'nothing is running are updated automatically'
+                ) from pinned_ex
 
         deferred = [
             key for key in drift if key != 'catalogs'
@@ -1690,12 +1720,26 @@ class Controller:
         wait_result = None
         released_on_timeout = False
         if wait and apply:  # nothing to wait on when we only staged the render
-            wait_result = self.wait_ready(
-                deployments,
-                endpoints=set(result.lease.endpoints),
-                timeout=timeout,
-                interval=interval,
-            )
+            try:
+                wait_result = self.wait_ready(
+                    deployments,
+                    endpoints=set(result.lease.endpoints),
+                    timeout=timeout,
+                    interval=interval,
+                )
+            except BaseException:
+                # Ctrl-C (or any SIGINT-driven KeyboardInterrupt, or a
+                # SystemExit) during the readiness wait used to leave the lease
+                # ACTIVE with its deployment LIVE: nothing released it, so the
+                # GPU stayed claimed and -- because the stack was no longer
+                # quiescent -- every later acquire was refused for redefining a
+                # frozen endpoint until the TTL expired. An interrupted wait is
+                # an acquire that did not deliver, exactly like a timeout, so it
+                # rolls back the same way before the interrupt continues.
+                # Measured 2026-09-21: an interrupted `run --endpoint
+                # ling3.0-flash` blocked the host's leasing for 22 minutes.
+                self.release(result.lease.id)
+                raise
             if not wait_result.ready:
                 # The endpoints never became ready. Roll the lease back (release +
                 # reconcile) so a timed-out acquire doesn't leave the deployment

@@ -181,3 +181,78 @@ def test_an_oom_crash_loop_says_so(tmp_path):
                logs='torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB\n')
     detail = ctl.backend.startup_failure(ledger.get_deployment(gid))
     assert 'ran out of memory' in detail
+
+
+# -- a transient cause only buys time if something will actually retry ---------
+
+
+def test_a_transient_failure_nothing_will_retry_is_still_hopeless(tmp_path):
+    """`restart: unless-stopped` is what makes a hub timeout worth waiting for.
+
+    A container that exited and will NOT be restarted has no next attempt, so
+    waiting for one is exactly the 1800 s of held GPU this all exists to avoid.
+    """
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one')
+    gid = out.deployments[0].id
+    crash_loop(ctl, docker, gid, state='exited', restarts=0, exit_code=1,
+               logs='ConnectionError: Max retries exceeded with url: /api/models\n')
+    for container in docker.containers.values():
+        container['restart_policy'] = 'no'
+
+    detail = ctl.backend.startup_failure(ledger.get_deployment(gid))
+    assert detail is not None
+    assert 'will not be restarted' in detail
+    assert 'Max retries exceeded' in detail          # the cause is still reported
+
+
+def test_a_transient_failure_that_docker_will_retry_is_left_alone(tmp_path):
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one')
+    gid = out.deployments[0].id
+    crash_loop(ctl, docker, gid, state='exited', restarts=3, exit_code=1,
+               logs='ConnectionError: Max retries exceeded with url: /api/models\n')
+    for container in docker.containers.values():
+        container['restart_policy'] = 'unless-stopped'
+
+    assert ctl.backend.startup_failure(ledger.get_deployment(gid)) is None
+
+
+def test_an_exhausted_on_failure_budget_counts_as_no_retry(tmp_path):
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one')
+    gid = out.deployments[0].id
+    crash_loop(ctl, docker, gid, state='exited', restarts=3, exit_code=1,
+               logs='Consistency check failed: file should be of size 100\n')
+    for container in docker.containers.values():
+        container.update(restart_policy='on-failure', restart_max=3)
+
+    assert 'will not be restarted' in ctl.backend.startup_failure(
+        ledger.get_deployment(gid))
+
+
+def test_an_interrupted_wait_does_not_leave_the_lease_holding_a_gpu(tmp_path):
+    """Ctrl-C during the readiness wait must release, like a timeout does.
+
+    Measured on aiq-gpu: an interrupted `run` left its lease ACTIVE and its
+    deployment LIVE, so `evict --all` could not reclaim the GPU (eviction is for
+    idle deployments) and every later acquire was refused -- the stack was not
+    quiescent, so the catalog it had been edited to no longer matched the frozen
+    epoch. It stayed that way until the 2 h TTL.
+    """
+    ledger, ctl, docker = make(tmp_path)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    ctl.wait_ready = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        out = acquire(ctl, 'one', wait=True)
+        assert out is None                      # never returns
+    # The lease is gone and nothing is left LIVE holding the GPU.
+    with ledger.store.transaction() as conn:
+        held = conn.execute(
+            "select id from leases where state != 'released'").fetchall()
+        live = conn.execute(
+            "select id from deployments where state = 'live'").fetchall()
+    assert held == [] and live == []

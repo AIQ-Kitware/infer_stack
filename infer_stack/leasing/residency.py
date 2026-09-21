@@ -101,6 +101,11 @@ class Container:
     #: crash-looping, which readiness must not mistake for a slow model load.
     restart_count: int = 0
     exit_code: int | None = None
+    #: Docker's restart policy for this container, and its retry cap
+    #: (``on-failure`` only). Together with the state these say whether anything
+    #: will try to start the container again.
+    restart_policy: str = ''
+    restart_max: int = 0
 
     @property
     def warm(self) -> bool:
@@ -108,6 +113,22 @@ class Container:
 
     def occupies(self, gpu: int) -> bool:
         return self.all_gpus or gpu in self.gpus
+
+    @property
+    def will_be_restarted(self) -> bool:
+        """Whether Docker will start this container again on its own.
+
+        ``always``/``unless-stopped`` always will; ``on-failure`` until its cap;
+        ``no`` (or no policy) never will. A container nothing will retry is as
+        good as dead, whatever its log says about the cause.
+        """
+        if self.state in WARM_STATES:
+            return True
+        if self.restart_policy in {'always', 'unless-stopped'}:
+            return True
+        if self.restart_policy == 'on-failure':
+            return self.restart_max == 0 or self.restart_count < self.restart_max
+        return False
 
 
 @dataclass(frozen=True)
@@ -228,6 +249,10 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
             labelled=bool(labels.get(SERVICE_LABEL) and labels.get(FINGERPRINT_LABEL)),
             health=str(((item.get('State') or {}).get('Health') or {}).get('Status') or ''),
             restart_count=int(item.get('RestartCount') or 0),
+            restart_policy=str((((item.get('HostConfig') or {}).get('RestartPolicy')
+                                 or {}).get('Name')) or ''),
+            restart_max=int((((item.get('HostConfig') or {}).get('RestartPolicy')
+                              or {}).get('MaximumRetryCount')) or 0),
             exit_code=(None if (item.get('State') or {}).get('ExitCode') is None
                        else int((item.get('State') or {})['ExitCode'])),
             ips=tuple(sorted(
