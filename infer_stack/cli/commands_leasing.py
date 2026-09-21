@@ -589,19 +589,31 @@ def _emit_acquire(config, controller, outcome) -> int:
                     'pending': []
                     if outcome.wait is None
                     else outcome.wait.pending,
+                    'failures': []
+                    if outcome.wait is None
+                    else outcome.wait.failures,
                     'released_on_timeout': outcome.released_on_timeout,
                 },
                 indent=2,
             )
         )
     elif outcome.released_on_timeout:
-        # The readiness wait timed out; the controller released the lease so it
-        # doesn't pin a GPU. Report the teardown, not a phantom "acquired".
-        print(
-            f'not ready within {config.timeout:.0f}s — '
-            f'lease {outcome.lease.id} released'
-        )
+        # The readiness wait ended without readiness; the controller released
+        # the lease so it doesn't pin a GPU. Report the teardown, not a phantom
+        # "acquired". A crash-looping engine ends the wait early and says why.
+        failures = outcome.wait.failures if outcome.wait else []
+        if failures:
+            print(f'engine cannot start — lease {outcome.lease.id} released')
+        else:
+            print(
+                f'not ready within {config.timeout:.0f}s — '
+                f'lease {outcome.lease.id} released'
+            )
+        for gid, endpoint, detail in failures:
+            print(f'  {endpoint} ({gid}): {detail}')
         for gid, endpoint in outcome.wait.pending:
+            if any(gid == g and endpoint == ep for g, ep, _ in failures):
+                continue
             print(f'  pending: {endpoint} ({gid})')
         for hint in _oom_hints(controller, outcome):
             print(f'  {hint}')
@@ -1461,6 +1473,8 @@ class MeasureCLI(_LeasingCommonMixin):
             if not_ready:
                 for hint in _oom_hints(controller, outcome):
                     print(f'  {hint}')
+                for _gid, _ep, why in (outcome.wait.failures if outcome.wait else []):
+                    print(f'  {why}')
                 raise SystemExit(
                     f'{name} never became ready — cannot measure '
                     f'(see `infer-stack logs` for the engine output).'
@@ -1687,6 +1701,12 @@ class RunCLI(_LeasingCommonMixin):
         if outcome.wait is not None and not outcome.wait.ready:
             # The controller already released the lease on timeout
             # (released_on_timeout); just surface why we're not running.
+            if outcome.wait.failures:
+                detail = '; '.join(
+                    f'{ep} ({gid}): {why}'
+                    for gid, ep, why in outcome.wait.failures
+                )
+                raise SystemExit(f'run: engine cannot start: {detail}')
             raise SystemExit(
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )

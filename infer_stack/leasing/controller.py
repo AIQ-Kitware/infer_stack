@@ -89,6 +89,9 @@ class ReconcileResult:
 class WaitResult:
     ready: bool
     pending: list[tuple[str, str]] = field(default_factory=list)
+    # Endpoints whose engine cannot start (crash-looping): (deployment, endpoint,
+    # the engine's own error). Present only when the wait stopped early.
+    failures: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -1300,6 +1303,10 @@ class Controller:
 
         ``endpoints`` filters which served names to wait on (a coalesced deployment
         may serve more than this caller asked for); ``None`` waits for all.
+
+        A probe that reports ``fatal`` (the engine is crash-looping, not
+        loading) ends the wait at once: waiting out the timeout would hold that
+        GPU against every other request while the engine's error goes unseen.
         """
         pairs = [
             (deployment, ep)
@@ -1309,13 +1316,23 @@ class Controller:
         ]
         deadline = self.clock() + timeout
         while True:
-            pending = [
-                (g, ep)
-                for (g, ep) in pairs
-                if not self.backend.probe_ready(g, ep).ready
-            ]
+            pending = []
+            failures = []
+            for (g, ep) in pairs:
+                probe = self.backend.probe_ready(g, ep)
+                if probe.ready:
+                    continue
+                pending.append((g, ep))
+                if probe.fatal:
+                    failures.append((g.id, ep, probe.detail))
             if not pending:
                 return WaitResult(ready=True)
+            if failures:
+                return WaitResult(
+                    ready=False,
+                    pending=[(g.id, ep) for g, ep in pending],
+                    failures=failures,
+                )
             if self.clock() >= deadline:
                 return WaitResult(
                     ready=False,

@@ -204,6 +204,15 @@ the live set. Adding or removing a model renumbers the others' ports, which
 changes their fingerprints, so selective apply recreates them. Behind the
 gateway (the default) upstreams publish no host port, and this does not happen.
 
+### Leased engines keep `restart: unless-stopped` (current)
+
+A crash-looping engine is detected by its restart count rather than by giving
+leased engines a restart budget (`on-failure:N`). A budget would let the
+container die so it could be distinguished by state alone, but it also stops
+a resident keep-warm model from recovering on its own after a transient
+failure. If detection by restart count proves too blunt, weigh the budget
+against keep-warm residency rather than changing it in isolation.
+
 ### `stack up` and `stack down` are raw Compose escape hatches (design boundary)
 
 `infer-stack stack up`/`stack down` (and the TUI's Down button) run

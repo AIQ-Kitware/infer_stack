@@ -22,10 +22,17 @@ from .models import Deployment
 
 @dataclass
 class Readiness:
-    """Result of a single readiness probe for one served endpoint."""
+    """Result of a single readiness probe for one served endpoint.
+
+    ``fatal`` means this endpoint can never become ready without operator
+    action -- the engine is crash-looping, not loading slowly. The controller
+    stops waiting immediately rather than holding the GPU for the whole
+    timeout, and ``detail`` carries the engine's own error.
+    """
 
     ready: bool
     detail: str = ''
+    fatal: bool = False
 
 
 class BackendTimeout(RuntimeError):

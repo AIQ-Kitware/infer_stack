@@ -251,6 +251,42 @@ def profile_images(profile: dict[str, Any]) -> list[str]:
     return sorted(wanted)
 
 
+#: Restarts after which Docker's own bookkeeping says an engine is looping,
+#: not loading. Two is already conclusive: a model that loads does not exit.
+CRASH_LOOP_RESTARTS = 2
+
+#: Engine log lines worth quoting verbatim, and what they mean.
+_ENGINE_ERROR_HINTS = (
+    ('trust_remote_code', 'the model needs trust_remote_code=True '
+     '(set `runtime.trust_remote_code: true` on the endpoint)'),
+    ('are not supported for now', 'this vLLM build does not implement the '
+     "model's architecture"),
+    ('is not supported', 'this vLLM build does not implement the '
+     "model's architecture"),
+    ('No supported config format', 'the model repository has no config this '
+     'engine can read'),
+    ('401 Client Error', 'the model is gated: set HF_TOKEN with '
+     '`infer-stack env HF_TOKEN=...`'),
+    ('403 Client Error', 'the model is gated: set HF_TOKEN with '
+     '`infer-stack env HF_TOKEN=...`'),
+)
+
+
+def _engine_error_summary(logs: str) -> str:
+    """The engine's own error, quoted, with a hint when we recognise it."""
+    from .vram import looks_like_cuda_oom
+
+    if not logs.strip():
+        return '; no engine log available (`infer-stack logs` for more)'
+    hint = next((note for needle, note in _ENGINE_ERROR_HINTS if needle in logs), None)
+    if hint is None and looks_like_cuda_oom(logs):
+        hint = 'the GPU ran out of memory for this configuration'
+    lines = [line.strip() for line in logs.splitlines() if line.strip()]
+    quoted = ' | '.join(lines[-3:])[:400]
+    summary = f'; last log: {quoted}'
+    return f'{summary}; likely cause: {hint}' if hint else summary
+
+
 def _network_name() -> str:
     from .network import NETWORK_NAME
 
@@ -2209,6 +2245,41 @@ class ComposeBackend(ConvergeScaffold):
             except Exception:
                 continue  # enrichment must never block placement
 
+    def startup_failure(self, deployment: Deployment) -> str | None:
+        """Diagnose an engine that cannot start, or ``None`` if it may still load.
+
+        ``restart: unless-stopped`` makes a container that exits immediately
+        restart forever, and the lenient ``observe()`` only counts *running*
+        services -- so a model that can never start looks exactly like one that
+        is still loading, and an acquire waits out its whole timeout holding a
+        GPU. Docker's own bookkeeping tells them apart: a container that has
+        been restarted :data:`CRASH_LOOP_RESTARTS` times, or that has exited
+        non-zero and is not being restarted, is not loading.
+
+        The returned string carries the engine's last words, because the cause
+        is in its log and nowhere else ("set trust_remote_code=True", a CUDA
+        OOM, an unsupported architecture).
+        """
+        try:
+            residency = self.residency()
+        except ResidencyUnknown:
+            return None                      # cannot read Docker: say nothing
+        containers = residency.containers(deployment.id)
+        if len(containers) != 1:
+            return None                      # absent (not created yet) or ambiguous
+        container = containers[0]
+        exited_for_good = (
+            container.state in {'exited', 'dead'}
+            and (container.exit_code or 0) != 0
+        )
+        looping = container.restart_count >= CRASH_LOOP_RESTARTS
+        if not (exited_for_good or looping):
+            return None
+        why = (f'restarted {container.restart_count} time(s)' if looping
+               else f'exited with code {container.exit_code}')
+        logs = self.deployment_logs(deployment, tail=200)
+        return f'engine is not starting ({why}){_engine_error_summary(logs)}'
+
     def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
         """Recent engine logs for a deployment's compose service.
 
@@ -3221,6 +3292,9 @@ class ComposeBackend(ConvergeScaffold):
             # probe — it is "ready" the moment placement assigned it a GPU.
             return Readiness(True, 'gpu reserved (no server to probe)')
         if deployment.id not in self.observe():
+            failure = self.startup_failure(deployment)
+            if failure is not None:
+                return Readiness(False, failure, fatal=True)
             return Readiness(False, 'container not running')
         served = deployment.served.get(endpoint) or {}
         protocol = served.get('protocol') or 'chat'

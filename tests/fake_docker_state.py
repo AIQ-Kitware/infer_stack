@@ -50,7 +50,7 @@ class ComposeFake:
         labels.setdefault(COMPOSE_SERVICE_LABEL, service)
         self.containers[cid] = {'service': service, 'labels': labels, 'state': state,
                                 'device_ids': [str(d) for d in device_ids],
-                                'ips': list(ips)}
+                                'ips': list(ips), 'restart_count': 0, 'exit_code': 0}
         return cid
 
     def __call__(self, args, **_):
@@ -67,11 +67,13 @@ class ComposeFake:
                 c = self.containers[cid]
                 requests = ([{'Driver': 'nvidia', 'Count': 0, 'DeviceIDs': c['device_ids']}]
                             if c['device_ids'] else None)
-                out.append({'Id': cid, 'State': {'Status': c['state']},
+                state = {'Status': c['state'], 'ExitCode': c.get('exit_code', 0)}
+                if c.get('health'):
+                    state['Health'] = {'Status': c['health']}
+                out.append({'Id': cid, 'State': state,
+                            'RestartCount': c.get('restart_count', 0),
                             'Config': {'Labels': c['labels']},
                             'HostConfig': {'DeviceRequests': requests},
-                            **({'State': {'Status': c['state'], 'Health': {'Status': c['health']}}}
-                               if c.get('health') else {}),
                             'NetworkSettings': {'Networks': {
                                 'n': {'IPAddress': ip} for ip in c.get('ips', [])}}})
             return json.dumps(out)

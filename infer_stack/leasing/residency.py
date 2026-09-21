@@ -96,6 +96,11 @@ class Container:
     #: Docker healthcheck status (``healthy``, ``starting``, ``unhealthy``), or
     #: empty when the container defines no healthcheck.
     health: str = ''
+    #: How many times Docker's restart policy has restarted this container, and
+    #: the exit code of its last run. A container that keeps exiting non-zero is
+    #: crash-looping, which readiness must not mistake for a slow model load.
+    restart_count: int = 0
+    exit_code: int | None = None
 
     @property
     def warm(self) -> bool:
@@ -222,6 +227,9 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
             fingerprint=str(labels.get(FINGERPRINT_LABEL) or ''),
             labelled=bool(labels.get(SERVICE_LABEL) and labels.get(FINGERPRINT_LABEL)),
             health=str(((item.get('State') or {}).get('Health') or {}).get('Status') or ''),
+            restart_count=int(item.get('RestartCount') or 0),
+            exit_code=(None if (item.get('State') or {}).get('ExitCode') is None
+                       else int((item.get('State') or {})['ExitCode'])),
             ips=tuple(sorted(
                 str(n.get('IPAddress')) for n in
                 (((item.get('NetworkSettings') or {}).get('Networks')) or {}).values()

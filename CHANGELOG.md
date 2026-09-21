@@ -2,6 +2,26 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### An engine that cannot start fails fast, with its own error
+
+Reported from a real run: a model whose architecture the vLLM build does not
+implement exits at once, `restart: unless-stopped` restarts it forever, and
+`observe()` counts only *running* services -- so the acquire held its GPU for
+the whole 1800 s timeout, and the engine's error never reached the operator.
+
+- **Readiness can now be fatal.** A probe consults Docker's own bookkeeping:
+  a container restarted twice, or exited non-zero and not restarting, is not
+  loading. `Readiness.fatal` ends the wait immediately, so the GPU is released
+  in seconds rather than at the timeout.
+- **The engine's own words are reported.** The diagnosis quotes the last log
+  lines and names a likely cause when it recognises one: missing
+  `trust_remote_code`, an unimplemented architecture, an unreadable config, a
+  gated repository (set `HF_TOKEN`), or CUDA OOM.
+- **`acquire`, `run` and `measure`** print it, and `acquire --json` carries a
+  `failures` list.
+- Unreadable Docker, a container still starting, a clean exit, or a single
+  restart are all left alone: they may still be loading.
+
 ### Refused TUI actions pop up instead of doing nothing
 
 An action the TUI declines -- `Edit` on an endpoint that is actively served,
