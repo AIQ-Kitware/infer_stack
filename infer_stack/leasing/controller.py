@@ -1007,11 +1007,11 @@ class Controller:
         """
         from .._log import logger
         from .profile import (
-    prune_catalog_sources,
             CatalogConflict,
             ProfileMismatch,
             merge_catalog_sources,
             profile_drift,
+            prune_catalog_sources,
         )
 
         stored = self.ledger.profile()

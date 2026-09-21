@@ -22,15 +22,22 @@ def cat(endpoint, source=None, **extra):
     }
 
 
-def backend(state_dir, *, catalog=None, **kw):
+def backend(state_dir, *, catalog=None, docker=None, **kw):
     return ComposeBackend(
-        state_dir=state_dir, inventory=simulate_inventory('4x80'), run=FakeDocker(),
+        state_dir=state_dir, inventory=simulate_inventory('4x80'),
+        run=docker or FakeDocker(),
         http=FakeHttp(state_dir), images=kw.pop('images', IMAGES), ports=PORTS,
         state=STATE, catalog=catalog, **kw,
     )
 
 
 def controller(tmp_path, **kw):
+    """A controller on this tmp_path's ledger.
+
+    Pass ``docker=`` to share one fake daemon between controllers, the way
+    separate CLI processes share the host's containers; without it each
+    controller sees an empty host.
+    """
     ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')))
     return ledger, Controller(ledger, backend(tmp_path / 'state', **kw))
 
@@ -113,8 +120,10 @@ def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path)
     old = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
 
     _, ctl2 = controller(tmp_path, catalog=changed)
-    with pytest.raises(ProfileMismatch, match='active leasing epoch'):
+    with pytest.raises(ProfileMismatch, match="redefines 'alpha'") as info:
         ctl2.acquire('y', changed.resolve_names(['alpha']), wait=False)
+    # The refusal names the endpoint to free, not the whole stack.
+    assert 'infer-stack evict alpha' in str(info.value)
 
     ctl.release_leases([old.lease.id], evict=True)
     _, ctl3 = controller(tmp_path, catalog=changed)
@@ -573,3 +582,51 @@ def test_env_writes_hold_the_publication_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(cl, '_secret_env_path', lambda: tmp_path / '.env')
     assert cl.EnvCLI.main(argv=['HF_TOKEN=x']) == 0
     assert held == [True]
+
+
+def test_redefining_an_endpoint_nothing_runs_does_not_block_the_host(tmp_path):
+    """Iterating with `catalog endpoint add --force` must not freeze every acquire.
+
+    Reported from a real host: two endpoints were re-registered while unrelated
+    keep-warm deployments were resident, and afterwards EVERY acquire was
+    refused until someone ran `evict --all`. Only definitions a resident
+    workload is actually running have to stay frozen.
+    """
+    both = {'models': {**cat('alpha')['models'], **cat('beta')['models']},
+            'endpoints': {**cat('alpha')['endpoints'], **cat('beta')['endpoints']}}
+    a = Catalog.from_dict(both)
+    docker = FakeDocker()
+    ledger, ctl = controller(tmp_path, catalog=a, docker=docker)
+    live = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)   # alpha is resident
+
+    # `beta` is re-registered with a different definition; nothing is running it.
+    edited = {**both, 'endpoints': {**both['endpoints'],
+                                    'beta': {'engine': 'vllm', 'model': 'm',
+                                             'runtime': {'max_model_len': 4096}}}}
+    changed = Catalog.from_dict(edited)
+    _, ctl2 = controller(tmp_path, catalog=changed, docker=docker)
+    out = ctl2.acquire('y', changed.resolve_names(['beta']), wait=False)
+
+    assert out.lease.endpoints == ['beta']
+    assert ctl2.backend.catalog.resolve_endpoint('beta').capacity['max_model_len'] == 4096
+    # ...and the resident definition is still frozen as it was.
+    assert 'alpha' in ctl2.backend.catalog.endpoints
+    assert ledger.get_lease(live.lease.id).state == 'active'
+
+
+def test_an_idle_but_resident_keep_warm_definition_stays_frozen(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    changed = Catalog.from_dict(cat('alpha', runtime={'max_model_len': 1024}))
+    docker = FakeDocker()
+    ledger, ctl = controller(tmp_path, catalog=a, docker=docker)
+    out = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)
+    ctl.release(out.lease.id)                      # idle, but its container stays warm
+
+    _, ctl2 = controller(tmp_path, catalog=changed, docker=docker)
+    with pytest.raises(ProfileMismatch, match="redefines 'alpha'"):
+        ctl2.acquire('y', changed.resolve_names(['alpha']), wait=False)
+
+    ctl2.evict(None)                               # evicting it frees the definition
+    _, ctl3 = controller(tmp_path, catalog=changed, docker=docker)
+    ctl3.acquire('z', changed.resolve_names(['alpha']), wait=False)
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024

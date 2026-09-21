@@ -12,6 +12,30 @@ frozen by the leasing epoch -- until the TTL expired. Measured on a real host:
 one interrupted `run` blocked all leasing for 22 minutes. An interrupted wait is
 an acquire that did not deliver, so it now rolls back exactly like a timeout.
 
+### Redefining an endpoint nothing is running no longer blocks the host
+
+Reported from a real host: two endpoints were re-registered with
+`catalog endpoint add --force` while unrelated keep-warm deployments were
+resident, and afterwards every acquire was refused until someone ran
+`evict --all`.
+
+Only definitions a resident workload is actually running now stay frozen.
+When the current catalog collides with the recovery snapshot, the snapshot is
+first pruned to the endpoints and bundles that LIVE deployments, and idle
+keep-warm deployments whose container is resident, are running. Redefining
+anything else simply replaces the stale definition. A collision that does
+matter names the endpoint and what to free (`infer-stack evict <alias>`)
+instead of asking for the whole stack to be quiesced.
+
+### A transient engine failure still fails fast if nothing will retry it
+
+`classify_engine_log` spares an engine whose log shows an unreachable hub or
+a truncated download, because `restart: unless-stopped` will try again. If
+nothing will try again -- the container exited under `restart: no`, or an
+`on-failure` budget is spent -- there is no next attempt to wait for, so the
+lease is released at once with the cause reported. Docker's own restart policy
+and retry cap, now carried on the residency snapshot, decide which case it is.
+
 ### An engine that cannot start fails fast, with its own error
 
 Reported from a real run: a model whose architecture the vLLM build does not
