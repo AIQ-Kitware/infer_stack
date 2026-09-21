@@ -255,21 +255,73 @@ def profile_images(profile: dict[str, Any]) -> list[str]:
 #: not loading. Two is already conclusive: a model that loads does not exit.
 CRASH_LOOP_RESTARTS = 2
 
-#: Engine log lines worth quoting verbatim, and what they mean.
+#: Engine log lines worth quoting verbatim, and what they mean. Each is
+#: UNRECOVERABLE: the same container, restarted, fails the same way, so one
+#: crash is already conclusive and there is nothing to wait for.
 _ENGINE_ERROR_HINTS = (
     ('trust_remote_code', 'the model needs trust_remote_code=True '
      '(set `runtime.trust_remote_code: true` on the endpoint)'),
+    ('does not recognize this architecture', 'this engine cannot read the '
+     "model's architecture (it may need trust_remote_code=True)"),
     ('are not supported for now', 'this vLLM build does not implement the '
      "model's architecture"),
     ('is not supported', 'this vLLM build does not implement the '
      "model's architecture"),
     ('No supported config format', 'the model repository has no config this '
      'engine can read'),
+    ('ValidationError', 'the engine rejected its own configuration'),
     ('401 Client Error', 'the model is gated: set HF_TOKEN with '
      '`infer-stack env HF_TOKEN=...`'),
     ('403 Client Error', 'the model is gated: set HF_TOKEN with '
      '`infer-stack env HF_TOKEN=...`'),
 )
+
+#: Failures a RESTART CAN FIX: the hub was unreachable, a download was cut off,
+#: a port was still held by the container we just replaced. `restart:
+#: unless-stopped` exists for exactly these, so a restart count alone must not
+#: condemn an engine -- the whole point of the policy is that the next attempt
+#: succeeds. Weigh a new entry by one question: would running the same container
+#: again plausibly work? If yes it belongs here; if no it belongs above.
+_TRANSIENT_ENGINE_SIGNATURES = (
+    'Max retries exceeded',
+    'Connection reset by peer',
+    'Connection refused',
+    'Temporary failure in name resolution',
+    'Failed to resolve',
+    'Read timed out',
+    'ReadTimeoutError',
+    'ConnectionError',
+    'IncompleteRead',
+    'Consistency check failed',          # a truncated HF download
+    '429 Client Error',                  # hub rate limit
+    '500 Server Error',
+    '502 Server Error',
+    '503 Server Error',
+    '504 Server Error',
+    'Address already in use',
+)
+
+
+def classify_engine_log(logs: str) -> str | None:
+    """``'fatal'``, ``'transient'``, or ``None`` when the log says neither.
+
+    Order matters: an unrecoverable signature wins over a transient one, because
+    a hub timeout earlier in the same log does not make a rejected config
+    loadable. CUDA OOM counts as fatal — the allocation is deterministic, so the
+    restart repeats it — and it is the one class with a documented remedy
+    (:mod:`infer_stack.leasing.vram`).
+    """
+    from .vram import looks_like_cuda_oom
+
+    if not logs:
+        return None
+    if any(needle in logs for needle, _ in _ENGINE_ERROR_HINTS):
+        return 'fatal'
+    if looks_like_cuda_oom(logs):
+        return 'fatal'
+    if any(needle in logs for needle in _TRANSIENT_ENGINE_SIGNATURES):
+        return 'transient'
+    return None
 
 
 def _engine_error_summary(logs: str) -> str:
@@ -2252,9 +2304,18 @@ class ComposeBackend(ConvergeScaffold):
         restart forever, and the lenient ``observe()`` only counts *running*
         services -- so a model that can never start looks exactly like one that
         is still loading, and an acquire waits out its whole timeout holding a
-        GPU. Docker's own bookkeeping tells them apart: a container that has
-        been restarted :data:`CRASH_LOOP_RESTARTS` times, or that has exited
-        non-zero and is not being restarted, is not loading.
+        GPU. Docker's bookkeeping says a container crashed; its LOG says whether
+        another attempt could ever work (:func:`classify_engine_log`):
+
+        * an unrecoverable error -- a rejected config, an architecture this
+          build does not implement, a gated repo, a CUDA OOM -- is fatal on the
+          FIRST crash, because the restart reproduces it exactly;
+        * a transient one -- an unreachable hub, a truncated download, a port
+          still held by the container being replaced -- is never fatal here;
+          that is what ``restart: unless-stopped`` is for;
+        * an unrecognised crash keeps the blunt budget of
+          :data:`CRASH_LOOP_RESTARTS` restarts, so a genuinely stuck engine
+          still fails fast without a signature for every possible error.
 
         The returned string carries the engine's last words, because the cause
         is in its log and nowhere else ("set trust_remote_code=True", a CUDA
@@ -2272,12 +2333,23 @@ class ComposeBackend(ConvergeScaffold):
             container.state in {'exited', 'dead'}
             and (container.exit_code or 0) != 0
         )
-        looping = container.restart_count >= CRASH_LOOP_RESTARTS
-        if not (exited_for_good or looping):
-            return None
-        why = (f'restarted {container.restart_count} time(s)' if looping
-               else f'exited with code {container.exit_code}')
+        crashed = exited_for_good or container.restart_count >= 1
+        if not crashed:
+            return None                      # created, starting, or healthy
+        # The log decides, not the restart count alone. `restart:
+        # unless-stopped` is there so a hub timeout or a port still held by the
+        # container we replaced resolves itself; condemning those would make the
+        # policy pointless. An unrecoverable error, by contrast, repeats
+        # identically, so waiting for a second restart only wastes the GPU.
         logs = self.deployment_logs(deployment, tail=200)
+        verdict = classify_engine_log(logs)
+        if verdict == 'transient':
+            return None
+        looping = container.restart_count >= CRASH_LOOP_RESTARTS
+        if verdict != 'fatal' and not (exited_for_good or looping):
+            return None                      # unrecognised: keep today's budget
+        why = (f'restarted {container.restart_count} time(s)' if container.restart_count
+               else f'exited with code {container.exit_code}')
         return f'engine is not starting ({why}){_engine_error_summary(logs)}'
 
     def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:

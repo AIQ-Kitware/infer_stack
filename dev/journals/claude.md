@@ -2980,3 +2980,57 @@ arrive.
   this work, but fingerprints made it visible, so it is now documented.
 - **Honest scope.** Everything here is verified against fakes. Real-daemon
   timing, health, and GPU handoff are still unverified.
+
+## 2026-09-21 13:10:00 -0400
+
+Model: Claude Opus 5 (1M context), claude-opus-5[1m], bypass permissions, running
+as the AIQ-Incubilate-Run session in the aiq-super-repo super-repo (not this
+repo's own session -- I own the Incubilate evaluation runs and reported the
+crash-loop failure that 437d1d6 answers).
+
+**User intent.** Verbatim: "You should patch infer-stack so it can recognize a
+crashing loop that is raising one of a known set of errors it cannot recover
+from (i.e. validation errors - not network errors)." This follows my report of
+inclusionAI/Ling-3.0-flash (BailingMoeV3, unimplemented in the pinned v0.25.1)
+exiting 1 on a config validation error and being restarted forever, so an
+acquire held a GPU for its whole 1800 s timeout with no diagnosis.
+
+**What I found and what I changed.** 437d1d6 had already landed the fail-fast
+machinery -- `Readiness.fatal`, `startup_failure`, the log quoting -- while I
+was preparing to write it. What it did NOT have was the distinction the user
+asked for: it condemned any container with two restarts, whatever the log said.
+That inverts the purpose of `restart: unless-stopped`, which exists so a hub
+timeout or a half-finished download resolves itself. So I added
+`classify_engine_log` and rewired `startup_failure` around it: an unrecoverable
+signature (rejected config, unimplemented architecture, gated repo, CUDA OOM) is
+fatal on the FIRST crash, a transient one (`Max retries exceeded`, a truncated
+download, `Address already in use`, hub 4xx/5xx) is never fatal here, and an
+unrecognised crash keeps the old two-restart budget.
+
+**Tradeoffs and what might break.** Fatal-on-first-crash is the aggressive half:
+a signature that appears in a log for an unrelated reason now kills a lease that
+used to get a second chance. I kept the lists narrow and asymmetric for that
+reason -- "would running the same container again plausibly work?" is the only
+question for adding an entry -- and unrecoverable wins over transient in the
+same log, since a hub timeout earlier does not make a rejected config loadable.
+The other direction is the real residual risk and is now written into
+known-limitations: an unrecognised crash that a restart WOULD have fixed is
+still condemned after two restarts. I changed one of 437d1d6's own tests, the
+"one restart is not a loop" case, because it asserted that shape using a
+`trust_remote_code` log, which under this change is conclusive immediately; it
+now uses an unrecognised log, and the recognised case is asserted separately.
+
+**Confidence.** High on the classifier and on the wiring: 777 tests pass, and
+the new cases cover fatal-on-first-crash, transient-never-fatal, precedence, and
+the classifier directly. Low on the signature lists being complete -- they are
+seeded from exactly one real incident plus the hints 437d1d6 already had. None
+of it has run against real Docker; the cohort re-run on aiq-gpu is what will
+say whether a legitimate slow load is ever declared fatal.
+
+**Takeaways.** (1) When a restart policy exists to paper over transient
+failures, any "it keeps crashing" detector has to read the error, or it defeats
+the policy it is layered on. (2) Asymmetric evidence deserves asymmetric
+thresholds: a deterministic error needs one observation, an unexplained one
+needs a budget. (3) Two sessions converged on the same file within minutes --
+the tree had uncommitted work when I started -- so check `git status` in a
+shared checkout before writing, not after.

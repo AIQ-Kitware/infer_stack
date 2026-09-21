@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from infer_stack.leasing.compose import CRASH_LOOP_RESTARTS
+from infer_stack.leasing.compose import CRASH_LOOP_RESTARTS, classify_engine_log
 from infer_stack.leasing.residency import DEPLOYMENT_LABEL
 from test_leasing_admission import CAT, acquire, make
 
@@ -103,8 +103,60 @@ def test_a_model_that_may_still_load_is_left_alone(tmp_path, state, restarts, ex
     ledger, ctl, docker = make(tmp_path)
     out = acquire(ctl, 'one')
     gid = out.deployments[0].id
-    crash_loop(ctl, docker, gid, state=state, restarts=restarts, exit_code=exit_code)
+    # An UNRECOGNISED crash: one restart is not yet a loop. (A recognised
+    # unrecoverable error is conclusive on the first crash -- see below.)
+    crash_loop(ctl, docker, gid, state=state, restarts=restarts, exit_code=exit_code,
+               logs='INFO starting\nSegmentation fault\n')
     assert ctl.backend.startup_failure(ledger.get_deployment(gid)) is None
+
+
+HUB_TIMEOUT_LOG = (
+    'INFO 09-21 10:00:00 api_server.py:1 vLLM API server version 0.25.1\n'
+    'requests.exceptions.ConnectionError: HTTPSConnectionPool(host='
+    "'huggingface.co', port=443): Max retries exceeded\n"
+)
+
+
+def test_a_transient_failure_is_left_to_the_restart_policy(tmp_path):
+    """`restart: unless-stopped` exists so an unreachable hub resolves itself.
+
+    Condemning a download that can succeed on the next attempt would waste a
+    working model and make the restart policy pointless -- so a transient error
+    is never fatal here, however many times it has restarted.
+    """
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one')
+    gid = out.deployments[0].id
+    crash_loop(ctl, docker, gid, restarts=CRASH_LOOP_RESTARTS + 3,
+               logs=HUB_TIMEOUT_LOG)
+    assert ctl.backend.startup_failure(ledger.get_deployment(gid)) is None
+
+
+def test_an_unrecoverable_error_is_fatal_on_the_very_first_crash(tmp_path):
+    """A rejected config fails identically on every restart, so do not wait."""
+    ledger, ctl, docker = make(tmp_path)
+    out = acquire(ctl, 'one')
+    gid = out.deployments[0].id
+    crash_loop(ctl, docker, gid, restarts=1)            # ONE restart, fatal log
+    detail = ctl.backend.startup_failure(ledger.get_deployment(gid))
+    assert detail is not None
+    assert 'trust_remote_code' in detail
+
+
+@pytest.mark.parametrize('logs,expected', [
+    (CRASH_LOG, 'fatal'),
+    ('ValueError: quantization fp8 is not supported on this device', 'fatal'),
+    ('torch.OutOfMemoryError: CUDA out of memory', 'fatal'),
+    (HUB_TIMEOUT_LOG, 'transient'),
+    ('OSError: [Errno 98] Address already in use', 'transient'),
+    ('INFO starting\nSegmentation fault', None),
+    ('', None),
+    # An unrecoverable error wins over a transient one earlier in the same log:
+    # a hub timeout does not make a rejected config loadable.
+    (HUB_TIMEOUT_LOG + CRASH_LOG, 'fatal'),
+])
+def test_the_log_classifier_separates_hopeless_from_retryable(logs, expected):
+    assert classify_engine_log(logs) == expected
 
 
 def test_unreadable_docker_never_declares_an_engine_hopeless(tmp_path):

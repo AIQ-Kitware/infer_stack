@@ -19,8 +19,15 @@ the whole 1800 s timeout, and the engine's error never reached the operator.
   gated repository (set `HF_TOKEN`), or CUDA OOM.
 - **`acquire`, `run` and `measure`** print it, and `acquire --json` carries a
   `failures` list.
+- **The engine's log decides, not the restart count.** `classify_engine_log`
+  separates errors a restart can never fix -- a rejected config, an
+  unimplemented architecture, a gated repo, CUDA OOM -- from ones it can: an
+  unreachable hub, a truncated download, a port still held by the container
+  being replaced. An unrecoverable error is fatal on the FIRST crash; a
+  transient one is never fatal, which is what `restart: unless-stopped` is for;
+  an unrecognised crash keeps the blunt two-restart budget.
 - Unreadable Docker, a container still starting, a clean exit, or a single
-  restart are all left alone: they may still be loading.
+  unrecognised restart are all left alone: they may still be loading.
 
 ### Refused TUI actions pop up instead of doing nothing
 

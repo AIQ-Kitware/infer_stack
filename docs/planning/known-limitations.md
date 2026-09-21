@@ -206,12 +206,21 @@ gateway (the default) upstreams publish no host port, and this does not happen.
 
 ### Leased engines keep `restart: unless-stopped` (current)
 
-A crash-looping engine is detected by its restart count rather than by giving
-leased engines a restart budget (`on-failure:N`). A budget would let the
-container die so it could be distinguished by state alone, but it also stops
-a resident keep-warm model from recovering on its own after a transient
-failure. If detection by restart count proves too blunt, weigh the budget
-against keep-warm residency rather than changing it in isolation.
+A crash-looping engine is detected from its restart count and its log rather
+than by giving leased engines a restart budget (`on-failure:N`). A budget would
+let the container die so it could be distinguished by state alone, but it also
+stops a resident keep-warm model from recovering on its own after a transient
+failure -- and that recovery is exactly what `classify_engine_log`'s transient
+class protects: an unreachable hub or a truncated download is left to the
+restart policy, however often it has restarted, while an unrecoverable error is
+fatal on the first crash.
+
+What remains blunt is the UNRECOGNISED crash, which still waits for two
+restarts and is then declared fatal. A model that crashes for a reason no
+signature covers, but that a restart would have fixed, is condemned. The
+signature lists are the place to fix that, with evidence from a real log; if
+that proves insufficient, weigh the restart budget against keep-warm residency
+rather than changing it in isolation.
 
 ### `stack up` and `stack down` are raw Compose escape hatches (design boundary)
 
