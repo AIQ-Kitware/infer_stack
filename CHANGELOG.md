@@ -2,6 +2,33 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Custom container launches are catalog data, not recipes
+
+`runtime.serve_recipe` is gone. An endpoint whose image has its own launcher
+now describes it with generic fields: `command` (replaces the stock `vllm
+serve` arguments), `env` (container environment, with `{max_model_len}`,
+`{gpu_memory_utilization}`, `{served_model_name}` and `{port}` filled in) and
+`mounts` (persisted under the runtime data dir). The renderer has no
+model-specific branch. The HyperQwen suggestion is ordinary data, and its
+long-context mode is an edit (`max_model_len: 150000`, `SPEC: mtp`,
+`CTX: long`), not a new recipe. The TUI endpoint editor shows and edits the
+image, command and environment, and keeps what it does not show.
+
+Compatibility:
+
+- An existing `serve_recipe: hyperqwen-3090-single` still works. It is read
+  as the fields it meant and renders the identical container. Editing and
+  saving the endpoint in the TUI rewrites it in the new form. Any other
+  recipe name is an error, as before.
+- `extra_args` are now deployment identity, so two endpoints that differ only
+  in them no longer share one process. An endpoint with `extra_args` gets a
+  new compatibility key: after upgrading, its next acquire starts a new
+  deployment and an idle one left from before is displaced. Upgrade while
+  nothing is leased to avoid a second copy of a model holding GPUs.
+- `extra_args` that repeat a flag infer-stack sets from its own fields
+  (`--served-model-name`, the parallel sizes, `--max-model-len`) are refused.
+  Other repeats still work, with the extra value winning.
+
 ### `catalog show` suggests what you probably meant
 
 `infer-stack catalog show NAME` for a name that is not in the catalog now

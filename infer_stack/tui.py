@@ -482,8 +482,9 @@ class _AddEndpointScreen(ModalScreen):
     Exposes the runtime knobs that matter for serving, including exact GPU
     affinity.  ``auto`` keeps normal VRAM-aware placement; a comma-separated
     list is an explicit physical-GPU override.  Pass ``entry``/``name`` to edit
-    an existing endpoint.  Fields this wizard does not own are preserved when
-    editing, which is important for specialized recipes such as HyperQwen.
+    an existing endpoint.  Fields this wizard does not own (``mounts``,
+    ``protocol``, ...) are preserved when editing.  An entry still using the
+    old ``serve_recipe`` is shown, and saved, as the generic fields it means.
     """
 
     CSS = """
@@ -544,8 +545,15 @@ class _AddEndpointScreen(ModalScreen):
         return lead + '\n' + '\n'.join(rows)
 
     def compose(self) -> ComposeResult:
+        import shlex
+
+        from .leasing.launch import env_string, translate_legacy
+
         editing = self._edit_name is not None
-        rt = self._entry.get('runtime') or {}
+        rt = translate_legacy(self._entry.get('runtime') or {})
+        command_str = shlex.join(str(c) for c in rt.get('command') or [])
+        env_str = shlex.join(f'{k}={env_string(v)}'
+                             for k, v in (rt.get('env') or {}).items())
         extra = rt.get('extra_args') or []
         extra_str = ' '.join(extra) if isinstance(extra, list) else str(extra)
         reclaim_spec = self._entry.get('reclaim')
@@ -613,6 +621,23 @@ class _AddEndpointScreen(ModalScreen):
                     yield Input(value=extra_str,
                                 placeholder='--dtype=half --enforce-eager',
                                 id='e-extra')
+                    yield Label('container image  (blank = the default vLLM image)')
+                    yield Input(value=str(rt.get('image') or ''),
+                                placeholder='e.g. vllm/vllm-openai:v0.25.1', id='e-image')
+                    yield Label('container command  (replaces `vllm serve MODEL …`; '
+                                'blank = stock)')
+                    yield Input(value=command_str,
+                                placeholder="for an image with its own launcher, e.g. single",
+                                id='e-command')
+                    yield Label('container environment  (KEY=VALUE, space-separated)')
+                    yield Static(
+                        '{max_model_len} {gpu_memory_utilization} '
+                        '{served_model_name} {port} are filled in from this '
+                        'endpoint, so a launcher stays in step with the fields above.',
+                        classes='hint', markup=False)
+                    yield Input(value=env_str,
+                                placeholder="SPEC=mtp MAX_LEN='{max_model_len}'",
+                                id='e-env')
                 with Vertical(id='ollama-opts'):
                     yield Label('host  (runtime host name from the catalog)')
                     yield Input(value=self._entry.get('host', ''),
@@ -710,7 +735,7 @@ class _AddEndpointScreen(ModalScreen):
             'engine': engine,
             'reclaim': reclaim,
             # Keep the raw entry so the writer can preserve fields this wizard
-            # does not expose (serve_recipe/image/protocol/sharing/etc.).
+            # does not expose (mounts/protocol/sharing/etc.).
             'base_entry': dict(self._entry),
         }
         try:
@@ -748,6 +773,9 @@ class _AddEndpointScreen(ModalScreen):
                     'prefix_caching': str(
                         self.query_one('#e-prefix', Select).value or ''),
                     'extra_args': self._v('e-extra'),
+                    'image': self._v('e-image').strip(),
+                    'command': self._v('e-command'),
+                    'env': self._parse_env(self._v('e-env')),
                     'placement': placement,
                 })
             else:
@@ -765,6 +793,19 @@ class _AddEndpointScreen(ModalScreen):
 
     def _v(self, wid: str) -> str:
         return self.query_one(f'#{wid}', Input).value
+
+    @staticmethod
+    def _parse_env(text: str) -> dict[str, str]:
+        """``KEY=VALUE`` words (shell quoting) into a mapping; raises on a bad word."""
+        import shlex
+
+        env: dict[str, str] = {}
+        for word in shlex.split(text):
+            key, sep, value = word.partition('=')
+            if not sep or not key:
+                raise ValueError(f'container environment: expected KEY=VALUE, got {word!r}')
+            env[key] = value
+        return env
 
 
 class _ConfirmScreen(ModalScreen):
@@ -2743,14 +2784,17 @@ class InferStackTUI(App):
         """Build a catalog endpoint entry from the endpoint editor result.
 
         Editing is patch-like rather than reconstructive: fields the wizard does
-        not expose (for example ``serve_recipe``, ``image``, ``protocol``, or
-        ``sharing``) survive. This is required for specialized serving recipes;
-        opening Edit merely to change the GPU must never downgrade HyperQwen to
-        stock vLLM.
+        not expose (for example ``mounts``, ``protocol`` or ``sharing``)
+        survive, so opening Edit merely to change the GPU can never turn a
+        custom-launcher endpoint back into stock vLLM.
         """
         import shlex
 
+        from .leasing.launch import translate_legacy
+
         base = dict(result.get('base_entry') or {})
+        if base.get('runtime'):
+            base['runtime'] = translate_legacy(dict(base['runtime']))
         old_engine = base.get('engine')
         engine = result['engine']
         entry: dict[str, Any] = dict(base)
@@ -2770,8 +2814,10 @@ class InferStackTUI(App):
             }
             # These are the runtime fields owned by the form. A blank field is
             # an explicit return to the engine default; unexposed fields stay.
+            # image / command / env are the form's only when it sent them.
+            launch_owned = [k for k in ('image', 'command', 'env') if k in result]
             for ck in [*keymap.values(), 'gpu_memory_utilization',
-                       'enable_prefix_caching', 'extra_args']:
+                       'enable_prefix_caching', 'extra_args', *launch_owned]:
                 runtime.pop(ck, None)
             for rk, ck in keymap.items():
                 if result.get(rk) is not None:
@@ -2784,6 +2830,12 @@ class InferStackTUI(App):
                 )
             if result.get('extra_args'):
                 runtime['extra_args'] = shlex.split(result['extra_args'])
+            if result.get('image'):
+                runtime['image'] = result['image']
+            if result.get('command'):
+                runtime['command'] = shlex.split(result['command'])
+            if result.get('env'):
+                runtime['env'] = dict(result['env'])
             placement = dict(result.get('placement') or {})
             if placement:
                 entry['placement'] = placement

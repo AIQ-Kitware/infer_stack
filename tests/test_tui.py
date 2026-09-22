@@ -756,7 +756,7 @@ def test_tui_gpu_pin_writes_catalog_and_updates_gpu_column(tmp_path):
     assert on_disk['endpoints']['qwen-coder']['placement']['gpu_indices'] == [1]
 
 
-def test_tui_endpoint_edit_preserves_specialized_recipe_and_changes_gpu_pin():
+def test_tui_endpoint_edit_keeps_a_custom_launch_and_changes_gpu_pin():
     from infer_stack.tui import InferStackTUI
 
     base = {
@@ -788,9 +788,53 @@ def test_tui_endpoint_edit_preserves_specialized_recipe_and_changes_gpu_pin():
     })
     assert entry['placement'] == {'min_vram_gib': 24, 'gpu_indices': [1]}
     assert entry['protocol'] == 'chat'
-    assert entry['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
+    # The legacy recipe name is saved as the generic launch it means.
+    assert 'serve_recipe' not in entry['runtime']
+    assert entry['runtime']['command'] == ['single']
+    assert entry['runtime']['mounts']['/cache'] == 'hyperqwen/qwen3.8-27b/cache'
     assert entry['runtime']['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
     assert entry['runtime']['pipeline_parallel_size'] == 1
+
+
+def test_tui_endpoint_edit_can_switch_a_launcher_mode_and_keeps_what_it_hides():
+    """Fast -> long from the form alone; mounts (not in the form) survive."""
+    from infer_stack.tui import InferStackTUI, _AddEndpointScreen
+
+    base = {'engine': 'vllm', 'model': 'q38', 'runtime': {
+        'image': 'img:1', 'command': ['single'], 'max_model_len': 65536,
+        'env': {'SPEC': 'dflash2', 'MAX_LEN': '{max_model_len}', 'PREFIX_CACHE': 1},
+        'mounts': {'/cache': 'x/cache'},
+    }}
+    env = _AddEndpointScreen._parse_env(
+        "SPEC=mtp CTX=long MAX_LEN='{max_model_len}' PREFIX_CACHE=1")
+    entry = InferStackTUI._endpoint_entry({
+        'name': 'q38', 'model': 'q38', 'engine': 'vllm', 'base_entry': base,
+        'placement': {}, 'tensor_parallel': None, 'data_parallel': None,
+        'max_model_len': 150000, 'gpu_mem': 0.93, 'max_num_seqs': None,
+        'prefix_caching': 'on', 'extra_args': '', 'reclaim': '',
+        'image': 'img:1', 'command': 'single', 'env': env,
+    })
+    rt = entry['runtime']
+    assert rt['max_model_len'] == 150000
+    assert rt['env'] == {'SPEC': 'mtp', 'CTX': 'long', 'MAX_LEN': '{max_model_len}',
+                         'PREFIX_CACHE': '1'}
+    assert rt['command'] == ['single'] and rt['mounts'] == {'/cache': 'x/cache'}
+    # Clearing the command field returns the endpoint to stock vLLM.
+    entry = InferStackTUI._endpoint_entry({
+        'name': 'q38', 'model': 'q38', 'engine': 'vllm', 'base_entry': entry,
+        'placement': {}, 'tensor_parallel': None, 'data_parallel': None,
+        'max_model_len': None, 'gpu_mem': None, 'max_num_seqs': None,
+        'prefix_caching': '', 'extra_args': '', 'reclaim': '',
+        'image': '', 'command': '', 'env': {},
+    })
+    assert not {'command', 'env', 'image'} & set(entry.get('runtime') or {})
+
+
+def test_tui_env_field_rejects_a_word_without_equals():
+    from infer_stack.tui import _AddEndpointScreen
+
+    with pytest.raises(ValueError, match='KEY=VALUE'):
+        _AddEndpointScreen._parse_env('SPEC=mtp long')
 
 
 def test_tui_remove_endpoint_writes_catalog(tmp_path):

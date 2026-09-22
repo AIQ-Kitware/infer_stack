@@ -53,7 +53,8 @@ from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
-from .models import HYPERQWEN_3090_RECIPE, Deployment, is_reservation
+from .launch import env_string, fill, translate_legacy
+from .models import Deployment, is_reservation
 from .placement import plan_placement
 from .residency import (  # labels live beside the code that reads them back
     FINGERPRINT_LABEL,
@@ -498,7 +499,9 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
     """Build the dict ``vllm_args`` consumes from a deployment's runtime spec
     (shared by the compose and kubeai backends, so every serving knob renders
     identically on both)."""
-    runtime = deployment.spec.get('runtime', {}) or {}
+    # A deployment recorded before the generic launch fields may still carry
+    # `serve_recipe`; read it as the fields it meant.
+    runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
     served = deployment.spec.get('served_model_name') or (
         sorted(deployment.served)[0] if deployment.served else deployment.id
     )
@@ -516,10 +519,10 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'chat_template': runtime.get('chat_template'),
         'trust_remote_code': bool(runtime.get('trust_remote_code', False)),
         'image': runtime.get('image'),
-        # Named launcher/preparation recipes are intentionally distinct from
-        # arbitrary command overrides. The catalog validates the name and the
-        # renderer owns its exact command/env/volume contract.
-        'serve_recipe': runtime.get('serve_recipe'),
+        # Generic launch fields (see leasing.launch).
+        'command': list(runtime.get('command') or []),
+        'env': dict(runtime.get('env') or {}),
+        'mounts': dict(runtime.get('mounts') or {}),
         'max_model_len': runtime.get('max_model_len', VLLM_DEFAULTS['max_model_len']),
         'gpu_memory_utilization': runtime.get(
             'gpu_memory_utilization', VLLM_DEFAULTS['gpu_memory_utilization']
@@ -580,14 +583,11 @@ def _vllm_service(
     state = {**default_state_paths(), **(state or {})}
     svc = _vllm_service_dict(deployment)
     simulated = bool(svc.get('simulator'))
-    recipe = svc.get('serve_recipe')
     if simulated:
         command = simulator_args(svc)
-    elif recipe == HYPERQWEN_3090_RECIPE:
-        # HyperQwen's image owns model preparation, patched-vLLM launch flags,
-        # and the DFlash2 drafter. Its entrypoint accepts the mode name rather
-        # than ``vllm serve MODEL ...``.
-        command = ['single']
+    elif svc['command']:
+        # An image with its own launcher: it gets exactly this, nothing added.
+        command = [fill(part, svc) for part in svc['command']]
     else:
         command = [
             deployment.spec['hf_model_id'],
@@ -598,21 +598,10 @@ def _vllm_service(
             *vllm_args(svc),
         ]
     environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
-    if recipe == HYPERQWEN_3090_RECIPE:
-        environment.update({
-            # Match the internal port infer-stack routes to. HyperQwen defaults
-            # to 18020 when run standalone.
-            'PORT': '8000',
-            # HyperQwen's current speed-first one/few-user 3090 profile.
-            'SPEC': 'dflash2',
-            'PREFIX_CACHE': '1' if svc.get('enable_prefix_caching') else '0',
-            'MAX_LEN': str(svc['max_model_len']),
-            'GPU_UTIL': str(svc['gpu_memory_utilization']),
-            # The launcher hardcodes qwen3.8-27b before EXTRA_ARGS. Infer-stack
-            # endpoints are allowed to choose a served alias, so override it
-            # last to keep the LiteLLM upstream model name truthful.
-            'EXTRA_ARGS': f"--served-model-name={svc['served_model_name']}",
-        })
+    for key, value in svc['env'].items():
+        # `$$` is a literal `$` to Compose: catalog values are never
+        # interpolated, so they cannot pull secrets out of the managed .env.
+        environment[str(key)] = fill(env_string(value), svc).replace('$', '$$')
     # Attention backend is a vLLM env var (VLLM_ATTENTION_BACKEND), not a CLI
     # flag; forward it verbatim when the endpoint sets one (e.g. TORCH_SDPA to
     # match a HuggingFace-eager deployment's numerics).
@@ -658,16 +647,14 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
-    if recipe == HYPERQWEN_3090_RECIPE:
-        # HyperQwen does not use vLLM's standard /root cache layout. Persist
-        # both its prepared ~20 GB model tree and compile/JIT/HF cache so
-        # release/reacquire is a container restart rather than a re-download +
-        # re-quantization + recompile.
-        root = f'{state["runtime"]}/hyperqwen/qwen3.8-27b'
-        service['volumes'] = [
-            f'{root}/models:/app/models',
-            f'{root}/cache:/cache',
-        ]
+    if svc['mounts']:
+        # An image that keeps prepared weights or caches outside vLLM's
+        # /root/.cache layout persists them here, so a release and re-acquire
+        # is a restart rather than a re-download and re-preparation. A custom
+        # launcher gets only these; stock vLLM keeps its caches as well.
+        mounts = [f'{state["runtime"]}/{sub}:{target}'
+                  for target, sub in svc['mounts'].items()]
+        service['volumes'] = mounts if svc['command'] else [*service['volumes'], *mounts]
     # Only publish a host port when there's no gateway to front the upstream.
     # Behind LiteLLM the upstream is internal (reached by compose-network DNS at
     # :8000), and a published port would have to be unique across the live set,

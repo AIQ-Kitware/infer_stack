@@ -175,14 +175,19 @@ def render_models(
                 'do not map onto it). Use --backend compose for ollama.'
             )
             continue
-        runtime = deployment.spec.get('runtime', {}) or {}
-        if runtime.get('serve_recipe'):
+        from ..leasing.launch import translate_legacy
+
+        runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
+        custom = [k for k in ('command', 'env', 'mounts') if runtime.get(k)]
+        if custom:
+            # A KubeAI Model runs stock vLLM; it has no place for a container
+            # command, environment or host mounts. Fail closed, never silently
+            # serve the stock engine instead.
             out.unrenderable.add(deployment.id)
             out.errors.append(
-                f"{deployment.id}: runtime.serve_recipe="
-                f"{runtime['serve_recipe']!r} is a container launcher/preparation "
-                'recipe supported by the compose backend, not a stock KubeAI '
-                'VLLM Model. Use --backend compose for this endpoint.'
+                f"{deployment.id}: runtime.{custom[0]} describes a custom container "
+                'launch, which the compose backend supports and a stock KubeAI '
+                'VLLM Model does not. Use --backend compose for this endpoint.'
             )
             continue
         profile = (

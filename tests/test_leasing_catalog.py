@@ -298,20 +298,65 @@ def test_explicit_gpu_pin_reaches_spec_and_is_structural():
     assert 'gpu_indices' not in auto.structural
 
 
-def test_vllm_serve_recipe_is_structural_and_reaches_spec():
-    plain_data = _one_vllm()
-    recipe_data = _one_vllm()
-    recipe_data['endpoints']['e']['runtime'] = {
-        'serve_recipe': 'hyperqwen-3090-single',
-        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
-    }
-    plain = Catalog.from_dict(plain_data).resolve_endpoint('e')
-    recipe = Catalog.from_dict(recipe_data).resolve_endpoint('e')
-    assert recipe.spec['runtime']['serve_recipe'] == 'hyperqwen-3090-single'
-    assert recipe.structural['serve_recipe'] == 'hyperqwen-3090-single'
-    assert recipe.compat_key != plain.compat_key
-    # Stock vLLM keeps the old structural shape/hashes when no recipe is set.
-    assert 'serve_recipe' not in plain.structural
+def _with_runtime(runtime):
+    data = _one_vllm()
+    data['endpoints']['e']['runtime'] = runtime
+    return Catalog.from_dict(data).resolve_endpoint('e')
+
+
+def test_every_launch_field_is_deployment_identity():
+    """Two endpoints that launch differently must never share a process."""
+    plain = _with_runtime({})
+    keys = {plain.compat_key}
+    for runtime in ({'command': ['single']},
+                    {'command': ['single'], 'env': {'SPEC': 'mtp'}},
+                    {'command': ['single'], 'env': {'SPEC': 'dflash2'}},
+                    {'command': ['single'], 'mounts': {'/cache': 'x/cache'}},
+                    {'extra_args': ['--reasoning-parser=qwen3']},
+                    {'extra_args': ['--reasoning-parser=gemma4']}):
+        keys.add(_with_runtime(runtime).compat_key)
+    assert len(keys) == 7
+    # An endpoint using none of them keeps the key it had before they existed.
+    assert 'launch' not in plain.structural
+    # Capacity is still not identity: a longer context can serve a shorter one.
+    assert (_with_runtime({'command': ['c'], 'max_model_len': 8192}).compat_key
+            == _with_runtime({'command': ['c'], 'max_model_len': 65536}).compat_key)
+
+
+def test_a_legacy_serve_recipe_reads_as_the_generic_fields_it_meant():
+    legacy = _with_runtime({'serve_recipe': 'hyperqwen-3090-single',
+                            'enable_prefix_caching': True})
+    runtime = legacy.spec['runtime']
+    assert 'serve_recipe' not in runtime
+    assert runtime['command'] == ['single']
+    assert runtime['env']['MAX_LEN'] == '{max_model_len}'
+    assert runtime['env']['PREFIX_CACHE'] == '1'
+    assert runtime['mounts']['/cache'] == 'hyperqwen/qwen3.8-27b/cache'
+
+
+@pytest.mark.parametrize('runtime,message', [
+    ({'env': {'HF_TOKEN': 'x'}}, 'may not set HF_TOKEN'),
+    ({'env': {'CUDA_VISIBLE_DEVICES': '1'}}, 'may not set CUDA_VISIBLE_DEVICES'),
+    ({'env': {'BAD-NAME': '1'}}, 'not a valid environment variable name'),
+    ({'env': {'A': [1]}}, 'must be a string, number or boolean'),
+    ({'command': 'single'}, 'non-empty list'),
+    ({'mounts': {'/c': '/etc'}}, 'subdirectory of the runtime data dir'),
+    ({'mounts': {'/c': '../up'}}, 'subdirectory of the runtime data dir'),
+    ({'mounts': {'c': 'x'}}, 'must be absolute'),
+    ({'command': ['x'], 'extra_args': ['--seed=0']}, 'apply to the stock vLLM command'),
+    ({'extra_args': ['--max-model-len=4096']}, 'repeats --max-model-len'),
+    ({'extra_args': ['--served-model-name=other']}, 'repeats --served-model-name'),
+])
+def test_launch_fields_are_validated(runtime, message):
+    data = _one_vllm()
+    data['endpoints']['e']['runtime'] = runtime
+    with pytest.raises(CatalogError, match=message):
+        Catalog.from_dict(data)
+
+
+def test_ordinary_extra_args_are_still_accepted():
+    ep = _with_runtime({'extra_args': ['--reasoning-parser=qwen3', '--dtype=half']})
+    assert ep.spec['runtime']['extra_args'] == ['--reasoning-parser=qwen3', '--dtype=half']
 
 
 def test_unknown_vllm_serve_recipe_is_rejected():

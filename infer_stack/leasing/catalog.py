@@ -29,10 +29,11 @@ Schema (all sections optional except as referenced)::
         # endpoint (GPU count is appended automatically from tp*pp*dp); falls
         # back to `config set kubeai_resource_profile <name>`.
         #   runtime: {resource_profile: nvidia-gpu-rtx-4090, ...}
-        # Named non-stock vLLM launcher/preparation recipe. Recipes are a
-        # closed set validated by infer-stack; today HyperQwen's measured 3090
-        # single-user path is Compose-only.
-        #   runtime: {serve_recipe: hyperqwen-3090-single, ...}
+        # An image with its own launcher (Compose only), described in data;
+        # see infer_stack/leasing/launch.py for the fields and templates.
+        #   runtime: {image: ..., command: [single],
+        #             env: {MAX_LEN: '{max_model_len}', SPEC: mtp},
+        #             mounts: {/cache: my-model/cache}}
         sharing: {mode: shared-compatible}
         reclaim: {policy: keep-warm}
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
@@ -71,10 +72,10 @@ from typing import Any
 
 import yaml
 
+from .launch import launch_identity, translate_legacy
 from .models import (
     EndpointRequest,
     Sharing,
-    VLLM_SERVE_RECIPES,
     ollama_structural,
     vllm_structural,
 )
@@ -283,21 +284,10 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
 
 
 def _runtime_errors(ep: EndpointSpec) -> list[str]:
-    """Validate named runtime recipes that have backend-specific semantics."""
-    recipe = ep.runtime.get('serve_recipe')
-    if recipe is None:
-        return []
-    if ep.engine != VLLM:
-        return [
-            f"endpoint '{ep.name}': runtime.serve_recipe is only supported "
-            f"on vllm endpoints (engine is '{ep.engine}')"
-        ]
-    if recipe not in VLLM_SERVE_RECIPES:
-        return [
-            f"endpoint '{ep.name}': unknown runtime.serve_recipe {recipe!r} "
-            f"(supported: {sorted(VLLM_SERVE_RECIPES)})"
-        ]
-    return []
+    """Validate the generic launch fields (see :mod:`.launch`)."""
+    from .launch import launch_errors
+
+    return launch_errors(ep.name, ep.engine, ep.runtime)
 
 
 @dataclass
@@ -358,7 +348,8 @@ class Catalog:
                 # reports as "needs a 'model'".
                 model=spec.get('model') or '',
                 host=spec.get('host'),
-                runtime=dict(spec.get('runtime') or {}),
+                # A pre-generic `serve_recipe` is read as the fields it meant.
+                runtime=translate_legacy(dict(spec.get('runtime') or {})),
                 sharing=_parse_sharing(spec.get('sharing')),
                 reclaim=_parse_reclaim(spec.get('reclaim')),
                 served_name=spec.get('public_name') or spec.get('served_name'),
@@ -538,7 +529,7 @@ class Catalog:
             attention_backend=rt.get('attention_backend'),
             served_name=served_name,
             gpu_indices=gpu_indices,
-            serve_recipe=rt.get('serve_recipe'),
+            launch=launch_identity(rt),
         )
         capacity: dict[str, Any] = {}
         if rt.get('max_model_len') is not None:

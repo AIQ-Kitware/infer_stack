@@ -73,14 +73,6 @@ RESERVED_ENGINE = 'reserved'
 # Synthetic endpoint/claim name for a reservation (it serves nothing).
 RESERVED_ENDPOINT = 'reserved-gpu'
 
-# Named vLLM launcher recipes that need more than the stock ``vllm serve``
-# command. Keep this deliberately small and explicit: a typo must not silently
-# fall through to vanilla vLLM with a model that only fits because the recipe
-# prepares/quantizes it first.
-HYPERQWEN_3090_RECIPE = 'hyperqwen-3090-single'
-VLLM_SERVE_RECIPES = frozenset({HYPERQWEN_3090_RECIPE})
-
-
 def is_reservation(obj: Any) -> bool:
     """True if a :class:`Deployment` / :class:`EndpointRequest` is a GPU reservation."""
     return getattr(obj, 'engine', None) == RESERVED_ENGINE
@@ -177,7 +169,7 @@ def vllm_structural(
     attention_backend: str | None = None,
     served_name: str | None = None,
     gpu_indices: list[int] | None = None,
-    serve_recipe: str | None = None,
+    launch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structural dict for a vLLM endpoint (one process per model)."""
     structural = {
@@ -205,12 +197,12 @@ def vllm_structural(
         # Do not emit an empty key for auto placement; old compatibility hashes
         # stay stable for every catalog that does not opt into pinning.
         structural['gpu_indices'] = [int(i) for i in gpu_indices]
-    if serve_recipe:
-        # A recipe can change the container entrypoint, preparation pipeline,
-        # quantized artifacts, and runtime defaults. It is therefore process
-        # identity, not merely a placement/capacity hint. Omit the key for the
-        # stock path so existing compatibility hashes remain stable.
-        structural['serve_recipe'] = serve_recipe
+    if launch:
+        # command / env / mounts / extra_args (see leasing.launch): they change
+        # what the process is, so two endpoints differing in them must never
+        # share one. Only the fields that are set appear, so an endpoint using
+        # none keeps its old compatibility key.
+        structural['launch'] = dict(launch)
     return structural
 
 

@@ -45,6 +45,7 @@ from typing import Any
 import yaml
 
 from ..hardware import available_gpu_indices
+from .launch import translate_legacy
 
 __all__ = [
     'SuggestionModel',
@@ -60,7 +61,6 @@ __all__ = [
 _OLD_DBIRKS_QWEN38_NAME = 'qwen3.8-27b'
 _DBIRKS_QWEN38_NAME = 'qwen3.8-27b-dbirks-hyperqwen'
 _DBIRKS_QWEN38_SOURCE = 'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound'
-_HYPERQWEN_RECIPE = 'hyperqwen-3090-single'
 
 
 @dataclass
@@ -165,7 +165,8 @@ def migrate_known_suggestion_aliases(data: dict[str, Any]) -> list[str]:
     if (
         old_model.get('source') != _DBIRKS_QWEN38_SOURCE
         or old_endpoint.get('model') != _OLD_DBIRKS_QWEN38_NAME
-        or runtime.get('serve_recipe') != _HYPERQWEN_RECIPE
+        # The name an older suggestion wrote, or the generic launch it means.
+        or translate_legacy(runtime).get('command') != ['single']
         or other_refs
     ):
         return []
@@ -300,10 +301,16 @@ def derive_runtime(
     if model.defaults.get('image'):
         runtime['image'] = str(model.defaults['image'])
 
-    if model.defaults.get('serve_recipe'):
-        runtime['serve_recipe'] = str(model.defaults['serve_recipe'])
+    # Generic launch fields (leasing.launch) come from the pool data as-is:
+    # a model's launcher knowledge lives there, not in code.
+    import copy
 
-    if any(_needs_fp16(g.get('name')) for g in host):
+    for key in ('command', 'env', 'mounts'):
+        if model.defaults.get(key):
+            runtime[key] = copy.deepcopy(model.defaults[key])
+
+    if any(_needs_fp16(g.get('name')) for g in host) and 'command' not in runtime:
+        # Stock vLLM only: a custom launcher takes no vLLM flags directly.
         runtime['extra_args'] = ['--dtype=half']
 
     return runtime

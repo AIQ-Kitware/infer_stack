@@ -37,9 +37,10 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
   and serving stack for running Qwen3.8-27B efficiently on 24-GiB consumer GPUs,
   with its published tuning and measurements centered on the RTX 3090.
-  infer-stack's `hyperqwen-3090-single` recipe deliberately delegates the
-  requantization, patched-vLLM launcher, speculative decoding, and GPU-level
-  tuning to HyperQwen; infer-stack adds hardware discovery, catalog suggestions,
+  infer-stack's suggestion for it delegates the requantization, patched-vLLM
+  launcher, speculative decoding, and GPU-level tuning to HyperQwen's image,
+  described entirely in catalog data (see "Images with their own launcher"
+  below); infer-stack adds hardware discovery, catalog suggestions,
   exact GPU affinity, lease lifecycle, and routing around that serving stack.
   `catalog suggest` offers it on any Ampere-or-newer GPU with 24 GiB; it has
   also been measured unchanged on an RTX PRO 6000 Blackwell. The suggestion is
@@ -595,6 +596,49 @@ infer-stack restart litellm
 The built-in `pythia-inspect-mmlu-compat` profile is a ready-made
 example; see
 [`recipies/compose_pythia_inspect_mmlu_compat.md`](recipies/compose_pythia_inspect_mmlu_compat.md).
+
+### Images with their own launcher
+
+Some images wrap vLLM in their own launcher and are configured through
+environment variables rather than `vllm serve` flags. Describe that in the
+endpoint's `runtime`; infer-stack has no model-specific code for it:
+
+```yaml
+runtime:
+  image: ghcr.io/syv-ai/hyperqwen:sha-684e927
+  max_model_len: 65536
+  gpu_memory_utilization: 0.93
+  command: [single]              # replaces `vllm serve MODEL <flags>`
+  env:                           # container environment
+    PORT: '{port}'
+    SPEC: dflash2
+    PREFIX_CACHE: 1
+    MAX_LEN: '{max_model_len}'   # filled from the field above
+    GPU_UTIL: '{gpu_memory_utilization}'
+    EXTRA_ARGS: '--served-model-name={served_model_name}'
+  mounts:                        # persisted under the runtime data dir
+    /app/models: hyperqwen/qwen3.8-27b/models
+    /cache: hyperqwen/qwen3.8-27b/cache
+```
+
+Switching that image to its long-context mode is a data edit, in the catalog
+or the TUI's endpoint editor: `max_model_len: 150000` and `SPEC: mtp`,
+`CTX: long` in `env`.
+
+- `{max_model_len}`, `{gpu_memory_utilization}`, `{served_model_name}` and
+  `{port}` are filled in from the endpoint, so a launcher that takes them
+  through its own variables stays in step when the fields change.
+- Env values are written as strings (`true`/`false` for booleans), and `$`
+  is literal. `HF_TOKEN`, `VLLM_ATTENTION_BACKEND`, `CUDA_VISIBLE_DEVICES` and
+  `NVIDIA_VISIBLE_DEVICES` are infer-stack's and are refused.
+- `extra_args` stay what they were: flags appended to the stock `vllm serve`
+  command, after infer-stack's own, so vLLM keeps the extra value for a
+  repeated flag. Repeating a flag infer-stack acts on (served name, parallel
+  sizes, `--max-model-len`) is refused; with `command`, pass flags through the
+  launcher instead.
+- All of these are deployment identity: endpoints that launch differently
+  never share a process.
+- Compose only; KubeAI refuses an endpoint with `command`, `env` or `mounts`.
 
 ### Reasoning / thinking models
 

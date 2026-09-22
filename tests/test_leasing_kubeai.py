@@ -182,15 +182,20 @@ def test_render_attention_backend_reaches_cr_env():
     assert not any('attention' in a.lower() for a in doc['spec']['args'])
 
 
-def test_render_refuses_compose_only_serve_recipe():
+@pytest.mark.parametrize('launch', [
+    {'serve_recipe': 'hyperqwen-3090-single'},       # a legacy entry, translated
+    {'command': ['single']},
+    {'env': {'SPEC': 'mtp'}},
+])
+def test_render_refuses_a_custom_container_launch(launch):
     rendered = render_models(
-        [vllm('grp-q38', serve_recipe='hyperqwen-3090-single')],
+        [vllm('grp-q38', **launch)],
         namespace='kubeai', default_resource_profile=None,
     )
     assert rendered.docs == []
     assert rendered.unrenderable == {'grp-q38'}
     assert len(rendered.errors) == 1
-    assert 'supported by the compose backend' in rendered.errors[0]
+    assert 'the compose backend supports' in rendered.errors[0]
 
 
 def test_render_omits_env_without_attention_backend():

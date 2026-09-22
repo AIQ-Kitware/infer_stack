@@ -37,8 +37,8 @@ def endpoint_add(name: str, entry: dict[str, Any], *, force: bool = False) -> st
     Example:
         >>> print(endpoint_add('qwen', {'engine': 'vllm', 'model': 'q',
         ...     'placement': {'gpu_indices': [0, 1]},
-        ...     'runtime': {'max_model_len': 8192, 'serve_recipe': 'r'}}, force=True))
-        infer-stack catalog endpoint add qwen --model q --gpu 0 1 --runtime max_model_len=8192 serve_recipe=r --force
+        ...     'runtime': {'max_model_len': 8192, 'command': ['single']}}, force=True))
+        infer-stack catalog endpoint add qwen --model q --gpu 0 1 --runtime max_model_len=8192 'command=["single"]' --force
     """
     parts: list[object] = ['catalog', 'endpoint', 'add', name]
     if entry.get('engine', 'vllm') != 'vllm':

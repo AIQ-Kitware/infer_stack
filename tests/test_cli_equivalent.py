@@ -59,6 +59,12 @@ ENTRIES = [
                  'enable_prefix_caching': True, 'tensor_parallel_size': 2,
                  'image': 'ghcr.io/x/y:sha-1', 'dtype': 'half', 'quantization': 'true',
                  'extra_args': ['--enforce-eager', '--seed', '0']}},
+    # An image with its own launcher: every generic launch field.
+    {'engine': 'vllm', 'model': 'm',
+     'runtime': {'image': 'img:1', 'max_model_len': 150000, 'command': ['single'],
+                 'env': {'SPEC': 'mtp', 'CTX': 'long', 'MAX_LEN': '{max_model_len}',
+                         'PREFIX_CACHE': 1, 'NOTE': 'has spaces and $dollar'},
+                 'mounts': {'/cache': 'm/cache'}}},
 ]
 
 

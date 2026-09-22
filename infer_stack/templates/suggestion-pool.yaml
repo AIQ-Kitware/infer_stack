@@ -133,7 +133,23 @@ vllm_models:
       gpu_memory_utilization: 0.93
       enable_prefix_caching: true
       image: ghcr.io/syv-ai/hyperqwen:sha-684e927
-      serve_recipe: hyperqwen-3090-single
+      # The image's own launcher, not `vllm serve`: its `single` mode reads
+      # the settings below from the environment. SPEC=dflash2 with the default
+      # CTX is the fast profile; SPEC=mtp with CTX=long (and a larger
+      # max_model_len) is its long-context one. EXTRA_ARGS go last on its
+      # vLLM command line, which keeps the served name infer-stack routes to.
+      command: [single]
+      env:
+        PORT: '{port}'
+        SPEC: dflash2
+        PREFIX_CACHE: 1
+        MAX_LEN: '{max_model_len}'
+        GPU_UTIL: '{gpu_memory_utilization}'
+        EXTRA_ARGS: '--served-model-name={served_model_name}'
+      # Prepared weights (~20 GB, requantized once) and its compile caches.
+      mounts:
+        /app/models: hyperqwen/qwen3.8-27b/models
+        /cache: hyperqwen/qwen3.8-27b/cache
   qwen2.5-7b:
     hf_model_id: Qwen/Qwen2.5-7B-Instruct
     served_model_name: qwen2.5-7b

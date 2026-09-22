@@ -256,6 +256,90 @@ def test_render_hyperqwen_3090_recipe_uses_prepared_single_user_launcher():
     assert svc['healthcheck']['test'][-1] == 'http://localhost:8000/health'
 
 
+def _hyperqwen_from_suggestion(**runtime_changes):
+    """The HyperQwen deployment exactly as `catalog suggest` writes it."""
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.suggest import suggest_catalog
+
+    frag = suggest_catalog({'gpu_count': 1, 'gpus': [
+        {'index': 0, 'name': 'NVIDIA GeForce RTX 3090', 'memory_gib': 24}]})
+    ep = frag['endpoints']['qwen3.8-27b-dbirks-hyperqwen']
+    ep['public_name'] = 'local-qwen38'
+    ep['runtime'].update(runtime_changes)
+    req = Catalog.from_dict(frag).resolve_endpoint('qwen3.8-27b-dbirks-hyperqwen')
+    deployment = vllm('grp-q38', hf=req.spec['hf_model_id'], served='local-qwen38')
+    deployment.spec['runtime'] = req.spec['runtime']
+    rc = render_compose(
+        [deployment], {'grp-q38': [3]}, images=IMAGES, ports=PORTS,
+        state={**STATE, 'runtime': '/cache/runtime'},
+    )
+    return rc.compose['services'][vllm_service_name(deployment)]
+
+
+def test_suggested_hyperqwen_renders_what_the_old_recipe_did():
+    """Generic catalog data, no recipe name, same container as before."""
+    svc = _hyperqwen_from_suggestion()
+    assert svc['command'] == ['single']
+    assert svc['environment'] == {
+        'HF_TOKEN': '${HF_TOKEN:-}', 'PORT': '8000', 'SPEC': 'dflash2',
+        'PREFIX_CACHE': '1', 'MAX_LEN': '65536', 'GPU_UTIL': '0.93',
+        'EXTRA_ARGS': '--served-model-name=local-qwen38',
+    }
+    assert svc['volumes'] == [
+        '/cache/runtime/hyperqwen/qwen3.8-27b/models:/app/models',
+        '/cache/runtime/hyperqwen/qwen3.8-27b/cache:/cache',
+    ]
+
+
+def test_the_long_context_profile_is_only_catalog_data():
+    """Fast -> long: edit max_model_len and two env values; no code knows the mode."""
+    from infer_stack.leasing.suggest import builtin_pool
+
+    env = dict(builtin_pool()['qwen3.8-27b-dbirks-hyperqwen'].defaults['env'])
+    env.update(SPEC='mtp', CTX='long')
+    svc = _hyperqwen_from_suggestion(max_model_len=150000, env=env)
+    assert svc['environment']['SPEC'] == 'mtp'
+    assert svc['environment']['CTX'] == 'long'
+    assert svc['environment']['MAX_LEN'] == '150000'      # follows the field
+    assert svc['command'] == ['single']
+
+
+def test_generic_launch_fields_render_as_written():
+    deployment = vllm('grp-x', served='x', max_len=4096)
+    deployment.spec['runtime'].update({
+        'command': ['serve', '--ctx={max_model_len}', '--name={served_model_name}'],
+        'env': {'MODE': 'fast', 'ON': True, 'N': 3, 'PRICE': '$5 ${LITELLM_MASTER_KEY}'},
+    })
+    svc = render_compose([deployment], {'grp-x': [0]}, images=IMAGES, ports=PORTS,
+                         state=STATE).compose['services'][vllm_service_name(deployment)]
+    assert svc['command'] == ['serve', '--ctx=4096', '--name=x']
+    env = svc['environment']
+    assert (env['MODE'], env['ON'], env['N']) == ('fast', 'true', '3')
+    # `$` is literal: a catalog value can never interpolate a managed secret.
+    assert env['PRICE'] == '$$5 $${LITELLM_MASTER_KEY}'
+
+
+def test_mounts_on_stock_vllm_keep_its_caches():
+    deployment = vllm('grp-m', served='m')
+    deployment.spec['runtime']['mounts'] = {'/extra': 'm/extra'}
+    svc = render_compose([deployment], {'grp-m': [0]}, images=IMAGES, ports=PORTS,
+                         state={**STATE, 'runtime': '/rt'}
+                         ).compose['services'][vllm_service_name(deployment)]
+    assert '/rt/m/extra:/extra' in svc['volumes']
+    assert any(v.endswith(':/root/.cache/huggingface') for v in svc['volumes'])
+
+
+def test_extra_args_still_follow_infer_stack_flags_on_the_stock_command():
+    deployment = vllm('grp-y', served='y')
+    deployment.spec['runtime']['extra_args'] = ['--max-num-seqs=4']
+    svc = render_compose([deployment], {'grp-y': [0]}, images=IMAGES, ports=PORTS,
+                         state=STATE).compose['services'][vllm_service_name(deployment)]
+    cmd = svc['command']
+    # vLLM keeps the last occurrence, so an extra flag overrides infer-stack's.
+    assert cmd.index('--max-num-seqs=4') > max(
+        i for i, a in enumerate(cmd) if a.startswith('--max-num-seqs=') and a != '--max-num-seqs=4')
+
+
 def test_render_reports_service_name_collisions():
     """Regression: two live deployments sharing a served name rendered to ONE
     compose service (dict overwrite) — the earlier deployment's container never

@@ -38,7 +38,8 @@ def test_builtin_pool_is_nonempty_and_real():
     assert qwen38.requires_ampere is True
     assert qwen38.defaults['max_model_len'] == 65536
     assert qwen38.defaults['gpu_memory_utilization'] == 0.93
-    assert qwen38.defaults['serve_recipe'] == 'hyperqwen-3090-single'
+    assert 'serve_recipe' not in qwen38.defaults       # generic fields only
+    assert qwen38.defaults['command'] == ['single']
     assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
@@ -116,7 +117,12 @@ def test_qwen38_27b_suggestion_uses_the_hyperqwen_recipe_on_any_card_that_fits()
         'gpu_memory_utilization': 0.93,
         'enable_prefix_caching': True,
         'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
-        'serve_recipe': 'hyperqwen-3090-single',
+        'command': ['single'],
+        'env': {'PORT': '{port}', 'SPEC': 'dflash2', 'PREFIX_CACHE': 1,
+                'MAX_LEN': '{max_model_len}', 'GPU_UTIL': '{gpu_memory_utilization}',
+                'EXTRA_ARGS': '--served-model-name={served_model_name}'},
+        'mounts': {'/app/models': 'hyperqwen/qwen3.8-27b/models',
+                   '/cache': 'hyperqwen/qwen3.8-27b/cache'},
     }
 
 
