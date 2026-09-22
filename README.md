@@ -41,8 +41,9 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
   requantization, patched-vLLM launcher, speculative decoding, and GPU-level
   tuning to HyperQwen; infer-stack adds hardware discovery, catalog suggestions,
   exact GPU affinity, lease lifecycle, and routing around that serving stack.
-  The current 3090 suggestion is named
-  `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
+  `catalog suggest` offers it on any Ampere-or-newer GPU with 24 GiB; it has
+  also been measured unchanged on an RTX PRO 6000 Blackwell. The suggestion is
+  named `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
   `dbirks/Qwen3.8-27B-W4A16-AutoRound` derivative; the unsuffixed
   `qwen3.8-27b` identity is left available for the official
   `Qwen/Qwen3.8-27B` checkpoint.

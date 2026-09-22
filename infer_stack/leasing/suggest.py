@@ -80,6 +80,9 @@ class SuggestionModel:
     # are case-insensitive substrings of the detected nvidia-smi GPU name. A
     # portable model leaves the list empty.
     gpu_name_hints: list[str] = field(default_factory=list)
+    # A recipe that cannot run before Ampere (no bf16, or a CUDA that dropped
+    # the architecture) sets this; the check is the name sniff below.
+    requires_ampere: bool = False
     defaults: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -101,6 +104,7 @@ class SuggestionModel:
             gpu_name_hints=[
                 str(v).lower() for v in (spec.get('gpu_name_hints') or [])
             ],
+            requires_ampere=bool(spec.get('requires_ampere', False)),
             defaults=dict(spec.get('defaults') or {}),
         )
 
@@ -209,6 +213,8 @@ def _gpu_mem(gpu: dict[str, Any]) -> float:
 
 def _gpu_is_eligible(model: SuggestionModel, gpu: dict[str, Any]) -> bool:
     if _gpu_mem(gpu) < model.min_vram_gib_per_replica:
+        return False
+    if model.requires_ampere and _needs_fp16(gpu.get('name')):
         return False
     if model.gpu_name_hints:
         name = str(gpu.get('name') or '').lower()

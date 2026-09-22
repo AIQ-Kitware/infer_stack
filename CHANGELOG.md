@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The HyperQwen suggestion is offered wherever it fits
+
+`catalog suggest` offered `qwen3.8-27b-dbirks-hyperqwen` only on cards named
+RTX 3090, and pinned it to that card. It now appears on any Ampere-or-newer GPU
+with 24 GiB, placed like any other model. Measured unchanged on an RTX PRO 6000
+Blackwell (sm120): ~300 tok/s single stream against ~27 for the bf16 base, and
+4 concurrent requests batched without queueing. Pre-Ampere cards are still
+excluded (new pool field `requires_ampere`).
+
 ### `infer-stack secrets rotate` replaces the gateway's master key
 
 It writes a new `LITELLM_MASTER_KEY`, restarts the gateway with it through a

@@ -34,7 +34,8 @@ def test_builtin_pool_is_nonempty_and_real():
     assert qwen38.memory_class_gib == 20
     assert qwen38.min_vram_gib_per_replica == 24
     assert qwen38.context_window == 262144
-    assert qwen38.gpu_name_hints == ['rtx 3090']
+    assert qwen38.gpu_name_hints == []
+    assert qwen38.requires_ampere is True
     assert qwen38.defaults['max_model_len'] == 65536
     assert qwen38.defaults['gpu_memory_utilization'] == 0.93
     assert qwen38.defaults['serve_recipe'] == 'hyperqwen-3090-single'
@@ -98,9 +99,9 @@ def test_fit_filter_tracks_gpu_size():
     assert 'qwen2.5-72b' not in one_small    # needs two GPUs
 
 
-def test_qwen38_27b_suggestion_uses_measured_3090_hyperqwen_recipe():
+def test_qwen38_27b_suggestion_uses_the_hyperqwen_recipe_on_any_card_that_fits():
     inv = {'gpu_count': 2, 'gpus': [
-        _gpu(0, 48, name='NVIDIA RTX 8000'),
+        _gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell Workstation Edition'),
         _gpu(3, 24, name='NVIDIA GeForce RTX 3090'),
     ]}
     out = suggest_catalog(inv)
@@ -108,10 +109,8 @@ def test_qwen38_27b_suggestion_uses_measured_3090_hyperqwen_recipe():
         'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound'
     )
     ep = out['endpoints']['qwen3.8-27b-dbirks-hyperqwen']
-    # The recipe is measured for a 3090. Preserve that hardware match into the
-    # generated catalog instead of letting the later best-fit placer choose the
-    # unrelated 48-GiB card.
-    assert ep['placement'] == {'min_vram_gib': 24, 'gpu_indices': [3]}
+    # Fit decides, not the card's name: no GPU pin, the placer chooses.
+    assert ep['placement'] == {'min_vram_gib': 24}
     assert ep['runtime'] == {
         'max_model_len': 65536,
         'gpu_memory_utilization': 0.93,
@@ -121,8 +120,14 @@ def test_qwen38_27b_suggestion_uses_measured_3090_hyperqwen_recipe():
     }
 
 
-def test_qwen38_27b_recipe_is_not_suggested_on_an_unmeasured_24gib_gpu():
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA RTX A5000')]}
+def test_qwen38_27b_recipe_is_suggested_wherever_it_fits():
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell')]}
+    assert 'qwen3.8-27b-dbirks-hyperqwen' in suggest_catalog(inv)['models']
+
+
+def test_qwen38_27b_recipe_is_not_suggested_before_ampere():
+    # 48 GiB is plenty, but a Turing card cannot run the recipe's image.
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 48, name='Quadro RTX 8000')]}
     assert 'qwen3.8-27b-dbirks-hyperqwen' not in suggest_catalog(inv)['models']
 
 
