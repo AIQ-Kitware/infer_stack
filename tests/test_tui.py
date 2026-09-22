@@ -1912,3 +1912,33 @@ def test_tui_refusals_pop_up_instead_of_doing_nothing():
     assert kwargs.get('severity') == 'warning'
     assert 'actively served' in seen['status']    # and the status line keeps it
     assert 'warn: ' in seen['applog'] and 'actively served' in seen['applog']
+
+
+def test_tui_log_shows_the_cli_command_for_an_action_and_backend_progress():
+    """The dashboard teaches the CLI, and a long pull is visible while it runs."""
+    import threading
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_release_all()
+            # A worker thread reporting, as ComposeBackend._pull_missing does.
+            worker = threading.Thread(
+                target=app._backend_progress,
+                args=('pulling img: 1 of 4 layers downloaded, 2.0 GB of 9.0 GB',))
+            worker.start()
+            while worker.is_alive():               # join() would block the loop it needs
+                await pilot.pause(0.05)
+            await pilot.pause()
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'CLI: infer-stack release --all --yes' in seen['applog']
+    assert 'pulling img: 1 of 4 layers' in seen['applog']

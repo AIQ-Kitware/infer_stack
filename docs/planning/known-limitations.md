@@ -207,6 +207,12 @@ measured.
 If lock wait becomes the bottleneck, skip an apply whose render is identical to
 the last successful one; do not reintroduce a separate apply lock.
 
+The exception is the first use of an image: it is pulled inside that apply,
+under the lock, so every other lease operation waits for the whole download
+(minutes for a multi-GB engine image). The pull now reports its progress, but
+it still blocks. `infer-stack config publish` pre-pulls a profile's images
+outside any acquire.
+
 ### Recovery after an interrupted apply is a settle check, not full quiescence (current)
 
 A timed-out or interrupted apply marks the pending change `interrupted`. Before

@@ -1676,6 +1676,7 @@ def docker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
 def _default_docker_run(
     args: list[str], *, timeout: float | None = None,
     stderr_lines: Callable[[str], None] | None = None,
+    stdout_lines: Callable[[str], None] | None = None,
 ) -> str:
     """Run a docker command and return stdout, bounded in wall-clock time.
 
@@ -1705,7 +1706,10 @@ def _default_docker_run(
         proc.communicate()
 
     try:
-        out, err = proc.communicate(timeout=bound)
+        if stdout_lines is None:
+            out, err = proc.communicate(timeout=bound)
+        else:
+            out, err = _communicate_streaming(proc, bound, stdout_lines)
     except subprocess.TimeoutExpired:
         kill_group()
         raise BackendTimeout(
@@ -1724,6 +1728,85 @@ def _default_docker_run(
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, args, output=out, stderr=err)
     return out
+
+
+def _communicate_streaming(proc, bound: float, on_line) -> tuple[str, str | None]:
+    """``proc.communicate(timeout=bound)``, handing each stdout line to ``on_line``.
+
+    The callback runs on a reader thread and must not raise; a progress
+    report that fails is not a reason to fail the command.
+    """
+    import threading
+
+    lines: list[str] = []
+
+    def read():
+        for line in proc.stdout:
+            lines.append(line)
+            try:
+                on_line(line.rstrip('\n'))
+            except Exception:  # noqa: BLE001
+                pass
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    proc.wait(timeout=bound)
+    reader.join(timeout=5.0)
+    err = proc.stderr.read() if proc.stderr is not None else None
+    return ''.join(lines), err
+
+
+class PullProgress:
+    """Turn non-TTY ``docker pull`` output into "N of M layers, X of Y GB".
+
+    A pull that is not on a terminal prints one line per layer event
+    (``<id>: Pulling fs layer`` ... ``Download complete`` ... ``Pull
+    complete``) and no byte counts. Sizes come from the registry manifest,
+    keyed by the same 12-character digest prefix the pull prints; without
+    them the report is layers only.
+
+    Example:
+        >>> p = PullProgress('img', {'aaaaaaaaaaaa': 2 * 10**9, 'bbbbbbbbbbbb': 10**9})
+        >>> p.feed('aaaaaaaaaaaa: Pulling fs layer')
+        >>> p.feed('bbbbbbbbbbbb: Already exists')
+        'pulling img: 1 of 2 layers downloaded, 1.0 GB of 3.0 GB'
+        >>> p.feed('cccccccccccc: Download complete')   # not in the manifest: ignored
+        >>> p.feed('aaaaaaaaaaaa: Download complete')
+        'pulling img: 2 of 2 layers downloaded, 3.0 GB of 3.0 GB'
+    """
+
+    _DONE = ('Download complete', 'Pull complete', 'Already exists')
+
+    def __init__(self, image: str, sizes: dict[str, int] | None = None):
+        self.image = image
+        self.sizes = dict(sizes or {})
+        self.layers: set[str] = set(self.sizes)
+        self.downloaded: set[str] = set()
+
+    def feed(self, line: str) -> str | None:
+        """A new report when a layer finished downloading, else ``None``."""
+        layer, sep, event = line.partition(': ')
+        if not sep or len(layer) != 12 or any(c not in '0123456789abcdef' for c in layer):
+            return None
+        if self.sizes and layer not in self.sizes:
+            return None             # an attestation blob, not an image layer
+        self.layers.add(layer)
+        if event.strip() in self._DONE and layer not in self.downloaded:
+            self.downloaded.add(layer)
+            return self.report()
+        return None
+
+    def report(self) -> str:
+        text = (f'pulling {self.image}: {len(self.downloaded)} of '
+                f'{len(self.layers)} layers downloaded')
+        if self.sizes:
+            done = sum(self.sizes.get(layer, 0) for layer in self.downloaded)
+            text += f', {_size(done)} of {_size(sum(self.sizes.values()))}'
+        return text
+
+
+def _size(n: int) -> str:
+    return f'{n / 1e9:.1f} GB' if n >= 1e9 else f'{n / 1e6:.0f} MB'
 
 
 def _parse_ps(out: str) -> set[str]:
@@ -1833,6 +1916,9 @@ class ComposeBackend(ConvergeScaffold):
             import requests
             http = requests
         self.http = http
+        # Called with a one-line message during long steps (image pulls); the
+        # TUI sets it. Always also logged.
+        self.progress: Callable[[str], None] | None = None
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
         # Merge over the defaults (not replace) so a caller-supplied partial
@@ -2773,6 +2859,79 @@ class ComposeBackend(ConvergeScaffold):
         logger.info('apply: recreating network {} ({} -> {})', NETWORK_NAME, actual, wanted)
         self.run(['docker', 'network', 'rm', NETWORK_NAME])
 
+    def _report(self, message: str) -> None:
+        """Progress for a long step: the log, and ``self.progress`` if set (the TUI)."""
+        from .._log import logger
+
+        logger.info(message)
+        if self.progress is not None:
+            try:
+                self.progress(message)
+            except Exception:  # noqa: BLE001 - a display failure must not fail an apply
+                pass
+
+    def _image_present(self, image: str) -> bool:
+        import subprocess
+
+        args = ['docker', 'image', 'inspect', '--format', '{{.Id}}', image]
+        try:
+            try:
+                # Capture "No such image" rather than let it reach the terminal
+                # (under the TUI it would draw over the screen).
+                self.run(args, stderr_lines=lambda _line: None)
+            except TypeError:           # an injected runner without the keyword
+                self.run(args)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def _layer_sizes(self, image: str) -> dict[str, int]:
+        """Layer sizes by 12-char digest prefix, for this host's platform. Best effort."""
+        import platform
+
+        arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine(),
+                                                           platform.machine())
+        try:
+            data = json.loads(self.run(['docker', 'manifest', 'inspect', '-v', image],
+                                       timeout=30.0) or 'null')
+        except Exception:  # noqa: BLE001 - sizes only improve the report
+            return {}
+        for entry in data if isinstance(data, list) else [data]:
+            if not isinstance(entry, dict):
+                continue
+            plat = (entry.get('Descriptor') or {}).get('platform') or {}
+            if plat and (plat.get('os'), plat.get('architecture')) != ('linux', arch):
+                continue
+            manifest = entry.get('OCIManifest') or entry.get('SchemaV2Manifest') or {}
+            layers = manifest.get('layers') or []
+            if layers:
+                return {str(l['digest']).split(':', 1)[-1][:12]: int(l.get('size') or 0)
+                        for l in layers if l.get('digest')}
+        return {}
+
+    def _pull_missing(self, images) -> None:
+        """Pull every image not present locally, reporting as layers arrive.
+
+        ``docker compose up`` would pull them itself, silently: on a first
+        use that is many minutes of an apply that looks hung. Pulling first
+        also means a failed pull aborts before anything is removed.
+        """
+        for image in sorted({str(i) for i in images if i}):
+            if self._image_present(image):
+                continue
+            progress = PullProgress(image, self._layer_sizes(image))
+            size = f' ({_size(sum(progress.sizes.values()))})' if progress.sizes else ''
+            self._report(f'pulling {image}{size}: not present locally')
+
+            def on_line(line, progress=progress):
+                message = progress.feed(line)
+                if message:
+                    self._report(message)
+
+            self.run(['docker', 'pull', image], timeout=DOCKER_TIMEOUT_PULL,
+                     stdout_lines=on_line)
+            self._report(f'pulled {image}')
+
     def selective_apply(self, services, fingerprints, *, degraded=frozenset(),
                         optional=frozenset(), networks=None):
         """Make the project match the render, touching only what differs.
@@ -2885,6 +3044,7 @@ class ComposeBackend(ConvergeScaffold):
                         f'{wanted_subnet}, but {len(foreign)} container(s) not managed '
                         f'for removal are attached ({", ".join(c[:12] for c in foreign)})'
                     )
+        self._pull_missing(services[name].get('image') for name in to_start)
         if orphans:
             logger.warning(
                 'apply: {} unmanaged container(s) in the project left alone ({}); '

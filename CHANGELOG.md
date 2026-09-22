@@ -2,6 +2,24 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### A first-use image pull shows its progress
+
+An acquire whose engine image was not yet on the host sat silent for as long
+as the download took (20 minutes on a real host), because `docker compose up`
+pulled it with its output captured. Missing images are now pulled before
+`up`, with a line each time a layer finishes: "pulling IMAGE: 7 of 23 layers
+downloaded, 4.1 GB of 9.8 GB" (sizes from the registry manifest). It goes to
+the log and, in the TUI, to the status bar and the TUI log tab. The pull also
+runs before any container is removed, so a failed pull changes nothing.
+
+### The TUI log shows the CLI command for each action
+
+Acquire, release, evict, apply, stack down, and the catalog edits (add model,
+add or edit an endpoint, remove, suggest) now log the equivalent
+`infer-stack ...` command in the TUI log tab. Tests check that each one parses
+and that the logged `catalog endpoint add` writes the same entry the TUI did.
+The TUI's cleanup action has no CLI counterpart yet, and its log says so.
+
 ### The HyperQwen suggestion is offered wherever it fits
 
 `catalog suggest` offered `qwen3.8-27b-dbirks-hyperqwen` only on cards named

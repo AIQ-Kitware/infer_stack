@@ -63,6 +63,9 @@ from .cli.commands_leasing import (
     _running_label,
 )
 from .leasing import DeploymentState, LeaseState
+from rich.markup import escape as escape_markup
+
+from . import cli_equivalent as cli
 from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
@@ -1149,17 +1152,30 @@ class InferStackTUI(App):
 
         from .leasing.compose import _default_docker_run
 
-        def quiet_run(args: list[str]) -> str:
+        def quiet_run(args: list[str], **kwargs) -> str:
             # Same bounded, explicit-environment runner as the CLI; only stderr
-            # is redirected to the logs pane.
+            # is redirected to the logs pane, unless the caller takes it.
             noisy = not any(a == 'ps' for a in args)
             sink = (
                 (lambda line: self.call_from_thread(self._append_log, line))
                 if noisy else (lambda line: None)
             )
-            return _default_docker_run(args, stderr_lines=sink)
+            kwargs.setdefault('stderr_lines', sink)
+            return _default_docker_run(args, **kwargs)
 
         backend.run = quiet_run
+        if hasattr(backend, 'progress'):
+            backend.progress = self._backend_progress
+
+    def _backend_progress(self, message: str) -> None:
+        """A long backend step (an image pull) reporting from a worker thread."""
+        try:
+            self.call_from_thread(self._show_progress, message)
+        except RuntimeError:           # already on the UI thread
+            self._show_progress(message)
+
+    def _show_progress(self, message: str) -> None:
+        self._status(message)          # also recorded in the TUI log
 
     # -- resizable panes ---------------------------------------------------
 
@@ -1908,6 +1924,11 @@ class InferStackTUI(App):
             except Exception:  # noqa: BLE001 - notifications are a bonus
                 pass
 
+    def _cli(self, *commands: str) -> None:
+        """Log the shell command(s) that do what the user just did here."""
+        for text in commands:
+            self.app_log(f'CLI: {escape_markup(text)}')
+
     def _refuse(self, message: str, *, level: str = 'warn') -> None:
         """Report an action the TUI declined to perform, or that failed.
 
@@ -2166,6 +2187,7 @@ class InferStackTUI(App):
             f'acquiring {name}… (the lease should appear immediately; '
             'engine output appears in the logs pane)'
         )
+        self._cli(cli.command('acquire', name, '--owner', 'manual', '--no-wait', '--yes'))
         self._do_acquire(name)
 
     def action_acquire(self) -> None:
@@ -2347,10 +2369,12 @@ class InferStackTUI(App):
             self._refuse('select a lease row (or check rows with space) to release')
             return
         self._status(f'releasing {len(ids)} lease(s)…')
+        self._cli(*(cli.command('release', lease, '--yes') for lease in ids))
         self._do_release(ids)
 
     def action_release_all(self) -> None:
         self._status('releasing all active leases…')
+        self._cli(cli.command('release', '--all', '--yes'))
         self._do_release_all()
 
     def action_evict(self) -> None:
@@ -2363,14 +2387,18 @@ class InferStackTUI(App):
             )
             return
         self._status(f'evicting {len(ids)} deployment(s)…')
+        self._cli(cli.command('evict', *ids, '--yes'))
         self._do_evict(ids)
 
     def action_evict_all(self) -> None:
         self._status('evicting all idle deployments…')
+        self._cli(cli.command('evict', '--all', '--yes'))
         self._do_evict_all()
 
     def action_cleanup(self) -> None:
         self._status('cleaning up released/expired leases + stopped deployments…')
+        self.app_log('CLI: none yet; this only forgets finished rows in '
+                     'the ledger (nothing running changes)')
         self._do_cleanup()
 
     # -- docker compose control -------------------------------------------
@@ -2389,6 +2417,7 @@ class InferStackTUI(App):
             self._refuse('nothing rendered yet — acquire a model first')
             return
         self._status('apply… (output in the Logs tab)')
+        self._cli(cli.command('apply', '--yes'))
         self._do_apply()
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -2409,6 +2438,7 @@ class InferStackTUI(App):
             self._refuse('nothing rendered yet — nothing to bring down')
             return
         self._status('docker compose down (raw: bypasses leases; releases nothing)…')
+        self._cli(cli.command('stack', 'down'))
         self._do_compose(['down', '--remove-orphans'], 'down')
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -2485,6 +2515,8 @@ class InferStackTUI(App):
                 'source': result['source'],
             })
             self._status(f'added model {result["name"]}')
+            self._cli(cli.command('catalog', 'model', 'add', result['name'],
+                                  '--source', result['source']))
         except Exception as ex:  # noqa: BLE001
             self._refuse(f'add model failed: {ex}', level='error')
             return
@@ -2650,12 +2682,15 @@ class InferStackTUI(App):
 
             data['endpoints'][name] = new_entry
             _save_raw(self.catalog_path, data)  # validates before publication
+            self.call_from_thread(self._cli, cli.endpoint_add(
+                name, new_entry, force=old_entry is not None))
 
             evicted = 0
             if stale:
                 evicted = len(
                     self.controller.evict(stale).evicted_deployment_ids
                 )
+                self.call_from_thread(self._cli, cli.command('evict', *stale, '--yes'))
             self.call_from_thread(self._reload_catalog)
             tail = (
                 f'; evicted {evicted} stale idle deployment(s)'
@@ -2698,6 +2733,7 @@ class InferStackTUI(App):
             data[section].pop(name, None)
             _save_raw(self.catalog_path, data)  # validates cross-refs
             self._status(f'removed {section[:-1]} {name}')
+            self._cli(cli.command('catalog', section[:-1], 'rm', name))
         except Exception as ex:  # noqa: BLE001
             self._refuse(f'remove failed: {ex}', level='error')
             return
@@ -2714,6 +2750,8 @@ class InferStackTUI(App):
             self._refuse('no catalog path — launch the TUI with a catalog to edit')
             return
         self._status('inspecting GPUs and suggesting a catalog…')
+        self._cli(cli.command('catalog', 'suggest'),
+                  cli.command('catalog', 'suggest', '--apply'))
         self._do_suggest()
 
     @work(thread=True, exclusive=True, group='mutate')
