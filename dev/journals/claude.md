@@ -3048,3 +3048,37 @@ KeyboardInterrupt is not a rollback path, since Ctrl-C is the most common way a
 human ends a wait; and when a state machine refuses to make progress, the
 refusal message ("quiesce the stack") named the symptom while the ledger named
 the cause -- one ACTIVE lease from 22 minutes earlier.
+
+## 2026-09-22 12:59:58 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**What happened.** The weight-floor fix (`c7cb491`) was verified against a real
+shared HF cache by a downstream evaluation session, not only against the
+synthetic layouts in `tests/test_leasing_vram.py`:
+
+- the repository that ships two complete copies now reads one set's worth,
+  where it previously read both added together;
+- two single-set repositories read exactly what they did before.
+
+The second half is the one that could have broken quietly: grouping weight
+files could have split the shards of a single set and under-reported every
+model. It did not.
+
+**Why this entry exists.** Everything else in the leasing work so far is
+verified against fakes — a container-level Docker fake, synthetic cache
+directories. This is the first independent confirmation from real host state,
+and it is worth being explicit that it covers the floor only. Selective apply,
+the GPU barrier, crash-loop detection, health-conditioned starts and
+`network migrate` remain fake-verified; `dev/tmp/host-verification-2026-09-16.md`
+is still outstanding.
+
+**Reflection.** Two design choices were confirmed by use rather than by
+argument. Grouping by (directory, format family) beat listing the directory
+names I had seen, because the name that broke it was simply the first one
+encountered and a publisher can invent another. And deliberately
+under-counting was right for a bound whose only job is gating: generous costs
+a retry, impossible costs the whole lease. The reporting detail that made it
+diagnosable in one read was that the placement error quotes the per-GPU figure
+it used — a number that was recognisably two copies of the model pointed at
+the cache immediately, not at the model.
