@@ -50,6 +50,7 @@ from .commands_leasing import (
     RenewCLI,
     NetworkModalCLI,
     RoutesModalCLI,
+    SecretsModalCLI,
     RunCLI,
     TestCLI,
     TuiCLI,
@@ -139,6 +140,7 @@ class ManageCLI(scfg.ModalCLI):
     test = TestCLI  # smoke-test a served endpoint through the front door
     measure = MeasureCLI  # measure an endpoint's real VRAM requirement (placement.min_vram_gib)
     env = LeasingEnvCLI  # managed env-file: path / read KEY / set KEY=VALUE
+    secrets = SecretsModalCLI  # rotate the LiteLLM master key
 
     # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
     # at the top level as the two hottest convenience aliases.

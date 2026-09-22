@@ -1967,6 +1967,14 @@ def _print_health(health: dict) -> None:
             print(f'  {line}')
 
 
+def _postgres_initialised() -> bool:
+    """Has the gateway's Postgres already created its data directory?"""
+    from ..config import default_state_paths
+
+    path = Path(default_state_paths()['postgres_litellm'])
+    return path.is_dir() and any(path.iterdir())
+
+
 def _secret_env_path() -> Path:
     """The managed compose secrets file (.env that docker compose auto-loads)."""
     return data_root() / 'leasing' / 'compose' / '.env'
@@ -2234,7 +2242,21 @@ class EnvCLI(_PathOverridesMixin):
                             f'while {len(active)} lease(s) are active; release them '
                             'first'
                         )
-                write_env_file(env_path, {key: value})
+                if key == 'LITELLM_DB_PASSWORD' and _postgres_initialised():
+                    raise SystemExit(
+                        'env: Postgres stored LITELLM_DB_PASSWORD when its data '
+                        'directory was created; changing the .env only would lock '
+                        'the gateway out of its database'
+                    )
+                if key == 'LITELLM_MASTER_KEY':
+                    from ..leasing.compose import set_master_key
+                    try:
+                        # Pins the salt first, so DB-stored routes stay readable.
+                        set_master_key(env_path, value)
+                    except ValueError as ex:
+                        raise SystemExit(f'env: {ex}')
+                else:
+                    write_env_file(env_path, {key: value})
             print(f'set {key} ({env_path})')
             return 0
 
@@ -2703,6 +2725,64 @@ class NetworkCheckCLI(_LeasingCommonMixin):
             for service, row in result.items():
                 print(f'  {row["status"]:<14} {service} (expects {row["expected"]})')
         return 4 if any(r['status'] == 'routing-fault' for r in result.values()) else 0
+
+
+class SecretsRotateCLI(_ApprovalMixin):
+    """Replace the LiteLLM master key and restart the gateway with it.
+
+    Refused while leases are active unless ``--force``: their holders use the
+    old key. Anything that copied the key must fetch it again
+    (``infer-stack env LITELLM_MASTER_KEY``). Stored routes stay readable:
+    the first rotation pins ``LITELLM_SALT_KEY`` to the old key, which is what
+    LiteLLM encrypted them with.
+    """
+
+    __command__ = 'rotate'
+
+    force = scfg.Value(False, isflag=True, help='Rotate even with active leases.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        controller = _open_controller(config, interactive=True)
+        backend = controller.backend
+        old = backend.master_key() if isinstance(backend, ComposeBackend) else None
+        try:
+            rec = controller.rotate_gateway_key(force=bool(config.force))
+        except ProfileMismatch as ex:
+            raise SystemExit(f'secrets rotate: {ex}')
+        except ConvergeAborted:
+            raise SystemExit('aborted: the key was not changed')
+        print('secrets rotate: LITELLM_MASTER_KEY replaced')
+        if rec.publication_pending:
+            print('  the gateway has not restarted yet; run `infer-stack apply`')
+            return 3
+        new = backend.master_key()
+        accepted = backend.gateway_accepts(new, wait=60.0)
+        if accepted is None:
+            print('  gateway not running: it will use the new key when it starts')
+        elif not accepted:
+            raise SystemExit('secrets rotate: the gateway rejects the new key')
+        elif backend.gateway_accepts(old) is not False:
+            raise SystemExit('secrets rotate: could not confirm the gateway '
+                             'rejects the OLD key')
+        else:
+            print('  gateway: new key accepted, old key rejected')
+        if getattr(backend, 'ui', False):
+            print('  Open WebUI may keep the old key in its own settings: '
+                  'update it under Admin > Settings > Connections')
+        return 0
+
+
+class SecretsModalCLI(scfg.ModalCLI):
+    """Manage the gateway's secrets."""
+
+    __command__ = 'secrets'
+
+    rotate = SecretsRotateCLI
 
 
 class NetworkModalCLI(scfg.ModalCLI):

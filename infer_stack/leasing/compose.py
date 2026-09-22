@@ -75,6 +75,11 @@ COMPOSE_FILENAME = 'docker-compose.yml'
 LITELLM_CONFIG_FILENAME = 'litellm_config.yaml'
 LITELLM_SERVICE = 'litellm'
 API_KEY_ENV = 'LITELLM_MASTER_KEY'
+# The key LiteLLM encrypts credentials stored in its database with. Unset, it
+# uses the master key -- so rotating the master key would make every
+# DB-stored route undecryptable. `set_master_key` pins it to the pre-rotation
+# master key the first time the key changes; it must never change after that.
+SALT_KEY_ENV = 'LITELLM_SALT_KEY'
 
 # Dynamic-routing (admin-API) extras. When dynamic routing is on, the gateway's
 # route table is managed live via LiteLLM's admin API against a Postgres-backed
@@ -1125,6 +1130,7 @@ def _litellm_service(
     config_hash: str | None = None,
     *,
     dynamic_routing: bool = False,
+    salt_key: bool = False,
 ) -> dict[str, Any]:
     # Reference the managed key via ${...} rather than baking the literal secret
     # into the compose YAML. Its value lives in the sidecar .env next to the
@@ -1137,6 +1143,10 @@ def _litellm_service(
         else '${' + API_KEY_ENV + ':-sk-local}'
     )
     environment = {API_KEY_ENV: key_value}
+    if salt_key:
+        # Only when the .env has one: LiteLLM treats an EMPTY salt as a key,
+        # so a `${...:-}` default would silently change the encryption key.
+        environment[SALT_KEY_ENV] = '${' + SALT_KEY_ENV + '}'
     if dynamic_routing:
         # DB-backed runtime model store so the admin API (/model/new,
         # /model/delete) works; the gateway then never needs recreating to learn
@@ -1365,6 +1375,7 @@ def render_compose(
     litellm: bool = False,
     litellm_port: int = 14042,
     litellm_master_key: str | None = None,
+    litellm_salt_key: bool = False,
     ui: bool = False,
     ui_port: int = 13000,
     reverse_proxy: bool = False,
@@ -1526,6 +1537,7 @@ def render_compose(
             master_key=litellm_master_key,
             config_hash=config_hash,
             dynamic_routing=dynamic_routing,
+            salt_key=litellm_salt_key,
         )
 
     # Open WebUI is its own standing front door, rendered whenever ``ui`` is set
@@ -1744,6 +1756,24 @@ def _parse_ps(out: str) -> set[str]:
     return running
 
 
+def set_master_key(env_path: Path, key: str) -> None:
+    """Replace the LiteLLM master key in ``env_path`` without losing DB routes.
+
+    The first time the key changes, the old one is pinned as
+    ``LITELLM_SALT_KEY`` -- the value LiteLLM has been encrypting stored
+    credentials with. After that the salt stays put and only the key moves.
+    """
+    if not key.startswith('sk-'):
+        # master_key() would silently replace it on the next render.
+        raise ValueError(f'{API_KEY_ENV} must start with "sk-" (LiteLLM rejects others)')
+    existing = parse_env_file(env_path)
+    values = {API_KEY_ENV: key}
+    old = existing.get(API_KEY_ENV, '').strip()
+    if old and old != key and not existing.get(SALT_KEY_ENV, '').strip():
+        values[SALT_KEY_ENV] = old
+    write_env_file(env_path, values)
+
+
 class ComposeBackend(ConvergeScaffold):
     """Single-host docker compose backend (converge-style).
 
@@ -1911,6 +1941,50 @@ class ComposeBackend(ConvergeScaffold):
         if key != existing.get(API_KEY_ENV):
             write_env_file(self._env_path, {API_KEY_ENV: key})
         return key
+
+    def rotate_master_key(self) -> dict[str, str]:
+        """Write a fresh master key to the ``.env``; return the values it replaced.
+
+        Only the file: the gateway and Open WebUI pick it up when the next apply
+        recreates them (their fingerprints hash the key). The caller holds the
+        publication lock and passes the return value to
+        :meth:`restore_env` if that apply does not happen.
+        """
+        before = parse_env_file(self._env_path)
+        set_master_key(self._env_path, ensure_secret({}, API_KEY_ENV, prefix='sk-'))
+        return {k: before.get(k) for k in (API_KEY_ENV, SALT_KEY_ENV)}
+
+    def restore_env(self, values: dict[str, str | None]) -> None:
+        """Put back what :meth:`rotate_master_key` replaced."""
+        from ..env_utils import remove_env_keys
+
+        write_env_file(self._env_path, {k: v for k, v in values.items() if v is not None})
+        remove_env_keys(self._env_path, [k for k, v in values.items() if v is None])
+
+    def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
+        """Does the gateway accept ``key``? ``None`` if it never answered.
+
+        Polls ``/v1/models`` for up to ``wait`` seconds while the gateway is
+        unreachable or still starting. A definite no is 401/403, or the 400
+        LiteLLM actually answers a wrong key with (measured on the pinned image).
+        """
+        deadline = self._clock() + wait
+        while True:
+            try:
+                resp = self.http.get(
+                    f'{self._gateway_base()}/v1/models',
+                    headers={'Authorization': f'Bearer {key}'}, timeout=10.0,
+                )
+                status = getattr(resp, 'status_code', 0)
+            except Exception:  # noqa: BLE001 - not up yet
+                status = 0
+            if status == 200:
+                return True
+            if status in (400, 401, 403):
+                return False
+            if self._clock() >= deadline:
+                return None
+            self._sleep(2.0)
 
     def db_password(self) -> str:
         """The managed Postgres password for LiteLLM's model store.
@@ -2141,6 +2215,7 @@ class ComposeBackend(ConvergeScaffold):
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
             litellm_master_key=self.master_key() if self.litellm else None,
+            litellm_salt_key=SALT_KEY_ENV in parse_env_file(self._env_path),
             ui=self.ui, ui_port=self.ui_port, reverse_proxy=self.reverse_proxy,
             reverse_proxy_port=self.reverse_proxy_port,
             reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,

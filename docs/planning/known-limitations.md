@@ -31,6 +31,24 @@ restrictive umask such as `umask 077` before setup, render, and controller
 operations. Do not treat the generated directory as safe for mutually
 untrusted local users.
 
+## Only the gateway master key can be rotated (current)
+
+`infer-stack secrets rotate` replaces `LITELLM_MASTER_KEY`. Not covered:
+
+- **The Postgres password** (dynamic routing). Postgres stores it when its data
+  directory is created, so changing the `.env` alone would lock the gateway
+  out; `infer-stack env LITELLM_DB_PASSWORD=...` is refused once that directory
+  exists. The database has no published port. Rotating it needs an
+  `ALTER USER` inside the container first.
+- **`LITELLM_SALT_KEY`**, by design. LiteLLM encrypts DB-stored credentials
+  with it and cannot read them after it changes. The first rotation pins it to
+  the pre-rotation master key, which is what LiteLLM had been using, and it
+  never moves after that.
+- **Open WebUI** may keep the old key in its persisted settings; update it
+  under Admin > Settings > Connections.
+- **Active leases** must be released first (or `--force`): their holders read
+  the key once, at acquire.
+
 ## One control plane per host or backend namespace
 
 `--data-dir` and `INFER_STACK_DATA_DIR` relocate infer-stack state; they do not

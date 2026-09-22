@@ -1041,3 +1041,33 @@ def test_routes_seed_and_prune_publish_through_the_controller(tmp_path, monkeypa
     assert RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json']) == 0
     from infer_stack.leasing import Ledger, SqliteStore
     assert Ledger(SqliteStore(db)).publication_pending() is None
+
+
+def test_env_keeps_stored_routes_readable_when_the_master_key_is_set(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+    from infer_stack.env_utils import parse_env_file
+
+    EnvCLI.main(argv=['LITELLM_MASTER_KEY=sk-first'])
+    EnvCLI.main(argv=['LITELLM_MASTER_KEY=sk-second'])
+    env = parse_env_file(tmp_path / 'leasing' / 'compose' / '.env')
+    assert env['LITELLM_SALT_KEY'] == 'sk-first'
+    with pytest.raises(SystemExit, match='sk-'):
+        EnvCLI.main(argv=['LITELLM_MASTER_KEY=plain'])
+
+
+def test_env_refuses_a_db_password_postgres_already_holds(tmp_path, monkeypatch):
+    monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
+    from infer_stack.cli.commands_leasing import EnvCLI
+    from infer_stack.config import default_state_paths
+
+    EnvCLI.main(argv=['LITELLM_DB_PASSWORD=before-init'])     # pinning your own: fine
+    from pathlib import Path
+
+    data = Path(default_state_paths()['postgres_litellm'])
+    data.mkdir(parents=True)
+    (data / 'PG_VERSION').write_text('17\n')
+    with pytest.raises(SystemExit, match='lock the gateway out'):
+        EnvCLI.main(argv=['LITELLM_DB_PASSWORD=after-init'])

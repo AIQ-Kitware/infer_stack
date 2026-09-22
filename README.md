@@ -349,6 +349,13 @@ infer-stack env LITELLM_MASTER_KEY
 infer-stack env VLLM_BACKEND_API_KEY
 ```
 
+To replace the gateway's master key (refused while leases are active; the
+gateway restarts, and clients must fetch the key again):
+
+```bash
+infer-stack secrets rotate
+```
+
 When you intentionally want the old quick behavior, skip the readiness wait:
 
 ```bash

@@ -666,6 +666,37 @@ class Controller:
             )
             return self._publish()
 
+    def rotate_gateway_key(self, *, force: bool = False) -> ReconcileResult:
+        """``infer-stack secrets rotate``: replace the LiteLLM master key.
+
+        Refused while any lease is ACTIVE unless ``force``: its holder
+        authenticates with the old key, and the gateway restarts. The new key
+        is written, then published like any desired-state change, so the
+        gateway (and Open WebUI) are recreated with it. A declined apply puts
+        the old key back.
+        """
+        from .backend import ConvergeAborted
+        from .profile import ProfileMismatch
+
+        rotate = getattr(self.backend, 'rotate_master_key', None)
+        if rotate is None or not getattr(self.backend, 'litellm', False):
+            raise ProfileMismatch('no LiteLLM gateway to rotate a key for')
+        with self._global_lock():
+            leases, _ = self.ledger.status(virtual_expiry=True)
+            active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
+            if active and not force:
+                raise ProfileMismatch(
+                    f'{len(active)} lease(s) are active and hold the current key '
+                    '(release them, or pass --force)'
+                )
+            self._mark_pending(apply=True)
+            replaced = rotate()
+            try:
+                return self._publish()
+            except ConvergeAborted:
+                self.backend.restore_env(replaced)
+                raise
+
     def observe_state(self) -> dict:
         """A read-only health view for ``leases`` / ``status`` (plan step P10).
 

@@ -101,3 +101,22 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     tmp = path.with_name(f'{path.name}.tmp')
     tmp.write_text(text, encoding='utf-8')
     os.replace(tmp, path)
+
+
+def remove_env_keys(path: Path, keys) -> None:
+    """Drop ``keys`` from the .env file, keeping every other line as it is."""
+    keys = set(keys)
+    if not keys or not path.exists():
+        return
+    kept = [
+        raw for kind, key, raw in _parse_env_lines(path.read_text(encoding='utf-8'))
+        if not (kind == 'kv' and key in keys)
+    ]
+    text = '\n'.join(kept)
+    if text and not text.endswith('\n'):
+        text += '\n'
+    import os
+
+    tmp = path.with_name(f'{path.name}.tmp')
+    tmp.write_text(text, encoding='utf-8')
+    os.replace(tmp, path)

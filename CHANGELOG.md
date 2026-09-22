@@ -2,6 +2,21 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `infer-stack secrets rotate` replaces the gateway's master key
+
+It writes a new `LITELLM_MASTER_KEY`, restarts the gateway with it through a
+normal publication, and checks that the new key is accepted and the old one
+rejected. Refused while leases are active unless `--force`.
+
+LiteLLM encrypts the routes dynamic routing stores in Postgres with
+`LITELLM_SALT_KEY`, falling back to the master key when that is unset, so
+changing only the key would have made them unreadable. The first rotation pins
+the salt to the old key. `env LITELLM_MASTER_KEY=...` now does the same and
+rejects a key without the `sk-` prefix (previously it was silently replaced on
+the next render). `env LITELLM_DB_PASSWORD=...` is refused once Postgres has
+initialised its data directory, because Postgres keeps the password it was
+created with.
+
 ### The TUI's engines log view no longer shows the gateway
 
 "(engines — no litellm)" streamed litellm lines. Three causes, each enough:
