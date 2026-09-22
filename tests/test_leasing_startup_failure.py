@@ -15,10 +15,13 @@ from infer_stack.leasing.compose import CRASH_LOOP_RESTARTS, classify_engine_log
 from infer_stack.leasing.residency import DEPLOYMENT_LABEL
 from test_leasing_admission import CAT, acquire, make
 
+# A synthetic log in the shape the engine really emits. The architecture name
+# is invented on purpose: which models an evaluation runs is not this public
+# repo's to publish (see docs/repo_visibility.md in the superproject).
 CRASH_LOG = (
     'INFO 09-21 10:00:00 api_server.py:1 vLLM API server version 0.25.1\n'
     'ValueError: The checkpoint you are trying to load has model type '
-    '`bailing_moe_v3` but Transformers does not recognize this architecture. '
+    '`example_moe_v1` but Transformers does not recognize this architecture. '
     'If the model is custom, set trust_remote_code=True.\n'
 )
 
