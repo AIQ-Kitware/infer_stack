@@ -84,9 +84,9 @@ This is the plan's test 25. It changes behaviour for anyone who edits
 `catalog.yaml` and immediately acquires the new endpoint. With the quiescent
 publish above, they must publish first, or wait until the stack is idle.
 
-Question: is that acceptable for current workflows? The incubilate and
-entrypoint scripts pass `--catalog` with an overlay that can differ between
-runbooks sharing one host. If they genuinely use **different catalogs
+Question: is that acceptable for current workflows? Downstream entrypoint
+scripts pass `--catalog` with an overlay that can differ between runbooks
+sharing one host. If they genuinely use **different catalogs
 concurrently**, a single frozen catalog breaks them, and the profile would have
 to hold the **union** instead (`routes seed` already builds unions). See open
 question A.

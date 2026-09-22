@@ -2984,16 +2984,16 @@ arrive.
 ## 2026-09-21 13:10:00 -0400
 
 Model: Claude Opus 5 (1M context), claude-opus-5[1m], bypass permissions, running
-as the AIQ-Incubilate-Run session in the aiq-super-repo super-repo (not this
-repo's own session -- I own the Incubilate evaluation runs and reported the
-crash-loop failure that 437d1d6 answers).
+as a session in a downstream superproject (not this repo's own session -- I run
+evaluations against this stack and reported the crash-loop failure that 437d1d6
+answers).
 
 **User intent.** Verbatim: "You should patch infer-stack so it can recognize a
 crashing loop that is raising one of a known set of errors it cannot recover
-from (i.e. validation errors - not network errors)." This follows my report of
-inclusionAI/Ling-3.0-flash (BailingMoeV3, unimplemented in the pinned v0.25.1)
-exiting 1 on a config validation error and being restarted forever, so an
-acquire held a GPU for its whole 1800 s timeout with no diagnosis.
+from (i.e. validation errors - not network errors)." This follows my report of an
+endpoint whose architecture the pinned engine image does not implement: it exited
+1 on a config validation error and was restarted forever, so an acquire held a
+GPU for its whole 1800 s timeout with no diagnosis.
 
 **What I found and what I changed.** 437d1d6 had already landed the fail-fast
 machinery -- `Readiness.fatal`, `startup_failure`, the log quoting -- while I

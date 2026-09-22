@@ -274,7 +274,7 @@ def test_lease_too_big_for_the_host_fails_without_waiting():
     """A lease whose deployments cannot fit TOGETHER on an idle host must fail
     at once, not wait out the placement timeout.
 
-    This is the Incubilate shape: a 4-GPU answerer plus a 1-GPU extractor,
+    A shape downstream evaluations hit: a 4-GPU model plus a 1-GPU auxiliary,
     held by one lease, on a 4-GPU host. Each deployment is individually
     placeable, so the planner's permanent-failure branch says nothing; only the
     aggregate is impossible. Waiting is worse than useless -- the lease holds

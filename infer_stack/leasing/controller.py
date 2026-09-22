@@ -1736,8 +1736,8 @@ class Controller:
                 # frozen endpoint until the TTL expired. An interrupted wait is
                 # an acquire that did not deliver, exactly like a timeout, so it
                 # rolls back the same way before the interrupt continues.
-                # Measured 2026-09-21: an interrupted `run --endpoint
-                # ling3.0-flash` blocked the host's leasing for 22 minutes.
+                # Measured 2026-09-21: one interrupted `run` blocked every
+                # acquire on the host for 22 minutes.
                 self.release(result.lease.id)
                 raise
             if not wait_result.ready:

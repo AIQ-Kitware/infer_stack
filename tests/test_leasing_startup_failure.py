@@ -1,7 +1,7 @@
 """An engine that can never start must fail fast, with its own error.
 
-Reported from a real run: `inclusionAI/Ling-3.0-flash` (an architecture this
-vLLM build does not implement) exits immediately, `restart: unless-stopped`
+Reported from a real run: an endpoint whose architecture this vLLM build does
+not implement exits immediately, `restart: unless-stopped`
 restarts it forever, and `observe()` only counts *running* services -- so the
 acquire waited out its whole 1800 s timeout holding a GPU, and the engine's
 error ("set trust_remote_code=True") never reached the operator.

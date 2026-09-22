@@ -1490,7 +1490,7 @@ def _fake_weights(hf_cache: Path, model_id: str, mib: int):
 def test_plan_on_idle_host_sees_the_aggregate_that_cannot_fit(tmp_path):
     """Two deployments each placeable alone, impossible together.
 
-    The Incubilate shape: a tensor-parallel-4 answerer plus a 1-GPU extractor
+    A shape downstream evaluations hit: a tensor-parallel-4 model plus a 1-GPU auxiliary
     on a 4-GPU host. Neither trips the planner's permanent-failure branch --
     each fits by itself -- so only planning them as a set reveals that the
     host can never hold both. The controller uses this to fail such a lease
