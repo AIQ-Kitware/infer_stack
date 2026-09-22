@@ -42,6 +42,18 @@ the apply; it needs no further change.
 
 ### V15: lock hold per operation (decides D22 and D25)
 
+**Partly done, from production logs rather than a run.** A downstream
+evaluation session extracted 30 shard logs of a 48-shard run: the apply an
+acquire waits on held the lock ~1 s (6 s max), a release 0-1 s, one apply per
+shard. That confirms D22 and resolves D25 **for a static gateway at
+concurrency 2**. What is still worth measuring deliberately:
+
+- the same add/remove **with dynamic routing**, which adds admin-API route
+  reconciliation to the hold;
+- a **fresh dynamic bootstrap** (Postgres health wait, then the gateway);
+- **higher concurrency** than 2.
+
+
 Measure the whole command, which is dominated by the lock hold:
 
 ```bash

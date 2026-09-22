@@ -3082,3 +3082,39 @@ a retry, impossible costs the whole lease. The reporting detail that made it
 diagnosable in one read was that the placement error quotes the per-GPU figure
 it used — a number that was recognisably two copies of the model pointed at
 the cache immediately, not at the model.
+
+## 2026-09-22 13:02:39 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**What happened.** V15 — the host measurement the plan's central decision (D22,
+serialised publication) was provisionally adopted pending — came back from
+production logs rather than from a deliberate run. A downstream evaluation
+session extracted 30 shard logs of a 48-shard run: the apply an acquire waits
+on held the lock about 1 s (6 s max), a release 0-1 s, one apply per shard,
+against a static gateway at concurrency 2.
+
+**What I changed.** Only records, no code:
+
+- the plan's status line and §9 now say D22 is **confirmed for that regime**,
+  with the dynamic-routing and higher-concurrency arms still open;
+- V15.1 is a row in §7 carrying the numbers and the reporter's caveats;
+- **D25 resolved: keep the current bounds.** The lean was 5× the observed p95
+  with a 30 s floor for `up -d`, which the measurement would put at 30 s. I
+  kept 1800 s instead, because an `up` that pulls an image legitimately takes
+  far longer and pre-pull only covers images the published profile names. The
+  bounds exist to stop a hang holding the lock forever, not to trim a fast
+  path;
+- known-limitations' "applies run one at a time" entry now carries the measured
+  numbers, including that the fallback it proposes (skip an apply whose render
+  matches the last success) would have saved nothing here.
+
+**Reflection.** The caveats are what make this usable. Concurrency 2, a static
+gateway, and 1 s log resolution mean "1 s median" is really "at or below what
+we can see", and the arm that would stress the design — route reconciliation
+inside the hold — is exactly the one not covered. Recording that next to the
+numbers is what keeps this from being read later as "V15 passed". Also worth
+noting: crash-loop detection met a genuinely unloadable model on real Docker
+and diagnosed it in seconds where the same failure had burned a 1800 s timeout
+the week before. That is the first real-Docker confirmation of any of the
+fail-fast work.

@@ -179,6 +179,13 @@ Every desired-state change renders and applies under one host-wide lock, so a
 burst of N concurrent acquires runs N selective applies one after another. Each
 caller can wait behind the others. An apply with nothing to change only reads
 residency.
+
+Measured on a host with per-shard leases (static gateway, two shards
+concurrent): the lock hold for an acquire's apply was about 1 s, 6 s at worst,
+and one apply per shard. At that scale serialisation is not what makes a run
+slow — model load (minutes) and generation dominate. Dynamic routing, which
+adds route reconciliation to the hold, and higher concurrency are not yet
+measured.
 If lock wait becomes the bottleneck, skip an apply whose render is identical to
 the last successful one; do not reintroduce a separate apply lock.
 

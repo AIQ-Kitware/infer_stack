@@ -5,10 +5,13 @@
 - **Status:** **P1-P10 are implemented** on `dev/0.7.1` (see §8.1 for commits and
   the deviations taken during implementation). Host verification (§7) is
   outstanding: `host-verification-2026-09-16.md` has the runbook.
-- **The central decision in this revision, D22 (serialised publication), is
-  adopted provisionally.** It is confirmed by host measurement V15 (§7). If V15
-  shows serialisation is too slow for real per-shard churn, revision 6 (`be6c89d`)
-  describes the bundle/activation alternative, and only §4.3 changes.
+- **D22 (serialised publication) is CONFIRMED** for the regime it was doubted
+  in: per-shard churn against a static gateway. Measured on the host from 30
+  shard logs of a 48-shard run (§7, V15): the lock hold for an acquire's apply
+  was ~1 s median and 6 s max, and a release ~0-1 s, against
+  `ROUTE_RECONCILE_STEADY_S = 20`. Dynamic routing and concurrency beyond 2
+  remain unmeasured. If they ever fail, revision 6 (`be6c89d`) describes the
+  bundle/activation alternative, and only §4.3 changes.
 - **History:** revisions 1-6 are `5244229`, `7be95ba`, `3aeb5c0`, `f0bf2f1`,
   `e7242f0`, `be6c89d`. Each §0 there records one review round.
 - **Evidence:**
@@ -638,7 +641,8 @@ One-time, explicit, on upgrade:
 | V1 | `HostConfig.DeviceRequests[].DeviceIDs` holds rendered GPU indices (confirmed on the guest daemon) | P1 close |
 | V2 | project- and label-scoped `docker ps -a` lists every model container | P1 close |
 | V8 | a `paused` container keeps its GPU memory | P1 close |
-| **V15** | **Whole `_global_lock` hold** for: a no-op apply; adding one model to a running static-gateway stack; removing one; the same add and remove with dynamic routing; a fresh dynamic gateway and Postgres bootstrap, measured separately; KubeAI apply if used; and several concurrent per-shard callers | **D22 final** |
+| **V15** | **Whole `_global_lock` hold** for: a no-op apply; adding one model to a running static-gateway stack; removing one; the same add and remove with dynamic routing; a fresh dynamic gateway and Postgres bootstrap, measured separately; KubeAI apply if used; and several concurrent per-shard callers | **D22** — **static-gateway arm done** (see V15.1); dynamic routing and concurrency > 2 outstanding |
+| **V15.1** | **Done.** From 30 shard logs of a 48-shard run (12 h wall, per-shard leases, each holding one model plus a shared keep-warm auxiliary), reported by a downstream evaluation session: acquire → the apply that brings engines up, **1 s median / 6 s max**; release at shard end, **0 s median / 1 s max**; **1 apply per shard**. Caveats from the reporter: concurrency was 2 (each shard reserves answerer + auxiliary GPUs), the gateway was static so no admin-API route reconciliation is included, and the times come from 1 s-resolution log timestamps, so "1 s" means "at or below the resolution" | D22 confirmed for this regime; D25 resolved |
 | V3 | whether `up --remove-orphans` can start a service before an orphan frees its GPU | confirms the barrier is necessary |
 | V5 | `up -d --no-deps <svc>` with an unchanged stanza does not recreate | P8 |
 | V6 | crashed-container states under `unless-stopped` | P8 |
@@ -716,18 +720,28 @@ in P3-P10 changes.
 **Resolved:**
 
 - **D1-D21:** as recorded in revisions 2-6.
-- **D22: serialised publication**, provisionally adopted, final after V15.
+- **D22: serialised publication** — **confirmed** by V15.1 for per-shard churn
+  against a static gateway (1 s median, 6 s max lock hold). Dynamic routing and
+  higher concurrency are still unmeasured; the fallback stands if they fail.
 - **D23:** a later ordinary apply starts leases staged with `--no-apply`. That is
   current behaviour, kept and documented.
 - **D24:** route reconciliation under the lock has an end-to-end wall-clock
-  deadline: small in steady state, larger for explicit bootstraps. Values come from
-  V15.
+  deadline: small in steady state, larger for explicit bootstraps. V15.1 puts
+  steady-state holds at ~1 s against the 20 s budget, so the values stand.
 
-**Open:**
+- **D25: timeout values for Docker operations under the lock** — **resolved:
+  keep the current bounds.** V15.1 measured steady-state holds of ~1 s (6 s
+  max), two orders of magnitude inside `DOCKER_TIMEOUT_CONVERGE = 1800`, and
+  well inside `ROUTE_RECONCILE_STEADY_S = 20`. The lean was "5× the observed
+  p95, floor 30 s for `up -d`", which the measurement puts at 30 s — but an
+  `up` that has to pull an image legitimately takes far longer, and pre-pull
+  (`config publish`) only covers images the profile names. The bounds exist to
+  stop a *hang* holding the lock forever, not to trim a fast path, so they stay
+  generous. Revisit only if a hang is observed in practice.
 
-| id | question | author's lean |
-|---|---|---|
-| **D25** | Timeout values for Docker operations under the lock | Set from V15 measurements: roughly 5× the observed steady-state p95 per operation, with a floor of 30 s for `up -d` |
+**Open:** none. D25 was the last, and V15.1 resolved it. What remains is
+verification, not decision: the dynamic-routing and higher-concurrency arms of
+V15, and the host checks in `host-verification-2026-09-16.md`.
 
 ---
 
