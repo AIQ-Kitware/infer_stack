@@ -1619,14 +1619,36 @@ def test_gateway_services_are_excluded_from_the_default_log_view():
     assert ENGINE_SERVICES not in names
 
 
-def test_named_log_process_scopes_docker_compose_to_that_service(monkeypatch):
-    """A named log view must not ask Docker Compose for gateway output."""
+def test_named_log_process_follows_only_that_service(monkeypatch):
+    """A named log view must never read the gateway's output."""
+    import os
+    import subprocess
+    import time
+
     from infer_stack.tui import _DockerLogProc
 
-    captured = {}
+    service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
+    touched = []
+
+    class _Done:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ['docker', 'ps']:
+            return _Done(f'c1 running {service}\nc2 running litellm\n')
+        touched.append(cmd[-1])                   # docker logs --tail N <id>
+        return _Done(b'')
 
     class _Proc:
-        stdout = iter(())
+        def __init__(self, cmd):
+            touched.append(cmd[-1])               # docker attach <id>
+            self._r, w = os.pipe()
+            os.close(w)                           # immediate EOF
+            self.stdout = os.fdopen(self._r, 'rb')
+
+        def poll(self):
+            return 0
 
         def terminate(self):
             pass
@@ -1634,20 +1656,15 @@ def test_named_log_process_scopes_docker_compose_to_that_service(monkeypatch):
         def wait(self, timeout=None):
             return 0
 
-        def kill(self):
-            pass
-
-    def fake_popen(cmd, **kwargs):
-        captured['cmd'] = list(cmd)
-        return _Proc()
-
-    monkeypatch.setattr('subprocess.Popen', fake_popen)
-    service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
-    _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
-
-    cmd = captured['cmd']
-    assert cmd[-1] == service
-    assert 'litellm' not in cmd
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    monkeypatch.setattr(subprocess, 'Popen', lambda cmd, **kw: _Proc(cmd))
+    proc = _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
+    deadline = time.monotonic() + 5
+    while len(touched) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    proc.terminate()
+    assert touched[:2] == ['c1', 'c1']           # its history, then its live output
+    assert 'c2' not in touched                   # the gateway, never
 
 
 def test_stale_log_stream_cannot_bleed_into_new_service_selection():

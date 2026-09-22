@@ -200,38 +200,203 @@ INFER_THEME = Theme(
 )
 
 
+class LogLineSplitter:
+    r"""Cut a container's raw output into display lines, ``\r`` included.
+
+    A progress bar (a model download) redraws one line with ``\r`` and may not
+    write a newline for minutes. Treating ``\r`` as a line end shows it while
+    it moves; keeping at most one redraw per ``every`` seconds stops it
+    flooding the pane.
+
+    Example:
+        >>> t = [0.0]
+        >>> s = LogLineSplitter(every=2.0, clock=lambda: t[0])
+        >>> s.feed('start\nfetch 1%\rfetch 2%\r')
+        ['start', 'fetch 1%']
+        >>> t[0] = 3.0
+        >>> s.feed('fetch 9%\rdone\n')
+        ['fetch 9%', 'done']
+        >>> t[0] = 10.0                     # tqdm starts each redraw with \r
+        >>> s.feed('\rpart 1\rpart 2\r')
+        ['part 1']
+    """
+
+    def __init__(self, *, every: float = 2.0, clock: Callable[[], float] = time.monotonic):
+        self.every = every
+        self.clock = clock
+        self._buf = ''
+        self._last_redraw = float('-inf')
+
+    def feed(self, text: str) -> list[str]:
+        self._buf += text
+        out: list[str] = []
+        while True:
+            cut = min((i for i in (self._buf.find('\n'), self._buf.find('\r')) if i >= 0),
+                      default=-1)
+            if cut < 0:
+                return out
+            line, end = self._buf[:cut], self._buf[cut]
+            self._buf = self._buf[cut + 1:]
+            if not line.strip():
+                if end == '\r' and self._buf.startswith('\n'):
+                    self._buf = self._buf[1:]
+                continue                                # nothing to show, no slot used
+            if end == '\r':
+                if self._buf.startswith('\n'):         # a CRLF line ending
+                    self._buf = self._buf[1:]
+                elif self.clock() - self._last_redraw < self.every:
+                    continue                            # a redraw too soon after the last
+                else:
+                    self._last_redraw = self.clock()
+            out.append(line)
+
+    def flush(self) -> list[str]:
+        line, self._buf = self._buf, ''
+        return [line] if line.strip() else []
+
+
 class _DockerLogProc:
-    """A live ``docker compose logs -f`` process for one (or all) service(s)."""
+    r"""Follow the project's containers: recent history, then live output.
+
+    Not ``docker compose logs -f``, and not ``docker logs -f`` either: Docker's
+    log driver stores output line by line and holds a partial line until its
+    newline, so a download bar redrawn with ``\r`` showed nothing for many
+    minutes and then arrived all at once (measured with both). ``docker
+    attach`` reads the container's output as it is written, so each container
+    gets its recent ``docker logs --tail`` (complete lines), then an attach
+    with stdin closed and signals not forwarded -- ending it never touches the
+    container.
+
+    Containers are re-listed every ``poll`` seconds: one created later (a model
+    starting, a recreate) is followed from its first line, and one that
+    restarted is attached again. ``stdout`` yields ``service  | line`` like
+    Compose. Output written between the history read and the attach (a few
+    milliseconds) can be missed.
+    """
+
+    poll = 3.0
 
     def __init__(self, project: str, compose_file: str, service=None):
-        cmd = [
-            'docker', 'compose', '-p', project, '-f', compose_file,
-            'logs', '-f', '--tail', '200', '--no-color',
-        ]
-        # `docker compose logs` takes any number of service names, so the
-        # engines-only view is just the gateway left off the end rather than a
-        # filter applied to the stream.
+        import queue
+        import threading
+
+        del compose_file                    # the project label is enough to find them
+        self.project = project
         if isinstance(service, (list, tuple)):
-            cmd.extend(str(s) for s in service)
-        elif service:
-            cmd.append(str(service))
+            self.services = {str(s) for s in service}
+        else:
+            self.services = {str(service)} if service else None
+        self._lines: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._seen: set[str] = set()
+        self._live: dict[str, subprocess.Popen] = {}
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _containers(self) -> list[tuple[str, str, bool]]:
+        """(id, service, running) for this project's containers in view."""
         from .leasing.compose import docker_environment
 
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=docker_environment(),
+        out = subprocess.run(
+            ['docker', 'ps', '-a', '--filter',
+             f'label=com.docker.compose.project={self.project}',
+             '--format', '{{.ID}} {{.State}} {{.Label "com.docker.compose.service"}}'],
+            capture_output=True, text=True, timeout=30, env=docker_environment(),
+        ).stdout
+        found = []
+        for row in out.splitlines():
+            cid, _, rest = row.strip().partition(' ')
+            state, _, svc = rest.partition(' ')
+            if cid and (self.services is None or svc in self.services):
+                found.append((cid, svc, state == 'running'))
+        return sorted(found, key=lambda row: row[1])
+
+    def _watch(self) -> None:
+        import threading
+
+        first = True
+        while not self._stop.is_set():
+            try:
+                found = self._containers()
+            except Exception:  # noqa: BLE001 - docker unreachable: try again
+                found = []
+            for cid, svc, running in found:
+                attached = cid in self._live and self._live[cid].poll() is None
+                if cid not in self._seen:
+                    # Existing containers: the recent tail. A new one: all of it.
+                    history = '200' if first else 'all'
+                elif running and not attached:
+                    history = None          # restarted: attach again, no repeat
+                else:
+                    continue
+                self._seen.add(cid)
+                threading.Thread(target=self._follow, args=(cid, svc, history, running),
+                                 daemon=True).start()
+            first = False
+            self._stop.wait(self.poll)
+
+    def _follow(self, cid: str, service: str, history: str | None, running: bool) -> None:
+        from .leasing.compose import docker_environment
+
+        prefix = f'{service}  | '
+        if history is not None:
+            try:
+                old = subprocess.run(
+                    ['docker', 'logs', '--tail', history, cid],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+                    env=docker_environment(),
+                ).stdout.decode('utf-8', 'replace')
+            except Exception:  # noqa: BLE001
+                old = ''
+            split = LogLineSplitter(every=0.0)
+            for line in split.feed(old) + split.flush():
+                self._lines.put(prefix + line)
+        if not running or self._stop.is_set():
+            return
+        proc = subprocess.Popen(
+            ['docker', 'attach', '--no-stdin', '--sig-proxy=false', cid],
+            # Engines log to stderr, which attach passes out on its own stderr.
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=docker_environment(),
         )
+        self._live[cid] = proc
+        self._pump(proc, prefix)
+
+    def _pump(self, proc: subprocess.Popen, prefix: str) -> None:
+        import codecs
+        import os
+
+        decode = codecs.getincrementaldecoder('utf-8')('replace').decode
+        split = LogLineSplitter()
+        fd = proc.stdout.fileno()
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                for line in split.feed(decode(chunk)):
+                    self._lines.put(prefix + line)
+        finally:
+            proc.stdout.close()
+        for line in split.flush():
+            self._lines.put(prefix + line)
 
     @property
     def stdout(self) -> Iterable[str]:
-        return self._proc.stdout or iter(())
+        import queue
+
+        while not self._stop.is_set():
+            try:
+                yield self._lines.get(timeout=0.5) + '\n'
+            except queue.Empty:
+                continue
 
     def terminate(self) -> None:
-        self._proc.terminate()
-        try:
-            self._proc.wait(timeout=2)
-        except Exception:  # noqa: BLE001
-            self._proc.kill()
+        self._stop.set()
+        for proc in list(self._live.values()):
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                proc.kill()
 
 
 class _Divider(Static):

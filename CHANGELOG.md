@@ -2,6 +2,19 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The TUI's Logs tab shows download progress as it happens
+
+A model's first start downloads weights with a progress bar that redraws one
+line with `\r`. Docker's log driver stores output line by line and holds a
+partial line until its newline, so both `docker compose logs -f` and
+`docker logs -f` showed nothing for many minutes and then everything at once.
+The Logs tab now reads each container's recent history with `docker logs
+--tail`, then its live output with `docker attach --no-stdin
+--sig-proxy=false` (ending that never touches the container). It shows at
+most one redraw every 2 s. Containers created while the tab is open are
+picked up within 3 s, and a restarted container is followed again.
+`infer-stack logs -f` still goes through Compose and still has the delay.
+
 ### A first-use image pull shows its progress
 
 An acquire whose engine image was not yet on the host sat silent for as long
