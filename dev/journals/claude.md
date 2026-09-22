@@ -3118,3 +3118,29 @@ noting: crash-loop detection met a genuinely unloadable model on real Docker
 and diagnosed it in seconds where the same failure had burned a 1800 s timeout
 the week before. That is the first real-Docker confirmation of any of the
 fail-fast work.
+
+## 2026-09-22 13:09:24 -0400
+
+**Model.** Claude Opus 5 (1M context), `claude-opus-5[1m]`, guest VM.
+
+**What happened.** The weight-floor fix is now confirmed end to end on the
+host, not only at the function level (see the earlier entry): the model that
+could not place at all this morning — the planner read two copies of its
+weights and called the pool permanently insufficient — placed on one card,
+loaded in about six minutes and generated.
+
+**What it covers, and what it does not.** One repository shape: a quantised
+serving set at the snapshot root beside a second complete set in a
+subdirectory, one revision. The risk I accepted when choosing to under-count —
+a repository whose *serving* set genuinely spans subdirectories — is still
+unexercised, and would show up as an out-of-memory at load rather than as a
+refusal. The reporter has agreed that if that ever happens the useful evidence
+is the pair (measured value from `infer-stack measure`, floor computed),
+not another placement anecdote.
+
+**Reflection.** Worth noticing which half of the verification was the valuable
+one. The fixed number on the duplicated repo only confirmed the arithmetic I
+had already written a test for; the unchanged numbers on single-set repos, and
+then a real load that did not OOM, are what rule out the failure mode the fix
+could have introduced. A fix that makes the reported number smaller is easy to
+confirm and easy to over-confirm.
