@@ -12,6 +12,27 @@ frozen by the leasing epoch -- until the TTL expired. Measured on a real host:
 one interrupted `run` blocked all leasing for 22 minutes. An interrupted wait is
 an acquire that did not deliver, so it now rolls back exactly like a timeout.
 
+### The VRAM floor stops double-counting duplicate weight sets
+
+A repository that ships the served weights plus a second complete copy --
+`original/`, `metal/`, `consolidated/`, or in-tree GGUF/MLX variants -- had
+every copy added together. Measured on a host: a root quantised set and a
+same-sized `original/` bf16 set reported 121.5 GiB for a model that serves in
+60.8 GiB, which exceeded every GPU and made it permanently unplaceable ("the
+pool can never satisfy that", so waiting could not help either).
+
+The engine loads one set of weights, so the floor is now the largest set, not
+the total: weight files are grouped by directory within the snapshot and by
+format family, and the largest group wins. This is the rule the floor already
+applied across snapshots, applied within one. Sharded weights in one directory
+are still one set and still add up.
+
+**A recorded measurement now also beats the floor.** `infer-stack measure`
+records the real footprint of an exact serve, and clamping that with a
+heuristic lower bound could only make a model that demonstrably ran look
+unplaceable. A hand-declared `min_vram_gib` is a guess and is still clamped,
+which is what the floor is for.
+
 ### Redefining an endpoint nothing is running no longer blocks the host
 
 Reported from a real host: two endpoints were re-registered with

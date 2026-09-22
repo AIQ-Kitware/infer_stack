@@ -396,3 +396,24 @@ def test_a_declared_requirement_is_already_per_gpu():
                 'placement': {'min_vram_gib': 90.0, 'floor_vram_gib': 135.43}}
 
     assert min_vram_per_gpu(_D()) == pytest.approx(90.0)
+
+
+def test_a_measurement_beats_the_weight_floor(tmp_path):
+    """A recorded measurement is the real footprint; the floor is a heuristic.
+
+    Clamping the first with the second can only make a model that demonstrably
+    ran look unplaceable. A hand-declared guess is still clamped.
+    """
+    from infer_stack.leasing.placement import min_vram_per_gpu
+
+    def deployment(**placement):
+        return Deployment('g', 'ck', 'vllm', 'shared-compatible', {},
+                          {'engine': 'vllm', 'runtime': {}, 'placement': placement},
+                          {}, DeploymentState.LIVE, 0.0, 0.0)
+
+    measured = deployment(min_vram_gib=61.0, floor_vram_gib=121.5,
+                          min_vram_source='measured')
+    assert min_vram_per_gpu(measured) == 61.0
+
+    declared = deployment(min_vram_gib=61.0, floor_vram_gib=121.5)
+    assert min_vram_per_gpu(declared) == 121.5        # a guess is still clamped

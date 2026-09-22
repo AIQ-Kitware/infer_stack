@@ -113,6 +113,44 @@ def test_weight_floor_takes_largest_snapshot_not_sum(tmp_path):
     assert floor == round(5 * 1024 ** 2 / 1024 ** 3, 2)
 
 
+def test_weight_floor_takes_largest_set_within_one_snapshot(tmp_path):
+    """A repo that ships the served weights AND a second complete copy.
+
+    Measured on a host: a root quantised set plus a same-sized bf16
+    `original/` set reported twice the real footprint, which exceeded every
+    GPU and made the model permanently unplaceable ("the pool can never
+    satisfy that"). The engine loads one set, so the floor is the largest set.
+    """
+    snap = tmp_path / 'hub' / 'models--org--m' / 'snapshots' / 'abc'
+    (snap / 'original').mkdir(parents=True)
+    (snap / 'metal').mkdir()
+    (snap / 'model-00001.safetensors').write_bytes(b'x' * (4 * 1024 ** 2))
+    (snap / 'model-00002.safetensors').write_bytes(b'x' * (2 * 1024 ** 2))
+    (snap / 'original' / 'consolidated.safetensors').write_bytes(b'x' * (6 * 1024 ** 2))
+    (snap / 'metal' / 'weights.bin').write_bytes(b'x' * (5 * 1024 ** 2))
+    floor = weight_floor_gib('org/m', tmp_path)
+    # max(root 6, original 6, metal 5) = 6 MiB, NOT the 17 MiB total.
+    assert floor == round(6 * 1024 ** 2 / 1024 ** 3, 2)
+
+
+def test_weight_floor_does_not_add_in_tree_gguf_to_safetensors(tmp_path):
+    snap = tmp_path / 'hub' / 'models--org--m' / 'snapshots' / 'abc'
+    snap.mkdir(parents=True)
+    (snap / 'model.safetensors').write_bytes(b'x' * (8 * 1024 ** 2))
+    (snap / 'model-q4.gguf').write_bytes(b'x' * (3 * 1024 ** 2))
+    floor = weight_floor_gib('org/m', tmp_path)
+    assert floor == round(8 * 1024 ** 2 / 1024 ** 3, 2)
+
+
+def test_weight_floor_still_sums_the_shards_of_one_set(tmp_path):
+    """Sharded weights in one directory ARE one set and must be added up."""
+    snap = tmp_path / 'hub' / 'models--org--m' / 'snapshots' / 'abc'
+    snap.mkdir(parents=True)
+    for i in range(4):
+        (snap / f'model-0000{i}-of-00004.safetensors').write_bytes(b'x' * (3 * 1024 ** 2))
+    assert weight_floor_gib('org/m', tmp_path) == round(12 * 1024 ** 2 / 1024 ** 3, 2)
+
+
 def test_weight_floor_absent_is_none(tmp_path):
     assert weight_floor_gib('org/never-downloaded', tmp_path) is None
     assert weight_floor_gib(None, tmp_path) is None

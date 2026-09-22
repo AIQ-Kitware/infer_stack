@@ -220,6 +220,16 @@ def min_vram_per_gpu(deployment: Deployment) -> float:
     placement = deployment.spec.get('placement', {}) or {}
     floor = float(placement.get('floor_vram_gib') or 0.0)
     floor = floor / weight_shard_count(deployment)
+    if placement.get('min_vram_source') == 'measured':
+        # A recorded measurement is the real footprint of this exact serve
+        # (model, image, dtype, context -- see vram.measurement_key), while the
+        # floor is a heuristic lower bound read off the files on disk. Clamping
+        # a measurement with a heuristic is backwards: it can only make a model
+        # that demonstrably ran look unplaceable. A hand-DECLARED value is a
+        # guess and is still clamped, which is what the floor exists for.
+        measured = float(placement.get('min_vram_gib') or 0.0)
+        if measured > 0:
+            return measured
     return max(declared_min_vram(deployment), floor)
 
 

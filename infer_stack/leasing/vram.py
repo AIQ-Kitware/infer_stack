@@ -167,12 +167,41 @@ def weight_floor_gib(
     """Weight bytes (GiB) from the local HF hub cache, or ``None`` if absent.
 
     Stat-only over ``<hf_cache>/hub/models--Org--Name/snapshots/*/`` weight
-    files (symlinks into ``blobs/`` are followed). Multiple snapshots (an old
-    and a new revision) would double-count, so the LARGEST single snapshot
-    wins — the floor must stay a sound underestimate of one served revision,
-    not a sum across revisions. Fail-open: any surprise (no cache yet, model
-    not downloaded, unreadable entry) returns ``None`` and placement simply
-    proceeds floor-less, exactly as before this feature.
+    files (symlinks into ``blobs/`` are followed).
+
+    **The engine loads ONE set of weights, so the floor is the largest set, not
+    the total.** Two kinds of duplicate live in a cache, and summing either one
+    inflates the floor until the model looks unplaceable on hardware that
+    serves it perfectly well:
+
+    * several *snapshots* (an old and a new revision);
+    * several *copies within one snapshot* — a repository that ships the
+      served weights at the root plus a second complete set under
+      ``original/``, ``metal/`` or ``consolidated/``, or GGUF/MLX variants
+      in-tree. Measured case: a repo with a root quantised set and a bf16
+      ``original/`` set of the same size reported twice its real footprint,
+      which exceeded every GPU on the host and produced "the pool can never
+      satisfy that".
+
+    So weight files are grouped by (directory within the snapshot, format
+    family) and the largest group wins. Under-counting is the safe direction
+    here: the floor is a lower bound on need, used only to gate eligibility,
+    and a declared ``min_vram_gib`` still applies on top of it.
+
+    Fail-open: any surprise (no cache yet, model not downloaded, unreadable
+    entry) returns ``None`` and placement simply proceeds floor-less, exactly
+    as before this feature.
+
+    Example:
+        >>> import os, tempfile
+        >>> cache = tempfile.mkdtemp()
+        >>> snap = os.path.join(cache, 'hub', 'models--org--m', 'snapshots', 'abc')
+        >>> os.makedirs(os.path.join(snap, 'original'))
+        >>> for path in ['model.safetensors', 'original/consolidated.safetensors']:
+        ...     with open(os.path.join(snap, path), 'wb') as file:
+        ...         _ = file.write(b'0' * (2 * 1024 ** 3))
+        >>> weight_floor_gib('org/m', cache)     # one 2 GiB set, not two
+        2.0
     """
     if not hf_model_id or not hf_cache:
         return None
@@ -189,14 +218,22 @@ def weight_floor_gib(
         for snapshot in model_dir.iterdir():
             if not snapshot.is_dir():
                 continue
-            total = 0
+            # (subdirectory, format family) -> bytes. One key is one candidate
+            # set of weights; the engine loads exactly one of them.
+            groups: dict[tuple[str, str], int] = {}
             for entry in snapshot.rglob('*'):
-                if entry.suffix in ('.safetensors', '.bin', '.gguf'):
-                    try:
-                        total += os.path.getsize(entry)  # follows symlinks
-                    except OSError:
-                        continue
-            best_bytes = max(best_bytes, total)
+                if entry.suffix not in ('.safetensors', '.bin', '.gguf', '.pth'):
+                    continue
+                try:
+                    size = os.path.getsize(entry)  # follows symlinks
+                except OSError:
+                    continue
+                relative = entry.relative_to(snapshot).parts
+                where = relative[0] if len(relative) > 1 else ''
+                family = 'gguf' if entry.suffix == '.gguf' else 'torch'
+                key = (where, family)
+                groups[key] = groups.get(key, 0) + size
+            best_bytes = max(best_bytes, max(groups.values(), default=0))
         if best_bytes <= 0:
             return None
         return round(best_bytes / GIB, 2)
