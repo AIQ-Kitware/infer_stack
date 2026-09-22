@@ -1352,7 +1352,7 @@ def test_tui_up_applies_through_the_controller(tmp_path):
 
 
 def test_tui_logs_stream_from_injected_source():
-    from infer_stack.tui import InferStackTUI
+    from infer_stack.tui import ALL_SERVICES, InferStackTUI
 
     controller, catalog = _ctx()
     lines = ['litellm   | started', 'litellm   | ready']
@@ -1362,6 +1362,7 @@ def test_tui_logs_stream_from_injected_source():
                             proc_factory=lambda svc: _FakeProc(lines))
         async with app.run_test() as pilot:
             await pilot.pause()
+            app._restart_logs(ALL_SERVICES)           # the gateway's own lines
             await app.workers.wait_for_complete()     # drain the log stream
             await pilot.pause()
             assert any('ready' in line for line in app._log_lines)
@@ -1370,7 +1371,7 @@ def test_tui_logs_stream_from_injected_source():
 
 
 def test_tui_compacts_registered_litellm_traceback():
-    from infer_stack.tui import InferStackTUI
+    from infer_stack.tui import ALL_SERVICES, InferStackTUI
 
     controller, catalog = _ctx()
     p = 'litellm-1 | '
@@ -1389,6 +1390,7 @@ def test_tui_compacts_registered_litellm_traceback():
         )
         async with app.run_test() as pilot:
             await pilot.pause()
+            app._restart_logs(ALL_SERVICES)           # the gateway's own lines
             await app.workers.wait_for_complete()
             await pilot.pause()
             text = '\n'.join(app._log_lines)
@@ -1697,11 +1699,51 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             target, label = app._resolve_log_target(ALL_SERVICES)
             assert target is None and label == 'all services'
 
-            # With no engines to show, fall back rather than passing an empty
-            # list and mislabelling it.
+            # With no engines there is nothing to follow. Falling back to
+            # every service would show the gateway under the engines label.
+            from infer_stack.tui import NO_LOG_TARGET
             app._service_names = lambda: ['litellm']
             target, label = app._resolve_log_target(ENGINE_SERVICES)
-            assert target is None and 'all services' in label
+            assert target is NO_LOG_TARGET and 'no engine services' in label
+
+    _run(scenario)
+
+
+def test_engines_view_follows_engines_that_appear_after_it_opened():
+    """Regression: the engines view showed litellm lines.
+
+    The pane opened while no engine existed, fell back to every service, and
+    kept that stream after engines appeared -- the selection had not changed,
+    so nothing restarted it.
+    """
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    started = []
+
+    def factory(service):
+        started.append(service)
+        return _FakeProc([])
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=factory)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            services = ['litellm']
+            app._service_names = lambda: list(services)
+            app._collapsed['docker'] = False
+            app._sync_log_services()
+            app._restart_logs(app._log_service)       # the pane opens
+            await pilot.pause(0.2)
+            assert started == []                      # nothing to follow yet
+
+            services.append('vllm-a')                 # an engine is deployed
+            app._sync_log_services()
+            await pilot.pause(0.2)
+            await pilot.pause()
+            assert started == [['vllm-a']]
+            assert None not in started                # never every service
 
     _run(scenario)
 

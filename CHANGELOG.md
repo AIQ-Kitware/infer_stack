@@ -2,6 +2,17 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The TUI's engines log view no longer shows the gateway
+
+"(engines — no litellm)" streamed litellm lines. Three causes, each enough:
+the selector was built with "(all services)" as its value, so mounting it
+switched the stream to every service; each refresh that saw the service list
+change rebuilt the options, which posted a change carrying `''` -- the value
+of "(all services)"; and a view opened before any engine existed fell back to
+every service and kept that stream once engines appeared. Refreshes no longer
+count as a selection, the engines view follows services as they come and go,
+and with no engine it says so instead of showing the gateway.
+
 ### An interrupted readiness wait releases its lease
 
 Ctrl-C during `acquire`/`run`'s readiness wait left the lease ACTIVE and its

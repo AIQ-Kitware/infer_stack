@@ -76,6 +76,9 @@ ENGINE_SERVICES = '\x00engines'
 # today, but deployment naming has carried suffixes before and a missed match
 # silently restores the noisy view.
 GATEWAY_SERVICE_HINT = 'litellm'
+# What `_resolve_log_target` returns when a view has nothing to follow. Not
+# None: None means "every service" to `docker compose logs`.
+NO_LOG_TARGET = object()
 
 
 # Textual renamed the blank Select sentinel between API generations (``NULL``
@@ -948,7 +951,7 @@ class InferStackTUI(App):
                             yield Select(
                                 [('(engines — no litellm)', ENGINE_SERVICES),
                                  ('(all services)', ALL_SERVICES)],
-                                value=ALL_SERVICES, allow_blank=False,
+                                value=ENGINE_SERVICES, allow_blank=False,
                                 id='logsvc',
                             )
                             yield RichLog(id='logs', highlight=False,
@@ -1740,16 +1743,30 @@ class InferStackTUI(App):
             ('(engines — no litellm)', ENGINE_SERVICES),
             ('(all services)', ALL_SERVICES),
         ] + [(n, n) for n in names]
-        select.set_options(options)
         # Keep whatever is selected. The two sentinels are not service names,
         # so they have to be allowed through explicitly or refreshing the
         # service list would silently knock the view back to a default.
-        select.value = (
+        keep = (
             self._log_service
             if self._log_service in names
             or self._log_service in (ENGINE_SERVICES, ALL_SERVICES)
             else ENGINE_SERVICES
         )
+        # Not a user choice, so it must not reach on_select_changed:
+        # set_options posts a Changed carrying '' -- which is ALL_SERVICES --
+        # and that switched the engines view to every service, gateway
+        # included, on each refresh that saw the service list change.
+        with select.prevent(Select.Changed):
+            select.set_options(options)
+            select.value = keep
+        self._log_service = keep
+        # The engines view names its services when the stream starts, so a
+        # stream begun before an engine existed would never show it, and one
+        # begun with an engine that has since left would miss its successor.
+        # The selection did not change, so no Select.Changed will restart it.
+        if (self._log_service == ENGINE_SERVICES
+                and not self._collapsed['docker']):
+            self._restart_logs(ENGINE_SERVICES)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == 'api-model':
@@ -1789,6 +1806,9 @@ class InferStackTUI(App):
         log.clear()
         self._log_lines = []
         target, label = self._resolve_log_target(service)
+        if target is NO_LOG_TARGET:
+            log.write(f'— {label} —')
+            return
         log.write(f'— following logs: {label} —')
         self._stream_logs(target, generation)
 
@@ -1797,14 +1817,16 @@ class InferStackTUI(App):
 
         ENGINE_SERVICES expands to the concrete non-gateway service names. If
         there are none -- nothing deployed yet, or a compose file that could
-        not be read -- fall back to every service rather than passing an empty
-        list, which `docker compose logs` would read as "all" anyway but
-        without saying so in the label.
+        not be read -- there is nothing to follow. Never fall back to every
+        service: that is the gateway's request spam under a label promising
+        its absence, and it stays that way once engines do appear.
         """
         if service == ENGINE_SERVICES:
             names = engine_services(self._service_names())
             if not names:
-                return None, 'all services (no engine services yet)'
+                return NO_LOG_TARGET, (
+                    'no engine services yet; choose (all services) '
+                    'for the gateway')
             return names, f'engines: {", ".join(names)}'
         if not service:
             return None, 'all services'
