@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `catalog show` suggests what you probably meant
+
+`infer-stack catalog show NAME` for a name that is not in the catalog now
+offers the likely intended entries, with their sections: `'gpt-oss' not
+found. Did you mean: gpt-oss-20b (model, endpoint), gpt-oss-120b (model,
+endpoint)?`. A name that is part of a longer one is matched by containment,
+which plain edit distance misses; typos are matched at a 0.75 similarity
+cutoff. `catalog endpoint show`, `catalog model show` and the unknown-endpoint
+error from `acquire` use the same matching.
+
 ### The TUI's Logs tab shows download progress as it happens
 
 A model's first start downloads weights with a progress bar that redraws one

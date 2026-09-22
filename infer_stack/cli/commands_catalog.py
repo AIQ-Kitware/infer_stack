@@ -194,6 +194,12 @@ def _show(config, section, name) -> int:
         _print_yaml(yaml.safe_dump({section: entries}, sort_keys=False))
         return 0
     if name not in entries:
+        from ..leasing.catalog import near_misses
+
+        close = near_misses(name, list(entries))
+        if close:
+            raise SystemExit(f"{section[:-1]} '{name}' not found. "
+                             f"Did you mean: {', '.join(close)}?")
         have = f" (have: {', '.join(sorted(entries))})" if entries else ''
         raise SystemExit(f"{section[:-1]} '{name}' not found{have}")
     _print_yaml(yaml.safe_dump({name: entries[name]}, sort_keys=False))
@@ -365,6 +371,23 @@ class CatalogPathCLI(_PathOverridesMixin):
         return 0
 
 
+def _not_found(name: str, data: dict) -> str:
+    """"NAME not found", naming the entries that were probably meant."""
+    from ..leasing.catalog import near_misses
+
+    where: dict[str, list[str]] = {}
+    for section in SECTIONS:
+        for entry in data.get(section) or {}:
+            where.setdefault(entry, []).append(
+                section[:-1].replace('runtime_host', 'host'))
+    close = near_misses(name, list(where))
+    if not close:
+        return (f"'{name}' not found in any section "
+                '(`infer-stack catalog show` lists everything)')
+    return f"'{name}' not found. Did you mean: " + ', '.join(
+        f'{entry} ({", ".join(where[entry])})' for entry in close) + '?'
+
+
 class CatalogShowCLI(_PathOverridesMixin):
     """Pretty-print the whole catalog (or one named entry across sections)."""
 
@@ -383,7 +406,7 @@ class CatalogShowCLI(_PathOverridesMixin):
                 if config.name in data[s]
             }
             if not hits:
-                raise SystemExit(f"'{config.name}' not found in any section")
+                raise SystemExit(_not_found(config.name, data))
             _print_yaml(yaml.safe_dump(hits, sort_keys=False))
         else:
             _print_yaml(yaml.safe_dump(data, sort_keys=False))

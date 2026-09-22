@@ -85,6 +85,43 @@ OLLAMA = 'ollama'
 DEFAULT_RECLAIM = 'keep-warm'
 
 
+#: How many names a did-you-mean offers.
+MAX_SUGGESTIONS = 5
+
+
+def near_misses(name: str, known) -> list[str]:
+    """Plausible intended names for ``name``, best first.
+
+    Edit distance alone fails both ways. A name that is part of a longer one
+    -- ``qwen3.8`` against ``qwen3.8-27b-dbirks-hyperqwen`` -- scores far below
+    any useful cutoff because of the length gap, while unrelated short names in
+    a uniformly named catalog can clear a low cutoff on shared punctuation. So
+    containment (case-insensitive) comes first, then close matches at 0.75.
+
+    Example:
+        >>> known = ['qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-9b', 'gemma4-31b']
+        >>> near_misses('Qwen3.8', known)
+        ['qwen3.8-27b-dbirks-hyperqwen']
+        >>> near_misses('gemma4-31', known)
+        ['gemma4-31b']
+        >>> near_misses('qwen3.5-9c', known)
+        ['qwen3.5-9b']
+        >>> near_misses('llama', known)
+        []
+    """
+    import difflib
+
+    known = list(known)
+    lowered = name.lower()
+    contained = [
+        candidate for candidate in known
+        if lowered and (lowered in candidate.lower() or candidate.lower() in lowered)
+    ]
+    close = difflib.get_close_matches(name, known, n=MAX_SUGGESTIONS, cutoff=0.75)
+    ordered = contained + [c for c in close if c not in contained]
+    return ordered[:MAX_SUGGESTIONS]
+
+
 class CatalogError(ValueError):
     """Raised when a catalog is structurally invalid or has dangling refs."""
 
@@ -425,10 +462,7 @@ class Catalog:
                 f"(it defaults to the endpoint name '{name}-1')."
             )
 
-        import difflib
-
-        pool = list(self.endpoints) + list(self.bundles)
-        close = difflib.get_close_matches(name, pool, n=3, cutoff=0.6)
+        close = near_misses(name, list(self.endpoints) + list(self.bundles))
         if close:
             return CatalogError(
                 f"unknown endpoint '{name}' — did you mean: "

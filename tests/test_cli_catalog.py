@@ -248,6 +248,29 @@ def test_endpoint_show_no_name_lists_all(tmp_path, capsys):
     assert 'have: e1, e2' in str(exc.value)
 
 
+def test_show_suggests_what_was_probably_meant(tmp_path):
+    from infer_stack.cli.commands_catalog import CatalogShowCLI, EndpointShowCLI
+
+    CatalogInitCLI.main(argv=_opts(tmp_path))
+    ModelAddCLI.main(argv=['qwen3.8-27b-w4', '--source', 'hf://a/b', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['qwen3.8-27b-w4', '--model', 'qwen3.8-27b-w4', *_opts(tmp_path)])
+    ModelAddCLI.main(argv=['gemma4-31b', '--source', 'hf://c/d', *_opts(tmp_path)])
+
+    with pytest.raises(SystemExit) as exc:        # a prefix: containment, not distance
+        CatalogShowCLI.main(argv=['Qwen3.8', *_opts(tmp_path)])
+    assert str(exc.value) == ("'Qwen3.8' not found. Did you mean: "
+                              'qwen3.8-27b-w4 (model, endpoint)?')
+    with pytest.raises(SystemExit) as exc:        # a typo
+        CatalogShowCLI.main(argv=['gemma4-31c', *_opts(tmp_path)])
+    assert 'Did you mean: gemma4-31b (model)?' in str(exc.value)
+    with pytest.raises(SystemExit) as exc:        # nothing close
+        CatalogShowCLI.main(argv=['llama', *_opts(tmp_path)])
+    assert 'not found in any section' in str(exc.value)
+    with pytest.raises(SystemExit) as exc:        # one section
+        EndpointShowCLI.main(argv=['qwen3.8', *_opts(tmp_path)])
+    assert 'Did you mean: qwen3.8-27b-w4?' in str(exc.value)
+
+
 def test_show_piped_output_is_plain(tmp_path, capsys):
     # Under capsys stdout is not a tty -> no ANSI escapes leak into pipes.
     from infer_stack.cli.commands_catalog import CatalogShowCLI
