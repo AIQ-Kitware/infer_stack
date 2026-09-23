@@ -2,6 +2,18 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `infer-stack clean`: a clean slate, dry run by default
+
+`clean` releases every active lease (whoever owns it), tears down every
+deployment including keep-warm ones, and removes unmanaged containers in the
+project. The gateway stays up. Like `git clean`, it only reports what it would
+do unless given `-f`; `--no-orphans` leaves unmanaged containers alone and
+`--json` prints the plan or the outcome. It composes `release --all --evict`
+and `gc --orphans`, so it adds no new teardown path. The use case is a batch
+scheduler with its own GPU accounting: a lease held outside it, manual or
+keep-warm, occupies a GPU the scheduler believes is free, and the job it
+places there cannot start.
+
 ### Custom container launches are catalog data, not recipes
 
 `runtime.serve_recipe` is gone. An endpoint whose image has its own launcher

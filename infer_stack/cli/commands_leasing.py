@@ -1297,6 +1297,124 @@ class GcCLI(_ApprovalMixin):
         return 0
 
 
+class CleanCLI(_LeasingCommonMixin):
+    """Bring the stack to a clean slate: no leases, and nothing holding a GPU.
+
+    Like ``git clean``: by default it only SHOWS what it would do; ``-f`` does
+    it. Everything the ledger knows is released and torn down -- every active
+    lease, whoever owns it, and every deployment, keep-warm included -- and
+    containers in the project that infer-stack does not manage are removed. The
+    gateway stays up. Use it when you know nothing else on the host needs its
+    models, for example before a batch run whose scheduler cannot see GPUs held
+    outside it.
+
+    It composes existing verbs: ``release --all --evict`` (which also evicts
+    idle deployments that no longer have a lease) and ``gc --orphans``.
+    """
+
+    __command__ = 'clean'
+    __epilog__ = """
+    Examples:
+        infer-stack clean           # dry run: what would be released and torn down
+        infer-stack clean -f        # do it
+        infer-stack clean -f --no-orphans   # leave unmanaged containers alone
+    """
+
+    force = scfg.Value(
+        False, isflag=True, short_alias=['f'],
+        help='Actually release and tear down. Without it, clean only reports.',
+    )
+    orphans = scfg.Value(
+        True, isflag=True,
+        help='Also remove containers in the project that infer-stack does not '
+        'manage (--no-orphans keeps them).',
+    )
+    json = scfg.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted
+
+        config = cls.cli(argv=argv, data=kwargs)
+        # -f IS the consent, so the converge does not ask a second time.
+        controller = _open_controller(config, interactive=False)
+        leases, deployments = controller.ledger.status(virtual_expiry=True)
+        active = [le for le in leases if le.state == LeaseState.ACTIVE]
+        held = [g for g in deployments
+                if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)]
+        observed, assignments = _placement_view(controller)
+        can_orphan = bool(config.orphans) and callable(
+            getattr(controller.backend, 'residency', None))
+
+        found: list = []
+
+        def _list_only(orphans):
+            found.extend(orphans)
+            return False
+
+        if not config.force:
+            if can_orphan:
+                controller.remove_orphans(_list_only)
+            plan = {
+                'dry_run': True,
+                'leases': [{'id': le.id, 'owner': le.owner,
+                            'endpoints': le.endpoints} for le in active],
+                'deployments': [{'id': g.id, 'state': g.state,
+                                 'running': g.id in observed,
+                                 'gpus': assignments.get(g.id),
+                                 'served': sorted(g.served)} for g in held],
+                'orphans': [{'id': c.container_id, 'service': c.service}
+                            for c in found],
+            }
+            if config.json:
+                print(json.dumps(plan, indent=2))
+                return 0
+            if not (active or held or found):
+                print('clean: already clean (no leases, no deployments, no orphans)')
+                return 0
+            print('clean: would release and tear down (dry run; -f to do it)')
+            for le in active:
+                print(f'  release   {le.id}  owner={le.owner}  '
+                      f'{",".join(le.endpoints)}')
+            for g in held:
+                gpus = assignments.get(g.id)
+                print(f'  tear down {g.id}  {g.state}'
+                      f'{" running" if g.id in observed else ""}'
+                      f'  gpus={gpus if gpus is not None else "-"}'
+                      f'  {",".join(sorted(g.served))}')
+            for c in found:
+                print(f'  remove    {c.container_id[:12]}  {c.service or "?"}  '
+                      '(unmanaged)')
+            return 0
+
+        try:
+            out = controller.release_leases(None, evict=True)
+        except ConvergeAborted:
+            raise _declined_exit()
+        removed = controller.remove_orphans(lambda _: True) if can_orphan else []
+        torn = sorted(out.reconcile.torn_down) if out.reconcile else []
+        pending = bool(out.reconcile and out.reconcile.publication_pending)
+        if config.json:
+            print(json.dumps({
+                'released': out.released_lease_ids,
+                'evicted': out.evicted_deployment_ids,
+                'torn_down': torn,
+                'orphans_removed': [c.container_id for c in removed],
+                'publication_pending': pending,
+            }, indent=2))
+            return 3 if pending else 0
+        print(f'clean: released {len(out.released_lease_ids)} lease(s), '
+              f'evicted {len(out.evicted_deployment_ids)} deployment(s), '
+              f'removed {len(removed)} unmanaged container(s)')
+        for gid in torn:
+            print(f'  torn down: {gid}')
+        if pending:
+            print('  ! the apply did not fully take effect; the change is still '
+                  'pending -- retry `infer-stack apply`')
+            return 3
+        return 0
+
+
 class WaitCLI(_LeasingCommonMixin):
     """Block until served endpoints are ready — the companion to ``acquire
     --no-wait``.
