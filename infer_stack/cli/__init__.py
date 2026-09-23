@@ -42,6 +42,7 @@ from .commands_mock import MockModalCLI
 from .commands_leasing import (
     AcquireCLI,
     ApplyCLI,
+    CleanCLI,
     EvictCLI,
     GcCLI,
     LeasesCLI,
@@ -127,6 +128,7 @@ class ManageCLI(scfg.ModalCLI):
     release = ReleaseCLI
     evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
     gc = GcCLI  # reclaim TTL-expired (leaked) leases + free their GPUs
+    clean = CleanCLI  # dry-run by default; -f releases + tears down everything
     renew = RenewCLI
     run = RunCLI
     # Reconcile primitives (lease-free): render desired -> disk, apply disk -> up

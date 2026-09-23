@@ -1071,3 +1071,55 @@ def test_env_refuses_a_db_password_postgres_already_holds(tmp_path, monkeypatch)
     (data / 'PG_VERSION').write_text('17\n')
     with pytest.raises(SystemExit, match='lock the gateway out'):
         EnvCLI.main(argv=['LITELLM_DB_PASSWORD=after-init'])
+
+
+def test_clean_is_a_dry_run_by_default(env, capsys):
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    capsys.readouterr()
+    rc = CleanCLI.main(argv=['--ledger', env.db])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert 'dry run' in out and 'release' in out and 'tear down' in out
+    data = _leases_json(env, capsys)
+    assert data['leases'][0]['state'] == 'active'       # nothing changed
+    assert data['deployments'][0]['state'] == 'live'
+
+
+def test_clean_force_releases_leases_and_evicts_keep_warm(env, capsys):
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    # One lease still active, and one keep-warm deployment already idle with no
+    # lease at all -- the two states `release --all` alone would leave holding
+    # a GPU between them.
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    states = {d['served'][0]: d['state'] for d in _leases_json(env, capsys)['deployments']}
+    assert states == {'reranker': 'idle', 'qwen-coder': 'live'}
+
+    rc = CleanCLI.main(argv=['--ledger', env.db, '-f'])
+    assert rc == 0
+    data = _leases_json(env, capsys)
+    assert all(le['state'] == 'released' for le in data['leases'])
+    assert all(d['state'] == 'stopped' for d in data['deployments'])
+
+
+def test_clean_reports_an_already_clean_stack(env, capsys):
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    assert CleanCLI.main(argv=['--ledger', env.db]) == 0
+    assert 'already clean' in capsys.readouterr().out
+
+
+def test_clean_json_dry_run_is_pure_json(env, capsys):
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env)])
+    capsys.readouterr()
+    CleanCLI.main(argv=['--ledger', env.db, '--json'])
+    data = json.loads(capsys.readouterr().out)
+    assert data['dry_run'] is True
+    assert [le['endpoints'] for le in data['leases']] == [['qwen-coder']]
+    assert data['deployments'][0]['served'] == ['qwen-coder']
