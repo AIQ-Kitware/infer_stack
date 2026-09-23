@@ -38,8 +38,12 @@ def test_builtin_pool_is_nonempty_and_real():
     assert qwen38.requires_ampere is True
     assert qwen38.defaults['max_model_len'] == 65536
     assert qwen38.defaults['gpu_memory_utilization'] == 0.93
+    assert qwen38.defaults['env']['CTX'] == 'fast'
     assert 'serve_recipe' not in qwen38.defaults       # generic fields only
     assert qwen38.defaults['command'] == ['single']
+    assert set(qwen38.endpoint_variants) == {'long', 'huge'}
+    assert qwen38.endpoint_variants['long']['runtime']['max_model_len'] == 150000
+    assert qwen38.endpoint_variants['huge']['runtime']['max_model_len'] == 245760
     assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
@@ -75,6 +79,50 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     assert too_big.isdisjoint(models)
 
 
+def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
+    out = suggest_catalog(inv)
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    assert {base, f'{base}-long', f'{base}-huge'} <= set(out['endpoints'])
+    # One model identity, three explicit ways to serve it.
+    assert set(out['models']) & {f'{base}-long', f'{base}-huge'} == set()
+    assert out['endpoints'][f'{base}-long']['model'] == base
+    assert out['endpoints'][f'{base}-huge']['model'] == base
+
+    fast = out['endpoints'][base]['runtime']
+    long = out['endpoints'][f'{base}-long']['runtime']
+    huge = out['endpoints'][f'{base}-huge']['runtime']
+    assert (fast['max_model_len'], fast['env']['SPEC'], fast['env']['CTX']) == (
+        65536, 'dflash2', 'fast')
+    assert (long['max_model_len'], long['env']['SPEC'], long['env']['CTX']) == (
+        150000, 'mtp', 'long')
+    assert (huge['max_model_len'], huge['env']['SPEC'], huge['env']['CTX']) == (
+        245760, 'dflash2', 'huge')
+    # The variant inherits the generic launcher contract rather than repeating a
+    # model-specific recipe in Python. The hardware gate becomes an exact pin so
+    # a later best-fit placement cannot silently move the measured profile.
+    for name in (f'{base}-long', f'{base}-huge'):
+        ep = out['endpoints'][name]
+        assert ep['runtime']['command'] == ['single']
+        assert ep['runtime']['env']['MAX_LEN'] == '{max_model_len}'
+        assert ep['runtime']['mounts']['/cache'] == 'hyperqwen/qwen3.8-27b/cache'
+        assert ep['placement']['gpu_indices'] == [0]
+        assert ep['reclaim']['policy'] == 'stop'
+
+
+def test_hyperqwen_context_variants_are_not_injected_on_other_ampere_cards():
+    # The base HyperQwen endpoint is portable to other supported >=24 GiB Ampere
+    # cards, but the extra long/huge suggestions are intentionally tied to the
+    # reference card whose profiles were measured. A user can still author the
+    # same generic runtime data explicitly elsewhere.
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 48, name='NVIDIA A40')]}
+    endpoints = suggest_catalog(inv)['endpoints']
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    assert base in endpoints
+    assert f'{base}-long' not in endpoints
+    assert f'{base}-huge' not in endpoints
+
+
 def test_fits_on_respects_vram_and_gpu_count():
     pool = builtin_pool()
     big = pool['qwen2.5-72b']            # needs 2 GPUs, 72 GiB each
@@ -100,7 +148,7 @@ def test_fit_filter_tracks_gpu_size():
     assert 'qwen2.5-72b' not in one_small    # needs two GPUs
 
 
-def test_qwen38_27b_suggestion_uses_the_hyperqwen_recipe_on_any_card_that_fits():
+def test_qwen38_27b_suggestion_uses_the_hyperqwen_profile_on_any_card_that_fits():
     inv = {'gpu_count': 2, 'gpus': [
         _gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell Workstation Edition'),
         _gpu(3, 24, name='NVIDIA GeForce RTX 3090'),
@@ -118,20 +166,21 @@ def test_qwen38_27b_suggestion_uses_the_hyperqwen_recipe_on_any_card_that_fits()
         'enable_prefix_caching': True,
         'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
         'command': ['single'],
-        'env': {'PORT': '{port}', 'SPEC': 'dflash2', 'PREFIX_CACHE': 1,
-                'MAX_LEN': '{max_model_len}', 'GPU_UTIL': '{gpu_memory_utilization}',
+        'env': {'PORT': '{port}', 'SPEC': 'dflash2', 'CTX': 'fast',
+                'PREFIX_CACHE': 1, 'MAX_LEN': '{max_model_len}',
+                'GPU_UTIL': '{gpu_memory_utilization}',
                 'EXTRA_ARGS': '--served-model-name={served_model_name}'},
         'mounts': {'/app/models': 'hyperqwen/qwen3.8-27b/models',
                    '/cache': 'hyperqwen/qwen3.8-27b/cache'},
     }
 
 
-def test_qwen38_27b_recipe_is_suggested_wherever_it_fits():
+def test_qwen38_27b_profile_is_suggested_wherever_it_fits():
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell')]}
     assert 'qwen3.8-27b-dbirks-hyperqwen' in suggest_catalog(inv)['models']
 
 
-def test_qwen38_27b_recipe_is_not_suggested_before_ampere():
+def test_qwen38_27b_profile_is_not_suggested_before_ampere():
     # 48 GiB is plenty, but a Turing card cannot run the recipe's image.
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 48, name='Quadro RTX 8000')]}
     assert 'qwen3.8-27b-dbirks-hyperqwen' not in suggest_catalog(inv)['models']

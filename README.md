@@ -42,8 +42,11 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
   described entirely in catalog data (see "Images with their own launcher"
   below); infer-stack adds hardware discovery, catalog suggestions,
   exact GPU affinity, lease lifecycle, and routing around that serving stack.
-  `catalog suggest` offers it on any Ampere-or-newer GPU with 24 GiB; it has
-  also been measured unchanged on an RTX PRO 6000 Blackwell. The suggestion is
+  `catalog suggest` offers its fast endpoint on any Ampere-or-newer GPU with
+  24 GiB; on a detected RTX 3090 it also offers explicit `-long` (150K) and
+  `-huge` (245,760) endpoint variants from HyperQwen's measured single-user
+  profiles. It has also been measured unchanged on an RTX PRO 6000 Blackwell.
+  The base suggestion is
   named `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
   `dbirks/Qwen3.8-27B-W4A16-AutoRound` derivative; the unsuffixed
   `qwen3.8-27b` identity is left available for the official
@@ -612,6 +615,7 @@ runtime:
   env:                           # container environment
     PORT: '{port}'
     SPEC: dflash2
+    CTX: fast
     PREFIX_CACHE: 1
     MAX_LEN: '{max_model_len}'   # filled from the field above
     GPU_UTIL: '{gpu_memory_utilization}'
@@ -621,9 +625,17 @@ runtime:
     /cache: hyperqwen/qwen3.8-27b/cache
 ```
 
-Switching that image to its long-context mode is a data edit, in the catalog
-or the TUI's endpoint editor: `max_model_len: 150000` and `SPEC: mtp`,
-`CTX: long` in `env`.
+Switching that image to another context profile is a data edit, in the catalog
+or the TUI's endpoint editor. HyperQwen's measured 3090 profiles are:
+
+- fast/default: `max_model_len: 65536`, `SPEC: dflash2`, `CTX: fast`;
+- long: `max_model_len: 150000`, `SPEC: mtp`, `CTX: long`;
+- huge: `max_model_len: 245760`, `SPEC: dflash2`, `CTX: huge`.
+
+On an RTX 3090, `catalog suggest` emits the latter two as `-long` and `-huge`
+endpoint variants. The hardware check happens only while suggesting: the
+resulting catalog contains ordinary explicit runtime data, so `apply`/`acquire`
+never silently retunes an endpoint after the fact.
 
 - `{max_model_len}`, `{gpu_memory_utilization}`, `{served_model_name}` and
   `{port}` are filled in from the endpoint, so a launcher that takes them

@@ -3,7 +3,7 @@
 The leasing controller reads a hand-built ``catalog.yaml``, but a fresh host
 shouldn't start empty. This module turns *what the server is* (the detected GPU
 inventory) plus *what's worth running* (a curated pool of models and, where
-needed, explicitly hardware-gated measured recipes) into a concrete,
+needed, explicitly hardware-gated measured profiles) into a concrete,
 fits-this-box catalog the user can review and merge.
 
 The design is that **seeding is a pure function**
@@ -16,9 +16,10 @@ the real entries of the legacy ``default-vllm-models.yaml``).
 Two layers, kept apart on purpose:
 
 * :class:`SuggestionModel` — model facts (footprint, min per-GPU VRAM,
-  preferred GPU count, context window, sane vLLM defaults), plus an optional
-  GPU-name allow-list for a recipe whose performance/fit has only been
-  validated on named hardware.
+  preferred GPU count, context window, sane vLLM defaults), plus optional
+  hardware-gated endpoint variants for measured serving profiles. Variants are
+  data: they override generic endpoint runtime fields and never add
+  model-specific renderer behavior.
 * :func:`suggest_catalog` — derives the *server-specific* layer (which models
   fit, what ``max_model_len`` / ``gpu_memory_utilization`` / ``dtype`` to use,
   which one to keep warm) by joining the pool against an inventory dict.
@@ -38,6 +39,7 @@ Example:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,7 +78,7 @@ class SuggestionModel:
     min_vram_gib_per_replica: float = 0.0
     preferred_gpu_count: int = 1
     context_window: int | None = None
-    # Optional hardware allow-list for a measured/tuned serving recipe. These
+    # Optional hardware allow-list for a measured/tuned serving profile. These
     # are case-insensitive substrings of the detected nvidia-smi GPU name. A
     # portable model leaves the list empty.
     gpu_name_hints: list[str] = field(default_factory=list)
@@ -84,6 +86,12 @@ class SuggestionModel:
     # the architecture) sets this; the check is the name sniff below.
     requires_ampere: bool = False
     defaults: dict[str, Any] = field(default_factory=dict)
+    # Optional named endpoint variants. Each variant can gate itself on GPU-name
+    # substrings and overlay generic runtime fields on the model defaults. The
+    # generated endpoint is named ``<model>-<variant>`` and still references the
+    # same model source. This is intentionally suggestion-time convenience, not
+    # a runtime recipe mechanism.
+    endpoint_variants: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_entry(cls, name: str, spec: dict[str, Any]) -> SuggestionModel:
@@ -105,7 +113,8 @@ class SuggestionModel:
                 str(v).lower() for v in (spec.get('gpu_name_hints') or [])
             ],
             requires_ampere=bool(spec.get('requires_ampere', False)),
-            defaults=dict(spec.get('defaults') or {}),
+            defaults=copy.deepcopy(spec.get('defaults') or {}),
+            endpoint_variants=copy.deepcopy(spec.get('endpoint_variants') or {}),
         )
 
 
@@ -212,15 +221,20 @@ def _gpu_mem(gpu: dict[str, Any]) -> float:
     return float(gpu.get('memory_gib') or 0.0)
 
 
+def _name_matches_hints(gpu: dict[str, Any], hints: list[str]) -> bool:
+    if not hints:
+        return True
+    name = str(gpu.get('name') or '').lower()
+    return any(str(hint).lower() in name for hint in hints)
+
+
 def _gpu_is_eligible(model: SuggestionModel, gpu: dict[str, Any]) -> bool:
     if _gpu_mem(gpu) < model.min_vram_gib_per_replica:
         return False
     if model.requires_ampere and _needs_fp16(gpu.get('name')):
         return False
-    if model.gpu_name_hints:
-        name = str(gpu.get('name') or '').lower()
-        if not any(hint in name for hint in model.gpu_name_hints):
-            return False
+    if not _name_matches_hints(gpu, model.gpu_name_hints):
+        return False
     return True
 
 
@@ -244,6 +258,57 @@ def _host_gpus(
         key=_gpu_mem,
     )
     return big_enough[: model.preferred_gpu_count]
+
+
+def _variant_host_gpus(
+    model: SuggestionModel, variant: dict[str, Any], gpus: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return the concrete GPUs that make a suggestion-only variant valid.
+
+    Variant gates refine the model's ordinary eligibility. A GPU-name gate is
+    also a placement promise: when it is present, the generated endpoint is
+    pinned to the matching GPU(s) so a later best-fit placement cannot move the
+    measured profile onto different hardware.
+    """
+    hints = [str(v).lower() for v in (variant.get('gpu_name_hints') or [])]
+    min_vram = float(
+        variant.get('min_vram_gib_per_replica')
+        or model.min_vram_gib_per_replica
+        or 0.0
+    )
+    count = int(
+        variant.get('preferred_gpu_count')
+        or model.preferred_gpu_count
+        or 1
+    )
+    eligible = sorted(
+        (
+            gpu for gpu in gpus
+            if _gpu_is_eligible(model, gpu)
+            and _gpu_mem(gpu) >= min_vram
+            and _name_matches_hints(gpu, hints)
+        ),
+        key=_gpu_mem,
+    )
+    return eligible[:count] if len(eligible) >= count else []
+
+
+def _merge_runtime(
+    base: dict[str, Any], overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """Deep-merge a suggestion variant's generic runtime overrides.
+
+    Nested mappings such as ``env`` are merged so a variant can change only
+    ``SPEC`` / ``CTX`` while retaining the launcher's templated PORT, MAX_LEN,
+    served-name and mount contract. Lists/scalars replace the base value.
+    """
+    result = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_runtime(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 def derive_runtime(
@@ -303,8 +368,6 @@ def derive_runtime(
 
     # Generic launch fields (leasing.launch) come from the pool data as-is:
     # a model's launcher knowledge lives there, not in code.
-    import copy
-
     for key in ('command', 'env', 'mounts'):
         if model.defaults.get(key):
             runtime[key] = copy.deepcopy(model.defaults[key])
@@ -371,5 +434,32 @@ def suggest_catalog(
             endpoint['runtime'] = runtime
         endpoint['reclaim'] = {'policy': 'keep-warm' if rank == 0 else 'stop'}
         endpoints[model.name] = endpoint
+
+        # Variants are additional endpoint suggestions over the same model, not
+        # duplicate model identities. They exist only when their hardware gates
+        # match this inventory. The live catalog is fully explicit afterwards:
+        # apply/acquire never re-detects a GPU and silently changes a profile.
+        for variant_name, variant in model.endpoint_variants.items():
+            variant_host = _variant_host_gpus(model, variant, gpus)
+            if not variant_host:
+                continue
+            variant_endpoint = copy.deepcopy(endpoint)
+            variant_runtime = derive_runtime(model, variant_host)
+            variant_runtime = _merge_runtime(
+                variant_runtime, dict(variant.get('runtime') or {})
+            )
+            if variant_runtime:
+                variant_endpoint['runtime'] = variant_runtime
+            placement = dict(variant_endpoint.get('placement') or {})
+            if variant.get('gpu_name_hints'):
+                placement['gpu_indices'] = [int(g['index']) for g in variant_host]
+            if variant.get('min_vram_gib_per_replica') is not None:
+                placement['min_vram_gib'] = variant['min_vram_gib_per_replica']
+            if placement:
+                variant_endpoint['placement'] = placement
+            variant_endpoint['reclaim'] = {
+                'policy': str(variant.get('reclaim_policy') or 'stop')
+            }
+            endpoints[f'{model.name}-{variant_name}'] = variant_endpoint
 
     return {'models': models, 'endpoints': endpoints}

@@ -71,6 +71,7 @@ LEGACY_RECIPES = {
         'env': {
             'PORT': '{port}',
             'SPEC': 'dflash2',
+            'CTX': 'fast',
             'MAX_LEN': '{max_model_len}',
             'GPU_UTIL': '{gpu_memory_utilization}',
             'EXTRA_ARGS': '--served-model-name={served_model_name}',

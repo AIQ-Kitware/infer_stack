@@ -1,9 +1,11 @@
 # suggestion-pool.yaml — the curated pool of "useful models" the leasing
 # controller draws on when it seeds a catalog from server introspection.
 #
-# This is the intrinsic, *hardware-independent* model registry: each entry
-# states facts that are true on any box (footprint, min per-GPU VRAM, preferred
-# GPU count, context window, sane vLLM defaults). `infer_stack.leasing.suggest`
+# This is the mostly intrinsic model registry: each entry states facts that are
+# true on any box (footprint, min per-GPU VRAM, preferred GPU count, context
+# window, sane vLLM defaults). An entry may also carry hardware-gated endpoint
+# variants for serving profiles measured on a particular card.
+# `infer_stack.leasing.suggest`
 # JOINS this pool against the detected GPU inventory to derive a concrete,
 # fits-this-server catalog ("seeding is a pure function
 # inventory × registry → catalog").
@@ -103,7 +105,7 @@ vllm_models:
       gpu_memory_utilization: 0.4
       enable_prefix_caching: true
 
-  # -- Qwen3.8-27B: measured single-3090 HyperQwen recipe ----------------
+  # -- Qwen3.8-27B: measured single-3090 HyperQwen profiles ---------------
   # Qwen/Qwen3.8-27B is a 27.78B-parameter hybrid model with a 262K context
   # window, but its bf16 weights do not fit a 24-GiB card. HyperQwen's measured
   # 3090 path starts from dbirks' ~19.5-GB W4A16 AutoRound body, requantizes the
@@ -114,7 +116,7 @@ vllm_models:
   # launcher pins the KV pool. Needs Ampere or newer (the image is CUDA 13).
   # Keep the unsuffixed `qwen3.8-27b` name free for the official
   # Qwen/Qwen3.8-27B checkpoint. This entry is the dbirks W4A16 derivative
-  # plus HyperQwen's serving recipe, so its catalog identity says so.
+  # plus HyperQwen's serving stack, so its catalog identity says so.
   qwen3.8-27b-dbirks-hyperqwen:
     hf_model_id: dbirks/Qwen3.8-27B-W4A16-AutoRound
     served_model_name: qwen3.8-27b-dbirks-hyperqwen
@@ -134,14 +136,16 @@ vllm_models:
       enable_prefix_caching: true
       image: ghcr.io/syv-ai/hyperqwen:sha-684e927
       # The image's own launcher, not `vllm serve`: its `single` mode reads
-      # the settings below from the environment. SPEC=dflash2 with the default
-      # CTX is the fast profile; SPEC=mtp with CTX=long (and a larger
+      # the settings below from the environment. Keep CTX explicit so the
+      # generated catalog describes the whole launch rather than relying on an
+      # image-internal default. SPEC=mtp with CTX=long (and a larger
       # max_model_len) is its long-context one. EXTRA_ARGS go last on its
       # vLLM command line, which keeps the served name infer-stack routes to.
       command: [single]
       env:
         PORT: '{port}'
         SPEC: dflash2
+        CTX: fast
         PREFIX_CACHE: 1
         MAX_LEN: '{max_model_len}'
         GPU_UTIL: '{gpu_memory_utilization}'
@@ -150,6 +154,28 @@ vllm_models:
       mounts:
         /app/models: hyperqwen/qwen3.8-27b/models
         /cache: hyperqwen/qwen3.8-27b/cache
+    # HyperQwen's other context-oriented single-user profiles are useful
+    # choices on its reference 24-GiB RTX 3090. These are suggestion variants,
+    # not runtime recipes: catalog suggest emits ordinary endpoints referencing
+    # this same model, and pins them to the detected 3090 that justified the
+    # hardware-specific suggestion. The live catalog stays explicit thereafter.
+    endpoint_variants:
+      long:
+        gpu_name_hints: [rtx 3090]
+        runtime:
+          max_model_len: 150000
+          env:
+            SPEC: mtp
+            CTX: long
+      huge:
+        gpu_name_hints: [rtx 3090]
+        runtime:
+          # HyperQwen's README calls this the ~240K profile; the launcher's
+          # measured ceiling with the default 7-token DFlash2 block is 245760.
+          max_model_len: 245760
+          env:
+            SPEC: dflash2
+            CTX: huge
   qwen2.5-7b:
     hf_model_id: Qwen/Qwen2.5-7B-Instruct
     served_model_name: qwen2.5-7b
