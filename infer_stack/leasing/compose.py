@@ -598,7 +598,13 @@ def _vllm_service(
             *vllm_args(svc),
         ]
     environment: dict[str, str] = {'HF_TOKEN': '${HF_TOKEN:-}'}
-    for key, value in svc['env'].items():
+    # Catalog mappings are semantically unordered.  A freshly resolved request
+    # preserves YAML insertion order, while the same deployment reloaded from
+    # sqlite has passed through JSON ``sort_keys=True``.  Render a canonical
+    # order so admission preview and post-commit render are byte-identical; the
+    # approval guard hashes the rendered files, not their parsed semantics.
+    for key in sorted(svc['env'], key=str):
+        value = svc['env'][key]
         # `$$` is a literal `$` to Compose: catalog values are never
         # interpolated, so they cannot pull secrets out of the managed .env.
         environment[str(key)] = fill(env_string(value), svc).replace('$', '$$')
@@ -652,8 +658,10 @@ def _vllm_service(
         # /root/.cache layout persists them here, so a release and re-acquire
         # is a restart rather than a re-download and re-preparation. A custom
         # launcher gets only these; stock vLLM keeps its caches as well.
-        mounts = [f'{state["runtime"]}/{sub}:{target}'
-                  for target, sub in svc['mounts'].items()]
+        mounts = [
+            f'{state["runtime"]}/{svc["mounts"][target]}:{target}'
+            for target in sorted(svc['mounts'], key=str)
+        ]
         service['volumes'] = mounts if svc['command'] else [*service['volumes'], *mounts]
     # Only publish a host port when there's no gateway to front the upstream.
     # Behind LiteLLM the upstream is internal (reached by compose-network DNS at

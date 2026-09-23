@@ -242,6 +242,7 @@ def test_render_hyperqwen_3090_recipe_uses_prepared_single_user_launcher():
         'HF_TOKEN': '${HF_TOKEN:-}',
         'PORT': '8000',
         'SPEC': 'dflash2',
+        'CTX': 'fast',
         'PREFIX_CACHE': '1',
         'MAX_LEN': '65536',
         'GPU_UTIL': '0.93',
@@ -256,17 +257,18 @@ def test_render_hyperqwen_3090_recipe_uses_prepared_single_user_launcher():
     assert svc['healthcheck']['test'][-1] == 'http://localhost:8000/health'
 
 
-def _hyperqwen_from_suggestion(**runtime_changes):
-    """The HyperQwen deployment exactly as `catalog suggest` writes it."""
+def _hyperqwen_from_suggestion(endpoint_name=None, **runtime_changes):
+    """A HyperQwen deployment exactly as `catalog suggest` writes it."""
     from infer_stack.leasing import Catalog
     from infer_stack.leasing.suggest import suggest_catalog
 
     frag = suggest_catalog({'gpu_count': 1, 'gpus': [
         {'index': 0, 'name': 'NVIDIA GeForce RTX 3090', 'memory_gib': 24}]})
-    ep = frag['endpoints']['qwen3.8-27b-dbirks-hyperqwen']
+    endpoint_name = endpoint_name or 'qwen3.8-27b-dbirks-hyperqwen'
+    ep = frag['endpoints'][endpoint_name]
     ep['public_name'] = 'local-qwen38'
     ep['runtime'].update(runtime_changes)
-    req = Catalog.from_dict(frag).resolve_endpoint('qwen3.8-27b-dbirks-hyperqwen')
+    req = Catalog.from_dict(frag).resolve_endpoint(endpoint_name)
     deployment = vllm('grp-q38', hf=req.spec['hf_model_id'], served='local-qwen38')
     deployment.spec['runtime'] = req.spec['runtime']
     rc = render_compose(
@@ -282,7 +284,8 @@ def test_suggested_hyperqwen_renders_what_the_old_recipe_did():
     assert svc['command'] == ['single']
     assert svc['environment'] == {
         'HF_TOKEN': '${HF_TOKEN:-}', 'PORT': '8000', 'SPEC': 'dflash2',
-        'PREFIX_CACHE': '1', 'MAX_LEN': '65536', 'GPU_UTIL': '0.93',
+        'CTX': 'fast', 'PREFIX_CACHE': '1', 'MAX_LEN': '65536',
+        'GPU_UTIL': '0.93',
         'EXTRA_ARGS': '--served-model-name=local-qwen38',
     }
     assert svc['volumes'] == [
@@ -304,6 +307,17 @@ def test_the_long_context_profile_is_only_catalog_data():
     assert svc['command'] == ['single']
 
 
+def test_suggested_hyperqwen_huge_profile_renders_as_plain_catalog_data():
+    svc = _hyperqwen_from_suggestion(
+        'qwen3.8-27b-dbirks-hyperqwen-huge'
+    )
+    assert svc['command'] == ['single']
+    assert svc['environment']['SPEC'] == 'dflash2'
+    assert svc['environment']['CTX'] == 'huge'
+    assert svc['environment']['MAX_LEN'] == '245760'
+    assert svc['environment']['EXTRA_ARGS'] == '--served-model-name=local-qwen38'
+
+
 def test_generic_launch_fields_render_as_written():
     deployment = vllm('grp-x', served='x', max_len=4096)
     deployment.spec['runtime'].update({
@@ -317,6 +331,50 @@ def test_generic_launch_fields_render_as_written():
     assert (env['MODE'], env['ON'], env['N']) == ('fast', 'true', '3')
     # `$` is literal: a catalog value can never interpolate a managed secret.
     assert env['PRICE'] == '$$5 $${LITELLM_MASTER_KEY}'
+
+
+def test_generic_launch_mapping_order_is_canonical_across_ledger_roundtrip():
+    """SQLite sorts JSON object keys; that must not invalidate preview approval."""
+    deployment = vllm('grp-order', served='order', max_len=245760)
+    deployment.spec['runtime'].update({
+        'command': ['single'],
+        # Deliberately not alphabetical: catalog YAML preserves this order, while
+        # SqliteStore serializes deployment specs with json sort_keys=True.
+        'env': {
+            'PORT': '{port}',
+            'SPEC': 'dflash2',
+            'CTX': 'huge',
+            'PREFIX_CACHE': 1,
+            'MAX_LEN': '{max_model_len}',
+            'GPU_UTIL': '{gpu_memory_utilization}',
+            'EXTRA_ARGS': '--served-model-name={served_model_name}',
+        },
+        'mounts': {
+            '/cache': 'hyperqwen/qwen3.8-27b/cache',
+            '/app/models': 'hyperqwen/qwen3.8-27b/models',
+        },
+    })
+    kwargs = {
+        'images': IMAGES,
+        'ports': PORTS,
+        'state': {**STATE, 'runtime': '/cache/runtime'},
+    }
+    before = yaml.safe_dump(
+        render_compose([deployment], {'grp-order': [0]}, **kwargs).compose,
+        sort_keys=False,
+    )
+
+    # Mirror the deployment's persistence boundary: SqliteStore._dumps uses
+    # json.dumps(..., sort_keys=True), then _loads reconstructs sorted mappings.
+    reloaded = vllm('grp-order', served='order', max_len=245760)
+    reloaded.spec = json.loads(json.dumps(deployment.spec, sort_keys=True))
+    reloaded.served = json.loads(json.dumps(deployment.served, sort_keys=True))
+    after = yaml.safe_dump(
+        render_compose([reloaded], {'grp-order': [0]}, **kwargs).compose,
+        sort_keys=False,
+    )
+
+    assert before == after
 
 
 def test_mounts_on_stock_vllm_keep_its_caches():

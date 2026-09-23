@@ -42,12 +42,13 @@ class Clock:
         self.now += s
 
 
-def make(tmp_path, *, gpus='2x80', docker=None, clock=None, backend_cls=ComposeBackend):
+def make(tmp_path, *, gpus='2x80', docker=None, clock=None, backend_cls=ComposeBackend,
+         catalog_obj=CAT):
     state = tmp_path / 'state'
     docker = docker or FakeDocker()
     backend = backend_cls(state_dir=state, inventory=simulate_inventory(gpus), run=docker,
                           http=FakeHttp(state), images=IMAGES, ports=PORTS, state=STATE,
-                          catalog=CAT, litellm=False, ui=False)
+                          catalog=catalog_obj, litellm=False, ui=False)
     clock = clock or Clock()
     ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=clock)
     return ledger, Controller(ledger, backend, clock=clock, sleep=clock.sleep), docker
@@ -401,6 +402,38 @@ def test_the_admission_approval_digest_is_committed_with_the_lease(tmp_path):
     acquire(ctl, 'one')
     assert seen['marker']['approved_digest']
     assert seen['marker']['approved_digest'] == ctl.backend.last_planned_digest
+    assert ledger.publication_pending() is None
+
+
+def test_custom_launch_maps_do_not_change_approval_digest_after_commit(tmp_path):
+    """Fresh YAML order and sqlite-sorted order describe one approved render."""
+    cat = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {'m': {'engine': 'vllm', 'model': 'm', 'runtime': {
+            'command': ['single'],
+            'env': {
+                'PORT': '{port}',
+                'SPEC': 'dflash2',
+                'CTX': 'huge',
+                'PREFIX_CACHE': 1,
+                'MAX_LEN': '{max_model_len}',
+                'GPU_UTIL': '{gpu_memory_utilization}',
+                'EXTRA_ARGS': '--served-model-name={served_model_name}',
+            },
+            'mounts': {
+                '/cache': 'model/cache',
+                '/app/models': 'model/weights',
+            },
+            'max_model_len': 245760,
+            'gpu_memory_utilization': 0.93,
+        }}},
+    })
+    ledger, ctl, _ = make(tmp_path, gpus='1x24', catalog_obj=cat)
+
+    out = ctl.acquire('owner', cat.resolve_names(['m']), wait=False)
+
+    assert out.lease.state == LeaseState.ACTIVE
+    assert len(ledger.status()[0]) == 1
     assert ledger.publication_pending() is None
 
 
