@@ -3180,3 +3180,40 @@ labels are stable enough to key residency on.
 **Takeaway.** Before unifying internals, check what callers see. Two backends
 that share 90% of their code but answer to different names are two products
 to the people using them.
+
+## 2026-09-24 12:54:30 -0400
+
+**Intent.** The user approved the backend-unification plan, asked for the
+work on a branch (`dev/backend-unification`), and authorised installing k3s
+on the guest to test KubeAI for real. Model: Claude Opus 5.5 (1M context).
+
+**What happened.** K0: k3s plus KubeAI 0.23.4, using the chart's `cpu`
+profile. It runs real vLLM on CPU, which beats the simulator: KubeAI builds
+vLLM's own command line, and the simulator's CLI would have refused it. The
+backend passed unchanged on its first real run since July. K1: the kubeai
+backend now owns a gateway-only ComposeBackend and feeds it generic
+`upstream` route rows. Before, a card's alias got 404 from KubeAI; after,
+the same request answered. K2 and K4: strict pod residency, and the crash
+diagnosis moved into a backend-neutral module. A Model whose vLLM rejected a
+flag failed in 52 s instead of the 800 s timeout. K5: one served-name rule.
+It fixed a real disagreement between the engine and two route builders.
+Removed the dead profile-era KubeAI renderer.
+
+**What I got wrong along the way.** I wrote a second e2e script before
+finding `dev/kubeai_e2e.sh`, a duplicate authority created in the middle of
+a de-duplication task, and folded it back in. That script's generation check
+could never fail (a `curl | grep && echo` list, where `set -e` does not
+fire), so it "passed" on a 404. The plan's claim that KubeAI's lenient
+`observe()` was a bug was wrong: Compose's is lenient by the same contract.
+I corrected the plan.
+
+**Open: K3 (one acquire path).** It is feasible: only 12 controller tests and
+the null backend depend on the old path. It carries a semantic decision the
+user should make. On a cluster nothing displaces an idle keep-warm Model, so
+the September starvation incident can recur on KubeAI unless admission
+evicts idle keep-warm Models when a new one cannot be scheduled.
+
+**Takeaways.** (1) A test that has never failed is not evidence. Make it
+fail on purpose first; GATEWAY=0 is that switch here. (2) "Has method X" is
+a poor stand-in for "is backend Y": when a second backend gains X, every
+such check silently changes meaning.
