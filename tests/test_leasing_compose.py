@@ -929,7 +929,7 @@ def test_litellm_config_hash_label_tracks_model_list(tmp_path):
     (spec unchanged), so the new alias never became routable. Stamping the
     config hash onto a label makes converge recreate litellm on a config change.
     """
-    from infer_stack.leasing.compose import CONFIG_HASH_LABEL
+    from infer_stack.leasing.gateway import CONFIG_HASH_LABEL
 
     def label(deployment):
         rc = render_compose(

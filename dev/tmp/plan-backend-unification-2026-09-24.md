@@ -202,3 +202,31 @@ to the kind script.
 - multi-cluster, or scheduling across a mix of Compose hosts and a cluster
 - KubeAI autoscaling policy beyond today's `min_replicas` / `max_replicas`
 - custom container launches on KubeAI
+
+## G. Pull the gateway out of compose.py (added 2026-09-24)
+
+`compose.py` mixes two jobs: engine containers (placement, render,
+selective apply, pulls, diagnosis) and the front door (LiteLLM config and
+service, route registry, dynamic-route reconciliation, keys, Open WebUI,
+nginx). K1 reused the whole `ComposeBackend` as a gateway-only instance for
+KubeAI. That added a mode rather than naming the seam. The user asked for
+the tool to be more elegant, architecture first and the TUI after.
+
+The gateway methods depend only on the state dir, ports, the HTTP client,
+the clock, the catalog and the flags (measured by AST), not on engine state.
+So the split is:
+
+- **A. `leasing/naming.py`**: `dns_slug` and the vLLM/Ollama service-name
+  rules. Engines and gateway routes both use them, and so does KubeAI.
+- **B. `leasing/gateway.py`**: the route functions, front-door service
+  renderers and gateway constants, moved as-is.
+- **C. `Gateway`**: keys, route registry and dynamic-route reconciliation.
+  `ComposeBackend` owns one and keeps thin public delegations (`master_key`,
+  `access`, ...).
+- **D. `render_front_door`**: `render_compose`'s second half.
+
+`compose` re-exports nothing private; importers (mostly tests) move to the
+new modules. Each step leaves the full suite, `ty` and flake8 green. The
+gateway still runs as a Compose project (it is a container), so KubeAI keeps
+a `ComposeBackend` with no engines: that is now simply "a Compose project
+with only the front door", not a special mode.

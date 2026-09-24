@@ -23,12 +23,12 @@ from fake_docker_state import ComposeFake
 
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import ComposeBackend, render_compose
-from infer_stack.leasing.compose import (
+from infer_stack.leasing.compose import vllm_service_name
+from infer_stack.leasing.gateway import (
     POSTGRES_SERVICE,
     ROUTE_ID_PREFIX,
     _litellm_routes,
     _route_id,
-    vllm_service_name,
 )
 from infer_stack.leasing.models import Deployment, DeploymentState
 
@@ -517,7 +517,7 @@ def test_apply_returns_true_once_routes_verify(tmp_path):
 
 
 def test_apply_uses_the_short_deadline_when_the_gateway_was_already_up(tmp_path):
-    from infer_stack.leasing.compose import (
+    from infer_stack.leasing.gateway import (
         ROUTE_RECONCILE_BOOTSTRAP_S,
         ROUTE_RECONCILE_STEADY_S,
     )

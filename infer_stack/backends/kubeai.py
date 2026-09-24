@@ -378,7 +378,7 @@ class KubeaiBackend(ConvergeScaffold):
 
     def _render_gateway(self, rendered: RenderedModels) -> None:
         """Route each endpoint alias through the gateway to its Model."""
-        from ..leasing.compose import UPSTREAM_ROUTE
+        from ..leasing.gateway import UPSTREAM_ROUTE
 
         base = self._upstream_url()
         self.gateway.upstream_routes = {

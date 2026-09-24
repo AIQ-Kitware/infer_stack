@@ -51,6 +51,8 @@ DEPLOYMENT_LABEL = 'infer-stack.deployment'
 #: Labels every rendered service carries: its service name, and a behavioural
 #: fingerprint that changes only when the service's behaviour does.
 SERVICE_LABEL = 'infer-stack.service'
+#: Which engine a service runs (``vllm``, ``ollama``, ``litellm``...).
+ENGINE_LABEL = 'infer-stack.engine'
 FINGERPRINT_LABEL = 'infer-stack.fingerprint'
 #: Labels Docker Compose puts on every container of a project.
 COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
