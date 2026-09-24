@@ -9,8 +9,10 @@ verbatim so adding this layer cannot silently hide a newly useful failure.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import Callable
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 _DOCKER_TIMESTAMP_RE = re.compile(
@@ -292,7 +294,7 @@ def compact_litellm_tracebacks(lines: Iterable[str]) -> Iterator[str]:
             continue
 
         if pending is None:
-            if _is_litellm(parsed) and parsed.message == _TRACEBACK_HEADER:
+            if parsed is not None and _is_litellm(parsed) and parsed.message == _TRACEBACK_HEADER:
                 pending = _TracebackBuffer(parsed.service, parsed)
             else:
                 yield raw
@@ -340,3 +342,58 @@ def compact_litellm_tracebacks(lines: Iterable[str]) -> Iterator[str]:
     if pending is not None:
         # EOF in the middle of a traceback is incomplete evidence, therefore raw.
         yield from pending.raw_lines()
+
+
+class LogLineSplitter:
+    r"""Cut a container's raw output into display lines, ``\r`` included.
+
+    A progress bar (a model download) redraws one line with ``\r`` and may not
+    write a newline for minutes. Treating ``\r`` as a line end shows it while
+    it moves; keeping at most one redraw per ``every`` seconds stops it
+    flooding the pane.
+
+    Example:
+        >>> t = [0.0]
+        >>> s = LogLineSplitter(every=2.0, clock=lambda: t[0])
+        >>> s.feed('start\nfetch 1%\rfetch 2%\r')
+        ['start', 'fetch 1%']
+        >>> t[0] = 3.0
+        >>> s.feed('fetch 9%\rdone\n')
+        ['fetch 9%', 'done']
+        >>> t[0] = 10.0                     # tqdm starts each redraw with \r
+        >>> s.feed('\rpart 1\rpart 2\r')
+        ['part 1']
+    """
+
+    def __init__(self, *, every: float = 2.0, clock: Callable[[], float] = time.monotonic):
+        self.every = every
+        self.clock = clock
+        self._buf = ''
+        self._last_redraw = float('-inf')
+
+    def feed(self, text: str) -> list[str]:
+        self._buf += text
+        out: list[str] = []
+        while True:
+            cut = min((i for i in (self._buf.find('\n'), self._buf.find('\r')) if i >= 0),
+                      default=-1)
+            if cut < 0:
+                return out
+            line, end = self._buf[:cut], self._buf[cut]
+            self._buf = self._buf[cut + 1:]
+            if not line.strip():
+                if end == '\r' and self._buf.startswith('\n'):
+                    self._buf = self._buf[1:]
+                continue                                # nothing to show, no slot used
+            if end == '\r':
+                if self._buf.startswith('\n'):         # a CRLF line ending
+                    self._buf = self._buf[1:]
+                elif self.clock() - self._last_redraw < self.every:
+                    continue                            # a redraw too soon after the last
+                else:
+                    self._last_redraw = self.clock()
+            out.append(line)
+
+    def flush(self) -> list[str]:
+        line, self._buf = self._buf, ''
+        return [line] if line.strip() else []

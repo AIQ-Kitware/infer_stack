@@ -172,7 +172,7 @@ def vllm_structural(
     launch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structural dict for a vLLM endpoint (one process per model)."""
-    structural = {
+    structural: dict[str, Any] = {
         'engine': 'vllm',
         'model_ref': model_ref,
         'revision': revision,

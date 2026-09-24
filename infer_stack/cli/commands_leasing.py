@@ -23,6 +23,7 @@ import os
 import shlex
 import subprocess
 import sys
+from typing import Any
 from pathlib import Path
 
 import scriptconfig as scfg
@@ -2743,7 +2744,7 @@ class ConfigPublishCLI(_ApprovalMixin):
                 if not path.exists():
                     raise SystemExit(f'catalog not found: {path}')
                 try:
-                    sources.append(Catalog.load(path).source)
+                    sources.append(Catalog.load(path).source or {})
                 except CatalogError as ex:
                     raise SystemExit(f'invalid catalog {path}: {ex}')
             profile = {**profile, 'catalogs': sources}
@@ -2866,7 +2867,9 @@ class SecretsRotateCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
-        backend = controller.backend
+        # Any: rotate_gateway_key below refuses a backend without a gateway,
+        # so past it these gateway methods exist.
+        backend: Any = controller.backend
         old = backend.master_key() if isinstance(backend, ComposeBackend) else None
         try:
             rec = controller.rotate_gateway_key(force=bool(config.force))
