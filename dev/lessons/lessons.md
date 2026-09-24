@@ -95,3 +95,15 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   absent.
 - **Applies when:** writing or reviewing any multi-threaded test that uses a
   barrier, latch, or queue rendezvous.
+
+- **Lesson:** A test that needs a large file for its *size* should create it
+  sparse (`file.truncate(n)`), and remove its temp dir. `os.path.getsize`
+  reports the full size, but no disk is used. Writing real bytes leaks gigabytes
+  per run unless the test cleans up.
+- **Evidence / MWE:** 21f5e09. The `weight_floor_gib` doctest wrote two 2 GiB
+  files into `mkdtemp()` and never removed them. A day of suite runs left
+  49 GB in `/tmp` on the guest, k3s tainted its node for disk pressure, and
+  KubeAI's pods were evicted. With sparse files the doctest takes 0.15 s and
+  leaves nothing behind.
+- **Applies when:** a test exercises size-dependent logic (VRAM floors, disk
+  checks, download sizes).
