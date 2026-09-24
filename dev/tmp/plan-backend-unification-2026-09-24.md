@@ -80,8 +80,17 @@ No GPU needed. Add `dev/e2e_tests/kubeai_kind.sh`: acquire, `run` a
 request, release, and verify the Model is pruned. Without it every step below
 is fake-verified only, which is how KubeAI drifted.
 
-Open: installing `kind`/`kubectl`/`helm` on the guest needs network access to
-their release downloads.
+**Done 2026-09-24**, with k3s instead of kind (k3s runs as a systemd service
+on the guest; `--disable traefik --disable servicelb` keeps ports 80/443
+free). KubeAI 0.23.4's `cpu` profile runs real vLLM 0.11.2 on CPU (needs
+AVX-512), which is better than the simulator: KubeAI builds vLLM's own
+command line, which the simulator's CLI would reject. Setup:
+`dev/e2e_tests/kubeai-cpu-values.yaml`; check:
+`dev/e2e_tests/kubeai_k3s.sh`, which passed. `doctor` passed its four checks;
+acquire → ready took 143 s with an image pull, the full `run` took 86 s with
+the image cached, a real completion came back, and release pruned the Model.
+A Docker container on the node reaches KubeAI's gateway at its cluster IP,
+which K1 relies on.
 
 ### K1. One client contract: the LiteLLM gateway fronts both backends
 

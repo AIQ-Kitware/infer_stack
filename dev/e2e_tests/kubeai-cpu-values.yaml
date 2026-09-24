@@ -1,0 +1,9 @@
+# KubeAI on a GPU-less machine, for exercising the kubeai backend for real.
+# The chart's `cpu` profile runs vLLM's CPU image (needs AVX-512). Sized for
+# a sub-1B model; raise the requests for anything larger.
+resourceProfiles:
+  cpu:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
