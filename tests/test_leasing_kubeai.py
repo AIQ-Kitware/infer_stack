@@ -634,3 +634,111 @@ def test_rotating_the_key_recreates_the_gateway_in_front_of_the_cluster(tmp_path
     ctl.rotate_gateway_key()
     assert be.master_key() != old
     assert fingerprint() != before
+
+
+# -- strict residency from pods, and crash diagnosis (plan steps K2, K4) ------
+#
+# Pod shapes follow real `kubectl get pods -o json` output captured on k3s +
+# KubeAI 0.23.4: KubeAI copies the Model's labels onto its pods, and a pod
+# whose engine rejected a flag reads Running, restartCount 1, lastState
+# terminated {exitCode: 2, reason: Error}.
+
+
+def _pod(name, gid, *, state=None, restarts=0, last=None, ready=False,
+         conditions=None, statuses=True):
+    status = {'phase': 'Running',
+              'conditions': conditions or [{'type': 'Ready',
+                                            'status': 'True' if ready else 'False'}]}
+    if statuses:
+        status['containerStatuses'] = [{
+            'name': 'server', 'restartCount': restarts,
+            'state': state or {'running': {'startedAt': 't'}},
+            'lastState': {'terminated': last} if last else {},
+        }]
+    return {'metadata': {'name': name, 'labels': {
+                'infer-stack/deployment': gid, 'infer-stack/managed': 'true',
+                'model': name.split('-')[1], 'app': 'model'}},
+            'status': status}
+
+
+class PodKubectl(FakeKubectl):
+    """FakeKubectl plus pods and per-pod logs (current, and --previous)."""
+
+    def __init__(self):
+        super().__init__()
+        self.pods: list[dict] = []
+        self.logs: dict[tuple[str, bool], str] = {}
+        self.fail_pods = False
+
+    def __call__(self, args):
+        if len(args) > 4 and args[3] == 'get' and args[4] == 'pods':
+            self.calls.append(args)
+            if self.fail_pods:
+                raise RuntimeError('connection refused')
+            return json.dumps({'items': self.pods})
+        if len(args) > 3 and args[3] == 'logs':
+            self.calls.append(args)
+            return self.logs.get((args[4], '--previous' in args), '')
+        return super().__call__(args)
+
+
+def make_pod_backend(tmp_path):
+    kubectl = PodKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    return be, kubectl
+
+
+def test_residency_reads_pods_and_never_guesses(tmp_path):
+    from infer_stack.leasing.residency import ResidencyUnknown
+
+    be, kubectl = make_pod_backend(tmp_path)
+    kubectl.pods = [_pod('model-qwen-1', 'grp-a', ready=True)]
+    pod = be.residency().resident('grp-a')
+    assert (pod.state, pod.health, pod.labelled) == ('running', 'healthy', True)
+    kubectl.fail_pods = True
+    with pytest.raises(ResidencyUnknown):
+        be.residency()                    # a failed look is never "nothing running"
+
+
+def test_an_unschedulable_pod_says_why(tmp_path):
+    be, kubectl = make_pod_backend(tmp_path)
+    kubectl.pods = [_pod('model-big-1', 'grp-b', statuses=False, conditions=[
+        {'type': 'PodScheduled', 'status': 'False', 'reason': 'Unschedulable'}])]
+    (pod,) = be.residency().containers('grp-b')
+    assert (pod.state, pod.reason, pod.warm) == ('created', 'Unschedulable', False)
+
+
+def test_a_rejected_flag_fails_the_wait_with_the_engines_words(tmp_path):
+    be, kubectl = make_pod_backend(tmp_path)
+    dep = vllm('grp-x', served='broken')
+    be.converge([dep])
+    kubectl.pods = [_pod('model-broken-1', 'grp-x', restarts=1,
+                         last={'exitCode': 2, 'reason': 'Error'})]
+    kubectl.logs[('model-broken-1', True)] = (
+        'usage: ...\napi_server.py: error: unrecognized arguments: --bogus\n')
+    be.http.post = lambda url, **kw: FakeHttp._Resp(503, {'detail': 'not ready'})
+    probe = be.probe_ready(dep, 'grp-x')
+    assert probe.fatal and not probe.ready
+    assert 'unrecognized arguments: --bogus' in probe.detail   # the previous run's log
+    assert 'rejected a command-line flag' in probe.detail
+
+
+def test_a_slow_start_is_not_a_failure(tmp_path):
+    be, kubectl = make_pod_backend(tmp_path)
+    dep = vllm('grp-y', served='slow')
+    be.converge([dep])
+    kubectl.pods = [_pod('model-slow-1', 'grp-y')]           # running, not ready
+    be.http.post = lambda url, **kw: FakeHttp._Resp(503, {'detail': 'not ready'})
+    probe = be.probe_ready(dep, 'grp-y')
+    assert not probe.ready and not probe.fatal
+
+
+def test_compose_only_commands_refuse_kubeai_explicitly(tmp_path, monkeypatch):
+    """`gc --orphans` used "has residency" to mean compose; kubeai has it now."""
+    from infer_stack.cli import commands_leasing
+
+    be, _ = make_pod_backend(tmp_path)
+    ctl = Controller(Ledger(SqliteStore(str(tmp_path / 'l.db'))), be)
+    monkeypatch.setattr(commands_leasing, '_open_controller', lambda *a, **k: ctl)
+    with pytest.raises(SystemExit, match='needs the compose backend'):
+        commands_leasing.GcCLI.main(argv=['--orphans', '--yes'])

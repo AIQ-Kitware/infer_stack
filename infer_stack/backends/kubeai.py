@@ -521,6 +521,71 @@ class KubeaiBackend(ConvergeScaffold):
         if self.gateway is not None:
             self.gateway.apply()
 
+    def residency(self):
+        """The managed Models' pods, strictly: raises rather than guess.
+
+        Unlike :meth:`observe`, a kubectl failure is never "nothing running";
+        see :mod:`infer_stack.leasing.residency`.
+        """
+        from ..leasing.residency import (
+            POD_MANAGED_LABEL,
+            ResidencyUnknown,
+            residency_from_pods,
+        )
+
+        try:
+            raw = self._kubectl(['get', 'pods', '-l', f'{POD_MANAGED_LABEL}=true',
+                                 '-o', 'json'])
+        except Exception as ex:  # noqa: BLE001 - any failure is "unknown"
+            raise ResidencyUnknown(f'kubectl get pods failed: {ex}') from ex
+        return residency_from_pods(raw)
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        """Recent engine logs: each pod's current run, then its previous one.
+
+        After a crash the kubelet has already restarted the container, so the
+        cause is in the previous run's log; it goes last, where the diagnosis
+        quotes from. Fail-open to ``''``.
+        """
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().containers(deployment.id)
+        except ResidencyUnknown:
+            return ''
+        parts: list[str] = []
+        for pod in pods:
+            runs = [[]] + ([['--previous']] if pod.restart_count else [])
+            for extra in runs:
+                try:
+                    parts.append(self._kubectl(['logs', pod.container_id, '--tail',
+                                                str(tail), *extra]))
+                except Exception:  # noqa: BLE001 - gone, or no previous run
+                    pass
+        return '\n'.join(p for p in parts if p)
+
+    def startup_failure(self, deployment: Deployment) -> str | None:
+        """Why this Model's engine cannot start, or ``None`` if it may still load."""
+        from ..leasing.diagnosis import diagnose_startup
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().containers(deployment.id)
+        except ResidencyUnknown:
+            return None                      # cannot read the cluster: say nothing
+        return diagnose_startup(pods, lambda: self.deployment_logs(deployment, tail=200))
+
+    def _waiting_reason(self, deployment: Deployment) -> str:
+        """The pod's own reason for not running yet (``ImagePullBackOff``...)."""
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().containers(deployment.id)
+        except ResidencyUnknown:
+            return ''
+        reasons = sorted({p.reason for p in pods if p.reason and p.state != 'running'})
+        return ', '.join(reasons)
+
     def observe(self) -> set[str]:
         """Deployment ids with a managed Model CR on the cluster (best-effort)."""
         try:
@@ -557,7 +622,15 @@ class KubeaiBackend(ConvergeScaffold):
             require_generation=True,
             http=self.http,
         )
-        return Readiness(ok, reason)
+        if ok:
+            return Readiness(True, reason)
+        # A crash-looping engine keeps its pod "Running" between restarts, so
+        # check every not-ready probe, not only when the Model is missing.
+        failure = self.startup_failure(deployment)
+        if failure is not None:
+            return Readiness(False, failure, fatal=True)
+        waiting = self._waiting_reason(deployment)
+        return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason)
 
     def access(self, endpoints: list[str]) -> dict[str, Any] | None:
         """Where a client reaches these endpoints (env-file descriptor).

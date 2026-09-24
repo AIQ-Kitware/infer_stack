@@ -260,92 +260,16 @@ def profile_images(profile: dict[str, Any]) -> list[str]:
     return sorted(wanted)
 
 
-#: Restarts after which Docker's own bookkeeping says an engine is looping,
-#: not loading. Two is already conclusive: a model that loads does not exit.
-CRASH_LOOP_RESTARTS = 2
-
-#: Engine log lines worth quoting verbatim, and what they mean. Each is
-#: UNRECOVERABLE: the same container, restarted, fails the same way, so one
-#: crash is already conclusive and there is nothing to wait for.
-_ENGINE_ERROR_HINTS = (
-    ('trust_remote_code', 'the model needs trust_remote_code=True '
-     '(set `runtime.trust_remote_code: true` on the endpoint)'),
-    ('does not recognize this architecture', 'this engine cannot read the '
-     "model's architecture (it may need trust_remote_code=True)"),
-    ('are not supported for now', 'this vLLM build does not implement the '
-     "model's architecture"),
-    ('is not supported', 'this vLLM build does not implement the '
-     "model's architecture"),
-    ('No supported config format', 'the model repository has no config this '
-     'engine can read'),
-    ('ValidationError', 'the engine rejected its own configuration'),
-    ('401 Client Error', 'the model is gated: set HF_TOKEN with '
-     '`infer-stack env HF_TOKEN=...`'),
-    ('403 Client Error', 'the model is gated: set HF_TOKEN with '
-     '`infer-stack env HF_TOKEN=...`'),
+# Crash diagnosis is backend-neutral (the kubeai backend uses it too); these
+# names stay importable from here.
+from .diagnosis import (  # noqa: E402,F401
+    CRASH_LOOP_RESTARTS,
+    _ENGINE_ERROR_HINTS,
+    _TRANSIENT_ENGINE_SIGNATURES,
+    _engine_error_summary,
+    classify_engine_log,
+    diagnose_startup,
 )
-
-#: Failures a RESTART CAN FIX: the hub was unreachable, a download was cut off,
-#: a port was still held by the container we just replaced. `restart:
-#: unless-stopped` exists for exactly these, so a restart count alone must not
-#: condemn an engine -- the whole point of the policy is that the next attempt
-#: succeeds. Weigh a new entry by one question: would running the same container
-#: again plausibly work? If yes it belongs here; if no it belongs above.
-_TRANSIENT_ENGINE_SIGNATURES = (
-    'Max retries exceeded',
-    'Connection reset by peer',
-    'Connection refused',
-    'Temporary failure in name resolution',
-    'Failed to resolve',
-    'Read timed out',
-    'ReadTimeoutError',
-    'ConnectionError',
-    'IncompleteRead',
-    'Consistency check failed',          # a truncated HF download
-    '429 Client Error',                  # hub rate limit
-    '500 Server Error',
-    '502 Server Error',
-    '503 Server Error',
-    '504 Server Error',
-    'Address already in use',
-)
-
-
-def classify_engine_log(logs: str) -> str | None:
-    """``'fatal'``, ``'transient'``, or ``None`` when the log says neither.
-
-    Order matters: an unrecoverable signature wins over a transient one, because
-    a hub timeout earlier in the same log does not make a rejected config
-    loadable. CUDA OOM counts as fatal — the allocation is deterministic, so the
-    restart repeats it — and it is the one class with a documented remedy
-    (:mod:`infer_stack.leasing.vram`).
-    """
-    from .vram import looks_like_cuda_oom
-
-    if not logs:
-        return None
-    if any(needle in logs for needle, _ in _ENGINE_ERROR_HINTS):
-        return 'fatal'
-    if looks_like_cuda_oom(logs):
-        return 'fatal'
-    if any(needle in logs for needle in _TRANSIENT_ENGINE_SIGNATURES):
-        return 'transient'
-    return None
-
-
-def _engine_error_summary(logs: str) -> str:
-    """The engine's own error, quoted, with a hint when we recognise it."""
-    from .vram import looks_like_cuda_oom
-
-    if not logs.strip():
-        return '; no engine log available (`infer-stack logs` for more)'
-    hint = next((note for needle, note in _ENGINE_ERROR_HINTS if needle in logs), None)
-    if hint is None and looks_like_cuda_oom(logs):
-        hint = 'the GPU ran out of memory for this configuration'
-    lines = [line.strip() for line in logs.splitlines() if line.strip()]
-    quoted = ' | '.join(lines[-3:])[:400]
-    summary = f'; last log: {quoted}'
-    return f'{summary}; likely cause: {hint}' if hint else summary
 
 
 def _network_name() -> str:
@@ -2493,39 +2417,10 @@ class ComposeBackend(ConvergeScaffold):
             residency = self.residency()
         except ResidencyUnknown:
             return None                      # cannot read Docker: say nothing
-        containers = residency.containers(deployment.id)
-        if len(containers) != 1:
-            return None                      # absent (not created yet) or ambiguous
-        container = containers[0]
-        exited_for_good = (
-            container.state in {'exited', 'dead'}
-            and (container.exit_code or 0) != 0
+        return diagnose_startup(
+            residency.containers(deployment.id),
+            lambda: self.deployment_logs(deployment, tail=200),
         )
-        crashed = exited_for_good or container.restart_count >= 1
-        if not crashed:
-            return None                      # created, starting, or healthy
-        # The log decides, not the restart count alone. `restart:
-        # unless-stopped` is there so a hub timeout or a port still held by the
-        # container we replaced resolves itself; condemning those would make the
-        # policy pointless. An unrecoverable error, by contrast, repeats
-        # identically, so waiting for a second restart only wastes the GPU.
-        logs = self.deployment_logs(deployment, tail=200)
-        verdict = classify_engine_log(logs)
-        if verdict == 'transient' and container.will_be_restarted:
-            return None                      # a retry is coming, and may work
-        if verdict == 'transient':
-            # Transient, but nothing will run it again: waiting is as pointless
-            # as for an unrecoverable error, and the cause still belongs in the
-            # message.
-            return (f'engine is not starting (exited with code '
-                    f'{container.exit_code} and will not be restarted)'
-                    f'{_engine_error_summary(logs)}')
-        looping = container.restart_count >= CRASH_LOOP_RESTARTS
-        if verdict != 'fatal' and not (exited_for_good or looping):
-            return None                      # unrecognised: keep today's budget
-        why = (f'restarted {container.restart_count} time(s)' if container.restart_count
-               else f'exited with code {container.exit_code}')
-        return f'engine is not starting ({why}){_engine_error_summary(logs)}'
 
     def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
         """Recent engine logs for a deployment's compose service.

@@ -107,6 +107,12 @@ infer-stack release --env-file lease.env
 - **Placement can only fail at admission.** The render never rejects for
   capacity (the cluster schedules); a Model the cluster cannot place sits
   not-ready until the acquire's `--timeout`, which then rolls the lease back.
+  The wait says why (`pod: Unschedulable`, `pod: ImagePullBackOff`).
+- **An engine that cannot start fails the acquire at once**, as on compose:
+  the crash diagnosis reads the pods (`kubectl get pods`, restart count, last
+  exit) and the previous run's log, and quotes the engine's error with a
+  likely cause. Verified on k3s: a rejected vLLM flag failed in 52 s instead
+  of the 800 s timeout.
   Loud render failures do exist for: a missing `resource_profile` (no invalid
   CR is ever written), served-name collisions between simultaneously live
   deployments, and **ollama endpoints** — KubeAI serves models, not daemons,

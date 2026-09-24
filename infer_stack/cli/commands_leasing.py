@@ -1270,7 +1270,7 @@ class GcCLI(_ApprovalMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
         if config.orphans:
-            if not callable(getattr(controller.backend, 'residency', None)):
+            if not isinstance(controller.backend, ComposeBackend):
                 raise SystemExit('gc --orphans needs the compose backend')
 
             def confirm(found):
@@ -1359,8 +1359,8 @@ class CleanCLI(_LeasingCommonMixin):
         held = [g for g in deployments
                 if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)]
         observed, assignments = _placement_view(controller)
-        can_orphan = bool(config.orphans) and callable(
-            getattr(controller.backend, 'residency', None))
+        can_orphan = bool(config.orphans) and isinstance(
+            controller.backend, ComposeBackend)
 
         found: list = []
 
@@ -2819,7 +2819,7 @@ class NetworkMigrateCLI(_ApprovalMixin):
         if not config.subnet:
             raise SystemExit('network migrate: --subnet is required')
         controller = _open_controller(config, interactive=True)
-        if not callable(getattr(controller.backend, 'residency', None)):
+        if not isinstance(controller.backend, ComposeBackend):
             raise SystemExit('network migrate needs the compose backend')
         try:
             rec = controller.network_migrate(config.subnet, force=bool(config.force))

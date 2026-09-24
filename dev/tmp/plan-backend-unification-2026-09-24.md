@@ -38,12 +38,18 @@ path carries the keep-warm fix, atomic acquire and serialised publication
 review; the other path is the pre-September one. In production only KubeAI
 takes it, and nothing has run it at scale.
 
-### C. Two liveness authorities
+### C. No strict liveness view on KubeAI
 
-Compose answers "what is running" with `residency()`: strict, and it raises
-`ResidencyUnknown` rather than guess. KubeAI answers with `observe()`, which
-returns the **empty set** when `kubectl` fails. Compose had that exact bug:
-an unreadable Docker looked like "nothing running" and led to wrong decisions.
+Both backends have a lenient `observe()` that returns an empty set when the
+runtime cannot be read. That is deliberate: it is for reporting. Compose also
+has `residency()`, a strict view that raises `ResidencyUnknown` rather than
+guess, and every decision that stops, evicts or hands over a GPU uses it.
+KubeAI had only the lenient view. (Corrected 2026-09-24: the first draft
+called KubeAI's `observe()` a bug; it matches Compose's contract.)
+
+Three CLI commands (`gc --orphans`, its orphan listing, `network migrate`)
+used "has `residency`" to mean "is the Compose backend", which is a duplicate
+authority of its own.
 
 ### D. Failure diagnosis only exists on Compose
 
@@ -132,6 +138,14 @@ reason, waiting reason, and GPUs when the backend knows them. Build KubeAI's
 from `kubectl get pods -l model=<name> -o json`, raising `ResidencyUnknown`
 when kubectl fails. `observe()` becomes a thin view of it on both backends.
 
+**Done 2026-09-24.** `residency_from_pods` builds the same `Residency`
+from `kubectl get pods`, selecting on the `infer-stack/managed` label KubeAI
+copies onto pods. Pod states map onto the Docker vocabulary, with the
+Kubernetes reason kept in `Container.reason`, and a kubectl failure raises.
+With it, `_never_ran`, the `config publish` quiescence check and the status
+view use strict residency on KubeAI too. The three CLI commands now check for
+the Compose backend explicitly.
+
 ### K3. One acquire path
 
 Give placement to the backend:
@@ -154,6 +168,12 @@ supplies container state and logs; KubeAI supplies pod state
 The fail-fast wait, the "likely cause" text and the TUI error path then work
 on both. Pull progress stays Compose-only; Kubernetes pulls by itself, and
 `ImagePullBackOff` is reported as a failure.
+
+**Done 2026-09-24.** The diagnosis moved to `leasing/diagnosis.py`
+(`diagnose_startup(instances, read_logs)`), and both backends call it. On k3s,
+a Model whose vLLM rejected a flag failed its acquire in 52 s with the
+engine's error quoted, instead of waiting out the 800 s timeout. Adding
+`error: unrecognized arguments` as a fatal signature helps compose as well.
 
 ### K5. Small cleanups
 

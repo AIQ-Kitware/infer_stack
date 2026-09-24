@@ -106,6 +106,10 @@ class Container:
     #: will try to start the container again.
     restart_policy: str = ''
     restart_max: int = 0
+    #: Why the instance is not running, when its runtime says:
+    #: ``CrashLoopBackOff``, ``ImagePullBackOff``, ``OOMKilled`` (Kubernetes).
+    #: Empty when there is nothing to say, or the runtime does not say.
+    reason: str = ''
 
     @property
     def warm(self) -> bool:
@@ -271,4 +275,97 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
             for gid, found in grouped.items()
         },
         tuple(sorted(others, key=lambda c: c.container_id)),
+    )
+
+
+#: Label a managed Kubernetes pod carries (copied by KubeAI from its Model).
+POD_DEPLOYMENT_LABEL = 'infer-stack/deployment'
+POD_MANAGED_LABEL = 'infer-stack/managed'
+
+
+def residency_from_pods(raw: str) -> Residency:
+    """Build a :class:`Residency` from ``kubectl get pods -o json`` output.
+
+    One pod is one instance (a :class:`Container`), keyed by the
+    ``infer-stack/deployment`` label KubeAI copies from the Model. The state
+    is mapped to the Docker vocabulary the rest of infer-stack reads:
+
+    * running container -> ``running``
+    * ``CrashLoopBackOff`` -> ``restarting`` (still warm: the kubelet retries)
+    * any other waiting reason, or a pod not started yet -> ``created``
+    * terminated -> ``exited``; a pod being deleted -> ``removing``
+
+    The waiting or last-termination reason is kept in :attr:`Container.reason`.
+    GPUs are left empty: the cluster, not this host, owns placement. Raises
+    :class:`ResidencyUnknown` on output that is not a pod list.
+
+    Example:
+        >>> raw = json.dumps({'items': [{
+        ...     'metadata': {'name': 'model-q-1', 'labels': {
+        ...         'infer-stack/deployment': 'grp-a', 'infer-stack/managed': 'true',
+        ...         'model': 'q'}},
+        ...     'status': {'phase': 'Running', 'containerStatuses': [{
+        ...         'state': {'waiting': {'reason': 'CrashLoopBackOff'}},
+        ...         'lastState': {'terminated': {'exitCode': 1, 'reason': 'Error'}},
+        ...         'restartCount': 3}]}}]})
+        >>> c = residency_from_pods(raw).containers('grp-a')[0]
+        >>> (c.state, c.reason, c.restart_count, c.exit_code, c.warm)
+        ('restarting', 'CrashLoopBackOff', 3, 1, True)
+    """
+    try:
+        data = json.loads(raw or '{}')
+    except json.JSONDecodeError as ex:
+        raise ResidencyUnknown(f'kubectl get pods output is not JSON: {ex}') from ex
+    items = data.get('items') if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ResidencyUnknown('kubectl get pods output has no items list')
+    grouped: dict[str, list[Container]] = {}
+    others: list[Container] = []
+    for pod in items:
+        meta = pod.get('metadata') or {}
+        labels = meta.get('labels') or {}
+        status = pod.get('status') or {}
+        statuses = status.get('containerStatuses') or []
+        first = statuses[0] if statuses else {}
+        current = first.get('state') or {}
+        last = (first.get('lastState') or {}).get('terminated') or {}
+        waiting = (current.get('waiting') or {}).get('reason') or ''
+        if meta.get('deletionTimestamp'):
+            state = 'removing'
+        elif 'running' in current:
+            state = 'running'
+        elif waiting == 'CrashLoopBackOff':
+            state = 'restarting'
+        elif 'terminated' in current:
+            state = 'exited'
+        else:
+            state = 'created'
+        ended = current.get('terminated') or last
+        if not waiting and not statuses:
+            # Not started at all: the pod's own condition says why, e.g. the
+            # scheduler found no node with the resources ("Unschedulable").
+            waiting = next((str(c.get('reason') or '') for c in status.get('conditions') or []
+                            if c.get('status') == 'False' and c.get('reason')), '')
+        ready = any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                    for c in status.get('conditions') or [])
+        container = Container(
+            container_id=str(meta.get('name') or ''),
+            deployment_id=str(labels.get(POD_DEPLOYMENT_LABEL) or ''),
+            state=state,
+            service=str(labels.get('model') or ''),
+            labelled=labels.get(POD_MANAGED_LABEL) == 'true',
+            health='healthy' if ready else ('starting' if state == 'running' else ''),
+            restart_count=int(first.get('restartCount') or 0),
+            exit_code=(None if ended.get('exitCode') is None else int(ended['exitCode'])),
+            # A Deployment's pods are always restarted by the kubelet.
+            restart_policy='always',
+            reason=waiting or str(ended.get('reason') or ''),
+        )
+        if container.deployment_id:
+            grouped.setdefault(container.deployment_id, []).append(container)
+        else:
+            others.append(container)
+    return Residency(
+        by_deployment={gid: tuple(found) for gid, found in grouped.items()},
+        others=tuple(others),
     )

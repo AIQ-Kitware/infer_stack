@@ -14,6 +14,22 @@ scheduler with its own GPU accounting: a lease held outside it, manual or
 keep-warm, occupies a GPU the scheduler believes is free, and the job it
 places there cannot start.
 
+### The kubeai backend fails fast on an engine that cannot start
+
+The crash diagnosis (restart count, exit code, and the engine log classified
+as fatal, transient or unknown) was Docker-only, so on a cluster a model that
+could never start held its lease for the whole timeout. It now lives in
+`infer_stack/leasing/diagnosis.py` and both backends use it. The kubeai
+backend reads pods through a new strict `residency()` (a kubectl failure
+raises instead of reading as "nothing running") and quotes the crashed run's
+log (`kubectl logs --previous`). A not-ready wait names the pod's reason, such
+as `Unschedulable` or `ImagePullBackOff`. vLLM rejecting a flag (`error:
+unrecognized arguments`) is now recognised as fatal on both backends; before,
+it waited for two restarts.
+
+`gc --orphans` and `network migrate` now refuse a non-compose backend
+explicitly. They had used "the backend has `residency`" to mean compose.
+
 ### The kubeai backend puts the LiteLLM gateway in front of the cluster
 
 On the kubeai backend a client had to name a model by its KubeAI Model name
