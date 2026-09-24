@@ -1702,6 +1702,12 @@ class TuiCLI(_LeasingCommonMixin):
 
     catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
     interval = scfg.Value(3.0, type=float, help='Auto-refresh interval (s).')
+    exit_after_paint = scfg.Value(
+        False, isflag=True,
+        help='Quit as soon as the first frame is drawn, then print when that '
+             'was (for measuring startup: `time infer-stack tui '
+             '--exit_after_paint`).',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1730,6 +1736,7 @@ class TuiCLI(_LeasingCommonMixin):
         return run_tui(
             controller, catalog,
             interval=float(config.interval), catalog_path=str(catalog_path),
+            exit_after_paint=bool(config.exit_after_paint),
         )
 
 

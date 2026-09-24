@@ -746,6 +746,52 @@ def docker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+#: Read-only docker queries in flight (ps, inspect, ...). A long-running
+#: process that is exiting (the TUI) kills these rather than wait for them;
+#: nothing that changes state is ever in this set.
+_RUNNING_QUERIES: set = set()
+
+
+_READ_VERBS = frozenset({'ps', 'inspect', 'logs', 'version', 'images', 'ls',
+                         'info', 'port', 'top', 'config'})
+_MUTATING_VERBS = frozenset({'up', 'down', 'rm', 'create', 'pull', 'run', 'exec',
+                             'start', 'stop', 'kill', 'pause', 'unpause', 'connect',
+                             'disconnect', 'prune', 'build', 'push', 'tag', 'restart'})
+
+
+def _read_only(args: list[str]) -> bool:
+    """A docker command that only reads state, and so is safe to abandon.
+
+    Example:
+        >>> _read_only(['docker', 'compose', '-p', 'x', 'ps', '--format', 'json'])
+        True
+        >>> _read_only(['docker', 'network', 'create', 'n'])
+        False
+    """
+    words = set(args)
+    return bool(words & _READ_VERBS) and not words & _MUTATING_VERBS
+
+
+def cancel_running_queries() -> int:
+    """Kill every in-flight read-only docker query; how many were killed.
+
+    For a process that is exiting: its background refresh would otherwise
+    hold the exit until ``docker compose ps`` returns (measured 0.66 s on the
+    guest, more on a loaded host). Mutations (up, rm, pull) are never killed.
+    """
+    import os
+    import signal
+
+    killed = 0
+    for proc in list(_RUNNING_QUERIES):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
+
+
 def _default_docker_run(
     args: list[str], *, timeout: float | None = None,
     stderr_lines: Callable[[str], None] | None = None,
@@ -771,6 +817,9 @@ def _default_docker_run(
         env=docker_environment(),
         stderr=subprocess.PIPE if stderr_lines is not None else None,
     )
+    query = _read_only(args)
+    if query:
+        _RUNNING_QUERIES.add(proc)
     def kill_group():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -794,6 +843,9 @@ def _default_docker_run(
         # session, so without this it would keep running unattended.
         kill_group()
         raise
+    finally:
+        if query:
+            _RUNNING_QUERIES.discard(proc)
     if stderr_lines is not None:
         for line in (err or '').splitlines():
             if line.strip():
@@ -967,9 +1019,6 @@ class ComposeBackend(ConvergeScaffold):
         # before the first frame.
         self._inventory = inventory
         self.run = run or _default_docker_run
-        if http is None:
-            import requests
-            http = requests
         # The front door: gateway settings, keys, routes. Created before the
         # settings below, which are stored on it.
         self.gateway = Gateway(

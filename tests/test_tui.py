@@ -2066,3 +2066,41 @@ def test_a_log_flood_is_drawn_in_bounded_batches():
             assert any('earlier line(s) not shown' in s for s in shown)
 
     _run(scenario)
+
+
+def test_a_running_action_shows_in_the_activity_line_until_it_ends():
+    """A slow action is visibly working: spinner, what, and for how long."""
+    import threading
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    name = next(iter(catalog.endpoints))
+    gate = threading.Event()
+    real_acquire = controller.acquire
+
+    def slow_acquire(*args, **kwargs):
+        gate.wait(5)
+        return real_acquire(*args, **kwargs)
+
+    controller.acquire = slow_acquire
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._start_acquire(name)
+            await pilot.pause(0.3)
+            line = app.query_one('#activity')
+            seen['during'] = (line.display, str(line.render()))
+            gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause(0.3)
+            seen['after'] = line.display
+
+    _run(scenario)
+    shown, text = seen['during']
+    assert shown and f'acquiring {name}' in text and 's' in text
+    assert seen['after'] is False

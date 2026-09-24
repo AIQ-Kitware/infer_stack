@@ -938,13 +938,24 @@ class Gateway(ConvergeScaffold):
         self.reverse_proxy = reverse_proxy
         self.reverse_proxy_port = reverse_proxy_port
         self.dynamic_routing = dynamic_routing
-        if http is None:
-            import requests
-            http = requests
-        self.http = http
+        # None: `requests`, imported on first use. It costs ~75 ms, and a TUI
+        # launch or a ledger-only command never makes a request.
+        self._http = http
         self._sleep = sleep
         self._clock = clock
         self.assume_yes = True
+
+    @property
+    def http(self) -> Any:
+        if self._http is None:
+            import requests
+
+            self._http = requests
+        return self._http
+
+    @http.setter
+    def http(self, value: Any) -> None:
+        self._http = value
 
     @property
     def litellm_port(self) -> int:

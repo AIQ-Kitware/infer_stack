@@ -38,6 +38,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
+from textual.lazy import Lazy
+from textual.widget import Widget
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
@@ -106,6 +109,48 @@ LOG_DRAIN_S = 0.1
 LOG_DRAIN_LINES = 200
 #: A UI-thread stall at least this long is reported, with what was running.
 STALL_REPORT_S = 0.5
+
+#: What a running background action is doing, shown in the activity line, by
+#: worker method. A worker not listed here (the refresh, log streams) is
+#: routine and shows nothing.
+ACTIVITY_VERBS = {
+    '_do_acquire': 'acquiring',
+    '_do_release': 'releasing',
+    '_do_release_all': 'releasing all leases',
+    '_do_evict': 'evicting',
+    '_do_evict_all': 'evicting idle deployments',
+    '_do_cleanup': 'cleaning up the ledger',
+    '_do_apply': 'applying',
+    '_do_compose': 'docker compose',
+    '_save_endpoint': 'saving endpoint',
+    '_do_suggest': 'inspecting GPUs for a suggestion',
+    '_prepare_endpoint_editor': 'inspecting GPUs',
+    '_do_api_send': 'waiting for the model',
+    '_do_api_test_all': 'testing every model',
+    '_do_api_list': 'listing models',
+}
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+
+def activity_label(description: str) -> str | None:
+    """``'acquiring qwen'`` from a worker description like ``_do_acquire('qwen')``.
+
+    Example:
+        >>> activity_label("_do_acquire('qwen')")
+        'acquiring qwen'
+        >>> activity_label('_do_apply()')
+        'applying'
+        >>> activity_label('_refresh_bg()') is None
+        True
+    """
+    import re
+
+    method, _, rest = str(description).partition('(')
+    verb = ACTIVITY_VERBS.get(method.strip())
+    if verb is None:
+        return None
+    first = re.match(r"\s*'([^']*)'", rest)
+    return f'{verb} {first.group(1)}' if first else verb
 
 SELECT_BLANK = next(
     (
@@ -793,6 +838,30 @@ class _ConfirmScreen(ModalScreen):
         self.dismiss(event.button.id == 'ok')
 
 
+class _Section(Widget):
+    """A tab's content, built from ``compose_fn`` when it mounts.
+
+    Wrapped in :class:`textual.lazy.Lazy` for tabs hidden at launch, so the
+    first frame does not wait for widgets nobody can see yet (CSS and layout
+    of the whole tree was most of the launch time). The app is told when the
+    content exists, to fill anything it set before then.
+    """
+
+    DEFAULT_CSS = '_Section { height: 1fr; }'
+
+    def __init__(self, compose_fn: Callable[[], ComposeResult], *, id: str):
+        super().__init__(id=id)
+        self._compose_fn = compose_fn
+
+    def compose(self) -> ComposeResult:
+        yield from self._compose_fn()
+
+    def on_mount(self) -> None:
+        on_section = getattr(self.app, '_on_section_mounted', None)
+        if on_section is not None:
+            on_section(self.id)
+
+
 class InferStackTUI(App):
     """Monitor + control the leasing stack across panes."""
 
@@ -886,6 +955,7 @@ class InferStackTUI(App):
     #api-extra Button { margin: 0 1 0 0; min-width: 12; }
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+    #activity { dock: bottom; height: 1; padding: 0 2; color: $warning; display: none; }
 
     #settings, #ui-settings { padding: 1 2; }
     #settings Label, #ui-settings Label { margin: 1 0 0 0; color: $text-muted; }
@@ -936,8 +1006,13 @@ class InferStackTUI(App):
         proc_factory: Callable[[str | None], Any] | None = None,
         catalog_path: str | Path | None = None,
         http: Any = None,
+        exit_after_paint: bool = False,
     ) -> None:
         super().__init__()
+        #: Quit once the first frame is drawn (``tui --exit_after_paint``).
+        self._exit_after_paint = exit_after_paint
+        #: Seconds from process start to the first drawn frame, once known.
+        self.first_frame_s: float | None = None
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
@@ -1003,6 +1078,10 @@ class InferStackTUI(App):
         self._log_dropped = 0
         # Parsed compose service names, keyed by the file's (mtime, size).
         self._service_names_cache: tuple[tuple[float, int], list[str]] | None = None
+        # Running background actions: worker -> (label, started). Drawn by
+        # _draw_activity, with the newest backend progress message.
+        self._activity: dict[Any, tuple[str, float]] = {}
+        self._activity_note = ''
         # The UI loop's heartbeat, read by the stall watchdog thread.
         self._beat = time.monotonic()
         self._watchdog_stop = None
@@ -1037,15 +1116,17 @@ class InferStackTUI(App):
         with TabbedContent(id='top'):
             with TabPane('Dashboard', id='tab-dashboard'):
                 yield from self._compose_dashboard()
+            # Hidden at launch: built right after the first frame, not before.
             with TabPane('API', id='tab-api'):
-                yield from self._compose_api()
+                yield Lazy(_Section(self._compose_api, id='section-api'))
             with TabPane('UI', id='tab-ui'):
-                yield from self._compose_ui_settings()
+                yield Lazy(_Section(self._compose_ui_settings, id='section-ui'))
             with TabPane('Settings', id='tab-settings'):
-                yield from self._compose_settings()
+                yield Lazy(_Section(self._compose_settings, id='section-settings'))
             with TabPane(APP_LOG_TAB_TITLE, id='tab-applog'):
                 yield from self._compose_app_log()
         yield Static('', id='status')
+        yield Static('', id='activity')
         yield Footer()
 
     def _compose_app_log(self) -> ComposeResult:
@@ -1314,13 +1395,28 @@ class InferStackTUI(App):
             self.ledger_interval, self.action_refresh
         )
         self.set_interval(LOG_DRAIN_S, self._drain_logs)
+        # Held directly: query_one searches the active screen, which is a
+        # dialog's while one is open.
+        self._activity_widget = self.query_one('#activity', Static)
+        self.set_interval(0.1, self._draw_activity)
         self._start_stall_watchdog()
         self.query_one('#endpoints', DataTable).focus()
+        self.call_after_refresh(self._first_frame_drawn)
+
+    def _first_frame_drawn(self) -> None:
+        self.first_frame_s = _seconds_since_process_start()
+        if self._exit_after_paint:
+            self.exit()
 
     def on_unmount(self) -> None:
         self._terminate_logs()
         if self._watchdog_stop is not None:
             self._watchdog_stop.set()
+        # Quit must not wait for the background refresh's `docker compose ps`:
+        # Python joins worker threads at exit. Read-only queries only.
+        from .leasing.compose import cancel_running_queries
+
+        cancel_running_queries()
 
     # -- responsiveness ------------------------------------------------------
 
@@ -1416,8 +1512,34 @@ class InferStackTUI(App):
         except RuntimeError:           # already on the UI thread
             self._show_progress(message)
 
+    def _on_section_mounted(self, section_id: str | None) -> None:
+        """A deferred tab now exists: fill what was set before it did."""
+        if section_id == 'section-api':
+            self._update_api_urls()
+            self._update_api_curl()
+            self._sync_api_models(list(getattr(self, '_api_models_wanted', [])))
+
     def _show_progress(self, message: str) -> None:
         self._status(message)          # also recorded in the TUI log
+        self._activity_note = message  # and beside the running action
+
+    def _draw_activity(self) -> None:
+        """The activity line: what is running, for how long, and its progress."""
+        widget = getattr(self, '_activity_widget', None)
+        if widget is None:
+            return
+        if not self._activity:
+            if widget.display:
+                widget.display = False
+                self._activity_note = ''
+            return
+        now = time.monotonic()
+        spin = SPINNER[int(now * 10) % len(SPINNER)]
+        parts = [f'{label} · {now - started:.0f}s'
+                 for label, started in sorted(self._activity.values(), key=lambda v: v[1])]
+        note = f'  —  {self._activity_note}' if self._activity_note else ''
+        widget.update(f'{spin} ' + '  |  '.join(parts) + note)
+        widget.display = True
 
     # -- resizable panes ---------------------------------------------------
 
@@ -1534,10 +1656,14 @@ class InferStackTUI(App):
 
     def _sync_api_models(self, names: list[str]) -> None:
         """Point the API model selector at the currently-ready endpoints only."""
+        self._api_models_wanted = names
         if names == self._ready_endpoints:
             return
+        try:
+            select = self.query_one('#api-model', Select)
+        except NoMatches:
+            return          # the API tab is not built yet; filled when it is
         self._ready_endpoints = names
-        select = self.query_one('#api-model', Select)
         current = None if _select_is_blank(select.value) else select.value
         select.set_options([(n, n) for n in names])
         if current in names:
@@ -2292,6 +2418,14 @@ class InferStackTUI(App):
 
         worker = event.worker
         name = worker.name or worker.group or 'worker'
+        if event.state is WorkerState.RUNNING:
+            label = activity_label(worker.description)
+            if label is not None:
+                self._activity[worker] = (label, time.monotonic())
+                self._draw_activity()
+        elif event.state in (WorkerState.SUCCESS, WorkerState.ERROR,
+                             WorkerState.CANCELLED):
+            self._activity.pop(worker, None)
         if event.state is WorkerState.ERROR:
             error = getattr(worker, 'error', None)
             if error is not None:
@@ -3220,7 +3354,10 @@ class InferStackTUI(App):
         self.query_one('#api-out', RichLog).write(line)
 
     def _selected_api_model(self) -> str | None:
-        value = self.query_one('#api-model', Select).value
+        try:
+            value = self.query_one('#api-model', Select).value
+        except NoMatches:
+            return None     # the API tab is built right after the first frame
         return None if _select_is_blank(value) else str(value)
 
     def action_api_send(self) -> None:
@@ -3417,12 +3554,29 @@ def _fmt_ports(row: dict) -> str:
     return ', '.join(bits)
 
 
+def _seconds_since_process_start() -> float | None:
+    """Wall time since this process started (Linux ``/proc``), else ``None``."""
+    import os
+
+    try:
+        with open('/proc/self/stat') as handle:
+            # Field 22 counts clock ticks since boot; the command name (field 2)
+            # may contain spaces, so split after its closing parenthesis.
+            start_ticks = int(handle.read().rsplit(')', 1)[1].split()[19])
+        with open('/proc/uptime') as handle:
+            uptime = float(handle.read().split()[0])
+        return uptime - start_ticks / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def run_tui(
     controller,
     catalog,
     *,
     interval: float = 3.0,
     catalog_path: str | Path | None = None,
+    exit_after_paint: bool = False,
 ) -> int:
     """Run the TUI against a built controller + catalog. Returns an exit code."""
     # The narration loguru sink writes to stderr, which would corrupt the
@@ -3434,7 +3588,14 @@ def run_tui(
     except Exception:  # noqa: BLE001
         pass
     app: Any = InferStackTUI(
-        controller, catalog, interval=interval, catalog_path=catalog_path
+        controller, catalog, interval=interval, catalog_path=catalog_path,
+        exit_after_paint=exit_after_paint,
     )
     app.run()
+    if exit_after_paint:
+        first = app.first_frame_s
+        exited = _seconds_since_process_start()
+        print(f'first frame {first:.2f}s after process start; exited at {exited:.2f}s'
+              if first is not None and exited is not None
+              else 'first frame drawn (process start time unavailable)')
     return 0
