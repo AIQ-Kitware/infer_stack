@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Ledger reads are safe across threads
+
+The ledger shares one SQLite connection between threads, but only write
+transactions took its lock. Concurrent reads on a shared Python sqlite3
+connection are not safe: the TUI, which reads from its refresh worker and its
+UI thread at once, intermittently got garbage rows (a lease listing `None`
+among its deployments). Every statement now runs under the lock with its rows
+fetched before release.
+
 ### `infer-stack clean`: a clean slate, dry run by default
 
 `clean` releases every active lease (whoever owns it), tears down every
