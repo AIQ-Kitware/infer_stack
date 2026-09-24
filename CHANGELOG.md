@@ -2,6 +2,18 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The TUI stops repainting what did not change
+
+Every refresh tick repainted the lease and deployment panes, because setting
+a pane's border title repaints it even when the text is unchanged: about
+7 KB/s of terminal output with nothing on screen changing, which is what an
+SSH session feels. Titles are now set only on change (75 bytes/s idle).
+Streamed engine logs are drawn in batches of up to 200 lines every 100 ms
+instead of one UI message per line, and a flood keeps its newest lines. A
+watchdog reports any UI-thread stall over 0.5 s in the TUI log, with the
+stack it was stuck in written to the error log file. `dev/profile_tui.py`
+measures event-loop lag for idle, docker-pane and log-flood cases.
+
 ### Ledger reads are safe across threads
 
 The ledger shares one SQLite connection between threads, but only write
