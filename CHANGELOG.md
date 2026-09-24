@@ -14,6 +14,17 @@ scheduler with its own GPU accounting: a lease held outside it, manual or
 keep-warm, occupies a GPU the scheduler believes is free, and the job it
 places there cannot start.
 
+### An idle keep-warm model gives way to a leased one on KubeAI too
+
+The rule: a keep-warm model that no lease holds is always a candidate for
+eviction when a model with a lease needs a resource. Compose admission already
+applied it when placing. On KubeAI the cluster schedules and never evicts, so
+a leased Model could sit `Unschedulable` behind idle warm ones until its
+timeout. A readiness probe can now report `needs_room`; the wait then evicts
+the longest-idle deployment, one per 30 s, never a leased one, and never
+after the wait's deadline. Verified on k3s: a leased Model that did not fit
+beside an idle one was ready 107 s later, with the idle one evicted.
+
 ### The gateway is its own module
 
 The front door (LiteLLM config and service, route registry, dynamic-route

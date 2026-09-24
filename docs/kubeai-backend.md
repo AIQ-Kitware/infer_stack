@@ -108,6 +108,11 @@ infer-stack release --env-file lease.env
   capacity (the cluster schedules); a Model the cluster cannot place sits
   not-ready until the acquire's `--timeout`, which then rolls the lease back.
   The wait says why (`pod: Unschedulable`, `pod: ImagePullBackOff`).
+- **A keep-warm model without a lease gives way to one with a lease.** When
+  a leased Model's pod is `Unschedulable`, the wait evicts the longest-idle
+  keep-warm deployment, one per 30 s, until it fits. Compose applies the same
+  rule when placing. A leased model is never evicted this way. Verified on
+  k3s: `E2E_MAKE_ROOM=1 dev/kubeai_e2e.sh` with the `cpu-half` profile.
 - **An engine that cannot start fails the acquire at once**, as on compose:
   the crash diagnosis reads the pods (`kubectl get pods`, restart count, last
   exit) and the previous run's log, and quotes the engine's error with a

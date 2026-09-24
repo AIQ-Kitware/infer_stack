@@ -7,3 +7,10 @@ resourceProfiles:
     requests:
       cpu: 8
       memory: "16Gi"
+  # Half the guest's 120 cores: only one such Model fits at a time, which is
+  # how dev/kubeai_e2e.sh's make-room check forces a scheduling conflict.
+  cpu-half:
+    imageName: "cpu"
+    requests:
+      cpu: 64
+      memory: "16Gi"

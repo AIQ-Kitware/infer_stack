@@ -37,6 +37,9 @@ from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseSt
 _T = TypeVar('_T')
 
 KEEP_WARM = 'keep-warm'
+#: Between two evictions made to fit leased demand: long enough for the
+#: freed instance to terminate and the scheduler to retry.
+ROOM_COOLDOWN_S = 30.0
 
 #: After an interrupted apply, how long to wait for the runtime to stop changing
 #: before applying again, and how often to sample it. Held under the lock.
@@ -1393,14 +1396,17 @@ class Controller:
             if endpoints is None or ep in endpoints
         ]
         deadline = self.clock() + timeout
+        last_room = float('-inf')
         while True:
             pending = []
             failures = []
+            needs_room = False
             for (g, ep) in pairs:
                 probe = self.backend.probe_ready(g, ep)
                 if probe.ready:
                     continue
                 pending.append((g, ep))
+                needs_room = needs_room or probe.needs_room
                 if probe.fatal:
                     failures.append((g.id, ep, probe.detail))
             if not pending:
@@ -1416,8 +1422,36 @@ class Controller:
                     ready=False,
                     pending=[(g.id, ep) for g, ep in pending],
                 )
+            # After the deadline check: a wait that has given up evicts nothing.
+            if needs_room and self.clock() - last_room >= ROOM_COOLDOWN_S:
+                # A leased model is waiting on resources: a model without a
+                # lease is always a candidate to give them up.
+                if self._make_room():
+                    last_room = self.clock()
             self.sleep(interval)
             pairs = pending
+
+    def _make_room(self) -> str | None:
+        """Evict the longest-idle deployment for leased demand; its id, or ``None``.
+
+        Idle means no lease holds it (a keep-warm model left resident). One at
+        a time: the runtime cannot say how much room is needed, and every
+        warm model kept is a load avoided. Compose backends never ask, since
+        their admission already moves idle models aside; this serves backends
+        where the runtime schedules (KubeAI).
+        """
+        from .._log import logger
+
+        _, deployments = self.ledger.status(virtual_expiry=True)
+        idle = sorted((g for g in deployments if g.state == DeploymentState.IDLE),
+                      key=lambda g: (g.updated_at, g.id))
+        if not idle:
+            return None
+        victim = idle[0].id
+        logger.info('making room for leased demand: evicting idle keep-warm {} ({})',
+                    victim, ', '.join(sorted(idle[0].served)))
+        self.evict([victim])
+        return victim
 
     def _never_ran(self, deployment_ids: list[str]) -> list[str]:
         """Which of these deployments definitely have no container at all.

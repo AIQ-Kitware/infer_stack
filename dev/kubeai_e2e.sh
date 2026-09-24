@@ -109,4 +109,32 @@ remaining=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
     -l infer-stack/managed=true -o name | wc -l)
 [ "$remaining" = 0 ] || { echo "!! model not pruned"; exit 1; }
 
+if [ "${E2E_MAKE_ROOM:-0}" = 1 ]; then
+  # Needs a profile only one Model fits at a time (`cpu-half` in
+  # dev/e2e_tests/kubeai-cpu-values.yaml): E2E_ROOM_PROFILE=cpu-half.
+  echo '== an idle keep-warm model gives way to a leased one'
+  cat >> "$WORK/config/catalog.yaml" <<EOF
+  e2e-warm:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: keep-warm}
+    runtime: {resource_profile: ${E2E_ROOM_PROFILE:-cpu-half}, max_model_len: 2048}
+  e2e-big:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: stop}
+    runtime: {resource_profile: ${E2E_ROOM_PROFILE:-cpu-half}, max_model_len: 2048}
+EOF
+  run_is acquire e2e-warm --yes --timeout "$TIMEOUT" --env-file "$WORK/warm.env"
+  run_is release --env-file "$WORK/warm.env" --yes     # idle, still resident
+  if ! run_is acquire e2e-big --yes --timeout "$TIMEOUT" \
+        --env-file "$WORK/big.env" 2>&1 | tee "$WORK/big.log" | grep -q 'ready: True'; then
+    echo '!! the leased model never became ready' >&2; exit 1
+  fi
+  grep -q 'making room for leased demand' "$WORK/big.log" \
+    || { echo '!! no idle model was evicted to make room' >&2; exit 1; }
+  echo '   the idle keep-warm model was evicted; the leased one is ready'
+  run_is release --env-file "$WORK/big.env" --yes
+fi
+
 echo 'PASS: kubeai backend end-to-end lifecycle'

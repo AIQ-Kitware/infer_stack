@@ -160,6 +160,12 @@ backends, `_admission_mode()` is always true for real backends. The
 non-admission branches are then deleted. Memory and Null backends get a
 trivial residency so tests use the same path.
 
+**Decision (user, 2026-09-24):** "Keep warm models without a lease should
+always be candidates for eviction if a model with a lease needs a resource."
+Implemented backend-neutrally ahead of K3: `Readiness.needs_room`, and
+`Controller._make_room` in the wait. The one acquire path itself (K3) is
+still open.
+
 ### K4. One failure diagnosis
 
 Move `startup_failure` and the log classifier behind the K2 snapshot. Compose

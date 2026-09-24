@@ -638,7 +638,8 @@ class KubeaiBackend(ConvergeScaffold):
         if failure is not None:
             return Readiness(False, failure, fatal=True)
         waiting = self._waiting_reason(deployment)
-        return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason)
+        return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason,
+                         needs_room='Unschedulable' in waiting)
 
     def access(self, endpoints: list[str]) -> dict[str, Any] | None:
         """Where a client reaches these endpoints (env-file descriptor).

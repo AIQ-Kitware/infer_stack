@@ -33,6 +33,10 @@ class Readiness:
     ready: bool
     detail: str = ''
     fatal: bool = False
+    #: The endpoint is waiting for resources held by others (a Kubernetes pod
+    #: the scheduler cannot place). The controller then frees room by
+    #: evicting idle keep-warm deployments, which no lease holds.
+    needs_room: bool = False
 
 
 class BackendTimeout(RuntimeError):
