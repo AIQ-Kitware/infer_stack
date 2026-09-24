@@ -2,6 +2,21 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The CLI is built on kwconf instead of scriptconfig
+
+kwconf is scriptconfig's successor, which aiq-magnet, cmd_queue and kwdagger
+already use. `Value`, `ModalCLI` and `__command__` carry over; `DataConfig`
+is now `Config`. One behavioural difference needed care: kwconf reads the
+strings `null`, `true` and numbers on the command line as values, so
+`--backend null` arrived as `None`. Options whose choices are strings now
+take `type=str`. The program name stays `infer-stack` in usage and errors
+(`__prog__`).
+
+The repository's uv `exclude-newer` cutoff (2026-06-04) predates every kwconf
+release, so kwconf alone gets an exception up to 0.11.0, the version tested.
+`uv.lock` and `requirements/locks/tests.txt` were regenerated: kwconf 0.11.0
+added, scriptconfig removed.
+
 ### The TUI stops repainting what did not change
 
 Every refresh tick repainted the lease and deployment panes, because setting

@@ -136,6 +136,7 @@ def activity_label(description: str) -> str | None:
     """``'acquiring qwen'`` from a worker description like ``_do_acquire('qwen')``.
 
     Example:
+        >>> # xdoctest: +REQUIRES(module:textual)
         >>> activity_label("_do_acquire('qwen')")
         'acquiring qwen'
         >>> activity_label('_do_apply()')

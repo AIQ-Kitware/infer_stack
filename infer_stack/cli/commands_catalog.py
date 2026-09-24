@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import scriptconfig as scfg
+import kwconf as kw
 import yaml
 
 from ..leasing import Catalog, CatalogError
@@ -223,8 +223,8 @@ def _parse_kv(items) -> dict[str, Any]:
 
 
 class _CatalogCommon(_PathOverridesMixin):
-    catalog = scfg.Value(None, type=str, help='Catalog path (default: config dir).')
-    dry_run = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Catalog path (default: config dir).')
+    dry_run = kw.Value(
         False, isflag=True, help='Print the resulting YAML, do not write.'
     )
 
@@ -233,7 +233,7 @@ class CatalogInitCLI(_CatalogCommon):
     """Write a starter catalog.yaml (empty sections) if none exists."""
 
     __command__ = 'init'
-    force = scfg.Value(False, isflag=True, help='Overwrite an existing catalog.')
+    force = kw.Value(False, isflag=True, help='Overwrite an existing catalog.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -275,12 +275,12 @@ class CatalogSuggestCLI(
     """
 
     __command__ = 'suggest'
-    catalog = scfg.Value(None, type=str, help='Catalog path (default: config dir).')
-    apply = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Catalog path (default: config dir).')
+    apply = kw.Value(
         False, isflag=True,
         help='Merge the suggestion into the catalog (default: render only).',
     )
-    force = scfg.Value(
+    force = kw.Value(
         False, isflag=True,
         help='With --apply, overwrite catalog entries that already exist.',
     )
@@ -363,7 +363,7 @@ class CatalogPathCLI(_PathOverridesMixin):
     """Print the catalog path."""
 
     __command__ = 'path'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -392,8 +392,8 @@ class CatalogShowCLI(_PathOverridesMixin):
     """Pretty-print the whole catalog (or one named entry across sections)."""
 
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str, help='Optional entry name.')
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str, help='Optional entry name.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -417,7 +417,7 @@ class CatalogValidateCLI(_PathOverridesMixin):
     """Parse + cross-reference check the catalog."""
 
     __command__ = 'validate'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -440,7 +440,7 @@ class CatalogEditCLI(_PathOverridesMixin):
     """Open the catalog in $EDITOR (escape hatch), then validate it."""
 
     __command__ = 'edit'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -470,12 +470,12 @@ class ModelAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a model: a Hugging Face / local weight source."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    source = scfg.Value(None, type=str, help='e.g. hf://org/Model or a path.')
-    revision = scfg.Value(None, type=str)
-    quantization = scfg.Value(None, type=str)
-    dtype = scfg.Value(None, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    source = kw.Value(None, type=str, help='e.g. hf://org/Model or a path.')
+    revision = kw.Value(None, type=str)
+    quantization = kw.Value(None, type=str)
+    dtype = kw.Value(None, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -503,7 +503,7 @@ class ModelAddCLI(_CatalogCommon):
 class ModelListCLI(_PathOverridesMixin):
     """List model names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -513,8 +513,8 @@ class ModelListCLI(_PathOverridesMixin):
 class ModelShowCLI(_PathOverridesMixin):
     """Show a model entry, or all of them when no NAME is given."""
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str,
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str,
                       help='Model name; omit to show every model.')
 
     @classmethod
@@ -526,7 +526,7 @@ class ModelShowCLI(_PathOverridesMixin):
 class ModelRmCLI(_CatalogCommon):
     """Remove one or more models by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Model name(s) to remove.')
 
     @classmethod
@@ -535,7 +535,7 @@ class ModelRmCLI(_CatalogCommon):
         return _rm(config, 'models', config.names)
 
 
-class CatalogModelCLI(scfg.ModalCLI):
+class CatalogModelCLI(kw.ModalCLI):
     """Manage catalog models."""
     __command__ = 'model'
     add = ModelAddCLI
@@ -562,55 +562,55 @@ class EndpointAddCLI(_CatalogCommon):
     """
 
     __command__ = 'add'
-    name = scfg.Value(
+    name = kw.Value(
         None, position=1, type=str,
         help='Endpoint alias (default: {model}-N, auto-incrementing).',
     )
-    engine = scfg.Value('vllm', choices=['vllm', 'ollama'])
-    model = scfg.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
-    host = scfg.Value(None, type=str, help='Runtime host (ollama).')
-    public_name = scfg.Value(
+    engine = kw.Value('vllm', type=str, choices=['vllm', 'ollama'])
+    model = kw.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
+    host = kw.Value(None, type=str, help='Runtime host (ollama).')
+    public_name = kw.Value(
         None, type=str, help='Served/public name (for coalescing aliases).'
     )
-    reclaim = scfg.Value(
-        None, choices=['keep-warm', 'stop', 'scale-to-zero'],
+    reclaim = kw.Value(
+        None, type=str, choices=['keep-warm', 'stop', 'scale-to-zero'],
         help='Reclaim policy when idle.',
     )
-    protocol = scfg.Value(
-        None, choices=['chat', 'completions'],
+    protocol = kw.Value(
+        None, type=str, choices=['chat', 'completions'],
         help='Which OpenAI surface this endpoint serves. Load-bearing twice: '
              'a base model has no chat template, and the readiness probe '
              'follows this — declaring chat for a completions-only serve '
              'blocks `acquire` until the TTL. Default (unset): chat.',
     )
-    min_vram_gib = scfg.Value(
+    min_vram_gib = kw.Value(
         None, type=float,
         help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
              'planner can pick any eligible free GPU. Declaring this is what '
              'lets one catalog be correct on every host.',
     )
-    gpu = scfg.Value(
+    gpu = kw.Value(
         [], nargs='*', type=int,
         help='placement.gpu_indices — exact physical GPU index/indices. Omit '
              'for automatic VRAM-aware placement. This is a local operator '
              'override and is intentionally less portable than --min-vram-gib.',
     )
     # vLLM runtime conveniences
-    max_model_len = scfg.Value(None, type=int)
-    gpu_mem = scfg.Value(
+    max_model_len = kw.Value(None, type=int)
+    gpu_mem = kw.Value(
         None, type=float, help='gpu_memory_utilization (0-1).'
     )
-    tensor_parallel = scfg.Value(None, type=int)
-    extra_args = scfg.Value(
+    tensor_parallel = kw.Value(None, type=int)
+    extra_args = kw.Value(
         None, type=str,
         help="Raw vLLM flags as one string (shell-split), "
         "e.g. --extra-args='--dtype=half --enforce-eager'.",
     )
-    runtime = scfg.Value(
+    runtime = kw.Value(
         [], nargs='*', type=str,
         help='Extra runtime KEY=VALUE pairs (YAML-typed).',
     )
-    force = scfg.Value(False, isflag=True)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -681,7 +681,7 @@ class EndpointAddCLI(_CatalogCommon):
 class EndpointListCLI(_PathOverridesMixin):
     """List endpoint names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -691,8 +691,8 @@ class EndpointListCLI(_PathOverridesMixin):
 class EndpointShowCLI(_PathOverridesMixin):
     """Show an endpoint entry, or all of them when no NAME is given."""
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str,
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str,
                       help='Endpoint name; omit to show every endpoint.')
 
     @classmethod
@@ -704,7 +704,7 @@ class EndpointShowCLI(_PathOverridesMixin):
 class EndpointRmCLI(_CatalogCommon):
     """Remove one or more endpoints by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Endpoint name(s) to remove.')
 
     @classmethod
@@ -713,7 +713,7 @@ class EndpointRmCLI(_CatalogCommon):
         return _rm(config, 'endpoints', config.names)
 
 
-class CatalogEndpointCLI(scfg.ModalCLI):
+class CatalogEndpointCLI(kw.ModalCLI):
     """Manage catalog endpoints."""
     __command__ = 'endpoint'
     add = EndpointAddCLI
@@ -731,15 +731,15 @@ class HostAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a runtime host (e.g. an Ollama daemon)."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    engine = scfg.Value('ollama', choices=['ollama'])
-    gpu = scfg.Value([], nargs='*', type=int, help='GPU index/indices.')
-    keep_alive = scfg.Value(None, type=str, help='Ollama keep_alive, e.g. 5m.')
-    num_parallel = scfg.Value(None, type=int)
-    max_loaded_models = scfg.Value(None, type=int)
-    context_length = scfg.Value(None, type=int)
-    image = scfg.Value(None, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    engine = kw.Value('ollama', type=str, choices=['ollama'])
+    gpu = kw.Value([], nargs='*', type=int, help='GPU index/indices.')
+    keep_alive = kw.Value(None, type=str, help='Ollama keep_alive, e.g. 5m.')
+    num_parallel = kw.Value(None, type=int)
+    max_loaded_models = kw.Value(None, type=int)
+    context_length = kw.Value(None, type=int)
+    image = kw.Value(None, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -780,7 +780,7 @@ class HostAddCLI(_CatalogCommon):
 class HostListCLI(_PathOverridesMixin):
     """List runtime-host names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -790,7 +790,7 @@ class HostListCLI(_PathOverridesMixin):
 class HostRmCLI(_CatalogCommon):
     """Remove one or more runtime hosts by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Runtime-host name(s) to remove.')
 
     @classmethod
@@ -799,7 +799,7 @@ class HostRmCLI(_CatalogCommon):
         return _rm(config, 'runtime_hosts', config.names)
 
 
-class CatalogHostCLI(scfg.ModalCLI):
+class CatalogHostCLI(kw.ModalCLI):
     """Manage runtime hosts (Ollama daemons / placement)."""
     __command__ = 'host'
     add = HostAddCLI
@@ -816,9 +816,9 @@ class BundleAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a bundle: a named group of endpoints."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    members = scfg.Value([], nargs='*', position=2, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    members = kw.Value([], nargs='*', position=2, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -844,7 +844,7 @@ class BundleAddCLI(_CatalogCommon):
 class BundleListCLI(_PathOverridesMixin):
     """List bundle names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -854,7 +854,7 @@ class BundleListCLI(_PathOverridesMixin):
 class BundleRmCLI(_CatalogCommon):
     """Remove one or more bundles by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Bundle name(s) to remove.')
 
     @classmethod
@@ -863,7 +863,7 @@ class BundleRmCLI(_CatalogCommon):
         return _rm(config, 'bundles', config.names)
 
 
-class CatalogBundleCLI(scfg.ModalCLI):
+class CatalogBundleCLI(kw.ModalCLI):
     """Manage endpoint bundles."""
     __command__ = 'bundle'
     add = BundleAddCLI
@@ -876,7 +876,7 @@ class CatalogBundleCLI(scfg.ModalCLI):
 # ---------------------------------------------------------------------------
 
 
-class CatalogModalCLI(scfg.ModalCLI):
+class CatalogModalCLI(kw.ModalCLI):
     """Edit the user serving catalog (models / endpoints / hosts / bundles)."""
 
     __command__ = 'catalog'

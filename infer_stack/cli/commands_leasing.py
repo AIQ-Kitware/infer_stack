@@ -26,7 +26,7 @@ import sys
 from typing import Any
 from pathlib import Path
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from ..env_utils import parse_env_file, write_env_file
 from ..leasing import (
@@ -726,24 +726,24 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 
 
 class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
-    backend = scfg.Value(
+    backend = kw.Value(
         None,
-        choices=['null', 'compose', 'kubeai'],
+        type=str, choices=['null', 'compose', 'kubeai'],
         help='Serving backend: "null" (dry-run), "compose" (single-host '
         'docker), or "kubeai" (cluster; see docs/kubeai-backend.md). '
         'Defaults to `config set backend …`, else "null".',
     )
-    ledger = scfg.Value(
+    ledger = kw.Value(
         None, type=str, help='Path to the lease ledger sqlite db.'
     )
-    require_generation = scfg.Value(
+    require_generation = kw.Value(
         False,
         isflag=True,
         help='Deprecated/no-op: readiness now ALWAYS verifies a real generation '
         '(a listed alias or a running container is not proof the model serves). '
         'Accepted for compatibility.',
     )
-    litellm = scfg.Value(
+    litellm = kw.Value(
         None,
         isflag=True,
         help='Render the LiteLLM gateway — one OpenAI base_url fronting every '
@@ -751,14 +751,14 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         'a lean stack where Open WebUI talks to the upstreams (e.g. an Ollama '
         'daemon) directly. Overrides `config set litellm …`.',
     )
-    ui = scfg.Value(
+    ui = kw.Value(
         None,
         isflag=True,
         help='Render a managed Open WebUI in front of the gateway (compose '
         'backend). On by default; use --no-ui to skip. Overrides '
         '`config set ui …`.',
     )
-    reverse_proxy = scfg.Value(
+    reverse_proxy = kw.Value(
         None,
         isflag=True,
         alias=['reverse-proxy'],
@@ -767,7 +767,7 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         '(localhost / trusted networks only). Port + bring-your-own nginx.conf '
         'live in the `reverse_proxy` setting (`config set` / `config edit`).',
     )
-    dynamic_routing = scfg.Value(
+    dynamic_routing = kw.Value(
         None,
         isflag=True,
         alias=['dynamic-routing'],
@@ -787,14 +787,14 @@ class _ApprovalMixin(_LeasingCommonMixin):
     terminal; ``--yes`` (or a non-TTY) applies without prompting.
     """
 
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Path to catalog.yaml. release/gc/evict reconcile the gateway too, '
         'so pass the same catalog as acquire to keep the static superset route '
         'table (no gateway blip); omitted, it falls back to the default-path '
         'catalog, else legacy per-deployment routing.',
     )
-    yes = scfg.Value(
+    yes = kw.Value(
         False, isflag=True, alias=['y'],
         help='Apply compose changes without showing the diff / prompting '
         '(compose backend). Implied when stdout is not a terminal.',
@@ -802,21 +802,21 @@ class _ApprovalMixin(_LeasingCommonMixin):
 
 
 class _AcquireFlagsMixin(_LeasingCommonMixin):
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    base_url = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    base_url = kw.Value(
         'http://127.0.0.1:14042/v1',
         type=str,
         help='Base URL written into the endpoint descriptor (dry-run placeholder).',
     )
-    api_key_env = scfg.Value(
+    api_key_env = kw.Value(
         'LITELLM_MASTER_KEY',
         type=str,
         help='Name of the env var holding the API key (kept out of artifacts).',
     )
-    wait = scfg.Value(
+    wait = kw.Value(
         True, isflag=True, help='Block until ready (use --no-wait to skip).'
     )
-    queue = scfg.Value(
+    queue = kw.Value(
         False, isflag=True,
         help='Admission queue: if every GPU is busy, WAIT for one to free '
         '(up to --timeout) instead of failing fast. Each retry sweeps the '
@@ -824,7 +824,7 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
         'waiting. Intended for batch/pipeline fan-out; interactive use '
         'defaults off (fail fast with a clear "no GPU" error).',
     )
-    apply = scfg.Value(
+    apply = kw.Value(
         True,
         isflag=True,
         help='Apply the render (docker compose up). Use --no-apply to *stage* '
@@ -833,17 +833,17 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
         '(compose backend). --no-apply implies no readiness wait and no diff '
         'prompt; `release` discards a staged lease.',
     )
-    timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    env_file = scfg.Value(
+    timeout = kw.Value(600, type=float, help='Readiness wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    env_file = kw.Value(
         None, type=str, help='Write the sourceable endpoint env-file here.'
     )
-    yes = scfg.Value(
+    yes = kw.Value(
         False, isflag=True, alias=['y'],
         help='Apply compose changes without showing the diff / prompting '
         '(compose backend). Implied when stdout is not a terminal.',
     )
-    json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
+    json = kw.Value(False, isflag=True, help='Emit JSON instead of text.')
 
 
 # ---------------------------------------------------------------------------
@@ -901,19 +901,19 @@ class AcquireCLI(_AcquireFlagsMixin):
         infer-stack leases
     """
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
     )
-    ttl = scfg.Value(
+    ttl = kw.Value(
         None, type=str, help='Soft TTL (e.g. 2h, 30m); default infinite.'
     )
-    owner = scfg.Value(None, type=str, help='Lease owner (default: $USER).')
-    dedicated = scfg.Value(
+    owner = kw.Value(None, type=str, help='Lease owner (default: $USER).')
+    dedicated = kw.Value(
         False,
         isflag=True,
         help='Force a dedicated deployment instead of coalescing.',
     )
-    reserve_gpus = scfg.Value(
+    reserve_gpus = kw.Value(
         0,
         type=int,
         alias=['reserve-gpus'],
@@ -949,7 +949,7 @@ class RenderCLI(_LeasingCommonMixin):
 
     __command__ = 'render'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -990,12 +990,12 @@ class ApplyCLI(_ApprovalMixin):
 
     __command__ = 'apply'
 
-    wait = scfg.Value(
+    wait = kw.Value(
         False, isflag=True, help='Also block until ready after bringing it up.'
     )
-    timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    json = scfg.Value(False, isflag=True)
+    timeout = kw.Value(600, type=float, help='Readiness wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1075,22 +1075,22 @@ class ReleaseCLI(_ApprovalMixin):
 
     __command__ = 'release'
 
-    lease = scfg.Value(
+    lease = kw.Value(
         None, position=1, type=str, help='Lease id (or use --env-file).'
     )
-    env_file = scfg.Value(
+    env_file = kw.Value(
         None, type=str, help='Read the lease id from this env-file.'
     )
-    all = scfg.Value(
+    all = kw.Value(
         False, isflag=True,
         help='Release every active lease (the whole stack idles/tears down).',
     )
-    evict = scfg.Value(
+    evict = kw.Value(
         False, isflag=True,
         help='Also evict (tear down) the released deployment(s) now, even if their '
         'reclaim policy is keep-warm — frees the GPU immediately.',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1183,12 +1183,12 @@ class EvictCLI(_ApprovalMixin):
 
     __command__ = 'evict'
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Endpoint alias or deployment id to evict.',
     )
-    all = scfg.Value(False, isflag=True, help='Evict every idle deployment.')
-    json = scfg.Value(False, isflag=True)
+    all = kw.Value(False, isflag=True, help='Evict every idle deployment.')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1252,17 +1252,17 @@ class GcCLI(_ApprovalMixin):
 
     __command__ = 'gc'
 
-    evict = scfg.Value(
+    evict = kw.Value(
         False, isflag=True,
         help='Also tear down idle keep-warm deployments (like `evict --all`), '
         'not just leaked/expired demand.',
     )
-    orphans = scfg.Value(
+    orphans = kw.Value(
         False, isflag=True,
         help='Instead: remove containers in the project that infer-stack does not '
         'manage (listed and confirmed first; --yes skips the prompt).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1337,16 +1337,16 @@ class CleanCLI(_LeasingCommonMixin):
         infer-stack clean -f --no-orphans   # leave unmanaged containers alone
     """
 
-    force = scfg.Value(
+    force = kw.Value(
         False, isflag=True, short_alias=['f'],
         help='Actually release and tear down. Without it, clean only reports.',
     )
-    orphans = scfg.Value(
+    orphans = kw.Value(
         True, isflag=True,
         help='Also remove containers in the project that infer-stack does not '
         'manage (--no-orphans keeps them).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1448,13 +1448,13 @@ class WaitCLI(_LeasingCommonMixin):
 
     __command__ = 'wait'
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Endpoint names to wait for (default: every live deployment).',
     )
-    timeout = scfg.Value(600, type=float, help='Overall wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    json = scfg.Value(False, isflag=True)
+    timeout = kw.Value(600, type=float, help='Overall wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1523,35 +1523,35 @@ class MeasureCLI(_LeasingCommonMixin):
 
     __command__ = 'measure'
 
-    endpoint = scfg.Value(
+    endpoint = kw.Value(
         None, position=1, required=True, type=str,
         help='Catalog endpoint to measure.',
     )
-    record = scfg.Value(
+    record = kw.Value(
         False, isflag=True,
         help='Record the result into the measurements overlay '
         '(consulted automatically at plan time when the catalog declares '
         'nothing for this endpoint).',
     )
-    kv_gib = scfg.Value(
+    kv_gib = kw.Value(
         2.0, type=float,
         help='KV-cache budget (GiB) added on top of the non-KV profile. '
         'A serving choice (max_model_len / max_num_seqs), not a model fact.',
     )
-    margin = scfg.Value(
+    margin = kw.Value(
         0.05, type=float,
         help='Safety-margin fraction over the non-KV profile '
         '(allocator fragmentation, engine drift).',
     )
-    timeout = scfg.Value(
+    timeout = kw.Value(
         900, type=float,
         help='Readiness timeout when the endpoint must be brought up first (s).',
     )
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Catalog path (default: <config-root>/catalog.yaml).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1700,9 +1700,9 @@ class TuiCLI(_LeasingCommonMixin):
 
     __command__ = 'tui'
 
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    interval = scfg.Value(3.0, type=float, help='Auto-refresh interval (s).')
-    exit_after_paint = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    interval = kw.Value(3.0, type=float, help='Auto-refresh interval (s).')
+    exit_after_paint = kw.Value(
         False, isflag=True,
         help='Quit as soon as the first frame is drawn, then print when that '
              'was (for measuring startup: `time infer-stack tui '
@@ -1745,9 +1745,9 @@ class RenewCLI(_LeasingCommonMixin):
 
     __command__ = 'renew'
 
-    lease = scfg.Value(None, position=1, type=str, help='Lease id.')
-    env_file = scfg.Value(None, type=str)
-    ttl = scfg.Value(None, type=str, help='New soft TTL (e.g. 2h); empty=infinite.')
+    lease = kw.Value(None, position=1, type=str, help='Lease id.')
+    env_file = kw.Value(None, type=str)
+    ttl = kw.Value(None, type=str, help='New soft TTL (e.g. 2h); empty=infinite.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1791,26 +1791,26 @@ class RunCLI(_LeasingCommonMixin):
 
     __command__ = 'run'
 
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    endpoint = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    endpoint = kw.Value(
         None,
         type=str,
         alias=['endpoints'],
         help='Comma-separated endpoint or bundle names.',
     )
-    base_url = scfg.Value('http://127.0.0.1:14042/v1', type=str)
-    api_key_env = scfg.Value('LITELLM_MASTER_KEY', type=str)
-    owner = scfg.Value(None, type=str)
-    ttl = scfg.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
-    timeout = scfg.Value(600, type=float)
-    interval = scfg.Value(5, type=float)
-    queue = scfg.Value(
+    base_url = kw.Value('http://127.0.0.1:14042/v1', type=str)
+    api_key_env = kw.Value('LITELLM_MASTER_KEY', type=str)
+    owner = kw.Value(None, type=str)
+    ttl = kw.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
+    timeout = kw.Value(600, type=float)
+    interval = kw.Value(5, type=float)
+    queue = kw.Value(
         False, isflag=True,
         help='Admission queue: wait (up to --timeout) for a GPU to free '
         'instead of failing fast when the fleet is full. Recommended for '
         'pipeline fan-out, where many jobs contend for a few GPUs.',
     )
-    command = scfg.Value(
+    command = kw.Value(
         [], nargs='*', position=1, type=str, help='Command to run (after --).'
     )
 
@@ -2028,7 +2028,7 @@ class LeasesCLI(_LeasingCommonMixin):
         infer-stack leases --json   # JSON (adds running + gpus per deployment)
     """
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2186,27 +2186,27 @@ class TestCLI(_PathOverridesMixin):
 
     __command__ = 'test'
 
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Catalog path, used only to look up the endpoint protocol.',
     )
-    name = scfg.Value(
+    name = kw.Value(
         None, position=1, type=str, help='Endpoint alias to test (e.g. chat).'
     )
-    prompt = scfg.Value(
+    prompt = kw.Value(
         'Reply with the single word: ready.', type=str, help='Prompt to send.'
     )
-    max_tokens = scfg.Value(32, type=int)
-    timeout = scfg.Value(60, type=float, help='Request timeout (s).')
-    base_url = scfg.Value(
+    max_tokens = kw.Value(32, type=int)
+    timeout = kw.Value(60, type=float, help='Request timeout (s).')
+    base_url = kw.Value(
         None, type=str, help='Override the gateway base URL (…/v1).'
     )
-    port = scfg.Value(
+    port = kw.Value(
         None, type=int, help='Override the gateway port (default: 14042).'
     )
-    json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
-    protocol = scfg.Value(
-        None, choices=['chat', 'completions'],
+    json = kw.Value(False, isflag=True, help='Emit JSON instead of text.')
+    protocol = kw.Value(
+        None, type=str, choices=['chat', 'completions'],
         help="Which surface to hit. Default: the endpoint's declared "
              '`protocol` from the catalog, falling back to chat.',
     )
@@ -2348,11 +2348,11 @@ class EnvCLI(_PathOverridesMixin):
 
     __command__ = 'env'
 
-    arg = scfg.Value(
+    arg = kw.Value(
         None, position=1, type=str,
         help='KEY to read its value, or KEY=VALUE to set it. Empty = path.',
     )
-    export = scfg.Value(
+    export = kw.Value(
         False, isflag=True, help='Print every entry as `export KEY=value`.'
     )
 
@@ -2478,7 +2478,7 @@ class RoutesListCLI(_LeasingCommonMixin):
 
     __command__ = 'list'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2559,7 +2559,7 @@ class RoutesPruneCLI(_ApprovalMixin):
 
     __command__ = 'prune'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2656,12 +2656,12 @@ class RoutesSeedCLI(_ApprovalMixin):
 
     __command__ = 'seed'
 
-    catalogs = scfg.Value(
+    catalogs = kw.Value(
         None, nargs='+', position=1, type=str,
         help='One or more catalog.yaml files whose endpoints to merge into the '
         'route registry.',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2735,16 +2735,16 @@ class ConfigPublishCLI(_ApprovalMixin):
 
     __command__ = 'publish'
 
-    catalogs = scfg.Value(
+    catalogs = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Catalog files to publish as one union (default: --catalog, or the '
         'default-path catalog).',
     )
-    pull = scfg.Value(
+    pull = kw.Value(
         True, isflag=True,
         help='Pre-pull every image the profile references (default; --no-pull skips).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2815,8 +2815,8 @@ class NetworkMigrateCLI(_ApprovalMixin):
 
     __command__ = 'migrate'
 
-    subnet = scfg.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
-    force = scfg.Value(False, isflag=True, help='Migrate even with active leases.')
+    subnet = kw.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
+    force = kw.Value(False, isflag=True, help='Migrate even with active leases.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2851,7 +2851,7 @@ class NetworkCheckCLI(_LeasingCommonMixin):
 
     __command__ = 'check'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2881,7 +2881,7 @@ class SecretsRotateCLI(_ApprovalMixin):
 
     __command__ = 'rotate'
 
-    force = scfg.Value(False, isflag=True, help='Rotate even with active leases.')
+    force = kw.Value(False, isflag=True, help='Rotate even with active leases.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2921,7 +2921,7 @@ class SecretsRotateCLI(_ApprovalMixin):
         return 0
 
 
-class SecretsModalCLI(scfg.ModalCLI):
+class SecretsModalCLI(kw.ModalCLI):
     """Manage the gateway's secrets."""
 
     __command__ = 'secrets'
@@ -2929,7 +2929,7 @@ class SecretsModalCLI(scfg.ModalCLI):
     rotate = SecretsRotateCLI
 
 
-class NetworkModalCLI(scfg.ModalCLI):
+class NetworkModalCLI(kw.ModalCLI):
     """Stable per-service addressing (migrate) and the upstream routing check."""
 
     __command__ = 'network'
@@ -2938,7 +2938,7 @@ class NetworkModalCLI(scfg.ModalCLI):
     check = NetworkCheckCLI
 
 
-class RoutesModalCLI(scfg.ModalCLI):
+class RoutesModalCLI(kw.ModalCLI):
     """Inspect + manage the LiteLLM route registry (static-superset mode).
 
     The registry accumulates every catalog's and every live deployment's routes

@@ -96,7 +96,7 @@ infer-stack version                   # print the installed version
 infer-stack config paths              # show where config / artifacts / caches live
 ```
 
-The CLI is built on [`scriptconfig`](https://gitlab.kitware.com/utils/scriptconfig),
+The CLI is built on [`kwconf`](https://github.com/Erotemic/kwconf),
 so every subcommand is also importable as a Python class — useful for
 notebooks, tests, and other scripts:
 

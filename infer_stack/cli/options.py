@@ -2,17 +2,17 @@ from __future__ import annotations
 
 from ..paths import CONFIG_DIR_ENV
 from ..paths import DATA_DIR_ENV
-import scriptconfig as scfg
+import kwconf as kw
 
 # ---------------------------------------------------------------------------
 # DataConfig mixins for common override flags
 # ---------------------------------------------------------------------------
 
 
-class _PathOverridesMixin(scfg.DataConfig):
+class _PathOverridesMixin(kw.Config):
     """Adds global ``--config-dir`` / ``--data-dir`` to a subcommand."""
 
-    config_dir = scfg.Value(
+    config_dir = kw.Value(
         None,
         type=str,
         help=(
@@ -20,7 +20,7 @@ class _PathOverridesMixin(scfg.DataConfig):
             f'~/.config/infer_stack (XDG_CONFIG_HOME) or ${CONFIG_DIR_ENV} when set.'
         ),
     )
-    data_dir = scfg.Value(
+    data_dir = kw.Value(
         None,
         type=str,
         help=(
@@ -30,42 +30,42 @@ class _PathOverridesMixin(scfg.DataConfig):
     )
 
 
-class _BackendOverrideMixin(scfg.DataConfig):
-    backend = scfg.Value(
-        None, choices=['compose', 'kubeai'], help='Active backend override.'
+class _BackendOverrideMixin(kw.Config):
+    backend = kw.Value(
+        None, type=str, choices=['compose', 'kubeai'], help='Active backend override.'
     )
 
 
-class _ComposeOverrideMixin(scfg.DataConfig):
-    compose_cmd = scfg.Value(
+class _ComposeOverrideMixin(kw.Config):
+    compose_cmd = kw.Value(
         None,
         type=str,
         help="Docker compose command override (e.g. 'podman compose').",
     )
 
 
-class _ProfileOverrideMixin(scfg.DataConfig):
-    profile = scfg.Value(
+class _ProfileOverrideMixin(kw.Config):
+    profile = kw.Value(
         None,
         type=str,
         help='Active profile override (sets config.active_profile).',
     )
 
 
-class _PortOverridesMixin(scfg.DataConfig):
-    litellm_port = scfg.Value(None, type=int)
-    open_webui_port = scfg.Value(None, type=int)
-    postgres_port = scfg.Value(None, type=int)
+class _PortOverridesMixin(kw.Config):
+    litellm_port = kw.Value(None, type=int)
+    open_webui_port = kw.Value(None, type=int)
+    postgres_port = kw.Value(None, type=int)
 
 
-class _ClusterOverridesMixin(scfg.DataConfig):
-    namespace = scfg.Value(
+class _ClusterOverridesMixin(kw.Config):
+    namespace = kw.Value(
         None, type=str, help='Kubernetes namespace for kubeai deployments.'
     )
-    ingress_host = scfg.Value(
+    ingress_host = kw.Value(
         None, type=str, help='Ingress host (kubeai only).'
     )
-    ingress_enabled = scfg.Value(
+    ingress_enabled = kw.Value(
         None,
         isflag=True,
         alias=['ingress'],
@@ -73,24 +73,24 @@ class _ClusterOverridesMixin(scfg.DataConfig):
     )
 
 
-class _AllowUnsupportedMixin(scfg.DataConfig):
-    allow_unsupported = scfg.Value(
+class _AllowUnsupportedMixin(kw.Config):
+    allow_unsupported = kw.Value(
         False,
         isflag=True,
         help='Allow validation errors when planning/rendering.',
     )
 
 
-class _SimulateHardwareMixin(scfg.DataConfig):
-    simulate_hardware = scfg.Value(
+class _SimulateHardwareMixin(kw.Config):
+    simulate_hardware = kw.Value(
         None,
         type=str,
         help='Simulate GPUs: comma-separated NxM or M entries (e.g. 4x96, 2x80, "48,16" for a heterogeneous host). Useful for planning on smaller machines.',
     )
 
 
-class _AllowedGpusMixin(scfg.DataConfig):
-    allowed_gpus = scfg.Value(
+class _AllowedGpusMixin(kw.Config):
+    allowed_gpus = kw.Value(
         None,
         type=str,
         help=(
@@ -102,8 +102,8 @@ class _AllowedGpusMixin(scfg.DataConfig):
     )
 
 
-class _DisplayGpuMixin(scfg.DataConfig):
-    skip_display_gpus = scfg.Value(
+class _DisplayGpuMixin(kw.Config):
+    skip_display_gpus = kw.Value(
         None,
         isflag=True,
         alias=['skip-display-gpus'],

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
-"""scriptconfig-based CLI for infer-stack.
+"""kwconf-based CLI for infer-stack.
 
-Each subcommand is a ``scfg.DataConfig`` subclass; ``ManageCLI`` composes
-them into a single ``scfg.ModalCLI`` exposed as the ``infer-stack`` entry
+Each subcommand is a ``kw.Config`` subclass; ``ManageCLI`` composes
+them into a single ``kw.ModalCLI`` exposed as the ``infer-stack`` entry
 point. Because every subcommand is a ``DataConfig``, the same class can
 be invoked from the shell (``infer-stack render --profile X``) or from
 Python (``RenderCLI.main(argv=False, profile='X')``).
@@ -22,7 +22,7 @@ The layers are:
 
 from __future__ import annotations
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from .. import __version__
 
@@ -78,7 +78,11 @@ from .commands_runtime import (
 # ---------------------------------------------------------------------------
 
 
-class ManageCLI(scfg.ModalCLI):
+class ManageCLI(kw.ModalCLI):
+    # The program name in usage and error messages (kwconf would use the class
+    # name, "ManageCLI").
+    __prog__ = 'infer-stack'
+
     description = (
         'Lease, acquire, and run LLM endpoints. Primary workflow: '
         'catalog -> acquire/run. See `infer-stack help tree`.'
@@ -104,7 +108,7 @@ class ManageCLI(scfg.ModalCLI):
         actual. Run `infer-stack help tree` for the whole command surface.
     """
 
-    # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
+    # Backs the modal ``--version`` flag (kwconf reads ``__version__``).
     # The ``version`` *subcommand* is registered below under a non-colliding
     # attribute name; its CLI name comes from ``VersionCLI.__command__``.
     __version__ = __version__

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from ..log_filter import compact_litellm_tracebacks
 from ..paths import config_root, data_root, get_setting, settings_path
@@ -365,7 +365,7 @@ class StatusCLI(_PathOverridesMixin):
     (active leases / live deployments), with pointers to dig deeper."""
 
     __command__ = 'status'
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str, help='Catalog path (default: config dir).'
     )
 
@@ -393,7 +393,7 @@ class _ComposeWrapperBase(_PathOverridesMixin):
     """Common fields for ``docker compose <subcmd>`` wrappers over the leasing
     Compose deployment."""
 
-    services = scfg.Value(
+    services = kw.Value(
         None,
         nargs='*',
         position=1,
@@ -435,17 +435,17 @@ class LogsCLI(_ComposeWrapperBase):
 
     __command__ = 'logs'
 
-    follow = scfg.Value(
+    follow = kw.Value(
         False, isflag=True, short_alias=['f'],
         help='Stream logs (docker compose logs -f).',
     )
-    tail = scfg.Value(
+    tail = kw.Value(
         None, type=str,
         help="Tail the last N lines (default: all). Pass a number or 'all'.",
     )
-    timestamps = scfg.Value(False, isflag=True)
-    no_color = scfg.Value(False, isflag=True)
-    raw = scfg.Value(
+    timestamps = kw.Value(False, isflag=True)
+    no_color = kw.Value(False, isflag=True)
+    raw = kw.Value(
         False,
         isflag=True,
         help='Show raw followed logs without known LiteLLM traceback compaction.',
@@ -487,14 +487,14 @@ class PsCLI(_ComposeWrapperBase):
 
     __command__ = 'ps'
 
-    all = scfg.Value(
+    all = kw.Value(
         False, isflag=True, short_alias=['a'], help='Include stopped containers.'
     )
-    services_only = scfg.Value(
+    services_only = kw.Value(
         False, isflag=True,
         help='Print only service names (passes --services to docker compose).',
     )
-    quiet = scfg.Value(
+    quiet = kw.Value(
         False, isflag=True, short_alias=['q'], help='Print only container IDs.'
     )
 
@@ -515,7 +515,7 @@ class PsCLI(_ComposeWrapperBase):
 class RestartCLI(_ComposeWrapperBase):
     """``docker compose restart [services...]``."""
 
-    timeout = scfg.Value(None, type=int, help='Stop timeout in seconds.')
+    timeout = kw.Value(None, type=int, help='Stop timeout in seconds.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -530,8 +530,8 @@ class RestartCLI(_ComposeWrapperBase):
 class PullCLI(_ComposeWrapperBase):
     """``docker compose pull [services...]``."""
 
-    quiet = scfg.Value(False, isflag=True, short_alias=['q'])
-    ignore_pull_failures = scfg.Value(False, isflag=True)
+    quiet = kw.Value(False, isflag=True, short_alias=['q'])
+    ignore_pull_failures = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -559,7 +559,7 @@ class StartCLI(_ComposeWrapperBase):
 class StopCLI(_ComposeWrapperBase):
     """``docker compose stop [services...]``."""
 
-    timeout = scfg.Value(None, type=int)
+    timeout = kw.Value(None, type=int)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -578,7 +578,7 @@ class StackDownCLI(_ComposeWrapperBase):
     automatically on release; this is the manual escape hatch.
     """
 
-    volumes = scfg.Value(
+    volumes = kw.Value(
         False, isflag=True, help='Also remove named volumes (--volumes).'
     )
 
@@ -608,7 +608,7 @@ class StackUpCLI(_ComposeWrapperBase):
         return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
-class StackModalCLI(scfg.ModalCLI):
+class StackModalCLI(kw.ModalCLI):
     """Day-2 ops on the running leasing deployment."""
 
     __command__ = 'stack'
@@ -645,13 +645,13 @@ class DoctorCLI(_PathOverridesMixin):
 
     __command__ = 'doctor'
 
-    backend = scfg.Value(
+    backend = kw.Value(
         None, type=str,
         help='Backend to check (default: the configured `backend` setting).',
     )
-    gpu = scfg.Value(False, isflag=True,
+    gpu = kw.Value(False, isflag=True,
                      help='Also check host GPUs (implied by --sudo).')
-    sudo = scfg.Value(False, isflag=True,
+    sudo = kw.Value(False, isflag=True,
                       help='Run the GPU holder scan as root. Without it that '
                            'check reports "not checked", never "clear".')
 
