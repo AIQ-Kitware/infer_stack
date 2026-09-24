@@ -93,6 +93,54 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, separators=(',', ':'), sort_keys=True)
 
 
+class _Result:
+    """A statement's rows, fetched while the connection lock was held."""
+
+    def __init__(self, rows: list, rowcount: int, lastrowid: int | None):
+        self._rows = rows
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list:
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _SerializedConnection:
+    """One sqlite connection, safe to share between threads.
+
+    Python's sqlite3 connection is not: two threads stepping the same cached
+    statement interleave and return garbage rows. The TUI hit this reading the
+    ledger from its refresh worker and the UI thread at once (a lease whose
+    deployment ids included ``None``). Each call here holds the store lock
+    until the statement has run and every row is fetched, so no cursor ever
+    outlives it. The lock is re-entrant, so :meth:`SqliteStore.transaction`
+    (which holds it for the whole transaction) nests.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock):
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, sql: str, params=()) -> _Result:
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            return _Result(cur.fetchall(), cur.rowcount, cur.lastrowid)
+
+    def executescript(self, script: str) -> None:
+        with self._lock:
+            self._conn.executescript(script)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
 class SqliteStore:
     """Thin sqlite wrapper exposing ledger row operations."""
 
@@ -101,17 +149,19 @@ class SqliteStore:
         if self.path != ':memory:':
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False lets a long-running process (e.g. the TUI) use
-        # this connection from a worker thread for converge-while-monitoring;
-        # ``_lock`` serializes write transactions so two threads can't both
-        # ``BEGIN IMMEDIATE`` on the one connection. sqlite itself is built
-        # serialized, so individual reads across threads are safe.
-        self._conn = sqlite3.connect(
+        # this connection from worker threads. That is only safe because every
+        # statement runs under ``_lock`` (see _SerializedConnection): sqlite's
+        # own serialized mode does NOT make a shared Python connection safe for
+        # concurrent reads.
+        raw = sqlite3.connect(
             self.path, isolation_level=None, timeout=busy_timeout_ms / 1000,
             check_same_thread=False,
         )
+        raw.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # Every use of the connection holds the lock: see _SerializedConnection.
+        self._conn = _SerializedConnection(raw, self._lock)
         self._busy_timeout_ms = busy_timeout_ms
-        self._conn.row_factory = sqlite3.Row
         self._conn.execute('PRAGMA foreign_keys = ON')
         self._conn.execute(f'PRAGMA busy_timeout = {busy_timeout_ms}')
         if self.path != ':memory:':
@@ -212,7 +262,7 @@ class SqliteStore:
     # -- transactions ------------------------------------------------------
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self) -> Iterator[_SerializedConnection]:
         """Take the write lock up front and commit/rollback atomically.
 
         ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
