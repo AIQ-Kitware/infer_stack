@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -731,6 +732,178 @@ def set_master_key(env_path: Path, key: str) -> None:
     if old and old != key and not existing.get(SALT_KEY_ENV, '').strip():
         values[SALT_KEY_ENV] = old
     write_env_file(env_path, values)
+
+
+@dataclass
+class FrontDoor:
+    """The rendered front door: its Compose services and config files."""
+
+    services: dict[str, Any]
+    litellm_config: str | None
+    nginx_config: str | None
+    litellm_routes: list[dict[str, Any]] | None
+
+
+def render_front_door(
+    deployments: list[Deployment],
+    assignments: dict[str, list[int]],
+    *,
+    engine_services: list[str],
+    vllm_v1_urls: list[str],
+    ollama_native_urls: list[str],
+    images: dict[str, str],
+    state: dict[str, str],
+    litellm: bool,
+    litellm_port: int,
+    litellm_master_key: str | None,
+    litellm_salt_key: bool,
+    ui: bool,
+    ui_port: int,
+    reverse_proxy: bool,
+    reverse_proxy_port: int,
+    reverse_proxy_config: str | None,
+    aux_dir: str | Path | None,
+    catalog: Any,
+    route_registry: dict[str, Any] | None,
+    dynamic_routing: bool,
+) -> FrontDoor:
+    """Render the gateway, its database, Open WebUI and the reverse proxy.
+
+    The engines are the caller's: it passes the services it rendered
+    (``engine_services``, only for the legacy per-model ``depends_on``) and
+    the in-network URLs a UI with no gateway can talk to directly.
+    """
+    services: dict[str, Any] = {}
+    litellm_config = None
+    litellm_routes = None
+    # The front door (gateway + UI) is rendered whenever it's enabled, even with
+    # zero models — it's a standing entry point, not a per-model service. So
+    # releasing/evicting every model leaves an empty gateway (and an empty Open
+    # WebUI picker) up instead of tearing the whole stack down; only an explicit
+    # `stack down` removes it. With no models the model_list is simply empty.
+    if litellm:
+        # Three route-table strategies, in order of preference:
+        #  * DYNAMIC ROUTING: the rendered config is a STATIC base (empty
+        #    model_list); the real routes live in Postgres and are applied to the
+        #    running gateway via the admin API (see _reconcile_routes). The config
+        #    hash never changes as models come/go, so the gateway is never
+        #    recreated — no blip, and per-deployment routing works (so same-model
+        #    --dedicated deployments each get their own upstream).
+        #  * ROUTE REGISTRY (static-superset default from ComposeBackend): render
+        #    from the whole accumulated registry (every catalog + live deployment
+        #    ever merged, across all runbooks). Byte-stable once seeded, so the
+        #    gateway is never recreated and a cross-catalog converge can no longer
+        #    strip another runbook's routes. The backend loads/merges/writes the
+        #    registry and passes the merged dict in; this function stays pure.
+        #  * STATIC SUPERSET (catalog): one route per catalog endpoint to a
+        #    deterministic host; config depends only on the catalog, so the
+        #    gateway is not recreated as models come/go (no blip) but same-model
+        #    dedicated collapses to one upstream. Unreachable from ComposeBackend
+        #    once the registry is wired; kept for direct callers/tests.
+        #  * LEGACY (no catalog): route only the placed deployments; churns the
+        #    config (and recreates the gateway) on every model change.
+        if dynamic_routing:
+            entries: list[dict[str, Any]] = []
+            litellm_routes = _litellm_routes(deployments, assignments)
+            litellm_depends: list[str] = []
+        elif route_registry is not None:
+            entries = _litellm_model_list_from_registry(route_registry)
+            litellm_depends = []  # no per-model depends_on -> no churn
+        elif catalog is not None:
+            entries = _litellm_model_list_from_catalog(catalog)
+            litellm_depends = []  # no per-model depends_on -> no churn
+        else:
+            entries = _litellm_model_list(deployments, assignments)
+            litellm_depends = list(engine_services)
+        litellm_config = yaml.safe_dump(
+            {
+                'model_list': entries,
+                'general_settings': {
+                    'master_key': f'os.environ/{API_KEY_ENV}'
+                },
+                # An upstream vLLM/Ollama is unreachable only briefly, while it
+                # loads its model (LiteLLM does not wait for upstream health to
+                # start). Retry transient connection errors and don't park a
+                # model in a long cooldown, so the warmup window is self-healing
+                # instead of surfacing as client 500s ("Connection error.
+                # Received Model Deployment=…").
+                'router_settings': {
+                    'num_retries': 3,
+                    'timeout': 600,
+                    'cooldown_time': 5,
+                    'allowed_fails': 100,
+                },
+            },
+            sort_keys=False,
+        )
+        config_hash = hashlib.sha256(
+            litellm_config.encode('utf-8')
+        ).hexdigest()[:12]
+        if dynamic_routing:
+            services[POSTGRES_SERVICE] = _postgres_service(images, state)
+        services[LITELLM_SERVICE] = _litellm_service(
+            litellm_depends,
+            litellm_port,
+            images,
+            str(aux_dir or '.'),
+            master_key=litellm_master_key,
+            config_hash=config_hash,
+            dynamic_routing=dynamic_routing,
+            salt_key=litellm_salt_key,
+        )
+
+    # Open WebUI is its own standing front door, rendered whenever ``ui`` is set
+    # — it does NOT require LiteLLM. Its OpenAI connection prefers the gateway
+    # (one URL covers every alias) and falls back to the rendered vLLM upstreams'
+    # own /v1 when there is no gateway. Its native Ollama connection always
+    # points straight at any Ollama daemon, so you can pull/run models from the
+    # UI and have the daemon load them on demand — a true drop-in for a
+    # hand-run ollama + Open WebUI stack. depends_on lists only LiteLLM (the one
+    # service guaranteed present alongside the UI); the per-model upstreams come
+    # and go, so the UI tolerates them being absent rather than hard-depending.
+    # With a gateway the UI is a standing front door (renders even at zero
+    # models). Without one it is only meaningful pointed at a live upstream, so
+    # render it only when there is something to connect to — otherwise an empty
+    # desired set has nothing to run and converge tears the project down.
+    if ui and (litellm or vllm_v1_urls or ollama_native_urls):
+        if litellm:
+            openai_urls = [f'http://{LITELLM_SERVICE}:{LITELLM_CONTAINER_PORT}/v1']
+            ui_depends = [LITELLM_SERVICE]
+        else:
+            openai_urls = list(vllm_v1_urls)
+            ui_depends = []
+        services[OPEN_WEBUI_SERVICE] = _open_webui_service(
+            ui_port,
+            images,
+            state,
+            litellm_master_key,
+            openai_urls=openai_urls,
+            ollama_urls=ollama_native_urls,
+            depends_on=ui_depends,
+        )
+
+    # Optional single-port HTTP reverse proxy fronting the gateway (+ UI). Needs
+    # the gateway, so it's only rendered alongside litellm.
+    nginx_config = None
+    if reverse_proxy and litellm:
+        depends = [LITELLM_SERVICE] + ([OPEN_WEBUI_SERVICE] if ui else [])
+        if reverse_proxy_config:
+            services[NGINX_SERVICE] = _nginx_service(
+                reverse_proxy_port, images, aux_dir=str(aux_dir or '.'),
+                depends_on=depends, config_path=reverse_proxy_config,
+            )
+        else:
+            nginx_config = _nginx_conf(litellm=litellm, ui=ui)
+            services[NGINX_SERVICE] = _nginx_service(
+                reverse_proxy_port, images, aux_dir=str(aux_dir or '.'),
+                depends_on=depends,
+                config_hash=hashlib.sha256(
+                    nginx_config.encode('utf-8')
+                ).hexdigest()[:12],
+            )
+
+    return FrontDoor(services=services, litellm_config=litellm_config,
+                     nginx_config=nginx_config, litellm_routes=litellm_routes)
 
 
 class Gateway(ConvergeScaffold):
