@@ -25,13 +25,16 @@ import fcntl
 import threading
 import time
 import warnings
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, TypeVar, cast
 
-from .backend import Backend
+from .backend import AdmissionBackend, Backend
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
+
+_T = TypeVar('_T')
 
 KEEP_WARM = 'keep-warm'
 
@@ -475,11 +478,11 @@ class Controller:
             # Residency decides which idle keep-warm deployments are candidates
             # at all; unknown residency fails the render (the change stays
             # pending) rather than guessing which warm models exist.
-            residency = self.backend.residency()
+            residency = self._admitting.residency()
             self._backfill_allocations(residency)
             self._prepare_network()
             desired, placement = self._admission_view(residency)
-            self.backend.adopted = self._prune_adopted(residency)
+            self._admitting.adopted = self._prune_adopted(residency)
         else:
             desired = self.desired_deployments()
         # Bound once rather than probed with hasattr: the capability check is
@@ -559,6 +562,20 @@ class Controller:
     # Other backends (KubeAI, where the cluster schedules; test fakes) keep the
     # previous behaviour.
 
+    def _stored_state(self, lease_id: str):
+        """A lease's state as stored (not virtually expired), or ``None``."""
+        lease = self.ledger.get_lease(lease_id)
+        return None if lease is None else lease.state
+
+    @property
+    def _admitting(self) -> AdmissionBackend:
+        """``self.backend`` as the admission surface.
+
+        Only for code that runs after :meth:`_admission_mode` (or an
+        equivalent capability check) said the backend has it.
+        """
+        return cast(AdmissionBackend, self.backend)
+
     def _admission_mode(self) -> bool:
         return all(
             callable(getattr(self.backend, name, None))
@@ -611,11 +628,11 @@ class Controller:
         """Give the backend the stable-address table, once a network is migrated."""
         config = self.ledger.network_config()
         if config is None:
-            self.backend.network = None
+            self._admitting.network = None
             return
-        self.backend.network = {
+        self._admitting.network = {
             'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()}
-        self.backend.on_addresses = self.ledger.add_service_addresses
+        self._admitting.on_addresses = self.ledger.add_service_addresses
 
     def network_migrate(self, subnet: str, *, force: bool = False) -> ReconcileResult:
         """``infer-stack network migrate``: move the project to stable addresses.
@@ -639,7 +656,7 @@ class Controller:
                     f'network migrate recreates every container; {len(active)} lease(s) '
                     'are active (release them, or pass --force)'
                 )
-            clash = overlapping_subnets(subnet, self.backend.run)
+            clash = overlapping_subnets(subnet, self._admitting.run)
             if clash:
                 raise ProfileMismatch(f'subnet {subnet} overlaps: {"; ".join(clash)}')
             current = self.ledger.network_config()
@@ -647,9 +664,9 @@ class Controller:
             # Preview the migrated render and take approval BEFORE any write:
             # a declined migration must leave the subnet and addresses as they were.
             self._sync_profile(create=True)
-            residency = self.backend.residency()
-            saved = self.backend.network
-            self.backend.network = {
+            residency = self._admitting.residency()
+            saved = self._admitting.network
+            self._admitting.network = {
                 'subnet': subnet,
                 'addresses': {} if reset else self.ledger.service_addresses(),
             }
@@ -657,9 +674,9 @@ class Controller:
                 desired, inputs = self._admission_view(
                     residency, virtual_expiry=True
                 )
-                self.backend.preview(desired, inputs, approve=True)
+                self._admitting.preview(desired, inputs, approve=True)
             finally:
-                self.backend.network = saved
+                self._admitting.network = saved
             self.ledger.store.migrate_network(
                 subnet=subnet, reset_addresses=reset,
                 approved_digest=getattr(self.backend, 'last_preview_digest', None),
@@ -694,7 +711,7 @@ class Controller:
             try:
                 return self._publish()
             except ConvergeAborted:
-                self.backend.restore_env(replaced)
+                getattr(self.backend, 'restore_env')(replaced)
                 raise
 
     def observe_state(self) -> dict:
@@ -725,7 +742,7 @@ class Controller:
         residency, residency_error = None, None
         if callable(getattr(self.backend, 'residency', None)):
             try:
-                residency = self.backend.residency()
+                residency = self._admitting.residency()
             except ResidencyUnknown as ex:
                 residency_error = str(ex)
         degraded = set(sidecar.get('degraded') or ())
@@ -771,7 +788,7 @@ class Controller:
             'network': self.ledger.network_config(),
             'addresses': self.ledger.service_addresses(),
             'expired_unswept': [le.id for le in leases if le.state == LeaseState.EXPIRED
-                                and (self.ledger.get_lease(le.id).state == LeaseState.ACTIVE)],
+                                and self._stored_state(le.id) == LeaseState.ACTIVE],
         }
 
     def _prune_adopted(self, residency) -> dict:
@@ -799,8 +816,8 @@ class Controller:
         """
         if self.ledger.adopted_containers() is not None:
             return
-        fingerprints = self.backend._load_sidecar().get('fingerprints') or {}
-        services = self.backend._load_sidecar().get('services') or {}
+        fingerprints = self._admitting._load_sidecar().get('fingerprints') or {}
+        services = self._admitting._load_sidecar().get('services') or {}
         _, deployments = self.ledger.status()
         by_id = {g.id: g for g in deployments}
         adopted = {}
@@ -820,7 +837,7 @@ class Controller:
             adopted[c.container_id] = {
                 'service': c.service, 'fingerprint': fingerprints[c.service]}
         self.ledger.set_adopted_containers(adopted)
-        self.backend.adopted = adopted
+        self._admitting.adopted = adopted
 
     def remove_orphans(self, confirm: Callable[[list], bool]) -> list:
         """``gc --orphans``: remove the project's unmanaged containers, with consent.
@@ -830,13 +847,13 @@ class Controller:
         (shown the list) returns True. Returns the removed containers.
         """
         with self._global_lock():
-            residency = self.backend.residency()
+            residency = self._admitting.residency()
             adopted = self.ledger.adopted_containers() or {}
             orphans = [c for c in residency.all_containers()
                        if not c.labelled and c.container_id not in adopted]
             if not orphans or not confirm(orphans):
                 return []
-            self.backend.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
+            self._admitting.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
             return orphans
 
     def _backfill_allocations(self, residency) -> list[str]:
@@ -904,7 +921,7 @@ class Controller:
             overlay.deployments[gid].assigned_gpus = gpus
         self._prepare_network()
         desired, inputs = self._admission_view(residency, overlay=overlay)
-        plan, rendered = self.backend.preview(desired, inputs)
+        plan, rendered = self._admitting.preview(desired, inputs)
         reasons = []
         unresolved = set(self._unresolved_allocations())
         # EVERY deployment the candidate claims must be placed and renderable,
@@ -938,7 +955,7 @@ class Controller:
             # after the commit produces the same files and does not ask again.
             # Its digest goes into the pending marker, so a recovery after a
             # crash (and perhaps an upgrade) cannot apply something else.
-            self.backend.preview(desired, inputs, approve=True)
+            self._admitting.preview(desired, inputs, approve=True)
             self._admission_digest = getattr(self.backend, 'last_preview_digest', None)
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
@@ -959,7 +976,7 @@ class Controller:
                            f'(owner {", ".join(sorted(owners[gid]))})')
         return out
 
-    def _unresolved_allocations(self, *, exclude: set[str] = frozenset()) -> list[str]:
+    def _unresolved_allocations(self, *, exclude: AbstractSet[str] = frozenset()) -> list[str]:
         from .placement import required_gpu_count
 
         _, deployments = self.ledger.status()
@@ -1658,14 +1675,14 @@ class Controller:
                 stored_profile = self.ledger.profile()
                 leases, _ = self.ledger.status(virtual_expiry=True)
                 if any(le.state == LeaseState.EXPIRED and
-                       self.ledger.get_lease(le.id).state == LeaseState.ACTIVE
+                       self._stored_state(le.id) == LeaseState.ACTIVE
                        for le in leases):
                     # Maintenance sweep: TTL expiry is a desired-state change.
                     self._mark_pending(apply=True)
                     self.ledger.sweep()
                     self._publish()
                 try:
-                    residency = self.backend.residency()
+                    residency = self._admitting.residency()
                 except ResidencyUnknown:
                     residency = None
                 candidate_profile = self._acquire_profile_candidate(
@@ -1837,7 +1854,7 @@ class Controller:
             rec = self._publish()
         return ReleaseLeasesOutcome(released, missing, idled, list(evicted), rec)
 
-    def publish_change(self, change: Callable[[], object]) -> tuple[object, ReconcileResult]:
+    def publish_change(self, change: Callable[[], _T]) -> tuple[_T, ReconcileResult]:
         """Run ``change`` and publish, as one serialised desired-state mutation.
 
         For changes to backend state that the render reads (the route registry,
@@ -1907,18 +1924,18 @@ class Controller:
                 previous = self._applied_profile
                 use(profile)
                 try:
-                    residency = self.backend.residency()
+                    residency = self._admitting.residency()
                     self._prepare_network()
                     desired, inputs = self._admission_view(
                         residency, virtual_expiry=True
                     )
-                    self.backend.preview(desired, inputs, approve=True)
+                    self._admitting.preview(desired, inputs, approve=True)
                 except BaseException:
                     if previous is not None:
                         use(previous)
                     raise
                 self.ledger.store.publish_profile(
-                    profile, approved_digest=self.backend.last_preview_digest)
+                    profile, approved_digest=self._admitting.last_preview_digest)
                 self._profile_error = None
                 self._applied_profile = profile
                 self._invocation_profile = profile
@@ -1983,7 +2000,7 @@ class Controller:
                 from .residency import ResidencyUnknown
 
                 try:
-                    residency = self.backend.residency()
+                    residency = self._admitting.residency()
                 except ResidencyUnknown:
                     residency = None
                 overlay = self.ledger.plan_acquire([])

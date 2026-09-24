@@ -1869,7 +1869,7 @@ class ComposeBackend(ConvergeScaffold):
         *,
         state_dir: str | Path,
         inventory: dict[str, Any] | None = None,
-        run: Callable[[list[str]], str] | None = None,
+        run: Callable[..., str] | None = None,
         http: Any = None,
         images: dict[str, str] | None = None,
         ports: dict[str, int] | None = None,
@@ -2023,7 +2023,7 @@ class ComposeBackend(ConvergeScaffold):
             write_env_file(self._env_path, {API_KEY_ENV: key})
         return key
 
-    def rotate_master_key(self) -> dict[str, str]:
+    def rotate_master_key(self) -> dict[str, str | None]:
         """Write a fresh master key to the ``.env``; return the values it replaced.
 
         Only the file: the gateway and Open WebUI pick it up when the next apply
@@ -2243,7 +2243,7 @@ class ComposeBackend(ConvergeScaffold):
         pinned = self._load_sidecar().get('assignments', {})
         desired = list(desired)
         self._enrich_placement(desired)
-        keywords = {}
+        keywords: dict[str, Any] = {}
         if placement is not None:
             # Admission mode: committed allocations and residency decide; the
             # sidecar's pins only keep unresolved LIVE deployments stable.
