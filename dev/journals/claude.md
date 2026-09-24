@@ -3144,3 +3144,39 @@ had already written a test for; the unchanged numbers on single-set repos, and
 then a real load that did not OOM, are what rule out the failure mode the fix
 could have introduced. A fix that makes the reported number smaller is easy to
 confirm and easy to over-confirm.
+
+## 2026-09-24 12:03:08 -0400
+
+**Intent.** The user wants the KubeAI backend usable for scale-up, and asked
+for whatever refactor makes Compose and KubeAI share code paths and removes
+duplicate authorities. Model: Claude Opus 5.5 (1M context).
+
+**What I did.** An audit and a plan
+(`dev/tmp/plan-backend-unification-2026-09-24.md`), no code. KubeAI has not
+changed in substance since 2026-07-02, and nothing since then has run on a
+cluster. The finding that matters most is not in the backend code: the two
+backends give clients different request names. Compose puts the LiteLLM
+gateway in front and the request name is the endpoint alias. KubeAI has no
+gateway and requires a DNS slug of the served name. Cards pass the alias, so
+a card that works on Compose would 404 on KubeAI. The other duplications are
+real but secondary: two acquire paths behind `_admission_mode()`, two
+liveness answers (strict `residency()` against a `kubectl` `observe()` that
+treats failure as "nothing running"), failure diagnosis that exists only for
+Docker, and a few copied helpers.
+
+**Why this order.** A test cluster comes first (kind plus the vLLM simulator,
+no GPU). Every KubeAI change so far was checked only against fakes, which is
+how the backend drifted without anyone noticing. After that, putting the
+gateway in front of KubeAI fixes the client contract and brings every
+gateway feature along for free. That is worth more than any internal cleanup,
+so it goes before the refactor.
+
+**Uncertain.** Where the gateway should run for KubeAI: on the operator host
+(cheap, but a single host in every request's path) or in the cluster (the
+right shape for scale, but a second renderer). I recommended the host first.
+I have not checked how KubeAI's own gateway handles auth, or whether its pod
+labels are stable enough to key residency on.
+
+**Takeaway.** Before unifying internals, check what callers see. Two backends
+that share 90% of their code but answer to different names are two products
+to the people using them.
