@@ -14,6 +14,22 @@ scheduler with its own GPU accounting: a lease held outside it, manual or
 keep-warm, occupies a GPU the scheduler believes is free, and the job it
 places there cannot start.
 
+### The kubeai backend puts the LiteLLM gateway in front of the cluster
+
+On the kubeai backend a client had to name a model by its KubeAI Model name
+(a DNS slug of the served name), not the endpoint alias. Cards send the
+alias, so a card that ran on the compose backend got HTTP 404 on a cluster
+(verified on k3s). The kubeai backend now runs the same LiteLLM gateway,
+routing each alias to its Model: one `OPENAI_BASE_URL`, the managed key, and
+the alias as the model name on both backends. `secrets rotate` works on it.
+`--no-litellm` keeps the old direct access. New setting:
+`kubeai_gateway_upstream`, for a gateway that cannot reach the cluster
+Service's IP.
+
+`dev/kubeai_e2e.sh` now sends the alias as a card does, and fails when the
+request fails. Before, a failed generation fell through to PASS: the check
+sat in a `&&` list, where `set -e` does not apply.
+
 ### Custom container launches are catalog data, not recipes
 
 `runtime.serve_recipe` is gone. An endpoint whose image has its own launcher

@@ -97,6 +97,9 @@ LITELLM_ROUTES_FILENAME = 'litellm_routes.json'  # rendered desired route set
 # ComposeBackend._update_route_registry.
 LITELLM_REGISTRY_FILENAME = 'litellm_registry.json'
 LITELLM_REGISTRY_VERSION = 1
+# A route-registry row for a server this project does not run:
+# ``{'engine': UPSTREAM_ROUTE, 'served': <its model name>, 'api_base': <url>}``.
+UPSTREAM_ROUTE = 'upstream'
 POSTGRES_SERVICE = 'postgres-litellm'
 POSTGRES_CONTAINER_PORT = 5432
 POSTGRES_DB_NAME = 'litellm'
@@ -928,6 +931,12 @@ def _litellm_model_list_from_registry(
                 f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
             )
             entries.append(_ollama_route_entry(name, tag, api_base))
+        elif engine == UPSTREAM_ROUTE and row.get('api_base'):
+            # An OpenAI-compatible server this project does not run (a KubeAI
+            # cluster's gateway): the row carries its address and the name it
+            # serves the model under.
+            entries.append(_vllm_route_entry(name, row.get('served') or name,
+                                             str(row['api_base'])))
     return entries
 
 
@@ -1914,6 +1923,9 @@ class ComposeBackend(ConvergeScaffold):
         # Called with a one-line message during long steps (image pulls); the
         # TUI sets it. Always also logged.
         self.progress: Callable[[str], None] | None = None
+        # alias -> UPSTREAM_ROUTE row, set by a backend that uses this one only
+        # as its gateway (the kubeai backend). Merged into the route registry.
+        self.upstream_routes: dict[str, dict[str, Any]] = {}
         self.images = {**PINNED_IMAGES, **(images or {})}
         self.ports = {**DEFAULT_PORTS, **(ports or {})}
         # Merge over the defaults (not replace) so a caller-supplied partial
@@ -2608,6 +2620,8 @@ class ComposeBackend(ConvergeScaffold):
         # live cross-runbook deployment routable (and, via persistence, routable
         # past release).
         incoming.update(_registry_incoming_from_deployments(desired, assignments))
+        # Routes to servers another backend runs (see UPSTREAM_ROUTE).
+        incoming.update(self.upstream_routes)
         merged, warnings = _merge_route_registry(existing, incoming)
         for w in warnings:
             logger.warning('  route registry: {}', w)

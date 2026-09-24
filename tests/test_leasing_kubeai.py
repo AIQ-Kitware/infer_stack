@@ -532,3 +532,105 @@ def test_doctor_cli_backends_without_preflight(monkeypatch, capsys):
     )
     assert DoctorCLI.main(argv=[]) == 0
     assert 'nothing to verify' in capsys.readouterr().out
+
+
+# -- the LiteLLM gateway in front of the cluster (plan step K1) ---------------
+#
+# Real-cluster evidence: dev/e2e_tests/kubeai_k3s.sh. Without the gateway a
+# card's alias got HTTP 404 from KubeAI; with it the same request answered.
+
+
+UPSTREAM = 'http://10.43.0.9/openai/v1'
+
+
+class GatewayHttp(FakeHttp):
+    """The LiteLLM gateway on 127.0.0.1, routing by its rendered model_list."""
+
+    def __init__(self, kubectl, gateway_dir):
+        super().__init__(kubectl)
+        self.gateway_dir = Path(gateway_dir)
+
+    def _routes(self):
+        cfg = self.gateway_dir / 'litellm_config.yaml'
+        doc = yaml.safe_load(cfg.read_text()) if cfg.exists() else {}
+        return {e['model_name']: e['litellm_params'] for e in doc.get('model_list') or []}
+
+    def get(self, url, **kw):
+        if url.startswith('http://127.0.0.1:') and url.endswith('/models'):
+            return self._Resp(200, {'data': [{'id': a} for a in self._routes()]})
+        return super().get(url, **kw)
+
+    def post(self, url, **kw):
+        if url.startswith('http://127.0.0.1:'):
+            route = self._routes().get((kw.get('json') or {}).get('model'))
+            if route is None or route['api_base'] != UPSTREAM:
+                return self._Resp(404, {'detail': 'no such alias'})
+            kw = {**kw, 'json': {**kw['json'], 'model': route['model'].split('/', 1)[1]}}
+        return super().post(url, **kw)
+
+
+def make_gateway_backend(tmp_path):
+    from infer_stack.leasing.compose import ComposeBackend
+    from test_leasing_compose import FakeDocker
+
+    kubectl = FakeKubectl()
+    gateway = ComposeBackend(
+        state_dir=tmp_path / 'gateway', inventory={'gpu_count': 0, 'gpus': []},
+        run=FakeDocker(), http=GatewayHttp(kubectl, tmp_path / 'gateway'),
+        project='infer-stack-gateway', litellm=True, ui=False,
+        images={'litellm': 'litellm:test'},
+    )
+    be = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=kubectl,
+                       http=gateway.http, gateway=gateway, gateway_upstream=UPSTREAM)
+    return be, kubectl
+
+
+def test_gateway_routes_each_alias_to_its_model(tmp_path):
+    be, _ = make_gateway_backend(tmp_path)
+    dep = vllm('grp-a', served='Qwen/Qwen2.5-0.5B')
+    dep.served = {'Qwen/Qwen2.5-0.5B': {'served_model_name': 'Qwen/Qwen2.5-0.5B',
+                                        'protocol': 'chat'}}
+    be.converge([dep])
+    route = GatewayHttp._routes(be.gateway.http)['Qwen/Qwen2.5-0.5B']
+    assert route == {'model': 'openai/qwen-qwen2-5-0-5b', 'api_base': UPSTREAM,
+                     'api_key': 'EMPTY'}
+
+
+def test_with_a_gateway_clients_use_the_alias_and_the_managed_key(tmp_path):
+    be, _ = make_gateway_backend(tmp_path)
+    dep = vllm('grp-a', served='Qwen/Qwen2.5-0.5B')
+    dep.served = {'tiny': {'served_model_name': 'Qwen/Qwen2.5-0.5B', 'protocol': 'chat'}}
+    be.converge([dep])
+    info = be.access(['tiny'])
+    assert info['request_names'] == {'tiny': 'tiny'}        # the alias, as on compose
+    assert info['base_url'].startswith('http://127.0.0.1:')
+    assert info['api_key'] == be.gateway.master_key()
+    # Ready is judged the way a client sees it: the alias, through the gateway.
+    assert be.probe_ready(dep, 'tiny').ready
+
+
+def test_without_a_gateway_clients_still_see_kubeai_directly(tmp_path):
+    be, _ = make_backend(tmp_path)
+    be.converge([vllm('grp-a', served='qwen-32b')])
+    assert be.litellm is False
+    assert be.access(['grp-a'])['request_names'] == {'grp-a': 'qwen-32b'}
+
+
+def test_rotating_the_key_recreates_the_gateway_in_front_of_the_cluster(tmp_path):
+    from infer_stack.leasing.residency import FINGERPRINT_LABEL
+
+    be, _ = make_gateway_backend(tmp_path)
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')))
+    ctl = Controller(ledger, be)
+    out = ctl.acquire('alice', [_req('qwen', profile='cpu')], wait=False)
+    ctl.release(out.lease.id)
+    old = be.master_key()
+
+    def fingerprint():
+        doc = yaml.safe_load(be.gateway.compose_file.read_text())
+        return doc['services']['litellm']['labels'][FINGERPRINT_LABEL]
+
+    before = fingerprint()
+    ctl.rotate_gateway_key()
+    assert be.master_key() != old
+    assert fingerprint() != before

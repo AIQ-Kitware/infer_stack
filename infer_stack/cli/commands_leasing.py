@@ -276,6 +276,20 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'kubeai':
         from ..backends.kubeai import KubeaiBackend
 
+        gateway = None
+        if _resolve_litellm(config):
+            # The same LiteLLM front door as the compose backend, fronting the
+            # cluster: one base_url, the managed key, and endpoint aliases as
+            # request names. Its own state dir and compose project, so it can
+            # never touch a compose stack's containers on the same host.
+            gateway = ComposeBackend(
+                state_dir=data_root() / 'leasing' / 'kubeai-gateway',
+                inventory={'gpu_count': 0, 'gpus': []},
+                project='infer-stack-gateway',
+                litellm=True,
+                ui=False,
+                assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            )
         backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
@@ -283,6 +297,8 @@ def _make_backend(config, *, interactive: bool = False):
             default_resource_profile=get_setting('kubeai_resource_profile')
             or None,
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            gateway=gateway,
+            gateway_upstream=get_setting('kubeai_gateway_upstream') or None,
         )
         try:
             backend.catalog = _load_catalog(config)   # frozen into the profile

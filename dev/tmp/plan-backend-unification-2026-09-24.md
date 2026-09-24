@@ -115,6 +115,15 @@ Recommendation: (1) first, since it reuses everything and unblocks cards
 now; (2) when a real multi-node run needs it. Record (1)'s single host as a
 known limitation.
 
+**Done 2026-09-24 as (1).** The kubeai backend owns a gateway-only
+`ComposeBackend` (its own state dir and project, `infer-stack-gateway`) and
+feeds it one generic `upstream` route row per alias (`api_base` + the Model
+name). The same row type is what external endpoints need. Verified on k3s
+with `dev/kubeai_e2e.sh`: without the gateway, the alias returned 404; with
+it, the same request answered, and `secrets rotate` accepted the new key and
+rejected the old one. Static routes only; dynamic routing stays
+compose-only.
+
 ### K2. One liveness authority
 
 Generalise `residency()` into a backend-neutral snapshot: per deployment,

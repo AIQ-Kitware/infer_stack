@@ -268,6 +268,8 @@ class KubeaiBackend(ConvergeScaffold):
         run: Callable[[list[str]], str] | None = None,
         http: Any = None,
         assume_yes: bool = True,
+        gateway: Any = None,
+        gateway_upstream: str | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +287,15 @@ class KubeaiBackend(ConvergeScaffold):
         self.last_unplaced: set[str] = set()
         # KubeAI/k8s schedules; there are no host GPU indices to report.
         self.last_assignments: dict[str, list[int]] = {}
+        # The LiteLLM gateway in front of the cluster: a gateway-only
+        # ComposeBackend. With it, clients use the same front door, key and
+        # request names (the endpoint aliases) as on the compose backend.
+        # Without it, clients talk to KubeAI directly under its Model names.
+        self.gateway = gateway
+        # How that gateway reaches KubeAI. Unset: the KubeAI Service's cluster
+        # IP, which containers on a cluster node can reach; a gateway off the
+        # cluster needs an ingress URL here.
+        self.gateway_upstream = gateway_upstream
 
     # -- state-dir plumbing --------------------------------------------------
 
@@ -326,6 +337,51 @@ class KubeaiBackend(ConvergeScaffold):
                 continue
             models[name] = (meta.get('labels') or {}).get(DEPLOYMENT_LABEL)
         return models
+
+    # -- the gateway -----------------------------------------------------------
+
+    @property
+    def litellm(self) -> bool:
+        return self.gateway is not None
+
+    @property
+    def litellm_port(self) -> int | None:
+        return self.gateway.litellm_port if self.gateway is not None else None
+
+    def master_key(self) -> str:
+        return self.gateway.master_key()
+
+    def rotate_master_key(self) -> dict[str, str]:
+        return self.gateway.rotate_master_key()
+
+    def restore_env(self, values) -> None:
+        self.gateway.restore_env(values)
+
+    def gateway_accepts(self, key: str, *, wait: float = 0.0):
+        return self.gateway.gateway_accepts(key, wait=wait)
+
+    def _upstream_url(self) -> str:
+        """Where the gateway sends requests for this cluster's Models."""
+        if not self.gateway_upstream:
+            ip = self._kubectl(['get', 'service', 'kubeai', '-o',
+                                'jsonpath={.spec.clusterIP}']).strip()
+            if not ip:
+                raise RuntimeError('the kubeai Service has no cluster IP; set '
+                                   '`config set kubeai_gateway_upstream <url>`')
+            self.gateway_upstream = f'http://{ip}/openai/v1'
+        return self.gateway_upstream.rstrip('/')
+
+    def _render_gateway(self, rendered: RenderedModels) -> None:
+        """Route each endpoint alias through the gateway to its Model."""
+        from ..leasing.compose import UPSTREAM_ROUTE
+
+        base = self._upstream_url()
+        self.gateway.upstream_routes = {
+            alias: {'engine': UPSTREAM_ROUTE, 'served': name, 'api_base': base}
+            for alias, name in rendered.request_names.items()
+        }
+        # Gateway only: no engines on this host, so nothing to place.
+        self.gateway.converge([], apply=False)
 
     # -- converge-style surface ------------------------------------------------
 
@@ -371,6 +427,8 @@ class KubeaiBackend(ConvergeScaffold):
                     'request_names': rendered.request_names,
                 }
             )
+            if self.gateway is not None:
+                self._render_gateway(rendered)
             if not apply:
                 logger.info(
                     'rendered {} Model(s) to {} (not applied; '
@@ -395,6 +453,8 @@ class KubeaiBackend(ConvergeScaffold):
             'namespace': self.namespace,
             'base_url': self.base_url,
             'resource_profile': self.default_resource_profile,
+            'gateway': self.gateway is not None,
+            'gateway_upstream': self.gateway_upstream,
             'catalogs': catalog_sources(self.catalog),
         }
 
@@ -416,6 +476,7 @@ class KubeaiBackend(ConvergeScaffold):
         self.namespace = profile['namespace']
         self.base_url = profile['base_url']
         self.default_resource_profile = profile['resource_profile']
+        self.gateway_upstream = profile.get('gateway_upstream') or self.gateway_upstream
         sources = profile.get('catalogs') or []
         self.catalog = CatalogUnion.from_sources(sources) if sources else None
 
@@ -457,6 +518,8 @@ class KubeaiBackend(ConvergeScaffold):
             self._kubectl(
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
+        if self.gateway is not None:
+            self.gateway.apply()
 
     def observe(self) -> set[str]:
         """Deployment ids with a managed Model CR on the cluster (best-effort)."""
@@ -475,12 +538,20 @@ class KubeaiBackend(ConvergeScaffold):
         """
         if deployment.id not in self.observe():
             return Readiness(False, 'Model CR not on the cluster')
-        name = model_name_for(_served_name(deployment))
         served = deployment.served.get(endpoint) or {}
         protocol = served.get('protocol') or 'chat'
+        if self.gateway is not None:
+            # Ready means ready the way a client sees it: the alias, through
+            # the gateway, with its key.
+            base, model = f'{self.gateway._gateway_base()}/v1', endpoint
+            headers = self.gateway._auth_headers()
+        else:
+            base, model = self.base_url, model_name_for(_served_name(deployment))
+            headers = None
         ok, reason = openai_ready(
-            base_url=self.base_url,
-            model=name,
+            base_url=base,
+            headers=headers,
+            model=model,
             protocol=protocol,
             require_listed=True,
             require_generation=True,
@@ -496,6 +567,8 @@ class KubeaiBackend(ConvergeScaffold):
         no alias layer. The gateway is unauthenticated, so the api key is the
         literal ``EMPTY`` placeholder and no key env var is advertised.
         """
+        if self.gateway is not None:
+            return self.gateway.access(endpoints)
         request_names = self._load_sidecar().get('request_names') or {}
         return {
             'base_url': self.base_url,
@@ -523,11 +596,13 @@ class KubeaiBackend(ConvergeScaffold):
         )
 
     def down(self) -> None:
-        """Delete every infer-stack-managed Model (explicit stop)."""
+        """Delete every infer-stack-managed Model (explicit stop), and the gateway."""
         for name in sorted(self._cluster_models()):
             self._kubectl(
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
+        if self.gateway is not None:
+            self.gateway.down()
 
     # -- preflight -------------------------------------------------------------
 

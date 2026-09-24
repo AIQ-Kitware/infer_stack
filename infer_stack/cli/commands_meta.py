@@ -362,6 +362,10 @@ BACKEND_SETTINGS = {
     'kubeai_resource_profile':
         'Fallback KubeAI resourceProfiles name for catalog endpoints whose '
         'runtime omits resource_profile.',
+    'kubeai_gateway_upstream':
+        'URL the LiteLLM gateway uses to reach KubeAI (default: the kubeai '
+        "Service's cluster IP, reachable from a cluster node; set an ingress "
+        'URL when the gateway runs off the cluster).',
 }
 
 

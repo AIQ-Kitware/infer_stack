@@ -10,10 +10,19 @@ only the realization layer changes:
 |---|---|---|
 | unit of serving | docker compose service | KubeAI `Model` CR |
 | GPU placement | planned locally (`plan_placement`) | cluster-scheduled via `resourceProfile` |
-| front door | LiteLLM gateway | KubeAI's own OpenAI-compatible gateway |
-| request name | endpoint alias (LiteLLM route) | Model CR name (dns-slug of the served name) |
-| auth | managed `LITELLM_MASTER_KEY` | none (`api_key: EMPTY`) |
-| state dir | `<data>/leasing/compose/` | `<data>/leasing/kubeai/` (`models.yaml` + sidecar) |
+| front door | LiteLLM gateway | the same LiteLLM gateway, on this host, routing to KubeAI |
+| request name | endpoint alias | endpoint alias |
+| auth | managed `LITELLM_MASTER_KEY` | the same |
+| state dir | `<data>/leasing/compose/` | `<data>/leasing/kubeai/` (`models.yaml` + sidecar), `<data>/leasing/kubeai-gateway/` |
+
+Clients see the same contract on both backends: one `OPENAI_BASE_URL`, the
+managed key, and the endpoint alias as the model name, so a card runs
+unchanged. The gateway is a one-service Compose project
+(`infer-stack-gateway`) that routes each alias to KubeAI under the Model's
+name. `secrets rotate` works as on compose. With `--no-litellm` (or `config
+set litellm false`) there is no gateway: clients talk to KubeAI directly and
+must use the Model name from the env file (`INFER_STACK_ENDPOINT_*`); the
+alias gets HTTP 404.
 
 A deployment in the desired set renders as one `Model` CR labeled
 `infer-stack/managed=true` + `infer-stack/deployment=<id>`; `apply` is
@@ -54,6 +63,9 @@ infer-stack config set kubeai_namespace kubeai
 infer-stack config set kubeai_base_url http://127.0.0.1:8000/openai/v1
 # fallback profile for endpoints whose runtime omits resource_profile:
 infer-stack config set kubeai_resource_profile nvidia-gpu-rtx-4090
+# how the gateway reaches KubeAI (default: the kubeai Service's cluster IP,
+# reachable from a cluster node; set an ingress URL when this host is not one):
+infer-stack config set kubeai_gateway_upstream http://kubeai.example/openai/v1
 ```
 
 Catalog endpoints opt into a specific profile per endpoint; the GPU count is
@@ -82,9 +94,8 @@ Then the normal verbs just work:
 
 ```bash
 infer-stack acquire qwen-coder --ttl 2h --env-file lease.env --yes
-source lease.env            # OPENAI_BASE_URL -> the KubeAI gateway
-# note: request the model by its CR name (the env-file's endpoint mapping
-# carries it), not the endpoint alias — KubeAI has no alias layer.
+source lease.env            # OPENAI_BASE_URL + OPENAI_API_KEY -> the gateway
+# request model=qwen-coder, the endpoint alias, as on the compose backend
 infer-stack release --env-file lease.env
 ```
 
@@ -105,6 +116,12 @@ infer-stack release --env-file lease.env
   (default 1/1 — the lease lifecycle, not the autoscaler, decides residency).
 - The legacy profile-era renderer (`infer_stack/backends/kubeai_renderer.py`,
   `kubeai_ops.py`) is superseded by this backend and kept only for reference.
-- `dev/kubeai_e2e.sh` runs the full lifecycle (doctor → acquire → generation
-  through the gateway → release → prune-verified) against a real cluster with
-  an isolated config/data root; use it as the first smoke test on new setups.
+- `dev/kubeai_e2e.sh` runs the full lifecycle (doctor → acquire → a request
+  by alias, as a card makes it → release → prune verified) against a real
+  cluster with an isolated config/data root; use it as the first smoke test
+  on new setups. Without a GPU, install the chart with
+  `dev/e2e_tests/kubeai-cpu-values.yaml` (real vLLM on CPU; needs AVX-512)
+  and run it with `E2E_RESOURCE_PROFILE=cpu`. Verified on k3s 2026-09-24.
+- The gateway runs on the host running infer-stack, so that host is in every
+  request's path. Dynamic routing (`dynamic_routing`) is compose-only; the
+  KubeAI gateway uses static routes.
