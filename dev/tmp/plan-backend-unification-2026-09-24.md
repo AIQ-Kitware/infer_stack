@@ -230,3 +230,15 @@ new modules. Each step leaves the full suite, `ty` and flake8 green. The
 gateway still runs as a Compose project (it is a container), so KubeAI keeps
 a `ComposeBackend` with no engines: that is now simply "a Compose project
 with only the front door", not a special mode.
+
+**G done 2026-09-24** (on `dev/backend-unification`). A: `naming.py`
+(99 lines). B: `gateway.py` module code. C: the `Gateway` class; backends
+supply route rows, the gateway merges, persists and renders them (the
+`upstream_routes` side-channel is gone), and the backend's gateway settings
+are properties onto the one `Gateway`. D: `render_front_door`, verified
+byte-identical across six configurations. `compose.py` went from 3651
+lines (on `main`) to 2360; `gateway.py` is 1377. Verified live after C: a
+Compose gateway apply and `secrets rotate`, and the KubeAI e2e.
+
+Found on the way: the weight-floor doctest wrote 4 GiB to `/tmp` per run
+(fixed on `main`, 21f5e09).

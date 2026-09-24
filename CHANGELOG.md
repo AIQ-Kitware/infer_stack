@@ -14,6 +14,19 @@ scheduler with its own GPU accounting: a lease held outside it, manual or
 keep-warm, occupies a GPU the scheduler believes is free, and the job it
 places there cannot start.
 
+### The gateway is its own module
+
+The front door (LiteLLM config and service, route registry, dynamic-route
+reconciliation, the managed keys, Open WebUI, the reverse proxy) moved out of
+`leasing/compose.py` into `leasing/gateway.py`, with a `Gateway` object that
+`ComposeBackend` owns (`backend.gateway`). The service naming rules moved to
+`leasing/naming.py`. Backends now hand the gateway their route rows rather
+than the gateway reading backend state. Rendered output is unchanged
+(verified byte for byte), and `compose.py` is about a third smaller. Code
+that imported gateway names from `infer_stack.leasing.compose` should import
+them from `infer_stack.leasing.gateway`; the public naming helpers are still
+importable from `compose`.
+
 ### The kubeai backend fails fast on an engine that cannot start
 
 The crash diagnosis (restart count, exit code, and the engine log classified

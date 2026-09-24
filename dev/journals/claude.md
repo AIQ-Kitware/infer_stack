@@ -3217,3 +3217,35 @@ evicts idle keep-warm Models when a new one cannot be scheduled.
 fail on purpose first; GATEWAY=0 is that switch here. (2) "Has method X" is
 a poor stand-in for "is backend Y": when a second backend gains X, every
 such check silently changes meaning.
+
+## 2026-09-24 14:39:35 -0400
+
+**Intent.** Make infer-stack more elegant, architecture first and the TUI
+after. The user agreed that the Compose backend's real seam is gateway vs.
+engines. Model: Claude Opus 5.5 (1M context).
+
+**What I did.** Four steps on `dev/backend-unification`, each green before
+the next: naming rules into `naming.py`, the gateway's module code into
+`gateway.py`, a `Gateway` class for its state, and `render_front_door`.
+The one real design change: the registry merge no longer reads backend
+state. Backends supply rows and the gateway only merges them, which removed
+the `upstream_routes` side-channel I had added for KubeAI in K1. Settings the
+gateway reads became backend properties onto the single `Gateway`, because
+`use_profile` and tests set them on the backend after construction. Two
+copies would drift.
+
+**How I checked a pure refactor.** Unit tests alone are weak evidence for
+moved code, so I also rendered six stack configurations with the old and new
+code and compared bytes (identical), then ran the real Compose gateway,
+`secrets rotate` and the KubeAI e2e.
+
+**What went wrong.** My first byte comparison "passed" on two empty files,
+because the script crashed in both runs. I caught it only because the byte
+count was 0. More serious: the weight-floor doctest I wrote earlier wrote
+4 GiB of real zeros into /tmp on every run and never cleaned up. A day of
+test runs filled 49 GB, k3s went into disk pressure and evicted KubeAI.
+Fixed with sparse files.
+
+**Takeaways.** (1) A comparison of outputs must check the outputs exist:
+equality of two failures is not evidence. (2) Test fixtures that need large
+files should be sparse. Size was the property under test, not the bytes.

@@ -1086,7 +1086,7 @@ class Controller:
             candidate['catalogs'] = merge_catalog_sources(
                 stored.get('catalogs') or [], invocation.get('catalogs') or []
             )
-        except CatalogConflict as ex:
+        except CatalogConflict:
             # Only definitions a resident workload is actually running have to
             # stay frozen. Redefining anything else -- the normal case while
             # iterating with `catalog endpoint add --force` -- drops the stale
@@ -1224,7 +1224,7 @@ class Controller:
         scope = getattr(self.backend, 'placement_scope', None)
         if scope is not None:
             with scope(context):
-                rec = self._render()
+                self._render()
         self.ledger.clear_placement_context()
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
