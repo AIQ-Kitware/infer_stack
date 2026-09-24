@@ -25,7 +25,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from ..paths import data_root
 from .models import (
@@ -340,7 +340,7 @@ class Ledger:
                 self.store.bump_desired_generation()
         return self.store.get_lease(lease_id)
 
-    def renew_if_live(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None | bool:
+    def renew_if_live(self, lease_id: str, *, ttl_seconds: float | None) -> Lease | None | Literal[False]:
         """The lock-free renew fast path: TTL only, when nothing needs admission.
 
         Returns the renewed lease when the lease is ACTIVE and every deployment

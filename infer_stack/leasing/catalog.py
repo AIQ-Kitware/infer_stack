@@ -298,6 +298,9 @@ class Catalog:
     endpoints: dict[str, EndpointSpec] = field(default_factory=dict)
     hosts: dict[str, RuntimeHostSpec] = field(default_factory=dict)
     bundles: dict[str, list[str]] = field(default_factory=dict)
+    #: The mapping it was parsed from, so it can be published into a profile
+    #: (see leasing/profile.py). Set by :meth:`from_dict`; ignored by equality.
+    source: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     # -- construction ------------------------------------------------------
 
@@ -364,8 +367,6 @@ class Catalog:
             models=models, endpoints=endpoints, hosts=hosts, bundles=bundles
         )
         catalog.validate()
-        # The mapping it was parsed from, so it can be published into a profile
-        # (see leasing/profile.py). Not a dataclass field: equality ignores it.
         import copy
 
         catalog.source = copy.deepcopy(data)

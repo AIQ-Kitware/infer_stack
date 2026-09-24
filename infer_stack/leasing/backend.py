@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from .models import Deployment
 
@@ -145,6 +145,40 @@ class ConvergeBackend(Backend, Protocol):
         keeps the change pending and retries); ``True`` or ``None`` otherwise.
         Raise on backend failure, which also leaves the change pending.
         """
+        ...
+
+
+@runtime_checkable
+class AdmissionBackend(ConvergeBackend, Protocol):
+    """The surface admission mode uses (see ``Controller._admission_mode``).
+
+    Today only :class:`~infer_stack.leasing.compose.ComposeBackend` has it:
+    strict residency, an in-memory placement ``preview``, and the Compose
+    network and adoption state the controller hands it. The controller
+    reaches these through ``Controller._admitting``, only after the
+    capability check, so the type checker sees one named capability instead
+    of attributes a minimal :class:`Backend` does not have.
+    """
+
+    network: dict[str, Any] | None
+    on_addresses: Callable[[dict[str, str]], None] | None
+    adopted: dict[str, Any]
+    last_preview_digest: str | None
+
+    def residency(self) -> Any:
+        """A strict :class:`~infer_stack.leasing.residency.Residency`, or raise."""
+        ...
+
+    def preview(self, desired: list[Deployment], placement: Any = None, *,
+                approve: bool = False) -> Any:
+        """Place and render ``desired`` without writing; ``(plan, rendered)``."""
+        ...
+
+    def run(self, args: list[str], **kwargs: Any) -> str:
+        """Run a runtime command (``docker ...``) and return its stdout."""
+        ...
+
+    def _load_sidecar(self) -> dict:
         ...
 
 
