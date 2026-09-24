@@ -474,7 +474,7 @@ def plan_placement(
 
     # 4) optional residents (admission mode): stay where they are, or yield.
     for deployment in optional:
-        want = [int(i) for i in optional_hints[deployment.id]]
+        want = [int(i) for i in (optional_hints or {})[deployment.id]]
         if all(i in pin_pool_set for i in want) and not (used & set(want)):
             plan.assignments[deployment.id] = want
             used.update(want)

@@ -193,15 +193,16 @@ def weight_floor_gib(
     as before this feature.
 
     Example:
-        >>> import os, tempfile
+        >>> import os, shutil, tempfile
         >>> cache = tempfile.mkdtemp()
         >>> snap = os.path.join(cache, 'hub', 'models--org--m', 'snapshots', 'abc')
         >>> os.makedirs(os.path.join(snap, 'original'))
         >>> for path in ['model.safetensors', 'original/consolidated.safetensors']:
         ...     with open(os.path.join(snap, path), 'wb') as file:
-        ...         _ = file.write(b'0' * (2 * 1024 ** 3))
+        ...         _ = file.truncate(2 * 1024 ** 3)   # sparse: sized, no disk used
         >>> weight_floor_gib('org/m', cache)     # one 2 GiB set, not two
         2.0
+        >>> shutil.rmtree(cache)
     """
     if not hf_model_id or not hf_cache:
         return None
