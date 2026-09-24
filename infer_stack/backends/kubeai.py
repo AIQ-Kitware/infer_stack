@@ -64,17 +64,16 @@ def model_name_for(served: str) -> str:
 
 
 def _served_name(deployment: Deployment) -> str:
-    return deployment.spec.get('served_model_name') or (
-        sorted(deployment.served)[0] if deployment.served else deployment.id
-    )
+    from ..leasing.models import served_name
+
+    return served_name(deployment)
 
 
 def _gpu_count(deployment: Deployment) -> int:
-    runtime = deployment.spec.get('runtime', {}) or {}
-    tp = int(runtime.get('tensor_parallel_size', 1) or 1)
-    pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
-    dp = int(runtime.get('data_parallel_size', 1) or 1)
-    return max(1, tp * pp * dp)
+    """Resource-profile units for a Model: the planner's GPU count, at least 1."""
+    from ..leasing.placement import required_gpu_count
+
+    return max(1, required_gpu_count(deployment))
 
 
 def _model_doc(
@@ -125,10 +124,16 @@ def _model_doc(
         },
         'spec': spec,
     }
-    # Attention backend is a vLLM env var, not a CLI arg (see compose._vllm_service);
-    # forward it through the KubeAI Model's env map for parity across backends.
+    # Container environment through the Model's env map, as compose renders
+    # it: runtime.env (templates filled, values as strings), plus the attention
+    # backend, which is a vLLM env var rather than a flag.
+    from ..leasing.launch import env_string, fill
+
+    env = {str(k): fill(env_string(v), svc) for k, v in svc['env'].items()}
     if svc.get('attention_backend'):
-        spec['env'] = {'VLLM_ATTENTION_BACKEND': str(svc['attention_backend'])}
+        env['VLLM_ATTENTION_BACKEND'] = str(svc['attention_backend'])
+    if env:
+        spec['env'] = env
     return doc
 
 
@@ -178,11 +183,11 @@ def render_models(
         from ..leasing.launch import translate_legacy
 
         runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
-        custom = [k for k in ('command', 'env', 'mounts') if runtime.get(k)]
+        custom = [k for k in ('command', 'mounts') if runtime.get(k)]
         if custom:
-            # A KubeAI Model runs stock vLLM; it has no place for a container
-            # command, environment or host mounts. Fail closed, never silently
-            # serve the stock engine instead.
+            # A KubeAI Model runs stock vLLM: it has no place for a container
+            # command or host mounts (env maps onto spec.env). Fail closed,
+            # never silently serve the stock engine instead.
             out.unrenderable.add(deployment.id)
             out.errors.append(
                 f"{deployment.id}: runtime.{custom[0]} describes a custom container "

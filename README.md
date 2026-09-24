@@ -650,7 +650,9 @@ never silently retunes an endpoint after the fact.
   launcher instead.
 - All of these are deployment identity: endpoints that launch differently
   never share a process.
-- Compose only; KubeAI refuses an endpoint with `command`, `env` or `mounts`.
+- `env` works on both backends (on KubeAI it becomes the Model's `spec.env`).
+  `command` and `mounts` are Compose only; KubeAI refuses an endpoint with
+  either rather than serve stock vLLM in its place.
 
 ### Reasoning / thinking models
 

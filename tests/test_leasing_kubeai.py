@@ -185,7 +185,7 @@ def test_render_attention_backend_reaches_cr_env():
 @pytest.mark.parametrize('launch', [
     {'serve_recipe': 'hyperqwen-3090-single'},       # a legacy entry, translated
     {'command': ['single']},
-    {'env': {'SPEC': 'mtp'}},
+    {'mounts': {'/cache': 'x/cache'}},
 ])
 def test_render_refuses_a_custom_container_launch(launch):
     rendered = render_models(
@@ -742,3 +742,14 @@ def test_compose_only_commands_refuse_kubeai_explicitly(tmp_path, monkeypatch):
     monkeypatch.setattr(commands_leasing, '_open_controller', lambda *a, **k: ctl)
     with pytest.raises(SystemExit, match='needs the compose backend'):
         commands_leasing.GcCLI.main(argv=['--orphans', '--yes'])
+
+
+def test_runtime_env_reaches_the_model_like_it_reaches_a_container():
+    rendered = render_models(
+        [vllm('grp-e', served='q', env={'MODE': 'fast', 'CTX': '{max_model_len}', 'ON': True},
+              attention_backend='TORCH_SDPA')],
+        namespace='kubeai', default_resource_profile='cpu',
+    )
+    (doc,) = rendered.docs
+    assert doc['spec']['env'] == {'MODE': 'fast', 'CTX': '4096', 'ON': 'true',
+                                  'VLLM_ATTENTION_BACKEND': 'TORCH_SDPA'}

@@ -27,6 +27,13 @@ as `Unschedulable` or `ImagePullBackOff`. vLLM rejecting a flag (`error:
 unrecognized arguments`) is now recognised as fatal on both backends; before,
 it waited for two restarts.
 
+`runtime.env` now works on the kubeai backend (the Model's `spec.env`, with
+the same templates and reserved names). The served-name rule lives in one
+place, `leasing.models.served_name`. Two gateway route builders fell back to
+the deployment id where the engine used the first served alias, so a
+deployment without `served_model_name` routed to a name its engine did not
+serve.
+
 `gc --orphans` and `network migrate` now refuse a non-compose backend
 explicitly. They had used "the backend has `residency`" to mean compose.
 

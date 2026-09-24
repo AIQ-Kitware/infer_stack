@@ -183,6 +183,11 @@ engine's error quoted, instead of waiting out the 800 s timeout. Adding
 - TUI engine logs through a backend `deployment_logs` stream, with
   `kubectl logs -f` on KubeAI
 
+**Done 2026-09-24** except TUI logs: there is one `served_name` (it fixed a
+real disagreement, noted in the changelog), KubeAI's GPU units come from
+`placement.required_gpu_count`, and KubeAI takes `runtime.env`. The unused
+profile-era KubeAI renderer is deleted. TUI engine logs on KubeAI remain open.
+
 ## Order and size
 
 K0, then K1, is the minimum for a card to run unchanged on a cluster. K2 and

@@ -54,7 +54,7 @@ from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
 from .backend import ConvergeScaffold, Readiness
 from .launch import env_string, fill, translate_legacy
-from .models import Deployment, is_reservation
+from .models import Deployment, is_reservation, served_name
 from .placement import plan_placement
 from .residency import (  # labels live beside the code that reads them back
     FINGERPRINT_LABEL,
@@ -180,9 +180,7 @@ def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:
     :meth:`ComposeBackend.observe` still maps service names through the render
     sidecar; it is for reporting, not for decisions that touch a GPU.)
     """
-    served = deployment.spec.get('served_model_name') or (
-        sorted(deployment.served)[0] if deployment.served else deployment.id
-    )
+    served = served_name(deployment)
     if unique:
         return _unique_vllm_service_name(served, deployment.id)
     return vllm_service_name_for(served)
@@ -429,9 +427,7 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
     # A deployment recorded before the generic launch fields may still carry
     # `serve_recipe`; read it as the fields it meant.
     runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
-    served = deployment.spec.get('served_model_name') or (
-        sorted(deployment.served)[0] if deployment.served else deployment.id
-    )
+    served = served_name(deployment)
     return {
         'served_model_name': served,
         'tensor_parallel_size': int(runtime.get('tensor_parallel_size', 1) or 1),
@@ -699,7 +695,7 @@ def _litellm_model_list(
         if deployment.id not in assignments:
             continue
         if deployment.engine == 'vllm':
-            served = deployment.spec.get('served_model_name') or deployment.id
+            served = served_name(deployment)
             api_base = f'http://{vllm_service_name(deployment)}:8000/v1'
             for endpoint in sorted(deployment.served):
                 entries.append(_vllm_route_entry(endpoint, served, api_base))
@@ -810,9 +806,7 @@ def _registry_incoming_from_deployments(
         if deployment.id not in assignments:
             continue
         if deployment.engine == 'vllm':
-            served = deployment.spec.get('served_model_name') or (
-                sorted(deployment.served)[0] if deployment.served else deployment.id
-            )
+            served = served_name(deployment)
             for endpoint in sorted(deployment.served):
                 incoming[endpoint] = {'engine': 'vllm', 'served': served}
         elif deployment.engine == 'ollama':
@@ -970,7 +964,7 @@ def _litellm_routes(
         if deployment.id not in assignments:
             continue
         if deployment.engine == 'vllm':
-            served = deployment.spec.get('served_model_name') or deployment.id
+            served = served_name(deployment)
             api_base = (
                 f'http://{vllm_service_name(deployment, unique=True)}'
                 f':{VLLM_CONTAINER_PORT}/v1'
