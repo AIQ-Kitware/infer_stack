@@ -55,7 +55,7 @@ def make(tmp_path):
 
 
 def env(ctl):
-    return parse_env_file(ctl.backend._env_path)
+    return parse_env_file(ctl.backend.gateway._env_path)
 
 
 def gateway(ctl):

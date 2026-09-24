@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
 from ..config import PINNED_IMAGES
-from ..env_utils import parse_env_file, write_env_file
+from ..config import DEFAULT_PORTS
+from ..env_utils import ensure_secret, parse_env_file, write_env_file
+from .backend import ConvergeScaffold
 from .models import Deployment, served_name
 from .naming import (
     OLLAMA_CONTAINER_PORT,
@@ -730,3 +733,472 @@ def set_master_key(env_path: Path, key: str) -> None:
     write_env_file(env_path, values)
 
 
+class Gateway(ConvergeScaffold):
+    """The front door's state: settings, the managed keys, the route registry.
+
+    Owned by the backend that runs it (``ComposeBackend.gateway``). The
+    backend supplies route rows for what it serves; this merges, persists and
+    renders them, reconciles dynamic routes through LiteLLM's admin API, and
+    keeps the ``.env`` secrets. It shares the backend's state directory (and
+    so its converge lock), because the gateway's files live beside the
+    compose project that runs it.
+    """
+
+    def __init__(
+        self,
+        state_dir: str | Path,
+        *,
+        ports: dict[str, int],
+        litellm: bool = True,
+        ui: bool = True,
+        reverse_proxy: bool = False,
+        reverse_proxy_port: int = 80,
+        dynamic_routing: bool = False,
+        http: Any = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.state_dir = Path(state_dir)
+        self.ports = ports
+        self.litellm = litellm
+        self.ui = ui
+        self.reverse_proxy = reverse_proxy
+        self.reverse_proxy_port = reverse_proxy_port
+        self.dynamic_routing = dynamic_routing
+        if http is None:
+            import requests
+            http = requests
+        self.http = http
+        self._sleep = sleep
+        self._clock = clock
+        self.assume_yes = True
+
+    @property
+    def litellm_port(self) -> int:
+        return self.ports.get('litellm', DEFAULT_PORTS['litellm'])
+
+    @property
+    def ui_port(self) -> int:
+        return self.ports.get('open_webui', DEFAULT_PORTS['open_webui'])
+
+    @property
+    def _env_path(self) -> Path:
+        return self.state_dir / '.env'
+
+    @property
+    def _routes_file(self) -> Path:
+        return self.state_dir / LITELLM_ROUTES_FILENAME
+
+    @property
+    def _registry_file(self) -> Path:
+        return self.state_dir / LITELLM_REGISTRY_FILENAME
+
+    def master_key(self) -> str:
+        """The managed LiteLLM master key.
+
+        infer-stack manages this secret in the state dir's ``.env``: reused if
+        already present (you may pin your own ``sk-`` key there), otherwise
+        generated and persisted. The caller doesn't need to invent or export it
+        — it is baked into the LiteLLM service, used by the readiness probe, and
+        shipped in the env-file descriptor (``infer-stack env KEY`` prints it).
+        """
+        existing = parse_env_file(self._env_path)
+        key = ensure_secret(existing, API_KEY_ENV, prefix='sk-')
+        if key != existing.get(API_KEY_ENV):
+            write_env_file(self._env_path, {API_KEY_ENV: key})
+        return key
+
+    def rotate_master_key(self) -> dict[str, str | None]:
+        """Write a fresh master key to the ``.env``; return the values it replaced.
+
+        Only the file: the gateway and Open WebUI pick it up when the next apply
+        recreates them (their fingerprints hash the key). The caller holds the
+        publication lock and passes the return value to
+        :meth:`restore_env` if that apply does not happen.
+        """
+        before = parse_env_file(self._env_path)
+        set_master_key(self._env_path, ensure_secret({}, API_KEY_ENV, prefix='sk-'))
+        return {k: before.get(k) for k in (API_KEY_ENV, SALT_KEY_ENV)}
+
+    def restore_env(self, values: dict[str, str | None]) -> None:
+        """Put back what :meth:`rotate_master_key` replaced."""
+        from ..env_utils import remove_env_keys
+
+        write_env_file(self._env_path, {k: v for k, v in values.items() if v is not None})
+        remove_env_keys(self._env_path, [k for k, v in values.items() if v is None])
+
+    def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
+        """Does the gateway accept ``key``? ``None`` if it never answered.
+
+        Polls ``/v1/models`` for up to ``wait`` seconds while the gateway is
+        unreachable or still starting. A definite no is 401/403, or the 400
+        LiteLLM actually answers a wrong key with (measured on the pinned image).
+        """
+        deadline = self._clock() + wait
+        while True:
+            try:
+                resp = self.http.get(
+                    f'{self._gateway_base()}/v1/models',
+                    headers={'Authorization': f'Bearer {key}'}, timeout=10.0,
+                )
+                status = getattr(resp, 'status_code', 0)
+            except Exception:  # noqa: BLE001 - not up yet
+                status = 0
+            if status == 200:
+                return True
+            if status in (400, 401, 403):
+                return False
+            if self._clock() >= deadline:
+                return None
+            self._sleep(2.0)
+
+    def db_password(self) -> str:
+        """The managed Postgres password for LiteLLM's model store.
+
+        Same managed-secret pattern as :meth:`master_key`: reused if already
+        present in the state-dir ``.env`` (you may pin your own), else generated
+        and persisted. ``docker compose --env-file`` interpolates it into the
+        postgres + litellm services, so it never appears literally in the YAML.
+        Only used when ``dynamic_routing`` is on. ``token_urlsafe`` output is safe
+        inside the ``postgresql://`` URL (no ``@ : /`` characters).
+        """
+        existing = parse_env_file(self._env_path)
+        pw = ensure_secret(existing, DB_PASSWORD_ENV)
+        if pw != existing.get(DB_PASSWORD_ENV):
+            write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
+        return pw
+
+    def _load_route_registry(self) -> dict[str, Any]:
+        """Read the route registry, tolerantly (fail-open — a broken registry
+        must never block a converge).
+
+        Missing file → seed from the live ``litellm_config.yaml`` if present
+        (upgrade migration, §6), else an empty registry. An *unknown* schema
+        version whose ``entries`` still parses as a name→row map is preserved
+        as-is (render what's understood, warn, do NOT rewrite) rather than
+        reseeded, so a binary rollback doesn't discard the accumulated union.
+        Only a structurally unusable file (not a map / garbage JSON) falls back
+        to seeding."""
+        from .._log import logger
+
+        if not self._registry_file.exists():
+            config = self.state_dir / LITELLM_CONFIG_FILENAME
+            if config.exists():
+                seeded, warnings = _seed_registry_from_litellm_config(
+                    config.read_text()
+                )
+                for w in warnings:
+                    logger.warning('  route registry: {}', w)
+                logger.info(
+                    '  route registry: seeded {} vLLM route(s) from {}',
+                    len(seeded['entries']), config.name,
+                )
+                return seeded
+            return {'version': LITELLM_REGISTRY_VERSION, 'entries': {}}
+        try:
+            data = json.loads(self._registry_file.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                '  route registry: {} is unreadable ({}); rebuilding from seed',
+                self._registry_file.name, exc,
+            )
+            data = None
+        if not isinstance(data, dict) or not isinstance(
+            data.get('entries'), dict
+        ):
+            config = self.state_dir / LITELLM_CONFIG_FILENAME
+            if config.exists():
+                seeded, warnings = _seed_registry_from_litellm_config(
+                    config.read_text()
+                )
+                for w in warnings:
+                    logger.warning('  route registry: {}', w)
+                return seeded
+            return {'version': LITELLM_REGISTRY_VERSION, 'entries': {}}
+        version = data.get('version')
+        if version != LITELLM_REGISTRY_VERSION:
+            logger.warning(
+                '  route registry: unknown schema version {!r} in {} — '
+                'rendering as-is without rewrite (fields this renderer does '
+                'not understand are ignored)',
+                version, self._registry_file.name,
+            )
+        return data
+
+    def _save_route_registry(self, merged: dict[str, Any]) -> None:
+        """Persist a merged registry if it changed (under the converge flock)."""
+        from .._log import logger
+
+        existing = self._load_route_registry()
+        if merged == existing:
+            return
+        prior = existing.get('entries', {}) if isinstance(existing, dict) else {}
+        added = sorted(set(merged['entries']) - set(prior))
+        updated = sorted(
+            k for k in merged['entries'] if k in prior and merged['entries'][k] != prior[k]
+        )
+        if added:
+            logger.info('  route registry: +{} route(s): {}', len(added), ', '.join(added))
+        if updated:
+            logger.info('  route registry: updated route(s): {}', ', '.join(updated))
+        self._atomic_write(self._registry_file, _dump_route_registry(merged))
+
+    def merge_route_registry(
+        self, incoming: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Public write path for out-of-converge registry seeds (``routes seed``).
+
+        Takes the converge flock, read-merge-writes the registry, and returns the
+        merged dict. ``converge`` only ever merges the invoking process's own
+        catalog, so a standalone caller (seeding a *sibling* runbook's catalog)
+        needs this to fold extra rows in before the follow-up ``reconcile``
+        renders+applies. The flock here and the one the subsequent converge takes
+        are sequential acquisitions, not nested — no reentrancy concern."""
+        from .._log import logger
+
+        with self._converge_lock():
+            existing = self._load_route_registry()
+            merged, warnings = _merge_route_registry(existing, incoming)
+            for w in warnings:
+                logger.warning('  route registry: {}', w)
+            if merged != existing:
+                self._atomic_write(
+                    self._registry_file, _dump_route_registry(merged)
+                )
+        return merged
+
+    def _gateway_base(self) -> str:
+        return f'http://127.0.0.1:{self.litellm_port}'
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {'Authorization': f'Bearer {self.master_key()}'}
+
+    def _desired_routes(self) -> list[dict[str, Any]]:
+        """The rendered desired route set (litellm_routes.json), or empty."""
+        try:
+            data = json.loads(self._routes_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _reconcile_routes(
+        self, *, deadline_s: float = ROUTE_RECONCILE_BOOTSTRAP_S, delay: float = 2.0,
+    ) -> bool:
+        """Make the live gateway's managed routes match the rendered route set.
+
+        The render half wrote the desired routes (one per live deployment×
+        endpoint) to ``litellm_routes.json``; this is the apply half. List the
+        gateway's current models, add the missing routes and delete the ones no
+        longer desired -- through the admin API, with **no** container restart --
+        then list again to verify both ids and routing semantics, re-diffing and
+        retrying failed calls until the table matches or the budget runs out.
+
+        Properties this relies on:
+
+        * **Idempotent.** A redundant apply re-diffs to the same set and does
+          nothing.
+        * **Drift-healing.** Routes lost to a gateway/DB restart reappear in the
+          diff and are re-added; stale routes from a prior run (still in the DB)
+          are deleted because they're no longer desired.
+        * **Co-existence.** Only routes infer-stack created (id prefix ``isr-``)
+          are ever deleted, so a model added by hand through the UI/API is left
+          alone.
+
+        **Bounded and reported.** Everything -- listing retries while the gateway
+        starts, every POST, and the final verification -- shares one wall-clock
+        budget, ``deadline_s``. A retry count alone would not bound it: a listing
+        can take 10 s and a POST 30 s. Returns ``True`` only when the verified
+        managed route set equals the desired set; any failure is logged and
+        returns ``False`` rather than raising, so the caller decides whether an
+        unverified route set blocks anything.
+        """
+        from .._log import logger
+
+        deadline = self._clock() + max(0.0, deadline_s)
+        desired = {
+            r['model_info']['id']: r
+            for r in self._desired_routes()
+            if isinstance(r.get('model_info'), dict) and r['model_info'].get('id')
+        }
+        desired_semantics = {rid: self._route_semantics(route)
+                             for rid, route in desired.items()}
+        rounds = 0
+        while True:
+            current = self._list_managed_routes(deadline=deadline, delay=delay)
+            if current is None:
+                logger.warning(
+                    'dynamic routing: route set not reconciled and verified within '
+                    '{:g}s; leaving it for the next apply', deadline_s,
+                )
+                return False
+            mismatched = sorted(
+                rid for rid in desired.keys() & current.keys()
+                if desired_semantics[rid] != current[rid]
+            )
+            to_add_ids = sorted((desired.keys() - current.keys()) | set(mismatched))
+            to_delete = sorted((current.keys() - desired.keys()) | set(mismatched))
+            to_add = [desired[rid] for rid in to_add_ids]
+            if not (to_add or to_delete):
+                return True            # this listing is the verification
+            if rounds:
+                logger.info('dynamic routing: route set still differs; retrying')
+            rounds += 1
+            ok = True
+            # A same-id semantic drift must be removed before it can be re-added;
+            # model/new is not an update API on every LiteLLM release.
+            for rid in to_delete:
+                # ok_if_missing: with a shared gateway, another converge may have
+                # deleted this route already; "not found in db" means the desired
+                # end-state (route gone) is reached, so don't treat it as an error.
+                ok &= self._post_route(
+                    '/model/delete', {'id': rid}, rid, ok_if_missing=True,
+                    deadline=deadline,
+                )
+            for route in to_add:
+                ok &= self._post_route(
+                    '/model/new', route, route.get('model_name'), deadline=deadline,
+                )
+            logger.info(
+                'dynamic routing: +{} route(s), -{} route(s), ~{} replacement(s) '
+                '(now {} desired)',
+                len(to_add), len(to_delete), len(mismatched), len(desired),
+            )
+            if not ok:
+                # A transient admin-API failure: spend the rest of the budget
+                # re-diffing rather than giving up with most of it unused.
+                if deadline - self._clock() <= delay:
+                    return False
+                self._sleep(delay)
+
+    @staticmethod
+    def _route_semantics(route: dict[str, Any]) -> dict[str, Any]:
+        """Observable route fields infer-stack owns and must verify.
+
+        LiteLLM's model-info response contains additional database/runtime fields
+        and may redact credentials.  The public alias, upstream model, and
+        upstream base URL are the routing semantics infer-stack can both set and
+        reliably observe.  A matching managed id with different values here is
+        drift and is replaced, not accepted as healthy.
+        """
+        params = route.get('litellm_params') or {}
+        return {
+            'model_name': route.get('model_name'),
+            'model': params.get('model'),
+            'api_base': params.get('api_base'),
+        }
+
+    def _list_managed_routes(
+        self, *, deadline: float, delay: float
+    ) -> dict[str, dict[str, Any]] | None:
+        """Observable semantics of infer-stack-managed gateway routes.
+
+        Retries while the gateway is unreachable, until ``deadline`` (a value of
+        ``self._clock``). Each request's own timeout is capped by the time left.
+        Returns ``None`` if no listing succeeded in time.
+        """
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return None
+            resp = None
+            try:
+                resp = self.http.get(
+                    f'{self._gateway_base()}/v1/model/info',
+                    headers=self._auth_headers(),
+                    timeout=min(10.0, remaining),
+                )
+            except Exception:  # noqa: BLE001 - the gateway may still be starting
+                resp = None
+            if resp is not None and getattr(resp, 'status_code', 0) == 200:
+                routes: dict[str, dict[str, Any]] = {}
+                for m in (resp.json().get('data') or []):
+                    rid = (m.get('model_info') or {}).get('id')
+                    if isinstance(rid, str) and rid.startswith(ROUTE_ID_PREFIX):
+                        routes[rid] = self._route_semantics(m)
+                return routes
+            if deadline - self._clock() <= delay:
+                return None
+            self._sleep(delay)
+
+    def _post_route(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        label: Any,
+        *,
+        ok_if_missing: bool = False,
+        deadline: float | None = None,
+    ) -> bool:
+        """POST one admin-API call (``/model/new`` or ``/model/delete``).
+
+        Returns whether it reached its desired end state. A failure is logged,
+        not raised, so the remaining calls still run. ``ok_if_missing`` accepts a
+        "model not found" response (a delete whose target is already gone).
+        The request timeout is capped by the time left before ``deadline``.
+        """
+        from .._log import logger
+
+        timeout = 30.0
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                logger.warning(
+                    'dynamic routing: POST {} {} skipped: route deadline passed',
+                    path, label,
+                )
+                return False
+            timeout = min(timeout, remaining)
+        try:
+            resp = self.http.post(
+                f'{self._gateway_base()}{path}',
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=timeout,
+            )
+        except Exception as ex:  # noqa: BLE001 - one bad call must not abort apply
+            logger.warning('dynamic routing: POST {} {} error: {}', path, label, ex)
+            return False
+        if getattr(resp, 'status_code', 0) >= 300:
+            body = str(getattr(resp, 'text', ''))
+            if ok_if_missing and 'not found' in body.lower():
+                return True
+            logger.warning(
+                'dynamic routing: POST {} {} -> {} {}',
+                path, label, resp.status_code, body[:200],
+            )
+            return False
+        return True
+
+    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
+        """Where a client reaches these endpoints, for the env-file descriptor.
+
+        With the LiteLLM front door, that is one ``base_url`` and the request
+        model name is the endpoint alias itself. With LiteLLM off there is no
+        single base URL, but a managed Open WebUI (if on) is still a useful
+        access point, so report just its URL rather than ``None``.
+        """
+        if not self.litellm:
+            if self.ui:
+                return {'ui_url': f'http://127.0.0.1:{self.ui_port}'}
+            return None
+        info: dict[str, Any] = {
+            'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
+            'api_key_env': API_KEY_ENV,
+            'api_key': self.master_key(),
+            'request_names': {ep: ep for ep in endpoints},
+        }
+        if self.ui:
+            info['ui_url'] = f'http://127.0.0.1:{self.ui_port}'
+        if self.reverse_proxy:
+            # The unified front door: one origin, UI at / and the API at /v1.
+            info['proxy_url'] = f'http://127.0.0.1:{self.reverse_proxy_port}'
+        return info
+
+    def merged_route_registry(self, incoming: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """The registry with ``incoming`` rows merged in, in memory (no write)."""
+        from .._log import logger
+
+        merged, warnings = _merge_route_registry(self._load_route_registry(), incoming)
+        for w in warnings:
+            logger.warning('  route registry: {}', w)
+        return merged

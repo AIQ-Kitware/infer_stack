@@ -317,7 +317,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
     first = ctl.acquire('x', cat.resolve_names(['a']), wait=False)
     gid = first.deployments[0].id
     served = dict(ledger.get_deployment(gid).served)
-    registry = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    registry = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
 
     def decline(planned):
         raise ConvergeAborted('no')
@@ -327,7 +327,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
         ctl.acquire('y', cat.resolve_names(['b']), wait=False)    # would add alias b
     assert len(ledger.status()[0]) == 1
     assert ledger.get_deployment(gid).served == served
-    now = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    now = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
     assert now == registry
 
 

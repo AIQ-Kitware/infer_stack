@@ -381,10 +381,12 @@ class KubeaiBackend(ConvergeScaffold):
         from ..leasing.gateway import UPSTREAM_ROUTE
 
         base = self._upstream_url()
-        self.gateway.upstream_routes = {
+        # This backend's route rows, persisted like any other (the registry is
+        # append-only, so a released Model stays routable, as on compose).
+        self.gateway.merge_route_registry({
             alias: {'engine': UPSTREAM_ROUTE, 'served': name, 'api_base': base}
             for alias, name in rendered.request_names.items()
-        }
+        })
         # Gateway only: no engines on this host, so nothing to place.
         self.gateway.converge([], apply=False)
 
@@ -613,8 +615,9 @@ class KubeaiBackend(ConvergeScaffold):
         if self.gateway is not None:
             # Ready means ready the way a client sees it: the alias, through
             # the gateway, with its key.
-            base, model = f'{self.gateway._gateway_base()}/v1', endpoint
-            headers = self.gateway._auth_headers()
+            front = self.gateway.gateway          # the runner's leasing.gateway.Gateway
+            base, model = f'{front._gateway_base()}/v1', endpoint
+            headers = front._auth_headers()
         else:
             base, model = self.base_url, model_name_for(_served_name(deployment))
             headers = None

@@ -528,7 +528,7 @@ def test_a_publish_that_never_commits_leaves_no_append_only_state(tmp_path):
     ledger, ctl = controller(tmp_path, catalog=a)
     ctl.gc()
     before = ledger.profile()
-    registry = ctl.backend._registry_file
+    registry = ctl.backend.gateway._registry_file
     registry_before = registry.read_text() if registry.exists() else None
 
     def crash(*args, **kw):

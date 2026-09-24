@@ -2384,7 +2384,7 @@ class EnvCLI(_PathOverridesMixin):
                         'the gateway out of its database'
                     )
                 if key == 'LITELLM_MASTER_KEY':
-                    from ..leasing.compose import set_master_key
+                    from ..leasing.gateway import set_master_key
                     try:
                         # Pins the salt first, so DB-stored routes stay readable.
                         set_master_key(env_path, value)
@@ -2485,7 +2485,7 @@ class RoutesListCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
         backend = _require_compose_backend(controller)
-        registry = backend._load_route_registry()
+        registry = backend.gateway._load_route_registry()
         entries = registry.get('entries', {})
         live = _live_endpoints(controller)
 
@@ -2558,7 +2558,7 @@ class RoutesPruneCLI(_ApprovalMixin):
     def main(cls, argv=True, **kwargs):
         from ..diff_prompt import confirm_writes
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.compose import (
+        from ..leasing.gateway import (
             LITELLM_REGISTRY_VERSION,
             _dump_route_registry,
             _registry_incoming_from_catalog,
@@ -2578,7 +2578,7 @@ class RoutesPruneCLI(_ApprovalMixin):
             if backend.catalog is not None:
                 keep.update(_registry_incoming_from_catalog(backend.catalog))
             keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
-            current = backend._load_route_registry().get('entries', {})
+            current = backend.gateway._load_route_registry().get('entries', {})
             return current, keep, sorted(set(current) - set(keep))
 
         # Preview outside the lock (the prompt must not hold it); the change
@@ -2595,7 +2595,7 @@ class RoutesPruneCLI(_ApprovalMixin):
             for name in dropped:
                 print(f'  - {name}')
             ok = confirm_writes(
-                {backend._registry_file: _dump_route_registry(pruned)},
+                {backend.gateway._registry_file: _dump_route_registry(pruned)},
                 assume_yes=False,
                 title='infer-stack routes prune',
             )
@@ -2613,7 +2613,7 @@ class RoutesPruneCLI(_ApprovalMixin):
             entries = {k: v for k, v in current.items() if k not in drop}
             with backend._converge_lock():
                 backend._atomic_write(
-                    backend._registry_file,
+                    backend.gateway._registry_file,
                     _dump_route_registry(
                         {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}),
                 )
@@ -2686,7 +2686,7 @@ class RoutesSeedCLI(_ApprovalMixin):
             )
 
         def change():
-            before = set(backend._load_route_registry().get('entries', {}))
+            before = set(backend.gateway._load_route_registry().get('entries', {}))
             backend.merge_route_registry(incoming)
             return sorted(set(incoming) - before)
 
