@@ -1407,7 +1407,8 @@ def test_tui_logs_stream_from_injected_source():
         async with app.run_test() as pilot:
             await pilot.pause()
             app._restart_logs(ALL_SERVICES)           # the gateway's own lines
-            await app.workers.wait_for_complete()     # drain the log stream
+            await app.workers.wait_for_complete()     # the stream has ended
+            app._drain_logs()                         # lines are drawn in batches
             await pilot.pause()
             assert any('ready' in line for line in app._log_lines)
 
@@ -1436,6 +1437,7 @@ def test_tui_compacts_registered_litellm_traceback():
             await pilot.pause()
             app._restart_logs(ALL_SERVICES)           # the gateway's own lines
             await app.workers.wait_for_complete()
+            app._drain_logs()                         # lines are drawn in batches
             await pilot.pause()
             text = '\n'.join(app._log_lines)
             assert 'Traceback (most recent call last):' not in text
@@ -1563,6 +1565,10 @@ def test_tui_table_rebuild_preserves_scroll_offset():
         app = InferStackTUI(controller, catalog, interval=999,
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
+            await pilot.pause()
+            # The mount-time background refresh must land first, or it can
+            # repaint all 40 rows after the rebuild below (an intermittent fail).
+            await app.workers.wait_for_complete()
             await pilot.pause()
             table = app.query_one('#leases', DataTable)
             assert table.row_count == 40
@@ -2003,3 +2009,60 @@ def test_tui_log_shows_the_cli_command_for_an_action_and_backend_progress():
     _run(scenario)
     assert 'CLI: infer-stack release --all --yes' in seen['applog']
     assert 'pulling img: 1 of 4 layers' in seen['applog']
+
+
+def test_a_ui_thread_stall_is_reported_with_where_it_happened(tmp_path, monkeypatch):
+    """"The TUI froze" must come with what it was doing."""
+    import time
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    monkeypatch.setattr(InferStackTUI, 'error_log_path', lambda self: tmp_path / 'e.log')
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.3)
+            original = app._update_summary
+
+            def slow(*args, **kwargs):
+                time.sleep(0.9)                   # a blocking call on the UI thread
+                return original(*args, **kwargs)
+
+            app._update_summary = slow
+            app._refresh_now()
+            app._update_summary = original
+            await pilot.pause(0.5)                # the watchdog reports after it ends
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'UI stalled' in seen['applog']
+    assert 'in slow' in seen['applog'] or 'tui.py' in seen['applog']
+    assert 'time.sleep(0.9)' in (tmp_path / 'e.log').read_text()
+
+
+def test_a_log_flood_is_drawn_in_bounded_batches():
+    from infer_stack.tui import ALL_SERVICES, LOG_PANE_LINES, InferStackTUI
+
+    controller, catalog = _ctx()
+    lines = [f'vllm-x  | loading shard {i}\n' for i in range(5000)]
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: _FakeProc(lines))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._restart_logs(ALL_SERVICES)
+            await app.workers.wait_for_complete()
+            for _ in range(20):                   # a bounded batch per tick
+                app._drain_logs()
+            await pilot.pause()
+            shown = list(app._log_lines)
+            assert len(shown) <= 2 * LOG_PANE_LINES
+            assert shown[-1].endswith('loading shard 4999')        # newest kept
+            assert any('earlier line(s) not shown' in s for s in shown)
+
+    _run(scenario)

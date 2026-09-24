@@ -96,6 +96,17 @@ NO_LOG_TARGET = object()
 #: Title of the tab that shows what the TUI itself did, and its errors.
 APP_LOG_TAB_TITLE = 'TUI log'
 
+#: The docker log pane shows at most this many lines (RichLog ``max_lines``).
+LOG_PANE_LINES = 2000
+#: How often streamed log lines are drawn: in one batch, not one UI message per
+#: line (which capped a loading engine's log at ~1800 lines/s).
+LOG_DRAIN_S = 0.1
+#: At most this many lines per drain: RichLog costs ~0.1 ms a line, and 2000 in
+#: one tick stalled the UI for 218 ms. The rest waits for the next tick.
+LOG_DRAIN_LINES = 200
+#: A UI-thread stall at least this long is reported, with what was running.
+STALL_REPORT_S = 0.5
+
 SELECT_BLANK = next(
     (
         candidate
@@ -982,6 +993,19 @@ class InferStackTUI(App):
         # visible; only the current generation is allowed to append.
         self._log_generation = 0
         self._log_lines: list[str] = []  # mirror of the docker log pane, for tests
+        # Lines streamed by the log worker, drawn by the UI every LOG_DRAIN_S.
+        # (generation, line): a line from a replaced stream is dropped.
+        import collections
+        self._log_pending: collections.deque = collections.deque()
+        # Lines taken from _log_pending, not yet drawn; only the newest
+        # LOG_PANE_LINES are kept, since the pane shows no more.
+        self._log_backlog: collections.deque = collections.deque(maxlen=LOG_PANE_LINES)
+        self._log_dropped = 0
+        # Parsed compose service names, keyed by the file's (mtime, size).
+        self._service_names_cache: tuple[tuple[float, int], list[str]] | None = None
+        # The UI loop's heartbeat, read by the stall watchdog thread.
+        self._beat = time.monotonic()
+        self._watchdog_stop = None
         self._app_log_lines: list[str] = []  # mirror of the TUI log pane, for tests
         self._app_log_errors = 0
         self._api_lines: list[str] = []  # mirror of the API output, for tests
@@ -1110,7 +1134,7 @@ class InferStackTUI(App):
                                 id='logsvc',
                             )
                             yield RichLog(id='logs', highlight=False,
-                                          markup=False, max_lines=2000,
+                                          markup=False, max_lines=LOG_PANE_LINES,
                                           wrap=False)
                         with TabPane('Containers', id='tab-containers'):
                             yield DataTable(id='ps', cursor_type='row',
@@ -1289,10 +1313,76 @@ class InferStackTUI(App):
         self._refresh_timer = self.set_interval(
             self.ledger_interval, self.action_refresh
         )
+        self.set_interval(LOG_DRAIN_S, self._drain_logs)
+        self._start_stall_watchdog()
         self.query_one('#endpoints', DataTable).focus()
 
     def on_unmount(self) -> None:
         self._terminate_logs()
+        if self._watchdog_stop is not None:
+            self._watchdog_stop.set()
+
+    # -- responsiveness ------------------------------------------------------
+
+    def _start_stall_watchdog(self) -> None:
+        """Report any UI-thread stall, with the stack that caused it.
+
+        A 0.1 s timer on the UI loop moves a heartbeat; a watchdog thread notices
+        when it stops, samples the UI thread's stack while it is stuck, and
+        reports the stall once it ends: its length in the TUI log, the stack in
+        the error log file. "The TUI froze" then comes with what it was doing.
+        """
+        import sys
+        import threading
+
+        ui_thread = threading.get_ident()
+        stop = threading.Event()
+        self._watchdog_stop = stop
+
+        def beat() -> None:
+            self._beat = time.monotonic()
+
+        self.set_interval(0.1, beat)
+
+        def watch() -> None:
+            import traceback
+
+            stalled_since = None
+            stack: list[str] = []
+            while not stop.wait(0.1):
+                behind = time.monotonic() - self._beat
+                if behind >= STALL_REPORT_S:
+                    if stalled_since is None:
+                        stalled_since = self._beat
+                        # The first sample, half a second in, is inside whatever
+                        # blocks; later ones can catch the loop catching up.
+                        frame = sys._current_frames().get(ui_thread)
+                        if frame is not None:
+                            stack = traceback.format_stack(frame)
+                elif stalled_since is not None:
+                    length = self._beat - stalled_since
+                    try:
+                        self.call_from_thread(self._report_stall, length, stack)
+                    except Exception:  # noqa: BLE001 - app shutting down
+                        return
+                    stalled_since, stack = None, []
+
+        threading.Thread(target=watch, name='tui-stall-watchdog', daemon=True).start()
+
+    def _report_stall(self, length: float, stack: list[str]) -> None:
+        # The innermost frames in infer_stack say what to fix; the file keeps all.
+        ours = [f for f in stack if 'infer_stack' in f] or stack
+        where = ours[-1].strip().splitlines()[0] if ours else '(no stack)'
+        path = self.error_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} '
+                             f'UI stalled {length:.1f}s\n')
+                handle.writelines(stack)
+        except OSError:
+            pass
+        self.app_log(f'UI stalled {length:.1f}s in {where} (stack: {path})', level='warn')
 
     # -- theming for docker output bleed ----------------------------------
 
@@ -1640,16 +1730,23 @@ class InferStackTUI(App):
         # "0 running" — say we're still observing instead of silently lying.
         observing = self._observed_at is None
         running_label = 'observing…' if observing else f'{running} running'
+        # Assign only on change: Textual repaints a pane whenever its border
+        # title is set, even to the same text, and these two panes hold the
+        # lease and deployment tables -- most of the screen, every tick
+        # (~7 KB/s of terminal output while nothing changed).
         try:
-            self.query_one('#docker', Collapsible).title = (
-                f'docker — {running_label}'
-            )
-            self.query_one('#leases-pane').border_title = (
-                f'leases — {active} active / {len(leases)}'
-            )
-            self.query_one('#deployments-pane').border_title = (
-                f'deployments — {running_label} / {len(deployments)}'
-            )
+            docker = self.query_one('#docker', Collapsible)
+            title = f'docker — {running_label}'
+            if docker.title != title:
+                docker.title = title
+            for pane, text in (
+                ('#leases-pane', f'leases — {active} active / {len(leases)}'),
+                ('#deployments-pane',
+                 f'deployments — {running_label} / {len(deployments)}'),
+            ):
+                widget = self.query_one(pane)
+                if widget.border_title != text:
+                    widget.border_title = text
         except Exception:  # noqa: BLE001
             pass
 
@@ -1895,9 +1992,16 @@ class InferStackTUI(App):
         if not path:
             return []
         try:
+            stat = Path(path).stat()
+            key = (stat.st_mtime, stat.st_size)
+            cached = self._service_names_cache
+            if cached is not None and cached[0] == key:
+                return list(cached[1])       # checked every refresh; parse on change
             import yaml
             data = yaml.safe_load(Path(path).read_text()) or {}
-            return sorted((data.get('services') or {}).keys())
+            names = sorted((data.get('services') or {}).keys())
+            self._service_names_cache = (key, names)
+            return list(names)
         except Exception:  # noqa: BLE001
             return []
 
@@ -1973,6 +2077,8 @@ class InferStackTUI(App):
         log = self.query_one('#logs', RichLog)
         log.clear()
         self._log_lines = []
+        self._log_backlog.clear()
+        self._log_dropped = 0
         target, label = self._resolve_log_target(service)
         if target is NO_LOG_TARGET:
             log.write(f'— {label} —')
@@ -2033,9 +2139,10 @@ class InferStackTUI(App):
         self._log_proc = proc
         try:
             for line in compact_litellm_tracebacks(proc.stdout):
-                self.call_from_thread(
-                    self._append_log_if_current, generation, line.rstrip('\n')
-                )
+                if generation != self._log_generation:
+                    break
+                # Drawn in batches by _drain_logs; deque.append is thread-safe.
+                self._log_pending.append((generation, line.rstrip('\n')))
         except Exception:  # noqa: BLE001 - stream ends when the proc dies
             pass
         finally:
@@ -2048,8 +2155,31 @@ class InferStackTUI(App):
         self._append_log(line)
 
     def _append_log(self, line: str) -> None:
-        self._log_lines.append(line)
-        self.query_one('#logs', RichLog).write(line)
+        self._write_log_lines([line])
+
+    def _write_log_lines(self, lines: list[str]) -> None:
+        self._log_lines.extend(lines)
+        if len(self._log_lines) > 2 * LOG_PANE_LINES:
+            del self._log_lines[:-LOG_PANE_LINES]
+        self.query_one('#logs', RichLog).write('\n'.join(lines))
+
+    def _drain_logs(self) -> None:
+        """Draw streamed lines: a bounded batch per tick, newest lines kept."""
+        pending, backlog = self._log_pending, self._log_backlog
+        while pending:
+            generation, line = pending.popleft()
+            if generation != self._log_generation:
+                continue
+            if len(backlog) == backlog.maxlen:
+                self._log_dropped += 1          # the oldest undrawn line falls off
+            backlog.append(line)
+        if not backlog:
+            return
+        batch = [backlog.popleft() for _ in range(min(LOG_DRAIN_LINES, len(backlog)))]
+        if self._log_dropped:
+            batch.insert(0, f'… {self._log_dropped} earlier line(s) not shown')
+            self._log_dropped = 0
+        self._write_log_lines(batch)
 
     # -- the TUI's own log -------------------------------------------------
 
