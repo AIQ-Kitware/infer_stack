@@ -114,8 +114,6 @@ infer-stack release --env-file lease.env
   `--backend compose` for those.
 - `min_replicas` / `max_replicas` runtime keys pass through to the CR
   (default 1/1 — the lease lifecycle, not the autoscaler, decides residency).
-- The legacy profile-era renderer (`infer_stack/backends/kubeai_renderer.py`,
-  `kubeai_ops.py`) is superseded by this backend and kept only for reference.
 - `dev/kubeai_e2e.sh` runs the full lifecycle (doctor → acquire → a request
   by alias, as a card makes it → release → prune verified) against a real
   cluster with an isolated config/data root; use it as the first smoke test

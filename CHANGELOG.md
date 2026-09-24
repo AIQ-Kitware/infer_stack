@@ -26,6 +26,10 @@ the alias as the model name on both backends. `secrets rotate` works on it.
 `kubeai_gateway_upstream`, for a gateway that cannot reach the cluster
 Service's IP.
 
+The profile-era KubeAI renderer (`infer_stack.backends.render_kubeai_artifacts`)
+is removed. Nothing called it since the profile path was excised; the kubeai
+backend is the one renderer for KubeAI.
+
 `dev/kubeai_e2e.sh` now sends the alias as a card does, and fails when the
 request fails. Before, a failed generation fell through to PASS: the check
 sat in a `&&` list, where `set -e` does not apply.
