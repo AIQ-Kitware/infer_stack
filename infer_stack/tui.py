@@ -970,9 +970,11 @@ class InferStackTUI(App):
 
     BINDINGS = [
         # Truly global controls stay in the footer.
-        ('r', 'refresh', 'Refresh'),
+        ('r', 'refresh_now', 'Refresh'),
         # Global on purpose: an error can happen while any tab is in front.
         ('l', 'show_app_log', 'TUI log'),
+        # Forgets finished history in both tables, so it belongs to neither pane.
+        ('x', 'cleanup', 'Clean up'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
         # Pane-scoped actions: keys still work, but they live as buttons under
@@ -981,7 +983,6 @@ class InferStackTUI(App):
         Binding('d', 'release', 'Release', show=False),
         Binding('e', 'evict', 'Evict', show=False),
         Binding('a', 'release_all', 'Release all', show=False),
-        Binding('x', 'cleanup', 'Clean up', show=False),
         # Multi-select: space toggles the cursor row in the focused leases/
         # deployments table; release/evict then act on every checked row.
         Binding('space', 'toggle_select', 'Select row', show=False),
@@ -1188,7 +1189,6 @@ class InferStackTUI(App):
                         with Horizontal(id='lease-actions'):
                             yield Button('Release', id='btn-release')
                             yield Button('Release all', id='btn-release-all')
-                            yield Button('Clean up', id='btn-cleanup')
                     yield _Divider('y', self._drag_tables, id='tsplit')
                     with Vertical(id='deployments-pane'):
                         yield Static(
@@ -1196,15 +1196,15 @@ class InferStackTUI(App):
                             "The 'leases' column is how many leases hold each. "
                             'Evict an idle one to free its GPU (cursor row, or '
                             'rows checked with space / ctrl/shift-click); Evict '
-                            'all idle clears every kept-warm one; Clean up forgets '
-                            'stopped ones.', classes='desc',
+                            'all idle clears every kept-warm one. x (Clean up) '
+                            'forgets stopped deployments and finished leases.',
+                            classes='desc',
                         )
                         yield DataTable(id='deployments', cursor_type='row',
                                         zebra_stripes=True)
                         with Horizontal(id='deployment-actions'):
                             yield Button('Evict', id='btn-evict')
                             yield Button('Evict all idle', id='btn-evict-all')
-                            yield Button('Clean up', id='btn-cleanup-deployments')
                 yield _Divider('y', self._drag_logs, id='hsplit')
                 with Collapsible(title='docker', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
@@ -1844,6 +1844,12 @@ class InferStackTUI(App):
     def _refresh_bg(self) -> None:
         data = self._collect()
         self.call_from_thread(self._render, data)
+
+    def action_refresh_now(self) -> None:
+        """The `r` key: a refresh the user asked for (the timer calls
+        ``action_refresh`` directly, and must not fill the TUI log)."""
+        self._cli(cli.command('status'))
+        self.action_refresh()
 
     def action_refresh(self) -> None:
         self._sync_pane_state()   # capture pane state on the UI thread first
@@ -2706,8 +2712,6 @@ class InferStackTUI(App):
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
             'btn-evict-all': self.action_evict_all,
-            'btn-cleanup': self.action_cleanup,
-            'btn-cleanup-deployments': self.action_cleanup,
             'btn-suggest': self.action_suggest,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
@@ -2748,6 +2752,7 @@ class InferStackTUI(App):
             return
         self.ledger_interval = ledger
         self.observe_interval = max(observe, ledger)  # observe never beats ledger
+        self.app_log('CLI: none; poll intervals are a TUI-only preference')
         self._apply_poll_settings()
         prefs = load_tui_settings()
         prefs['ledger_interval'] = self.ledger_interval
@@ -2777,6 +2782,10 @@ class InferStackTUI(App):
             )
             path = save_settings(s)
             self._status(f'saved settings → {path}')
+            self._cli(*(cli.command('config', 'set', key, str(s[key]).lower()
+                                    if isinstance(s[key], bool) else s[key])
+                        for key in ('backend', 'data_dir', 'ui', 'reverse_proxy',
+                                    'skip_display_gpus') if key in s))
         except Exception as ex:  # noqa: BLE001
             self._status(f'save settings failed: {ex}')
 
@@ -2814,8 +2823,7 @@ class InferStackTUI(App):
 
     def action_cleanup(self) -> None:
         self._status('cleaning up released/expired leases + stopped deployments…')
-        self.app_log('CLI: none yet; this only forgets finished rows in '
-                     'the ledger (nothing running changes)')
+        self._cli(cli.command('gc', '--forget'))
         self._do_cleanup()
 
     # -- docker compose control -------------------------------------------
@@ -3369,6 +3377,7 @@ class InferStackTUI(App):
         prompt = (self.query_one('#api-prompt', Input).value.strip()
                   or 'Say hello in one short sentence.')
         self._api_log(f'> [{model}] {prompt}')
+        self._cli(cli.command('test', model, '--prompt', prompt))
         self._do_api_send(model, prompt)
 
     def action_api_test_all(self) -> None:
@@ -3377,10 +3386,12 @@ class InferStackTUI(App):
             self._refuse('no ready models to test (acquire one first)')
             return
         self._api_log(f'— testing {len(models)} ready model(s) —')
+        self._cli(*(cli.command('test', model) for model in models))
         self._do_api_test_all(models)
 
     def action_api_list_models(self) -> None:
         self._api_log('> GET /v1/models  (what the gateway routes)')
+        self._cli(cli.MODELS_CURL)
         self._do_api_list()
 
     def action_api_copy_curl(self) -> None:

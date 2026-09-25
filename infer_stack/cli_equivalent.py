@@ -26,6 +26,11 @@ def _kv_value(value: Any) -> str:
     return json.dumps(value)
 
 
+#: What the gateway routes; the key comes from the CLI, never the log.
+MODELS_CURL = ('curl -s "$(infer-stack env OPENAI_BASE_URL)/models" '
+               '-H "Authorization: Bearer $(infer-stack env LITELLM_MASTER_KEY)"')
+
+
 #: Endpoint fields `catalog endpoint add` can express.
 _ENDPOINT_FIELDS = {'engine', 'model', 'host', 'public_name', 'reclaim',
                     'protocol', 'placement', 'runtime'}

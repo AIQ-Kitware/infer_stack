@@ -1231,6 +1231,36 @@ def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
     assert not any(str(le.state) == 'released' for le in leases)
 
 
+def test_clean_up_is_one_footer_key_that_logs_its_cli_command():
+    """One Clean up, on `x` in the footer, and each action names its command."""
+    from textual.widgets import Button
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            seen['buttons'] = [b.id for b in app.query(Button)
+                               if 'cleanup' in (b.id or '')]
+            seen['footer'] = [b for b in app.BINDINGS if isinstance(b, tuple)]
+            await pilot.press('x')
+            await app.workers.wait_for_complete()
+            await pilot.press('r')
+            await pilot.pause()
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert seen['buttons'] == []
+    assert ('x', 'cleanup', 'Clean up') in seen['footer']    # tuples show in the footer
+    assert 'CLI: infer-stack gc --forget' in seen['applog']
+    assert 'CLI: infer-stack status' in seen['applog']
+
+
 def test_tui_evict_all_idle_button():
     from infer_stack.leasing import DeploymentState
     from infer_stack.tui import InferStackTUI

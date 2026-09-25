@@ -2,6 +2,19 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### One Clean up, in the footer, with a CLI command behind it
+
+The leases and deployments panes each had a Clean up button, and both did the
+same thing: forget released/expired leases and stopped deployments. Nothing
+running changes. That is now one `x Clean up` in the footer, and the same
+action on the CLI is `infer-stack gc --forget`.
+
+The TUI log now names the CLI command for the actions that were missing one:
+`r` (`status`), Clean up (`gc --forget`), saving settings (`config set …`),
+and the API tab's send, test-all (`test <alias>`) and model list (a `curl`
+that reads the key through `infer-stack env` and never prints it). Poll
+intervals are TUI-only, and the log says so.
+
 ### The CLI is built on kwconf instead of scriptconfig
 
 kwconf is scriptconfig's successor, which aiq-magnet, cmd_queue and kwdagger

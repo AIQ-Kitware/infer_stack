@@ -1248,6 +1248,7 @@ class GcCLI(_ApprovalMixin):
     blocking ``acquire`` (``--queue``) already does this implicitly while it waits.
     ``--evict`` additionally tears down idle *keep-warm* deployments (like ``evict
     --all``). On a terminal the teardown is shown and confirmed (``--yes`` skips).
+    ``--forget`` only drops finished rows from the ledger (the TUI's Clean up).
     """
 
     __command__ = 'gc'
@@ -1262,6 +1263,11 @@ class GcCLI(_ApprovalMixin):
         help='Instead: remove containers in the project that infer-stack does not '
         'manage (listed and confirmed first; --yes skips the prompt).',
     )
+    forget = kw.Value(
+        False, isflag=True,
+        help='Instead: forget released/expired leases and stopped deployments '
+        'from the ledger. History only; nothing running changes.',
+    )
     json = kw.Value(False, isflag=True)
 
     @classmethod
@@ -1270,6 +1276,15 @@ class GcCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
+        if config.forget:
+            n_leases, n_deployments = controller.prune()
+            if config.json:
+                print(json.dumps({'leases': n_leases,
+                                  'deployments': n_deployments}, indent=2))
+            else:
+                print(f'gc --forget: forgot {n_leases} released/expired lease(s), '
+                      f'{n_deployments} stopped deployment(s)')
+            return 0
         if config.orphans:
             if not isinstance(controller.backend, ComposeBackend):
                 raise SystemExit('gc --orphans needs the compose backend')

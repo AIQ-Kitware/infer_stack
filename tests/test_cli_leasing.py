@@ -225,6 +225,22 @@ def test_release_evict_tears_down_immediately(env, capsys):
     assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
+def test_gc_forget_drops_only_finished_rows(env, capsys):
+    """`gc --forget` is the TUI's Clean up: history goes, live rows stay."""
+    from infer_stack.cli.commands_leasing import GcCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--evict'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    capsys.readouterr()
+    assert GcCLI.main(argv=['--ledger', env.db, '--forget', '--json']) == 0
+    assert json.loads(capsys.readouterr().out) == {'leases': 1, 'deployments': 1}
+    data = _leases_json(env, capsys)
+    assert [le['owner'] for le in data['leases']] == ['b']
+    assert [g['state'] for g in data['deployments']] != ['stopped']
+    assert len(data['deployments']) == 1
+
+
 def test_acquire_without_ttl_is_standing_lease(env, capsys):
     # No --ttl -> an infinite (standing-service) lease owned by the caller.
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
