@@ -1149,8 +1149,7 @@ class InferStackTUI(App):
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
                 yield Static(
-                    'Endpoints — runnable model + engine configs. Acquire one to '
-                    'serve it, or Suggest a set sized to your GPUs.', classes='desc',
+                    'Endpoints: acquirable configurations', classes='desc',
                 )
                 yield Static('', id='catalog-help')
                 yield _EndpointTable(id='endpoints', cursor_type='row',
@@ -1165,8 +1164,7 @@ class InferStackTUI(App):
                     yield Button('✨  Suggest from my GPUs', id='btn-suggest')
                 yield _Divider('y', self._drag_models, id='csplit')
                 yield Static(
-                    'Models — weights an endpoint can serve. Add models here, '
-                    'then point an endpoint at one.', classes='desc',
+                    'Models: servable weights', classes='desc',
                 )
                 yield DataTable(id='models', cursor_type='row',
                                 zebra_stripes=True)
@@ -1178,10 +1176,8 @@ class InferStackTUI(App):
                 with Vertical(id='tables'):
                     with Vertical(id='leases-pane'):
                         yield Static(
-                            'Reservations you hold. Each maps to one deployment '
-                            'below (see the deployment column); many leases can '
-                            'share one. Release acts on the cursor row, or on '
-                            'every row you check (space, or ctrl/shift-click).',
+                            'Reservations that map to a deployment. '
+                            '(space or ctrl/shift-click to multiselect).',
                             classes='desc',
                         )
                         yield DataTable(id='leases', cursor_type='row',
@@ -1192,13 +1188,7 @@ class InferStackTUI(App):
                     yield _Divider('y', self._drag_tables, id='tsplit')
                     with Vertical(id='deployments-pane'):
                         yield Static(
-                            'Running model deployments and the GPUs they hold. '
-                            "The 'leases' column is how many leases hold each. "
-                            'Evict an idle one to free its GPU (cursor row, or '
-                            'rows checked with space / ctrl/shift-click); Evict '
-                            'all idle clears every kept-warm one. x (Clean up) '
-                            'forgets stopped deployments and finished leases.',
-                            classes='desc',
+                            'Models running.', classes='desc',
                         )
                         yield DataTable(id='deployments', cursor_type='row',
                                         zebra_stripes=True)
