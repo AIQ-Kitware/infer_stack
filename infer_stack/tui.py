@@ -940,6 +940,10 @@ class InferStackTUI(App):
     #leases-pane { height: 14; min-height: 6; }   /* height set via _apply_sizes */
     #deployments-pane { height: 1fr; min-height: 6; }
     #leases, #deployments { height: 1fr; min-height: 3; }
+    /* tabbed pairs (_pair): the visible pane takes all the room */
+    .pair, .pair ContentSwitcher, .pair TabPane { height: 1fr; }
+    .pair TabPane { padding: 0; }
+    .pair #models, .pair #leases-pane { height: 1fr; }
     #docker-tabs { height: 16; min-height: 8; }
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
@@ -967,6 +971,11 @@ class InferStackTUI(App):
     #compose-actions { height: auto; }
     #compose-actions Button { margin: 0 1 0 0; }
     """
+
+    #: Endpoints|models and leases|deployments as tabs (True), or as two panes
+    #: split by a draggable divider (False). Each is one switch to flip back.
+    TABBED_CATALOG = True
+    TABBED_TABLES = True
 
     BINDINGS = [
         # Truly global controls stay in the footer.
@@ -1145,56 +1154,78 @@ class InferStackTUI(App):
         yield RichLog(id='applog', highlight=False, markup=True,
                       max_lines=4000, wrap=True)
 
+    def _pair(self, tabbed: bool, tabs_id: str, split_id: str, drag,
+              first: tuple[str, Any], second: tuple[str, Any]) -> ComposeResult:
+        """Two panes, as tabs or stacked around a draggable divider.
+
+        ``first``/``second`` are ``(tab label, compose function)``. Only the
+        container differs between the layouts: the panes, and every id the
+        rest of the app queries, are the same either way.
+        """
+        if tabbed:
+            with TabbedContent(id=tabs_id, classes='pair'):
+                for label, body in (first, second):
+                    with TabPane(label, id=f'pane-{label.lower()}'):
+                        yield from body()
+        else:
+            yield from first[1]()
+            yield _Divider('y', drag, id=split_id)
+            yield from second[1]()
+
+    def _compose_endpoints(self) -> ComposeResult:
+        yield Static('Endpoints: acquirable configurations', classes='desc')
+        yield Static('', id='catalog-help')
+        yield _EndpointTable(id='endpoints', cursor_type='row',
+                             zebra_stripes=True)
+        with Horizontal(id='endpoint-actions'):
+            yield Button('Acquire', id='btn-acquire', variant='primary',
+                         action='app.acquire')
+            yield Button('Add', id='btn-add-endpoint')
+            yield Button('Edit', id='btn-edit-endpoint')
+            yield Button('Remove', id='btn-remove-endpoint')
+        with Horizontal(id='suggest-actions'):
+            yield Button('✨  Suggest from my GPUs', id='btn-suggest')
+
+    def _compose_models(self) -> ComposeResult:
+        yield Static('Models: servable weights', classes='desc')
+        yield DataTable(id='models', cursor_type='row', zebra_stripes=True)
+        with Horizontal(id='model-actions'):
+            yield Button('Add', id='btn-add-model')
+            yield Button('Remove', id='btn-remove-model')
+
+    def _compose_leases(self) -> ComposeResult:
+        with Vertical(id='leases-pane'):
+            yield Static('Reservations that map to a deployment. '
+                         '(space or ctrl/shift-click to multiselect).',
+                         classes='desc')
+            yield DataTable(id='leases', cursor_type='row', zebra_stripes=True)
+            with Horizontal(id='lease-actions'):
+                yield Button('Release', id='btn-release')
+                yield Button('Release all', id='btn-release-all')
+
+    def _compose_deployments(self) -> ComposeResult:
+        with Vertical(id='deployments-pane'):
+            yield Static('Models running.', classes='desc')
+            yield DataTable(id='deployments', cursor_type='row',
+                            zebra_stripes=True)
+            with Horizontal(id='deployment-actions'):
+                yield Button('Evict', id='btn-evict')
+                yield Button('Evict all idle', id='btn-evict-all')
+
     def _compose_dashboard(self) -> ComposeResult:
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
-                yield Static(
-                    'Endpoints: acquirable configurations', classes='desc',
-                )
-                yield Static('', id='catalog-help')
-                yield _EndpointTable(id='endpoints', cursor_type='row',
-                                     zebra_stripes=True)
-                with Horizontal(id='endpoint-actions'):
-                    yield Button('Acquire', id='btn-acquire', variant='primary',
-                                 action='app.acquire')
-                    yield Button('Add', id='btn-add-endpoint')
-                    yield Button('Edit', id='btn-edit-endpoint')
-                    yield Button('Remove', id='btn-remove-endpoint')
-                with Horizontal(id='suggest-actions'):
-                    yield Button('✨  Suggest from my GPUs', id='btn-suggest')
-                yield _Divider('y', self._drag_models, id='csplit')
-                yield Static(
-                    'Models: servable weights', classes='desc',
-                )
-                yield DataTable(id='models', cursor_type='row',
-                                zebra_stripes=True)
-                with Horizontal(id='model-actions'):
-                    yield Button('Add', id='btn-add-model')
-                    yield Button('Remove', id='btn-remove-model')
+                yield from self._pair(
+                    self.TABBED_CATALOG, 'catalog-tabs', 'csplit', self._drag_models,
+                    ('Endpoints', self._compose_endpoints),
+                    ('Models', self._compose_models))
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):
                 with Vertical(id='tables'):
-                    with Vertical(id='leases-pane'):
-                        yield Static(
-                            'Reservations that map to a deployment. '
-                            '(space or ctrl/shift-click to multiselect).',
-                            classes='desc',
-                        )
-                        yield DataTable(id='leases', cursor_type='row',
-                                        zebra_stripes=True)
-                        with Horizontal(id='lease-actions'):
-                            yield Button('Release', id='btn-release')
-                            yield Button('Release all', id='btn-release-all')
-                    yield _Divider('y', self._drag_tables, id='tsplit')
-                    with Vertical(id='deployments-pane'):
-                        yield Static(
-                            'Models running.', classes='desc',
-                        )
-                        yield DataTable(id='deployments', cursor_type='row',
-                                        zebra_stripes=True)
-                        with Horizontal(id='deployment-actions'):
-                            yield Button('Evict', id='btn-evict')
-                            yield Button('Evict all idle', id='btn-evict-all')
+                    yield from self._pair(
+                        self.TABBED_TABLES, 'table-tabs', 'tsplit', self._drag_tables,
+                        ('Leases', self._compose_leases),
+                        ('Deployments', self._compose_deployments))
                 yield _Divider('y', self._drag_logs, id='hsplit')
                 with Collapsible(title='docker', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
@@ -1537,8 +1568,11 @@ class InferStackTUI(App):
     def _apply_sizes(self) -> None:
         self.query_one('#sidebar').styles.width = self._sidebar_w
         self.query_one('#docker-tabs').styles.height = self._log_h
-        self.query_one('#models').styles.height = self._models_h
-        self.query_one('#leases-pane').styles.height = self._leases_h
+        # Fixed heights only matter beside a divider; a tab fills its pane.
+        if not self.TABBED_CATALOG:
+            self.query_one('#models').styles.height = self._models_h
+        if not self.TABBED_TABLES:
+            self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
         # Allow the full width range (down to a sliver, up to nearly all of it),
@@ -1870,6 +1904,17 @@ class InferStackTUI(App):
                 widget = self.query_one(pane)
                 if widget.border_title != text:
                     widget.border_title = text
+            if self.TABBED_TABLES:
+                # A hidden tab's counts show on its label.
+                tabs = self.query_one('#table-tabs', TabbedContent)
+                for pane_id, text in (
+                    ('pane-leases', f'Leases {active}/{len(leases)}'),
+                    ('pane-deployments', f'Deployments {"…" if observing else running}'
+                                        f'/{len(deployments)}'),
+                ):
+                    tab = tabs.get_tab(pane_id)
+                    if str(tab.label) != text:
+                        tab.label = text
         except Exception:  # noqa: BLE001
             pass
 

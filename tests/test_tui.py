@@ -373,35 +373,65 @@ def test_tui_monitor_panes_are_collapsible():
     _run(scenario)
 
 
-def test_tui_leases_deployments_are_separate_panes():
+def _split_layout():
+    """The TUI with both pane pairs stacked around dividers instead of tabbed."""
+    from infer_stack.tui import InferStackTUI
+
+    class Split(InferStackTUI):
+        TABBED_CATALOG = False
+        TABBED_TABLES = False
+    return Split
+
+
+@pytest.mark.parametrize('tabbed', [True, False])
+def test_tui_pane_pairs_are_tabs_or_split(tabbed):
+    """Either layout has the same panes and ids; only the container differs."""
     from textual.containers import Vertical
+    from textual.css.query import NoMatches
+    from textual.widgets import TabbedContent
 
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
+    out = controller.acquire('bob', catalog.resolve_names(['qwen-coder']))
+    assert out.lease
+    cls = InferStackTUI if tabbed else _split_layout()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
-        async with app.run_test() as pilot:
+        app = cls(controller, catalog, interval=999, proc_factory=lambda svc: None)
+        async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            # leases/deployments are their own panes split by a drag handle,
-            # not collapsibles.
-            assert isinstance(app.query_one('#leases-pane'), Vertical)
-            assert isinstance(app.query_one('#deployments-pane'), Vertical)
-            assert app.query_one('#tsplit')
+            app.action_refresh()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            for pane in ('#leases-pane', '#deployments-pane'):
+                assert isinstance(app.query_one(pane), Vertical)
+            for table in ('#endpoints', '#models', '#leases', '#deployments'):
+                assert app.query_one(table)
+            dividers = []
+            for divider in ('#csplit', '#tsplit'):
+                try:
+                    dividers.append(app.query_one(divider))
+                except NoMatches:
+                    pass
+            if tabbed:
+                assert not dividers
+                tabs = app.query_one('#table-tabs', TabbedContent)
+                assert str(tabs.get_tab('pane-leases').label) == 'Leases 1/1'
+                # the pane in front gets the whole height, not a fixed 14 rows
+                assert app.query_one('#leases-pane').size.height > 14
+            else:
+                assert len(dividers) == 2
 
     _run(scenario)
 
 
 def test_tui_panes_drag_resize():
-    from infer_stack.tui import InferStackTUI
-
     controller, catalog = _ctx()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
+        app = _split_layout()(controller, catalog, interval=999,
+                              proc_factory=lambda svc: None)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             w0, h0 = app._sidebar_w, app._log_h
@@ -420,13 +450,11 @@ def test_tui_panes_drag_resize():
 
 
 def test_tui_dividers_have_a_grab_area():
-    from infer_stack.tui import InferStackTUI
-
     controller, catalog = _ctx()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
+        app = _split_layout()(controller, catalog, interval=999,
+                              proc_factory=lambda svc: None)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             # A 0-size divider can't be grabbed; both must span their cross-axis.

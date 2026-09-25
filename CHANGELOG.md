@@ -2,6 +2,15 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Endpoints|models and leases|deployments are tabs
+
+The sidebar shows Endpoints and Models as two tabs instead of two panes split
+by a divider, so the endpoint list gets the whole height; the main area does
+the same for Leases and Deployments. A tab's label carries its counts
+(`Leases 1/3`), so the hidden one is still readable. Each pair is one switch
+(`InferStackTUI.TABBED_CATALOG`, `TABBED_TABLES`); setting it to `False`
+restores the draggable split, and both layouts are tested.
+
 ### One Clean up, in the footer, with a CLI command behind it
 
 The leases and deployments panes each had a Clean up button, and both did the
