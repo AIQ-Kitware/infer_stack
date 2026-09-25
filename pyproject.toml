@@ -70,13 +70,6 @@ packages.find.include = [
   "infer_stack*",
 ]
 
-[tool.uv]
-exclude-newer = "2026-06-04T04:00:00Z"
-# kwconf (the CLI library, successor to scriptconfig) has no release before
-# the cutoff. Admit it up to 0.11.0 (2026-08-07), the version tested; the
-# cutoff still holds for every other package.
-exclude-newer-package = { kwconf = "2026-08-08T00:00:00Z" }
-
 [tool.ruff]
 target-version = "py310"
 line-length = 80

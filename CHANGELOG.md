@@ -12,10 +12,9 @@ strings `null`, `true` and numbers on the command line as values, so
 take `type=str`. The program name stays `infer-stack` in usage and errors
 (`__prog__`).
 
-The repository's uv `exclude-newer` cutoff (2026-06-04) predates every kwconf
-release, so kwconf alone gets an exception up to 0.11.0, the version tested.
 `uv.lock` and `requirements/locks/tests.txt` were regenerated: kwconf 0.11.0
-added, scriptconfig removed.
+added, scriptconfig removed. The uv `exclude-newer` cutoff (2026-06-04), which
+predated every kwconf release, is removed; the locked versions are unchanged.
 
 ### The TUI stops repainting what did not change
 
