@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### KubeAI acquires go through admission, as Compose's do
+
+An acquire on the KubeAI backend is now previewed in memory and commits its
+lease only if every deployment renders, the same path Compose takes. A
+refused acquire (no resource profile, an ollama endpoint, a served-name
+collision) writes no lease and runs no `kubectl`; before, the lease was
+committed, rendered, and then rolled back. A `--queue` acquire of such an
+endpoint fails at once instead of waiting out its timeout. The cluster
+schedules, so a KubeAI deployment commits an empty GPU allocation; `leases`
+still shows no GPU for it, and a `--no-apply` acquire now reports it as
+cluster-scheduled rather than unplaced. An idle
+keep-warm Model is kept only while its pod has started, as a keep-warm
+container is on Compose. The approval digest moved into the scaffold both
+backends share, and one function now answers whether a backend allocates
+GPUs. Removing the older acquire branch, which only test fakes still use,
+is the next step (roadmap P1b).
+
 ### Compose and KubeAI: a parity matrix and a roadmap
 
 `docs/backend-parity.md` states the relationship the two backends are meant

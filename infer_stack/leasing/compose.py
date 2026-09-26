@@ -1389,10 +1389,7 @@ class ComposeBackend(ConvergeScaffold):
         then does not ask again as long as it produces the same files.
         """
         docs = self._render_documents(list(desired), placement)
-        self.last_preview_digest = self._planned_digest(docs['planned'])
-        if approve:
-            self._approve_changes(docs['planned'])
-            self._preapproved = self.last_preview_digest
+        self._preview_approval(docs['planned'], approve=approve)
         return docs['plan'], docs['rendered']
 
     def _render_documents(self, desired: list[Deployment], placement) -> dict[str, Any]:
@@ -1455,18 +1452,6 @@ class ComposeBackend(ConvergeScaffold):
     #: newly allocated addresses (append-only).
     on_addresses: Any = None
 
-    @staticmethod
-    def _planned_digest(planned: dict) -> str:
-        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
-        return hashlib.sha256(material.encode('utf-8')).hexdigest()
-
-    #: Digest of files an admission preview already had approved.
-    _preapproved: str | None = None
-    #: Digest of the files the last render produced (approved-digest guard).
-    last_planned_digest: str | None = None
-    #: Digest of the files the last preview produced.
-    last_preview_digest: str | None = None
-
     def pull_images(self, images) -> list[str]:
         """Pull ``images``; ``config publish`` passes :func:`profile_images`."""
         from .._log import logger
@@ -1475,13 +1460,6 @@ class ComposeBackend(ConvergeScaffold):
             logger.info('docker pull {}', image)
             self.run(['docker', 'pull', image])
         return sorted(set(images))
-
-    def _approve_changes(self, planned: dict) -> None:
-        if self._preapproved is not None and self._planned_digest(planned) == self._preapproved:
-            self._preapproved = None
-            return
-        self._preapproved = None
-        super()._approve_changes(planned)
 
     def plan_on_idle_host(self, desired: list[Deployment]):
         """Placement for ``desired`` alone, as if nothing else were running.

@@ -1,7 +1,8 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · P1–P5 not started · P6 is ongoing.
+`dev/backend-unification` · **P1a done** 2026-09-25 · P1b–P5 not started ·
+P6 is ongoing.
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -56,24 +57,50 @@ Today `Controller._admission_mode()` is true only for a backend with
 pre-September branch in five places (render, acquire, `observe_state`,
 `config publish`, `renew`).
 
+Review 2026-09-25 against the code split this in two. The admission path
+assumes GPU accounting in three places (`_backfill_allocations`,
+`_unresolved_allocations`, `_admission_view` keeps a LIVE deployment only
+with committed GPUs), so a `preview` alone would drop every KubeAI lease from
+the render. And about fifteen test fakes drive the legacy path on purpose
+(queue, lock, serialised publication), so deleting it is test work, not
+controller work.
+
+**P1a. KubeAI on the admission path.**
+
+- One authority for "this backend allocates GPUs": `allocates_gpus`
+  (Compose true, KubeAI false). The controller's accounting reads it
+  through one helper; on KubeAI every deployment commits an empty
+  allocation, so nothing is ever unresolved.
 - `KubeaiBackend.preview(desired, placement, approve)`: render the Models
   to memory with a digest, write nothing. Placement inputs are accepted and
-  ignored; `unplaced` is exactly the unrenderable set (no profile, engine,
-  custom launch).
-- Admission accepts a backend with no GPU accounting: Compose reports
-  assignments, KubeAI reports none, and the ledger's allocation table stays
-  empty for it. A Pending pod is a wait reason, never an unplaced error.
-- `--queue` on KubeAI: admitted at once; the cluster is the queue. Say so
-  in the option's help.
-- `MemoryBackend` / `NullBackend` get a trivial `residency` and `preview`
-  so the tests run the one path.
-- Delete the non-admission branches and `_admission_mode()`.
+  ignored; the plan assigns every renderable deployment no GPUs.
+  `plan_on_idle_host` is the same render, so a `--queue` acquire of an
+  unrenderable endpoint fails at once instead of waiting out the timeout.
+- `converge(..., placement=)` on KubeAI. Without it the controller's
+  `TypeError` fallback would render **and apply** in one step.
+- The approved-digest guard (`_planned_digest`, pre-approval,
+  `last_planned_digest` / `last_preview_digest`) moves from `ComposeBackend`
+  to `ConvergeScaffold`: one approval mechanism, not a copy.
+- Compose's stable addresses and container adoption stay Compose-only by
+  capability (`network`, `adopted`), not by joining KubeAI to them.
+- `--queue` on KubeAI: admitted at once; the cluster is the queue.
 
-**Exit:** `_admission_mode` is gone; a render failure on KubeAI rolls the
-lease back before any `kubectl`; e2e passes; `test_controller` runs its
-acquire scenarios on all three fakes.
-**Size:** medium. The controller is the most-changed module; start from a
-green e2e and keep the diff to the five sites.
+**P1a done 2026-09-25.** Verified on k3s by `dev/kubeai_e2e.sh`, which
+gained the step "an unrenderable endpoint is refused before anything is
+written" (a `--queue` acquire, no lease, no Model), and still passes the
+make-room step, which now runs on the admission path.
+
+**P1b. Delete the legacy branch** (with P6).
+`MemoryBackend` / `NullBackend` and the test fakes get a trivial
+`residency` and `preview`; then the non-admission branches and
+`_admission_mode()` go. Until then the legacy path serves only test fakes
+and `realize`/`teardown` backends, and no new code may depend on it.
+
+**Exit:** P1a: `_admission_mode()` is true for both real backends; a render
+failure on KubeAI rolls the lease back before any `kubectl`; e2e passes.
+P1b: `_admission_mode` is gone; `test_controller` runs its acquire scenarios
+on all three fakes.
+**Size:** P1a medium, P1b medium (mostly tests).
 
 ### P2. Day-2 verbs and the TUI through the seam
 
@@ -154,6 +181,21 @@ the gateway, and the only one that needs a second machine. Last.
 - Finishing a phase updates the matrix in `backend-parity.md`; the plan is
   done when the matrix has no *gap* row.
 
+## Duplicate authorities
+
+The rule while executing: a duplicate authority found on the way is
+refactored when it is small, recorded here when it is not, and never made
+worse. A blocker is fixed whatever its size.
+
+| authority | where it was | status |
+|---|---|---|
+| "this backend allocates GPUs" | inferred from which methods a backend has | **fixed** (P1a): `allocates_gpus()` in `leasing/backend.py`, read by the controller and the CLI |
+| approval digest and pre-approval | a copy inside `ComposeBackend` | **fixed** (P1a): `ConvergeScaffold`, shared |
+| KubeAI render vs its plan | `converge` rendered inline | **fixed** (P1a): one `_render_documents` behind `converge`, `preview` and `plan_on_idle_host` |
+| the acquire path | admission and a legacy branch in five places | deferred to P1b |
+| `_render`'s one-shot `converge(desired)` fallback, which applies | a second render contract for old backends | deferred to P1b: it goes with the legacy branch |
+| the KubeAI gateway's approval | the gateway project asks its own diff approval at render, after the lease commits, not in the admission preview | deferred to P3. Same result under `--yes`; interactively, a declined gateway change rolls the lease back after the commit |
+
 ## Not in scope
 
 - more than one cluster, or scheduling across a Compose host and a cluster;
@@ -168,7 +210,8 @@ the gateway, and the only one that needs a second machine. Last.
 
 | phase | size | needs | gives |
 |---|---|---|---|
-| P1 | medium | a green e2e | one controller; atomic acquire on a cluster |
+| P1a | medium | a green e2e | atomic acquire on a cluster |
+| P1b | medium | P1a; with P6 | one controller path |
 | P2 | medium | P1 (instances from residency) | the TUI and day-2 verbs on a cluster |
 | P3 | small–medium | none | dynamic routing, Open WebUI on a cluster |
 | P4 | small | a mixed-GPU cluster to verify | less hand-written cluster information |

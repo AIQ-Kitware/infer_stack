@@ -511,9 +511,13 @@ def _emit_staged(config, controller, outcome) -> int:
         }, indent=2))
         return 0
     print(f'staged {outcome.lease.id} (owner={outcome.lease.owner}) — not applied')
+    from ..leasing.backend import allocates_gpus
+
+    local = allocates_gpus(controller.backend)
     for g in outcome.deployments:
         eps = ', '.join(sorted(g.served)) or g.id
-        print(f'  {eps}: {_gpu_where(assignments.get(g.id))}  ({g.id})')
+        where = _gpu_where(assignments.get(g.id)) if local else 'cluster-scheduled'
+        print(f'  {eps}: {where}  ({g.id})')
     path = _compose_file_path(controller)
     if path:
         print(f'  compose: {path}')
@@ -1898,6 +1902,10 @@ def _placement_view(controller):
     except Exception:  # noqa: BLE001 - status must never crash
         pass
     assignments: dict[str, list[int]] = {}
+    from ..leasing.backend import allocates_gpus
+
+    if not allocates_gpus(backend):
+        return observed, assignments      # the cluster places; no GPU indices
     if controller._admission_mode():
         # Committed allocations, and idle residents' physical GPUs; the
         # legacy planner view would show placements admission would not make.

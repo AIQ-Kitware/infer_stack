@@ -70,6 +70,11 @@ class FakeKubectl:
                 if doc:
                     self.applied[doc['metadata']['name']] = doc
             return ''
+        if verb == 'get' and args[4] == 'pods':
+            # KubeAI runs one pod per applied Model; here it is up at once.
+            return json.dumps({'items': [
+                _pod(f'model-{name}-0', doc['metadata']['labels']['infer-stack/deployment'])
+                for name, doc in self.applied.items()]})
         if verb == 'get':
             items = list(self.applied.values())
             if '-l' in args:  # emulate the label selector
@@ -386,17 +391,53 @@ def test_acquire_release_lifecycle(tmp_path):
     assert rel.reconcile is not None
 
 
-def test_acquire_missing_profile_rolls_back(tmp_path):
-    """An unrenderable deployment behaves exactly like a placement failure:
-    the acquire fails loudly and the lease is rolled back."""
+def test_acquire_missing_profile_commits_nothing(tmp_path):
+    """An unrenderable deployment fails admission, as an unplaceable one does
+    on compose: the preview refuses it before any lease is written or any
+    kubectl apply runs."""
     from infer_stack.leasing.backend import PlacementError
 
     ctl, be, kubectl = make_controller(tmp_path)
     with pytest.raises(PlacementError, match='resource profile'):
         ctl.acquire('alice', [_req('qwen', profile=None)], wait=False)
     leases, deployments = ctl.ledger.status()
-    assert [le.state for le in leases] == [LeaseState.RELEASED]
+    assert leases == []
+    assert not any('apply' in call for call in kubectl.calls)
     assert kubectl.applied == {}
+
+
+def test_kubeai_takes_the_admission_path(tmp_path):
+    """One acquire path: KubeAI admits by preview and commits no GPUs."""
+    ctl, be, kubectl = make_controller(tmp_path)
+    assert ctl._admission_mode()
+    out = ctl.acquire('alice', [_req('qwen')], wait=False)
+    (deployment,) = out.deployments
+    assert deployment.assigned_gpus == []     # committed, and empty
+    assert ctl._unresolved_allocations() == []
+
+
+def test_status_shows_no_gpu_for_a_cluster_scheduled_deployment(tmp_path):
+    """The committed allocation is empty, which must not read as "cpu"."""
+    from infer_stack.cli.commands_leasing import _gpu_label, _placement_view
+
+    ctl, be, kubectl = make_controller(tmp_path)
+    out = ctl.acquire('alice', [_req('qwen')], wait=False)
+    observed, assignments = _placement_view(ctl)
+    (deployment,) = out.deployments
+    assert _gpu_label(deployment.id, observed, assignments) == '-'
+
+
+def test_queued_acquire_of_an_unrenderable_endpoint_fails_at_once(tmp_path):
+    """The cluster is the queue, but it cannot queue what it cannot render."""
+    from infer_stack.leasing.backend import PlacementError
+
+    ctl, be, kubectl = make_controller(tmp_path)
+    slept = []
+    ctl.sleep = slept.append
+    with pytest.raises(PlacementError, match='resource profile'):
+        ctl.acquire('alice', [_req('qwen', profile=None)], wait=False,
+                    wait_for_placement=True, timeout=600)
+    assert slept == []
 
 
 def test_keep_warm_stays_resident_after_release(tmp_path):

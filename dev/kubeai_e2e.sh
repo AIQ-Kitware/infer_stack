@@ -109,6 +109,30 @@ remaining=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
     -l infer-stack/managed=true -o name | wc -l)
 [ "$remaining" = 0 ] || { echo "!! model not pruned"; exit 1; }
 
+echo '== an unrenderable endpoint is refused before anything is written'
+# No resource_profile and no kubeai_resource_profile default: admission's
+# preview refuses it, so no lease is committed and kubectl applies nothing;
+# --queue fails at once, since waiting cannot make it renderable.
+cat >> "$WORK/config/catalog.yaml" <<EOF
+  e2e-noprofile:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: stop}
+EOF
+if run_is acquire e2e-noprofile --yes --timeout 60 --queue \
+    --env-file "$WORK/bad.env" > "$WORK/bad.log" 2>&1; then
+  echo '!! an endpoint with no resource profile was admitted' >&2; exit 1
+fi
+grep -q 'resource profile' "$WORK/bad.log" \
+  || { cat "$WORK/bad.log" >&2; echo '!! the refusal did not name the cause' >&2; exit 1; }
+active=$(run_is leases --json | python3 -c \
+  'import json,sys; print(sum(le["state"] == "active" for le in json.load(sys.stdin)["leases"]))')
+[ "$active" = 0 ] || { echo "!! $active lease(s) left active" >&2; exit 1; }
+remaining=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
+    -l infer-stack/managed=true -o name | wc -l)
+[ "$remaining" = 0 ] || { echo '!! a Model was applied for it' >&2; exit 1; }
+echo '   refused at admission: no lease, no Model'
+
 if [ "${E2E_MAKE_ROOM:-0}" = 1 ]; then
   # Needs a profile only one Model fits at a time (`cpu-half` in
   # dev/e2e_tests/kubeai-cpu-values.yaml): E2E_ROOM_PROFILE=cpu-half.

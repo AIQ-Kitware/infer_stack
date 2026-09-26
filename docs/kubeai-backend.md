@@ -108,10 +108,18 @@ infer-stack release --env-file lease.env
 - **Readiness is a real generation** through the gateway (same philosophy as
   compose): a Model CR existing — even with ready replicas — is not proof it
   can serve.
-- **Placement can only fail at admission.** The render never rejects for
-  capacity (the cluster schedules); a Model the cluster cannot place sits
-  not-ready until the acquire's `--timeout`, which then rolls the lease back.
-  The wait says why (`pod: Unschedulable`, `pod: ImagePullBackOff`).
+- **Admission is the same as on compose, minus GPU accounting.** An acquire
+  is previewed in memory and commits its lease only if every deployment
+  renders; a refused one (no resource profile, an ollama endpoint, a
+  served-name collision) writes no lease and runs no `kubectl`. The cluster
+  schedules, so capacity is never an admission reason and `--queue` is
+  admitted at once. A Model the cluster cannot place sits not-ready until
+  the acquire's `--timeout`, which rolls the lease back; the wait says why
+  (`pod: Unschedulable`, `pod: ImagePullBackOff`).
+- **An idle keep-warm Model stays only while its pod has started**, as an
+  idle keep-warm container does on compose (a crash-looping pod counts, like
+  a restarting container). One whose pod is gone, still Pending or finished
+  is pruned at the next render.
 - **A keep-warm model without a lease gives way to one with a lease.** When
   a leased Model's pod is `Unschedulable`, the wait evicts the longest-idle
   keep-warm deployment, one per 30 s, until it fits. Compose applies the same

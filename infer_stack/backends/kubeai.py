@@ -392,8 +392,52 @@ class KubeaiBackend(ConvergeScaffold):
 
     # -- converge-style surface ------------------------------------------------
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
-        """Render the desired Model set, then optionally apply it."""
+    #: The cluster schedules: no host GPU indices are allocated or recorded,
+    #: and admission commits an empty allocation for every deployment.
+    allocates_gpus = False
+
+    def _render_documents(self, desired: list[Deployment]):
+        """``(plan, rendered, planned)`` in memory: the one KubeAI render.
+
+        The plan assigns every renderable deployment no GPUs; the
+        unrenderable ones are left out, with the render's reasons.
+        """
+        from ..leasing.placement import GpuPlan
+
+        rendered = render_models(
+            list(desired),
+            namespace=self.namespace,
+            default_resource_profile=self.default_resource_profile,
+        )
+        plan = GpuPlan(
+            assignments={g.id: [] for g in desired if g.id not in rendered.unrenderable},
+            errors=list(rendered.errors),
+        )
+        return plan, rendered, {self.models_file: rendered.text}
+
+    def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
+        """Render ``desired`` as :meth:`converge` would; write nothing.
+
+        ``placement`` is accepted for the admission interface and ignored:
+        the cluster places. Returns ``(plan, rendered)``.
+        """
+        plan, rendered, planned = self._render_documents(desired)
+        self._preview_approval(planned, approve=approve)
+        return plan, rendered
+
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Whether ``desired`` could ever be served here: renderable or not.
+
+        Capacity is the cluster's to decide, so only a render failure is
+        permanent; that lets a queued acquire of one fail at once.
+        """
+        return self._render_documents(desired)[0]
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True, placement=None):
+        """Render the desired Model set, then optionally apply it.
+
+        ``placement`` (admission inputs) is ignored: the cluster places.
+        """
         from .._log import logger
 
         desired = list(desired)
@@ -416,17 +460,14 @@ class KubeaiBackend(ConvergeScaffold):
                         'requirement via the resource profile instead)',
                         g.id,
                     )
-            rendered = render_models(
-                desired,
-                namespace=self.namespace,
-                default_resource_profile=self.default_resource_profile,
-            )
+            plan, rendered, planned = self._render_documents(desired)
             self.last_errors = list(rendered.errors)
             self.last_unplaced = set(rendered.unrenderable)
-            self.last_assignments = {}
+            self.last_assignments = {}      # the cluster places
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
-            self._approve_changes({self.models_file: rendered.text})
+            self.last_planned_digest = self._planned_digest(planned)
+            self._approve_changes(planned)
             self._atomic_write(self.models_file, rendered.text)
             self._save_sidecar(
                 {

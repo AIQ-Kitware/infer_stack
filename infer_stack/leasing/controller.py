@@ -485,7 +485,8 @@ class Controller:
             self._backfill_allocations(residency)
             self._prepare_network()
             desired, placement = self._admission_view(residency)
-            self._admitting.adopted = self._prune_adopted(residency)
+            if hasattr(self.backend, 'adopted'):
+                self._admitting.adopted = self._prune_adopted(residency)
         else:
             desired = self.desired_deployments()
         # Bound once rather than probed with hasattr: the capability check is
@@ -520,7 +521,7 @@ class Controller:
                 displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
                 degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
             )
-            if placement is not None:
+            if placement is not None and hasattr(self.backend, 'adopted'):
                 self._adopt_existing(residency)
             return rec
         desired_ids = {g.id for g in desired}
@@ -554,16 +555,19 @@ class Controller:
 
     # -- admission (plan steps P5, P6, P9) ------------------------------------
     #
-    # Backends with strict residency and an in-memory preview (Compose) get
-    # admission semantics:
+    # Backends with strict residency and an in-memory preview (Compose and
+    # KubeAI) get admission semantics:
     #   * a LIVE deployment holds a committed allocation (assigned_gpus);
     #   * an IDLE keep-warm deployment is only an optional candidate, and only
     #     while it is uniquely resident; it yields its GPUs to demand and is
     #     never started;
     #   * an acquire is previewed in memory (placement AND render) and commits
     #     its lease together with its allocations, or commits nothing.
-    # Other backends (KubeAI, where the cluster schedules; test fakes) keep the
-    # previous behaviour.
+    # Where the cluster schedules (KubeAI, ``allocates_gpus`` false) every
+    # deployment commits an empty allocation: admission then decides only
+    # renderability, and a Pending pod is a wait reason, not an unplaced
+    # error. Test fakes without residency/preview keep the previous path
+    # (roadmap P1b removes it).
 
     def _stored_state(self, lease_id: str):
         """A lease's state as stored (not virtually expired), or ``None``."""
@@ -628,7 +632,13 @@ class Controller:
         return [*required.values(), *optional], inputs
 
     def _prepare_network(self) -> None:
-        """Give the backend the stable-address table, once a network is migrated."""
+        """Give the backend the stable-address table, once a network is migrated.
+
+        Compose only: a backend without a ``network`` attribute has no
+        host network to stamp addresses on.
+        """
+        if not hasattr(self.backend, 'network'):
+            return
         config = self.ledger.network_config()
         if config is None:
             self._admitting.network = None
@@ -859,6 +869,13 @@ class Controller:
             self._admitting.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
             return orphans
 
+    def _gpu_units(self, deployment) -> int:
+        """GPUs admission must account for: none where the cluster schedules."""
+        from .backend import allocates_gpus
+        from .placement import required_gpu_count
+
+        return required_gpu_count(deployment) if allocates_gpus(self.backend) else 0
+
     def _backfill_allocations(self, residency) -> list[str]:
         """Adopt allocations for LIVE deployments that predate them.
 
@@ -867,14 +884,12 @@ class Controller:
         GPUs stays unresolved: it keeps running where it is, but no new GPU is
         allocated to anyone until it is released. Returns the unresolved ids.
         """
-        from .placement import required_gpu_count
-
         unresolved = []
         _, deployments = self.ledger.status()
         for deployment in deployments:
             if deployment.state != DeploymentState.LIVE or deployment.assigned_gpus is not None:
                 continue
-            if required_gpu_count(deployment) == 0:
+            if self._gpu_units(deployment) == 0:
                 self.ledger.set_allocation(deployment.id, [])
                 continue
             resident = residency.resident(deployment.id)
@@ -891,15 +906,13 @@ class Controller:
         commit for the candidate's new and revived deployments. Nothing is
         written here.
         """
-        from .placement import required_gpu_count
-
         adopted: dict[str, list[int]] = {}
         need: list[str] = []
         for gid, deployment in overlay.deployments.items():
             fresh = gid in overlay.created or gid in overlay.revived
             if not fresh:
                 continue
-            if required_gpu_count(deployment) == 0:
+            if self._gpu_units(deployment) == 0:
                 continue
             resident = residency.resident(gid) if (
                 residency is not None and gid in overlay.revived) else None
@@ -980,13 +993,11 @@ class Controller:
         return out
 
     def _unresolved_allocations(self, *, exclude: AbstractSet[str] = frozenset()) -> list[str]:
-        from .placement import required_gpu_count
-
         _, deployments = self.ledger.status()
         return [
             g.id for g in deployments
             if g.state == DeploymentState.LIVE and g.assigned_gpus is None
-            and g.id not in exclude and required_gpu_count(g) > 0
+            and g.id not in exclude and self._gpu_units(g) > 0
         ]
 
     def set_invocation_catalog(self, catalog) -> None:

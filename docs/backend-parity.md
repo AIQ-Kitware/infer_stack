@@ -70,8 +70,9 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | `acquire` / `release` / `wait` / `evict` / `gc` / `clean` / `renew` / `run` / `test` | same | same |
-| admission: lease and GPUs committed atomically; a `--queue`d acquire holds nothing | yes | **gap** (roadmap P1): the lease is committed first, then rendered; a Model the cluster cannot place waits out `--timeout`, then rolls back |
-| `config publish` | pure preview, then commit | render, then commit (same gap) |
+| admission: previewed in memory, then the lease committed with its allocation; a refused acquire writes nothing | yes | same; the allocation is empty (the cluster places), so admission decides renderability, and a pod the cluster cannot place is a wait reason |
+| `--queue` | waits for a free GPU | ≈ admitted at once, the cluster is the queue; an unrenderable endpoint fails at once |
+| `config publish` | pure preview, then commit | same |
 | `--no-apply` / `apply` / `render` | same | same |
 | unleased keep-warm yields to leased demand | at placement | ≈ during the wait: `needs_room` evicts the longest-idle, one per 30 s |
 | crash-loop fail-fast, the engine's error quoted | same | same (pods, `kubectl logs --previous`) |

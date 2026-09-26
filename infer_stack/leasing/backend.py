@@ -85,6 +85,17 @@ class PlacementError(Exception):
         )
 
 
+def allocates_gpus(backend) -> bool:
+    """Whether ``backend`` allocates host GPU indices itself.
+
+    True for Compose, which places on this host and records the GPUs each
+    deployment holds. False for a backend whose cluster schedules (KubeAI):
+    admission commits an empty allocation, and no GPU is ever "unresolved".
+    The one place the controller and the CLI ask this.
+    """
+    return bool(getattr(backend, 'allocates_gpus', True))
+
+
 @runtime_checkable
 class Backend(Protocol):
     """What the :class:`Controller` needs from a serving backend.
@@ -156,12 +167,14 @@ class ConvergeBackend(Backend, Protocol):
 class AdmissionBackend(ConvergeBackend, Protocol):
     """The surface admission mode uses (see ``Controller._admission_mode``).
 
-    Today only :class:`~infer_stack.leasing.compose.ComposeBackend` has it:
-    strict residency, an in-memory placement ``preview``, and the Compose
-    network and adoption state the controller hands it. The controller
-    reaches these through ``Controller._admitting``, only after the
-    capability check, so the type checker sees one named capability instead
-    of attributes a minimal :class:`Backend` does not have.
+    Both real backends have it: strict residency and an in-memory
+    ``preview``. Compose also takes the stable-address network and the
+    container-adoption table from the controller (``network``,
+    ``on_addresses``, ``adopted``); those are Compose-only, and the
+    controller hands them over only to a backend that declares them. The
+    controller reaches these through ``Controller._admitting``, only after
+    the capability check, so the type checker sees one named capability
+    instead of attributes a minimal :class:`Backend` does not have.
     """
 
     network: dict[str, Any] | None
@@ -254,8 +267,36 @@ class ConvergeScaffold:
 
         self._atomic_write(self._state_file, json.dumps(data, indent=2))
 
+    #: Digest of files an admission preview already had approved.
+    _preapproved: str | None = None
+    #: Digest of the files the last render produced (approved-digest guard).
+    last_planned_digest: str | None = None
+    #: Digest of the files the last preview produced.
+    last_preview_digest: str | None = None
+
+    @staticmethod
+    def _planned_digest(planned: dict) -> str:
+        import hashlib
+        import json
+
+        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
+        return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+    def _preview_approval(self, planned: dict, *, approve: bool) -> None:
+        """Record a preview's digest; with ``approve``, ask now, not after commit.
+
+        The render that follows the commit skips the prompt when it produces
+        the same files (see :meth:`_approve_changes`).
+        """
+        self.last_preview_digest = self._planned_digest(planned)
+        if approve:
+            self._approve_changes(planned)
+            self._preapproved = self.last_preview_digest
+
     def _approve_changes(self, planned: dict) -> None:
         """Show pending rendered-state changes and confirm them.
+
+        Files a preview already had approved (same digest) pass silently once.
 
         ``planned`` maps target paths to their new content. When nothing
         actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
@@ -265,6 +306,9 @@ class ConvergeScaffold:
         """
         from .._log import logger
 
+        preapproved, self._preapproved = self._preapproved, None
+        if preapproved is not None and self._planned_digest(planned) == preapproved:
+            return
         changed = {
             p: text
             for p, text in planned.items()
