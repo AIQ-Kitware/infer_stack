@@ -75,7 +75,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | `--queue` | waits for a free GPU | ≈ admitted at once, the cluster is the queue; an unrenderable endpoint fails at once |
 | `config publish` | pure preview, then commit | same |
 | `--no-apply` / `apply` / `render` | same | same |
-| unleased keep-warm yields to leased demand | at placement | ≈ during the wait: `needs_room` evicts the longest-idle, one per 30 s |
+| unleased keep-warm yields to leased demand | at placement | ≈ during the wait, one per 30 s: only when the scheduler reports a capacity shortage, and only an idle Model on a node the pod could use, holding the resource that is short (longest idle first) |
 | crash-loop fail-fast, the engine's error quoted | same | same (pods, `kubectl logs --previous`) |
 | image-pull progress | yes | n/a: the kubelet pulls; `ImagePullBackOff` is a reported wait reason |
 | strict `residency()` for decisions, lenient `observe()` for reports | same | same |

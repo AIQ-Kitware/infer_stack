@@ -126,6 +126,22 @@ class _Kubectl:
         self.crash: dict[str, str] = {}
         self.crash_one: set[str] = set()
         self.extra_pods: list[dict] = []
+        # Scheduler mode: nodes, where each Model's pods run, what they
+        # request, and Models whose pods the scheduler cannot place
+        # ({gid: {'message', 'spec', 'until_gone'}}: pending until the Model
+        # of deployment `until_gone` is deleted, when it names one).
+        self.nodes: list[dict] = []
+        self.node_of: dict[str, str] = {}
+        self.pending: dict[str, dict] = {}
+
+    def is_pending(self, gid: str) -> bool:
+        entry = self.pending.get(gid)
+        if entry is None:
+            return False
+        gone = entry.get('until_gone')
+        return not gone or any(
+            d['metadata']['labels']['infer-stack/deployment'] == gone
+            for d in self.inner.applied.values())
 
     @property
     def applied(self):
@@ -134,6 +150,8 @@ class _Kubectl:
     def __call__(self, args: list[str]) -> str:
         from test_leasing_kubeai import _pod
 
+        if len(args) > 4 and args[3] == 'get' and args[4] == 'nodes':
+            return json.dumps({'items': self.nodes})
         if len(args) > 4 and args[3] == 'get' and args[4] == 'pods':
             pods = []
             for name, doc in self.inner.applied.items():
@@ -141,6 +159,14 @@ class _Kubectl:
                 replicas = int((doc.get('spec') or {}).get('minReplicas') or 1)
                 # `crash` marks every replica crash-looping; `crash_one`, one.
                 bad = replicas if gid in self.crash else int(gid in self.crash_one)
+                if self.is_pending(gid):
+                    entry = self.pending[gid]
+                    pod = _pod(f'model-{name}-0', gid, statuses=False, conditions=[
+                        {'type': 'PodScheduled', 'status': 'False',
+                         'reason': 'Unschedulable', 'message': entry['message']}])
+                    pod['spec'] = dict(entry.get('spec') or {})
+                    pods.append(pod)
+                    continue
                 for i in range(replicas):
                     if i < bad:
                         pods.append(_pod(f'model-{name}-{i}', gid, restarts=3,
@@ -148,6 +174,12 @@ class _Kubectl:
                                          last={'exitCode': 1, 'reason': 'Error'}))
                     else:
                         pods.append(_pod(f'model-{name}-{i}', gid, ready=True))
+            for pod in pods:
+                gid = pod['metadata']['labels']['infer-stack/deployment']
+                if not self.is_pending(gid):
+                    pod['spec'] = {'nodeName': self.node_of.get(gid, 'node-a'),
+                                   'containers': [{'resources': {
+                                       'requests': {'nvidia.com/gpu': '1'}}}]}
             return json.dumps({'items': [*pods, *self.extra_pods]})
         return self.inner(args)
 
@@ -547,3 +579,91 @@ def test_every_replica_crash_looping_fails_fast_and_one_healthy_does_not(tmp_pat
     stack.runtime.crash[gid] = CRASH_LOG               # now every replica loops
     why = stack.backend.startup_failure(deployment)
     assert why and 'all 2 replicas' in why and 'trust_remote_code' in why
+
+
+# Scheduler pressure: `Unschedulable` is not "evict an idle model". Only a
+# capacity shortage, and only an idle Model on a node the blocked pod could
+# use, holding the resource that is short.
+
+SCHED = Catalog.from_dict({**CATALOG, 'endpoints': {
+    **CATALOG['endpoints'],
+    'warm-a': {'engine': 'vllm', 'model': 'tiny', 'reclaim': {'policy': 'keep-warm'},
+               'runtime': {'max_model_len': 1024}},
+    'warm-b': {'engine': 'vllm', 'model': 'big', 'reclaim': {'policy': 'keep-warm'},
+               'runtime': {'max_model_len': 1024}},
+    'blocked': {'engine': 'vllm', 'model': 'tiny', 'reclaim': {'policy': 'stop'},
+                'runtime': {'max_model_len': 4096}},
+}})
+NODES = [{'metadata': {'name': 'node-a', 'labels': {'gpu': 'a100'}}, 'spec': {}},
+         {'metadata': {'name': 'node-b', 'labels': {'gpu': 'l4'}}, 'spec': {}}]
+
+
+def _two_idle_models(tmp_path):
+    """warm-a idle on node-a (the longest idle), warm-b idle on node-b."""
+    import time
+
+    stack = _kubeai(tmp_path)
+    stack.backend.catalog = SCHED
+    stack.runtime.nodes = NODES
+    ids = {}
+    for name, node in (('warm-a', 'node-a'), ('warm-b', 'node-b')):
+        out = stack.ctl.acquire('alice', SCHED.resolve_names([name]), wait=False)
+        ids[name] = out.deployments[0].id
+        stack.runtime.node_of[ids[name]] = node
+        stack.ctl.release(out.lease.id)
+        time.sleep(0.01)                    # distinct idle times
+    stack.ctl.sleep = lambda seconds: time.sleep(0.005)
+    return stack, ids
+
+
+def _wait_blocked(stack, message, spec, until_gone=None):
+    """Acquire `blocked`, whose pod the scheduler cannot place; wait briefly."""
+    out = stack.ctl.acquire('alice', SCHED.resolve_names(['blocked']), wait=False)
+    gid = out.deployments[0].id
+    stack.runtime.pending[gid] = {'message': message, 'spec': spec,
+                                  'until_gone': until_gone}
+    post = stack.backend.http.post
+    stack.backend.http.post = lambda url, **kw: (
+        stack.backend.http._Resp(503, {'detail': 'pending'})
+        if stack.runtime.is_pending(gid) and (kw.get('json') or {}).get('model') == 'blocked'
+        else post(url, **kw))
+    return stack.ctl.wait_ready(out.deployments, timeout=0.3, interval=0.01)
+
+
+def _idle(stack, ids):
+    return {name for name, gid in ids.items()
+            if stack.ctl.ledger.get_deployment(gid).state == 'idle'}
+
+
+def test_an_impossible_node_selector_evicts_nothing(tmp_path):
+    stack, ids = _two_idle_models(tmp_path)
+    result = _wait_blocked(stack, "0/2 nodes are available: 2 node(s) didn't match "
+                           "Pod's node affinity/selector.", {'nodeSelector': {'gpu': 'h100'}})
+    assert not result.ready
+    assert _idle(stack, ids) == {'warm-a', 'warm-b'}
+
+
+def test_an_untolerated_taint_evicts_nothing(tmp_path):
+    stack, ids = _two_idle_models(tmp_path)
+    _wait_blocked(stack, '0/2 nodes are available: 2 node(s) had untolerated taint '
+                  '{dedicated: training}.', {})
+    assert _idle(stack, ids) == {'warm-a', 'warm-b'}
+
+
+def test_only_an_idle_model_on_a_usable_node_is_evicted(tmp_path):
+    stack, ids = _two_idle_models(tmp_path)
+    # Short of GPUs on the l4 node, the only one the pod may use: warm-a is
+    # the longest idle, but it runs on the a100 node and frees nothing useful.
+    _wait_blocked(stack, "0/2 nodes are available: 1 Insufficient nvidia.com/gpu, "
+                  "1 node(s) didn't match Pod's node affinity/selector.",
+                  {'nodeSelector': {'gpu': 'l4'}})
+    assert _idle(stack, ids) == {'warm-a'}
+
+
+def test_reclaimable_pressure_evicts_a_compatible_idle_model_and_the_lease_proceeds(tmp_path):
+    stack, ids = _two_idle_models(tmp_path)
+    result = _wait_blocked(stack, '0/2 nodes are available: 1 Insufficient nvidia.com/gpu, '
+                           "1 node(s) didn't match Pod's node affinity/selector.",
+                           {'nodeSelector': {'gpu': 'a100'}}, until_gone=ids['warm-a'])
+    assert _idle(stack, ids) == {'warm-b'}
+    assert result.ready

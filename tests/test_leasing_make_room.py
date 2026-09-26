@@ -3,8 +3,10 @@
 The rule (decided 2026-09-24): an idle keep-warm deployment -- resident, but
 held by no lease -- is always a candidate for eviction when a leased model
 needs a resource. Compose admission enforces it when placing. Where the
-runtime schedules instead (KubeAI), the probe says `needs_room` and the wait
-evicts idle models, the longest idle first, one per cooldown.
+runtime schedules instead (KubeAI), the probe says `needs_room` only when
+the scheduler reports a capacity shortage, and the wait evicts, one per
+cooldown and the longest idle first, an idle model the backend says could
+free that capacity (tests/test_parity.py has the scheduler cases).
 """
 
 from __future__ import annotations
@@ -104,9 +106,15 @@ def test_an_unschedulable_kubeai_pod_asks_for_room(tmp_path):
     be, kubectl = make_pod_backend(tmp_path)
     dep = vllm('grp-big', served='big')
     be.converge([dep])
-    kubectl.pods = [_pod('model-big-1', 'grp-big', statuses=False, conditions=[
-        {'type': 'PodScheduled', 'status': 'False', 'reason': 'Unschedulable'}])]
-    be.http.post = lambda url, **kw: FakeHttp._Resp(503, {'detail': 'not ready'})
+    def pending(message):
+        kubectl.pods = [_pod('model-big-1', 'grp-big', statuses=False, conditions=[
+            {'type': 'PodScheduled', 'status': 'False', 'reason': 'Unschedulable',
+             'message': message}])]
 
+    be.http.post = lambda url, **kw: FakeHttp._Resp(503, {'detail': 'not ready'})
+    pending('0/1 nodes are available: 1 Insufficient nvidia.com/gpu.')
     probe = be.probe_ready(dep, 'grp-big')
     assert probe.needs_room and not probe.fatal and not probe.ready
+    # Unschedulable for a reason room cannot fix: no room is asked for.
+    pending("0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.")
+    assert not be.probe_ready(dep, 'grp-big').needs_room

@@ -1946,6 +1946,12 @@ class ComposeBackend(ConvergeScaffold):
         if container_ids:
             self.run(['docker', 'rm', '-f', *container_ids])
 
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """None: admission already moves idle models aside when it places, so
+        a Compose probe never reports ``needs_room``."""
+        return []
+
     def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
         """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""
         deadline = self._clock() + deadline_s

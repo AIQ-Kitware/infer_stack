@@ -446,7 +446,7 @@ poison test that fails on the old code with every fix; no new `hasattr`
 probes; no second KubeAI lifecycle path; backwards compatibility for cards,
 catalogs and CLI invocations that work today.
 
-### 11. [ ] Residency: replicas are not duplicates
+### 11. [x] Residency: replicas are not duplicates
 
 *Why added:* `Residency.ambiguous()` meant "more than one unit" and
 `resident()` returned a unit only when there was exactly one. On Compose two
@@ -476,7 +476,14 @@ replica crash-looping fails fast with the engine's error, one healthy
 replica does not; two Compose containers for one deployment still fail
 closed; the k3s e2e has a two-replica keep-warm phase and passes.
 
-### 12. [ ] One backend protocol, the one the controller uses
+*Done 2026-09-27 (35be92c):* `Residency.replicated` (true for pods) with
+`is_resident`, `is_conflicted`, `warm_units`, `resident_gpus`, and
+`unique_unit` kept for GPU adoption only; every caller audited;
+`diagnose_startup(..., replicated=)` fails fast only when every replica has
+crashed. Unit and parity tests; the k3s e2e's two-replica keep-warm phase
+passed (released and gc-ed: still desired, both replicas up, shown running).
+
+### 12. [x] One backend protocol, the one the controller uses
 
 *Why added:* `Controller` took a `Backend` (the old `realize/teardown/
 observe` protocol) and cast it to `AdmissionBackend`, which inherited that
@@ -496,6 +503,15 @@ satisfy a protocol; the controller builds no `docker` command and reads no
 sidecar; `ty` checks each backend against the protocol, and fails when one
 drifts.
 
+*Done 2026-09-27 (35be92c):* `ServingBackend` is the controller's protocol
+(no cast); `Realizer` holds `realize/teardown` for `SimpleAdmission` only;
+KubeAI's no-op methods are gone; `HostRuntime` (Compose:
+`network_table/configure_network`, `subnet_clashes`, `rendered_services`,
+`set_adopted`, `remove_containers`) behind `backend.host_runtime`;
+`placement_notes()` replaces the sidecar read. `backend._conforms()` makes
+`ty` check each backend against the protocol (verified: removing KubeAI's
+`host_runtime` fails the check). `Backend` stays exported as an alias.
+
 ### 13. [ ] Parity tests: cross-feature invariants
 
 *Why added:* the parity suite's KubeAI fake ran one pod per Model, so
@@ -511,7 +527,7 @@ roadmap.
 **Done when:** the suite is in `tests/test_parity.py` (or beside it), each
 case fails on the code before its fix, and the roadmap states the rule.
 
-### 14. [ ] Scheduler-aware reclaim, not "Unschedulable means evict"
+### 14. [x] Scheduler-aware reclaim, not "Unschedulable means evict"
 
 *Why added:* KubeAI's readiness sets `needs_room` whenever a pod waits with
 reason `Unschedulable`, and `wait_ready` answers by evicting the
@@ -533,6 +549,15 @@ is a candidate. Keep: a leased deployment is never a victim; the policy
 untolerated taint evicts nothing; with two profiles on two nodes the idle
 Model on the wrong node is not chosen; real reclaimable pressure evicts a
 compatible idle Model and the leased one proceeds.
+
+*Done 2026-09-27:* KubeAI's probe sets `needs_room` only when the
+scheduler's message names an `Insufficient` resource (the message is now in
+residency); `ServingBackend.reclaim_candidates(blocked, idle)` names idle
+Models with a pod on a node the blocked pod could use (node selector,
+taints; required affinity is not evaluated, so nothing is evicted) that
+request the short resource. Compose returns none, the in-process backends
+all. `_make_room` keeps the policy. Four parity poison tests; three fail on
+the old code.
 
 ### 15. [ ] Publication phases: the approved digest outlives a partial apply
 
@@ -658,5 +683,7 @@ full suite, `ty`, flake8, and the full k3s e2e.
 **Done when:** those pass and the docs match the code.
 
 Also observed while working on these: `test_an_edit_made_outside_the_tui_appears_on_the_next_refresh`
-failed once in a full-suite run and passed alone three times; timing
-around the catalog reload. Looked at under item 22 if it recurs.
+failed in two of five full-suite runs and never alone. It counted every
+`_refuse` call after two refreshes, and a refresh's background worker can
+refuse something unrelated meanwhile; it now counts catalog-reload
+refusals only (the likely cause, not reproduced on demand).

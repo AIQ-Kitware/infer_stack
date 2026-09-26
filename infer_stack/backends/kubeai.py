@@ -396,6 +396,88 @@ def kubectl_complaint(stderr: str) -> str:
 
 
 
+
+def insufficient_resources(message: str) -> set[str]:
+    """The resources a scheduler message says some node is short of.
+
+    ``Unschedulable`` covers a node selector nothing matches, a taint the pod
+    does not tolerate, affinity, and plain capacity alike. Only capacity can
+    be relieved by stopping another Model, and the message says which it is,
+    node by node.
+
+    >>> sorted(insufficient_resources(
+    ...     '0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 1 Insufficient '
+    ...     "memory, 1 node(s) didn't match Pod's node affinity/selector."))
+    ['memory', 'nvidia.com/gpu']
+    >>> insufficient_resources("0/2 nodes are available: 2 node(s) had untolerated "
+    ...                        "taint {gpu: reserved}.")
+    set()
+    """
+    import re
+
+    return set(re.findall(r'Insufficient ([A-Za-z0-9./_-]+?)[,.]?(?:\s|$)', message or ''))
+
+
+def _tolerates(tolerations: list[dict], taint: dict) -> bool:
+    """Whether a pod's tolerations admit one node taint (Kubernetes' rule)."""
+    if taint.get('effect') not in ('NoSchedule', 'NoExecute'):
+        return True                                 # PreferNoSchedule never blocks
+    for t in tolerations:
+        if t.get('effect') and t.get('effect') != taint.get('effect'):
+            continue
+        if t.get('operator') == 'Exists':
+            if not t.get('key') or t.get('key') == taint.get('key'):
+                return True
+        elif t.get('key') == taint.get('key') and t.get('value') == taint.get('value'):
+            return True
+    return False
+
+
+def eligible_nodes(pod_spec: dict, nodes: list[dict]) -> set[str] | None:
+    """Nodes a pod could run on if they had room, or ``None`` if not known.
+
+    A node qualifies when it is schedulable, carries every label of the
+    pod's ``nodeSelector``, and every blocking taint is tolerated. Required
+    node affinity is not evaluated here: ``None`` then, and the caller frees
+    nothing on a guess.
+
+    >>> spec = {'nodeSelector': {'gpu': 'a100'}, 'tolerations': []}
+    >>> nodes = [{'metadata': {'name': 'a', 'labels': {'gpu': 'a100'}}, 'spec': {}},
+    ...          {'metadata': {'name': 'b', 'labels': {'gpu': 'l4'}}, 'spec': {}},
+    ...          {'metadata': {'name': 'c', 'labels': {'gpu': 'a100'}},
+    ...           'spec': {'taints': [{'key': 'x', 'effect': 'NoSchedule'}]}}]
+    >>> eligible_nodes(spec, nodes)
+    {'a'}
+    """
+    required = (((pod_spec.get('affinity') or {}).get('nodeAffinity') or {})
+                .get('requiredDuringSchedulingIgnoredDuringExecution'))
+    if required:
+        return None
+    selector = pod_spec.get('nodeSelector') or {}
+    tolerations = pod_spec.get('tolerations') or []
+    out = set()
+    for node in nodes:
+        meta, spec = node.get('metadata') or {}, node.get('spec') or {}
+        labels = meta.get('labels') or {}
+        if spec.get('unschedulable'):
+            continue
+        if any(labels.get(k) != v for k, v in selector.items()):
+            continue
+        if all(_tolerates(tolerations, t) for t in spec.get('taints') or []):
+            out.add(str(meta.get('name') or ''))
+    return out
+
+
+def _requests(pod: dict) -> set[str]:
+    """The resource names a pod's containers request or limit."""
+    names: set[str] = set()
+    for c in (pod.get('spec') or {}).get('containers') or []:
+        res = c.get('resources') or {}
+        names.update((res.get('requests') or {}).keys())
+        names.update((res.get('limits') or {}).keys())
+    return names
+
+
 class KubeaiBackend(ConvergeScaffold):
     """Cluster KubeAI backend (converge-style).
 
@@ -978,6 +1060,63 @@ class KubeaiBackend(ConvergeScaffold):
                                 lambda: self.deployment_logs(deployment, tail=200),
                                 replicated=residency.replicated)
 
+    def _capacity_shortage(self, deployment: Deployment) -> set[str]:
+        """Resources the scheduler says this Model's pending pods lack."""
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().units(deployment.id)
+        except ResidencyUnknown:
+            return set()
+        return {r for p in pods if p.reason == 'Unschedulable'
+                for r in insufficient_resources(p.message)}
+
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """Which idle Models could free room for ``blocked``, in ``idle``'s order.
+
+        One whose pod runs on a node ``blocked`` could be scheduled on, and
+        requests a resource the scheduler says is short. Nothing when the
+        blocked pod is not short of capacity, when its node constraints
+        cannot be evaluated, or when the cluster cannot be read: an eviction
+        that cannot help only loses a warm model.
+        """
+        try:
+            pods = json.loads(self._kubectl(
+                ['get', 'pods', '-l', f'{MANAGED_LABEL}=true', '-o', 'json']) or '{}')
+            nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
+        except Exception:  # noqa: BLE001 - unknown: evict nothing
+            return []
+        items = pods.get('items') or []
+
+        def gid(pod):
+            return ((pod.get('metadata') or {}).get('labels') or {}).get(DEPLOYMENT_LABEL)
+
+        short: set[str] = set()
+        where: set[str] | None = set()
+        for pod in items:
+            if gid(pod) != blocked.id:
+                continue
+            for cond in (pod.get('status') or {}).get('conditions') or []:
+                if cond.get('reason') == 'Unschedulable' and cond.get('status') == 'False':
+                    found = insufficient_resources(str(cond.get('message') or ''))
+                    if found:
+                        short |= found
+                        nodes_here = eligible_nodes(pod.get('spec') or {},
+                                                    nodes.get('items') or [])
+                        if nodes_here is None:
+                            where = None
+                        elif where is not None:
+                            where |= nodes_here
+        if not short or not where:
+            return []
+        wanted = {g.id for g in idle}
+        useful = {gid(pod) for pod in items
+                  if gid(pod) in wanted
+                  and (pod.get('spec') or {}).get('nodeName') in where
+                  and _requests(pod) & short}
+        return [g.id for g in idle if g.id in useful]
+
     def _waiting_reason(self, deployment: Deployment) -> str:
         """The pod's own reason for not running yet (``ImagePullBackOff``...)."""
         from ..leasing.residency import ResidencyUnknown
@@ -1034,8 +1173,11 @@ class KubeaiBackend(ConvergeScaffold):
         if failure is not None:
             return Readiness(False, failure, fatal=True)
         waiting = self._waiting_reason(deployment)
+        # Room helps only when the scheduler says some node is short of a
+        # resource; a selector, taint or affinity no node satisfies stays
+        # unschedulable whatever is stopped (reclaim_candidates picks whom).
         return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason,
-                         needs_room='Unschedulable' in waiting)
+                         needs_room=bool(self._capacity_shortage(deployment)))
 
     def access(self, endpoints: list[str]) -> dict[str, Any] | None:
         """Where a client reaches these endpoints (env-file descriptor).

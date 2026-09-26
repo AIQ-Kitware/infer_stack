@@ -1362,13 +1362,14 @@ class Controller:
         while True:
             pending = []
             failures = []
-            needs_room = False
+            blocked: dict[str, Deployment] = {}
             for (g, ep) in pairs:
                 probe = self.backend.probe_ready(g, ep)
                 if probe.ready:
                     continue
                 pending.append((g, ep))
-                needs_room = needs_room or probe.needs_room
+                if probe.needs_room:
+                    blocked[g.id] = g
                 if probe.fatal:
                     failures.append((g.id, ep, probe.detail))
             if not pending:
@@ -1385,22 +1386,24 @@ class Controller:
                     pending=[(g.id, ep) for g, ep in pending],
                 )
             # After the deadline check: a wait that has given up evicts nothing.
-            if needs_room and self.clock() - last_room >= ROOM_COOLDOWN_S:
-                # A leased model is waiting on resources: a model without a
-                # lease is always a candidate to give them up.
-                if self._make_room():
+            if blocked and self.clock() - last_room >= ROOM_COOLDOWN_S:
+                # A leased model is waiting on capacity: an idle model the
+                # backend says could free it gives it up.
+                if self._make_room(list(blocked.values())):
                     last_room = self.clock()
             self.sleep(interval)
             pairs = pending
 
-    def _make_room(self) -> str | None:
-        """Evict the longest-idle deployment for leased demand; its id, or ``None``.
+    def _make_room(self, blocked: list[Deployment]) -> str | None:
+        """Evict one idle deployment that could free room for ``blocked``.
 
-        Idle means no lease holds it (a keep-warm model left resident). One at
-        a time: the runtime cannot say how much room is needed, and every
-        warm model kept is a load avoided. Compose backends never ask, since
-        their admission already moves idle models aside; this serves backends
-        where the runtime schedules (KubeAI).
+        The policy is here: only idle deployments (no lease holds them, so a
+        leased one is never a victim), the longest idle first, one at a time,
+        since the runtime cannot say how much room is needed and every warm
+        model kept is a load avoided. Whether a victim could help at all is
+        the backend's to say (:meth:`ServingBackend.reclaim_candidates`: the
+        same node pool and the resource that is short); when none could,
+        nothing is evicted. Returns the victim's id, or ``None``.
         """
         from .._log import logger
 
@@ -1409,11 +1412,17 @@ class Controller:
                       key=lambda g: (g.updated_at, g.id))
         if not idle:
             return None
-        victim = idle[0].id
+        useful: set[str] = set()
+        for g in blocked:
+            useful.update(self.backend.reclaim_candidates(g, idle))
+        victims = [g for g in idle if g.id in useful]
+        if not victims:
+            return None
+        victim = victims[0]
         logger.info('making room for leased demand: evicting idle keep-warm {} ({})',
-                    victim, ', '.join(sorted(idle[0].served)))
-        self.evict([victim])
-        return victim
+                    victim.id, ', '.join(sorted(victim.served)))
+        self.evict([victim.id])
+        return victim.id
 
     def _never_ran(self, deployment_ids: list[str]) -> list[str]:
         """Which of these deployments definitely have no container at all.

@@ -37,9 +37,10 @@ class Readiness:
     ready: bool
     detail: str = ''
     fatal: bool = False
-    #: The endpoint is waiting for resources held by others (a Kubernetes pod
-    #: the scheduler cannot place). The controller then frees room by
-    #: evicting idle keep-warm deployments, which no lease holds.
+    #: The endpoint is waiting for capacity held by others: the scheduler says
+    #: a node is short of a resource, not that no node could ever host it.
+    #: The controller then evicts an idle keep-warm deployment the backend
+    #: names in ``reclaim_candidates`` (none: nothing is evicted).
     needs_room: bool = False
 
 
@@ -218,6 +219,16 @@ class ServingBackend(Protocol):
         residents that yielded their GPUs). Empty where nothing is placed."""
         ...
 
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """Which of ``idle`` could free room ``blocked`` is waiting for.
+
+        Asked only when a probe said ``needs_room``. The backend knows the
+        scheduling domain (which nodes, which resources); the controller
+        keeps the policy (only idle deployments, longest idle first, one at
+        a time). Return in ``idle``'s order; empty means evicting would not help.
+        """
+        ...
 
 
 #: The name ``infer_stack.leasing`` has always exported for the controller's
@@ -409,6 +420,11 @@ class SimpleAdmission:
 
     def placement_notes(self) -> dict[str, list[str]]:
         return {}
+
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """One scheduling domain in-process: any idle deployment frees room."""
+        return [g.id for g in idle]
 
     def plan(self, desired: list[Deployment], placement: Any = None):
         """Which of ``desired`` fit; here, all of them, on no GPU."""

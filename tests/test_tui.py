@@ -2207,7 +2207,10 @@ def test_an_edit_made_outside_the_tui_appears_on_the_next_refresh(tmp_path):
             catalog_path.write_text('endpoints: [not, a, mapping\n')
             app.action_refresh()
             app.action_refresh()
-            assert len(refused) == 1 and 'catalog reload failed' in refused[0]
+            # Only the catalog's refusals: a refresh's background worker may
+            # report something else meanwhile (it did, under a loaded suite).
+            reloads = [m for m in refused if 'catalog reload failed' in m]
+            assert len(reloads) == 1
             assert 'qwen-extra' in app._endpoint_names       # the last good one stays
 
     _run(scenario)

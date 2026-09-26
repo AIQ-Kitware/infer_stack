@@ -130,6 +130,9 @@ class Container:
     #: ``CrashLoopBackOff``, ``ImagePullBackOff``, ``OOMKilled`` (Kubernetes).
     #: Empty when there is nothing to say, or the runtime does not say.
     reason: str = ''
+    #: The runtime's own words for ``reason``, when it gives any: a
+    #: scheduler's ``0/2 nodes are available: 2 Insufficient nvidia.com/gpu``.
+    message: str = ''
     #: When the current run started (the runtime's timestamp), for display.
     started: str = ''
     #: Published ports, ``host->container/proto`` joined by ``, ``; display only.
@@ -412,11 +415,15 @@ def residency_from_pods(raw: str) -> Residency:
         else:
             state = 'created'
         ended = current.get('terminated') or last
+        message = ''
         if not waiting and not statuses:
             # Not started at all: the pod's own condition says why, e.g. the
-            # scheduler found no node with the resources ("Unschedulable").
-            waiting = next((str(c.get('reason') or '') for c in status.get('conditions') or []
-                            if c.get('status') == 'False' and c.get('reason')), '')
+            # scheduler found no node with the resources ("Unschedulable"),
+            # and its message says which constraint each node failed.
+            failed = next((c for c in status.get('conditions') or []
+                           if c.get('status') == 'False' and c.get('reason')), {})
+            waiting = str(failed.get('reason') or '')
+            message = str(failed.get('message') or '')
         ready = any(c.get('type') == 'Ready' and c.get('status') == 'True'
                     for c in status.get('conditions') or [])
         container = Container(
@@ -431,6 +438,7 @@ def residency_from_pods(raw: str) -> Residency:
             # A Deployment's pods are always restarted by the kubelet.
             restart_policy='always',
             reason=waiting or str(ended.get('reason') or ''),
+            message=message,
             started=str((current.get('running') or {}).get('startedAt')
                         or status.get('startTime') or ''),
         )
