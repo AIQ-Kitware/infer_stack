@@ -446,7 +446,7 @@ poison test that fails on the old code with every fix; no new `hasattr`
 probes; no second KubeAI lifecycle path; backwards compatibility for cards,
 catalogs and CLI invocations that work today.
 
-### 11. [x] Residency: replicas are not duplicates
+### 11. [ ] Residency: replicas are not duplicates (reopened by the re-review)
 
 *Why added:* `Residency.ambiguous()` meant "more than one unit" and
 `resident()` returned a unit only when there was exactly one. On Compose two
@@ -541,7 +541,7 @@ LIVE-over-IDLE coalescing (`test_leasing_controller.py`); seed conflicts
 the positive control for reclaimable pressure, which passes on both.
 The rule is in the roadmap's Principles.
 
-### 14. [x] Scheduler-aware reclaim, not "Unschedulable means evict"
+### 14. [ ] Scheduler-aware reclaim, not "Unschedulable means evict" (reopened by the re-review)
 
 *Why added:* KubeAI's readiness sets `needs_room` whenever a pod waits with
 reason `Unschedulable`, and `wait_ready` answers by evicting the
@@ -573,7 +573,7 @@ request the short resource. Compose returns none, the in-process backends
 all. `_make_room` keeps the policy. Four parity poison tests; three fail on
 the old code.
 
-### 15. [x] Publication phases: the approved digest outlives a partial apply
+### 15. [ ] Publication phases: the approved digest outlives a partial apply (reopened by the re-review)
 
 *Why added:* `_apply_pending()` clears the approved-render digest right
 after `apply()` returns, before checking it returned `False`. Compose
@@ -600,7 +600,7 @@ routes behind KubeAI cleared the marker; it now returns both. Tests: the
 partial-apply/renderer-drift case (fails on the old controller: the digest
 was gone) and the KubeAI propagation.
 
-### 16. [x] Secret rotation is a transaction
+### 16. [ ] Secret rotation is a transaction (reopened by the re-review)
 
 *Why added:* `rotate_gateway_key()` writes the new key into `.env`, then
 publishes, and restores the old key only on `ConvergeAborted`. A strict
@@ -728,7 +728,7 @@ preview's digest. Test: a refused acquire on a fresh root leaves no key in
 `.env` (fails on the old code: it wrote the master key and the Open WebUI
 secret), and the next admitted acquire needs no second approval.
 
-### 21. [x] Controller decomposition, where the authorities now show it
+### 21. [ ] Controller decomposition, where the authorities now show it (reopened by the re-review)
 
 *Why added:* the controller holds admission, residency interpretation,
 placement, publication markers, recovery snapshots, network migration,
@@ -781,3 +781,55 @@ failed in two of five full-suite runs and never alone. It counted every
 `_refuse` call after two refreshes, and a refresh's background worker can
 refuse something unrelated meanwhile; it now counts catalog-reload
 refusals only (the likely cause, not reproduced on demand).
+
+## Re-review (2026-09-26): second-order cases
+
+The re-review closed most of items 11-22 and reopened five, for states the
+new abstractions exposed but did not carry through. Order: 21's settlement
+bug first (a safety bug), then 16, 15, 11, 14, 23, then the rest of 21.
+
+- **21, settlement.** `_wait_for_settled_runtime` reads
+  `getattr(backend, 'settle_snapshot')`; KubeAI has none, but its host
+  gateway is a Compose runtime whose Docker work can outlive a killed client.
+  After a `BackendTimeout` in the gateway's apply, the next apply starts
+  another Compose operation unsettled. **Do:** a required
+  `settle_snapshot() -> object | None`; KubeAI delegates to a host gateway.
+  **Done when:** a KubeAI backend whose host gateway times out mid-apply
+  makes the next apply settle first (or raise `RuntimeUnsettled`).
+- **16.** An apply that returns `ApplyResult(runtime=False)` cleanly leaves
+  `.env` on the new key and the gateway on the old one: the boundary was
+  "apply was called", not "the runtime changed". **Done when:** a backend
+  returning `runtime=False` without recreating the gateway leaves no key in
+  `.env` the gateway rejects.
+- **15.** `infer-stack apply` accepting D2 over an approved D1 does not
+  record D2, so a partial D2 apply leaves D1 approved and every retry asks
+  again. **Done when:** after an explicit D2 apply that is partial, the
+  marker holds D2 and an ordinary retry of D2 proceeds; a D3 still refuses.
+- **11, diagnosis.** A replica set is judged from the concatenated log, so
+  one fatal and one transient replica read as fatal. **Done when:** replicas
+  are classified one by one; fatal only when each is fatal; one transient
+  replica with retries left suppresses it.
+- **11, health.** `status` equated residency with serving: every replica in
+  CrashLoopBackOff is "resident" (restarting is warm) and showed `up`.
+  **Done when:** one deployment health summary (up / starting / restarting /
+  conflicted) feeds `status` and `observe_state`; all replicas looping is not
+  up, one healthy is up, one starting plus one looping is not up.
+- **14.** `eligible_nodes()` models the default scheduler; a pod with
+  `schedulerName` (the catalog's `scheduler_name`) or required pod
+  (anti-)affinity may be filtered differently. **Done when:** those evict
+  nothing (test through `scheduler_name`).
+- **23 (new), route seed race.** A conflict found under the lock raises after
+  `publish_change` set the marker, so a clean refusal leaves a publication
+  pending. **Done when:** a race-time conflict leaves the marker as it was.
+  (The stale `--replace` display is noted, not fixed.)
+- **21, optional hooks.** Classified by the re-review: the `last_*`
+  attributes and a new `last_planned_digest` and `allocates_gpus` are
+  required state read directly; `plan_on_idle_host` and `validate_requests`
+  become common operations with in-process defaults; `last_displaced` /
+  `last_degraded` go (`placement_notes()` is the authority);
+  `render_profile` / `use_profile` become a nullable recovery-profile
+  capability; `rotate_master_key` / `restore_env` / `litellm` belong on a
+  typed `front_door() -> FrontDoor | None`. Rule: a `getattr` default may
+  serve display, never a correctness decision.
+
+### 23. [ ] A race-time `routes seed` conflict leaves no marker
