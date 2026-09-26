@@ -537,8 +537,8 @@ apply with renderer drift and the KubeAI gateway result
 boundaries (`test_leasing_secrets.py`); route removal failure on Compose and
 KubeAI, and a replacement gap (`test_leasing_dynamic_routing.py`);
 LIVE-over-IDLE coalescing (`test_leasing_controller.py`); seed conflicts
-(`test_cli_leasing.py`). Each failed on the code before its fix, except the
-two positive controls (reclaimable pressure, the replacement-gap report).
+(`test_cli_leasing.py`). Each failed on the code before its fix, except
+the positive control for reclaimable pressure, which passes on both.
 The rule is in the roadmap's Principles.
 
 ### 14. [x] Scheduler-aware reclaim, not "Unschedulable means evict"
