@@ -381,7 +381,36 @@ Audit pass 8 (2026-09-26): **passed.** `dev/ux_audit.sh` on both backends
 mistakes); the README's no-GPU first run from empty roots; the TUI on both
 backends at 80x24, enlarged to 200x50, every top tab by key. Nothing new.
 
-### 10. [ ] Handover
+### 10. [x] Handover
 
 Summarize for the operator: what was verified here, and the two handover
 scripts (items 6 and 7) with what each run proves.
+
+**Verified here** (a VM with no GPU; k3s with a second node in a container):
+
+- Both backends through one admission path, day-2 commands and the TUI
+  through the backend's instances (items 1-5): the unit suite, the 21-row
+  parity table on both backends, and `dev/kubeai_e2e.sh` with every phase
+  (CPU vLLM: acquire, env-file client, gateway routes and Open WebUI,
+  release, refusal, `min_vram_gib` sizing on fake GPU labels, dynamic
+  routing, the gateway in the cluster, a Model on the second node).
+- The UX audit (item 9): eight passes, the last with nothing new.
+
+**Needs GPUs or a second machine** (run on the operator's hosts):
+
+- `dev/handover/p4_gpu_labels.sh` on a GPU k3s node. Proves GPU Feature
+  Discovery's real labels feed sizing: `catalog suggest --backend kubeai`
+  proposes a profile per GPU product, an endpoint with only `min_vram_gib`
+  lands on the right one and answers, and `measure --record` reads vLLM's
+  memory profile from the pod log. Here those labels were faked.
+- `dev/handover/p5_two_hosts.sh` on the first node once a second GPU
+  workstation has joined. Proves pod-to-pod traffic across the real
+  network: a Model on the second node's GPU answers through the in-cluster
+  gateway, the NodePort answers on the second node's own address (one env
+  file for cards on either machine), and `secrets rotate` holds with the
+  Model served. Here the second node shared the host's network.
+
+Both keep their own config and data roots and print PASS/FAIL per step.
+
+**Open decisions:** 8a (rewrite or delete the pre-leasing recipes) and 8b
+(`/dev/shm` for vLLM, which recreates running engines).
