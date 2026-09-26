@@ -347,7 +347,7 @@ down, `gc --forget` as "Clear finished").
 
 - [x] `release`'s summary read "deployments idle/teardown per their reclaim
       policy"; now "its models stay warm or stop, per their reclaim policy".
-- [ ] Considered, not changed: argparse accepts abbreviated flags, so
+- [x] Decided, no change: argparse accepts abbreviated flags, so
       `leases --all` fails as "ambiguous option: --all could match
       --allowed_gpus". kwconf's `__allow_abbrev__ = False` would give
       "unrecognized arguments" instead, and would break any script that
