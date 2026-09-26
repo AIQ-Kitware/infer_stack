@@ -202,3 +202,11 @@ def test_acquire_yes_before_the_endpoint_still_names_it():
 
     config = AcquireCLI.cli(argv=['--yes', 'qwen'])
     assert config.yes is True and config.names == ['qwen']
+
+
+def test_no_color_turns_color_off():
+    """kwconf reads a leading `no-` as negation: `--no-color` must negate `color`."""
+    from infer_stack.cli.commands_runtime import LogsCLI
+
+    assert LogsCLI.cli(argv=[]).color is True
+    assert LogsCLI.cli(argv=['--no-color']).color is False

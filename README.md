@@ -126,7 +126,7 @@ infer-stack stack compose -- ps --format json   # any other docker compose comma
 or an endpoint alias. Interactive `infer-stack logs -f` compacts only
 explicitly registered, known-noisy LiteLLM traceback shapes; unknown
 tracebacks pass through unchanged. Redirected or piped output stays raw, and
-`--raw` disables compaction in an interactive follow. `--no_color` drops the
+`--raw` disables compaction in an interactive follow. `--no-color` drops the
 name-prefix colors. The TUI uses the same compactor.
 
 Ollama tags are pulled into the daemon on the first `acquire` of an endpoint

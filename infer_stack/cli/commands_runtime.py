@@ -548,7 +548,10 @@ class LogsCLI(_InstancesBase):
         help="Only the last N lines of each (default: all). A number or 'all'.",
     )
     timestamps = kw.Value(False, isflag=True)
-    no_color = kw.Value(False, isflag=True, help='Do not color the name prefixes.')
+    # A positive flag: kwconf reads a leading `no-` as negation, so a flag
+    # named `no_color` silently ignored `--no-color`.
+    color = kw.Value(True, isflag=True,
+                     help='Color the name prefixes on a terminal (`--no-color` to not).')
     raw = kw.Value(
         False,
         isflag=True,
@@ -577,7 +580,7 @@ class LogsCLI(_InstancesBase):
             chosen = pick(_instances(backend))
         except UnknownTarget as ex:
             raise SystemExit(str(ex))
-        color = sys.stdout.isatty() and not config.no_color
+        color = sys.stdout.isatty() and bool(config.color)
         if config.follow:
             def listing():
                 try:
