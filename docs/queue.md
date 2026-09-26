@@ -81,7 +81,7 @@ fake-Compose and fake-KubeAI backends; `tests/test_parity.py` runs each
 
 ### 6. [x] P4: placement from node labels (verified with faked labels)
 
-Done 2026-09-26; the GPU run is `dev/handover/p4_gpu_labels.sh`.
+Done 2026-09-26, `94c263d`; the GPU run is `dev/handover/p4_gpu_labels.sh`.
 *Why reordered:* two GPU sizes need two nodes (a node has one
 `nvidia.com/gpu.memory` label), so item 7's simulated second node
 (`dev/k3s_agent_container.sh`) was built first, here.
