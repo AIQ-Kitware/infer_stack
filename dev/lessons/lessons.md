@@ -141,3 +141,15 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   `dev/k3s_agent_container.sh` passes the same to the second node.
 - **Applies when:** a dev cluster shares its disk with anything else, and
   whenever a test or audit keeps large artifacts in `/tmp`.
+
+- **Lesson:** An e2e that runs `infer-stack` from an editable install imports
+  the live checkout, so editing the tree while it runs can break it midway.
+  Run long e2e passes from a copy: `cp -r infer_stack dev/... $SNAP` and
+  `PYTHONPATH=$SNAP` (it precedes the editable install's path entry).
+- **Evidence / MWE:** 2026-09-27: a `dev/kubeai_e2e.sh` run failed at its
+  routes step with `ImportError: cannot import name 'Backend'` while the
+  backend protocol was being renamed, and its cleanup failed the same way,
+  leaving a Model and the gateway containers behind. The rerun from a copy
+  printed the copy's `infer_stack.__file__` and passed while edits continued.
+- **Applies when:** a long e2e or audit runs in tmux while work continues in
+  the same checkout.

@@ -3312,3 +3312,38 @@ remove the file to undo it.
 an audit: the script now refuses to start without `infer-stack` on PATH.
 (2) Read a report whole: the one pass-5 finding I nearly missed was a line
 my own `sed` range skipped.
+
+## 2026-09-26 18:30:00 -0400 — review hardening of the backend-parity campaign
+
+**Intent.** An outside review, in two parts, of the finished queue: fix what
+it confirmed (replica residency, the backend protocol, cross-feature tests;
+then scheduler reclaim, approval lifetime, secret rotation, route ordering,
+coalescing, route seeding, preview purity, decomposition, docs), queueing
+the work first. Model: Claude Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** Queue items 11-22, each with a poison test that fails on the old
+code. The common thread the review named held: several shared concepts
+carried less than the controller needed. `Residency` now says whether
+several units are replicas or a conflict; `Readiness.needs_room` is only
+set for a capacity shortage, and the backend names useful victims;
+`apply()` returns how far it got; routes retire before upstreams go. The
+protocol the controller takes is the one the backends implement, checked by
+`ty` (a deliberate drift fails it).
+
+**Found on the way.** KubeAI's `apply` dropped its host gateway's result,
+so unverified routes behind KubeAI cleared the marker; `routes seed --json`
+printed its conflict list into the JSON; a TUI test counted unrelated
+refusals.
+
+**Uncertain.** The scheduler parsing reads Kubernetes' English message
+("Insufficient <resource>"); a scheduler that words it differently evicts
+nothing, which is the safe failure. Required node affinity is not
+evaluated, also safe. The replica diagnosis quotes the concatenated pod
+logs; with mixed failures it names the first fatal line it finds.
+
+**Takeaways.** (1) A "same" row is a claim about one path; the bug lived
+where two rows met, so a backend feature needs one test with the common
+lifecycle. (2) When a boolean crosses a boundary, ask what the caller does
+with the cases it merges; `True/False` and `needs_room` each merged cases
+that needed opposite actions. (3) Run long e2e passes from a frozen copy
+(lessons.md).
