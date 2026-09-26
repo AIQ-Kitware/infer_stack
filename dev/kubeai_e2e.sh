@@ -3,7 +3,7 @@
 #
 # Prereqs (once): a cluster + the KubeAI chart. On a single GPU host:
 #   ./scripts/bootstrap_k3s.sh
-#   printf 'resourceProfiles:\n  %s:\n    limits:\n      nvidia.com/gpu: "1"\n' \
+#   printf 'resourceProfiles:\n  %s:\n    runtimeClassName: nvidia\n    requests: {nvidia.com/gpu: "1"}\n    limits: {nvidia.com/gpu: "1"}\n' \
 #       "${E2E_RESOURCE_PROFILE:-nvidia-gpu}" > /tmp/kubeai-values.yaml
 #   ./scripts/install_kubeai.sh /tmp/kubeai-values.yaml kubeai
 #   kubectl -n kubeai port-forward svc/kubeai 8000:80 &

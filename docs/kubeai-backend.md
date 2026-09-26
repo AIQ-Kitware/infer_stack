@@ -43,12 +43,20 @@ Where the two backends match and where they still differ, row by row:
 
 # 2. Resource profiles: name -> the requests/limits/nodeSelector that one
 #    "GPU unit" means on your cluster. These names are what the catalog's
-#    `runtime.resource_profile` refers to.
+#    `runtime.resource_profile` refers to. Without the GPU request and
+#    runtimeClassName the pod can land on a GPU node and still start without
+#    libcuda.so.1. `infer-stack catalog suggest --backend kubeai` proposes
+#    one per GPU product once the device plugin runs.
 cat > kubeai-values.yaml <<'EOF'
 resourceProfiles:
   nvidia-gpu-rtx-4090:
+    runtimeClassName: nvidia
+    requests:
+      nvidia.com/gpu: "1"
     limits:
       nvidia.com/gpu: "1"
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
 EOF
 
 # 3. Install the chart (HF_TOKEN, if exported, is passed to the chart secret):
