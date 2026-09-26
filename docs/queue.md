@@ -321,6 +321,13 @@ Pass 5, the TUI by eye (compose, 80x24 and 200x50):
 - [x] The tab named "UI" held the TUI's own refresh settings, beside "open
       webui" everywhere else. Renamed "TUI settings", like "TUI log".
 
+Pass 5, the TUI by eye on kubeai (80x24, then enlarged to 200x50):
+
+- [x] Enlarging the terminal left the runtime pane at its small-screen
+      height: one log line under a 26-row leases pane. The resize handler
+      read the app's size before it updated; it now uses the event's.
+      Instances, Control and Deployments read the same as on compose.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

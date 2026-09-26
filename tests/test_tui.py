@@ -2335,3 +2335,25 @@ def test_tui_number_keys_and_palette_reach_every_top_tab():
             assert {f'Go to {label}' for label, _ in TOP_TABS} <= set(titles)
 
     _run(scenario)
+
+
+def test_tui_log_pane_grows_when_the_terminal_does():
+    # Pass 5 of the UX audit: started at 80x24 and enlarged to 200x50, the
+    # runtime pane kept its small-screen height (one log line) because the
+    # resize handler read the app's size before it updated.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            small = app.query_one('#docker-tabs').styles.height.value
+            await pilot.resize_terminal(200, 50)
+            await pilot.pause()
+            assert app.query_one('#docker-tabs').styles.height.value > small
+            assert app.query_one('#docker-tabs').styles.height.value == app._log_height(50)
+
+    _run(scenario)

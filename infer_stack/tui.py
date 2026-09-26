@@ -1449,13 +1449,13 @@ class InferStackTUI(App):
 
     # -- resizable panes ---------------------------------------------------
 
-    def _log_height(self) -> int:
+    def _log_height(self, rows: int | None = None) -> int:
         """The runtime pane's log height: the chosen one, capped near half the
         screen, so on a small terminal the lease and deployment tables keep
         rows when the pane opens (its tabs and picker take ~9 rows already)."""
         # The tabbed area holds the tab strip (2) and the source picker (3)
         # before any log line: 8 is those and three lines.
-        rows = self.size.height or 50
+        rows = rows or self.size.height or 50
         return max(8, min(self._log_h, rows // 2 - 4))
 
     #: Below this many rows the pane descriptions give way to tables and logs.
@@ -1479,13 +1479,14 @@ class InferStackTUI(App):
         if not self._sidebar_set:
             self._sidebar_w = self._auto_sidebar(event.size.width)
         try:
-            self._apply_sizes()
+            # The event's size: the app's own still reads the old one here.
+            self._apply_sizes(event.size.height)
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
-    def _apply_sizes(self) -> None:
+    def _apply_sizes(self, rows: int | None = None) -> None:
         self.query_one('#sidebar').styles.width = self._sidebar_w
-        self.query_one('#docker-tabs').styles.height = self._log_height()
+        self.query_one('#docker-tabs').styles.height = self._log_height(rows)
         # Fixed heights only matter beside a divider; a tab fills its pane.
         if not self.TABBED_CATALOG:
             self.query_one('#models').styles.height = self._models_h
