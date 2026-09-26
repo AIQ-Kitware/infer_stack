@@ -231,3 +231,45 @@ def test_controller_with_catalog():
     assert backend.realize_calls == [out.deployments[0].id]
     assert set(out.deployments[0].served) == {'e1', 'e2'}
     assert out.wait.ready is True
+
+
+# -- coalescing prefers what costs least to use (queue item 18) --------------------
+
+
+def test_a_request_coalesces_onto_a_live_deployment_not_an_older_idle_one():
+    """8k, released; then 32k (a new deployment, the 8k one cannot serve it);
+    then 4k, which both could serve. The live 32k deployment serves it now; the
+    older idle 8k one is not revived (on one GPU that revival would queue)."""
+    ctl, backend, _ = make_controller(ready=True)
+    ledger = ctl.ledger
+    small = ctl.acquire('a', [vreq('m', max_model_len=8192)])
+    ctl.release(small.lease.id)
+    small_id = small.deployments[0].id
+    big = ctl.acquire('b', [vreq('m', max_model_len=32768)])
+    big_id = big.deployments[0].id
+    assert big_id != small_id
+    starts = list(backend.realize_calls)
+
+    out = ctl.acquire('c', [vreq('m', max_model_len=4096)])
+
+    assert out.deployments[0].id == big_id
+    assert ledger.get_deployment(small_id).state == DeploymentState.IDLE   # not revived
+    assert backend.realize_calls == starts                                  # nothing started
+
+
+def test_a_resident_idle_deployment_beats_an_older_one_that_is_gone():
+    ctl, backend, _ = make_controller(ready=True)
+    ledger = ctl.ledger
+    old = ctl.acquire('a', [vreq('m', max_model_len=8192)])
+    ctl.release(old.lease.id)
+    new = ctl.acquire('b', [vreq('m', max_model_len=16384, sharing=Sharing.DEDICATED)])
+    ctl.release(new.lease.id)
+    old_id, new_id = old.deployments[0].id, new.deployments[0].id
+    # Make the newer one shareable, and the older one no longer resident.
+    ledger.store._conn.execute("UPDATE deployments SET sharing = ? WHERE id = ?",
+                               (Sharing.SHARED, new_id))
+    backend.realized.pop(old_id)
+
+    out = ctl.acquire('c', [vreq('m', max_model_len=4096)])
+
+    assert out.deployments[0].id == new_id

@@ -1619,7 +1619,9 @@ class Controller:
                     validate = getattr(self.backend, 'validate_requests', None)
                     if validate is not None:
                         validate(requests)
-                    overlay = self.ledger.plan_acquire(requests)
+                    overlay = self.ledger.plan_acquire(
+                        requests,
+                        resident=residency.is_resident if residency is not None else None)
                     allocations, reasons = self._admit(overlay, residency)
                 except BaseException:
                     if candidate_profile is not None:

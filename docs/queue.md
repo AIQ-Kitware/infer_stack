@@ -639,7 +639,7 @@ Compose and on KubeAI with a host gateway (both fail on the old code): the
 departing engine or Model keeps running while its route stays, and goes
 once the gateway recovers.
 
-### 18. [ ] Coalescing prefers a LIVE deployment over reviving an IDLE one
+### 18. [x] Coalescing prefers a LIVE deployment over reviving an IDLE one
 
 *Why added (older than this campaign):* `plan_acquire()` takes the first
 compatible deployment by creation time among LIVE and IDLE, so an older
@@ -654,6 +654,13 @@ residency hint from the controller.
 **Done when:** the 8k/32k/4k sequence on a one-slot backend coalesces the
 4k request onto the live 32k deployment: nothing revived, no placement, no
 queue, no runtime change.
+
+*Done 2026-09-27:* `Ledger.plan_acquire(requests, resident=)` ranks
+adequate candidates LIVE, then created in this plan, then resident IDLE,
+then other IDLE, creation order within each; the controller passes
+`residency.is_resident`. Tests: the 8k/32k/4k sequence coalesces onto the
+live 32k deployment with nothing revived or started, and a resident idle
+deployment beats an older one that is gone (both fail on the old code).
 
 ### 19. [ ] `routes seed` fails closed on a redefinition; one route API
 

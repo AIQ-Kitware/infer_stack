@@ -149,9 +149,25 @@ class Ledger:
 
     # -- public API --------------------------------------------------------
 
-    def plan_acquire(self, requests: list[EndpointRequest]) -> AcquireOverlay:
-        """Decide how ``requests`` would coalesce, without writing anything."""
+    def plan_acquire(self, requests: list[EndpointRequest], *,
+                     resident: Callable[[str], bool] | None = None) -> AcquireOverlay:
+        """Decide how ``requests`` would coalesce, without writing anything.
+
+        Among the shared deployments whose capacity covers a request, the one
+        that costs least to use wins: one already LIVE (nothing to place or
+        start), then one this plan is already creating, then an IDLE one that
+        is still ``resident`` (the controller's hint from residency: a revival
+        with nothing to start), then any other IDLE one; creation order within
+        each. Eligibility stays here; ``resident`` only orders.
+        """
         import copy
+
+        def cost(deployment: Deployment, pending: bool) -> int:
+            if deployment.state == DeploymentState.LIVE and not pending:
+                return 0
+            if pending:
+                return 1
+            return 2 if resident is not None and resident(deployment.id) else 3
 
         now = self.clock()
         state_version = self.store.admission_state_version()
@@ -171,8 +187,11 @@ class Ledger:
                     g for g in created.values()
                     if g.compat_key == req.compat_key and g.sharing == Sharing.SHARED
                 ]
-                for candidate in [*stored, *pending]:
-                    current = view.get(candidate.id) or copy.deepcopy(candidate)
+                candidates = [(view.get(g.id) or copy.deepcopy(g), False) for g in stored]
+                candidates += [(g, True) for g in pending]
+                ranked = sorted(enumerate(candidates),
+                                key=lambda item: (cost(*item[1]), item[0]))
+                for _, (current, _) in ranked:
                     if capacity_satisfies(current.capacity, req.capacity):
                         chosen = current
                         break
