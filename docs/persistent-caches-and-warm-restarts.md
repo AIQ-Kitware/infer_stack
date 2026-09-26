@@ -84,12 +84,20 @@ to come back healthy: the expensive work is not just downloading weights.
 
 ## Shared memory
 
-vLLM uses shared memory for tensor-parallel communication and worker IPC, and
-upstream vLLM's Docker guidance is `ipc: host` or a `shm_size` of a few GiB
-for TP > 1. The rendered Compose currently sets neither, so vLLM containers get
-Docker's default 64 MiB `/dev/shm`. If an endpoint, most likely a
-tensor-parallel one, fails on shared memory, this is the first thing to
-check.
+vLLM's workers share memory when a model spans GPUs (tensor or pipeline
+parallel), and Docker gives a container a 64 MiB `/dev/shm`. Upstream vLLM's
+Docker guidance is `ipc: host` or a `shm_size` of a few GiB. On Compose, set
+it per endpoint:
+
+```yaml
+runtime: {tensor_parallel_size: 4, shm_size: 16g}
+```
+
+It is opt-in: an endpoint without it renders exactly as before, so the
+upgrade recreates no running engine. A parallel engine without it logs one
+warning naming the key, and `catalog suggest` sets it on the multi-GPU
+entries it adds. KubeAI needs nothing: its vLLM pods mount a memory-backed
+`/dev/shm` (checked on KubeAI v0.23.4).
 
 ## Minimal-restart workflow
 

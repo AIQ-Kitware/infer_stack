@@ -129,23 +129,37 @@ top-level `restart` / `stop` / `start` / `pull` (they live under `stack`).
 **Done when:** every command in the README and `docs/` runs as written
 against the current CLI, and `grep` finds none of those verbs.
 
-### 8a. [ ] Decide: rewrite or delete the pre-leasing recipes
+### 8a. [x] Decide: rewrite or delete the pre-leasing recipes
 
 *Why added (2026-09-26):* `docs/demos/`, `recipies/` and `examples/` (about
-2,000 lines) are hardware recipes for the removed profile CLI; the Makefile
-targets that used them are gone. Each now opens with a "Pre-leasing" banner
-saying its commands no longer run. Rewriting them as catalog entries needs
-the hardware they describe; deleting them loses tuning notes. **The
-operator's call.**
+2,000 lines) were hardware recipes for the removed profile CLI.
 
-### 8b. [ ] Decide: `/dev/shm` for vLLM containers
+*Decided (2026-09-26): keep the tuning, delete the pages.* The only content
+the current docs lacked was the 4 x 96 GB vLLM tuning. It is now three gated
+variants in the suggestion pool, which `catalog suggest` offers on a host
+with four GPUs of 80 GiB or more: `qwen3.5-122b-a10b-tp4-128k`,
+`qwen3.5-122b-a10b-fp8-tp4-262k`, `qwen3.6-35b-a3b-tp2-262k` (TP, context,
+batch limits, `--language-model-only`, the qwen3 reasoning parser). They are
+marked as not re-run since leasing. The rest was covered already: the
+completions-only Pythia recipes by the README's protocol modes, the TLS/LDAP
+example by the README's statement that those settings are gone, and the
+tutorials by the manual. The pages are deleted; git history keeps them.
+Test: `test_a_4x96_host_gets_the_former_recipes_as_variants`.
 
-*Why added (2026-09-26):* the leasing renderer sets neither `ipc: host` nor
-`shm_size`, so a vLLM container gets Docker's 64 MiB `/dev/shm`; the
-pre-leasing template had `ipc: host`, and vLLM's own Docker instructions use
-it for tensor parallelism. Adding it changes every vLLM service's
-fingerprint, so the next apply recreates running engines. Needs a TP=2 run
-on a GPU host to confirm the symptom first. **The operator's call.**
+### 8b. [x] Decide: `/dev/shm` for vLLM containers
+
+*Why added (2026-09-26):* the renderer set neither `ipc: host` nor
+`shm_size`, so a vLLM container got Docker's 64 MiB `/dev/shm`.
+
+*Decided (2026-09-26): opt-in, with a nudge.* `runtime.shm_size` (e.g.
+`16g`) renders `shm_size` on the Compose service; unset, the service is
+byte-identical to before, so no running engine is recreated by the upgrade.
+A tensor- or pipeline-parallel engine without it logs one warning naming the
+key, and `catalog suggest` sets `16g` on the multi-GPU entries it adds.
+KubeAI needs nothing: its vLLM pods mount a memory-backed `/dev/shm`
+(checked on the dev cluster, KubeAI v0.23.4). The TP=2 failure itself is
+still unobserved here (no GPUs); the key is how an operator fixes it when
+seen. Tests: `tests/test_shm_size.py`.
 
 ### 9. [x] UX audit loop: do not stop without a passing audit
 
@@ -412,5 +426,6 @@ scripts (items 6 and 7) with what each run proves.
 
 Both keep their own config and data roots and print PASS/FAIL per step.
 
-**Open decisions:** 8a (rewrite or delete the pre-leasing recipes) and 8b
-(`/dev/shm` for vLLM, which recreates running engines).
+**Decided without GPUs, worth confirming on them:** 8a's recipe variants
+were not re-run since leasing, and 8b's `shm_size` fixes a TP failure not yet
+observed here.

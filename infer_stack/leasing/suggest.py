@@ -359,6 +359,9 @@ def derive_runtime(
 
     if model.preferred_gpu_count > 1:
         runtime['tensor_parallel_size'] = model.preferred_gpu_count
+        # Workers across GPUs talk through /dev/shm; Docker's default is
+        # 64 MiB (vLLM's Docker guidance: a few GiB, or ipc: host).
+        runtime['shm_size'] = '16g'
 
     if model.defaults.get('enable_prefix_caching'):
         runtime['enable_prefix_caching'] = True

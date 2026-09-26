@@ -2,6 +2,17 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `/dev/shm` for vLLM on Compose, and the old recipes as suggestions
+
+`runtime.shm_size` (e.g. `16g`) sets a vLLM container's `/dev/shm` on the
+Compose backend; Docker's default is 64 MiB, and vLLM's workers share memory
+when a model spans GPUs. It is opt-in, so no running engine is recreated; a
+parallel engine without it logs a warning, and `catalog suggest` sets it on
+multi-GPU entries. The pre-leasing `docs/demos/`, `recipies/` and `examples/`
+are removed: their 4 x 96 GB vLLM tuning is now three suggestion variants
+(`qwen3.5-122b-a10b-tp4-128k`, `qwen3.5-122b-a10b-fp8-tp4-262k`,
+`qwen3.6-35b-a3b-tp2-262k`).
+
 ### The gateway can run inside the cluster
 
 `infer-stack config set kubeai_gateway cluster` runs the LiteLLM gateway as a

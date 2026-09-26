@@ -272,3 +272,23 @@ def test_display_gpu_reservation_shrinks_the_pool():
 def test_empty_inventory_yields_empty_suggestion():
     out = suggest_catalog({'gpu_count': 0, 'gpus': []})
     assert out == {'models': {}, 'endpoints': {}}
+
+
+def test_a_4x96_host_gets_the_former_recipes_as_variants():
+    # Queue item 8a: the pre-leasing 4 x 96 GB recipes live on as gated
+    # variants, so `catalog suggest` offers their tuning where it applies.
+    inv = {'gpu_count': 4, 'gpus': [_gpu(i, 96) for i in range(4)]}
+    out = suggest_catalog(inv)
+    eps = out['endpoints']
+    wanted = {'qwen3.5-122b-a10b-tp4-128k': (4, 131072),
+              'qwen3.5-122b-a10b-fp8-tp4-262k': (4, 262144),
+              'qwen3.6-35b-a3b-tp2-262k': (2, 262144)}
+    for name, (tp, ctx) in wanted.items():
+        rt = eps[name]['runtime']
+        assert (rt['tensor_parallel_size'], rt['max_model_len']) == (tp, ctx)
+        assert rt['shm_size'] == '16g'
+        assert rt['extra_args'] == ['--language-model-only', '--reasoning-parser', 'qwen3']
+    Catalog.from_dict(out)                          # a valid catalog as suggested
+
+    small = {'gpu_count': 2, 'gpus': [_gpu(i, 48) for i in range(2)]}
+    assert not set(wanted) & set(suggest_catalog(small)['endpoints'])

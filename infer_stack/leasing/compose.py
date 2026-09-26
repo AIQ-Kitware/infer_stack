@@ -367,6 +367,8 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         # vLLM's (see profile_runtime.simulator_args). Absent => a real engine.
         'simulator': runtime.get('simulator') or None,
         'extra_args': list(runtime.get('extra_args', []) or []),
+        # Compose only (a KubeAI pod mounts a memory-backed /dev/shm already).
+        'shm_size': runtime.get('shm_size'),
     }
 
 
@@ -395,6 +397,28 @@ def _serve_config_hash(
         ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+_SHM_WARNED: set[str] = set()
+
+
+def _warn_small_shm(deployment: Deployment, svc: dict[str, Any]) -> None:
+    """Once per deployment: a parallel vLLM engine on Docker's 64 MiB /dev/shm.
+
+    vLLM's workers talk through shared memory when a model spans GPUs, and
+    Docker gives a container 64 MiB of it. Opt-in, not a default: setting it
+    on existing engines would change their rendered service, and recreate
+    them, for every catalog that works today.
+    """
+    parallel = svc['tensor_parallel_size'] * svc['pipeline_parallel_size']
+    if parallel <= 1 or deployment.id in _SHM_WARNED:
+        return
+    _SHM_WARNED.add(deployment.id)
+    from .._log import logger
+    logger.warning(
+        '{} spans {} GPUs on Docker\'s 64 MiB /dev/shm; if its workers fail on '
+        'shared memory, set runtime.shm_size (e.g. 16g) on the endpoint',
+        served_name(deployment), parallel)
 
 
 def _vllm_service(
@@ -497,6 +521,10 @@ def _vllm_service(
         service['ports'] = [f'{host_port}:8000']
     if gpus:
         service['deploy'] = _gpu_reservation(gpus)
+    if svc.get('shm_size') and not simulated:
+        service['shm_size'] = str(svc['shm_size'])
+    elif not simulated:
+        _warn_small_shm(deployment, svc)
     if simulated:
         # A simulator downloads no weights and compiles no graphs, so the
         # caches above are dead weight -- and worse, the images ship
