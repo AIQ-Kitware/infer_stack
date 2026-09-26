@@ -310,12 +310,14 @@ def upstream_route(deployment_id: str, endpoint: str, served: str,
 def _merge_route_registry(
     existing: dict[str, Any], incoming: dict[str, dict[str, Any]]
 ) -> tuple[dict[str, Any], list[str]]:
-    """Merge ``incoming`` semantic rows into ``existing`` (append-only).
+    """Merge ``incoming`` semantic rows into ``existing`` (a render's merge).
 
-    Idempotent (merging identical rows is a no-op) and additive (never removes a
-    row). On a conflict — same key, different row — *incoming wins* and a warning
-    naming both definitions is emitted; the changed definition changes the
-    rendered bytes, which is the one justified recreate. The existing ``version``
+    Idempotent (merging identical rows is a no-op) and never removes a row. On
+    a conflict (same key, different row) *incoming wins* with a warning: this
+    is how a render folds in the invoking catalog, so an endpoint whose
+    catalog entry was edited gets its new route, the one justified recreate.
+    Seeding other catalogs is not this: ``routes seed`` refuses a redefinition
+    (:mod:`infer_stack.leasing.routes`). The existing ``version``
     is preserved (an unknown version merged under is not silently rewritten to
     the current schema; see :meth:`ComposeBackend._load_route_registry`)."""
     version = LITELLM_REGISTRY_VERSION
@@ -1207,6 +1209,26 @@ class Gateway(ConvergeScaffold):
         if updated:
             logger.info('  route registry: updated route(s): {}', ', '.join(updated))
         self._atomic_write(self._registry_file, _dump_route_registry(merged))
+
+    def route_registry(self) -> dict[str, Any]:
+        """The registry as stored: ``{'version': ..., 'entries': {...}}``."""
+        registry = self._load_route_registry()
+        return registry if isinstance(registry, dict) else {}
+
+    def route_entries(self) -> dict[str, dict[str, Any]]:
+        """The registry's entries: public alias -> route row."""
+        entries = self.route_registry().get('entries')
+        return dict(entries) if isinstance(entries, dict) else {}
+
+    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
+        """Write the registry's entries (under the converge flock, atomically);
+        its schema version is kept."""
+        with self._converge_lock():
+            existing = self._load_route_registry()
+            version = (existing.get('version', LITELLM_REGISTRY_VERSION)
+                       if isinstance(existing, dict) else LITELLM_REGISTRY_VERSION)
+            self._atomic_write(self._registry_file, _dump_route_registry(
+                {'version': version, 'entries': dict(entries)}))
 
     def merge_route_registry(
         self, incoming: dict[str, dict[str, Any]]

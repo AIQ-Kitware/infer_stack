@@ -662,7 +662,7 @@ then other IDLE, creation order within each; the controller passes
 live 32k deployment with nothing revived or started, and a resident idle
 deployment beats an older one that is gone (both fail on the old code).
 
-### 19. [ ] `routes seed` fails closed on a redefinition; one route API
+### 19. [x] `routes seed` fails closed on a redefinition; one route API
 
 *Why added:* the registry merge is documented as additive, but a same-name
 row with a different definition wins with a warning, and `routes seed`
@@ -679,6 +679,19 @@ and asks. The CLI presents and confirms only.
 **Done when:** tests: seed A; seed identical A is a no-op; seed a
 conflicting A refuses and leaves the registry unchanged; the override
 reports A updated. No private names from the CLI.
+
+*Done 2026-09-27:* `leasing/routes.py` plans a seed (added, unchanged,
+conflicted) or a prune (dropped); `Controller.plan_route_seed/prune` and
+`commit_route_seed/prune` recheck under the lock and publish through
+`publish_change`; the gateway exposes `route_registry()`,
+`route_entries()`, `replace_route_entries()`. `routes seed` refuses a
+redefinition and leaves the registry unchanged unless `--replace` (which
+lists each change and asks on a terminal); its JSON says added, unchanged,
+updated, conflicted. The CLI uses no private name. The render's own merge
+keeps "incoming wins" (an edited catalog updates its route) and its
+docstring now says so. Also fixed: under `--json` the conflict list went to
+stdout and broke the JSON. Test: seed, identical seed, refused conflict,
+`--replace` (fails on the old code).
 
 ### 20. [ ] Preview does not write secrets
 

@@ -260,6 +260,20 @@ class ServingBackend(Protocol):
         residents that yielded their GPUs). Empty where nothing is placed."""
         ...
 
+    def front_door(self) -> Any:
+        """What holds the LiteLLM gateway (its keys and route registry), or
+        ``None`` for a backend without one."""
+        ...
+
+    def route_rows(self, desired: list[Deployment], placement: Any = None
+                   ) -> dict[str, dict[str, Any]]:
+        """The gateway route rows a render of ``desired`` merges in."""
+        ...
+
+    def catalog_route_rows(self, catalog: Any) -> dict[str, dict[str, Any]]:
+        """The route rows every endpoint of ``catalog`` would get."""
+        ...
+
     def reclaim_candidates(self, blocked: Deployment,
                            idle: list[Deployment]) -> list[str]:
         """Which of ``idle`` could free room ``blocked`` is waiting for.
@@ -466,6 +480,16 @@ class SimpleAdmission:
                            idle: list[Deployment]) -> list[str]:
         """One scheduling domain in-process: any idle deployment frees room."""
         return [g.id for g in idle]
+
+    def front_door(self) -> Any:
+        return None                     # no gateway in-process
+
+    def route_rows(self, desired: list[Deployment], placement: Any = None
+                   ) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def catalog_route_rows(self, catalog: Any) -> dict[str, dict[str, Any]]:
+        return {}
 
     def plan(self, desired: list[Deployment], placement: Any = None):
         """Which of ``desired`` fit; here, all of them, on no GPU."""

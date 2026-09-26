@@ -2569,19 +2569,15 @@ class EnvCLI(_PathOverridesMixin):
 # ---------------------------------------------------------------------------
 
 
-def _require_compose_backend(controller):
-    """What holds the gateway's route registry (its front door).
+def _routes_or_exit(call):
+    """Run a route-registry operation; its refusals become CLI errors."""
+    from ..leasing.profile import ProfileMismatch
+    from ..leasing.routes import RouteConflict
 
-    The stack itself on the compose backend; on kubeai the gateway, on this
-    host or in the cluster. A SystemExit for a backend with no gateway (null,
-    or ``litellm false``)."""
-    project = getattr(controller.backend, 'front_door', lambda: None)()
-    if project is None or not getattr(project, 'litellm', False):
-        raise SystemExit(
-            'the `routes` commands need a LiteLLM gateway (the compose or kubeai '
-            'backend, with `litellm` on)'
-        )
-    return project
+    try:
+        return call()
+    except (ProfileMismatch, RouteConflict) as ex:
+        raise SystemExit(f'routes: {ex}')
 
 
 def _live_endpoints(controller) -> set[str]:
@@ -2616,8 +2612,7 @@ class RoutesListCLI(_LeasingCommonMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        backend = _require_compose_backend(controller)
-        registry = backend.gateway._load_route_registry()
+        registry = _routes_or_exit(controller.route_registry)
         entries = registry.get('entries', {})
         live = _live_endpoints(controller)
 
@@ -2681,70 +2676,30 @@ class RoutesPruneCLI(_ApprovalMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from ..diff_prompt import confirm_writes
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.gateway import LITELLM_REGISTRY_VERSION, _dump_route_registry
 
         config = cls.cli(argv=argv, data=kwargs)
         # interactive=False so reconcile auto-applies the compose diff; the
         # meaningful gate (which routes get dropped) is confirmed here instead.
         controller = _open_controller(config, interactive=False)
-        backend = _require_compose_backend(controller)
-
-        def prune_plan() -> tuple[dict, dict, list[str]]:
-            # The desired set exactly as the next render sees it, and the rows
-            # that render merges: the catalog's and the live deployments'.
-            # Any: _require_compose_backend above confirmed a gateway, and
-            # both backends that have one supply route rows.
-            engines: Any = controller.backend
-            desired, inputs = controller._admission_view(engines.residency())
-            keep = dict(engines.route_rows(desired, inputs))
-            current = backend.gateway._load_route_registry().get('entries', {})
-            return current, keep, sorted(set(current) - set(keep))
-
-        # Preview outside the lock (the prompt must not hold it); the change
-        # itself is recomputed under the lock below.
-        _, keep, dropped = prune_plan()
-        if not dropped:
+        # Planned outside the lock (the prompt must not hold it); the commit
+        # rechecks under the lock and drops only what is still unneeded.
+        plan = _routes_or_exit(controller.plan_route_prune)
+        if not plan.dropped:
             print('routes prune: nothing to drop (registry already minimal)')
             return 0
-
-        pruned = {'version': LITELLM_REGISTRY_VERSION, 'entries': keep}
         skip_prompt = bool(config.yes) or not sys.stdout.isatty()
         if not skip_prompt:
             print('routes prune will DROP these routes:')
-            for name in dropped:
+            for name in plan.dropped:
                 print(f'  - {name}')
-            ok = confirm_writes(
-                {backend.gateway._registry_file: _dump_route_registry(pruned)},
-                assume_yes=False,
-                title='infer-stack routes prune',
-            )
-            if not ok:
+            if input('drop them? [y/N] ').strip().lower() not in ('y', 'yes'):
                 raise SystemExit('aborted: registry not pruned')
-
-        confirmed = set(dropped)
-
-        def change():
-            # Under the lock: drop only routes that were confirmed AND are still
-            # unneeded now; anything that became needed meanwhile is kept. (No
-            # sweep: an expired-but-unswept deployment only keeps its routes.)
-            current, _, still = prune_plan()
-            drop = sorted(confirmed & set(still))
-            entries = {k: v for k, v in current.items() if k not in drop}
-            with backend._converge_lock():
-                backend._atomic_write(
-                    backend.gateway._registry_file,
-                    _dump_route_registry(
-                        {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}),
-                )
-            return drop, sorted(entries)
-
         try:
-            (dropped, kept), rec = controller.publish_change(change)
+            dropped, rec = _routes_or_exit(lambda: controller.commit_route_prune(plan))
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
-
+        kept = sorted(_routes_or_exit(controller.route_registry).get('entries', {}))
         if config.json:
             print(json.dumps({'dropped': dropped, 'kept': kept,
                               'publication_pending': rec.publication_pending}, indent=2))
@@ -2766,9 +2721,18 @@ class RoutesSeedCLI(_ApprovalMixin):
 
     Unlike a normal converge (which only ever merges the *invoking* process's own
     catalog), this folds in sibling catalogs you name explicitly.
+
+    Adding an alias is additive; redefining one already in the registry
+    redirects its clients, so that is refused and nothing is written unless
+    ``--replace`` is given (which shows each change and asks on a terminal).
     """
 
     __command__ = 'seed'
+
+    replace = kw.Value(
+        False, isflag=True,
+        help='Redefine aliases the registry already routes elsewhere.',
+    )
 
     catalogs = kw.Value(
         None, nargs='+', position=1, type=str,
@@ -2785,50 +2749,53 @@ class RoutesSeedCLI(_ApprovalMixin):
         paths = _collect_names(config.catalogs)
         if not paths:
             raise SystemExit('routes seed: name at least one catalog.yaml file')
-        # interactive=False: the reconcile auto-applies (seeding is additive, so
-        # there is no destructive gate to confirm).
-        controller = _open_controller(config, interactive=False)
-        backend = _require_compose_backend(controller)
-        # Any: a gateway exists (checked above), and its backend supplies rows.
-        engines: Any = controller.backend
-
-        incoming: dict = {}
+        catalogs = []
         for raw in paths:
             path = Path(raw).expanduser()
             if not path.exists():
                 raise SystemExit(f'catalog not found: {path}')
             try:
-                cat = Catalog.load(path)
+                catalogs.append(Catalog.load(path))
             except CatalogError as ex:
                 raise SystemExit(f'invalid catalog {path}: {ex}')
-            # The engine backend's rows for it: compose upstreams on compose,
-            # the cluster's Models on kubeai.
-            incoming.update(engines.catalog_route_rows(cat))
-        if not incoming:
+        # interactive=False: the reconcile auto-applies; the gate that matters
+        # (a redefined alias) is decided here.
+        controller = _open_controller(config, interactive=False)
+        plan = _routes_or_exit(lambda: controller.plan_route_seed(catalogs))
+        if not plan.incoming:
             raise SystemExit(
                 'routes seed: the named catalog(s) resolved no routable endpoints'
             )
-
-        def change():
-            before = set(backend.gateway._load_route_registry().get('entries', {}))
-            backend.merge_route_registry(incoming)
-            return sorted(set(incoming) - before)
-
+        if plan.conflicted:
+            # stderr under --json, which must stay one JSON document on stdout.
+            out = sys.stderr if config.json else sys.stdout
+            print(f'routes seed: {len(plan.conflicted)} alias(es) would be redefined:',
+                  file=out)
+            for name, (old, new) in sorted(plan.conflicted.items()):
+                print(f'  ~ {name}: {old} -> {new}', file=out)
+            if not config.replace:
+                raise SystemExit('routes seed: refused, the registry is unchanged '
+                                 '(pass --replace to redefine them)')
+            if not (bool(config.yes) or not sys.stdout.isatty()):
+                if input('redefine them? [y/N] ').strip().lower() not in ('y', 'yes'):
+                    raise SystemExit('aborted: registry unchanged')
         try:
-            added, rec = controller.publish_change(change)
+            done, rec = _routes_or_exit(
+                lambda: controller.commit_route_seed(plan, replace=bool(config.replace)))
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
-
+        updated = sorted(done.conflicted) if config.replace else []
         if config.json:
             print(json.dumps(
-                {'merged': sorted(incoming), 'added': added,
+                {'added': sorted(done.added), 'unchanged': done.unchanged,
+                 'updated': updated, 'conflicted': sorted(done.conflicted),
                  'publication_pending': rec.publication_pending}, indent=2
             ))
         else:
-            print(
-                f'routes seed: merged {len(incoming)} route(s) '
-                f'({len(added)} new): {", ".join(added) or "(all already present)"}'
-            )
+            print(f'routes seed: {len(done.added)} added, {len(done.unchanged)} '
+                  f'unchanged, {len(updated)} updated'
+                  + (f': {", ".join(sorted(done.added) + updated)}'
+                     if done.added or updated else ''))
         return 3 if rec.publication_pending else 0
 
 

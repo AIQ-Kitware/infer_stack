@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
 from .backend import ApplyResult, HostRuntime, ServingBackend
+from .routes import RoutePlan
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
 
@@ -1776,6 +1777,89 @@ class Controller:
                 evicted = self.ledger.evict_idle(idled)
             rec = self._publish()
         return ReleaseLeasesOutcome(released, missing, idled, list(evicted), rec)
+
+    # -- the gateway's route registry (routes seed / prune) ----------------
+
+    def _route_gateway(self):
+        """The front door's gateway, or a ProfileMismatch saying there is none."""
+        from .profile import ProfileMismatch
+
+        front = self.backend.front_door()
+        if front is None or not getattr(front, 'litellm', False):
+            raise ProfileMismatch(
+                'the `routes` commands need a LiteLLM gateway (the compose or '
+                'kubeai backend, with `litellm` on)')
+        return front.gateway
+
+    def route_registry(self) -> dict:
+        """The route registry as stored (``routes list``)."""
+        return self._route_gateway().route_registry()
+
+    def plan_route_seed(self, catalogs: Iterable) -> RoutePlan:
+        """What seeding these catalogs' routes would add, keep, or redefine."""
+        from .routes import plan_seed
+
+        gateway = self._route_gateway()
+        incoming: dict[str, dict] = {}
+        for catalog in catalogs:
+            incoming.update(self.backend.catalog_route_rows(catalog))
+        return plan_seed(gateway.route_entries(), incoming)
+
+    def commit_route_seed(self, plan: RoutePlan, *, replace: bool = False
+                          ) -> tuple[RoutePlan, ReconcileResult]:
+        """Add the plan's routes and publish; redefine conflicts only with
+        ``replace``. Rechecked under the lock: a conflict that appeared since
+        the plan refuses too (:class:`~infer_stack.leasing.routes.RouteConflict`)
+        and nothing is written."""
+        from .routes import RouteConflict, plan_seed
+
+        gateway = self._route_gateway()
+        fresh = plan_seed(gateway.route_entries(), plan.incoming)
+        if fresh.conflicted and not replace:
+            raise RouteConflict(sorted(fresh.conflicted))
+
+        def change():
+            now = plan_seed(gateway.route_entries(), plan.incoming)
+            if now.conflicted and not replace:
+                raise RouteConflict(sorted(now.conflicted))
+            entries = gateway.route_entries()
+            entries.update(now.added)
+            if replace:
+                entries.update({name: new for name, (_, new) in now.conflicted.items()})
+            if entries != gateway.route_entries():
+                gateway.replace_route_entries(entries)
+            return now
+
+        return self.publish_change(change)
+
+    def plan_route_prune(self) -> RoutePlan:
+        """Which routes a prune drops: all but the catalog's and the live ones,
+        exactly as the next render would keep them."""
+        from .routes import plan_prune
+
+        gateway = self._route_gateway()
+        desired, inputs = self._admission_view(self.backend.residency())
+        return plan_prune(gateway.route_entries(), self.backend.route_rows(desired, inputs))
+
+    def commit_route_prune(self, plan: RoutePlan) -> tuple[list[str], ReconcileResult]:
+        """Drop the plan's routes that are still unneeded, and publish. A route
+        that became needed since the plan is kept."""
+        from .routes import plan_prune
+
+        gateway = self._route_gateway()
+        confirmed = set(plan.dropped)
+
+        def change():
+            desired, inputs = self._admission_view(self.backend.residency())
+            current = gateway.route_entries()
+            still = plan_prune(current, self.backend.route_rows(desired, inputs)).dropped
+            drop = sorted(confirmed & set(still))
+            if drop:
+                gateway.replace_route_entries(
+                    {k: v for k, v in current.items() if k not in drop})
+            return drop
+
+        return self.publish_change(change)
 
     def publish_change(self, change: Callable[[], _T]) -> tuple[_T, ReconcileResult]:
         """Run ``change`` and publish, as one serialised desired-state mutation.

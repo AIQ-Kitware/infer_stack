@@ -1169,3 +1169,42 @@ def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
     (tmp_path / 'lease.env').write_text('export OPENAI_BASE_URL=x\n')
     with pytest.raises(SystemExit, match='names no lease'):
         ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+
+
+def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monkeypatch, capsys):
+    """Queue item 19: seeding a new alias is additive; seeding a different
+    definition of an existing alias redirects its clients, so it refuses by
+    default and leaves the registry as it was."""
+    from infer_stack.cli.commands_leasing import RoutesSeedCLI
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    first = tmp_path / 'a.yaml'
+    first.write_text(yaml.safe_dump(_one_endpoint_catalog('alpha')))
+    other = _one_endpoint_catalog('alpha')
+    other['endpoints']['alpha']['served_name'] = 'alpha-v2'   # alpha, routed elsewhere
+    second = tmp_path / 'b.yaml'
+    second.write_text(yaml.safe_dump(other))
+
+    def seed(*args):
+        capsys.readouterr()
+        rc = RoutesSeedCLI.main(argv=['--ledger', db, *args, '--json', '--yes'])
+        return rc, json.loads(capsys.readouterr().out)
+
+    rc, out = seed(str(first))
+    assert rc == 0 and out['added'] == ['alpha']
+    registry = (state / 'litellm_registry.json').read_text()
+
+    rc, out = seed(str(first))                                  # identical: a no-op
+    assert out['added'] == [] and out['unchanged'] == ['alpha']
+    assert (state / 'litellm_registry.json').read_text() == registry
+
+    with pytest.raises(SystemExit, match='refused'):
+        RoutesSeedCLI.main(argv=['--ledger', db, str(second), '--yes'])
+    assert (state / 'litellm_registry.json').read_text() == registry   # unchanged
+
+    rc, out = seed(str(second), '--replace')
+    assert rc == 0 and out['updated'] == ['alpha']
+    assert (state / 'litellm_registry.json').read_text() != registry
