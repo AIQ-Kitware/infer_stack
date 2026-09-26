@@ -56,7 +56,9 @@ memory line reaches the pod log.
 with the same output shape as on Compose, and the TUI follows a Model's log
 and lists its pod (checked in a real terminal, not only in tests).
 
-### 4. [ ] P3: gateway feature parity
+### 4. [x] P3: gateway feature parity
+
+Done 2026-09-26.
 
 `routes` and `secrets rotate` resolve the backend's gateway instead of
 checking its kind; the KubeAI gateway project honours `ui`,

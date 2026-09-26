@@ -578,6 +578,7 @@ def render_compose(
     catalog: Any = None,
     route_registry: dict[str, Any] | None = None,
     dynamic_routing: bool = False,
+    upstream_routes: list[dict[str, Any]] | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
 
@@ -665,7 +666,7 @@ def render_compose(
         reverse_proxy=reverse_proxy, reverse_proxy_port=reverse_proxy_port,
         reverse_proxy_config=reverse_proxy_config, aux_dir=aux_dir,
         catalog=catalog, route_registry=route_registry,
-        dynamic_routing=dynamic_routing,
+        dynamic_routing=dynamic_routing, upstream_routes=upstream_routes,
     )
     services.update(front.services)
     litellm_config = front.litellm_config
@@ -1426,6 +1427,7 @@ class ComposeBackend(ConvergeScaffold):
             reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
             project=self.project, catalog=self.catalog,
             route_registry=route_registry, dynamic_routing=self.dynamic_routing,
+            upstream_routes=self.upstream_routes,
         )
         addresses = None
         if self.network is not None:
@@ -1622,11 +1624,29 @@ class ComposeBackend(ConvergeScaffold):
         placed deployment (``desired`` spans all runbooks via the shared ledger,
         so a live cross-runbook deployment stays routable, and past release).
         """
-        incoming: dict[str, dict[str, Any]] = {}
-        if self.catalog is not None:
-            incoming.update(_registry_incoming_from_catalog(self.catalog))
+        incoming = self.catalog_route_rows(self.catalog)
         incoming.update(_registry_incoming_from_deployments(desired, assignments))
+        incoming.update(self.upstream_rows)
         return self.gateway.merged_route_registry(incoming)
+
+    #: Render inputs from the owner of engines this project does not run (the
+    #: kubeai backend, whose gateway this is): static route-registry rows and
+    #: dynamic routes, both pointing at its servers. Set before each render.
+    upstream_rows: dict[str, dict[str, Any]] = {}
+    upstream_routes: list[dict[str, Any]] = []
+
+    def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
+        """Route-registry rows for every endpoint of ``catalog``."""
+        return {} if catalog is None else _registry_incoming_from_catalog(catalog)
+
+    def route_rows(self, desired: list[Deployment], placement=None) -> dict[str, dict[str, Any]]:
+        """The rows a render of ``desired`` merges: catalog, placed deployments,
+        and the owner's upstream rows (``routes prune`` keeps exactly these)."""
+        assignments = self.plan(desired, placement).assignments
+        rows = self.catalog_route_rows(self.catalog)
+        rows.update(_registry_incoming_from_deployments(desired, assignments))
+        rows.update(self.upstream_rows)
+        return rows
 
     def _update_route_registry(
         self, desired: list[Deployment], assignments: dict[str, list[int]]

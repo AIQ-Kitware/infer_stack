@@ -773,15 +773,18 @@ def test_a_slow_start_is_not_a_failure(tmp_path):
     assert not probe.ready and not probe.fatal
 
 
-def test_compose_only_commands_refuse_kubeai_explicitly(tmp_path, monkeypatch):
-    """`gc --orphans` used "has residency" to mean compose; kubeai has it now."""
+def test_gc_orphans_on_kubeai_finds_nothing_to_remove(tmp_path, monkeypatch, capsys):
+    """Residency selects pods by infer-stack's label, so none is an orphan:
+    the command runs on kubeai and never deletes anything."""
     from infer_stack.cli import commands_leasing
 
-    be, _ = make_pod_backend(tmp_path)
+    be, kubectl = make_pod_backend(tmp_path)
+    kubectl.pods = [_pod('model-a-0', 'grp-1', ready=True)]
     ctl = Controller(Ledger(SqliteStore(str(tmp_path / 'l.db'))), be)
     monkeypatch.setattr(commands_leasing, '_open_controller', lambda *a, **k: ctl)
-    with pytest.raises(SystemExit, match='needs the compose backend'):
-        commands_leasing.GcCLI.main(argv=['--orphans', '--yes'])
+    assert commands_leasing.GcCLI.main(argv=['--orphans', '--yes']) == 0
+    assert 'removed 0' in capsys.readouterr().out
+    assert not any('delete' in call or 'rm' in call for call in kubectl.calls)
 
 
 def test_runtime_env_reaches_the_model_like_it_reaches_a_container():
@@ -793,3 +796,128 @@ def test_runtime_env_reaches_the_model_like_it_reaches_a_container():
     (doc,) = rendered.docs
     assert doc['spec']['env'] == {'MODE': 'fast', 'CTX': '4096', 'ON': 'true',
                                   'VLLM_ATTENTION_BACKEND': 'TORCH_SDPA'}
+
+
+# -- the front door: same settings, same approval, same routes (P3) -----------
+
+
+def make_front_door_backend(tmp_path, **gateway_kw):
+    from infer_stack.leasing.compose import ComposeBackend
+    from test_leasing_compose import FakeDocker
+
+    kubectl = FakeKubectl()
+    gateway = ComposeBackend(
+        state_dir=tmp_path / 'gateway', inventory={'gpu_count': 0, 'gpus': []},
+        run=FakeDocker(), http=GatewayHttp(kubectl, tmp_path / 'gateway'),
+        project='infer-stack-gateway', litellm=True,
+        images={'litellm': 'litellm:test', 'open-webui': 'owui:test',
+                'nginx': 'nginx:test', 'postgres': 'pg:test'},
+        **gateway_kw,
+    )
+    be = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=kubectl,
+                       http=gateway.http, gateway=gateway, gateway_upstream=UPSTREAM)
+    return be, kubectl
+
+
+def _services(be):
+    doc = yaml.safe_load(be.gateway.compose_file.read_text())
+    return set(doc['services'])
+
+
+def test_the_gateway_project_takes_the_front_door_settings(tmp_path):
+    be, _ = make_front_door_backend(tmp_path, ui=True, reverse_proxy=True)
+    from infer_stack.leasing.gateway import NGINX_SERVICE, OPEN_WEBUI_SERVICE
+
+    be.converge([vllm('grp-a', served='tiny')], apply=False)
+    assert {'litellm', OPEN_WEBUI_SERVICE, NGINX_SERVICE} <= _services(be)
+
+
+def test_dynamic_routing_gives_each_dedicated_deployment_its_own_model(tmp_path):
+    be, kubectl = make_front_door_backend(tmp_path, dynamic_routing=True)
+    a = vllm('grp-aaaaaaaa1111', served='tiny', t=1.0)
+    b = vllm('grp-bbbbbbbb2222', served='tiny', t=2.0)
+    for dep in (a, b):
+        dep.served = {'tiny': {'served_model_name': 'tiny', 'protocol': 'chat'}}
+    be.converge([a, b], apply=False)
+    models = yaml.safe_load_all(be.models_file.read_text())
+    assert {m['metadata']['name'] for m in models} == {'tiny-aaaaaaaa', 'tiny-bbbbbbbb'}
+    routes = json.loads((be.gateway.state_dir / 'litellm_routes.json').read_text())
+    assert sorted(r['litellm_params']['model'] for r in routes) == [
+        'openai/tiny-aaaaaaaa', 'openai/tiny-bbbbbbbb']
+    assert {r['model_name'] for r in routes} == {'tiny'}   # one alias, two upstreams
+    assert 'postgres-litellm' in _services(be)
+
+
+def test_catalog_endpoints_are_routed_before_they_run(tmp_path):
+    """The static superset, as on compose: acquiring a catalog endpoint does
+    not change the gateway's config, so the gateway is not recreated."""
+    from infer_stack.leasing import Catalog
+
+    be, _ = make_front_door_backend(tmp_path)
+    be.catalog = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {'tiny': {'engine': 'vllm', 'model': 'm'}},
+    })
+    be.converge([], apply=False)
+    before = (be.gateway.state_dir / 'litellm_config.yaml').read_text()
+    assert 'tiny' in before
+    dep = vllm('grp-a', served='tiny')
+    dep.served = {'tiny': {'served_model_name': 'tiny', 'protocol': 'chat'}}
+    be.converge([dep], apply=False)
+    assert (be.gateway.state_dir / 'litellm_config.yaml').read_text() == before
+
+
+def test_the_gateways_changes_are_approved_in_the_preview(tmp_path, monkeypatch):
+    """One approval, before the lease commits: a decline writes neither the
+    Models nor the gateway's route registry."""
+    from infer_stack import diff_prompt as dp
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    be, _ = make_front_door_backend(tmp_path)
+    be.assume_yes = be.gateway.assume_yes = False
+    asked = []
+    monkeypatch.setattr(dp, 'confirm_writes', lambda changed, **kw: asked.append(
+        sorted(p.name for p in changed)) or False)
+    with pytest.raises(ConvergeAborted):
+        be.preview([vllm('grp-a', served='tiny')], approve=True)
+    assert not be.models_file.exists()
+    assert not be.gateway.gateway._registry_file.exists()
+
+    asked.clear()
+    monkeypatch.setattr(dp, 'confirm_writes', lambda changed, **kw: asked.append(
+        sorted(p.name for p in changed)) or True)
+    desired = [vllm('grp-a', served='tiny')]
+    be.preview(desired, approve=True)
+    approved = be.last_preview_digest
+    assert any('litellm_config.yaml' in names for names in asked)
+    asked.clear()
+    be.converge(desired, apply=False)
+    assert asked == []                                # not asked a second time
+    assert be.last_planned_digest == approved         # the approved-digest guard holds
+
+
+def test_routes_list_shows_kubeai_upstreams(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli import commands_leasing
+
+    be, _ = make_front_door_backend(tmp_path)
+    dep = vllm('grp-a', served='Qwen/Qwen2.5-0.5B')
+    dep.served = {'tiny': {'served_model_name': 'Qwen/Qwen2.5-0.5B', 'protocol': 'chat'}}
+    be.converge([dep], apply=False)
+    ctl = Controller(Ledger(SqliteStore(str(tmp_path / 'l.db'))), be)
+    monkeypatch.setattr(commands_leasing, '_open_controller', lambda *a, **k: ctl)
+    capsys.readouterr()                                  # the render's own output
+    assert commands_leasing.RoutesListCLI.main(argv=['--json']) == 0
+    (row,) = json.loads(capsys.readouterr().out)['routes']
+    assert row['name'] == 'tiny' and row['engine'] == 'upstream'
+    assert row['target'] == 'qwen-qwen2-5-0-5b' and row['upstream'] == UPSTREAM
+
+
+def test_the_front_doors_settings_are_in_the_recovery_profile(tmp_path):
+    be, _ = make_front_door_backend(tmp_path, ui=True, dynamic_routing=True)
+    profile = be.render_profile()
+    assert profile['gateway']['ui'] is True and profile['gateway']['dynamic_routing'] is True
+    other, _ = make_front_door_backend(tmp_path / 'other')
+    other.use_profile(profile)
+    assert other.gateway.ui is True and other.dynamic_routing is True
+    other.use_profile({**profile, 'gateway': True})     # a profile from before
+    assert other.dynamic_routing is True                 # keeps what it has

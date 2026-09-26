@@ -148,5 +148,8 @@ infer-stack release --env-file lease.env
   as on compose. `stack compose …` and `stack restart` act on the gateway's
   Compose project; the engines are pods, restarted by the kubelet.
 - The gateway runs on the host running infer-stack, so that host is in every
-  request's path. Dynamic routing (`dynamic_routing`) is compose-only; the
-  KubeAI gateway uses static routes.
+  request's path. It takes the same settings as on compose: `ui` (Open WebUI,
+  on by default), `reverse_proxy`, and `dynamic_routing`, under which each
+  deployment is its own Model (`<name>-<id tail>`), so `--dedicated` twice
+  gives two Models behind one alias. The gateway's config changes are shown
+  and approved with the acquire's, before its lease commits.

@@ -261,30 +261,49 @@ def _litellm_model_list_from_registry(
     entries: list[dict[str, Any]] = []
     rows = registry.get('entries', {}) if isinstance(registry, dict) else {}
     for name in sorted(rows):
-        row = rows[name]
-        if not isinstance(row, dict):
-            continue
-        engine = row.get('engine')
-        if engine == 'vllm':
-            served = row.get('served') or name
-            api_base = (
-                f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1'
-            )
-            entries.append(_vllm_route_entry(name, served, api_base))
-        elif engine == 'ollama':
-            tag = row.get('model') or name
-            host = row.get('host') or name
-            api_base = (
-                f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
-            )
-            entries.append(_ollama_route_entry(name, tag, api_base))
-        elif engine == UPSTREAM_ROUTE and row.get('api_base'):
-            # An OpenAI-compatible server this project does not run (a KubeAI
-            # cluster's gateway): the row carries its address and the name it
-            # serves the model under.
-            entries.append(_vllm_route_entry(name, row.get('served') or name,
-                                             str(row['api_base'])))
+        entry = registry_route_entry(name, rows[name])
+        if entry is not None:
+            entries.append(entry)
     return entries
+
+
+def registry_route_entry(name: str, row: Any) -> dict[str, Any] | None:
+    """The LiteLLM entry one registry row renders to, or ``None`` if it cannot.
+
+    The one derivation of a row's upstream: the render uses it, and so does
+    ``routes list``. Upstreams come from the live naming helpers, so the
+    registry never becomes a rendered-config parse surface.
+    """
+    if not isinstance(row, dict):
+        return None
+    engine = row.get('engine')
+    if engine == 'vllm':
+        served = row.get('served') or name
+        api_base = f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1'
+        return _vllm_route_entry(name, served, api_base)
+    if engine == 'ollama':
+        tag = row.get('model') or name
+        host = row.get('host') or name
+        api_base = f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}'
+        return _ollama_route_entry(name, tag, api_base)
+    if engine == UPSTREAM_ROUTE and row.get('api_base'):
+        # An OpenAI-compatible server this project does not run (a KubeAI
+        # cluster's gateway): the row carries its address and the name it
+        # serves the model under.
+        return _vllm_route_entry(name, row.get('served') or name, str(row['api_base']))
+    return None
+
+
+def upstream_route(deployment_id: str, endpoint: str, served: str,
+                   api_base: str) -> dict[str, Any]:
+    """A dynamic route to a server this project does not run (a KubeAI Model).
+
+    The same entry shape, and the same deterministic id, as a Compose engine's
+    dynamic route (:func:`_litellm_routes`).
+    """
+    entry = _vllm_route_entry(endpoint, served, api_base)
+    entry['model_info'] = {'id': _route_id(deployment_id, endpoint)}
+    return entry
 
 
 def _merge_route_registry(
@@ -399,17 +418,7 @@ def _litellm_routes(
                 f':{VLLM_CONTAINER_PORT}/v1'
             )
             for endpoint in sorted(deployment.served):
-                entries.append(
-                    {
-                        'model_name': endpoint,
-                        'litellm_params': {
-                            'model': f'openai/{served}',
-                            'api_base': api_base,
-                            'api_key': 'EMPTY',
-                        },
-                        'model_info': {'id': _route_id(deployment.id, endpoint)},
-                    }
-                )
+                entries.append(upstream_route(deployment.id, endpoint, served, api_base))
         elif deployment.engine == 'ollama':
             api_base = (
                 f'http://{ollama_service_name(deployment)}:{OLLAMA_CONTAINER_PORT}'
@@ -766,12 +775,15 @@ def render_front_door(
     catalog: Any,
     route_registry: dict[str, Any] | None,
     dynamic_routing: bool,
+    upstream_routes: list[dict[str, Any]] | None = None,
 ) -> FrontDoor:
     """Render the gateway, its database, Open WebUI and the reverse proxy.
 
     The engines are the caller's: it passes the services it rendered
     (``engine_services``, only for the legacy per-model ``depends_on``) and
     the in-network URLs a UI with no gateway can talk to directly.
+    ``upstream_routes`` are dynamic routes to servers this project does not
+    run (see :func:`upstream_route`).
     """
     services: dict[str, Any] = {}
     litellm_config = None
@@ -804,7 +816,8 @@ def render_front_door(
         #    config (and recreates the gateway) on every model change.
         if dynamic_routing:
             entries: list[dict[str, Any]] = []
-            litellm_routes = _litellm_routes(deployments, assignments)
+            litellm_routes = (_litellm_routes(deployments, assignments)
+                              + list(upstream_routes or []))
             litellm_depends: list[str] = []
         elif route_registry is not None:
             entries = _litellm_model_list_from_registry(route_registry)

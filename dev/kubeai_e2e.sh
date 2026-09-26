@@ -24,6 +24,9 @@
 #   GATEWAY                1 (default): clients go through infer-stack's LiteLLM
 #                          gateway, as on the compose backend. 0: straight to
 #                          KubeAI, where the alias below does NOT route (404).
+#   E2E_DYNAMIC            1 (default): finish with dynamic routing, two
+#                          --dedicated leases of one model (two Models at once).
+#   E2E_UI_PORT            Open WebUI's port on this host (default 13000).
 set -euo pipefail
 
 MODEL="${E2E_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
@@ -45,6 +48,7 @@ cleanup() {
   set +e
   run_is release --all --yes >/dev/null 2>&1
   run_is gc --evict --yes >/dev/null 2>&1
+  run_is stack down >/dev/null 2>&1          # the gateway, UI and database too
   # nothing managed may remain on the cluster, pass or fail
   leftover=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
       -l infer-stack/managed=true -o name 2>/dev/null | wc -l)
@@ -103,6 +107,26 @@ else
   exit 1
 fi
 
+if [ "${GATEWAY:-1}" = 1 ]; then
+  echo '== the gateway fronts the cluster as on compose: routes, Open WebUI'
+  if ! run_is routes list --json | python3 -c '
+import json, sys
+alias = sys.argv[1]
+row = next(r for r in json.load(sys.stdin)["routes"] if r["name"] == alias)
+assert row["engine"] == "upstream" and row["live"], row
+print("   routes list:", alias, "->", row["target"], "at", row["upstream"])' "$ALIAS"; then
+    echo '!! routes list does not route the alias to the cluster' >&2; exit 1
+  fi
+  ui=''
+  for _ in $(seq 60); do
+    ui=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${E2E_UI_PORT:-13000}/" || true)
+    [ "$ui" = 200 ] && break
+    sleep 2
+  done
+  [ "$ui" = 200 ] || { echo "!! Open WebUI did not answer (HTTP $ui)" >&2; exit 1; }
+  echo '   Open WebUI answers in front of the cluster'
+fi
+
 echo '== release prunes the Model (reclaim: stop)'
 run_is release --env-file "$WORK/lease.env" --yes
 remaining=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
@@ -159,6 +183,35 @@ EOF
     || { echo '!! no idle model was evicted to make room' >&2; exit 1; }
   echo '   the idle keep-warm model was evicted; the leased one is ready'
   run_is release --env-file "$WORK/big.env" --yes
+fi
+
+if [ "${GATEWAY:-1}" = 1 ] && [ "${E2E_DYNAMIC:-1}" = 1 ]; then
+  echo '== dynamic routing: two --dedicated leases on one model, two Models, one alias'
+  run_is stack down >/dev/null 2>&1          # the gateway comes back with Postgres
+  run_is config set dynamic_routing true
+  for n in 1 2; do
+    run_is acquire "$ALIAS" --dedicated --yes --ttl 30m --timeout "$TIMEOUT" \
+        --env-file "$WORK/dyn$n.env"
+  done
+  models=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
+      -l infer-stack/managed=true -o name | wc -l)
+  [ "$models" = 2 ] || { echo "!! $models Model(s), expected 2" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  source "$WORK/dyn1.env"
+  routes=$(curl -s "$OPENAI_BASE_URL/model/info" -H "Authorization: Bearer $OPENAI_API_KEY" \
+    | python3 -c 'import json,sys; print(sum(m["model_name"] == sys.argv[1] for m in json.load(sys.stdin)["data"]))' "$ALIAS")
+  [ "$routes" = 2 ] || { echo "!! $routes route(s) for $ALIAS, expected 2" >&2; exit 1; }
+  if curl -sS --fail-with-body "$OPENAI_BASE_URL/chat/completions" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+      -d "{\"model\": \"$ALIAS\", \"max_tokens\": 4,
+           \"messages\": [{\"role\": \"user\", \"content\": \"say ok\"}]}" \
+    | grep -q 'choices'; then
+    echo '   two Models, two routes under one alias, and it answers'
+  else
+    echo "!! no generation for $ALIAS under dynamic routing" >&2; exit 1
+  fi
+  run_is release --env-file "$WORK/dyn1.env" --yes
+  run_is release --env-file "$WORK/dyn2.env" --yes
 fi
 
 echo 'PASS: kubeai backend end-to-end lifecycle'

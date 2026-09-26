@@ -54,8 +54,16 @@ def _unique_vllm_service_name(served: str, deployment_id: str) -> str:
     so N dedicated deployments of one model become N containers on N GPUs. The
     suffix is the deployment id's hex tail, keeping the name short and DNS-safe.
     """
-    tail = deployment_id.rsplit('-', 1)[-1][:8] or 'x'
-    return f'{vllm_service_name_for(served)}-{_dns_slug(tail)}'
+    return f'{vllm_service_name_for(served)}-{deployment_tail(deployment_id)}'
+
+
+def deployment_tail(deployment_id: str) -> str:
+    """The short, DNS-safe suffix that makes a per-deployment name unique.
+
+    >>> deployment_tail('grp-0123456789ab')
+    '01234567'
+    """
+    return _dns_slug(deployment_id.rsplit('-', 1)[-1][:8] or 'x')
 
 
 def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:

@@ -2,6 +2,19 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The gateway in front of a cluster is the compose gateway
+
+On the kubeai backend the gateway now takes the same settings as on compose:
+Open WebUI (`ui`, on by default), the reverse proxy, and dynamic routing,
+under which each deployment is its own Model (`<name>-<id tail>`), so the
+same model acquired `--dedicated` twice runs as two Models behind one alias.
+Catalog endpoints are routed before they run, as on compose, so a new Model
+no longer recreates the gateway. The gateway's changes are shown and
+approved with the acquire's, before its lease commits. `routes list / seed /
+prune` work on kubeai and show a cluster route's upstream (they showed `?`),
+and `gc --orphans` and `clean --orphans` run there (and find nothing: the
+backend only reads its own labelled pods).
+
 ### `ps`, `logs`, `status` and the TUI read the backend, on either backend
 
 `infer-stack ps` lists what the backend runs, containers or pods and the

@@ -107,9 +107,10 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | static superset routes, no blip on model churn | same | same |
-| `routes` inspect / seed / prune | yes | **gap** (P3): refused, although the registry exists |
-| `dynamic_routing` (admin API + Postgres; distinct upstreams for same-model `--dedicated`) | yes | **gap** (P3) |
-| Open WebUI (`ui`), reverse proxy | yes | **gap** (P3): the gateway project is rendered with `ui` off |
+| `routes` inspect / seed / prune | yes | same; a route points at the cluster under the Model's name |
+| `dynamic_routing` (admin API + Postgres; distinct upstreams for same-model `--dedicated`) | yes | same: each deployment is its own Model (`<name>-<id tail>`) |
+| Open WebUI (`ui`), reverse proxy | yes | same, in the gateway's project on this host |
+| the gateway's changes approved with the acquire's, before the lease commits | yes | same |
 | `network migrate` / `network check` | yes | n/a: Service addresses are stable |
 | where the gateway runs | this host | this host, so it is in every request's path (P5 moves it into the cluster) |
 

@@ -53,14 +53,32 @@ DEFAULT_NAMESPACE = 'kubeai'
 DEFAULT_BASE_URL = 'http://127.0.0.1:8000/openai/v1'
 
 
-def model_name_for(served: str) -> str:
+def model_name_for(served: str, deployment_id: str | None = None) -> str:
     """Deterministic Model CR name for a served model name: ``<dns-slug>``.
 
     Derived purely from the served name (like the compose service name), so it
     is identical across releases/re-acquires of the same endpoint — the request
-    name clients use through the KubeAI gateway never changes.
+    name clients use through the KubeAI gateway never changes. With
+    ``deployment_id`` (dynamic routing), the deployment's tail is appended, as
+    for a compose service, so same-model ``--dedicated`` deployments are
+    separate Models; the gateway addresses each by name.
+
+    >>> model_name_for('Qwen/Qwen3-8B')
+    'qwen-qwen3-8b'
+    >>> model_name_for('Qwen/Qwen3-8B', 'grp-0123456789ab')
+    'qwen-qwen3-8b-01234567'
     """
-    return dns_slug(served)
+    if deployment_id is None:
+        return dns_slug(served)
+    from ..leasing.naming import deployment_tail
+
+    tail = deployment_tail(deployment_id)
+    return f'{dns_slug(served)[:62 - len(tail)].rstrip("-")}-{tail}'
+
+
+def model_name(deployment: Deployment, *, unique: bool = False) -> str:
+    """The Model CR name for ``deployment``: the one place it is derived."""
+    return model_name_for(_served_name(deployment), deployment.id if unique else None)
 
 
 def _served_name(deployment: Deployment) -> str:
@@ -81,6 +99,7 @@ def _model_doc(
     *,
     namespace: str,
     resource_profile: str,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Build one KubeAI ``Model`` CR for a vLLM deployment.
 
@@ -90,7 +109,7 @@ def _model_doc(
     engine here too. ``served_model_name`` is overridden to the CR name so the
     gateway's request name and vLLM's served name agree.
     """
-    name = model_name_for(_served_name(deployment))
+    name = name or model_name(deployment)
     svc = vllm_service_dict(deployment)
     svc['served_model_name'] = name
     profile = resource_profile
@@ -159,6 +178,7 @@ def render_models(
     *,
     namespace: str,
     default_resource_profile: str | None,
+    unique_names: bool = False,
 ) -> RenderedModels:
     """Render the desired set into KubeAI ``Model`` docs (pure, no I/O).
 
@@ -208,7 +228,7 @@ def render_models(
                 'kubeai_resource_profile <name>` as the default.'
             )
             continue
-        name = model_name_for(_served_name(deployment))
+        name = model_name(deployment, unique=unique_names)
         if name in out.models:
             out.unrenderable.add(deployment.id)
             out.errors.append(
@@ -222,6 +242,7 @@ def render_models(
                 deployment,
                 namespace=namespace,
                 resource_profile=str(profile),
+                name=name,
             )
         )
         out.models[name] = deployment.id
@@ -383,19 +404,68 @@ class KubeaiBackend(ConvergeScaffold):
             self.gateway_upstream = f'http://{ip}/openai/v1'
         return self.gateway_upstream.rstrip('/')
 
-    def _render_gateway(self, rendered: RenderedModels) -> None:
-        """Route each endpoint alias through the gateway to its Model."""
-        from ..leasing.gateway import UPSTREAM_ROUTE
+    @property
+    def dynamic_routing(self) -> bool:
+        """The gateway manages routes live, so each deployment is its own Model."""
+        return bool(self.gateway is not None and getattr(self.gateway, 'dynamic_routing', False))
 
+    def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
+        """Registry rows sending each vLLM catalog endpoint to its Model.
+
+        The static superset, as on compose: the gateway's config then stays
+        byte-stable as models come and go, so it is never recreated for one.
+        """
+        from ..leasing.gateway import UPSTREAM_ROUTE, _registry_incoming_from_catalog
+
+        if catalog is None or self.gateway is None:
+            return {}
         base = self._upstream_url()
-        # This backend's route rows, persisted like any other (the registry is
-        # append-only, so a released Model stays routable, as on compose).
-        self.gateway.merge_route_registry({
+        return {
+            alias: {'engine': UPSTREAM_ROUTE,
+                    'served': model_name_for(row.get('served') or alias),
+                    'api_base': base}
+            for alias, row in _registry_incoming_from_catalog(catalog).items()
+            if row.get('engine') == 'vllm'
+        }
+
+    def route_rows(self, desired: list[Deployment], placement=None) -> dict[str, dict[str, Any]]:
+        """The registry rows a render of ``desired`` merges (``routes prune``
+        keeps exactly these): the catalog's, and every rendered Model's."""
+        return self._front_door_inputs(desired, self._render_documents(desired)[1])[0]
+
+    def _front_door_inputs(self, desired, rendered: RenderedModels):
+        """``(registry rows, dynamic routes)`` for the gateway, from a render.
+
+        Static routing: one row per alias, to the Model serving it. Dynamic
+        routing: one route per (deployment, endpoint), each to its own Model,
+        so same-model ``--dedicated`` Models share the alias and LiteLLM
+        balances across them.
+        """
+        from ..leasing.gateway import UPSTREAM_ROUTE, upstream_route
+
+        if self.gateway is None:
+            return {}, []
+        base = self._upstream_url()
+        if self.dynamic_routing:
+            by_id = {g.id: g for g in desired}
+            routes = [
+                upstream_route(gid, endpoint, name, base)
+                for name, gid in sorted(rendered.models.items())
+                for endpoint in sorted(by_id[gid].served)
+            ]
+            return {}, routes
+        rows = self.catalog_route_rows(self.catalog)
+        rows.update({
             alias: {'engine': UPSTREAM_ROUTE, 'served': name, 'api_base': base}
             for alias, name in rendered.request_names.items()
         })
-        # Gateway only: no engines on this host, so nothing to place.
-        self.gateway.converge([], apply=False)
+        return rows, []
+
+    def _set_front_door(self, desired, rendered: RenderedModels) -> None:
+        """Hand the gateway its inputs for the next render or preview."""
+        rows, routes = self._front_door_inputs(desired, rendered)
+        self.gateway.upstream_rows = rows
+        self.gateway.upstream_routes = routes
 
     # -- converge-style surface ------------------------------------------------
 
@@ -415,6 +485,7 @@ class KubeaiBackend(ConvergeScaffold):
             list(desired),
             namespace=self.namespace,
             default_resource_profile=self.default_resource_profile,
+            unique_names=self.dynamic_routing,
         )
         plan = GpuPlan(
             assignments={g.id: [] for g in desired if g.id not in rendered.unrenderable},
@@ -430,7 +501,20 @@ class KubeaiBackend(ConvergeScaffold):
         """
         plan, rendered, planned = self._render_documents(desired)
         self._preview_approval(planned, approve=approve)
+        if self.gateway is not None:
+            # The gateway's changes are part of the same approval: shown now,
+            # before the lease commits, and not asked again at the render.
+            self._set_front_door(desired, rendered)
+            self.gateway.preview([], None, approve=approve)
+            self.last_preview_digest = self._combined_digest(
+                self.last_preview_digest, self.gateway.last_preview_digest)
         return plan, rendered
+
+    def _combined_digest(self, models: str | None, gateway: str | None) -> str | None:
+        """One digest for the Models and the gateway's files together."""
+        if gateway is None:
+            return models
+        return self._planned_digest({'models': models or '', 'gateway': gateway})
 
     def plan_on_idle_host(self, desired: list[Deployment]):
         """Whether ``desired`` could ever be served here: renderable or not.
@@ -473,7 +557,8 @@ class KubeaiBackend(ConvergeScaffold):
             self.last_assignments = {}      # the cluster places
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
-            self.last_planned_digest = self._planned_digest(planned)
+            models_digest = self._planned_digest(planned)
+            self.last_planned_digest = models_digest
             self._approve_changes(planned)
             self._atomic_write(self.models_file, rendered.text)
             self._save_sidecar(
@@ -483,7 +568,13 @@ class KubeaiBackend(ConvergeScaffold):
                 }
             )
             if self.gateway is not None:
-                self._render_gateway(rendered)
+                # Gateway only: no engines on this host, so nothing to place.
+                # Its converge persists the merged route registry after its
+                # own approval (pre-approved by the preview when there was one).
+                self._set_front_door(desired, rendered)
+                self.gateway.converge([], apply=False)
+                self.last_planned_digest = self._combined_digest(
+                    models_digest, self.gateway.last_planned_digest)
             if not apply:
                 logger.info(
                     'rendered {} Model(s) to {} (not applied; '
@@ -508,7 +599,9 @@ class KubeaiBackend(ConvergeScaffold):
             'namespace': self.namespace,
             'base_url': self.base_url,
             'resource_profile': self.default_resource_profile,
-            'gateway': self.gateway is not None,
+            # The front door's own settings (UI, proxy, routing mode), in the
+            # gateway project's profile; None without a gateway.
+            'gateway': self.gateway.render_profile() if self.gateway is not None else None,
             'gateway_upstream': self.gateway_upstream,
             'catalogs': catalog_sources(self.catalog),
         }
@@ -534,6 +627,11 @@ class KubeaiBackend(ConvergeScaffold):
         self.gateway_upstream = profile.get('gateway_upstream') or self.gateway_upstream
         sources = profile.get('catalogs') or []
         self.catalog = CatalogUnion.from_sources(sources) if sources else None
+        front = profile.get('gateway')
+        # A profile from before the front door's settings were recorded holds
+        # only True/False here; it then keeps this process's settings.
+        if isinstance(front, dict) and self.gateway is not None:
+            self.gateway.use_profile(front)
 
     def apply(self) -> None:
         """Converge the cluster to the last render: apply + prune.
@@ -679,7 +777,7 @@ class KubeaiBackend(ConvergeScaffold):
             base, model = f'{front._gateway_base()}/v1', endpoint
             headers = front._auth_headers()
         else:
-            base, model = self.base_url, model_name_for(_served_name(deployment))
+            base, model = self.base_url, model_name(deployment)
             headers = None
         ok, reason = openai_ready(
             base_url=base,
@@ -732,7 +830,7 @@ class KubeaiBackend(ConvergeScaffold):
         pass
 
     def teardown(self, deployment: Deployment) -> None:
-        name = model_name_for(_served_name(deployment))
+        name = model_name(deployment, unique=self.dynamic_routing)
         self._kubectl(
             ['delete', 'models.kubeai.org', name, '--ignore-not-found']
         )

@@ -1,7 +1,7 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1, P2 done** 2026-09-26 · P3–P5 not started ·
+`dev/backend-unification` · **P1–P3 done** 2026-09-26 · P4, P5 not started ·
 P6 is ongoing. Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
@@ -155,6 +155,18 @@ step that acquires the same model `--dedicated` twice under dynamic routing
 and gets two Models and two routes.
 **Size:** small to medium; the `Gateway` class already owns the pieces.
 
+**P3 done 2026-09-26.** The KubeAI gateway takes the compose settings (`ui`,
+`reverse_proxy`, `dynamic_routing`) and records them in the recovery profile
+as the gateway project's own profile. The kubeai backend hands the gateway
+explicit render inputs (registry rows for the catalog and every Model, or
+per-deployment dynamic routes) instead of writing rows into the registry
+before approval, so the gateway's changes are previewed and approved with
+the acquire's. Under dynamic routing each deployment is its own Model,
+named with the deployment tail compose uses for its services. The `routes`
+commands resolve the backend's Compose project and ask the backend for its
+rows. Verified by `dev/kubeai_e2e.sh` on k3s: routes, Open WebUI, and two
+`--dedicated` Models behind one alias.
+
 ### P4. Placement information parity (optional)
 
 **Closes:** `min_vram_gib` / `measure`; less hand-written cluster
@@ -218,7 +230,11 @@ worse. A blocker is fixed whatever its size.
 | engine vs gateway in the TUI | a `litellm` name hint (Open WebUI and Postgres counted as engines) | **fixed** (P2): an instance serves a deployment or it does not |
 | where the day-2 verbs find the Compose project | a hard-coded path and project name | **fixed** (P2): the backend's `compose_project()` and `compose_argv()` |
 | how the TUI runs a runtime command | it replaced the backend's runner with Docker's, whose allowlisted environment has no `KUBECONFIG`: every kubectl call from the TUI failed | **fixed** (P2): only `docker` commands are wrapped |
-| the KubeAI gateway's approval | the gateway project asks its own diff approval at render, after the lease commits, not in the admission preview | deferred to P3. Same result under `--yes`; interactively, a declined gateway change rolls the lease back after the commit |
+| the KubeAI gateway's approval | the gateway project asked its own diff approval at render, after the lease committed | **fixed** (P3): previewed and approved with the acquire's |
+| KubeAI's route rows | written into the registry before any approval, and only for live Models (so every new Model recreated the gateway) | **fixed** (P3): render inputs, persisted after approval; the catalog's rows too, so no blip |
+| a route's upstream | derived twice, in the render and in `routes list` (which showed `?` for a cluster route) | **fixed** (P3): `registry_route_entry` |
+| a deployment's Model name | derived in five places | **fixed** (P3): `model_name()` |
+| "is this the compose backend" in the CLI | `isinstance(…, ComposeBackend)` for `routes`, `gc --orphans`, `clean`, `network migrate`, `secrets rotate` | **fixed** (P3): the capability each needs (`compose_project()`, residency labels, `network`, `litellm`) |
 
 ## Not in scope
 

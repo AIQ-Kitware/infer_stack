@@ -283,12 +283,19 @@ def _make_backend(config, *, interactive: bool = False):
             # cluster: one base_url, the managed key, and endpoint aliases as
             # request names. Its own state dir and compose project, so it can
             # never touch a compose stack's containers on the same host.
+            # The front door takes the same settings as on compose (UI,
+            # reverse proxy, dynamic routing); only the engines are elsewhere.
+            rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
             gateway = ComposeBackend(
                 state_dir=data_root() / 'leasing' / 'kubeai-gateway',
                 inventory={'gpu_count': 0, 'gpus': []},
                 project='infer-stack-gateway',
                 litellm=True,
-                ui=False,
+                ui=_resolve_ui(config),
+                reverse_proxy=rp_enabled,
+                reverse_proxy_port=rp_port,
+                reverse_proxy_config=rp_config,
+                dynamic_routing=_resolve_dynamic_routing(config),
                 assume_yes=_resolve_assume_yes(config, interactive=interactive),
             )
         backend = KubeaiBackend(
@@ -1290,8 +1297,8 @@ class GcCLI(_ApprovalMixin):
                       f'{n_deployments} stopped deployment(s)')
             return 0
         if config.orphans:
-            if not isinstance(controller.backend, ComposeBackend):
-                raise SystemExit('gc --orphans needs the compose backend')
+            # Unlabelled units in residency. The kubeai backend reads only the
+            # pods carrying its label, so it never has any.
 
             def confirm(found):
                 print(f'gc --orphans: {len(found)} unmanaged container(s):')
@@ -1379,8 +1386,8 @@ class CleanCLI(_LeasingCommonMixin):
         held = [g for g in deployments
                 if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)]
         observed, assignments = _placement_view(controller)
-        can_orphan = bool(config.orphans) and isinstance(
-            controller.backend, ComposeBackend)
+        # On any backend: one that selects its units by label (kubeai) has none.
+        can_orphan = bool(config.orphans)
 
         found: list = []
 
@@ -2456,17 +2463,17 @@ class EnvCLI(_PathOverridesMixin):
 
 
 def _require_compose_backend(controller):
-    """The controller's ComposeBackend, or a SystemExit for other backends.
+    """The Compose project holding the gateway's route registry.
 
-    The route registry is a compose-backend concept (it feeds the static-superset
-    LiteLLM gateway); ``--backend null``/``kubeai`` have no registry to touch."""
-    backend = controller.backend
-    if not isinstance(backend, ComposeBackend):
+    The stack itself on the compose backend, the gateway's project on kubeai;
+    a SystemExit for a backend with no gateway (null, or ``litellm false``)."""
+    project = getattr(controller.backend, 'compose_project', lambda: None)()
+    if project is None or not getattr(project, 'litellm', False):
         raise SystemExit(
-            'the `routes` commands require the compose backend '
-            '(set `--backend compose` or `config set backend compose`)'
+            'the `routes` commands need a LiteLLM gateway (the compose or kubeai '
+            'backend, with `litellm` on)'
         )
-    return backend
+    return project
 
 
 def _live_endpoints(controller) -> set[str]:
@@ -2484,7 +2491,8 @@ class RoutesListCLI(_LeasingCommonMixin):
     """Print the accumulated LiteLLM route registry (static-superset mode).
 
     One row per persisted route: its alias, engine, served-model/tag, the
-    upstream compose service it derives, and whether a live deployment is
+    upstream it routes to (a compose service, or a KubeAI cluster's gateway
+    under the Model's name), and whether a live deployment is
     currently backing it. Routes with no live backer still list (that is the
     point — a released endpoint stays routable/testable); their upstream simply
     errors until something serves it.
@@ -2496,12 +2504,7 @@ class RoutesListCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from ..leasing.compose import (
-            OLLAMA_CONTAINER_PORT,
-            VLLM_CONTAINER_PORT,
-            ollama_service_name_for,
-            vllm_service_name_for,
-        )
+        from ..leasing.gateway import registry_route_entry
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
@@ -2514,22 +2517,13 @@ class RoutesListCLI(_LeasingCommonMixin):
         for name in sorted(entries):
             row = entries[name]
             engine = row.get('engine')
-            if engine == 'vllm':
-                served = row.get('served') or name
-                upstream = (
-                    f'http://{vllm_service_name_for(served)}:'
-                    f'{VLLM_CONTAINER_PORT}/v1'
-                )
-                target = served
-            elif engine == 'ollama':
-                target = row.get('model') or name
-                host = row.get('host') or name
-                upstream = (
-                    f'http://{ollama_service_name_for(host)}:'
-                    f'{OLLAMA_CONTAINER_PORT}'
-                )
-            else:
+            entry = registry_route_entry(name, row)   # what the gateway renders
+            if entry is None:
                 target, upstream = '?', '?'
+            else:
+                params = entry['litellm_params']
+                target = params['model'].split('/', 1)[-1]
+                upstream = params['api_base']
             rows.append({
                 'name': name,
                 'engine': engine,
@@ -2579,12 +2573,7 @@ class RoutesPruneCLI(_ApprovalMixin):
     def main(cls, argv=True, **kwargs):
         from ..diff_prompt import confirm_writes
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.gateway import (
-            LITELLM_REGISTRY_VERSION,
-            _dump_route_registry,
-            _registry_incoming_from_catalog,
-            _registry_incoming_from_deployments,
-        )
+        from ..leasing.gateway import LITELLM_REGISTRY_VERSION, _dump_route_registry
 
         config = cls.cli(argv=argv, data=kwargs)
         # interactive=False so reconcile auto-applies the compose diff; the
@@ -2593,13 +2582,13 @@ class RoutesPruneCLI(_ApprovalMixin):
         backend = _require_compose_backend(controller)
 
         def prune_plan() -> tuple[dict, dict, list[str]]:
-            # The desired set exactly as the next render sees it.
-            desired, inputs = controller._admission_view(backend.residency())
-            plan = backend.plan(desired, inputs)
-            keep: dict = {}
-            if backend.catalog is not None:
-                keep.update(_registry_incoming_from_catalog(backend.catalog))
-            keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
+            # The desired set exactly as the next render sees it, and the rows
+            # that render merges: the catalog's and the live deployments'.
+            # Any: _require_compose_backend above confirmed a gateway, and
+            # both backends that have one supply route rows.
+            engines: Any = controller.backend
+            desired, inputs = controller._admission_view(engines.residency())
+            keep = dict(engines.route_rows(desired, inputs))
             current = backend.gateway._load_route_registry().get('entries', {})
             return current, keep, sorted(set(current) - set(keep))
 
@@ -2681,7 +2670,6 @@ class RoutesSeedCLI(_ApprovalMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.compose import _registry_incoming_from_catalog
 
         config = cls.cli(argv=argv, data=kwargs)
         paths = _collect_names(config.catalogs)
@@ -2691,6 +2679,8 @@ class RoutesSeedCLI(_ApprovalMixin):
         # there is no destructive gate to confirm).
         controller = _open_controller(config, interactive=False)
         backend = _require_compose_backend(controller)
+        # Any: a gateway exists (checked above), and its backend supplies rows.
+        engines: Any = controller.backend
 
         incoming: dict = {}
         for raw in paths:
@@ -2701,7 +2691,9 @@ class RoutesSeedCLI(_ApprovalMixin):
                 cat = Catalog.load(path)
             except CatalogError as ex:
                 raise SystemExit(f'invalid catalog {path}: {ex}')
-            incoming.update(_registry_incoming_from_catalog(cat))
+            # The engine backend's rows for it: compose upstreams on compose,
+            # the cluster's Models on kubeai.
+            incoming.update(engines.catalog_route_rows(cat))
         if not incoming:
             raise SystemExit(
                 'routes seed: the named catalog(s) resolved no routable endpoints'
@@ -2842,8 +2834,9 @@ class NetworkMigrateCLI(_ApprovalMixin):
         if not config.subnet:
             raise SystemExit('network migrate: --subnet is required')
         controller = _open_controller(config, interactive=True)
-        if not isinstance(controller.backend, ComposeBackend):
-            raise SystemExit('network migrate needs the compose backend')
+        if not hasattr(controller.backend, 'network'):
+            raise SystemExit('network migrate gives compose containers stable '
+                             'addresses; this backend runs none (n/a on kubeai)')
         try:
             rec = controller.network_migrate(config.subnet, force=bool(config.force))
         except ProfileMismatch as ex:
@@ -2908,7 +2901,7 @@ class SecretsRotateCLI(_ApprovalMixin):
         # Any: rotate_gateway_key below refuses a backend without a gateway,
         # so past it these gateway methods exist.
         backend: Any = controller.backend
-        old = backend.master_key() if isinstance(backend, ComposeBackend) else None
+        old = backend.master_key() if getattr(backend, 'litellm', False) else None
         try:
             rec = controller.rotate_gateway_key(force=bool(config.force))
         except ProfileMismatch as ex:
@@ -2930,7 +2923,8 @@ class SecretsRotateCLI(_ApprovalMixin):
                              'rejects the OLD key')
         else:
             print('  gateway: new key accepted, old key rejected')
-        if getattr(backend, 'ui', False):
+        front = getattr(backend, 'compose_project', lambda: None)()
+        if getattr(front, 'ui', False):
             print('  Open WebUI may keep the old key in its own settings: '
                   'update it under Admin > Settings > Connections')
         return 0
