@@ -147,7 +147,7 @@ it for tensor parallelism. Adding it changes every vLLM service's
 fingerprint, so the next apply recreates running engines. Needs a TP=2 run
 on a GPU host to confirm the symptom first. **The operator's call.**
 
-### 9. [ ] UX audit loop: do not stop without a passing audit
+### 9. [x] UX audit loop: do not stop without a passing audit
 
 Polishing the UX can take hours; that is expected, and this item is the
 reason the queue exists. Loop:
@@ -375,6 +375,11 @@ both reports read whole.
       `ps` said `-`. `ps` now uses the same words: `cpu` for a Docker engine
       with no GPU, `all` for one that requests every GPU, `-` for a pod
       (the cluster picks) or a front-door service.
+
+Audit pass 8 (2026-09-26): **passed.** `dev/ux_audit.sh` on both backends
+(0 flags, reports read whole, the only non-zero exits are the deliberate
+mistakes); the README's no-GPU first run from empty roots; the TUI on both
+backends at 80x24, enlarged to 200x50, every top tab by key. Nothing new.
 
 ### 10. [ ] Handover
 
