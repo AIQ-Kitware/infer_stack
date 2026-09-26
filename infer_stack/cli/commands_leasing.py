@@ -739,11 +739,13 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         lines += [f'  {r}' for r in ex.reasons] or [
             f'  {", ".join(ex.deployment_ids)}'
         ]
-        lines.append(
-            '  free a GPU first — `infer-stack leases` to see what holds them, '
-            'then `infer-stack release`/`evict`. (Every GPU, including any '
-            'display-attached one, is used unless you set --skip-display-gpus.)'
-        )
+        if ex.capacity:
+            lines.append(
+                '  free a GPU first — `infer-stack leases` to see what holds them, '
+                'then `infer-stack release`/`evict`, or wait for one with --queue. '
+                '(Every GPU, including any display-attached one, is used unless '
+                'you set --skip-display-gpus.)'
+            )
         raise SystemExit('\n'.join(lines))
     return _emit_acquire(config, controller, outcome)
 

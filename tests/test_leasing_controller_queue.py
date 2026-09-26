@@ -115,8 +115,9 @@ def test_unplaced_fails_fast_by_default():
 
     ctl, backend, _, _ = _make(budget=1, sleep=sleep)
     ctl.acquire('alice', [vreq('A')])  # fills the single slot
-    with pytest.raises(PlacementError):
+    with pytest.raises(PlacementError) as ei:
         ctl.acquire('bob', [vreq('B')])  # no wait -> fail fast
+    assert ei.value.capacity           # a free GPU would have let it in
 
 
 def test_acquire_queues_until_a_gpu_frees():

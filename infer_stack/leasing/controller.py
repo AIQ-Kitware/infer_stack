@@ -199,6 +199,8 @@ class Controller:
         # that differs from an earlier approved digest.
         self._explicit_apply = False
         self._admission_digest: str | None = None
+        #: Whether the last refused admission was for lack of GPUs.
+        self._admission_capacity = False
         from .profile import ProfileMismatch
 
         try:
@@ -844,6 +846,7 @@ class Controller:
         commit for the candidate's new and revived deployments. Nothing is
         written here.
         """
+        self._admission_capacity = False
         adopted: dict[str, list[int]] = {}
         need: list[str] = []
         for gid, deployment in overlay.deployments.items():
@@ -879,7 +882,10 @@ class Controller:
         self._prepare_network()
         desired, inputs = self._admission_view(residency, overlay=overlay)
         plan, rendered = self._admitting.preview(desired, inputs)
+        from .backend import allocates_gpus
+
         reasons = []
+        capacity = False            # did any refusal come from GPU placement?
         unresolved = set(self._unresolved_allocations())
         # EVERY deployment the candidate claims must be placed and renderable,
         # including an existing one it only coalesces onto (whose served
@@ -893,9 +899,12 @@ class Controller:
                 continue
             if gid in plan.degraded:
                 reasons.append(f'{gid}: its GPUs are no longer available')
+                capacity = True
             elif gid not in plan.assignments:
                 why = [e for e in plan.errors if e.startswith(gid)]
                 reasons.extend(why or [f'{gid}: could not be placed'])
+                # Where the cluster places, a plan without it is a refusal.
+                capacity = capacity or allocates_gpus(self.backend)
             elif gid in set(rendered.unrenderable):
                 why = [e for e in rendered.errors if gid in e] or [
                     f'{gid}: could not be rendered ({e})' for e in rendered.errors]
@@ -907,6 +916,7 @@ class Controller:
             if holders:
                 reasons.append('GPUs held by admitted demand: ' + '; '.join(holders))
         self._admission_digest = None
+        self._admission_capacity = capacity
         if not reasons:
             # Approval happens now, before anything is committed; the render
             # after the commit produces the same files and does not ask again.
@@ -1611,15 +1621,16 @@ class Controller:
                     if gid in overlay.created or gid in overlay.revived
                 )
             if not (wait_for_placement and apply):
-                raise PlacementError(blocked, reasons)
+                raise PlacementError(blocked, reasons, capacity=self._admission_capacity)
             if not checked_feasible:
                 checked_feasible = True
                 infeasible = self._infeasible_alone(
                     list(overlay.deployments.values()), set(blocked))
                 if infeasible:
-                    raise PlacementError(sorted(infeasible), sorted(infeasible.values()))
+                    raise PlacementError(sorted(infeasible), sorted(infeasible.values()),
+                                         capacity=False)
             if self.clock() + placement_interval > deadline:
-                raise PlacementError(blocked, reasons)
+                raise PlacementError(blocked, reasons, capacity=self._admission_capacity)
             self.sleep(placement_interval)
 
     def _finish_acquire(self, result, rec, *, apply, wait, timeout, interval) -> AcquireOutcome:
@@ -1850,7 +1861,8 @@ class Controller:
                     self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
             allocations, reasons = self._admit(overlay, residency)
             if reasons:
-                raise PlacementError(list(overlay.revived), reasons)
+                raise PlacementError(list(overlay.revived), reasons,
+                                     capacity=self._admission_capacity)
             self._mark_pending(apply=True)
             if self._admission_digest:
                 self.ledger.mark_publication_pending(

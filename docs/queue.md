@@ -169,9 +169,10 @@ Seed findings, already known:
 - [ ] Open WebUI writes its data directory as root: removing a data root
       (the e2e's cleanup, or an operator's `rm -rf`) fails with permission
       denied. Found by `dev/kubeai_e2e.sh` 2026-09-26.
-- [ ] A refused acquire always ends with "free a GPU first — …", also when
+- [x] A refused acquire always ends with "free a GPU first — …", also when
       the reason is a render refusal (a served-name collision) or the
-      backend is kubeai, where no GPU is ours to free. Found 2026-09-26.
+      backend is kubeai, where no GPU is ours to free. Found 2026-09-26;
+      fixed: `PlacementError.capacity` says whether room would have helped.
 
 ### 10. [ ] Handover
 

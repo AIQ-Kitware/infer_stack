@@ -1111,3 +1111,13 @@ def test_the_recovery_profile_says_where_the_gateway_runs(tmp_path):
     host_be.use_profile({**cluster_be.render_profile(),
                          'gateway': host_gateway.render_profile()})
     assert host_be.gateway is host_gateway
+
+
+def test_a_render_refusal_is_not_a_capacity_problem(tmp_path):
+    """"Free a GPU first" is advice only for a lack of GPUs."""
+    from infer_stack.leasing.backend import PlacementError
+
+    ctl, be, kubectl = make_controller(tmp_path)
+    with pytest.raises(PlacementError) as ei:
+        ctl.acquire('alice', [_req('qwen', profile=None)], wait=False)
+    assert ei.value.capacity is False

@@ -74,11 +74,16 @@ class PlacementError(Exception):
     controller rolls back the just-created lease before raising, so a request
     that cannot be satisfied does not linger as a phantom ``live`` deployment with no
     container behind it. ``reasons`` carries the planner's per-deployment messages.
+
+    ``capacity`` says whether free GPUs would have let it in, as opposed to a
+    request no amount of room admits (a render refusal, an unreadable
+    runtime, a host too small): only then is "free a GPU" the advice.
     """
 
-    def __init__(self, deployment_ids, reasons):
+    def __init__(self, deployment_ids, reasons, *, capacity: bool = True):
         self.deployment_ids = list(deployment_ids)
         self.reasons = list(reasons)
+        self.capacity = bool(capacity)
         super().__init__(
             '; '.join(self.reasons)
             or f'could not place: {", ".join(self.deployment_ids)}'
