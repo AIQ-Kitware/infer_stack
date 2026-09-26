@@ -1357,7 +1357,9 @@ class ComposeBackend(ConvergeScaffold):
 
         # 3. Every image this configuration would actually bring up. Checking
         #    the full PINNED_IMAGES set would fail on services that are off.
-        wanted: dict[str, str] = {'vllm': self.images['vllm']}
+        # A gateway-only project (kubeai's) runs no engine here.
+        wanted: dict[str, str] = ({} if self.fronts_elsewhere
+                                  else {'vllm': self.images['vllm']})
         if self.litellm:
             wanted['litellm'] = self.images['litellm']
             if self.dynamic_routing:
@@ -1396,6 +1398,9 @@ class ComposeBackend(ConvergeScaffold):
 
         # 4. GPUs. Last because a CPU-only stack is legitimate (mock endpoints,
         #    the null backend), so this is informational rather than fatal.
+        #    Not for a gateway-only project: its engines are elsewhere.
+        if self.fronts_elsewhere:
+            return checks
         try:
             gpus = self.inventory.get('gpus') or []
             if gpus:

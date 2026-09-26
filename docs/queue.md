@@ -284,6 +284,15 @@ mistakes, the day-2 sweep; 0 flags on both), and the reports read by eye.
       infer-stack's LiteLLM gateway; it is "KubeAI's API" now, here and in
       the docs.
 
+Audit pass 4 (2026-09-26): `dev/ux_audit.sh` on both backends (0 flags;
+the two reports differ only in backend facts), the reports read by eye.
+
+- [x] `doctor` on kubeai did not check Docker, though the gateway on this
+      host is a Compose project: a stopped daemon passed preflight and
+      failed the first acquire. The gateway project's checks (Docker,
+      compose, its images; no engine image or GPU check) now follow
+      KubeAI's.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

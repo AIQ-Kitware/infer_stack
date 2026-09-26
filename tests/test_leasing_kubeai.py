@@ -1134,3 +1134,12 @@ def test_env_and_test_use_the_kubeai_gateways_key(tmp_path, monkeypatch):
     env_path, base = commands_leasing._gateway_state(None)
     assert env_path == be.gateway.gateway._env_path
     assert commands_leasing._front_door(None) == (base.rstrip('/'), key)
+
+
+def test_doctor_checks_the_host_gateways_docker_too(tmp_path):
+    """The gateway on this host is a Compose project: without Docker the
+    first acquire failed after a clean preflight."""
+    be, _ = make_front_door_backend(tmp_path)
+    names = [name for name, ok, _ in be.doctor()]
+    assert 'gateway: docker daemon reachable' in names
+    assert not any('image vllm' in n or 'GPUs visible' in n for n in names)

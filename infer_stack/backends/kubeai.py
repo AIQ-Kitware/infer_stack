@@ -1140,4 +1140,9 @@ class KubeaiBackend(ConvergeScaffold):
         # KubeAI's own API (what the port-forward reaches), not infer-stack's
         # LiteLLM gateway, which starts with the first acquire.
         checks.append((f"KubeAI's API at {self.base_url}", ok, detail))
+        if self.gateway is not None and hasattr(self.gateway, 'doctor'):
+            # The gateway on this host is a Compose project: Docker and its
+            # images are part of what an acquire needs.
+            checks.extend((f'gateway: {name}', good, why)
+                          for name, good, why in self.gateway.doctor())
         return checks
