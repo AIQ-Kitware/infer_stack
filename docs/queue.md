@@ -512,7 +512,7 @@ KubeAI's no-op methods are gone; `HostRuntime` (Compose:
 `ty` check each backend against the protocol (verified: removing KubeAI's
 `host_runtime` fails the check). `Backend` stays exported as an alias.
 
-### 13. [ ] Parity tests: cross-feature invariants
+### 13. [x] Parity tests: cross-feature invariants
 
 *Why added:* the parity suite's KubeAI fake ran one pod per Model, so
 "replicas render" and "release keeps keep-warm" each passed while their
@@ -526,6 +526,20 @@ roadmap.
 
 **Done when:** the suite is in `tests/test_parity.py` (or beside it), each
 case fails on the code before its fix, and the roadmap states the rule.
+
+*Done 2026-09-27:* the KubeAI fake runs `minReplicas` pods, injects rollout
+pods, and has a scheduler mode (nodes, pending pods with a message). Poison
+cases: replicated keep-warm, rollout snapshot, replicated crash-loop,
+Compose duplicates (`tests/test_parity.py`); scheduler selector, taint,
+wrong-node victim, reclaimable pressure (`tests/test_parity.py`); partial
+apply with renderer drift and the KubeAI gateway result
+(`test_leasing_admission.py`, `test_leasing_kubeai.py`); rotation at both
+boundaries (`test_leasing_secrets.py`); route removal failure on Compose and
+KubeAI, and a replacement gap (`test_leasing_dynamic_routing.py`);
+LIVE-over-IDLE coalescing (`test_leasing_controller.py`); seed conflicts
+(`test_cli_leasing.py`). Each failed on the code before its fix, except the
+two positive controls (reclaimable pressure, the replacement-gap report).
+The rule is in the roadmap's Principles.
 
 ### 14. [x] Scheduler-aware reclaim, not "Unschedulable means evict"
 

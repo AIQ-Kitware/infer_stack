@@ -132,13 +132,12 @@ kinds.
 
 ### A queued acquire holds nothing while it waits (current, by design)
 
-With the Compose backend an acquire is admitted atomically: its lease and its
-GPU allocations are committed together, or nothing is. A queued (`--queue`)
-acquire that has not been admitted yet has written nothing, so it holds no GPU
-and has no place in line (see "Admission is first-come" below).
-
-Backends without strict residency (KubeAI, the null backend) keep the earlier
-behaviour: the lease is committed first and placed by the render.
+On every backend an acquire is admitted atomically: its lease and its
+allocations are committed together, or nothing is (on KubeAI, where the
+cluster schedules, the allocation is empty and admission decides only
+renderability). A queued (`--queue`) acquire that has not been admitted yet
+has written nothing, so it holds no GPU and has no place in line (see
+"Admission is first-come" below).
 
 ### Admission is first-come, not fair (design boundary)
 
@@ -283,11 +282,12 @@ starved new leases.
   has no single running container (for example a GPU reservation, which runs
   nothing), it stays *unresolved*: it keeps working, but no new GPU is
   allocated to anyone until its lease is released.
-- **Other backends.** On backends without strict residency (KubeAI, null),
-  idle keep-warm deployments stay in the desired set, as before. A failed
-  acquire whose rollback cannot read residency can then leave a leaseless idle
-  candidate that the next apply starts (workaround: `infer-stack evict
-  <deployment>`).
+- **Other backends.** KubeAI reads strict residency from pods: an idle
+  keep-warm Model stays in the desired set while it is resident (any of its
+  replicas warm), and on a scheduling failure the wait evicts only an idle
+  Model that could free the capacity that is short (see
+  [../backend-parity.md](../backend-parity.md)). The null backend reports
+  nothing running.
 
 ### Known fault: the gateway can route a model's traffic to another container (until `network migrate`)
 

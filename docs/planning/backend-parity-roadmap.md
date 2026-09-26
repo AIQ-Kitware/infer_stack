@@ -30,6 +30,14 @@ it is not a sibling with its own habits.
 
 ## Principles
 
+- **Parity is an invariant, not a row.** A row reading *same* for a verb or
+  an output shape is not enough: every shared lifecycle invariant must hold
+  when combined with the backend-specific features that stress it (replicas,
+  scheduler pressure, partial applies, route failures). Each such feature
+  gets at least one test combining it with the common lifecycle; the
+  2026-09-27 review found a replicated keep-warm Model pruned on release
+  although both of those rows passed alone.
+
 - **Superset, not sibling.** KubeAI gains what Compose has. Where a Compose
   feature has no cluster meaning (GPU indices, `network migrate`), the
   matrix says *n/a* and the CLI says why; it does not grow a second design.
@@ -282,7 +290,12 @@ worse. A blocker is fixed whatever its size.
 | KubeAI's route rows | written into the registry before any approval, and only for live Models (so every new Model recreated the gateway) | **fixed** (P3): render inputs, persisted after approval; the catalog's rows too, so no blip |
 | a route's upstream | derived twice, in the render and in `routes list` (which showed `?` for a cluster route) | **fixed** (P3): `registry_route_entry` |
 | a deployment's Model name | derived in five places | **fixed** (P3): `model_name()` |
-| "is this the compose backend" in the CLI | `isinstance(…, ComposeBackend)` for `routes`, `gc --orphans`, `clean`, `network migrate`, `secrets rotate` | **fixed** (P3): the capability each needs (`compose_project()`, residency labels, `network`, `litellm`) |
+| "is this the compose backend" in the CLI | `isinstance(…, ComposeBackend)` for `routes`, `gc --orphans`, `clean`, `network migrate`, `secrets rotate` | **fixed** (P3): the capability each needs (`compose_project()`, residency labels, `network`, `litellm`); since item 12, `backend.host_runtime` |
+| how many units a deployment may have | "more than one is ambiguous", written into the shared residency | **fixed** (item 11): `Residency.replicated`, set by the runtime that built it; only GPU adoption asks for a unique unit |
+| the controller's backend contract | the old `realize/teardown` protocol, cast to one carrying Compose internals, probed with `hasattr` | **fixed** (item 12): `ServingBackend`, `HostRuntime` for Compose-only work, `Realizer` behind `SimpleAdmission`; `ty` checks each backend |
+| whether an idle model can free room | the probe's reason (`Unschedulable`) alone | **fixed** (item 14): the scheduler's message says capacity, the backend's `reclaim_candidates` says which victim could help |
+| how far an apply got | `True`/`False`/raise, and the approval cleared before looking | **fixed** (item 15): `ApplyResult`; the approval lives until the publication completes |
+| a route registry change | the CLI wrote the registry file under the backend's lock itself | **fixed** (item 19): the controller plans and commits it; the gateway owns the file |
 
 ## Not in scope
 

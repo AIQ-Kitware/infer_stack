@@ -613,3 +613,33 @@ def test_kubeai_keeps_a_departing_model_while_its_route_stays(tmp_path):
     gw.refuse = False
     assert be.apply().complete
     assert len(kubectl.applied) == 1 and len(_managed(gw)) == 1
+
+
+def test_a_replacement_whose_add_fails_is_reported_as_a_gap(tmp_path, monkeypatch):
+    """A drifted route is replaced by delete-then-add; if the add fails, the
+    alias has no route until the next apply. That is not hidden: the result is
+    unverified and the gap is logged by route id."""
+    from infer_stack import _log
+
+    class NoAddGateway(RecordingGateway):
+        refuse_add = False
+
+        def post(self, url, **kw):
+            if self.refuse_add and url.endswith('/model/new'):
+                return FakeResp(500, {'error': 'db unavailable'})
+            return super().post(url, **kw)
+
+    time = FakeTime()
+    gw = NoAddGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    be.converge([a], apply=True)
+    rid = _route_id(a.id, 'smol')
+    gw.models[rid]['litellm_params']['model'] = 'ollama/wrong-tag'   # drift
+    gw.refuse_add = True
+    seen = []
+    monkeypatch.setattr(_log.logger, 'warning', lambda msg, *a, **k: seen.append(msg.format(*a)))
+
+    assert be.gateway._reconcile_routes(deadline_s=10.0) is False
+    assert rid not in gw.models                                      # the gap
+    assert any(rid in m and 'missing until the next apply' in m for m in seen)

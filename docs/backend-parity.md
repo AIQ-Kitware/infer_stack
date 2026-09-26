@@ -62,7 +62,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | one `OPENAI_BASE_URL`, the managed key, the alias as model name | same | same through the gateway; with `litellm false`, Model names and no key |
-| `secrets rotate` | same | same |
+| `secrets rotate` | same; a failure before the apply began restores the old key, after it the pending publication converges to the new one | same |
 | env file (`INFER_STACK_*`, `OPENAI_*`) | same | same |
 | readiness is a real generation through the front door | same | same |
 
@@ -74,11 +74,14 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | admission: previewed in memory, then the lease committed with its allocation; a refused acquire writes nothing | yes | same; the allocation is empty (the cluster places), so admission decides renderability, and a pod the cluster cannot place is a wait reason |
 | `--queue` | waits for a free GPU | ≈ admitted at once, the cluster is the queue; an unrenderable endpoint fails at once |
 | `config publish` | pure preview, then commit | same |
+| a preview (admission, `config publish`) writes nothing, not even a first secret | same | same |
+| an apply reports how far it got (runtime, routes); the publication and its approved render stay pending until both | same | same, the host gateway's routes included |
 | `--no-apply` / `apply` / `render` | same | same |
 | unleased keep-warm yields to leased demand | at placement | ≈ during the wait, one per 30 s: only when the scheduler reports a capacity shortage, and only an idle Model on a node the pod could use, holding the resource that is short (longest idle first) |
 | crash-loop fail-fast, the engine's error quoted | same | same (pods, `kubectl logs --previous`) |
 | image-pull progress | yes | n/a: the kubelet pulls; `ImagePullBackOff` is a reported wait reason |
-| strict `residency()` for decisions, lenient `observe()` for reports | same | same |
+| strict `residency()` for decisions, lenient `observe()` for reports | same: two containers for one deployment are a conflict, and decisions fail closed | same: several pods for one Model are its replicas (or a rollout), resident while any is warm |
+| coalescing: an adequate LIVE deployment before a resident IDLE one before any other IDLE one | same | same |
 | recovery after an interrupted apply (settle check) | yes | ≈ `kubectl apply` is idempotent; nothing is left half-created |
 
 ### Placement
@@ -101,7 +104,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | served-name rules | same | same (`leasing/naming.py`) |
 | `runtime.command`, `runtime.mounts` (custom launchers) | yes | boundary: a stock vLLM Model has no place for them; the render refuses loudly |
 | ollama endpoints (`runtime_hosts`) | yes | boundary: daemon-shaped, not model-shaped |
-| `min_replicas` / `max_replicas` | n/a | pass-through, default 1/1 |
+| `min_replicas` / `max_replicas` | n/a | pass-through, default 1/1; a replicated Model is kept warm, pinned, shown running and diagnosed as one (fatal when every replica crash-loops) |
 | weight cache | the host HF cache, mounted | whatever the chart provides; cache profiles are not rendered |
 
 ### Gateway
@@ -109,8 +112,9 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | static superset routes, no blip on model churn | same | same |
-| `routes` inspect / seed / prune | yes | same; a route points at the cluster under the Model's name |
+| `routes` inspect / seed / prune | yes; `seed` refuses to redefine an alias without `--replace` | same; a route points at the cluster under the Model's name |
 | `dynamic_routing` (admin API + Postgres; distinct upstreams for same-model `--dedicated`) | yes | same: each deployment is its own Model (`<name>-<id tail>`) |
+| a departing upstream outlives its route: routes are removed and verified before engines or Models go | yes | same with the host gateway; the in-cluster gateway's static routes have nothing to remove |
 | Open WebUI (`ui`), reverse proxy | yes | same, in the gateway's project on this host |
 | the gateway's changes approved with the acquire's, before the lease commits | yes | same |
 | `network migrate` / `network check` | yes | n/a: Service addresses are stable |
@@ -135,6 +139,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 |---|---|---|
 | unit suite with fake runtimes | yes | yes |
 | parity suite (`tests/test_parity.py`: each *same* row, both backends) | yes | yes |
+| cross-feature poison cases (a backend feature combined with the shared lifecycle: replicas, rollouts, scheduler pressure, partial applies, route failures, coalescing, route conflicts) | yes | yes |
 | end to end | `dev/e2e_tests/run.sh` (tiers; `--gpu` for serving) | `dev/kubeai_e2e.sh` against a real cluster; k3s with CPU vLLM needs no GPU |
 
 ## Deviations that stay

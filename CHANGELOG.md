@@ -2,6 +2,27 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Hardening from a review of the backend-parity work
+
+- A KubeAI Model with several replicas (`min_replicas`) is resident like one
+  pod: releasing its last keep-warm lease no longer prunes it, `leases` shows
+  it running, and it fails fast when every replica crash-loops.
+- On KubeAI, a pod the scheduler cannot place evicts an idle Model only when
+  the scheduler reports a capacity shortage, and only one on a node the pod
+  could use; an impossible node selector or a taint evicts nothing.
+- An apply that reached the runtime but not its routes keeps the publication
+  and its approved render pending, so a render that changes before the retry
+  (an upgrade) must be approved again. KubeAI's apply reports its host
+  gateway's result instead of dropping it.
+- `secrets rotate` restores the old key when the publication fails before
+  its apply began.
+- With dynamic routing, routes are removed and verified before their
+  upstreams are stopped.
+- An acquire coalesces onto an adequate live deployment before reviving an
+  older idle one.
+- `routes seed` refuses to redefine an existing alias unless `--replace`.
+- A preview (admission) no longer writes the gateway's secrets.
+
 ### `/dev/shm` for vLLM on Compose, and the old recipes as suggestions
 
 `runtime.shm_size` (e.g. `16g`) sets a vLLM container's `/dev/shm` on the
