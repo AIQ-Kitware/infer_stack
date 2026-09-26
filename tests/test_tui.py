@@ -2160,3 +2160,40 @@ def test_a_running_action_shows_in_the_activity_line_until_it_ends():
     shown, text = seen['during']
     assert shown and f'acquiring {name}' in text and 's' in text
     assert seen['after'] is False
+
+
+def test_an_edit_made_outside_the_tui_appears_on_the_next_refresh(tmp_path):
+    """The catalog file is reread when it changes (and on `r`); a broken save
+    is reported once, not on every refresh."""
+    import copy
+
+    import yaml
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            edited = copy.deepcopy(CATALOG)
+            edited['endpoints']['qwen-extra'] = dict(edited['endpoints']['qwen-fast'])
+            catalog_path.write_text(yaml.safe_dump(edited))
+            app.action_refresh()
+            await pilot.pause()
+            assert 'qwen-extra' in app._endpoint_names
+
+            refused = []
+            app._refuse = lambda msg, **kw: refused.append(msg)
+            catalog_path.write_text('endpoints: [not, a, mapping\n')
+            app.action_refresh()
+            app.action_refresh()
+            assert len(refused) == 1 and 'catalog reload failed' in refused[0]
+            assert 'qwen-extra' in app._endpoint_names       # the last good one stays
+
+    _run(scenario)

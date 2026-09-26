@@ -895,6 +895,7 @@ class InferStackTUI(App):
         self._ps_rows_cache: list[tuple] = []
         self._gpus_rows_cache: list[tuple] = []
         self.catalog_path = Path(catalog_path).expanduser() if catalog_path else None
+        self._catalog_seen = self._catalog_stamp()   # the catalog given is this one
         self._http = http
         self._proc_factory = proc_factory or self._default_proc_factory()
         self._endpoint_names: list[str] = []
@@ -1567,9 +1568,26 @@ class InferStackTUI(App):
                 'open it in Open WebUI.'
             )
 
+    def _catalog_stamp(self):
+        """The catalog file's (mtime, size), or None when there is none."""
+        try:
+            st = self.catalog_path.stat() if self.catalog_path else None
+        except OSError:
+            return None
+        return None if st is None else (st.st_mtime_ns, st.st_size)
+
+    def _reload_catalog_if_changed(self) -> None:
+        """Pick up an edit made outside the TUI (checked on each refresh)."""
+        stamp = self._catalog_stamp()
+        if stamp is not None and stamp != getattr(self, '_catalog_seen', None):
+            self._reload_catalog()
+
     def _reload_catalog(self) -> None:
         if not self.catalog_path or not self.catalog_path.exists():
             return
+        # Remember this version even if it fails to load: a half-saved edit is
+        # reported once, not on every refresh until it is fixed.
+        self._catalog_seen = self._catalog_stamp()
         try:
             from .leasing import Catalog
             self.catalog = Catalog.load(self.catalog_path)
@@ -1732,12 +1750,15 @@ class InferStackTUI(App):
 
     def action_refresh_now(self) -> None:
         """The `r` key: a refresh the user asked for (the timer calls
-        ``action_refresh`` directly, and must not fill the TUI log)."""
+        ``action_refresh`` directly, and must not fill the TUI log). It also
+        rereads the catalog, edited or not."""
         self._cli(cli.command('status'))
+        self._reload_catalog()
         self.action_refresh()
 
     def action_refresh(self) -> None:
         self._sync_pane_state()   # capture pane state on the UI thread first
+        self._reload_catalog_if_changed()
         self._refresh_bg()
 
     def _update_summary(self, leases, deployments, observed) -> None:

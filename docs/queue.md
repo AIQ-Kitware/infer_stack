@@ -178,8 +178,10 @@ The audit covers:
 
 Seed findings, already known:
 
-- [ ] `r` does not reload catalogs, and edits to a catalog file are not
-      picked up until restart.
+- [x] `r` does not reload catalogs, and edits to a catalog file are not
+      picked up until restart. Fixed: each refresh rereads a changed catalog
+      (a broken save is reported once), and `r` rereads it always. Checked
+      live: `catalog endpoint add` in another shell shows in the TUI.
 - [x] `infer-stack logs` should accept a container name, a prefixed name or
       an endpoint name. Done with P2: an instance name, a container id
       prefix, a deployment id or an endpoint alias.
