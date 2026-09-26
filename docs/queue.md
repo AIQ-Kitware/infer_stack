@@ -586,7 +586,7 @@ routes behind KubeAI cleared the marker; it now returns both. Tests: the
 partial-apply/renderer-drift case (fails on the old controller: the digest
 was gone) and the KubeAI propagation.
 
-### 16. [ ] Secret rotation is a transaction
+### 16. [x] Secret rotation is a transaction
 
 *Why added:* `rotate_gateway_key()` writes the new key into `.env`, then
 publishes, and restores the old key only on `ConvergeAborted`. A strict
@@ -602,6 +602,14 @@ revert the file blindly). Uses item 15's phase information.
 tests for a declined approval, a render failure before apply (both: old
 file, old running key), and a failure after the gateway restarted (pending,
 converges on retry).
+
+*Done 2026-09-27:* the controller records when an apply begins; a rotation
+whose publication fails before that restores the old key (any failure, not
+only a decline), and after it keeps the new key with the publication
+pending and interrupted. Tests use a gateway that accepts the key its
+container started with: a residency failure before apply (fails on the old
+code), a decline, and a failure after apply began that converges on
+`infer-stack apply`.
 
 ### 17. [ ] Dynamic routes never point at a torn-down upstream
 

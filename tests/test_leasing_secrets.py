@@ -147,3 +147,84 @@ def test_an_unreachable_gateway_is_not_a_rejection(tmp_path):
     ledger, ctl = make(tmp_path)
     ctl.backend.http.down = True
     assert ctl.backend.gateway_accepts('sk-anything', wait=5.0) is None
+
+
+# -- rotation is a transaction (queue item 16) --------------------------------------
+
+
+class StartedGateway(Gateway):
+    """Accepts the key its container STARTED with, as a real LiteLLM does.
+
+    The key is read from the .env when the litellm container is (re)created,
+    not per request: a key written to the file afterwards is not the one the
+    gateway checks.
+    """
+
+    def __init__(self, env_path, docker):
+        super().__init__(env_path)
+        self.docker = docker
+        self.container = None
+        self.key = None
+
+    def get(self, url, headers=None, **kw):
+        current = next((cid for cid, c in self.docker.containers.items()
+                        if c['service'] == 'litellm'), None)
+        if current != self.container:              # (re)created: read the key now
+            self.container = current
+            self.key = parse_env_file(self.env_path).get(API_KEY_ENV)
+        if headers and headers.get('Authorization') == f'Bearer {self.key}':
+            return FakeResp(200, {'data': []})
+        return FakeResp(400, {'error': 'Authentication Error'})
+
+
+def make_started(tmp_path):
+    ledger, ctl = make(tmp_path)
+    ctl.backend.http = StartedGateway(ctl.backend.gateway._env_path, ctl.backend.run)
+    ctl.backend.gateway.http = ctl.backend.http
+    ctl.release(acquire(ctl, 'one').lease.id)
+    return ledger, ctl
+
+
+def test_a_render_failure_before_apply_keeps_file_and_gateway_on_the_old_key(tmp_path):
+    from infer_stack.leasing.residency import ResidencyUnknown
+
+    ledger, ctl = make_started(tmp_path)
+    old = env(ctl)[API_KEY_ENV]
+    assert ctl.backend.gateway_accepts(old)
+    real = ctl.backend.residency
+    ctl.backend.residency = lambda: (_ for _ in ()).throw(ResidencyUnknown('docker down'))
+    with pytest.raises(ResidencyUnknown):
+        ctl.rotate_gateway_key()
+    assert env(ctl)[API_KEY_ENV] == old            # the file says what the gateway runs
+    ctl.backend.residency = real
+    assert ctl.backend.gateway_accepts(old)
+
+
+def test_a_declined_rotation_keeps_file_and_gateway_on_the_old_key(tmp_path):
+    from infer_stack.leasing.backend import ConvergeAborted
+
+    ledger, ctl = make_started(tmp_path)
+    old = env(ctl)[API_KEY_ENV]
+    ctl.backend._approve_changes = lambda planned: (_ for _ in ()).throw(ConvergeAborted('no'))
+    with pytest.raises(ConvergeAborted):
+        ctl.rotate_gateway_key()
+    assert env(ctl)[API_KEY_ENV] == old and ctl.backend.gateway_accepts(old)
+
+
+def test_a_failure_after_apply_began_keeps_the_new_key_and_converges(tmp_path):
+    from infer_stack.leasing.backend import BackendTimeout
+
+    ledger, ctl = make_started(tmp_path)
+    old = env(ctl)[API_KEY_ENV]
+    real = ctl.backend.apply
+    ctl.backend.apply = lambda: (_ for _ in ()).throw(BackendTimeout('up timed out'))
+    ctl.backend.settle_snapshot = lambda: ()
+    with pytest.raises(BackendTimeout):
+        ctl.rotate_gateway_key()
+    new = env(ctl)[API_KEY_ENV]
+    assert new != old                              # not reverted blindly
+    assert ledger.publication_pending()['apply_requested']
+    ctl.backend.apply = real
+    ctl.apply_now()                                # the pending publication converges
+    assert ctl.backend.gateway_accepts(new) and not ctl.backend.gateway_accepts(old)
+    assert ledger.publication_pending() is None

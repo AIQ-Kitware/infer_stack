@@ -662,10 +662,16 @@ class Controller:
         Refused while any lease is ACTIVE unless ``force``: its holder
         authenticates with the old key, and the gateway restarts. The new key
         is written, then published like any desired-state change, so the
-        gateway (and Open WebUI) are recreated with it. A declined apply puts
-        the old key back.
+        gateway (and Open WebUI) are recreated with it.
+
+        A running LiteLLM keeps the key it started with. So when the
+        publication fails before its apply began (declined, residency
+        unreadable, a render refused) nothing was recreated, and the old key
+        goes back into the managed ``.env``: otherwise clients would be handed
+        a key the gateway rejects. Once the apply began, the gateway may
+        already run the new key; the file keeps it, and the pending
+        publication converges the runtime to it on the next apply.
         """
-        from .backend import ConvergeAborted
         from .profile import ProfileMismatch
 
         rotate = getattr(self.backend, 'rotate_master_key', None)
@@ -681,10 +687,12 @@ class Controller:
                 )
             self._mark_pending(apply=True)
             replaced = rotate()
+            self._apply_began = False
             try:
                 return self._publish()
-            except ConvergeAborted:
-                getattr(self.backend, 'restore_env')(replaced)
+            except BaseException:
+                if not self._apply_began:
+                    getattr(self.backend, 'restore_env')(replaced)
                 raise
 
     def observe_state(self) -> dict:
