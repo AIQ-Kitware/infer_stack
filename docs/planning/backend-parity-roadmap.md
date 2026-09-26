@@ -1,8 +1,8 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1–P4, P6 done** 2026-09-26 (P4's GPU run is
-a handover) · P5 not started. Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · **all phases done** 2026-09-26; P4 and P5 end in
+a handover run on real hardware (`dev/handover/`). Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -209,6 +209,22 @@ reading vLLM's memory lines are `dev/handover/p4_gpu_labels.sh`.
 
 **Exit:** on two nodes, a card on node A leases a model that lands on node
 B and talks to it through the in-cluster gateway; `secrets rotate` works.
+
+**P5 done 2026-09-26** with the second node a container on the same host
+(`dev/k3s_agent_container.sh`): `kubeai_gateway cluster` renders the gateway
+as a Deployment and a NodePort Service (`backends/kubeai_gateway.py`),
+reaching KubeAI by its Service's DNS name, so no port-forward is needed;
+the key is a Secret applied from the state dir, never shown in a diff, and
+its hash rolls the pods; `doctor` checks it. The recovery profile says which
+placement renders, so changing the setting is adopted like any other once
+the stack is quiescent. `dev/kubeai_e2e.sh` (with `E2E_SIZED=1
+E2E_REMOTE_NODE=1`) served a Model on the second node through that gateway,
+rotated the key, and removed it with `stack down`. Deferred: dynamic
+routing and Open WebUI in the cluster (they need Postgres and a UI there),
+and an Ingress (no controller on the development cluster; `kubeai_gateway_url`
+takes one). The run across two real machines is
+`dev/handover/p5_two_hosts.sh`, and the runbook is "Add a workstation" in
+`kubeai-backend.md`.
 **Size:** medium to large. The only phase that adds a second renderer for
 the gateway, and the only one that needs a second machine. Last.
 

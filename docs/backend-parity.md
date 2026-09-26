@@ -24,8 +24,8 @@ cluster setup is [kubeai-backend.md](kubeai-backend.md).
 | | Compose | KubeAI adds |
 |---|---|---|
 | tools | Docker with the NVIDIA runtime | a cluster (`scripts/bootstrap_k3s.sh` for one host, `scripts/join_agent.sh` for another), `kubectl`, `helm`, the KubeAI chart (`scripts/install_kubeai.sh`), the NVIDIA device plugin on GPU nodes |
-| information | none: GPUs are discovered with `nvidia-smi` | `resourceProfiles` in the chart values (what one GPU unit requests, and on which nodes), and per endpoint `runtime.resource_profile` or a default `kubeai_resource_profile` |
-| settings | `backend compose` | `backend kubeai`; `kubeai_namespace`, `kubeai_base_url`, `kubeai_gateway_upstream` when the defaults (namespace `kubeai`, a port-forward on 8000, the Service's cluster IP) do not hold |
+| information | none: GPUs are discovered with `nvidia-smi` | `resourceProfiles` in the chart values (what one GPU unit requests, and on which nodes; `catalog suggest --backend kubeai` proposes them from the nodes' GPU labels), and per endpoint `runtime.resource_profile`, a `min_vram_gib` that picks one by size, or a default `kubeai_resource_profile` |
+| settings | `backend compose` | `backend kubeai`; `kubeai_gateway cluster` for more than one workstation; `kubeai_namespace`, `kubeai_base_url`, `kubeai_gateway_upstream` when the defaults (namespace `kubeai`, a port-forward on 8000, the Service's cluster IP) do not hold |
 | preflight | none needed | `infer-stack doctor`: cluster → CRD → namespace → gateway |
 
 The catalog, `acquire … --env-file`, `release`, the TUI and the env file a
@@ -114,7 +114,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | Open WebUI (`ui`), reverse proxy | yes | same, in the gateway's project on this host |
 | the gateway's changes approved with the acquire's, before the lease commits | yes | same |
 | `network migrate` / `network check` | yes | n/a: Service addresses are stable |
-| where the gateway runs | this host | this host, so it is in every request's path (P5 moves it into the cluster) |
+| where the gateway runs | this host | this host (default), or the cluster (`kubeai_gateway cluster`: a Deployment and a NodePort any node answers on; static routes, no UI) |
 
 ### Day-2 operations and the TUI
 

@@ -31,6 +31,12 @@
 #                          on two nodes with fake GPU labels. Needs
 #                          dev/k3s_agent_container.sh up (E2E_SIZED_NODE names
 #                          the node; default k3s-agent-b).
+#   E2E_CLUSTER_GATEWAY    1 (default): finish with the gateway in the cluster
+#                          (kubeai_gateway cluster): a NodePort, doctor,
+#                          secrets rotate, stack down.
+#   E2E_REMOTE_NODE        1 (with E2E_SIZED=1): also serve a Model on the
+#                          second node through that gateway (pulls the vLLM
+#                          CPU image inside the node container once).
 set -euo pipefail
 
 MODEL="${E2E_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
@@ -292,6 +298,62 @@ if [ "${GATEWAY:-1}" = 1 ] && [ "${E2E_DYNAMIC:-1}" = 1 ]; then
   fi
   run_is release --env-file "$WORK/dyn1.env" --yes
   run_is release --env-file "$WORK/dyn2.env" --yes
+fi
+
+if [ "${GATEWAY:-1}" = 1 ] && [ "${E2E_CLUSTER_GATEWAY:-1}" = 1 ]; then
+  echo '== the gateway inside the cluster: a card reaches the Model on a NodePort'
+  run_is stack down >/dev/null 2>&1            # the host gateway, and any Models
+  for _ in $(seq 90); do
+    [ -z "$(kubectl -n "$NAMESPACE" get pods -l infer-stack/managed=true -o name)" ] && break
+    sleep 2
+  done
+  run_is config set dynamic_routing false >/dev/null
+  run_is config set kubeai_gateway cluster
+  run_is acquire "$ALIAS" --yes --ttl 30m --timeout "$TIMEOUT" \
+      --env-file "$WORK/cluster.env" > "$WORK/cluster.log" 2>&1 || true
+  grep -q 'ready: True' "$WORK/cluster.log" \
+    || { tail -20 "$WORK/cluster.log" >&2; echo '!! not ready through the in-cluster gateway' >&2; exit 1; }
+  # shellcheck disable=SC1090
+  source "$WORK/cluster.env"
+  case "$OPENAI_BASE_URL" in
+    *:"${E2E_NODE_PORT:-30442}"/v1) ;;
+    *) echo "!! the env file points at $OPENAI_BASE_URL, not a NodePort" >&2; exit 1 ;;
+  esac
+  ask() {   # <model> -> a generation through the env file's gateway
+    curl -sS --fail-with-body "$OPENAI_BASE_URL/chat/completions" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+      -d "{\"model\": \"$1\", \"max_tokens\": 4,
+           \"messages\": [{\"role\": \"user\", \"content\": \"say ok\"}]}" > "$WORK/ask.json" \
+      && grep -q choices "$WORK/ask.json"
+  }
+  ask "$ALIAS" || { echo "!! no generation via $OPENAI_BASE_URL" >&2; exit 1; }
+  echo "   generation ok via $OPENAI_BASE_URL (a node's NodePort, no port-forward)"
+  run_is doctor > "$WORK/doctor.log" 2>&1 || { cat "$WORK/doctor.log" >&2; exit 1; }
+  grep -q '\[ok  \] in-cluster gateway' "$WORK/doctor.log" \
+    || { cat "$WORK/doctor.log" >&2; echo '!! doctor did not check the gateway' >&2; exit 1; }
+  echo '   doctor checks the in-cluster gateway'
+  if [ "${E2E_SIZED:-0}" = 1 ] && [ "${E2E_REMOTE_NODE:-0}" = 1 ]; then
+    run_is acquire e2e-sized-big --yes --timeout "$TIMEOUT" \
+        --env-file "$WORK/remote.env" > "$WORK/remote.log" 2>&1 || true
+    grep -q 'ready: True' "$WORK/remote.log" \
+      || { tail -20 "$WORK/remote.log" >&2; echo '!! the Model on the second node never became ready' >&2; exit 1; }
+    got=$(where e2e-sized-big)
+    [ "$got" = "sized-80g:1 $NODE_B" ] || { echo "!! the remote Model is at: $got" >&2; exit 1; }
+    ask e2e-sized-big || { echo '!! no generation from the second node' >&2; exit 1; }
+    echo "   a Model on $NODE_B answers through the same gateway"
+    run_is release --env-file "$WORK/remote.env" --yes >/dev/null
+  fi
+  run_is release --env-file "$WORK/cluster.env" --yes >/dev/null
+  run_is secrets rotate > "$WORK/rotate.log" 2>&1 \
+    || { cat "$WORK/rotate.log" >&2; echo '!! secrets rotate failed' >&2; exit 1; }
+  grep -q 'new key accepted, old key rejected' "$WORK/rotate.log" \
+    || { cat "$WORK/rotate.log" >&2; exit 1; }
+  echo '   secrets rotate: new key accepted, old key rejected (a Secret and a rollout)'
+  run_is stack down >/dev/null
+  if kubectl -n "$NAMESPACE" get deployment infer-stack-gateway >/dev/null 2>&1; then
+    echo '!! stack down left the gateway Deployment' >&2; exit 1
+  fi
+  echo '   stack down removes it'
 fi
 
 echo 'PASS: kubeai backend end-to-end lifecycle'

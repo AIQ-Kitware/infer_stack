@@ -943,8 +943,13 @@ class Gateway(ConvergeScaffold):
         http: Any = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        base_url: str | Callable[[], str] | None = None,
     ):
         self.state_dir = Path(state_dir)
+        # Where clients reach the gateway (no ``/v1``). None: this host, on the
+        # published port. The in-cluster gateway passes a callable, so the
+        # node address is looked up only when something asks.
+        self.base_url: str | Callable[[], str] | None = base_url
         self.ports = ports
         self.litellm = litellm
         self.ui = ui
@@ -1165,7 +1170,14 @@ class Gateway(ConvergeScaffold):
         return merged
 
     def _gateway_base(self) -> str:
-        return f'http://127.0.0.1:{self.litellm_port}'
+        where = self.base_url
+        if where is None:
+            base = f'http://127.0.0.1:{self.litellm_port}'
+        elif isinstance(where, str):
+            base = where
+        else:
+            base = where()
+        return base.rstrip('/')
 
     def _auth_headers(self) -> dict[str, str]:
         return {'Authorization': f'Bearer {self.master_key()}'}
@@ -1379,7 +1391,7 @@ class Gateway(ConvergeScaffold):
                 return {'ui_url': f'http://127.0.0.1:{self.ui_port}'}
             return None
         info: dict[str, Any] = {
-            'base_url': f'http://127.0.0.1:{self.litellm_port}/v1',
+            'base_url': f'{self._gateway_base()}/v1',
             'api_key_env': API_KEY_ENV,
             'api_key': self.master_key(),
             'request_names': {ep: ep for ep in endpoints},

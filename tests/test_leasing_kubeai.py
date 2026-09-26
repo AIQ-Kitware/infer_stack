@@ -1010,3 +1010,104 @@ def test_a_recorded_measurement_picks_the_profile(tmp_path):
     be.converge([dep], apply=False)
     (doc,) = yaml.safe_load_all(be.models_file.read_text())
     assert doc['spec']['resourceProfile'] == 'big:1'
+
+
+# -- the gateway inside the cluster (P5) ----------------------------------------
+
+
+class ClusterKubectl(FakeKubectl):
+    """FakeKubectl that keeps the gateway's objects apart from the Models."""
+
+    def __init__(self):
+        super().__init__()
+        self.gateway_objects: dict[str, dict] = {}
+        self.rollouts = 0
+
+    def __call__(self, args):
+        if len(args) > 4 and args[3] == 'get' and args[4] == 'nodes':
+            return json.dumps({'items': [{'status': {'addresses': [
+                {'type': 'InternalIP', 'address': '10.0.0.7'}]}}]})
+        if len(args) > 3 and args[3] == 'rollout':
+            self.rollouts += 1
+            return ''
+        if len(args) > 3 and args[3] == 'apply':
+            path = Path(args[args.index('-f') + 1])
+            docs = [d for d in yaml.safe_load_all(path.read_text()) if d]
+            if all(d.get('kind') != 'Model' for d in docs):
+                for d in docs:
+                    self.gateway_objects[d['kind']] = d
+                return ''
+        return super().__call__(args)
+
+
+def make_cluster_gateway_backend(tmp_path):
+    from infer_stack.backends.kubeai_gateway import ClusterGateway
+
+    kubectl = ClusterKubectl()
+    gateway = ClusterGateway(state_dir=tmp_path / 'gw', namespace='kubeai', run=kubectl,
+                             images={'litellm': 'litellm:test'})
+    be = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=kubectl, http=FakeHttp(kubectl),
+                       gateway=gateway)
+    return be, kubectl
+
+
+def test_the_in_cluster_gateway_routes_by_cluster_dns(tmp_path):
+    be, kubectl = make_cluster_gateway_backend(tmp_path)
+    dep = vllm('grp-a', served='tiny')
+    dep.served = {'tiny': {'served_model_name': 'tiny', 'protocol': 'chat'}}
+    be.converge([dep])
+    config = yaml.safe_load(kubectl.gateway_objects['ConfigMap']['data']['config.yaml'])
+    (route,) = config['model_list']
+    assert route['model_name'] == 'tiny'
+    assert route['litellm_params']['api_base'] == \
+        'http://kubeai.kubeai.svc.cluster.local/openai/v1'
+    assert kubectl.gateway_objects['Service']['spec']['type'] == 'NodePort'
+    assert kubectl.rollouts == 1
+    assert be.access(['tiny'])['base_url'] == 'http://10.0.0.7:30442/v1'
+    assert be.compose_project() is None and be.front_door() is be.gateway
+
+
+def test_the_key_is_a_secret_never_a_diff_and_rotating_it_rolls_the_pods(tmp_path):
+    import stat
+
+    be, kubectl = make_cluster_gateway_backend(tmp_path)
+    be.converge([])
+    key = be.master_key()
+    assert key not in be.gateway.manifests_file.read_text()
+    secret = be.gateway.state_dir / 'gateway-secret.yaml'
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+    assert kubectl.gateway_objects['Secret']['stringData']['LITELLM_MASTER_KEY'] == key
+
+    def key_hash():
+        tmpl = kubectl.gateway_objects['Deployment']['spec']['template']
+        return tmpl['metadata']['annotations']['infer-stack/key-hash']
+
+    before = key_hash()
+    be.rotate_master_key()
+    be.converge([])
+    assert key_hash() != before
+
+
+def test_doctor_checks_the_in_cluster_gateway_not_a_port_forward(tmp_path):
+    be, _ = make_cluster_gateway_backend(tmp_path)
+    be.gateway.gateway_accepts = lambda key, wait=0.0: True
+    names = [name for name, ok, _ in be.doctor()]
+    assert names[-1] == 'in-cluster gateway at http://10.0.0.7:30442/v1'
+    assert not any('port-forward' in name for name in names)
+
+
+def test_the_recovery_profile_says_where_the_gateway_runs(tmp_path):
+    """Changing `kubeai_gateway` is adopted like any setting: the snapshot
+    decides which gateway renders, host or cluster, and switches it."""
+    from infer_stack.backends.kubeai_gateway import ClusterGateway
+
+    cluster_be, _ = make_cluster_gateway_backend(tmp_path / 'c')
+    host_be, _ = make_front_door_backend(tmp_path / 'h')
+    host_gateway = host_be.gateway
+    host_be.gateway_factory = lambda placement: (
+        cluster_be.gateway if placement == 'cluster' else host_gateway)
+    host_be.use_profile(cluster_be.render_profile())
+    assert isinstance(host_be.gateway, ClusterGateway)
+    host_be.use_profile({**cluster_be.render_profile(),
+                         'gateway': host_gateway.render_profile()})
+    assert host_be.gateway is host_gateway

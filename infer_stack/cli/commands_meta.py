@@ -366,6 +366,15 @@ BACKEND_SETTINGS = {
         'URL the LiteLLM gateway uses to reach KubeAI (default: the kubeai '
         "Service's cluster IP, reachable from a cluster node; set an ingress "
         'URL when the gateway runs off the cluster).',
+    'kubeai_gateway':
+        'Where the LiteLLM gateway runs: `host` (default; a Compose project on '
+        'this host) or `cluster` (a Deployment + NodePort Service in the KubeAI '
+        'namespace, reachable from every node).',
+    'kubeai_gateway_node_port':
+        'NodePort of the in-cluster gateway (default: 30442).',
+    'kubeai_gateway_url':
+        'Where clients reach the in-cluster gateway, e.g. an ingress URL '
+        "(default: the first node's address on the NodePort).",
 }
 
 

@@ -398,6 +398,7 @@ class KubeaiBackend(ConvergeScaffold):
         assume_yes: bool = True,
         gateway: Any = None,
         gateway_upstream: str | None = None,
+        gateway_factory: Callable[[str], Any] | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -420,6 +421,9 @@ class KubeaiBackend(ConvergeScaffold):
         # request names (the endpoint aliases) as on the compose backend.
         # Without it, clients talk to KubeAI directly under its Model names.
         self.gateway = gateway
+        # Builds the gateway for a placement ('host' or 'cluster'), so a
+        # recovery profile can say where it runs (see use_profile).
+        self.gateway_factory = gateway_factory
         # How that gateway reaches KubeAI. Unset: the KubeAI Service's cluster
         # IP, which containers on a cluster node can reach; a gateway off the
         # cluster needs an ingress URL here.
@@ -441,7 +445,12 @@ class KubeaiBackend(ConvergeScaffold):
     rendered_file = models_file
 
     def compose_project(self):
-        """The Compose project on this host: the gateway's, or ``None``."""
+        """The Compose project on this host: the gateway's, or ``None``
+        (no gateway, or the gateway runs in the cluster)."""
+        return self.gateway.compose_project() if self.gateway is not None else None
+
+    def front_door(self):
+        """What holds the gateway's keys and route registry: the gateway."""
         return self.gateway
 
     @property
@@ -503,6 +512,10 @@ class KubeaiBackend(ConvergeScaffold):
 
     def _upstream_url(self) -> str:
         """Where the gateway sends requests for this cluster's Models."""
+        if not self.gateway_upstream and getattr(self.gateway, 'in_cluster', False):
+            # Inside the cluster: the Service's DNS name, stable across
+            # reinstalls, unlike its cluster IP.
+            return f'http://kubeai.{self.namespace}.svc.cluster.local/openai/v1'
         if not self.gateway_upstream:
             ip = self._kubectl(['get', 'service', 'kubeai', '-o',
                                 'jsonpath={.spec.clusterIP}']).strip()
@@ -820,6 +833,18 @@ class KubeaiBackend(ConvergeScaffold):
         # A profile from before the front door's settings were recorded holds
         # only True/False here; it then keeps this process's settings.
         if isinstance(front, dict) and self.gateway is not None:
+            wanted = 'cluster' if front.get('placement') == 'cluster' else 'host'
+            have = 'cluster' if getattr(self.gateway, 'in_cluster', False) else 'host'
+            if wanted != have:
+                # The snapshot decides where the gateway runs, as it decides
+                # everything else it renders.
+                if self.gateway_factory is None:
+                    from ..leasing.profile import ProfileMismatch
+
+                    raise ProfileMismatch(
+                        f'the active recovery snapshot has the gateway on the {wanted}, '
+                        f'this process on the {have}')
+                self.gateway = self.gateway_factory(wanted)
             self.gateway.use_profile(front)
 
     def apply(self) -> None:
@@ -1072,6 +1097,10 @@ class KubeaiBackend(ConvergeScaffold):
             f'kubectl create namespace {self.namespace} (or install the '
             'chart there)',
         )
+        if getattr(self.gateway, 'in_cluster', False):
+            # Clients use the gateway in the cluster; no port-forward needed.
+            checks.append(self.gateway.doctor_check())
+            return checks
         try:
             resp = self.http.get(f'{self.base_url}/models', timeout=10)
             code = getattr(resp, 'status_code', 0)

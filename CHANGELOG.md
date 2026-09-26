@@ -2,6 +2,18 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### The gateway can run inside the cluster
+
+`infer-stack config set kubeai_gateway cluster` runs the LiteLLM gateway as a
+Deployment and a NodePort Service in the KubeAI namespace instead of on the
+host running infer-stack, so no single host is in every request's path and
+no `kubectl port-forward` is needed: an env file's `OPENAI_BASE_URL` is a
+node's address on the NodePort (or `kubeai_gateway_url`), and every node
+answers. It is the same gateway, key and route registry; `secrets rotate`
+updates its Secret and rolls it, `doctor` checks it, and `stack down`
+removes it. It takes static routes only. `docs/kubeai-backend.md` gains
+"Add a workstation", the runbook for a second GPU machine.
+
 ### KubeAI picks a resource profile by GPU size
 
 On the kubeai backend, an endpoint with `placement.min_vram_gib` and no

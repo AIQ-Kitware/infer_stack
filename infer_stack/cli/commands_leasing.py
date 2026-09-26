@@ -277,16 +277,29 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'kubeai':
         from ..backends.kubeai import KubeaiBackend
 
-        gateway = None
-        if _resolve_litellm(config):
+        def make_gateway(placement: str):
+            """The LiteLLM front door for a placement: 'host' or 'cluster'."""
+            if placement == 'cluster':
+                from ..backends.kubeai import _default_kubectl_run
+                from ..backends.kubeai_gateway import DEFAULT_NODE_PORT, ClusterGateway
+
+                return ClusterGateway(
+                    state_dir=data_root() / 'leasing' / 'kubeai-cluster-gateway',
+                    namespace=get_setting('kubeai_namespace') or 'kubeai',
+                    run=_default_kubectl_run,
+                    node_port=int(get_setting('kubeai_gateway_node_port')
+                                  or DEFAULT_NODE_PORT),
+                    url=get_setting('kubeai_gateway_url') or None,
+                    assume_yes=_resolve_assume_yes(config, interactive=interactive),
+                )
             # The same LiteLLM front door as the compose backend, fronting the
             # cluster: one base_url, the managed key, and endpoint aliases as
             # request names. Its own state dir and compose project, so it can
-            # never touch a compose stack's containers on the same host.
-            # The front door takes the same settings as on compose (UI,
-            # reverse proxy, dynamic routing); only the engines are elsewhere.
+            # never touch a compose stack's containers on the same host. It
+            # takes the same settings as on compose (UI, reverse proxy,
+            # dynamic routing); only the engines are elsewhere.
             rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
-            gateway = ComposeBackend(
+            return ComposeBackend(
                 state_dir=data_root() / 'leasing' / 'kubeai-gateway',
                 inventory={'gpu_count': 0, 'gpus': []},
                 project='infer-stack-gateway',
@@ -298,6 +311,9 @@ def _make_backend(config, *, interactive: bool = False):
                 dynamic_routing=_resolve_dynamic_routing(config),
                 assume_yes=_resolve_assume_yes(config, interactive=interactive),
             )
+
+        gateway = (make_gateway(get_setting('kubeai_gateway') or 'host')
+                   if _resolve_litellm(config) else None)
         backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
@@ -307,6 +323,7 @@ def _make_backend(config, *, interactive: bool = False):
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
             gateway=gateway,
             gateway_upstream=get_setting('kubeai_gateway_upstream') or None,
+            gateway_factory=make_gateway if gateway is not None else None,
         )
         try:
             backend.catalog = _load_catalog(config)   # frozen into the profile
@@ -2462,11 +2479,12 @@ class EnvCLI(_PathOverridesMixin):
 
 
 def _require_compose_backend(controller):
-    """The Compose project holding the gateway's route registry.
+    """What holds the gateway's route registry (its front door).
 
-    The stack itself on the compose backend, the gateway's project on kubeai;
-    a SystemExit for a backend with no gateway (null, or ``litellm false``)."""
-    project = getattr(controller.backend, 'compose_project', lambda: None)()
+    The stack itself on the compose backend; on kubeai the gateway, on this
+    host or in the cluster. A SystemExit for a backend with no gateway (null,
+    or ``litellm false``)."""
+    project = getattr(controller.backend, 'front_door', lambda: None)()
     if project is None or not getattr(project, 'litellm', False):
         raise SystemExit(
             'the `routes` commands need a LiteLLM gateway (the compose or kubeai '

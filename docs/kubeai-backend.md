@@ -120,6 +120,61 @@ source lease.env            # OPENAI_BASE_URL + OPENAI_API_KEY -> the gateway
 infer-stack release --env-file lease.env
 ```
 
+## The gateway inside the cluster
+
+By default the gateway is a Compose project on the host running infer-stack,
+so that host is in every request's path. For more than one workstation, put
+it in the cluster:
+
+```bash
+infer-stack stack down                       # the host gateway (and any Models)
+infer-stack config set kubeai_gateway cluster
+infer-stack acquire <endpoint> --env-file lease.env --yes
+# OPENAI_BASE_URL is now http://<a node's address>:30442/v1: any node answers
+```
+
+It is the same gateway (image, config, managed key, route registry) as a
+Deployment and a NodePort Service in the KubeAI namespace, and it reaches
+KubeAI by the Service's cluster DNS name, so no `kubectl port-forward` is
+needed. `secrets rotate` updates its Secret and rolls it; `doctor` checks it;
+`stack down` removes it. Settings: `kubeai_gateway_node_port` (30442) and
+`kubeai_gateway_url` (an ingress URL clients should use instead). Static
+routes only: dynamic routing and Open WebUI need the host placement.
+
+## Add a workstation
+
+The cluster's first node is the one `scripts/bootstrap_k3s.sh` set up. To add
+a GPU workstation as a second node:
+
+1. On the first node, collect the join facts:
+   ```bash
+   sudo cat /var/lib/rancher/k3s/server/node-token   # the token
+   k3s --version                                     # join with the same version
+   ```
+2. On the new workstation (NVIDIA driver and container toolkit installed),
+   join with the server's version:
+   ```bash
+   INSTALL_K3S_VERSION='v1.36.4+k3s1' \
+     scripts/join_agent.sh https://<first-node-ip>:6443 <token> <name>
+   ```
+   Between the nodes, open 6443/tcp (to the first node), 8472/udp (flannel)
+   and 10250/tcp; for clients, the NodePort (30442/tcp).
+3. Back on the first node: the NVIDIA device plugin is a DaemonSet, so it
+   starts on the new node by itself. Check the new node reports its GPUs and
+   labels, then add a sized profile for its GPU product:
+   ```bash
+   kubectl get node <name> -o jsonpath='{.status.allocatable.nvidia\.com/gpu}{"\n"}'
+   infer-stack catalog suggest --backend kubeai     # profiles per GPU product (stderr)
+   ```
+   Merge the proposed `resourceProfiles` into your helm values and rerun
+   `scripts/install_kubeai.sh <values>`. An endpoint that names that profile,
+   or declares a `min_vram_gib` only that GPU meets, lands on the new node.
+4. With the gateway in the cluster (above), a card on either workstation uses
+   the env file as it is: the NodePort answers on every node.
+
+`dev/k3s_agent_container.sh` makes a second node out of a container on one
+host, for development; `dev/handover/p5_two_hosts.sh` checks a real one.
+
 ## Semantics + limitations
 
 - **Readiness is a real generation** through the gateway (same philosophy as
@@ -164,8 +219,9 @@ infer-stack release --env-file lease.env
   runtime pane read the pods (and the gateway's containers), in the same shape
   as on compose. `stack compose …` and `stack restart` act on the gateway's
   Compose project; the engines are pods, restarted by the kubelet.
-- The gateway runs on the host running infer-stack, so that host is in every
-  request's path. It takes the same settings as on compose: `ui` (Open WebUI,
+- By default the gateway runs on the host running infer-stack, so that host is
+  in every request's path (`kubeai_gateway cluster` moves it; see above). It
+  takes the same settings as on compose: `ui` (Open WebUI,
   on by default), `reverse_proxy`, and `dynamic_routing`, under which each
   deployment is its own Model (`<name>-<id tail>`), so `--dedicated` twice
   gives two Models behind one alias. The gateway's config changes are shown

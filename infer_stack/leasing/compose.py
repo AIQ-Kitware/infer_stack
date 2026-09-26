@@ -1101,6 +1101,10 @@ class ComposeBackend(ConvergeScaffold):
         """The Compose project on this host: this one."""
         return self
 
+    def front_door(self):
+        """What holds the gateway's keys and route registry: this project."""
+        return self
+
     def compose_argv(self) -> list[str]:
         """``docker compose [--env-file ...] -p <project> -f <file>``: the one base.
 
