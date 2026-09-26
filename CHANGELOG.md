@@ -2,6 +2,19 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Compose and KubeAI: a parity matrix and a roadmap
+
+`docs/backend-parity.md` states the relationship the two backends are meant
+to have (KubeAI is Compose plus a scheduler: more information supplied, more
+tools installed, the same catalog, verbs, env file and TUI) and records, row
+by row, where that holds today, where it does not, and which differences are
+deliberate. `docs/planning/backend-parity-roadmap.md` plans the rest in five
+phases with exit criteria, from one acquire path to the gateway inside the
+cluster for a multi-workstation run. The README's KubeAI section, which still
+described the pre-leasing `setup` / `deploy` workflow and a live patch that
+is no longer needed, now points at the current docs and keeps only the
+cluster prerequisites and the `kubectl` debugging checks.
+
 ### Endpoints|models and leases|deployments are tabs
 
 The sidebar shows Endpoints and Models as two tabs instead of two panes split

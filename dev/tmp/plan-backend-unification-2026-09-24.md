@@ -1,6 +1,11 @@
 # Plan: one set of authorities for the Compose and KubeAI backends
 
 Status: draft for review, 2026-09-24. Nothing here is implemented.
+Update 2026-09-25: K0, K1, K2, K4, K5 (except TUI logs) and G are done;
+what remains (K3, TUI logs, dynamic routing on KubeAI, the in-cluster
+gateway) is planned as phases in `docs/planning/backend-parity-roadmap.md`,
+and the current state is `docs/backend-parity.md`. This file stays as the
+audit record.
 
 ## Goal
 

@@ -31,6 +31,10 @@ semantics carry over: an idle `keep-warm` deployment keeps its CR (model stays
 resident); `stop` deployments are pruned on release; `evict`/`gc` free the
 cluster. Hand-applied Models without the managed label are never touched.
 
+Where the two backends match and where they still differ, row by row:
+[backend-parity.md](backend-parity.md); the plan for the rest is
+[planning/backend-parity-roadmap.md](planning/backend-parity-roadmap.md).
+
 ## One-time cluster setup
 
 ```bash

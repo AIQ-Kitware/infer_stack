@@ -702,27 +702,33 @@ chat settings.
 
 ## Backend 2: KubeAI
 
-Use KubeAI when you want Kubernetes-managed serving.
+`--backend kubeai` runs the same leasing verbs against a Kubernetes cluster
+running [KubeAI](https://www.kubeai.org): the same catalog, ledger, TTLs,
+env file and TUI, with `Model` custom resources in place of compose
+services and the cluster scheduler in place of the local GPU planner. The
+LiteLLM gateway still fronts everything, so a card sees one `OPENAI_BASE_URL`,
+the managed key and the endpoint alias on either backend.
 
-### Important rules
+* Setup, settings and semantics: [docs/kubeai-backend.md](docs/kubeai-backend.md).
+* What matches Compose, what does not yet, and what is deliberate:
+  [docs/backend-parity.md](docs/backend-parity.md); the plan to close the
+  rest: [docs/planning/backend-parity-roadmap.md](docs/planning/backend-parity-roadmap.md).
 
-1. **Use the same namespace everywhere.** The namespace in `infer-stack setup --namespace ...` must match the namespace where the KubeAI Helm release already exists.
-2. **Prefer the repo-driven path.** The normal path is `setup` -> `validate` -> `render` -> `deploy` -> `status`.
-3. **`kubectl port-forward` stays in the foreground.** Leave it running in one terminal and send requests from another.
-4. **The first request can take a while.** `/openai/v1/models` may work before chat completions work. The first completion may trigger pod creation, image pull, model load, and compile warmup.
-5. **On the current repo version, KubeAI still needs a live workaround after deploy.** The renderer currently produces a `Model` spec that needs a small manual patch to work with the KubeAI version used in these notes.
+The short version:
+
+```bash
+./scripts/bootstrap_k3s.sh                         # a one-host cluster (k3s + helm)
+./scripts/install_kubeai.sh kubeai-values.yaml     # the chart, with your resourceProfiles
+kubectl -n kubeai port-forward svc/kubeai 8000:80 &
+infer-stack config set backend kubeai
+infer-stack doctor                                 # cluster -> CRD -> namespace -> gateway
+infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
+```
 
 ### KubeAI prerequisites
 
-You need:
-
-* a working Kubernetes cluster
-* `kubectl`
-* Helm
-
-If you want a quick local single-node cluster, K3s is a good option.
-
-Install K3s:
+You need a Kubernetes cluster, `kubectl` and Helm. `scripts/bootstrap_k3s.sh`
+installs k3s and helm on one host; the steps it runs, by hand:
 
 ```bash
 curl -sfL https://get.k3s.io | sh -
@@ -773,332 +779,78 @@ kubectl get node "$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')" 
 kubectl get nodes --show-labels | tr ',' '\n' | grep 'nvidia.com/' || true
 ```
 
-You want to see a non-empty `nvidia.com/gpu` count and `nvidia.com/*` labels such as product and memory.
+You want a non-empty `nvidia.com/gpu` count and `nvidia.com/*` labels such as product and memory.
 
-### KubeAI Helm repository
+### Resource profiles
 
-```bash
-helm repo add kubeai https://www.kubeai.org
-helm repo update
-```
-
-## Determine which namespace to use
-
-Before doing anything else, discover whether a `kubeai` release already exists and which namespace it uses.
-
-```bash
-KUBEAI_NAMESPACE="$(helm list -A | awk '$1=="kubeai"{print $2; exit}')"
-if [ -z "${KUBEAI_NAMESPACE}" ]; then
-  KUBEAI_NAMESPACE=default
-fi
-echo "Using KubeAI namespace: ${KUBEAI_NAMESPACE}"
-```
-
-If a release already exists, **reuse that namespace**.
-
-Sanity-check the cluster:
-
-```bash
-kubectl get nodes
-kubectl get crd models.kubeai.org || true
-helm list -A | grep kubeai || true
-kubectl -n "${KUBEAI_NAMESPACE}" get pods || true
-kubectl get node "$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')" \
-  -o jsonpath='{.status.allocatable.nvidia\.com/gpu}{"\n"}'
-```
-
----
-
-## Generate the local KubeAI resource-profile file
-
-Generate a local KubeAI resource-profile file from the labels on this machine.
-
-For the built-in serving profiles in this repo, keep these names aligned:
-
-* `gpu-single-default`
-* `gpu-tp2-balanced`
-* `gpu-tp2-maxctx`
-
-**Important:** include GPU `requests`, GPU `limits`, and `runtimeClassName: nvidia`. Without those, the model pod can land on the GPU node but still start without `libcuda.so.1` available inside the container.
+A `resourceProfile` is what one "GPU unit" means on your cluster; the
+catalog's `runtime.resource_profile` (or the `kubeai_resource_profile`
+setting) names one, and infer-stack appends the GPU count. Include GPU
+`requests`, GPU `limits` and `runtimeClassName: nvidia`: without them the
+pod can land on the GPU node and still start without `libcuda.so.1`.
 
 ```bash
 PRODUCT="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.nvidia\.com/gpu\.product}')"
-MEMORY="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.nvidia\.com/gpu\.memory}')"
 
-cat > values-kubeai-local-gpu.yaml <<EOF
+cat > kubeai-values.yaml <<EOF
 resourceProfiles:
-  gpu-single-default:
+  nvidia-gpu:
+    runtimeClassName: nvidia
+    requests:
+      nvidia.com/gpu: "1"
+    limits:
+      nvidia.com/gpu: "1"
     nodeSelector:
       nvidia.com/gpu.product: "${PRODUCT}"
-      nvidia.com/gpu.memory: "${MEMORY}"
-    requests:
-      nvidia.com/gpu: 1
-    limits:
-      nvidia.com/gpu: 1
-    runtimeClassName: nvidia
-
-  gpu-tp2-balanced:
-    nodeSelector:
-      nvidia.com/gpu.product: "${PRODUCT}"
-      nvidia.com/gpu.memory: "${MEMORY}"
-    requests:
-      nvidia.com/gpu: 2
-    limits:
-      nvidia.com/gpu: 2
-    runtimeClassName: nvidia
-
-  gpu-tp2-maxctx:
-    nodeSelector:
-      nvidia.com/gpu.product: "${PRODUCT}"
-      nvidia.com/gpu.memory: "${MEMORY}"
-    requests:
-      nvidia.com/gpu: 2
-    limits:
-      nvidia.com/gpu: 2
-    runtimeClassName: nvidia
 EOF
-
-cat values-kubeai-local-gpu.yaml
+./scripts/install_kubeai.sh kubeai-values.yaml kubeai
 ```
 
-Sync that file so `validate` and `render` use the same local resource-profile data:
+If a `kubeai` release already exists, reuse its namespace
+(`helm list -A | grep kubeai`) and set `kubeai_namespace` to match.
+
+### Debugging checks
+
+`infer-stack acquire` reports pod-level failures itself (`ImagePullBackOff`,
+`Unschedulable`, a crash with the engine's error quoted). For anything else,
+with `NS` the namespace and `MODEL` the Model's name (`kubectl -n $NS get models`):
 
 ```bash
-infer-stack kubeai-sync-resource-profiles --from-file values-kubeai-local-gpu.yaml
+kubectl -n "$NS" describe model "$MODEL"
+kubectl -n "$NS" get pods -l model="$MODEL"
+kubectl -n "$NS" logs -f -l model="$MODEL" -c server            # the engine
+kubectl -n "$NS" logs -l model="$MODEL" -c server --previous     # after a restart
+kubectl -n "$NS" logs deploy/kubeai --tail=200 -f                # the KubeAI controller
+kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 40
 ```
 
----
+Common bad states:
 
-## Example 1: single-GPU system
-
-Use this example on a 1-GPU workstation.
-
-```bash
-infer-stack setup \
-  --backend kubeai \
-  --profile qwen2-5-7b-instruct-turbo-default \
-  --namespace "${KUBEAI_NAMESPACE}"
-
-infer-stack list-profiles
-infer-stack describe-profile qwen2-5-7b-instruct-turbo-default --format yaml
-infer-stack validate
-infer-stack render
-infer-stack deploy
-infer-stack status
-```
-
-### Current live workaround for the single-GPU example
-
-On the current repo version, apply this live patch after `deploy`.
-
-This patch does four things:
-
-* keeps the model warm with `minReplicas: 1`
-* changes `resourceProfile` from `gpu-single-default` to `gpu-single-default:1`
-* makes the served model name match the public profile name
-* avoids the duplicate `--served-model-name` mismatch that causes 404s on completions
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" patch model qwen2-5-7b-instruct-turbo-default --type merge -p '{
-  "spec": {
-    "minReplicas": 1,
-    "resourceProfile": "gpu-single-default:1",
-    "args": [
-      "--served-model-name=qwen2-5-7b-instruct-turbo-default",
-      "--tensor-parallel-size=1",
-      "--data-parallel-size=1",
-      "--max-model-len=32768",
-      "--gpu-memory-utilization=0.9",
-      "--max-num-batched-tokens=8192",
-      "--max-num-seqs=16",
-      "--disable-log-requests",
-      "--enable-prefix-caching"
-    ]
-  }
-}'
-
-kubectl -n "${KUBEAI_NAMESPACE}" delete pod -l model=qwen2-5-7b-instruct-turbo-default
-```
-
-If you run `infer-stack render` or `infer-stack deploy` again on the current repo version, re-apply this live patch.
-
----
-
-## Example 2: four-GPU system
-
-On a 4-GPU host, do the same **single-GPU smoke test first** to verify the cluster, KubeAI, runtime class, and model plumbing. That exact sequence worked on a 4-GPU machine during bring-up.
-
-```bash
-infer-stack setup \
-  --backend kubeai \
-  --profile qwen2-5-7b-instruct-turbo-default \
-  --namespace "${KUBEAI_NAMESPACE}"
-
-infer-stack validate
-infer-stack render
-infer-stack deploy
-infer-stack status
-
-kubectl -n "${KUBEAI_NAMESPACE}" patch model qwen2-5-7b-instruct-turbo-default --type merge -p '{
-  "spec": {
-    "minReplicas": 1,
-    "resourceProfile": "gpu-single-default:1",
-    "args": [
-      "--served-model-name=qwen2-5-7b-instruct-turbo-default",
-      "--tensor-parallel-size=1",
-      "--data-parallel-size=1",
-      "--max-model-len=32768",
-      "--gpu-memory-utilization=0.9",
-      "--max-num-batched-tokens=8192",
-      "--max-num-seqs=16",
-      "--disable-log-requests",
-      "--enable-prefix-caching"
-    ]
-  }
-}'
-
-kubectl -n "${KUBEAI_NAMESPACE}" delete pod -l model=qwen2-5-7b-instruct-turbo-default
-```
-
-After the 7B smoke test works, move up to larger profiles such as `qwen2-72b-instruct-tp2-balanced`. On the current repo version, apply the same kind of live patch after deploy: keep `minReplicas: 1`, append `:1` to the chosen `resourceProfile`, and make the single effective `--served-model-name` match the public profile name.
-
----
-
-## Test that KubeAI is responding
-
-If you are not exposing ingress yet, port-forward the service.
-
-**This command stays in the foreground.** Run it in one terminal and leave it there:
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" port-forward svc/kubeai 8000:80
-```
-
-Then use another terminal for requests.
-
-### First check: `/models`
-
-```bash
-curl http://127.0.0.1:8000/openai/v1/models
-```
-
-If that works, the KubeAI front door is alive.
-
-### Then try the smoke test
-
-```bash
-infer-stack smoke-test \
-  --base-url http://127.0.0.1:8000/openai/v1 \
-  --model qwen2-5-7b-instruct-turbo-default
-```
-
-### Or test chat completions directly
-
-```bash
-time curl http://127.0.0.1:8000/openai/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen2-5-7b-instruct-turbo-default",
-    "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
-    "max_tokens": 8
-  }'
-```
-
-### What to expect on the first request
-
-Common first-request behavior:
-
-* `/openai/v1/models` works before completions work
-* a completion request causes KubeAI to create a model-serving pod
-* that pod may spend time in `ContainerCreating` while the image is pulled
-* the model then spends more time loading and warming up
-* the first completion can be much slower than later ones
-
-That is not automatically a failure. Watch the system state while the first request is happening:
-
-```bash
-watch -n 1 'kubectl -n '"${KUBEAI_NAMESPACE}"' get pods; echo; kubectl -n '"${KUBEAI_NAMESPACE}"' get models'
-```
-
----
-
-## Debugging checks
-
-### Check the live Model object
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" describe model qwen2-5-7b-instruct-turbo-default
-kubectl -n "${KUBEAI_NAMESPACE}" get model qwen2-5-7b-instruct-turbo-default -o yaml | grep -E 'minReplicas|maxReplicas|resourceProfile'
-```
-
-### Check the current model pod
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" describe pod "$(kubectl -n "${KUBEAI_NAMESPACE}" get pods -o name | grep 'model-qwen2-5-7b-instruct-turbo-default' | tail -n 1 | cut -d/ -f2)"
-```
-
-### Tail KubeAI controller logs
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" logs deploy/kubeai --tail=200 -f
-```
-
-### Tail model-server logs
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" logs -f "$(kubectl -n "${KUBEAI_NAMESPACE}" get pods -o name | grep 'model-qwen2-5-7b-instruct-turbo-default' | tail -n 1 | cut -d/ -f2)" -c server
-```
-
-If the model pod restarted, inspect the previous crash:
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" logs "$(kubectl -n "${KUBEAI_NAMESPACE}" get pods -o name | grep 'model-qwen2-5-7b-instruct-turbo-default' | tail -n 1 | cut -d/ -f2)" -c server --previous
-```
-
-### Check recent events
-
-```bash
-kubectl -n "${KUBEAI_NAMESPACE}" get events --sort-by=.lastTimestamp | tail -n 40
-```
-
-### Common bad states and what they mean
-
-* `invalid resource profile: "gpu-single-default", should match <name>:<multiple>`
-  * append `:1` in the live `Model` spec
-* `libcuda.so.1: cannot open shared object file`
-  * the pod landed on the GPU node without actually requesting a GPU; fix the resource-profile file to include GPU requests, limits, and `runtimeClassName: nvidia`
-* `/models` works but completions 404 with `The model ... does not exist.`
-  * the served model name does not match the public profile name; apply the live args patch above
-* startup probe fails with `connection refused`
-  * the model pod may still be pulling the image, loading the model, or warming up
+* `libcuda.so.1: cannot open shared object file`: the pod did not request a
+  GPU; fix the resource profile (requests, limits, `runtimeClassName`).
+* startup probe fails with `connection refused`: still pulling the image,
+  loading the model or warming up; the acquire's wait reports which.
+* `/models` works but completions 404: the request bypassed the gateway and
+  used the alias; through the gateway the alias is the model name, directly
+  against KubeAI the Model name is (`INFER_STACK_ENDPOINT_*` in the env file).
 
 ---
 
 ## Which backend should I start with?
 
-Start with **Compose** if you want:
+**Compose** when one workstation is enough: it is the fastest path to a
+working server, everything it renders is a file you can read, and it needs
+only Docker.
 
-* the fastest path to a working local server
-* easy inspection of generated files
-* simple single-host iteration
+**KubeAI** when the models must run on more than one machine, or a cluster
+already exists. It is Compose plus a scheduler: the same catalog, verbs and
+env file, with a cluster and `resourceProfiles` supplied. Expect more
+first-request overhead (pod creation, image pull, model load).
 
-Move to **KubeAI** when you want:
-
-* vLLM runtimes on Kubernetes
-* KubeAI’s OpenAI-compatible front door
-* profile deployment through Kubernetes artifacts
-
-KubeAI rendering is vLLM-only for now. Profiles that enable Ollama, LiteLLM, or Open WebUI are rejected for `--backend kubeai`.
-
-A good workflow is:
-
-1. inspect a profile with `describe-profile`
-2. run it with Compose when you want the simplest local deployment
-3. move to KubeAI when you want Kubernetes-backed serving
-
-Compose is the better fit when you already know which profile you want. KubeAI has more first-request overhead because it may need to create pods, pull images, load the model, and warm up the backend.
-
-
+A catalog written for Compose runs on KubeAI, with two exceptions: ollama
+endpoints and custom container launches (`runtime.command` / `mounts`),
+which stay Compose-only. [docs/backend-parity.md](docs/backend-parity.md)
+has the full matrix.
 
 ## vLLM startup caches
 
@@ -1107,39 +859,24 @@ Triton, and CUDA JIT caches. Warm starts avoid redownloading and redoing many
 compile/JIT steps, but a vLLM model swap still creates a new engine process and
 must reload weights into GPU memory.
 
-### Diagnosing profile switches and readiness
+### Diagnosing readiness
 
-`docker compose` health only means that a container-level healthcheck passed.  It
-is not the same thing as "the routed model can answer a request through the
-active access surface."  This matters most when switching between two vLLM
-profiles that reuse the same runtime service name: the old vLLM process exits,
-Docker starts the replacement process, and LiteLLM may remain up while returning
-upstream connection errors until vLLM finishes loading the new model.
-
-Use the dedicated readiness and diagnostics commands after a switch:
+`docker compose` health only means a container-level healthcheck passed. It
+is not "the routed model answers a request through the front door", which is
+what `acquire` and `wait` check: a model swap starts a new engine process,
+and LiteLLM stays up while returning upstream connection errors until vLLM
+has loaded the weights.
 
 ```bash
-infer-stack switch gpt2-single --apply --yes
-infer-stack wait-ready --model gpt2
-infer-stack smoke-test --model gpt2
+infer-stack acquire <endpoint> --yes     # waits for a real generation
+infer-stack wait <endpoint>              # after acquire --no-wait
+infer-stack test <endpoint>              # one generation through the gateway
+infer-stack status                       # desired vs running, per deployment
+infer-stack logs <service> --tail 80     # the engine or gateway log
 ```
 
-For debugging, use:
-
-```bash
-infer-stack diagnose --model gpt2 --generation
-infer-stack diagnose --logs --tail 80
-```
-
-`diagnose` prints the resolved provider/gateway/frontend graph, rendered Compose
-service state, LiteLLM route probes, direct provider probes, and optional recent
-logs.  It is intended to distinguish an actual LiteLLM outage from the more
-common case where LiteLLM is running but its upstream vLLM runtime is still
-booting.
-
-The Compose service-state diagnostics include Docker's exit code, OOM-killed
-flag, restart count, and actual container name.  This is important because
-`litellm exited with code 137` usually means Docker sent SIGKILL, commonly from
-an OOM kill or a forced container replacement, whereas LiteLLM returning HTTP
-500 with `Cannot connect to host vllm-*` means LiteLLM is still running but the
-upstream vLLM runtime is not ready yet.
+A crash-looping engine fails the acquire at once with its error quoted, so
+the timeout is only for a model that is loading. Reading Docker's own
+signals: `litellm exited with code 137` is a SIGKILL (an OOM kill or a forced
+replacement), whereas LiteLLM returning HTTP 500 with `Cannot connect to host
+vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
