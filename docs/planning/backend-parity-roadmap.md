@@ -1,8 +1,8 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1–P3 done** 2026-09-26 · P4, P5 not started ·
-P6 is ongoing. Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · **P1–P3, P6 done** 2026-09-26 · P4, P5 not
+started. Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -209,6 +209,16 @@ the gateway, and the only one that needs a second machine. Last.
 - `dev/kubeai_e2e.sh` gains one step per phase.
 - Finishing a phase updates the matrix in `backend-parity.md`; the plan is
   done when the matrix has no *gap* row.
+
+**P6 done 2026-09-26** as a suite that stays open: `tests/test_parity.py`
+builds the same stack over a fake Docker and a fake kubectl and runs one
+test per *same* row on both (21 rows, the TUI included). A row turned *same*
+gets its test in the same change. The Memory and Null backends run the
+controller's one path through `SimpleAdmission` (P1b), so the controller
+suites cover them without a third parametrization. Found on the way: the
+TUI replaced an injected Docker runner with the real one, so a TUI started
+on a test backend talked to the host's Docker; it now wraps only the
+default runner.
 
 ## Duplicate authorities
 

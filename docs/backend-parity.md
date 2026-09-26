@@ -51,7 +51,8 @@ rotate` and the static superset route table work unchanged.
 
 ## Parity matrix
 
-**same**: one code path, or verified equivalent. **≈**: the same outcome by
+**same**: one code path, or verified equivalent; every *same* row has a test
+in `tests/test_parity.py` that runs the same scenario on both backends. **≈**: the same outcome by
 a different mechanism. **gap**: missing on one side and on the roadmap.
 **n/a**: does not apply there. **boundary**: deliberately unsupported
 (see [planning/known-limitations.md](planning/known-limitations.md)).
@@ -125,13 +126,14 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | TUI: leases, deployments, catalog editing, acquire / release / evict, API tab, settings | same | same |
 | TUI: log follow, the Instances tab, Apply / Down | containers | same, over pods |
 | TUI GPU pane | `nvidia-smi` on this host | this host, not the cluster |
-| `gc --orphans` (also inside `clean`) | yes | n/a: unlabeled Models are never touched |
+| `gc --orphans` (also inside `clean`) | yes | runs, and finds none: pods are read by infer-stack's label, so unlabelled Models are never touched |
 
 ### Testing
 
 | | Compose | KubeAI |
 |---|---|---|
 | unit suite with fake runtimes | yes | yes |
+| parity suite (`tests/test_parity.py`: each *same* row, both backends) | yes | yes |
 | end to end | `dev/e2e_tests/run.sh` (tiers; `--gpu` for serving) | `dev/kubeai_e2e.sh` against a real cluster; k3s with CPU vLLM needs no GPU |
 
 ## Deviations that stay

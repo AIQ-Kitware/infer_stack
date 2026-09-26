@@ -1351,22 +1351,21 @@ class InferStackTUI(App):
     def _install_quiet_docker(self) -> None:
         """Route ``docker`` output to the logs pane, not the terminal.
 
-        Only ``docker`` commands: the kubeai backend runs ``kubectl`` through
-        the same seam, and the Docker runner's allowlisted environment has no
-        ``KUBECONFIG`` (every kubectl call from the TUI used to fail). The
-        kubeai backend's gateway is a Compose project of its own, so it is
-        wrapped too.
+        Only where the backend runs Docker with the default runner: the kubeai
+        backend runs ``kubectl`` through the same seam, and the Docker
+        runner's allowlisted environment has no ``KUBECONFIG`` (every kubectl
+        call from the TUI used to fail); an injected runner is the caller's
+        and is left alone. The kubeai backend's gateway is a Compose project
+        of its own, so it is wrapped too.
         """
         from .leasing.compose import _default_docker_run
 
         def quiet(target) -> None:
             original = getattr(target, 'run', None)
-            if original is None:
+            if original is not _default_docker_run:
                 return
 
             def quiet_run(args: list[str], **kwargs) -> str:
-                if not args or args[0] != 'docker':
-                    return original(args, **kwargs)
                 # Same bounded, explicit-environment runner as the CLI; only
                 # stderr is redirected to the logs pane, unless the caller
                 # takes it.

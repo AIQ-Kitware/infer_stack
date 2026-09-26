@@ -2,6 +2,13 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### A parity suite for the two backends
+
+`tests/test_parity.py` runs one scenario per row that `docs/backend-parity.md`
+marks *same*, on the compose backend over a fake Docker and on the kubeai
+backend over a fake kubectl, from the client contract to the TUI. The TUI no
+longer swaps an injected Docker runner for the real one.
+
 ### The gateway in front of a cluster is the compose gateway
 
 On the kubeai backend the gateway now takes the same settings as on compose:

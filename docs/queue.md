@@ -69,7 +69,9 @@ into the admission preview (deferred duplicate).
 the cluster; an e2e step acquires the same model `--dedicated` twice under
 dynamic routing and gets two Models and two routes.
 
-### 5. [ ] P6: one test surface
+### 5. [x] P6: one test surface
+
+Done 2026-09-26.
 
 Parametrize the controller's acquire scenarios over the Memory,
 fake-Compose and fake-KubeAI backends; `tests/test_parity.py` runs each
