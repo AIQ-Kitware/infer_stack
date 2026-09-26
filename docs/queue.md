@@ -71,7 +71,7 @@ dynamic routing and gets two Models and two routes.
 
 ### 5. [x] P6: one test surface
 
-Done 2026-09-26.
+Done 2026-09-26, `1a4e4b2`.
 
 Parametrize the controller's acquire scenarios over the Memory,
 fake-Compose and fake-KubeAI backends; `tests/test_parity.py` runs each
