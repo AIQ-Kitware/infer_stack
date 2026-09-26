@@ -366,11 +366,34 @@ def _default_kubectl_run(args: list[str]) -> str:
         args, capture_output=True, text=True, timeout=120,
     )
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or '').strip()
+        detail = kubectl_complaint(proc.stderr or proc.stdout or '')
         raise RuntimeError(
             f'{" ".join(args)} failed ({proc.returncode}): {detail[:500]}'
         )
     return proc.stdout
+
+
+def kubectl_complaint(stderr: str) -> str:
+    r"""kubectl's own complaint, without the client library's log lines.
+
+    kubectl prefixes its retries with klog lines (``E0926 14:05:52 ...
+    memcache.go:265] "Unhandled Error" err="..."``) and ends with the sentence
+    that says what is wrong; that sentence is the complaint.
+
+    >>> kubectl_complaint('E0926 14:05:52.449219  841241 memcache.go:265] "Unhandled '
+    ...                   'Error" err="couldn\'t get current server API group list"\n'
+    ...                   'The connection to the server localhost:8080 was refused - '
+    ...                   'did you specify the right host or port?\n')
+    'The connection to the server localhost:8080 was refused - did you specify the right host or port?'
+    """
+    import re
+
+    lines = [ln.strip() for ln in str(stderr).splitlines() if ln.strip()]
+    plain = [ln for ln in lines if not re.match(r'^[EWIF]\d{4} \d\d:\d\d:\d\d', ln)]
+    if plain:
+        return plain[-1]
+    return lines[-1] if lines else ''
+
 
 
 class KubeaiBackend(ConvergeScaffold):

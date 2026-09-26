@@ -201,6 +201,8 @@ class Controller:
         self._admission_digest: str | None = None
         #: Whether the last refused admission was for lack of GPUs.
         self._admission_capacity = False
+        #: Why residency could not be read, for the refusal that follows.
+        self._residency_error: str | None = None
         from .profile import ProfileMismatch
 
         try:
@@ -864,10 +866,10 @@ class Controller:
         if residency is None:
             # The render after the commit needs residency too, so nothing can
             # be admitted without it; refusing here commits nothing.
+            why = self._residency_error or 'the runtime did not answer'
             return {}, [
-                'what is running cannot be read right now (the runtime did not '
-                'answer), so nothing is admitted; retry when `infer-stack leases` '
-                'shows no residency error'
+                f'what is running cannot be read right now ({why}), so nothing is '
+                'admitted; `infer-stack doctor` checks the runtime'
             ]
         if need:
             unresolved = self._unresolved_allocations(exclude=set(overlay.deployments))
@@ -1559,8 +1561,10 @@ class Controller:
                     self._publish()
                 try:
                     residency = self._admitting.residency()
-                except ResidencyUnknown:
+                    self._residency_error = None
+                except ResidencyUnknown as ex:
                     residency = None
+                    self._residency_error = str(ex)
                 candidate_profile = self._acquire_profile_candidate(
                     residency=residency
                 )
@@ -1847,8 +1851,10 @@ class Controller:
 
             try:
                 residency = self._admitting.residency()
-            except ResidencyUnknown:
+                self._residency_error = None
+            except ResidencyUnknown as ex:
                 residency = None
+                self._residency_error = str(ex)
             overlay = self.ledger.plan_acquire([])
             for gid in dict.fromkeys(lease.deployment_ids):
                 deployment = self.ledger.get_deployment(gid)

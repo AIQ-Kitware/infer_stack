@@ -227,6 +227,11 @@ dry-run root.
       evict"; it now says whether each name is held by a lease or unknown.
       `test` on a stopped gateway printed a urllib3 dump; now "nothing is
       listening there". `logs` said "running: nothing".
+- [x] On kubeai with no cluster, `acquire` refused with "the runtime did
+      not answer" and no cause; `ps` and `leases` printed kubectl's klog
+      retries (hundreds of characters). Now kubectl's own last sentence
+      ("The connection to the server … was refused"), in the refusal too,
+      with `infer-stack doctor` as the next step.
 
 ### 10. [ ] Handover
 
