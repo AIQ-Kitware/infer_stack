@@ -25,7 +25,7 @@ launches (`runtime.command` / `mounts`) stay Compose-only.
 | | Compose | KubeAI |
 |---|---|---|
 | front door | LiteLLM gateway, one `base_url` | KubeAI's own gateway |
-| request name | the **endpoint alias** | a DNS slug of the served name (`Qwen/Qwen3.8-27B` → `qwen-qwen3-8-27b`) |
+| request name | the **endpoint alias** | a DNS slug of the served name (`Org/Model-7B` → `org-model-7b`) |
 | auth | managed master key | none (`EMPTY`) |
 
 Cards and the pipeline send the endpoint alias as `model=`. Only one magnet
