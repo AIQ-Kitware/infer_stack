@@ -4,14 +4,10 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/infer-stack.svg)](https://pypi.org/project/infer-stack/)
 [![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
 
-> **Heads up — the leasing model is now the primary workflow.** Declare models
-> in a catalog (`infer-stack catalog …`) and `acquire`/`run` endpoints
-> on demand; see `docs/source/manual/` (the Ollama + Open WebUI tutorial and the
-> leasing demo) and `infer-stack help tree`. The
-> **named stack profiles** documented below (`setup`/`render`/`up`/`switch`/…)
-> are the pre-leasing model and now live under **`infer-stack legacy <command>`**
-> (e.g. `infer-stack legacy render`). This README still describes that legacy
-> flow; a leasing-oriented rewrite is pending.
+Declare models in a catalog (`infer-stack catalog …`) and `acquire` or `run`
+endpoints on demand. `infer-stack help tree` prints the whole command surface;
+[docs/source/manual/](docs/source/manual/) has the Ollama + Open WebUI
+tutorial and the leasing demo.
 
 ## Primary leasing workflow
 
@@ -23,7 +19,8 @@ infer-stack catalog suggest --apply
 infer-stack acquire <endpoint>
 ```
 
-`config.yaml` and `catalog.yaml` are the user configuration. Leasing keeps an
+`settings.yaml` (`infer-stack config …`) and `catalog.yaml` are the user
+configuration. Leasing keeps an
 internal frozen recovery snapshot so a crash cannot re-render committed state
 with different settings, but ordinary `acquire` advances that snapshot
 automatically. Compatible catalog additions can be acquired while other models
@@ -62,49 +59,46 @@ Operational and security constraints that are accepted during the current
 planning-stage release are tracked in
 [docs/planning/known-limitations.md](docs/planning/known-limitations.md).
 
-`infer_stack` manages **named stack profiles** for local and Kubernetes-backed inference.
+`infer-stack` serves the endpoints declared in a catalog. `acquire` takes a
+lease on an endpoint; the controller places its engine on free GPUs and
+reconciles the backend to run it:
 
-A stack profile is a small graph made from:
+* **engines**: vLLM (one container per deployment) and Ollama (one daemon per
+  `runtime_hosts` entry, serving many tags);
+* **LiteLLM gateway**: one OpenAI base URL, `http://127.0.0.1:14042/v1`, in
+  front of every endpoint alias. On by default; `config set litellm false`
+  drops it;
+* **Open WebUI**: on by default at `http://127.0.0.1:13000`;
+  `config set ui false` or `acquire --no-ui` drops it;
+* **reverse proxy**: an optional single-port nginx in front of both.
 
-* **providers** — inference runtimes such as vLLM and Ollama
-* **gateways** — optional API routers such as LiteLLM
-* **frontends** — optional UIs such as Open WebUI
-* **routes** — optional public model aliases exposed through a gateway
-
-This repo can render those profiles through two backends:
-
-* **Compose** for local single-host serving. Compose supports vLLM, Ollama, optional LiteLLM, and optional Open WebUI.
-* **KubeAI** for Kubernetes-backed vLLM serving. KubeAI support is vLLM-only for now.
-
-The direct Ollama path can run without LiteLLM and without predeclaring models. vLLM profiles still use explicit runtimes, placement, and runtime settings.
+Two backends run this: **Compose** (single host; vLLM and Ollama) and
+**KubeAI** (a Kubernetes cluster; vLLM only).
 
 ## Main commands
 
 ```bash
-infer-stack setup --backend compose --profile ollama-direct
-# or: infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default
-infer-stack list-profiles
-infer-stack describe-profile <profile>
-infer-stack validate
-infer-stack render
-infer-stack up -d
-infer-stack deploy
-infer-stack switch <profile> --apply  # re-render and converge; no separate up needed
-infer-stack status
-infer-stack smoke-test
-infer-stack version                   # print the installed version
-infer-stack config paths              # show where config / artifacts / caches live
+infer-stack config init               # data dir + default backend -> settings.yaml
+infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
+infer-stack catalog show              # what can be acquired
+infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
+infer-stack test <endpoint>           # one generation through the gateway
+infer-stack leases                    # desired vs running, per deployment
+infer-stack status                    # paths, backend and a lease summary
+infer-stack release --all             # drop every lease
+infer-stack paths                     # where settings, catalog, ledger and caches live
+infer-stack version
+infer-stack help tree                 # the whole command surface
 ```
 
 The CLI is built on [`kwconf`](https://github.com/Erotemic/kwconf),
-so every subcommand is also importable as a Python class — useful for
-notebooks, tests, and other scripts:
+so every subcommand is also importable as a Python class:
 
 ```python
-from infer_stack.cli import RenderCLI, SmokeTestCLI
+from infer_stack.cli import AcquireCLI, TestCLI
 
-RenderCLI.main(argv=False, profile="qwen2-5-7b-instruct-turbo-default", yes=True)
-SmokeTestCLI.main(argv=False, model="qwen/qwen2.5-7b-instruct-turbo")
+AcquireCLI.main(argv=False, names=['smol135-1'], yes=True)
+TestCLI.main(argv=False, name='smol135-1')
 ```
 
 `manage.py` and `infer-stack` are aliases for the same entry point;
@@ -112,247 +106,216 @@ shell examples below use `infer-stack`.
 
 ## Operating the rendered Compose stack
 
-Once the stack is up, common docker compose operations are available as
-`infer-stack` subcommands so you don't have to `cd` into the rendered
-output directory or repeat the `-f docker-compose.yml --env-file .env`
-flags. They all resolve the rendered location via the same
-`output.generated_dir` chain as the rest of the CLI.
+`ps` and `logs` read the backend directly; `stack` wraps `docker compose` on
+the rendered project, so you never `cd` into it or repeat `-f`/`--env-file`.
 
 ```bash
-infer-stack ps                              # docker compose ps
-infer-stack ps -a                           # include stopped
-infer-stack logs -f open-webui              # follow one service
-infer-stack logs --tail=200 litellm vllm-*  # tailored backlog
-infer-stack logs -f --raw litellm            # full LiteLLM tracebacks
-infer-stack restart open-webui              # restart specific services
-infer-stack stop                            # stop everything (no remove)
-infer-stack start                           # start back up
-infer-stack pull                            # refresh images
+infer-stack ps                            # engines, gateway, UI
+infer-stack ps -a                         # include exited instances
+infer-stack logs -f <endpoint>            # follow whatever serves an endpoint
+infer-stack logs --tail 200 litellm       # the gateway's backlog
+infer-stack logs -f --raw litellm         # full LiteLLM tracebacks
+infer-stack stack restart open-webui      # docker compose restart
+infer-stack stack stop                    # stop everything (no remove)
+infer-stack stack start                   # start it back up
+infer-stack stack pull                    # refresh images
+infer-stack stack compose -- ps --format json   # any other docker compose command
 ```
 
-Interactive ``infer-stack logs -f`` compacts only explicitly registered, known-noisy
-LiteLLM traceback shapes; unknown tracebacks pass through unchanged. Redirected or
-piped output stays raw, and ``--raw`` disables compaction in an interactive follow.
-The compacted CLI path preserves Compose ANSI service colors when attached to a TTY;
-``--no-color`` still disables them. The TUI uses the same conservative compactor when
-LiteLLM logs are visible.
+`logs` accepts a service or pod name, a container id prefix, a deployment id
+or an endpoint alias. Interactive `infer-stack logs -f` compacts only
+explicitly registered, known-noisy LiteLLM traceback shapes; unknown
+tracebacks pass through unchanged. Redirected or piped output stays raw, and
+`--raw` disables compaction in an interactive follow. `--no_color` drops the
+name-prefix colors. The TUI uses the same compactor.
 
-For Ollama model management inside the rendered Ollama service, prefer the
-CLI wrappers:
+Ollama tags are pulled into the daemon on the first `acquire` of an endpoint
+that serves them. `stack compose` reaches the daemon for anything else, e.g.
+`infer-stack stack compose -- exec ollama-local-ollama ollama list`.
+
+On the KubeAI backend `ps` and `logs` read pods, and the `stack` Compose verbs
+act on the gateway's Compose project on this host.
+
+## Inspect an endpoint before running it
 
 ```bash
-infer-stack ollama-pull smollm2:135m
-infer-stack ollama-list
-infer-stack ollama-ps
+infer-stack catalog show <endpoint>
+infer-stack acquire <endpoint> --no-apply   # declare + write the compose project; start nothing
+infer-stack paths leasing                   # where docker-compose.yml landed
+infer-stack apply                           # start it (or `release --all` to discard)
 ```
 
-For other interactive one-shot commands inside a container, use
-`infer-stack logs`, `infer-stack ps`, `infer-stack restart`, or fall back to raw
-Compose only when no wrapper exists.
+## Catalog model
 
-On the KubeAI backend these wrappers raise ``NotImplementedError`` —
-use the equivalent ``kubectl`` commands in the meantime.
+`catalog.yaml` is the one user-edited description of what can run. Its
+sections:
 
-## Inspect a profile before running it
-
-```bash
-infer-stack describe-profile qwen2-5-7b-instruct-turbo-default --format yaml
-```
-
-## Stack profile model
-
-Profiles are written as stack graphs. The main sections are `providers`, `gateways`, `frontends`, and `routes`. For details and examples, see [docs/stack-graph-profiles.md](docs/stack-graph-profiles.md).
-
-Common shapes:
-
-```text
-Open WebUI -> Ollama                         # ollama-direct, no LiteLLM
-Open WebUI -> LiteLLM -> vLLM                # classic vLLM compose profiles
-Open WebUI -> LiteLLM -> Ollama              # Ollama with stable aliases
-Open WebUI -> LiteLLM -> Ollama + vLLM       # mixed migration / test stacks
-Ollama API + vLLM API directly               # raw backend profiles
-```
-
-Custom provider models and custom profiles live in the configured `catalog.user_models_file`, which defaults to `~/.config/infer_stack/models.yaml`. New files should prefer provider-specific top-level keys:
+* `models`: weight sources (`hf://org/name`, with optional `revision`,
+  `quantization`, `dtype`);
+* `endpoints`: served API names. Each picks an `engine` (`vllm` or `ollama`),
+  a `model` (a `models` key, or an Ollama tag), and optionally `runtime`
+  (vLLM settings), `protocol`, `placement`, `sharing` and `reclaim`;
+* `runtime_hosts`: Ollama daemons, each with its GPUs and daemon settings;
+* `bundles`: named lists of endpoints to acquire together.
 
 ```yaml
-vllm_models:
-  my-vllm-model:
-    hf_model_id: org/model
+models:
+  smol135:
+    source: hf://HuggingFaceTB/SmolLM2-135M-Instruct
 
-ollama_models:
-  my-ollama-model:
-    tag: qwen3.5:4b
+endpoints:
+  smol135-1:
+    engine: vllm
+    model: smol135
+    runtime: {max_model_len: 8192}
+  chat:
+    engine: ollama
+    host: local-ollama
+    model: qwen3.5:4b
 
-profiles:
-  my-stack:
-    providers: {}
-    gateways: {}
-    frontends: {}
-    routes: {}
+runtime_hosts:
+  local-ollama:
+    engine: ollama
+    placement: {gpu_indices: [0]}
+    settings: {keep_alive: 30m}
+
+bundles:
+  both: [smol135-1, chat]
 ```
 
-`models:` is still interpreted as a vLLM model catalog for convenience, but new docs and recipes use `vllm_models:` / `ollama_models:`.
+Edit it with `infer-stack catalog model|endpoint|host|bundle add …`, or by
+hand with `infer-stack catalog edit`; `infer-stack catalog validate` checks it.
+The schema reference is the docstring of `infer_stack/leasing/catalog.py`.
+
+Shapes the stack renders:
+
+```text
+Open WebUI -> LiteLLM -> vLLM / Ollama     # the default
+Open WebUI -> vLLM / Ollama                # config set litellm false
+```
+
+The named stack profiles of earlier releases (`setup`, `switch`,
+`--profile`) are gone; see
+[docs/stack-graph-profiles.md](docs/stack-graph-profiles.md).
 
 ## Where config and rendered artifacts live
 
-`infer-stack` follows XDG basedir conventions, so where you invoke it
-from never changes which config it reads or where it writes rendered
-artifacts:
-
-There are exactly two path roots:
+`infer-stack` follows XDG basedir conventions, so the directory you invoke it
+from never changes which config it reads or where it writes. There are two
+roots:
 
 | What | Default location | How to relocate |
 | --- | --- | --- |
-| `config.yaml`, `models.yaml`, `kubeai-values.local.yaml` | `~/.config/infer_stack/` (resp. `$XDG_CONFIG_HOME`) | `--config-dir` (or `INFER_STACK_CONFIG_DIR`) |
-| **Everything generated** — `generated/` (docker-compose.yml, .env, plan.yaml, kubeai/*) **and** `state/` (hf-cache, postgres volumes, Ollama store, runtime bind mounts) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `--data-dir` (or `INFER_STACK_DATA_DIR`) |
+| `settings.yaml`, `catalog.yaml` | `~/.config/infer_stack/` (resp. `$XDG_CONFIG_HOME`) | `--config-dir` or `INFER_STACK_CONFIG_DIR` |
+| **Everything generated**: `leasing/` (the ledger, the compose project, its `.env`) and the bind-mounted state (`hf-cache/`, `vllm-cache/`, `open-webui/`, `ollama/`, …) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `config set data_dir <path>`, `--data-dir` or `INFER_STACK_DATA_DIR` |
 
-`--data-dir` is the single knob for "put everything I generate in one
-directory." It **relocates the one infer-stack installation controlling a
+`infer-stack paths` prints every resolved path and whether it exists.
+
+The data dir **relocates the one infer-stack installation controlling a
 host/backend; it does not create an isolated second installation**. Do not run
 controllers from multiple config/data roots against the same Docker host or
 Kubernetes namespace. See the
 [single-owner limitation](docs/planning/known-limitations.md#one-control-plane-per-host-or-backend-namespace).
 
-Set it once at `setup`; it is baked into the absolute
-`state.*` and `output.generated_dir` paths written to `config.yaml`, so
-later commands don't need it again:
-
 ```bash
-# All rendered artifacts and bind-mount state land under one directory.
-infer-stack setup \
-  --backend compose \
-  --profile ollama-direct \
-  --data-dir /data/service/docker/vllm-stack
+# Persist it once; later commands read it from settings.yaml.
+infer-stack config set data_dir /data/service/docker/infer-stack
 
-infer-stack render --yes
+# Or keep both roots in a checkout for an ad-hoc experiment.
+export INFER_STACK_CONFIG_DIR=$PWD/cfg INFER_STACK_DATA_DIR=$PWD/stack
+infer-stack paths
 ```
 
-```bash
-# Keep config.yaml in a checkout for ad-hoc experiments.
-infer-stack setup --config-dir $PWD --backend compose --profile <p> --data-dir $PWD/stack
-```
-
-`--config-dir` / `--data-dir` live on every subcommand, so they appear
-**after** the subcommand name. For "set once for the whole shell" use the
-env vars instead. For a bespoke split layout (e.g. big `state/` on a data
-disk, artifacts elsewhere), edit `state.*` / `output.generated_dir` in
-`config.yaml` directly.
+`--config-dir` / `--data-dir` are accepted by every subcommand, after the
+subcommand name.
 
 ## Constraining placement to specific GPUs
 
-If some of your GPUs are tied up by other work, restrict the planner
-(and the rendered ``device_ids``) to the subset you want it to use:
-
 ```bash
 # Only place onto GPU 1 (e.g. GPU 0 is running a display).
-infer-stack render --yes --profile test-single-11gb --allowed-gpus 1
+infer-stack acquire <endpoint> --allowed-gpus 1
 
-# Or pin a TP=2 profile to physical GPUs 1 and 3.
-infer-stack render --yes --profile test-multi-gpu --allowed-gpus 1,3
+# Or confine a TP=2 endpoint to physical GPUs 1 and 3.
+infer-stack acquire <tp2-endpoint> --allowed-gpus 1,3
 ```
 
-``--allowed-gpus`` (or ``INFER_STACK_ALLOWED_GPUS=1,3``) filters the
-detected inventory before placement — real indices are preserved, so
-the rendered compose stack pins ``device_ids: ["1", "3"]`` to those
-exact physical GPUs. Useful for integration tests that need to share a
-host with other jobs.
+`--allowed-gpus` (or `INFER_STACK_ALLOWED_GPUS=1,3`) filters the detected
+inventory before placement for that call only. Real indices are preserved, so
+the rendered compose stack pins `device_ids` to those exact GPUs. The durable
+forms live in data:
+
+* `placement: {gpu_indices: [1]}` on a vLLM endpoint pins it exactly (the list
+  length must equal tp×pp×dp); Ollama daemons pin through their
+  `runtime_hosts` entry;
+* `placement: {min_vram_gib: 24}` makes smaller GPUs ineligible;
+* `config set skip_display_gpus true` (or `--skip-display-gpus`) leaves the
+  GPU driving a monitor free.
 
 ## Demos / integration recipes
 
-End-to-end examples under [docs/demos/](docs/demos/) are written as
-markdown tutorials. The CI smoke test is runnable with pytest-codeblocks:
-
-```bash
-pytest --codeblocks docs/demos/ci_smoke_test.md
-```
-
-Each ``bash`` block is a self-contained shell snippet you can also
-copy-paste into a terminal. See
-[docs/demos/ci_smoke_test.md](docs/demos/ci_smoke_test.md) for the
-``setup → describe → validate → render`` flow on the smallest test
-profiles.
-
-For a real running vLLM stack on a workstation, see
-[docs/demos/quickstart.md](docs/demos/quickstart.md). For direct Ollama on a dual GTX 1080 Ti style host, see
-[docs/demos/ollama_direct_quickstart.md](docs/demos/ollama_direct_quickstart.md). For a focused GPU-1 backend switch test, see [docs/demos/smollm2_gpu1_backend_switch.md](docs/demos/smollm2_gpu1_backend_switch.md).
-
-User-supplied paths on the CLI (`--file`, `--from-file`,
-`--resource-profiles-file`, `--output-dir`) still resolve against the
-current working directory — they're meant to behave as typed.
+The user manual under [docs/source/manual/](docs/source/manual/) has two
+walkthroughs on the current CLI:
+[the Ollama + Open WebUI tutorial](docs/source/manual/ollama-openwebui-tutorial.md)
+and [the leasing demo](docs/source/manual/leasing-demo.md) (standing service,
+Open WebUI, several models side by side).
 
 ---
 
 ## Backend 1: Compose
 
-Use Compose for local single-host deployments. It can render direct Ollama stacks, vLLM stacks, mixed Ollama+vLLM stacks, and raw backend-only stacks.
+Use Compose for single-host serving. It runs vLLM and Ollama engines, mixed
+freely, behind the optional gateway and UI.
 
 ### Getting started
 
-Prerequisite: Docker and the `docker compose` plugin must be installed.
+Prerequisite: Docker and the `docker compose` plugin.
 
 ```bash
-# Direct Ollama, no LiteLLM and no predeclared models.
-infer-stack setup --backend compose --profile ollama-direct
-infer-stack validate --simulate-hardware 2x11
-infer-stack render --yes --simulate-hardware 2x11
-infer-stack up -d
+infer-stack config init --backend compose
+infer-stack doctor --gpu
+infer-stack catalog init
 
-# Classic vLLM through LiteLLM/Open WebUI.
-infer-stack setup --backend compose --profile qwen2-5-7b-instruct-turbo-default
-infer-stack validate
-infer-stack render
-infer-stack up -d
+# A vLLM endpoint.
+infer-stack catalog model add smol135 --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
+infer-stack catalog endpoint add --model smol135    # -> smol135-1
+infer-stack acquire smol135-1
+
+# An Ollama endpoint, on a daemon pinned to GPU 0.
+infer-stack catalog host add local-ollama --engine ollama --gpu 0
+infer-stack catalog endpoint add chat --engine ollama --host local-ollama --model qwen3.5:4b
+infer-stack acquire chat
 ```
+
+`infer-stack catalog suggest --apply` fills the catalog with endpoints sized
+for the detected GPUs instead.
 
 ### Test that it is responding
 
-When LiteLLM is enabled, the default Compose front door is:
+With LiteLLM enabled, every endpoint is reachable by its alias at:
 
 ```text
 http://127.0.0.1:14042/v1
 ```
 
-When using `ollama-direct`, Open WebUI talks to Ollama directly and the Ollama API is available at:
-
-```text
-http://127.0.0.1:11434
-http://127.0.0.1:11434/v1
-```
-
-unless you changed the relevant ports in config.
-
-Wait until the active profile can serve a real request through its resolved default endpoint:
+`acquire` already blocks until the endpoint returns a real generation through
+that front door, which is stronger than Docker's container health. After
+`acquire --no-wait`, block separately; to check again later, send one request:
 
 ```bash
-infer-stack wait-ready
+infer-stack wait smol135-1
+infer-stack test smol135-1
+infer-stack test chat --prompt "Name three colors." --max-tokens 32
 ```
 
-`wait-ready` is stronger than Docker Compose health: it probes the user-facing
-LiteLLM, Ollama, or direct vLLM access surface and, by default, requires a tiny
-generation/completion to succeed. The smoke test runs this readiness probe by
-default before issuing its normal test request:
+Clients read the front door and the managed key from the env file:
 
 ```bash
-infer-stack smoke-test
+export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
+export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
 ```
 
-For direct Ollama profiles, pull a model first and then smoke-test that model:
-
-```bash
-infer-stack ollama-pull qwen3.5:4b
-infer-stack ollama-list
-infer-stack smoke-test --model qwen3.5:4b
-```
-
-For LiteLLM profiles, `smoke-test` reads the rendered `.env` automatically and
-uses the active profile's resolved OpenAI-compatible front door. You can inspect
-individual secrets when needed:
-
-```bash
-infer-stack env LITELLM_MASTER_KEY
-infer-stack env VLLM_BACKEND_API_KEY
-```
+or get both, plus per-endpoint names, from
+`infer-stack acquire <endpoint> --env-file lease.env`.
 
 To replace the gateway's master key (refused while leases are active; the
 gateway restarts, and clients must fetch the key again):
@@ -361,244 +324,111 @@ gateway restarts, and clients must fetch the key again):
 infer-stack secrets rotate
 ```
 
-When you intentionally want the old quick behavior, skip the readiness wait:
-
-```bash
-infer-stack smoke-test --no-wait --model gpt2
-```
-
 ### Stop it
 
 ```bash
-infer-stack down
+infer-stack release --all            # drop every lease
+infer-stack release --all --evict    # ...and stop the engines now
+infer-stack clean -f                 # no leases, nothing on a GPU; the gateway stays
+infer-stack stack down               # docker compose down, bypassing the ledger
 ```
 
-`down` never removes named volumes. The Postgres data directory and the
-Open WebUI volume are preserved across `down`, `up`, `switch`, and `render`.
+After a plain `release`, `keep-warm` endpoints (the default `reclaim` policy)
+stay loaded until another lease needs their GPUs or `infer-stack evict` stops
+them. `stack down` releases no lease, so the next `apply` or `acquire` brings
+leased models back.
+
+All state is bind-mounted from the data dir, so none of these delete it,
+including `stack down --volumes`. For a destructive reset, remove the
+directories `infer-stack paths` lists.
 
 ### Open WebUI authentication
 
-By default Open WebUI runs with `WEBUI_AUTH=False` — no login screen,
-anyone who can reach the port gets straight into the UI. This is the
-expected behavior for a local dev box. To re-enable login/signup, set
-in `config.yaml`:
+Open WebUI runs with `WEBUI_AUTH=False`: no login screen, and anyone who can
+reach port 13000 gets the UI. No setting changes that. Keep the host on a
+trusted network, or run without the UI (`config set ui false`).
 
-```yaml
-open_webui:
-  auth: true
-```
+### Reverse proxy
 
-and re-render. Existing accounts stored in the `postgres-open-webui`
-volume are preserved across the toggle.
-
-### Reverse proxy (TLS) and LDAP
-
-Open WebUI can be fronted by an opt-in nginx TLS reverse proxy, and its
-login can be backed by an LDAP directory. Both are off by default and
-configured as ordinary config fields. The built-in `openwebui-tls-ldap`
-profile wires them together as a worked example (Ollama + Open WebUI
-behind nginx, no public Open WebUI/Ollama ports); see
-[`examples/openwebui-tls-ldap/`](examples/openwebui-tls-ldap/).
+An optional nginx service publishes one HTTP port with the UI at `/` and the
+API at `/v1`. It needs the LiteLLM gateway.
 
 ```bash
-infer-stack setup --backend compose --profile openwebui-tls-ldap
+infer-stack config set reverse_proxy true                        # port 80
+infer-stack config set reverse_proxy '{enabled: true, port: 8080}'
 ```
 
-**Reverse proxy.** Enable it under `frontends.reverse_proxy`. It renders
-an nginx service plus a generated `state.runtime/nginx.conf`:
+`acquire --reverse-proxy` turns it on for one call. Add `config_path:
+/path/to/nginx.conf` to the block to mount your own config at
+`/etc/nginx/conf.d/default.conf` instead of the generated one.
 
-```yaml
-frontends:
-  reverse_proxy:
-    enabled: true
-    target: open_webui        # or litellm / ollama / a custom upstream
-    server_name: host.example.com
-    ssl:
-      enabled: true
-      certificate: ./certs/site.crt
-      certificate_key: ./certs/site.key
-      dhparam: ./dhparam.pem   # optional
-```
-
-When `ssl.enabled` is true, port 80 redirects to HTTPS (`force_https`)
-and the cert/key/dhparam host paths are bind-mounted read-only. When
-`ssl.enabled` is false, only HTTP is published (HTTPS publishing is
-gated on TLS so you never get a `:443` mapping with nothing listening).
-
-> **Path caveat.** Relative `certificate`/`certificate_key`/`dhparam`/
-> `config_path` values are written verbatim into the generated
-> `docker-compose.yml`, so Docker Compose resolves them **relative to the
-> generated directory** (where the compose file lives), not your CWD.
-> `infer-stack render` warns when a referenced cert or config file is not
-> found. Use absolute paths if you want to avoid the ambiguity.
-
-**LDAP.** Enable it under `frontends.open_webui.ldap`. The directory
-settings render as Open WebUI `LDAP_*` environment variables, and
-secrets/site-specific values are emitted as `.env` placeholders
-(`LDAP_HOST`, `LDAP_PASSWD`, `LDAP_SEARCH_BASE`, …) so you can fill them
-in after the first render without re-touching the compose YAML:
-
-```yaml
-frontends:
-  open_webui:
-    ldap:
-      enabled: true
-      env_defaults:
-        LDAP_PORT: '636'
-        LDAP_USE_TLS: 'true'
-        LDAP_ATTRIBUTE_FOR_USERNAME: uid
-```
-
-**Manual escape hatches.** When the typed renderer is not enough, drop
-to manual control without leaving infer-stack:
-
-* `frontends.reverse_proxy.config_path` — mount an existing nginx config
-  file instead of rendering one.
-* `frontends.reverse_proxy.extra_config` — inject extra directives into
-  the rendered HTTPS `server` block.
-* Every rendered service (`ollama`, vLLM runtimes, `litellm`,
-  `open_webui`, `reverse_proxy`) accepts generic overrides:
-  `extra_env`, `env_file`, `extra_volumes`, `extra_hosts`, `labels`,
-  `additional_ports`, and `gpus` (scalar `all`/count or a structured
-  device-request list).
-
-Field precedence (lowest to highest) is: top-level config section
-(`reverse_proxy:` / `open_webui:` / `ollama:`) → the matching
-`frontends.*` / `providers.*` / `gateways.*` section → the active
-profile. Newer configs should prefer the `frontends.*` / `providers.*`
-form shown above.
+It does no TLS and no authentication. Only the one port is published and no
+certificate is mounted, so terminate TLS in a proxy in front of it. The TLS
+and LDAP settings of the pre-leasing profiles no longer exist.
 
 ### Persistent state and database layout
 
-Compose renders stateful services only when their components are enabled:
+Everything lives under the data dir (`infer-stack paths`):
 
-* `postgres-open-webui` — rendered only when Open WebUI is enabled. It stores chats, accounts, and settings in `state.postgres_open_webui`.
-* `postgres-litellm` — rendered only when LiteLLM is enabled. It stores router state in `state.postgres_litellm`.
-* `ollama` — rendered only when the Ollama provider is enabled. Its model store is `state.ollama`, mounted at `/root/.ollama`.
-* vLLM runtimes mount `state.hf_cache` for Hugging Face weights and `state.vllm_cache` for compiled artifacts.
+* `open-webui/`: Open WebUI's data directory (accounts, chats, settings),
+  mounted at `/app/backend/data`;
+* `postgres-litellm/`: LiteLLM's route store, rendered only with
+  `config set dynamic_routing true`;
+* `ollama/`: the Ollama model store, mounted at `/root/.ollama`;
+* `hf-cache/`, `vllm-cache/`, `torch-cache/`, `triton-cache/`, `cuda-cache/`:
+  vLLM weights and compile caches (see
+  [docs/persistent-caches-and-warm-restarts.md](docs/persistent-caches-and-warm-restarts.md));
+* `runtime/`: directories an endpoint's `runtime.mounts` asks for;
+* `leasing/`: the ledger and the rendered compose project.
 
-Each Postgres container has its own `POSTGRES_DB`, `POSTGRES_USER`, and
-`POSTGRES_PASSWORD`, sourced from component-specific `.env` keys. There is no shared Postgres instance and no `postgres-init` bootstrap service.
-
-Open WebUI chat history is **not** tied to the model currently being served, so after a profile switch old chats may reference model IDs the current gateway no longer advertises — that is expected.
-
-### Operational tips
-
-Prefer scoping commands to specific services rather than relying on
-container names. Use only the services rendered by the active profile:
-
-```bash
-# LiteLLM gateway profile
-infer-stack logs -f litellm
-
-# Direct Ollama profile
-infer-stack logs -f ollama
-
-# Ollama model store helpers
-infer-stack ollama-list
-infer-stack ollama-ps
-```
-
-You do not need to delete any volume during normal operation. If you
-ever want a destructive reset, do it explicitly with
-`docker compose down -v` against `generated/docker-compose.yml` — the
-toolchain itself never does this.
+Open WebUI chat history is not tied to the models currently served, so old
+chats may name aliases the gateway no longer advertises. That is expected.
 
 ### Custom .env values are preserved
 
-`generated/.env` is rewritten non-destructively. Any `KEY=value` pair
-you add manually (for example `VERBOSE=1`, `HF_HOME=/data/hf`, or any
-key this program does not yet know about) is preserved across
-`render`, `setup`, `switch`, `up`, and `deploy`. Comments and the order
-of existing lines are preserved where practical.
+The compose project's `.env` holds the managed secrets (`LITELLM_MASTER_KEY`,
+`HF_TOKEN`, …). `infer-stack env KEY=VALUE` merges a value into it, and keys
+you add are kept across renders. Compose uses the file for interpolation, so a
+key reaches a container only when the rendered service references it (as
+`HF_TOKEN` does for vLLM). Set `HF_TOKEN` before the first `acquire` of a
+gated model.
 
-### Switching profiles
+### Switching models
+
+There is no single active model to switch. `acquire` another endpoint and it
+runs beside the first; release the first when you are done:
 
 ```bash
-infer-stack switch <profile> --apply
+infer-stack acquire smol135-1
+infer-stack acquire chat          # now both are served
+infer-stack leases                # find smol135-1's lease id
+infer-stack release <lease-id>
 ```
 
-`switch --apply` re-renders from the updated `config.yaml`, then brings the
-stack up convergently with `--remove-orphans` so a separate `infer-stack up` is
-not needed. Components/runtimes that are no longer in the rendered compose file
-are dropped. Compose preserves existing containers whose service definitions did
-not change. For vLLM-to-vLLM profile switches, unchanged Open WebUI stays up;
-LiteLLM is refreshed through its admin API when possible. The live refresh
-path treats LiteLLM's "model not found in db" response for config-backed
-models as non-fatal, so switching aliases can add the new route without
-tearing LiteLLM down. That can temporarily leave stale config-backed aliases
-in `/v1/models`; restart LiteLLM manually only when you want to clean those
-up. If Compose already created or recreated LiteLLM while converging the new
-stack, no extra router refresh is attempted because the new container has
-already loaded the freshly rendered YAML. Profiles that do not render
-LiteLLM, such as direct Ollama profiles, skip the router refresh path even if
-an old `runtime/litellm_config.yaml` file remains from a previous profile.
-Switches that change Open WebUI's provider wiring, such as
-`Open WebUI -> LiteLLM` to `Open WebUI -> Ollama`, necessarily recreate
-Open WebUI because its environment changes. Postgres volumes and provider
-caches are left untouched. vLLM runtime containers are named after their
-Compose service, for example `vllm-chat`, so `docker ps` and
-`infer-stack logs vllm-chat` clearly identify them as vLLM containers.
+The gateway carries a route for every catalog endpoint, so adding or removing
+a model does not recreate LiteLLM, and Open WebUI stays up. When GPUs are
+short, `acquire` fails fast; `--queue` waits for a GPU instead, and idle
+`keep-warm` deployments are evicted to make room. vLLM containers are named
+after the served alias (`vllm-<alias>`), so `docker ps` and
+`infer-stack logs vllm-<alias>` identify them.
 
 ### Protocol modes for base vs. instruct models
 
-Profiles declare a `protocol_mode` (`chat` or `completions`) that the
-served model must support. Models also declare which protocols they
-support via `supported_protocols`. Validation runs before render and
-fails with an actionable message if a profile asks for `chat` on a
-completions-only model.
-
-Practical guidance:
-
-* Instruct/chat models (with a chat template) can use either, but
-  default to `chat`.
-* Base models like Pythia, Llama-2 base, Mistral-v0.1 base, and Falcon
-  base do not define a chat template. Their HELM profiles use
-  `protocol_mode: completions` and the `smoke-test` command will
-  exercise `/v1/completions` for them.
-* The rendered LiteLLM config uses `text-completion-openai/<served>`
-  as the upstream provider for completions-only services. That means
-  even chat-shaped requests sent through Open WebUI to a Pythia model
-  get translated by LiteLLM into upstream `/v1/completions` calls — no
-  second vLLM container is needed to support Open WebUI for a
-  completions-only model.
-* Open WebUI is still a chat UI, so prompt formatting matters.
-  HELM/eval clients should call `/v1/completions` directly for exact
-  prompt control rather than going through the chat frontend.
-
-### Chat-shaped clients on top of completions models
-
-Some clients (e.g. InspectAI / Inspect Evals stock MMLU tasks) only
-speak `/v1/chat/completions` and cannot be reconfigured. For those
-cases, profiles can opt into a LiteLLM-only adapter:
-
-```yaml
-chat_compat:
-  enabled: true
-  strategy: flat_messages
-```
-
-When set on a `protocol_mode: completions` service, the rendered
-LiteLLM config keeps the `text-completion-openai/<served>` upstream
-and adds LiteLLM's documented prompt-template fields
-(`initial_prompt_value` / `roles` / `final_prompt_value`) so chat
-messages get flattened into a plain prompt — no role labels, messages
-joined by `\n` — before being forwarded to vLLM `/v1/completions`.
-
-This is **not** a chat tune; the model is still a base model and
-prompt formatting still matters for evaluation. Use it only when a
-chat-shaped client cannot be changed. The vLLM container is not
-restarted, no `--chat-template` is rendered, and the adapter takes
-effect after a `litellm`-only restart:
+An endpoint's `protocol` is `chat` (the default) or `completions`. It decides
+which surface the readiness probe and `infer-stack test` use, so a base model
+without a chat template must declare `completions` or its `acquire` never sees
+a ready generation:
 
 ```bash
-infer-stack render
-infer-stack restart litellm
+infer-stack catalog model add pythia-160m --source hf://EleutherAI/pythia-160m
+infer-stack catalog endpoint add --model pythia-160m --protocol completions
+infer-stack acquire pythia-160m-1
+infer-stack test pythia-160m-1              # hits /v1/completions
 ```
 
-The built-in `pythia-inspect-mmlu-compat` profile is a ready-made
-example; see
-[`recipies/compose_pythia_inspect_mmlu_compat.md`](recipies/compose_pythia_inspect_mmlu_compat.md).
+The gateway forwards `/v1/completions` unchanged, so evaluation clients that
+need exact prompt control should call it directly. Open WebUI is a chat UI and
+sends chat requests, which a base model cannot answer.
 
 ### Images with their own launcher
 
@@ -608,34 +438,25 @@ endpoint's `runtime`; infer-stack has no model-specific code for it:
 
 ```yaml
 runtime:
-  image: ghcr.io/syv-ai/hyperqwen:sha-684e927
+  image: example.org/my-vllm-launcher:1.0
   max_model_len: 65536
   gpu_memory_utilization: 0.93
   command: [single]              # replaces `vllm serve MODEL <flags>`
   env:                           # container environment
     PORT: '{port}'
-    SPEC: dflash2
-    CTX: fast
-    PREFIX_CACHE: 1
     MAX_LEN: '{max_model_len}'   # filled from the field above
     GPU_UTIL: '{gpu_memory_utilization}'
     EXTRA_ARGS: '--served-model-name={served_model_name}'
   mounts:                        # persisted under the runtime data dir
-    /app/models: hyperqwen/qwen3.8-27b/models
-    /cache: hyperqwen/qwen3.8-27b/cache
+    /app/models: my-launcher/models
 ```
 
-Switching that image to another context profile is a data edit, in the catalog
-or the TUI's endpoint editor. HyperQwen's measured 3090 profiles are:
-
-- fast/default: `max_model_len: 65536`, `SPEC: dflash2`, `CTX: fast`;
-- long: `max_model_len: 150000`, `SPEC: mtp`, `CTX: long`;
-- huge: `max_model_len: 245760`, `SPEC: dflash2`, `CTX: huge`.
-
-On an RTX 3090, `catalog suggest` emits the latter two as `-long` and `-huge`
-endpoint variants. The hardware check happens only while suggesting: the
-resulting catalog contains ordinary explicit runtime data, so `apply`/`acquire`
-never silently retunes an endpoint after the fact.
+Changing the launcher's mode is a data edit, in the catalog or the TUI's
+endpoint editor. The HyperQwen suggestion (see "Related work") is a worked
+example: on an RTX 3090, `catalog suggest` emits its measured context
+profiles as separate `-long` and `-huge` endpoints. The hardware check
+happens only while suggesting; the resulting catalog holds ordinary explicit
+runtime data, so `apply`/`acquire` never retunes an endpoint after the fact.
 
 - `{max_model_len}`, `{gpu_memory_utilization}`, `{served_model_name}` and
   `{port}` are filled in from the endpoint, so a launcher that takes them
@@ -656,42 +477,29 @@ never silently retunes an endpoint after the fact.
 
 ### Reasoning / thinking models
 
-Models can declare reasoning support in the catalog:
+vLLM separates a reasoning trace from the answer when it is started with a
+reasoning parser. Pass the flag through `runtime.extra_args`:
 
 ```yaml
-reasoning:
-  enabled: true
-  parser: qwen3
-  expose_to_openwebui: true
+endpoints:
+  qwen3-think:
+    engine: vllm
+    model: qwen3-0.6b
+    runtime:
+      extra_args: [--reasoning-parser=qwen3]
 ```
 
-Profiles can override or set the same field per service. When a
-service has `reasoning.enabled: true` and a `parser`, the renderer
-adds `--reasoning-parser <parser>` to that vLLM container's command
-line — that flag alone enables reasoning extraction in the current
-vLLM CLI. You do not need to repeat it by hand in `extra_args`.
-
-Open WebUI sees reasoning content via two paths:
-
-1. Inline `<think>...</think>` tags emitted by the model.
-2. Structured `reasoning_content` fields when LiteLLM normalizes them.
-
-The LiteLLM template keeps `merge_reasoning_content_in_choices: true`
-on chat-mode entries so Open WebUI can display reasoning in the
-streamed response. To test reasoning end-to-end:
+The parser name depends on the model family and the vLLM version (`vllm serve
+--help` lists them). To test end to end:
 
 ```bash
-# Non-streaming CLI smoke test:
-infer-stack smoke-test \
-  --model qwen3.6-35b-a3b \
-  --prompt "Think step by step: 17*23"
+infer-stack test qwen3-think --prompt "Think step by step: 17*23" --max-tokens 512
 
-# For streaming inspection, read the key with the CLI wrapper:
-LITELLM_MASTER_KEY=$(infer-stack env LITELLM_MASTER_KEY)
-curl -N http://127.0.0.1:14042/v1/chat/completions \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+# Streaming, through the gateway:
+curl -N "$(infer-stack env OPENAI_BASE_URL)/chat/completions" \
+  -H "Authorization: Bearer $(infer-stack env LITELLM_MASTER_KEY)" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.6-35b-a3b","stream":true,
+  -d '{"model":"qwen3-think","stream":true,
        "messages":[{"role":"user","content":"Think step by step: 17*23"}]}'
 ```
 
