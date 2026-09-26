@@ -1121,6 +1121,24 @@ def test_clean_force_releases_leases_and_evicts_keep_warm(env, capsys):
     assert all(d['state'] == 'stopped' for d in data['deployments'])
 
 
+
+def test_a_released_stop_deployment_is_neither_missing_nor_left_to_clean(env, capsys):
+    # UX audit pass 5, the README's first run: after `release --all` tore a
+    # `reclaim: stop` model down, `leases` warned NOT-RUNNING and `clean`
+    # offered to tear it down again. It is IDLE in the ledger by design.
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    catalog = yaml.safe_load(open(env.cat))
+    catalog['endpoints']['reranker']['reclaim'] = {'policy': 'stop'}
+    open(env.cat, 'w').write(yaml.safe_dump(catalog))
+    AcquireCLI.main(argv=['reranker', *_base(env)])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    capsys.readouterr()
+    LeasesCLI.main(argv=['--ledger', env.db])
+    assert 'NOT-RUNNING' not in capsys.readouterr().out
+    assert CleanCLI.main(argv=['--ledger', env.db]) == 0
+    assert 'already clean' in capsys.readouterr().out
+
 def test_clean_reports_an_already_clean_stack(env, capsys):
     from infer_stack.cli.commands_leasing import CleanCLI
 

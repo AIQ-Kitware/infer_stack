@@ -518,6 +518,19 @@ class Controller:
     # error. Backends that neither place nor inspect (dry-run, tests) get the
     # same surface from SimpleAdmission.
 
+    def keeps_up(self, deployment: Deployment) -> bool:
+        """Whether the reconciler keeps ``deployment`` running.
+
+        LIVE always; IDLE only under ``keep-warm`` (the default policy). An
+        IDLE ``stop`` deployment is torn down by the release that idled it
+        and stays IDLE in the ledger, so a view that treats every IDLE row as
+        running reports a missing container that is exactly as intended.
+        """
+        if deployment.state == DeploymentState.LIVE:
+            return True
+        return (deployment.state == DeploymentState.IDLE
+                and deployment.spec.get('reclaim', self.reclaim_default) == KEEP_WARM)
+
     def _stored_state(self, lease_id: str):
         """A lease's state as stored (not virtually expired), or ``None``."""
         lease = self.ledger.get_lease(lease_id)
@@ -563,7 +576,7 @@ class Controller:
                 # unique container). Never freshly placed; it blocks new
                 # allocation until released (see _admit).
             elif deployment.state == DeploymentState.IDLE:
-                if deployment.spec.get('reclaim', self.reclaim_default) != KEEP_WARM:
+                if not self.keeps_up(deployment):
                     continue
                 resident = residency.resident(gid) if residency is not None else None
                 if resident is not None and not resident.all_gpus:
@@ -682,6 +695,8 @@ class Controller:
           neither started nor removed until its lease is released);
         * ``displaced``: an idle keep-warm model that yielded its GPUs;
         * ``unresolved``: LIVE from before allocations, with no unique container;
+        * ``reclaimed``: idle under ``stop``, and its container is gone, as
+          intended (see :meth:`keeps_up`);
         * ``running`` / ``not-running``: whether its single container serves.
         """
         from .profile import profile_drift
@@ -718,8 +733,10 @@ class Controller:
                   and residency is not None
                   and residency.resident(g.id) is None):
                 condition = 'unresolved'
+            elif residency is not None and residency.resident(g.id):
+                condition = 'running'
             elif residency is not None:
-                condition = 'running' if residency.resident(g.id) else 'not-running'
+                condition = 'not-running' if self.keeps_up(g) else 'reclaimed'
             else:
                 condition = None
             rows.append({'id': g.id, 'state': g.state, 'condition': condition,

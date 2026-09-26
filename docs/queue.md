@@ -328,6 +328,18 @@ Pass 5, the TUI by eye on kubeai (80x24, then enlarged to 200x50):
       read the app's size before it updated; it now uses the event's.
       Instances, Control and Deployments read the same as on compose.
 
+Pass 5, the first run from the README (no-GPU path, empty roots): config
+init, `catalog suggest --simulator --apply`, acquire, test, the env exports
+and a raw request all worked as written.
+
+- [x] After `release --all` tore down the simulator (`reclaim: stop`),
+      `leases` warned `NOT-RUNNING` and `clean` offered to tear it down
+      again: both read every IDLE row as meant to run. The ledger keeps a
+      released `stop` deployment IDLE by design. `Controller.keeps_up` is
+      now the one reading of the reclaim policy (admission, health,
+      `clean`); such a row is `reclaimed`, and `clean` says the stack is
+      already clean ("no active leases, no models up").
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

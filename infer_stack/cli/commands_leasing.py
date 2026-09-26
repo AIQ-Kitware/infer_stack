@@ -1420,9 +1420,12 @@ class CleanCLI(_LeasingCommonMixin):
         controller = _open_controller(config, interactive=False)
         leases, deployments = controller.ledger.status(virtual_expiry=True)
         active = [le for le in leases if le.state == LeaseState.ACTIVE]
-        held = [g for g in deployments
-                if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)]
         observed, assignments = _placement_view(controller)
+        # An idle `stop` deployment with nothing running was already torn
+        # down by its release: nothing is left to do but forget it (-f does).
+        held = [g for g in deployments
+                if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)
+                and (controller.keeps_up(g) or g.id in observed)]
         # On any backend: one that selects its units by label (kubeai) has none.
         can_orphan = bool(config.orphans)
 
@@ -1450,7 +1453,7 @@ class CleanCLI(_LeasingCommonMixin):
                 print(json.dumps(plan, indent=2))
                 return 0
             if not (active or held or found):
-                print('clean: already clean (no leases, no deployments, no orphans)')
+                print('clean: already clean (no active leases, no models up, no orphans)')
                 return 0
             print('clean: would release and tear down (dry run; -f to do it)')
             for le in active:
