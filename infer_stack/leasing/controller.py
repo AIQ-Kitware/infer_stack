@@ -28,9 +28,9 @@ import warnings
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, TypeVar, cast
+from typing import Callable, Iterable, TypeVar
 
-from .backend import AdmissionBackend, Backend
+from .backend import HostRuntime, ServingBackend
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
 
@@ -79,7 +79,7 @@ class ReconcileResult:
     placement_errors: list[str] = field(default_factory=list)
     # deployment id -> GPU indices it is on / slated for (placement backends only).
     assignments: dict[str, list[int]] = field(default_factory=dict)
-    # False when reconcile only rendered the on-disk state (no docker up/down).
+    # False when reconcile only rendered the on-disk state (nothing brought up or taken down).
     applied: bool = True
     # True when a publication marker is still set after this operation: the
     # desired state was staged (--no-apply, render) or its apply did not fully
@@ -168,7 +168,7 @@ class Controller:
     def __init__(
         self,
         ledger: Ledger,
-        backend: Backend,
+        backend: ServingBackend,
         *,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -468,14 +468,15 @@ class Controller:
         # Residency decides which idle keep-warm deployments are candidates at
         # all; unknown residency fails the render (the change stays pending)
         # rather than guessing which warm models exist.
-        residency = self._admitting.residency()
+        residency = self.backend.residency()
         self._backfill_allocations(residency)
-        self._prepare_network()
+        host = self.backend.host_runtime
+        self._prepare_network(host)
         desired, placement = self._admission_view(residency)
-        if hasattr(self.backend, 'adopted'):
-            self._admitting.adopted = self._prune_adopted(residency)
+        if host is not None:
+            host.set_adopted(self._prune_adopted(residency))
         before = set(self.backend.observe())
-        self._admitting.converge(desired, apply=False, placement=placement)
+        self.backend.converge(desired, apply=False, placement=placement)
         after = set(self.backend.observe())
         rec = ReconcileResult(
             realized=sorted(after - before),
@@ -487,8 +488,8 @@ class Controller:
             displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
             degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
         )
-        if hasattr(self.backend, 'adopted'):
-            self._adopt_existing(residency)
+        if host is not None:
+            self._adopt_existing(residency, host)
         return rec
 
     # -- serialised publication --------------------------------------------
@@ -536,15 +537,6 @@ class Controller:
         lease = self.ledger.get_lease(lease_id)
         return None if lease is None else lease.state
 
-    @property
-    def _admitting(self) -> AdmissionBackend:
-        """``self.backend`` as the admission surface.
-
-        Every backend the controller drives has it (the real ones, and
-        :class:`~infer_stack.leasing.backend.SimpleAdmission` for the rest).
-        """
-        return cast(AdmissionBackend, self.backend)
-
     def _admission_view(
         self, residency, *, overlay=None, virtual_expiry: bool = False
     ):
@@ -578,30 +570,33 @@ class Controller:
             elif deployment.state == DeploymentState.IDLE:
                 if not self.keeps_up(deployment):
                     continue
-                resident = residency.resident(gid) if residency is not None else None
-                if resident is not None and not resident.all_gpus:
-                    hints[gid] = list(resident.gpus)
+                # Resident, with its GPUs known: every warm unit counts (a
+                # KubeAI Model's replicas), a conflict or an unmappable
+                # reservation does not. [] where the cluster places.
+                gpus = residency.resident_gpus(gid) if residency is not None else None
+                if gpus is not None:
+                    hints[gid] = gpus
                     optional.append(deployment)
         inputs = PlacementInputs(
             required_ids=set(required), hard=hard, optional_hints=hints,
         )
         return [*required.values(), *optional], inputs
 
-    def _prepare_network(self) -> None:
-        """Give the backend the stable-address table, once a network is migrated.
+    def _prepare_network(self, host: HostRuntime | None) -> None:
+        """Give the host runtime the stable-address table, once a network is migrated.
 
-        Compose only: a backend without a ``network`` attribute has no
-        host network to stamp addresses on.
+        Only a backend with containers on this host has a network to stamp
+        addresses on; for any other there is nothing to do.
         """
-        if not hasattr(self.backend, 'network'):
+        if host is None:
             return
         config = self.ledger.network_config()
         if config is None:
-            self._admitting.network = None
+            host.configure_network(None)
             return
-        self._admitting.network = {
-            'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()}
-        self._admitting.on_addresses = self.ledger.add_service_addresses
+        host.configure_network(
+            {'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()},
+            on_addresses=self.ledger.add_service_addresses)
 
     def network_migrate(self, subnet: str, *, force: bool = False) -> ReconcileResult:
         """``infer-stack network migrate``: move the project to stable addresses.
@@ -613,10 +608,14 @@ class Controller:
         """
         import ipaddress
 
-        from .network import overlapping_subnets
         from .profile import ProfileMismatch
 
         subnet = str(ipaddress.ip_network(subnet))
+        host = self.backend.host_runtime
+        if host is None:
+            raise ProfileMismatch(
+                'network migrate moves containers on this host to fixed addresses; '
+                'this backend runs none (the compose backend does)')
         with self._global_lock():
             leases, _ = self.ledger.status(virtual_expiry=True)
             active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
@@ -625,7 +624,7 @@ class Controller:
                     f'network migrate recreates every container; {len(active)} lease(s) '
                     'are active (release them, or pass --force)'
                 )
-            clash = overlapping_subnets(subnet, self._admitting.run)
+            clash = host.subnet_clashes(subnet)
             if clash:
                 raise ProfileMismatch(f'subnet {subnet} overlaps: {"; ".join(clash)}')
             current = self.ledger.network_config()
@@ -633,19 +632,19 @@ class Controller:
             # Preview the migrated render and take approval BEFORE any write:
             # a declined migration must leave the subnet and addresses as they were.
             self._sync_profile(create=True)
-            residency = self._admitting.residency()
-            saved = self._admitting.network
-            self._admitting.network = {
+            residency = self.backend.residency()
+            saved = host.network_table()
+            host.configure_network({
                 'subnet': subnet,
                 'addresses': {} if reset else self.ledger.service_addresses(),
-            }
+            })
             try:
                 desired, inputs = self._admission_view(
                     residency, virtual_expiry=True
                 )
-                self._admitting.preview(desired, inputs, approve=True)
+                self.backend.preview(desired, inputs, approve=True)
             finally:
-                self._admitting.network = saved
+                host.configure_network(saved)
             self.ledger.store.migrate_network(
                 subnet=subnet, reset_addresses=reset,
                 approved_digest=getattr(self.backend, 'last_preview_digest', None),
@@ -703,27 +702,24 @@ class Controller:
         from .residency import ResidencyUnknown
 
         leases, deployments = self.ledger.status(virtual_expiry=True)
-        sidecar = {}
-        loader = getattr(self.backend, '_load_sidecar', None)
-        if loader is not None:
-            try:
-                sidecar = loader() or {}
-            except Exception:  # noqa: BLE001 - a view must always render
-                sidecar = {}
+        try:
+            notes = self.backend.placement_notes() or {}
+        except Exception:  # noqa: BLE001 - a view must always render
+            notes = {}
         residency, residency_error = None, None
         try:
-            residency = self._admitting.residency()
+            residency = self.backend.residency()
         except ResidencyUnknown as ex:
             residency_error = str(ex)
-        degraded = set(sidecar.get('degraded') or ())
-        displaced = set(sidecar.get('displaced') or ())
+        degraded = set(notes.get('degraded') or ())
+        displaced = set(notes.get('displaced') or ())
         rows = []
         for g in deployments:
             if g.state not in (DeploymentState.LIVE, DeploymentState.IDLE):
                 continue
             if residency is None and residency_error is not None:
                 condition = 'unknown'
-            elif residency is not None and residency.ambiguous(g.id):
+            elif residency is not None and residency.is_conflicted(g.id):
                 condition = 'ambiguous'
             elif g.id in degraded and g.state == DeploymentState.LIVE:
                 condition = 'degraded'
@@ -731,9 +727,10 @@ class Controller:
                 condition = 'displaced'
             elif (g.state == DeploymentState.LIVE and g.assigned_gpus is None
                   and residency is not None
-                  and residency.resident(g.id) is None):
+                  and self._gpu_units(g) > 0
+                  and residency.unique_unit(g.id) is None):
                 condition = 'unresolved'
-            elif residency is not None and residency.resident(g.id):
+            elif residency is not None and residency.is_resident(g.id):
                 condition = 'running'
             elif residency is not None:
                 condition = 'not-running' if self.keeps_up(g) else 'reclaimed'
@@ -774,7 +771,7 @@ class Controller:
             self.ledger.set_adopted_containers(kept)
         return kept
 
-    def _adopt_existing(self, residency) -> None:
+    def _adopt_existing(self, residency, host: HostRuntime) -> None:
         """One-time migration: adopt project containers from before ownership labels.
 
         Runs after the first render on a ledger. A container
@@ -788,8 +785,9 @@ class Controller:
         """
         if self.ledger.adopted_containers() is not None:
             return
-        fingerprints = self._admitting._load_sidecar().get('fingerprints') or {}
-        services = self._admitting._load_sidecar().get('services') or {}
+        rendered = host.rendered_services()
+        fingerprints = {name: fp for name, (fp, _) in rendered.items()}
+        services = {name: gid for name, (_, gid) in rendered.items()}
         _, deployments = self.ledger.status()
         by_id = {g.id: g for g in deployments}
         adopted = {}
@@ -803,13 +801,13 @@ class Controller:
                 live_here = (deployment.state == DeploymentState.LIVE
                              and list(c.gpus) == list(deployment.assigned_gpus or []))
                 resident = (deployment.state == DeploymentState.IDLE
-                            and residency.resident(c.deployment_id) is not None)
+                            and residency.is_resident(c.deployment_id))
                 if not (live_here or resident):
                     continue
             adopted[c.container_id] = {
                 'service': c.service, 'fingerprint': fingerprints[c.service]}
         self.ledger.set_adopted_containers(adopted)
-        self._admitting.adopted = adopted
+        host.set_adopted(adopted)
 
     def remove_orphans(self, confirm: Callable[[list], bool]) -> list:
         """``gc --orphans``: remove the project's unmanaged containers, with consent.
@@ -818,14 +816,17 @@ class Controller:
         neither labelled nor adopted, and removes exactly those if ``confirm``
         (shown the list) returns True. Returns the removed containers.
         """
+        host = self.backend.host_runtime
+        if host is None:
+            return []           # nothing of this host's to be an orphan
         with self._global_lock():
-            residency = self._admitting.residency()
+            residency = self.backend.residency()
             adopted = self.ledger.adopted_containers() or {}
             orphans = [c for c in residency.all_containers()
                        if not c.labelled and c.container_id not in adopted]
             if not orphans or not confirm(orphans):
                 return []
-            self._admitting.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
+            host.remove_containers([c.container_id for c in orphans])
             return orphans
 
     def _gpu_units(self, deployment) -> int:
@@ -851,7 +852,8 @@ class Controller:
             if self._gpu_units(deployment) == 0:
                 self.ledger.set_allocation(deployment.id, [])
                 continue
-            resident = residency.resident(deployment.id)
+            # One reservation to adopt: a unique unit, not a replica set.
+            resident = residency.unique_unit(deployment.id)
             if resident is not None and not resident.all_gpus and resident.gpus:
                 self.ledger.set_allocation(deployment.id, list(resident.gpus))
             else:
@@ -874,7 +876,7 @@ class Controller:
                 continue
             if self._gpu_units(deployment) == 0:
                 continue
-            resident = residency.resident(gid) if (
+            resident = residency.unique_unit(gid) if (
                 residency is not None and gid in overlay.revived) else None
             if resident is not None and not resident.all_gpus and resident.gpus:
                 adopted[gid] = list(resident.gpus)      # IDLE->LIVE keeps its GPUs
@@ -898,9 +900,9 @@ class Controller:
                 ]
         for gid, gpus in adopted.items():
             overlay.deployments[gid].assigned_gpus = gpus
-        self._prepare_network()
+        self._prepare_network(self.backend.host_runtime)
         desired, inputs = self._admission_view(residency, overlay=overlay)
-        plan, rendered = self._admitting.preview(desired, inputs)
+        plan, rendered = self.backend.preview(desired, inputs)
         from .backend import allocates_gpus
 
         reasons = []
@@ -941,7 +943,7 @@ class Controller:
             # after the commit produces the same files and does not ask again.
             # Its digest goes into the pending marker, so a recovery after a
             # crash (and perhaps an upgrade) cannot apply something else.
-            self._admitting.preview(desired, inputs, approve=True)
+            self.backend.preview(desired, inputs, approve=True)
             self._admission_digest = getattr(self.backend, 'last_preview_digest', None)
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
@@ -1003,7 +1005,7 @@ class Controller:
             if deployment.state == DeploymentState.LIVE:
                 pinned.update(deployment.served)
             elif deployment.state == DeploymentState.IDLE and residency is not None:
-                if residency.resident(deployment.id) is not None:
+                if residency.is_resident(deployment.id):
                     pinned.update(deployment.served)
         return pinned
 
@@ -1208,7 +1210,7 @@ class Controller:
         marker = self.ledger.publication_pending()
         if marker is None:
             return rec
-        apply_fn = self._admitting.apply
+        apply_fn = self.backend.apply
         if not marker['apply_requested']:
             rec.publication_pending = True    # staged; never applied here
             return rec
@@ -1423,10 +1425,10 @@ class Controller:
         from .residency import ResidencyUnknown
 
         try:
-            snap = self._admitting.residency()
+            snap = self.backend.residency()
         except ResidencyUnknown:
             return []
-        return [gid for gid in deployment_ids if not snap.containers(gid)]
+        return [gid for gid in deployment_ids if not snap.units(gid)]
 
     def _rollback_acquire(self, lease_id: str, *, apply: bool) -> ReconcileResult | None:
         """Roll a failed acquire back and publish the result, under the lock.
@@ -1577,7 +1579,7 @@ class Controller:
                     self.ledger.sweep()
                     self._publish()
                 try:
-                    residency = self._admitting.residency()
+                    residency = self.backend.residency()
                     self._residency_error = None
                 except ResidencyUnknown as ex:
                     residency = None
@@ -1795,7 +1797,7 @@ class Controller:
                     f'lease(s) ({", ".join(active[:3])}); release them first'
                 )
             try:
-                snap = self._admitting.residency()
+                snap = self.backend.residency()
             except ResidencyUnknown as ex:
                 raise ProfileMismatch(
                     f'config publish cannot confirm the stack is quiescent: {ex}'
@@ -1814,18 +1816,18 @@ class Controller:
             previous = self._applied_profile
             use(profile)
             try:
-                residency = self._admitting.residency()
-                self._prepare_network()
+                residency = self.backend.residency()
+                self._prepare_network(self.backend.host_runtime)
                 desired, inputs = self._admission_view(
                     residency, virtual_expiry=True
                 )
-                self._admitting.preview(desired, inputs, approve=True)
+                self.backend.preview(desired, inputs, approve=True)
             except BaseException:
                 if previous is not None:
                     use(previous)
                 raise
             self.ledger.store.publish_profile(
-                profile, approved_digest=self._admitting.last_preview_digest)
+                profile, approved_digest=self.backend.last_preview_digest)
             self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile
@@ -1867,7 +1869,7 @@ class Controller:
             from .residency import ResidencyUnknown
 
             try:
-                residency = self._admitting.residency()
+                residency = self.backend.residency()
                 self._residency_error = None
             except ResidencyUnknown as ex:
                 residency = None

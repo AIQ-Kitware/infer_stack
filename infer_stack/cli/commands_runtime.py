@@ -172,13 +172,16 @@ def _served_models(deployments, backend=None, *,
     for d in live:
         if residency is None:
             health = 'unverified'
-        elif residency.resident(d.id) is not None:
-            # Warm; a health check that has not passed yet means still loading.
-            health = ('starting' if residency.resident(d.id).health == 'starting'
-                      else 'up')
-        elif residency.containers(d.id):
-            # There, but not warm: starting, crashed, or ambiguous.
-            health = residency.containers(d.id)[0].state
+        elif residency.is_resident(d.id):
+            # Warm; up once any unit (a replica) has passed its health check,
+            # still loading while none has.
+            warm = residency.warm_units(d.id)
+            health = 'starting' if all(c.health == 'starting' for c in warm) else 'up'
+        elif residency.is_conflicted(d.id):
+            health = 'conflicted'          # several containers claim it
+        elif residency.units(d.id):
+            # There, but not warm: starting or crashed (every replica's state).
+            health = '/'.join(sorted({c.state for c in residency.units(d.id)}))
         elif pending:
             # Recorded, not applied yet: an apply is running, or a failed one
             # left the change for `infer-stack apply`.

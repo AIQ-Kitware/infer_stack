@@ -1238,7 +1238,7 @@ class EvictCLI(_ApprovalMixin):
     overriding keep-warm. Target by served endpoint alias or deployment id, or
     ``--all`` for every idle deployment. (Live models — those with an active lease —
     are never evicted; release them first.) On a terminal the teardown is shown
-    and confirmed before docker is touched (``--yes`` skips).
+    and confirmed before anything is torn down (``--yes`` skips).
     """
 
     __command__ = 'evict'
@@ -1996,9 +1996,9 @@ def _placement_view(controller):
     try:
         residency = backend.residency()
         for g in deployments:
-            c = residency.resident(g.id)
-            if g.id not in assignments and c is not None:
-                assignments[g.id] = list(c.gpus)
+            gpus = residency.resident_gpus(g.id)
+            if g.id not in assignments and gpus is not None:
+                assignments[g.id] = gpus
     except Exception:  # noqa: BLE001
         pass
     return observed, assignments

@@ -31,6 +31,8 @@
 #                          on two nodes with fake GPU labels. Needs
 #                          dev/k3s_agent_container.sh up (E2E_SIZED_NODE names
 #                          the node; default k3s-agent-b).
+#   E2E_REPLICAS           1 (default): a keep-warm Model with two replicas
+#                          stays up after its last release and a gc.
 #   E2E_CLUSTER_GATEWAY    1 (default): finish with the gateway in the cluster
 #                          (kubeai_gateway cluster): a NodePort, doctor,
 #                          secrets rotate, stack down.
@@ -173,6 +175,46 @@ remaining=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
     -l infer-stack/managed=true -o name | wc -l)
 [ "$remaining" = 0 ] || { echo '!! a Model was applied for it' >&2; exit 1; }
 echo '   refused at admission: no lease, no Model'
+
+if [ "${E2E_REPLICAS:-1}" = 1 ]; then
+  # Two pods for one Model are its replicas, not two claimants: releasing the
+  # last lease of a keep-warm Model must leave it up (queue item 11).
+  echo '== a keep-warm Model with two replicas stays up after its release'
+  cat >> "$WORK/config/catalog.yaml" <<EOF
+  e2e-pair:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: keep-warm}
+    runtime: {resource_profile: $PROFILE, max_model_len: 2048,
+              min_replicas: 2, max_replicas: 2}
+EOF
+  run_is acquire e2e-pair --yes --timeout "$TIMEOUT" --env-file "$WORK/pair.env"
+  pods=0
+  for _ in $(seq 300); do
+    pods=$(kubectl -n "$NAMESPACE" get pods -l infer-stack/managed=true \
+        --field-selector=status.phase=Running -o name | wc -l)
+    [ "$pods" -ge 2 ] && break
+    sleep 2
+  done
+  [ "$pods" -ge 2 ] || { echo "!! $pods replica(s) running, expected 2" >&2; exit 1; }
+  run_is release --env-file "$WORK/pair.env" --yes
+  run_is gc
+  models=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
+      -l infer-stack/managed=true -o name | wc -l)
+  [ "$models" = 1 ] || { echo '!! the idle replicated Model was pruned' >&2; exit 1; }
+  run_is leases > "$WORK/pair.log" 2>&1
+  if grep -q 'AMBIGUOUS\|NOT-RUNNING' "$WORK/pair.log"; then
+    cat "$WORK/pair.log" >&2; echo '!! replicas reported as a problem' >&2; exit 1
+  fi
+  grep -q 'state=idle  running=running' "$WORK/pair.log" \
+    || { cat "$WORK/pair.log" >&2; echo '!! the idle Model is not shown running' >&2; exit 1; }
+  echo '   released and gc-ed: still desired, both replicas up, shown running'
+  run_is evict --all --yes
+  for _ in $(seq 60); do
+    [ -z "$(kubectl -n "$NAMESPACE" get models.kubeai.org -l infer-stack/managed=true -o name)" ] && break
+    sleep 2
+  done
+fi
 
 if [ "${E2E_MAKE_ROOM:-0}" = 1 ]; then
   # Needs a profile only one Model fits at a time (`cpu-half` in

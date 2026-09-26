@@ -113,13 +113,19 @@ def _compose(tmp_path, **gateway_kw) -> Stack:
 
 
 class _Kubectl:
-    """kubectl over applied Model CRs; each Model runs one pod."""
+    """kubectl over applied Model CRs; each Model runs ``minReplicas`` pods.
+
+    ``extra_pods`` adds pods a test injects, such as the old pod of a
+    rollout still terminating beside its replacement.
+    """
 
     def __init__(self):
         from test_leasing_kubeai import FakeKubectl
 
         self.inner = FakeKubectl()
         self.crash: dict[str, str] = {}
+        self.crash_one: set[str] = set()
+        self.extra_pods: list[dict] = []
 
     @property
     def applied(self):
@@ -132,13 +138,17 @@ class _Kubectl:
             pods = []
             for name, doc in self.inner.applied.items():
                 gid = doc['metadata']['labels']['infer-stack/deployment']
-                if gid in self.crash:
-                    pods.append(_pod(f'model-{name}-0', gid, restarts=3,
-                                     state={'waiting': {'reason': 'CrashLoopBackOff'}},
-                                     last={'exitCode': 1, 'reason': 'Error'}))
-                else:
-                    pods.append(_pod(f'model-{name}-0', gid, ready=True))
-            return json.dumps({'items': pods})
+                replicas = int((doc.get('spec') or {}).get('minReplicas') or 1)
+                # `crash` marks every replica crash-looping; `crash_one`, one.
+                bad = replicas if gid in self.crash else int(gid in self.crash_one)
+                for i in range(replicas):
+                    if i < bad:
+                        pods.append(_pod(f'model-{name}-{i}', gid, restarts=3,
+                                         state={'waiting': {'reason': 'CrashLoopBackOff'}},
+                                         last={'exitCode': 1, 'reason': 'Error'}))
+                    else:
+                        pods.append(_pod(f'model-{name}-{i}', gid, ready=True))
+            return json.dumps({'items': [*pods, *self.extra_pods]})
         return self.inner(args)
 
 
@@ -447,3 +457,93 @@ def test_the_tui_reads_either_backend(make_stack):
             assert target == [engine['name']]
 
     asyncio.run(scenario())
+
+
+# -- cross-feature invariants -----------------------------------------------------
+#
+# Rows of the matrix are not independent: a backend-specific feature must
+# leave the common lifecycle around it unchanged. Each case below combines
+# one such feature with acquire / release / gc / status / pinning. A few
+# poison cases, not a matrix (roadmap, "Testing").
+
+REPLICATED = Catalog.from_dict({**CATALOG, 'endpoints': {
+    **CATALOG['endpoints'],
+    'pair': {'engine': 'vllm', 'model': 'tiny', 'reclaim': {'policy': 'keep-warm'},
+             'runtime': {'max_model_len': 1024, 'min_replicas': 2, 'max_replicas': 2}},
+}})
+
+
+def _replicated(tmp_path):
+    """A KubeAI stack serving `pair`, a keep-warm Model with two replicas."""
+    stack = _kubeai(tmp_path)
+    stack.backend.catalog = REPLICATED
+    out = stack.ctl.acquire('alice', REPLICATED.resolve_names(['pair']), wait=False)
+    gid = out.deployments[0].id
+    assert len(stack.backend.residency().warm_units(gid)) == 2
+    return stack, out, gid
+
+
+def _condition(stack, gid):
+    rows = stack.ctl.observe_state()['deployments']
+    return next(r['condition'] for r in rows if r['id'] == gid)
+
+
+def _desired(stack, gid):
+    return any(doc['metadata']['labels']['infer-stack/deployment'] == gid
+               for doc in stack.runtime.applied.values())
+
+
+def test_replicas_leave_the_keep_warm_lifecycle_unchanged(tmp_path):
+    from infer_stack.cli.commands_runtime import _served_models
+
+    stack, out, gid = _replicated(tmp_path)
+    assert _condition(stack, gid) == 'running'          # replicas, not a conflict
+    _, deployments = stack.ctl.ledger.status()
+    assert [row[3] for row in _served_models(deployments, stack.backend)] == ['up']
+    stack.ctl.release(out.lease.id)
+    assert _desired(stack, gid) and gid in stack.running()   # keep-warm stays
+    assert _condition(stack, gid) == 'running'
+    # The idle Model still pins the definition it is running.
+    assert 'pair' in stack.ctl._pinned_endpoints(stack.backend.residency())
+    stack.ctl.gc()
+    assert _desired(stack, gid) and gid in stack.running()   # plain gc leaves it
+    stack.ctl.evict(None)
+    assert not _desired(stack, gid)
+
+
+def test_a_rollout_snapshot_prunes_nothing(tmp_path):
+    from test_leasing_kubeai import _pod
+
+    stack, out, gid = _replicated(tmp_path)
+    # The old pod of a rollout, terminating beside the new ones.
+    old = _pod('model-pair-old', gid, ready=True)
+    old['metadata']['deletionTimestamp'] = '2026-09-27T00:00:00Z'
+    stack.runtime.extra_pods.append(old)
+    stack.ctl.release(out.lease.id)            # re-renders from this snapshot
+    assert _desired(stack, gid) and _condition(stack, gid) == 'running'
+    stack.ctl.gc()
+    assert _desired(stack, gid)
+
+
+def test_two_compose_containers_for_one_deployment_still_fail_closed(tmp_path):
+    stack = _compose(tmp_path)
+    gid = stack.acquire('warm').deployments[0].id
+    first = next(c for c in stack.runtime.containers.values()
+                 if c['labels'].get(DEPLOYMENT_LABEL) == gid)
+    stack.runtime.add_container(first['service'], labels=first['labels'],
+                                device_ids=first['device_ids'])
+    residency = stack.backend.residency()
+    assert residency.is_conflicted(gid) and not residency.is_resident(gid)
+    assert residency.unique_unit(gid) is None and residency.resident_gpus(gid) is None
+    assert _condition(stack, gid) == 'ambiguous'
+
+
+def test_every_replica_crash_looping_fails_fast_and_one_healthy_does_not(tmp_path):
+    stack, out, gid = _replicated(tmp_path)
+    deployment = stack.ctl.ledger.get_deployment(gid)
+    stack.backend.deployment_logs = lambda deployment, tail=400: CRASH_LOG
+    stack.runtime.crash_one.add(gid)                   # one replica still serves
+    assert stack.backend.startup_failure(deployment) is None
+    stack.runtime.crash[gid] = CRASH_LOG               # now every replica loops
+    why = stack.backend.startup_failure(deployment)
+    assert why and 'all 2 replicas' in why and 'trust_remote_code' in why

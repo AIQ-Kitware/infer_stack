@@ -951,7 +951,7 @@ class KubeaiBackend(ConvergeScaffold):
         from ..leasing.residency import ResidencyUnknown
 
         try:
-            pods = self.residency().containers(deployment.id)
+            pods = self.residency().units(deployment.id)
         except ResidencyUnknown:
             return ''
         parts: list[str] = []
@@ -971,17 +971,19 @@ class KubeaiBackend(ConvergeScaffold):
         from ..leasing.residency import ResidencyUnknown
 
         try:
-            pods = self.residency().containers(deployment.id)
+            residency = self.residency()
         except ResidencyUnknown:
             return None                      # cannot read the cluster: say nothing
-        return diagnose_startup(pods, lambda: self.deployment_logs(deployment, tail=200))
+        return diagnose_startup(residency.units(deployment.id),
+                                lambda: self.deployment_logs(deployment, tail=200),
+                                replicated=residency.replicated)
 
     def _waiting_reason(self, deployment: Deployment) -> str:
         """The pod's own reason for not running yet (``ImagePullBackOff``...)."""
         from ..leasing.residency import ResidencyUnknown
 
         try:
-            pods = self.residency().containers(deployment.id)
+            pods = self.residency().units(deployment.id)
         except ResidencyUnknown:
             return ''
         reasons = sorted({p.reason for p in pods if p.reason and p.state != 'running'})
@@ -1056,20 +1058,8 @@ class KubeaiBackend(ConvergeScaffold):
             },
         }
 
-    # -- realize/teardown (Protocol completeness; converge path supersedes) ---
-
-    def realize(self, deployment: Deployment) -> None:  # pragma: no cover
-        # The controller always drives converge-style backends through
-        # converge()/apply(); realize exists only so the Backend Protocol is
-        # satisfied. Deliberately NOT converge([deployment]) — a one-element
-        # desired set would prune every other managed Model.
-        pass
-
-    def teardown(self, deployment: Deployment) -> None:
-        name = model_name(deployment, unique=self.dynamic_routing)
-        self._kubectl(
-            ['delete', 'models.kubeai.org', name, '--ignore-not-found']
-        )
+    #: No containers of this host to manage: the cluster owns network and pods.
+    host_runtime = None
 
     def down(self) -> None:
         """Delete every infer-stack-managed Model (explicit stop), and the gateway."""

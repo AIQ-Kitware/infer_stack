@@ -16,9 +16,12 @@ Failure modes are explicit:
 
 * Docker cannot be read, or returns something unparseable → :class:`ResidencyUnknown`
   is raised. A snapshot is never silently empty.
-* One deployment has more than one container → the deployment is *ambiguous*.
-  All containers are kept (never collapsed to one), :meth:`Residency.resident`
-  returns ``None`` for it, and callers must fail closed.
+* One deployment has more than one container on Docker → the deployment is
+  *conflicted*: two authorities claim it. All containers are kept (never
+  collapsed to one), it is not resident, and callers must fail closed. On
+  Kubernetes several pods for one deployment are its replicas (or a rollout
+  in progress), so the same shape is ordinary residency there: the snapshot
+  says which rule applies (:attr:`Residency.replicated`).
 * A container's GPUs cannot be mapped to physical indices (a count-based
   reservation, or device UUIDs rather than indices) → it is treated as occupying
   *every* GPU, so no GPU is ever handed over on a guess.
@@ -32,12 +35,12 @@ Example:
     ...      'HostConfig': {'DeviceRequests': [{'Count': 0, 'DeviceIDs': ['1', '2']}]}},
     ... ])
     >>> res = residency_from_inspect(raw, project='infer-stack')
-    >>> res.resident('grp-a').gpus
-    (1, 2)
+    >>> res.is_resident('grp-a'), res.unique_unit('grp-a').gpus
+    (True, (1, 2))
     >>> [c.container_id for c in res.occupants(2)]
     ['c1']
-    >>> res.resident('grp-missing') is None
-    True
+    >>> res.is_resident('grp-missing'), res.unique_unit('grp-missing')
+    (False, None)
 """
 
 from __future__ import annotations
@@ -158,35 +161,80 @@ class Container:
 
 @dataclass(frozen=True)
 class Residency:
-    """A strict snapshot of deployment containers, keyed by deployment id.
+    """A strict snapshot of deployment units, keyed by deployment id.
 
-    Every container matching a deployment is kept. Nothing is collapsed, so a
-    duplicate is visible rather than silently lost.
+    A unit is a Docker container or a Kubernetes pod. Every unit matching a
+    deployment is kept; nothing is collapsed, so a duplicate is visible
+    rather than silently lost.
+
+    The questions are asked of a deployment, not of a unit. Whether several
+    units for one deployment are normal depends on the runtime, and the
+    snapshot carries that rule (:attr:`replicated`), so no caller branches on
+    the backend:
+
+    >>> pod = lambda name, state='running': Container(name, 'grp-a', state)
+    >>> pods = Residency({'grp-a': (pod('p1'), pod('p2'))}, replicated=True)
+    >>> pods.is_resident('grp-a'), pods.is_conflicted('grp-a'), pods.unique_unit('grp-a')
+    (True, False, None)
+    >>> docker = Residency({'grp-a': (pod('c1'), pod('c2'))})
+    >>> docker.is_resident('grp-a'), docker.is_conflicted('grp-a')
+    (False, True)
+    >>> rollout = Residency({'grp-a': (pod('old', 'removing'), pod('new'))}, replicated=True)
+    >>> rollout.is_resident('grp-a'), [c.container_id for c in rollout.warm_units('grp-a')]
+    (True, ['new'])
     """
 
     by_deployment: dict[str, tuple[Container, ...]] = field(default_factory=dict)
-    #: Project containers that belong to no deployment (infrastructure, or
+    #: Project units that belong to no deployment (infrastructure, or
     #: containers without infer-stack labels at all).
     others: tuple[Container, ...] = ()
+    #: Whether one deployment may run as several units. True on Kubernetes
+    #: (replicas; old and new pods during a rollout); False on Docker, where a
+    #: second container for one deployment is a conflicting authority.
+    replicated: bool = False
 
-    def containers(self, deployment_id: str) -> tuple[Container, ...]:
-        """Every container carrying this deployment's label, in any state."""
+    def units(self, deployment_id: str) -> tuple[Container, ...]:
+        """Every unit carrying this deployment's label, in any state."""
         return self.by_deployment.get(deployment_id, ())
 
-    def ambiguous(self, deployment_id: str) -> bool:
-        """More than one container claims this deployment; fail closed."""
-        return len(self.containers(deployment_id)) > 1
+    def warm_units(self, deployment_id: str) -> tuple[Container, ...]:
+        """The units that hold, or will reclaim on their own, a warm model."""
+        return tuple(c for c in self.units(deployment_id) if c.warm)
 
-    def resident(self, deployment_id: str) -> Container | None:
-        """The deployment's single warm container, or ``None``.
+    def is_conflicted(self, deployment_id: str) -> bool:
+        """Several units claim a deployment that may have only one; fail closed."""
+        return not self.replicated and len(self.units(deployment_id)) > 1
 
-        ``None`` covers "no container", "one container that is not warm", and
-        "ambiguous". Use :meth:`ambiguous` to tell the last apart.
+    def is_resident(self, deployment_id: str) -> bool:
+        """The deployment is running: at least one warm unit, and no conflict."""
+        return not self.is_conflicted(deployment_id) and bool(self.warm_units(deployment_id))
+
+    def unique_unit(self, deployment_id: str) -> Container | None:
+        """The deployment's one warm unit, or ``None``.
+
+        For decisions that recover one physical fact from one unit: which
+        GPUs a deployment's reservation holds. ``None`` for no unit, a unit
+        that is not warm, a conflict, and several replicas alike: none of
+        those names one reservation, so GPU adoption fails closed.
         """
-        found = self.containers(deployment_id)
+        found = self.units(deployment_id)
         if len(found) != 1 or not found[0].warm:
             return None
         return found[0]
+
+    def resident_gpus(self, deployment_id: str) -> list[int] | None:
+        """The physical GPUs a resident deployment holds, or ``None`` if unknown.
+
+        ``[]`` for a resident deployment holding none (a CPU engine, or a pod:
+        the cluster owns placement). ``None`` when it is not resident, or a
+        unit's reservation could not be mapped to indices.
+        """
+        if not self.is_resident(deployment_id):
+            return None
+        warm = self.warm_units(deployment_id)
+        if any(c.all_gpus for c in warm):
+            return None
+        return sorted({g for c in warm for g in c.gpus})
 
     def occupants(self, gpu: int) -> tuple[Container, ...]:
         """Every container, in any state, whose reservation includes ``gpu``."""
@@ -331,7 +379,7 @@ def residency_from_pods(raw: str) -> Residency:
         ...         'state': {'waiting': {'reason': 'CrashLoopBackOff'}},
         ...         'lastState': {'terminated': {'exitCode': 1, 'reason': 'Error'}},
         ...         'restartCount': 3}]}}]})
-        >>> c = residency_from_pods(raw).containers('grp-a')[0]
+        >>> c = residency_from_pods(raw).units('grp-a')[0]
         >>> (c.state, c.reason, c.restart_count, c.exit_code, c.warm)
         ('restarting', 'CrashLoopBackOff', 3, 1, True)
     """
@@ -393,4 +441,5 @@ def residency_from_pods(raw: str) -> Residency:
     return Residency(
         by_deployment={gid: tuple(found) for gid, found in grouped.items()},
         others=tuple(others),
+        replicated=True,
     )

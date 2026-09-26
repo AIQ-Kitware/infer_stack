@@ -1688,8 +1688,9 @@ class ComposeBackend(ConvergeScaffold):
         except ResidencyUnknown:
             return None                      # cannot read Docker: say nothing
         return diagnose_startup(
-            residency.containers(deployment.id),
+            residency.units(deployment.id),
             lambda: self.deployment_logs(deployment, tail=200),
+            replicated=residency.replicated,
         )
 
     def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
@@ -1910,6 +1911,40 @@ class ComposeBackend(ConvergeScaffold):
     #: Service-level ownership adopted at migration: container id ->
     #: {service, fingerprint}. Set by the controller from the ledger.
     adopted: dict[str, dict[str, str]] = {}
+
+    # -- HostRuntime: what only containers on this host have -----------------
+
+    @property
+    def host_runtime(self) -> ComposeBackend:
+        """This backend is its own :class:`~infer_stack.leasing.backend.HostRuntime`."""
+        return self
+
+    def network_table(self) -> dict[str, Any] | None:
+        return self.network
+
+    def configure_network(self, table, *, on_addresses=None) -> None:
+        self.network = table
+        if on_addresses is not None:
+            self.on_addresses = on_addresses
+
+    def subnet_clashes(self, subnet: str) -> list[str]:
+        from .network import overlapping_subnets
+
+        return overlapping_subnets(subnet, self.run)
+
+    def rendered_services(self) -> dict[str, tuple[str, str]]:
+        sidecar = self._load_sidecar()
+        fingerprints = sidecar.get('fingerprints') or {}
+        services = sidecar.get('services') or {}
+        return {name: (fp, str(services.get(name) or ''))
+                for name, fp in fingerprints.items()}
+
+    def set_adopted(self, table) -> None:
+        self.adopted = dict(table)
+
+    def remove_containers(self, container_ids: list[str]) -> None:
+        if container_ids:
+            self.run(['docker', 'rm', '-f', *container_ids])
 
     def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
         """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""

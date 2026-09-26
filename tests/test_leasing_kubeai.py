@@ -733,7 +733,7 @@ def test_residency_reads_pods_and_never_guesses(tmp_path):
 
     be, kubectl = make_pod_backend(tmp_path)
     kubectl.pods = [_pod('model-qwen-1', 'grp-a', ready=True)]
-    pod = be.residency().resident('grp-a')
+    pod = be.residency().unique_unit('grp-a')
     assert (pod.state, pod.health, pod.labelled) == ('running', 'healthy', True)
     kubectl.fail_pods = True
     with pytest.raises(ResidencyUnknown):
@@ -744,7 +744,7 @@ def test_an_unschedulable_pod_says_why(tmp_path):
     be, kubectl = make_pod_backend(tmp_path)
     kubectl.pods = [_pod('model-big-1', 'grp-b', statuses=False, conditions=[
         {'type': 'PodScheduled', 'status': 'False', 'reason': 'Unschedulable'}])]
-    (pod,) = be.residency().containers('grp-b')
+    (pod,) = be.residency().units('grp-b')
     assert (pod.state, pod.reason, pod.warm) == ('created', 'Unschedulable', False)
 
 

@@ -626,7 +626,7 @@ def test_rollback_keeps_a_deployment_that_has_a_container(tmp_path):
 
     def any_id(backend):
         class Everything(Residency):
-            def containers(self, deployment_id):
+            def units(self, deployment_id):
                 return (Container('c1', deployment_id, 'exited'),)
         return Everything({})
 
