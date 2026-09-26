@@ -232,6 +232,11 @@ dry-run root.
       retries (hundreds of characters). Now kubectl's own last sentence
       ("The connection to the server … was refused"), in the refusal too,
       with `infer-stack doctor` as the next step.
+- [x] TUI at 80x24: opening the runtime pane took every row (the lease and
+      deployment tables vanished), and each log line spent ~20 of its ~33
+      columns on the instance-name prefix. The pane is now capped near half
+      the screen (three log lines at 24 rows), pane descriptions hide below
+      32 rows, and one followed instance gets no prefix.
 
 ### 10. [ ] Handover
 

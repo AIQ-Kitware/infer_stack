@@ -213,3 +213,42 @@ def test_no_color_turns_color_off():
 
     assert LogsCLI.cli(argv=[]).color is True
     assert LogsCLI.cli(argv=['--no-color']).color is False
+
+
+def test_one_followed_instance_needs_no_name_prefix(monkeypatch):
+    """The TUI's follower leaves the name off while it follows one instance:
+    on a narrow pane the prefix took most of every line."""
+    import os
+    import subprocess
+    import time
+
+    from infer_stack.leasing.instances import LogFollower
+
+    class _Done:
+        stdout = b'first\nsecond\n'
+
+    class _Proc:
+        def __init__(self, *a, **kw):
+            r, w = os.pipe()
+            os.close(w)
+            self.stdout = os.fdopen(r, 'rb')
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: _Done())
+    monkeypatch.setattr(subprocess, 'Popen', _Proc)
+    follower = LogFollower(lambda: [GATEWAY], prefix='auto')
+    lines, deadline = [], time.monotonic() + 5
+    for line in follower.stdout:
+        lines.append(line)
+        if len(lines) == 2 or time.monotonic() > deadline:
+            break
+    follower.terminate()
+    assert lines == ['first\n', 'second\n']

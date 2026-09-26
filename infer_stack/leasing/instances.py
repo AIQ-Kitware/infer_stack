@@ -163,20 +163,25 @@ class LogFollower:
     ``list_instances`` is called every ``poll`` seconds, so an instance that
     appears later (a model starting, a recreate) is followed from its first
     line, and one that restarted is followed again. ``stdout`` yields
-    ``name  | line``. Output written between the history read and the live
-    stream (a few milliseconds) can be missed.
+    ``name  | line``; with ``prefix='auto'`` the name is left off while only
+    one instance has been followed (it says nothing then, and costs a narrow
+    pane most of its width). Output written between the history read and the
+    live stream (a few milliseconds) can be missed.
     """
 
     poll = 3.0
 
     def __init__(self, list_instances: Callable[[], list[Instance]], *,
-                 history: str | int = 200, timestamps: bool = False):
+                 history: str | int = 200, timestamps: bool = False,
+                 prefix: str = 'always'):
         import queue
         import threading
 
         self._list = list_instances
         self._history = history
         self._timestamps = timestamps
+        self._prefix = prefix
+        self._names: set[str] = set()
         self._lines: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._seen: set[str] = set()
@@ -204,6 +209,7 @@ class LogFollower:
                 else:
                     continue
                 self._seen.add(inst.id)
+                self._names.add(inst.name)
                 threading.Thread(target=self._follow, args=(inst, history, running),
                                  daemon=True).start()
             first = False
@@ -212,7 +218,7 @@ class LogFollower:
     def _follow(self, inst: Instance, history, running: bool) -> None:
         from ..log_filter import LogLineSplitter
 
-        prefix = f'{inst.name}  | '
+        prefix = inst.name
         env = runtime_env(inst)
         if history is not None:
             argv = history_argv(inst, tail=history, timestamps=self._timestamps)
@@ -227,7 +233,7 @@ class LogFollower:
                     old = ''
             split = LogLineSplitter(every=0.0)
             for line in split.feed(old) + split.flush():
-                self._lines.put(prefix + line)
+                self._lines.put((prefix, line))
         argv = follow_argv(inst, timestamps=self._timestamps)
         if not running or argv is None or self._stop.is_set():
             return
@@ -253,11 +259,11 @@ class LogFollower:
                 if not chunk:
                     break
                 for line in split.feed(decode(chunk)):
-                    self._lines.put(prefix + line)
+                    self._lines.put((prefix, line))
         finally:
             proc.stdout.close()
         for line in split.flush():
-            self._lines.put(prefix + line)
+            self._lines.put((prefix, line))
 
     @property
     def stdout(self) -> Iterator[str]:
@@ -265,9 +271,13 @@ class LogFollower:
 
         while not self._stop.is_set():
             try:
-                yield self._lines.get(timeout=0.5) + '\n'
+                name, line = self._lines.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if self._prefix == 'auto' and len(self._names) <= 1:
+                yield line + '\n'
+            else:
+                yield f'{name}  | {line}\n'
 
     def terminate(self) -> None:
         self._stop.set()

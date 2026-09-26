@@ -2197,3 +2197,27 @@ def test_an_edit_made_outside_the_tui_appears_on_the_next_refresh(tmp_path):
             assert 'qwen-extra' in app._endpoint_names       # the last good one stays
 
     _run(scenario)
+
+
+def test_an_80x24_terminal_shows_logs_and_the_tables_when_the_runtime_opens():
+    """At 80x24 the runtime pane used to take every row (the tables vanished),
+    and then, capped naively, left none for the log itself."""
+    from textual.widgets import Collapsible
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            assert app.has_class('compact')           # descriptions give way
+            app.query_one('#docker', Collapsible).collapsed = False
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one('#logs').region.height >= 3
+            assert app.query_one('#tables').region.height >= 1
+
+    _run(scenario)

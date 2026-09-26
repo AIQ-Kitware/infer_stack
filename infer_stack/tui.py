@@ -731,6 +731,9 @@ class InferStackTUI(App):
 
     /* one-line, per-pane descriptions (replaces the old global intro) */
     .desc { height: auto; color: $text-muted; padding: 0 1; }
+    /* A short terminal (see on_resize): rows go to tables and logs. */
+    .compact .desc { display: none; }
+    .compact #logsvc { margin: 0; }
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
 
     #endpoint-actions, #lease-actions, #deployment-actions, #model-actions,
@@ -787,7 +790,7 @@ class InferStackTUI(App):
     .pair, .pair ContentSwitcher, .pair TabPane { height: 1fr; }
     .pair TabPane { padding: 0; }
     .pair #models, .pair #leases-pane { height: 1fr; }
-    #docker-tabs { height: 16; min-height: 8; }
+    #docker-tabs { height: 16; min-height: 8; }   /* capped by _log_height */
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
     #gpus, #api-out { height: 8; background: $surface; }
@@ -1424,9 +1427,28 @@ class InferStackTUI(App):
 
     # -- resizable panes ---------------------------------------------------
 
+    def _log_height(self) -> int:
+        """The runtime pane's log height: the chosen one, capped near half the
+        screen, so on a small terminal the lease and deployment tables keep
+        rows when the pane opens (its tabs and picker take ~9 rows already)."""
+        # The tabbed area holds the tab strip (2) and the source picker (3)
+        # before any log line: 8 is those and three lines.
+        rows = self.size.height or 50
+        return max(8, min(self._log_h, rows // 2 - 4))
+
+    #: Below this many rows the pane descriptions give way to tables and logs.
+    COMPACT_ROWS = 32
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.set_class(event.size.height < self.COMPACT_ROWS, 'compact')
+        try:
+            self._apply_sizes()
+        except Exception:  # noqa: BLE001 - not mounted yet
+            pass
+
     def _apply_sizes(self) -> None:
         self.query_one('#sidebar').styles.width = self._sidebar_w
-        self.query_one('#docker-tabs').styles.height = self._log_h
+        self.query_one('#docker-tabs').styles.height = self._log_height()
         # Fixed heights only matter beside a divider; a tab fills its pane.
         if not self.TABBED_CATALOG:
             self.query_one('#models').styles.height = self._models_h
@@ -2081,7 +2103,7 @@ class InferStackTUI(App):
                 found = backend.instances()
                 return [i for i in found if wanted is None or i.name in wanted]
 
-            return LogFollower(listing)
+            return LogFollower(listing, prefix='auto')
 
         return factory
 
