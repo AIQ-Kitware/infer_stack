@@ -500,3 +500,27 @@ def test_a_partial_apply_keeps_the_approval_so_a_drifted_render_is_refused(tmp_p
     assert ledger.publication_pending()['approved_digest'] == approved
     ctl.apply_now()                                  # the explicit re-approval
     assert ledger.publication_pending() is None
+
+
+def test_a_refused_acquire_writes_no_secret(tmp_path):
+    """Queue item 20: admission previews the render, and the render names the
+    gateway's secrets; a preview must not create them. A refused acquire on a
+    fresh data root leaves no .env; the next admitted one writes the key its
+    preview staged, so the commit's render matches what was approved."""
+    from infer_stack.leasing.backend import PlacementError
+    from infer_stack.env_utils import parse_env_file
+
+    state = tmp_path / 'state'
+    backend = ComposeBackend(state_dir=state, inventory=simulate_inventory('1x80'),
+                             run=FakeDocker(), http=FakeHttp(state), images=IMAGES,
+                             ports=PORTS, state=STATE, catalog=CAT, litellm=True, ui=True)
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=Clock())
+    ctl = Controller(ledger, backend)
+    env = backend.gateway._env_path
+    with pytest.raises(PlacementError):
+        acquire(ctl, 'big')                          # two GPUs on a one-GPU host
+    assert not env.exists() or 'LITELLM_MASTER_KEY' not in parse_env_file(env)
+
+    acquire(ctl, 'one')
+    assert parse_env_file(env)['LITELLM_MASTER_KEY'] == backend.master_key()
+    assert ledger.publication_pending() is None      # no second approval needed

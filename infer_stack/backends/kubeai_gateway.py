@@ -183,7 +183,8 @@ class ClusterGateway(ConvergeScaffold):
 
     def preview(self, desired=(), placement=None, *, approve: bool = False):
         """Render without writing; with ``approve``, show the diff now."""
-        planned, _ = self._render_documents()
+        with self.gateway.staging_secrets():
+            planned, _ = self._render_documents()
         self._preview_approval(planned, approve=approve)
         return None, None
 

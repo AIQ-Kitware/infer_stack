@@ -252,6 +252,7 @@ class RenderedCompose:
 
 def stamp_fingerprints(
     compose: dict[str, Any], *, files: dict[Path, str], env_file: Path | None = None,
+    env_values: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Label every service with a behavioural fingerprint; return service -> fingerprint.
 
@@ -263,7 +264,9 @@ def stamp_fingerprints(
     recreate everything on every apply.)
 
     ``files`` holds content about to be written (path -> text); a mounted file
-    that is not in it is read from disk if it exists.
+    that is not in it is read from disk if it exists. ``env_values``, when
+    given, are the managed ``.env``'s effective values (a preview's staged
+    secrets included) and stand in for reading ``env_file``.
 
     Example:
         >>> doc = {'services': {'a': {'image': 'x', 'labels': {}}}}
@@ -277,11 +280,12 @@ def stamp_fingerprints(
     import re
 
     by_path = {str(Path(p)): text for p, text in files.items()}
-    env_values: dict[str, str] = {}
-    if env_file is not None and Path(env_file).exists():
-        from ..env_utils import parse_env_file
+    if env_values is None:
+        env_values = {}
+        if env_file is not None and Path(env_file).exists():
+            from ..env_utils import parse_env_file
 
-        env_values = parse_env_file(Path(env_file))
+            env_values = parse_env_file(Path(env_file))
     out: dict[str, str] = {}
     for name, svc in (compose.get('services') or {}).items():
         labels = dict(svc.get('labels') or {})
@@ -1487,7 +1491,8 @@ class ComposeBackend(ConvergeScaffold):
         :class:`ConvergeAborted` on decline); the render that follows the commit
         then does not ask again as long as it produces the same files.
         """
-        docs = self._render_documents(list(desired), placement)
+        with self.gateway.staging_secrets():       # a preview writes nothing
+            docs = self._render_documents(list(desired), placement)
         self._preview_approval(docs['planned'], approve=approve)
         return docs['plan'], docs['rendered']
 
@@ -1549,7 +1554,7 @@ class ComposeBackend(ConvergeScaffold):
         if rendered.litellm_routes is not None:
             planned[self.gateway._routes_file] = json.dumps(rendered.litellm_routes, indent=2)
         fingerprints = stamp_fingerprints(
-            rendered.compose, files=planned, env_file=self.gateway._env_path,
+            rendered.compose, files=planned, env_values=self.gateway.managed_env(),
         )
         planned[self.compose_file] = yaml.safe_dump(rendered.compose, sort_keys=False)
         return {'plan': plan, 'rendered': rendered, 'planned': planned,

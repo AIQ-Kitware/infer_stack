@@ -1052,6 +1052,51 @@ class Gateway(ConvergeScaffold):
     def _registry_file(self) -> Path:
         return self.state_dir / LITELLM_REGISTRY_FILENAME
 
+    #: Secrets a preview generated and has not written (see staging_secrets).
+    _staged: dict[str, str] | None = None
+    _staging_depth: int = 0
+
+    def staging_secrets(self):
+        """While active, a missing managed secret is generated in memory, not
+        written: a preview (admission, the idle-host feasibility check) leaves
+        the ``.env`` as it was, even when the admission is then refused. The
+        next writing call persists the same value, so the commit's render
+        matches what the preview approved."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def staging():
+            self._staging_depth += 1
+            try:
+                yield
+            finally:
+                self._staging_depth -= 1
+
+        return staging()
+
+    def managed_env(self) -> dict[str, str]:
+        """The managed ``.env`` as a render sees it: the file, plus secrets a
+        preview has staged and not yet written (so a preview's fingerprints
+        match the commit's render)."""
+        values = parse_env_file(self._env_path) if self._env_path.exists() else {}
+        return {**(self._staged or {}), **values}
+
+    def _managed_secret(self, name: str, *, prefix: str = '') -> str:
+        """A secret from the managed ``.env``, made on first use (see
+        :meth:`staging_secrets` for when "made" is not yet "written")."""
+        existing = parse_env_file(self._env_path)
+        if existing.get(name):
+            return existing[name]
+        if self._staged is None:
+            self._staged = {}
+        value = self._staged.get(name) or ensure_secret({}, name, prefix=prefix)
+        if self._staging_depth:
+            self._staged[name] = value
+        else:
+            write_env_file(self._env_path, {name: value})
+            self._staged.pop(name, None)
+        return value
+
     def master_key(self) -> str:
         """The managed LiteLLM master key.
 
@@ -1061,11 +1106,7 @@ class Gateway(ConvergeScaffold):
         — it is baked into the LiteLLM service, used by the readiness probe, and
         shipped in the env-file descriptor (``infer-stack env KEY`` prints it).
         """
-        existing = parse_env_file(self._env_path)
-        key = ensure_secret(existing, API_KEY_ENV, prefix='sk-')
-        if key != existing.get(API_KEY_ENV):
-            write_env_file(self._env_path, {API_KEY_ENV: key})
-        return key
+        return self._managed_secret(API_KEY_ENV, prefix='sk-')
 
     def rotate_master_key(self) -> dict[str, str | None]:
         """Write a fresh master key to the ``.env``; return the values it replaced.
@@ -1113,11 +1154,7 @@ class Gateway(ConvergeScaffold):
 
     def webui_secret(self) -> str:
         """Open WebUI's managed session key (the .env), made on first use."""
-        existing = parse_env_file(self._env_path)
-        key = ensure_secret(existing, WEBUI_SECRET_ENV)
-        if key != existing.get(WEBUI_SECRET_ENV):
-            write_env_file(self._env_path, {WEBUI_SECRET_ENV: key})
-        return key
+        return self._managed_secret(WEBUI_SECRET_ENV)
 
     def db_password(self) -> str:
         """The managed Postgres password for LiteLLM's model store.
@@ -1129,10 +1166,7 @@ class Gateway(ConvergeScaffold):
         Only used when ``dynamic_routing`` is on. ``token_urlsafe`` output is safe
         inside the ``postgresql://`` URL (no ``@ : /`` characters).
         """
-        existing = parse_env_file(self._env_path)
-        pw = ensure_secret(existing, DB_PASSWORD_ENV)
-        if pw != existing.get(DB_PASSWORD_ENV):
-            write_env_file(self._env_path, {DB_PASSWORD_ENV: pw})
+        pw = self._managed_secret(DB_PASSWORD_ENV)
         return pw
 
     def _load_route_registry(self) -> dict[str, Any]:

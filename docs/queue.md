@@ -693,7 +693,7 @@ docstring now says so. Also fixed: under `--json` the conflict list went to
 stdout and broke the JSON. Test: seed, identical seed, refused conflict,
 `--replace` (fails on the old code).
 
-### 20. [ ] Preview does not write secrets
+### 20. [x] Preview does not write secrets
 
 *Why added:* rendering calls `master_key()`, `db_password()`,
 `webui_secret()`, which generate and write missing secrets, so a preview
@@ -704,6 +704,15 @@ secrets with the publication. If kept, document the narrower guarantee.
 
 **Done when:** a refused acquire on a fresh data root leaves no `.env`, or
 the docs say exactly what a preview may write.
+
+*Done 2026-09-27:* the gateway's secrets go through one `_managed_secret`;
+inside `staging_secrets()` (Compose `preview`, the in-cluster gateway's
+`preview`) a missing secret is generated in memory and not written, and the
+next writing call persists that same value. Fingerprints read
+`managed_env()` (file plus staged), so the commit's render matches the
+preview's digest. Test: a refused acquire on a fresh root leaves no key in
+`.env` (fails on the old code: it wrote the master key and the Open WebUI
+secret), and the next admitted acquire needs no second approval.
 
 ### 21. [ ] Controller decomposition, where the authorities now show it
 
