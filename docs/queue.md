@@ -253,6 +253,11 @@ dry-run root.
       message when there is no GPU, and in the README), and `config init`
       points at `suggest`. Checked: init, suggest --simulator --apply,
       acquire, test, release, from nothing.
+- [x] Consistency: the TUI's "Clean up" (`x`) runs `gc --forget`, which
+      only forgets finished rows, while `infer-stack clean` releases and
+      tears everything down. It is "Clear finished" now. The KubeAI setup
+      example's resource profile had no GPU request or runtime class,
+      which the README warns makes a pod start without CUDA.
 
 ### 10. [ ] Handover
 

@@ -175,8 +175,9 @@ something is still warming up vs truly live.
 > Each pane carries its own description and buttons; expanding a pane (or its
 > tab) is what triggers its polling, so hidden data is never fetched.
 > New here? The catalog buttons (or `g`) **Suggest** a set sized to your GPUs,
-> and `m` / `n` open wizards to add a model / endpoint by hand. **Clean up**
-> (`x`) forgets released/stopped entries. **Ctrl+click** a served endpoint
+> and `m` / `n` open wizards to add a model / endpoint by hand. **Clear finished**
+> (`x`) forgets released/stopped entries (`gc --forget`; unlike `infer-stack
+> clean`, it stops nothing). **Ctrl+click** a served endpoint
 > (or `o`) opens it in Open WebUI. Resize panes by dragging the splitter bars
 > (or `[` `]` / `-` `+`). Opt-in extra: `pip install "infer-stack[tui]"`.
 

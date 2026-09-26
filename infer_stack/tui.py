@@ -841,7 +841,9 @@ class InferStackTUI(App):
         # Global on purpose: an error can happen while any tab is in front.
         ('l', 'show_app_log', 'TUI log'),
         # Forgets finished history in both tables, so it belongs to neither pane.
-        ('x', 'cleanup', 'Clean up'),
+        # Not "Clean up": `infer-stack clean` releases and tears everything
+        # down, and this only forgets finished rows (`gc --forget`).
+        ('x', 'cleanup', 'Clear finished'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
         # Pane-scoped actions: keys still work, but they live as buttons under
@@ -2747,7 +2749,7 @@ class InferStackTUI(App):
         self._do_evict_all()
 
     def action_cleanup(self) -> None:
-        self._status('cleaning up released/expired leases + stopped deployments…')
+        self._status('clearing finished rows: released/expired leases, stopped deployments…')
         self._cli(cli.command('gc', '--forget'))
         self._do_cleanup()
 
@@ -3460,10 +3462,10 @@ class InferStackTUI(App):
     def _do_cleanup(self) -> None:
         try:
             n_leases, n_deployments = self.controller.prune()
-            msg = (f'cleaned up {n_leases} released/expired lease(s) + '
+            msg = (f'cleared {n_leases} released/expired lease(s) + '
                    f'{n_deployments} stopped deployment(s)')
         except Exception as ex:  # noqa: BLE001
-            msg = f'cleanup failed: {_why(ex)}'
+            msg = f'clear finished failed: {_why(ex)}'
         self._after_mutation(msg)
 
     def _after_mutation(self, message: str) -> None:

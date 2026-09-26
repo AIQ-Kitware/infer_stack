@@ -1279,7 +1279,7 @@ def test_clean_up_is_one_footer_key_that_logs_its_cli_command():
 
     _run(scenario)
     assert seen['buttons'] == []
-    assert ('x', 'cleanup', 'Clean up') in seen['footer']    # tuples show in the footer
+    assert ('x', 'cleanup', 'Clear finished') in seen['footer']    # tuples show in the footer
     assert 'CLI: infer-stack gc --forget' in seen['applog']
     assert 'CLI: infer-stack status' in seen['applog']
 
