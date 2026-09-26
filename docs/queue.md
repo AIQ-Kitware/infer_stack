@@ -354,6 +354,20 @@ down, `gc --forget` as "Clear finished").
       abbreviates a flag today. Backwards compatibility wins; revisit with a
       deprecation warning if it bites.
 
+Audit pass 6 (2026-09-26): `dev/ux_audit.sh` on both backends. Compose 0
+flags; kubeai 2.
+
+- [x] `release --env-file lease.env` and `renew --env-file ...` on a file the
+      acquire never wrote (it failed and rolled back): a FileNotFoundError
+      traceback, which is what a cleanup trap hits. Now "no env-file at ...;
+      the acquire that writes it did not finish", and a file without a lease
+      id says so.
+- [x] The acquire failed because the dev cluster's node was under disk
+      pressure and evicted KubeAI: ten audit data roots (0.9 GB each, Open
+      WebUI's files and the weights) were still in /tmp. The audit now
+      removes its data root and keeps the report, whose long outputs keep
+      their tail (where a failure says why). `doctor` named the dead API.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

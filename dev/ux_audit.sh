@@ -27,7 +27,15 @@ flag() { echo "!! $*" | tee -a "$REPORT"; FLAGS=$((FLAGS + 1)); }
 run() {   # run a command, keep its output, and check it for known bad shapes
   local out rc
   out=$(timeout 300 infer-stack "$@" 2>&1); rc=$?
-  { echo "\$ infer-stack $*  (rc=$rc)"; echo "$out" | head -20; echo; } >> "$REPORT"
+  {   # the head, and the tail where a failure says why
+    echo "\$ infer-stack $*  (rc=$rc)"
+    if [ "$(echo "$out" | wc -l)" -gt 26 ]; then
+      echo "$out" | head -18; echo '  [...]'; echo "$out" | tail -6
+    else
+      echo "$out"
+    fi
+    echo
+  } >> "$REPORT"
   [ "$rc" -ge 124 ] && flag "rc=$rc (timeout or not run): infer-stack $*"
   echo "$out" | grep -q 'Traceback' && flag "traceback: infer-stack $*"
   echo "$out" | grep -q 'Write .env' && flag "stray 'Write .env': infer-stack $*"
@@ -46,6 +54,9 @@ run() {   # run a command, keep its output, and check it for known bad shapes
 cleanup() {
   infer-stack clean -f >/dev/null 2>&1
   infer-stack stack down >/dev/null 2>&1
+  # The data root holds Open WebUI's files and model weights, about 1 GB a
+  # run: kept, a day of passes put the dev cluster's node under disk pressure.
+  rm -rf "$WORK/data"
   echo "report: $REPORT"
   echo "flags: $FLAGS"
 }

@@ -1156,3 +1156,16 @@ def test_clean_json_dry_run_is_pure_json(env, capsys):
     assert data['dry_run'] is True
     assert [le['endpoints'] for le in data['leases']] == [['qwen-coder']]
     assert data['deployments'][0]['served'] == ['qwen-coder']
+
+
+def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
+    # UX audit pass 6: a cleanup trap after a failed acquire ran
+    # `release --env-file lease.env` on a file never written: a traceback.
+    missing = str(tmp_path / 'lease.env')
+    with pytest.raises(SystemExit, match='release: no env-file at .*did not finish'):
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+    with pytest.raises(SystemExit, match='renew: no env-file at'):
+        RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
+    (tmp_path / 'lease.env').write_text('export OPENAI_BASE_URL=x\n')
+    with pytest.raises(SystemExit, match='names no lease'):
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])

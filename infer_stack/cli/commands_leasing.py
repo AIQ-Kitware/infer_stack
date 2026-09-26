@@ -432,10 +432,27 @@ def _resolve(catalog, names, *, sharing=None):
         raise SystemExit(str(ex))
 
 
-def _resolve_lease(config) -> str | None:
+def _resolve_lease(config, verb: str) -> str | None:
+    """The lease id given directly, or the one an ``--env-file`` records.
+
+    A missing env-file is the usual cleanup-trap case: the acquire that would
+    have written it failed (and rolled back), so there is nothing of it to
+    release. Said so, not a traceback.
+    """
+    from ..leasing.envfile import LEASE_ENV
+
     sid = getattr(config, 'lease', None)
-    if not sid and getattr(config, 'env_file', None):
-        sid = read_lease_id(config.env_file)
+    env_file = getattr(config, 'env_file', None)
+    if not sid and env_file:
+        path = Path(env_file).expanduser()
+        if not path.is_file():
+            raise SystemExit(
+                f'{verb}: no env-file at {path}; the acquire that writes it did '
+                'not finish, so it holds no lease (`infer-stack leases` lists '
+                'what is held)')
+        sid = read_lease_id(path)
+        if not sid:
+            raise SystemExit(f'{verb}: {path} names no lease ({LEASE_ENV})')
     return sid
 
 
@@ -1147,7 +1164,7 @@ class ReleaseCLI(_ApprovalMixin):
                 raise SystemExit('release: --all takes no lease/--env-file')
             targets = None
         else:
-            sid = _resolve_lease(config)
+            sid = _resolve_lease(config, 'release')
             if not sid:
                 raise SystemExit(
                     'release: give a lease id, --env-file, or --all'
@@ -1819,7 +1836,7 @@ class RenewCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        sid = _resolve_lease(config)
+        sid = _resolve_lease(config, 'renew')
         if not sid:
             raise SystemExit('renew: give a lease id or --env-file')
         # Through the controller: a renew can revive an idle deployment, which
