@@ -1748,11 +1748,9 @@ class ComposeBackend(ConvergeScaffold):
             })
             services = rendered.compose.get('services')
             if not apply:
-                logger.info(
-                    'rendered {} service(s) to {} (not applied; '
-                    '`infer-stack apply` to bring it up)',
-                    len(services or {}), self.compose_file,
-                )
+                # The caller applies next, or (--no-apply, render) says how.
+                logger.info('rendered {} service(s) to {}',
+                            len(services or {}), self.compose_file)
                 return plan
         # Apply OUTSIDE the converge (render) lock: the controller coalesces and
         # serializes applies via its own apply-lock, so re-taking the render lock

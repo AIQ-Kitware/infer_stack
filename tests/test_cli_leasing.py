@@ -967,8 +967,7 @@ def test_routes_prune_drops_stale(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     rc = RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json'])
     assert rc == 0
-    raw = capsys.readouterr().out  # `Write .env to ...` may precede the JSON
-    out = json.loads(raw[raw.index('{'):])
+    out = json.loads(capsys.readouterr().out)   # --json output is only the JSON
     assert out['dropped'] == ['beta']
     assert out['kept'] == ['alpha']
 

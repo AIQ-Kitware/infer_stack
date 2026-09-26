@@ -8,7 +8,7 @@ the models it needs, block until ready, and release after:
     infer-stack run --endpoint qwen-coder -- python my_node.py
     infer-stack release --env-file is.env
     infer-stack acquire qwen-coder      # standing service (no --ttl)
-    infer-stack leases                  # status of leases + deployment deployments
+    infer-stack leases                  # status of leases + deployments
 
 Until the Compose/KubeAI backends land, the default ``--backend null`` is a
 dry-run: the ledger does all the real bookkeeping (coalescing, demand, TTL) but
@@ -498,7 +498,14 @@ def _public_descriptor(descriptor: dict) -> dict:
 
 
 def _compose_file_path(controller) -> str | None:
+    """The compose file, on the compose backend only (JSON's ``compose_file``)."""
     path = getattr(controller.backend, 'compose_file', None)
+    return str(path) if path else None
+
+
+def _rendered_path(controller) -> str | None:
+    """The file a render writes, on any backend: compose project or Models."""
+    path = getattr(controller.backend, 'rendered_file', None)
     return str(path) if path else None
 
 
@@ -527,6 +534,7 @@ def _emit_staged(config, controller, outcome) -> int:
             'applied': False,
             'descriptor': _public_descriptor(descriptor),
             'compose_file': _compose_file_path(controller),
+            'rendered_file': _rendered_path(controller),
             'placement': [
                 {'deployment': g.id, 'served': sorted(g.served),
                  'gpus': assignments.get(g.id)}
@@ -542,10 +550,11 @@ def _emit_staged(config, controller, outcome) -> int:
         eps = ', '.join(sorted(g.served)) or g.id
         where = _gpu_where(assignments.get(g.id)) if local else 'cluster-scheduled'
         print(f'  {eps}: {where}  ({g.id})')
-    path = _compose_file_path(controller)
-    if path:
-        print(f'  compose: {path}')
+    rendered = _rendered_path(controller)
+    if rendered:
+        print(f'  rendered: {rendered}')
     print('  apply:   infer-stack apply           # bring the staged set up')
+    path = _compose_file_path(controller)
     if path:
         # The file carries `name: infer-stack`, so plain docker works too.
         print(f'  ...or:   docker compose -f {path} up -d')
@@ -777,16 +786,16 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         None,
         isflag=True,
         help='Render the LiteLLM gateway — one OpenAI base_url fronting every '
-        'endpoint alias (compose backend). On by default; use --no-litellm for '
+        'endpoint alias. On by default; use --no-litellm for '
         'a lean stack where Open WebUI talks to the upstreams (e.g. an Ollama '
         'daemon) directly. Overrides `config set litellm …`.',
     )
     ui = kw.Value(
         None,
         isflag=True,
-        help='Render a managed Open WebUI in front of the gateway (compose '
-        'backend). On by default; use --no-ui to skip. Overrides '
-        '`config set ui …`.',
+        help='Render a managed Open WebUI in front of the gateway (on this host; '
+        'not with kubeai_gateway cluster). On by default; use --no-ui to skip. '
+        'Overrides `config set ui …`.',
     )
     reverse_proxy = kw.Value(
         None,
@@ -826,8 +835,9 @@ class _ApprovalMixin(_LeasingCommonMixin):
     )
     yes = kw.Value(
         False, isflag=True, alias=['y'],
-        help='Apply compose changes without showing the diff / prompting '
-        '(compose backend). Implied when stdout is not a terminal.',
+        help='Apply the rendered changes (the compose project, or the KubeAI '
+        'Models and gateway) without showing the diff / prompting. Implied when '
+        'stdout is not a terminal.',
     )
 
 
@@ -852,16 +862,17 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
         '(up to --timeout) instead of failing fast. Each retry sweeps the '
         'ledger, so a crashed job\'s TTL-expired lease is reclaimed while '
         'waiting. Intended for batch/pipeline fan-out; interactive use '
-        'defaults off (fail fast with a clear "no GPU" error).',
+        'defaults off (fail fast with a clear "no GPU" error). On kubeai the '
+        'cluster is the queue: admitted at once, and a Pending pod waits.',
     )
     apply = kw.Value(
         True,
         isflag=True,
-        help='Apply the render (docker compose up). Use --no-apply to *stage* '
-        'only: declare the lease and write the on-disk compose project + '
-        'placement WITHOUT starting it, then `infer-stack apply` to bring it up '
-        '(compose backend). --no-apply implies no readiness wait and no diff '
-        'prompt; `release` discards a staged lease.',
+        help='Apply the render (bring it up). Use --no-apply to *stage* only: '
+        'declare the lease and write the rendered state (the compose project, '
+        'or the KubeAI Models) WITHOUT starting it, then `infer-stack apply` to '
+        'bring it up. --no-apply implies no readiness wait and no diff prompt; '
+        '`release` discards a staged lease.',
     )
     timeout = kw.Value(600, type=float, help='Readiness wait timeout (s).')
     interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
@@ -870,8 +881,9 @@ class _AcquireFlagsMixin(_LeasingCommonMixin):
     )
     yes = kw.Value(
         False, isflag=True, alias=['y'],
-        help='Apply compose changes without showing the diff / prompting '
-        '(compose backend). Implied when stdout is not a terminal.',
+        help='Apply the rendered changes (the compose project, or the KubeAI '
+        'Models and gateway) without showing the diff / prompting. Implied when '
+        'stdout is not a terminal.',
     )
     json = kw.Value(False, isflag=True, help='Emit JSON instead of text.')
 
@@ -885,11 +897,11 @@ class AcquireCLI(_AcquireFlagsMixin):
     """Acquire a lease on one or more endpoints/bundles, bring them up, wait.
 
     ``acquire NAME…`` is the everyday verb. It takes a lease on each endpoint or
-    bundle, renders the compose project (the LiteLLM gateway + one container per
-    model + a managed Open WebUI), brings it up, and blocks until every endpoint
-    is ready. Run it again with more names to add models side by side — the
-    gateway and UI stay put. Placement, ``docker compose``, and readiness are
-    narrated on stderr.
+    bundle, renders what serves it (the LiteLLM gateway, one engine per model:
+    a container on compose, a Model on kubeai, and a managed Open WebUI),
+    brings it up, and blocks until every endpoint is ready. Run it again with
+    more names to add models side by side — the gateway and UI stay put.
+    Placement, the apply, and readiness are narrated on stderr.
 
     With no ``--ttl`` the lease is infinite — a standing service you tear down
     explicitly (``release`` / ``evict``). Pass ``--ttl`` (e.g. ``2h``, ``30m``)
@@ -900,13 +912,13 @@ class AcquireCLI(_AcquireFlagsMixin):
     when done. (For a one-shot "acquire, run a command, release", use
     ``infer-stack run`` instead.)
 
-    The work is render (write the on-disk compose project) then apply (``docker
-    compose up``). ``--no-apply`` does just the render so you can see what
-    would run before pulling the trigger (then ``infer-stack apply``).
-    ``--no-wait`` applies but returns immediately so several models load in
-    parallel (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a
-    terminal you are shown the compose diff and asked before applying; ``--yes``
-    skips that prompt (and it is skipped automatically off a TTY).
+    The work is render (write the rendered state to disk) then apply (bring
+    it up). ``--no-apply`` does just the render so you can see what would run
+    before pulling the trigger (then ``infer-stack apply``). ``--no-wait``
+    applies but returns immediately so several models load in parallel
+    (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a terminal you
+    are shown the diff and asked before anything is committed; ``--yes`` skips
+    that prompt (and it is skipped automatically off a TTY).
     """
 
     __command__ = 'acquire'
@@ -968,10 +980,11 @@ class AcquireCLI(_AcquireFlagsMixin):
 
 
 class RenderCLI(_LeasingCommonMixin):
-    """Write the on-disk compose project for the current desired set — no up.
+    """Write the rendered state for the current desired set, without bringing it up.
 
-    Lease-free and idempotent: ``render`` re-materializes the manifest (compose
-    file + gateway config + GPU placement) from whatever is *already* declared,
+    Lease-free and idempotent: ``render`` re-materializes what would run (the
+    compose project and gateway config with GPU placement, or the KubeAI Models
+    and gateway) from whatever is *already* declared,
     WITHOUT starting anything — to inspect what would run, or refresh a file you
     touched by hand. It creates no lease; to stage a *new* endpoint use ``acquire
     --no-apply`` (which declares it too). Apply with ``infer-stack apply``.
@@ -986,16 +999,17 @@ class RenderCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=False)
         rec = controller.reconcile(apply=False)
-        path = _compose_file_path(controller)
+        path = _rendered_path(controller)
         if config.json:
             print(json.dumps({
                 'applied': False,
-                'compose_file': path,
+                'compose_file': _compose_file_path(controller),
+                'rendered_file': path,
                 'placement': rec.assignments,
                 'unplaced': rec.unplaced,
             }, indent=2))
             return 0
-        print(f'rendered desired set -> {path or "(backend has no on-disk project)"}')
+        print(f'rendered desired set -> {path or "(this backend renders no file)"}')
         for gid, gpus in sorted(rec.assignments.items()):
             print(f'  {gid}: {_gpu_where(gpus)}')
         for err in rec.placement_errors:
@@ -1011,11 +1025,10 @@ class ApplyCLI(_ApprovalMixin):
     declared (by ``acquire``) onto the backend. It is the *trigger*
     for a staged ``acquire --no-apply`` and the re-sync button after a manual edit
     or a backend hiccup; idempotent (a second apply with nothing changed is a
-    no-op). On a terminal it shows the compose diff and asks (``--yes`` skips).
-    The rendered file carries ``name: infer-stack``, so ``docker compose -f
-    <file> up -d`` is an exact equivalent. (``infer-stack stack up`` is the
-    lower-level "run exactly what is on disk" hatch; ``apply`` re-renders from
-    intent first.)
+    no-op). On a terminal it shows the diff and asks (``--yes`` skips).
+    ``infer-stack stack up`` is the same command. On compose, ``infer-stack
+    stack compose -- up -d`` runs exactly what is on disk without re-rendering
+    from intent first.
     """
 
     __command__ = 'apply'
@@ -1478,8 +1491,7 @@ class CleanCLI(_LeasingCommonMixin):
 
 
 class WaitCLI(_LeasingCommonMixin):
-    """Block until served endpoints are ready — the companion to ``acquire
-    --no-wait``.
+    """Block until served endpoints are ready (the companion to ``acquire --no-wait``).
 
     Fan out, then wait: ``acquire --no-wait smol17b-1`` + ``acquire --no-wait
     smol135-1`` kick both deployments off in parallel (each converges and starts
@@ -1548,8 +1560,10 @@ class WaitCLI(_LeasingCommonMixin):
 
 
 class MeasureCLI(_LeasingCommonMixin):
-    """Measure an endpoint's real per-GPU VRAM requirement from the engine's
-    own memory-profiling log (docs/planning/vram-aware-placement.md §3).
+    """Measure an endpoint's real per-GPU VRAM requirement from its engine's log.
+
+    Reads the engine's own memory-profiling log
+    (docs/planning/vram-aware-placement.md §3).
 
     Parses vLLM's profiling breakdown (weights + non-torch + activation peak)
     — deliberately NOT ``nvidia-smi memory.used``, which only reflects the
@@ -1733,8 +1747,9 @@ class MeasureCLI(_LeasingCommonMixin):
 
 
 class TuiCLI(_LeasingCommonMixin):
-    """Launch the Textual TUI: a live monitor of the stack with controls to
-    serve / release / evict models.
+    """Launch the Textual TUI: a live monitor of the stack, with controls.
+
+    Serve, release and evict models, and follow their logs.
 
     Mostly a monitor — the lease + deployment tables (desired state vs running, GPUs)
     refresh live — with key-bound controls: ``s`` serve, ``d`` release, ``a``
@@ -2040,7 +2055,7 @@ def _print_leases_rich(leases, deployments, observed, assignments, console) -> N
 
 
 class LeasesCLI(_LeasingCommonMixin):
-    """Show current leases and deployment deployments (the leasing-model status).
+    """Show current leases and deployments (the leasing-model status).
 
     Two tables. **leases** are who asked for what (id, owner, state, ttl,
     endpoints). **deployments** are the actual deployments behind them — one deployment is
@@ -2570,8 +2585,10 @@ class RoutesListCLI(_LeasingCommonMixin):
 
 
 class RoutesPruneCLI(_ApprovalMixin):
-    """Forget stale routes: rewrite the registry to *invoking catalog ∪ live*,
-    then converge (one accepted gateway recreate).
+    """Forget stale routes: keep only the invoking catalog's and the live ones.
+
+    Rewrites the registry to *invoking catalog ∪ live*, then converges (one
+    accepted gateway recreate).
 
     The registry is append-only by design (that is what keeps the gateway config
     byte-stable), so pruning is the explicit, operator-driven "forget" verb —

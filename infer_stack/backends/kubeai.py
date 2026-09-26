@@ -778,12 +778,9 @@ class KubeaiBackend(ConvergeScaffold):
                 self.last_planned_digest = self._combined_digest(
                     models_digest, self.gateway.last_planned_digest)
             if not apply:
-                logger.info(
-                    'rendered {} Model(s) to {} (not applied; '
-                    '`infer-stack apply` to converge the cluster)',
-                    len(rendered.models),
-                    self.models_file,
-                )
+                # The caller applies next, or (--no-apply, render) says how.
+                logger.info('rendered {} Model(s) to {}',
+                            len(rendered.models), self.models_file)
                 return None
         self.apply()
         return None

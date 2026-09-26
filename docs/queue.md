@@ -204,6 +204,22 @@ Seed findings, already known:
       backend is kubeai, where no GPU is ours to free. Found 2026-09-26;
       fixed: `PlacementError.capacity` says whether room would have helped.
 
+Audit pass 1 (2026-09-26): every command's `--help` collected
+(`infer-stack help tree`, 65 leaves) and every example in them run on a
+dry-run root.
+
+- [x] Five one-line summaries ended mid-sentence in `help tree` (`measure`,
+      `routes prune`, `status`, `tui`, `wait`); `leases` said "deployment
+      deployments".
+- [x] `--litellm`, `--ui` and `--yes` said "(compose backend)", and
+      `acquire`, `apply`, `--apply` and `render` described only a compose
+      project; `render` on kubeai printed "(backend has no on-disk project)".
+      `apply`'s help still called `stack up` the raw hatch.
+- [x] Every `.env` write printed `Write .env to …` on stdout, into `--json`
+      output too.
+- [x] The render step logged "(not applied; `infer-stack apply` …)" in
+      every acquire, right before the apply it said had not happened.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

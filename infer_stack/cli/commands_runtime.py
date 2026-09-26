@@ -380,8 +380,10 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
 
 
 class StatusCLI(_PathOverridesMixin):
-    """Holistic overview: where things live, the backend, and a leasing summary
-    (active leases / live deployments), with pointers to dig deeper."""
+    """Holistic overview: where things live, the backend, and what is serving.
+
+    A leasing summary (active leases, live deployments) with each endpoint's
+    health, and pointers to dig deeper."""
 
     __command__ = 'status'
     catalog = kw.Value(
