@@ -1477,7 +1477,7 @@ class InferStackTUI(App):
         self._apply_sizes()
 
     def _drag_logs(self, delta: int) -> None:
-        # Dragging the divider down (delta > 0) makes the docker pane shorter.
+        # Dragging the divider down (delta > 0) makes the runtime pane shorter.
         self._log_h = max(6, min(60, self._log_h - delta))
         self._apply_sizes()
 
