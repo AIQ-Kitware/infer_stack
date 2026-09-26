@@ -2033,6 +2033,8 @@ class InferStackTUI(App):
 
     def _ps_rows(self, instances) -> list[dict[str, str]] | None:
         """Rows for the Instances table (same shape as ``infer-stack ps``)."""
+        from .leasing.instances import local_time
+
         if instances is None:
             return None
         served = {g.id: sorted(g.served) for g in (self._last_deployments or [])}
@@ -2041,7 +2043,7 @@ class InferStackTUI(App):
             'status': i.status,
             'serves': (', '.join(served.get(i.deployment_id, []))
                        if i.deployment_id else '(front door)'),
-            'started': (i.started or '')[:19].replace('T', ' '),
+            'started': local_time(i.started),
             'ports': i.ports,
         } for i in instances]
 

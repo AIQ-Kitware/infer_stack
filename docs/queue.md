@@ -293,6 +293,17 @@ the two reports differ only in backend facts), the reports read by eye.
       compose, its images; no engine image or GPU check) now follow
       KubeAI's.
 
+Audit pass 5 (2026-09-26): `dev/ux_audit.sh` on both backends.
+
+- [x] `ps` (and the TUI's Instances table) printed the runtime's UTC start
+      time with no zone, 4 hours off every other time on screen here. Now
+      local time; `ps --json` keeps the runtime's UTC stamp.
+- [x] The audit script itself: without `infer-stack` on PATH every command
+      returned 127 and the pass reported 0 flags. It now refuses to start,
+      and flags a timeout or a command that did not run. Doctor's `gateway:`
+      lines on kubeai no longer trip the Compose-wording check: that gateway
+      is a Compose project and needs it.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

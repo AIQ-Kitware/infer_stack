@@ -935,7 +935,9 @@ def test_tui_instance_rows_say_what_each_serves():
             engine, gateway = app._ps_rows(instances)
             assert engine['serves'] == 'qwen'
             assert engine['status'] == 'restarting (CrashLoopBackOff, 2 restarts)'
-            assert engine['started'] == '2026-06-19 00:00:00'
+            # Shown in local time, like every other time a person reads here.
+            from infer_stack.leasing.instances import local_time
+            assert engine['started'] == local_time('2026-06-19T00:00:00Z')
             assert gateway['serves'] == '(front door)'
             assert gateway['ports'] == '14042->4000/tcp'
             assert app._ps_rows(None) is None          # the runtime was unreadable

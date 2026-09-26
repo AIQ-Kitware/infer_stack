@@ -14,6 +14,8 @@
 set -uo pipefail
 
 BACKEND="${1:-compose}"
+# A missing command must not read as a clean pass.
+command -v infer-stack >/dev/null || { echo 'infer-stack is not on PATH' >&2; exit 2; }
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/infer-stack-ux.XXXXXX")"
 export INFER_STACK_CONFIG_DIR="$WORK/config" INFER_STACK_DATA_DIR="$WORK/data"
@@ -26,12 +28,15 @@ run() {   # run a command, keep its output, and check it for known bad shapes
   local out rc
   out=$(timeout 300 infer-stack "$@" 2>&1); rc=$?
   { echo "\$ infer-stack $*  (rc=$rc)"; echo "$out" | head -20; echo; } >> "$REPORT"
+  [ "$rc" -ge 124 ] && flag "rc=$rc (timeout or not run): infer-stack $*"
   echo "$out" | grep -q 'Traceback' && flag "traceback: infer-stack $*"
   echo "$out" | grep -q 'Write .env' && flag "stray 'Write .env': infer-stack $*"
   echo "$out" | grep -qE 'ttl=@[0-9]' && flag "raw timestamp: infer-stack $*"
   echo "$out" | grep -q $'\x1b\[' && flag "ANSI codes in piped output: infer-stack $*"
   if [ "$BACKEND" = kubeai ]; then
-    echo "$out" | grep -v '^\s*\(INFO\|[0-9:]* INFO\)' \
+    # The host-side gateway really is a compose project: doctor's "gateway:"
+    # checks name docker compose because that gateway needs it.
+    echo "$out" | grep -v '^\s*\(INFO\|[0-9:]* INFO\)' | grep -v '^\[[a-z ]*\] gateway: ' \
       | grep -iqE '\bcompose (project|backend)\b|docker compose' \
       && flag "compose wording on kubeai: infer-stack $*"
   fi

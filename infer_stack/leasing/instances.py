@@ -60,6 +60,35 @@ class Instance:
         return f'{self.state} ({", ".join(bits)})' if bits else self.state
 
 
+def local_time(started: str) -> str:
+    """A runtime's UTC start stamp as local ``YYYY-MM-DD HH:MM:SS``.
+
+    Docker and Kubernetes both report UTC; everything else a person reads
+    here (log lines, lease TTLs) is local, so a bare UTC time reads as hours
+    off. Anything unparsable is shown as given, trimmed to the second.
+
+    >>> import os, time
+    >>> os.environ['TZ'] = 'America/New_York'; time.tzset()
+    >>> local_time('2026-09-26T18:51:30Z')
+    '2026-09-26 14:51:30'
+    >>> local_time('2026-09-26T18:50:17.123456789Z')
+    '2026-09-26 14:50:17'
+    >>> local_time('')
+    ''
+    >>> local_time('soon')
+    'soon'
+    >>> del os.environ['TZ']; time.tzset()
+    """
+    import re
+    from datetime import datetime, timezone
+
+    m = re.match(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)', started or '')
+    if not m:
+        return (started or '')[:19]
+    stamp = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+    return stamp.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+
+
 def from_residency(residency, *, runtime: str = DOCKER, namespace: str = '',
                    container: str = '') -> list[Instance]:
     """Every instance in a :class:`~infer_stack.leasing.residency.Residency`."""

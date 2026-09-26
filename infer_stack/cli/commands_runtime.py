@@ -450,12 +450,14 @@ def _ps_rows(instances, served) -> list[dict[str, Any]]:
 
 
 def _print_ps(rows) -> None:
+    from ..leasing.instances import local_time
+
     def cell(row):
         serves = ', '.join(row['serves']) or ('-' if row['deployment'] else '(front door)')
         gpus = ','.join(map(str, row['gpus'])) or '-'
         ident = row['id'][:12] if row['runtime'] == 'docker' else '-'
         return (row['name'], row['status'], serves, gpus,
-                (row['started'] or '-')[:19], ident, row['ports'] or '-')
+                local_time(row['started'] or '') or '-', ident, row['ports'] or '-')
 
     head = ('NAME', 'STATUS', 'SERVES', 'GPUS', 'STARTED', 'ID', 'PORTS')
     table = [head, *(cell(r) for r in rows)]
