@@ -102,7 +102,7 @@ real GPU node, and runs `measure` there.
 
 ### 7. [x] P5: in-cluster gateway and a second node
 
-Done 2026-09-26; the two-machine run is `dev/handover/p5_two_hosts.sh`.
+Done 2026-09-26, `49e70dd`; the two-machine run is `dev/handover/p5_two_hosts.sh`.
 
 Render the gateway as a Deployment + Service behind an ingress; `secrets
 rotate` becomes a Secret update and a rollout; `doctor` checks the ingress.
