@@ -1,7 +1,7 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1 done** 2026-09-26 · P2–P5 not started ·
+`dev/backend-unification` · **P1, P2 done** 2026-09-26 · P3–P5 not started ·
 P6 is ongoing. Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
@@ -129,6 +129,16 @@ Up / Down, and `measure`.
 logs <alias>` and `ps` work on both backends with the same output shape.
 **Size:** medium, mostly plumbing; no controller change.
 
+**P2 done 2026-09-26.** `leasing/instances.py`: an `Instance` per container
+or pod, built from residency by each backend's `instances()`, and one
+`LogFollower` for the CLI and the TUI. `stack up` is `apply`, `stack down` is
+`backend.down()`, and the raw Compose verbs (`stack compose …`) act on
+whichever Compose project the backend has on this host, the gateway's on
+KubeAI. Verified on k3s and on compose (the simulator catalog), in a real
+terminal. `measure` was never refused on KubeAI (its guard was
+`deployment_logs`, which KubeAI has), but it reads GPU memory-profiling lines
+that CPU vLLM does not print: it moves to P4 with its GPU handover.
+
 ### P3. Gateway feature parity
 
 **Closes:** `routes` on KubeAI, `dynamic_routing`, Open WebUI and the reverse
@@ -204,6 +214,10 @@ worse. A blocker is fixed whatever its size.
 | "can anything be admitted while residency is unknown" | `_admit` admitted requests needing no new GPU; the render after the commit then failed without residency | **fixed** (P1b): nothing is admitted, and nothing is committed |
 | the desired set | `desired_deployments()` beside the admission view; `routes prune` used the former | **fixed** (P1b): one view, `_admission_view` |
 | a crashed acquire's placement scope | recorded in the marker and re-applied by a recovery render, although admission never records one | **fixed** (P1b): a stale scope is dropped |
+| "is it running" for `status` | `docker compose ps` service names beside residency (so KubeAI read `unverified`) | **fixed** (P2): residency |
+| engine vs gateway in the TUI | a `litellm` name hint (Open WebUI and Postgres counted as engines) | **fixed** (P2): an instance serves a deployment or it does not |
+| where the day-2 verbs find the Compose project | a hard-coded path and project name | **fixed** (P2): the backend's `compose_project()` and `compose_argv()` |
+| how the TUI runs a runtime command | it replaced the backend's runner with Docker's, whose allowlisted environment has no `KUBECONFIG`: every kubectl call from the TUI failed | **fixed** (P2): only `docker` commands are wrapped |
 | the KubeAI gateway's approval | the gateway project asks its own diff approval at render, after the lease commits, not in the admission preview | deferred to P3. Same result under `--yes`; interactively, a declined gateway change rolls the lease back after the commit |
 
 ## Not in scope

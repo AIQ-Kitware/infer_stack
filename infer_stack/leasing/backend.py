@@ -188,6 +188,13 @@ class AdmissionBackend(ConvergeBackend, Protocol):
         """A strict :class:`~infer_stack.leasing.residency.Residency`, or raise."""
         ...
 
+    def instances(self) -> list[Any]:
+        """Every running unit, as :class:`~infer_stack.leasing.instances.Instance`.
+
+        Built from :meth:`residency`, so it raises when that does.
+        """
+        ...
+
     def preview(self, desired: list[Deployment], placement: Any = None, *,
                 approve: bool = False) -> Any:
         """Place and render ``desired`` without writing; ``(plan, rendered)``."""
@@ -374,6 +381,12 @@ class SimpleAdmission:
                             state='running', labelled=True),)
             for gid in sorted(self.observe())
         })
+
+    def instances(self):
+        """One in-process instance per realized deployment; no log to read."""
+        from .instances import MEMORY, from_residency
+
+        return from_residency(self.residency(), runtime=MEMORY)
 
     def _preview(self, desired: list[Deployment], placement: Any = None):
         desired = list(desired)

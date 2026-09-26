@@ -308,6 +308,13 @@ class KubeaiBackend(ConvergeScaffold):
     def models_file(self) -> Path:
         return self.state_dir / MODELS_FILENAME
 
+    #: The file a render writes, whatever the backend (``status`` shows it).
+    rendered_file = models_file
+
+    def compose_project(self):
+        """The Compose project on this host: the gateway's, or ``None``."""
+        return self.gateway
+
     @property
     def _state_file(self) -> Path:
         return self.state_dir / STATE_FILENAME
@@ -587,6 +594,18 @@ class KubeaiBackend(ConvergeScaffold):
         except Exception as ex:  # noqa: BLE001 - any failure is "unknown"
             raise ResidencyUnknown(f'kubectl get pods failed: {ex}') from ex
         return residency_from_pods(raw)
+
+    def instances(self):
+        """The managed Models' pods, then the gateway's containers.
+
+        Raises :class:`~infer_stack.leasing.residency.ResidencyUnknown` when
+        the cluster cannot be read.
+        """
+        from ..leasing.instances import KUBERNETES, from_residency
+
+        pods = from_residency(self.residency(), runtime=KUBERNETES,
+                              namespace=self.namespace)
+        return pods + (self.gateway.instances() if self.gateway is not None else [])
 
     def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
         """Recent engine logs: each pod's current run, then its previous one.

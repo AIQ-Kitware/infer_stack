@@ -262,84 +262,51 @@ def test_eof_mid_traceback_fails_open():
     assert list(compact_litellm_tracebacks(original)) == original
 
 
-def test_cli_follow_compaction_helper_streams_known_trace(monkeypatch):
+def _follow_logs(monkeypatch, lines, *, no_color, tty=True):
+    """Run `infer-stack logs -f` over a fake instance whose log is ``lines``."""
     from infer_stack.cli import commands_runtime
+    from infer_stack.leasing import instances as instances_mod
+    from infer_stack.leasing.instances import Instance
 
-    source = _known_segments()[0]
+    config = SimpleNamespace(follow=True, raw=False, no_color=no_color, tail=None,
+                             timestamps=False, services=None)
 
-    class FakeProc:
-        def __init__(self):
-            self.stdout = iter(source)
+    class Backend:
+        def instances(self):
+            return [Instance('litellm', 'c1', '', 'running')]
 
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            return 0
+    class Follower:
+        def __init__(self, listing, **kw):
+            assert [i.name for i in listing()] == ['litellm']
+            self.stdout = iter(lines)
 
         def terminate(self):
-            raise AssertionError('completed process should not be terminated')
+            pass
 
-        def kill(self):
-            raise AssertionError('completed process should not be killed')
-
-    monkeypatch.setattr(commands_runtime.subprocess, 'Popen', lambda *a, **kw: FakeProc())
-    stream = io.StringIO()
-    monkeypatch.setattr(commands_runtime.sys, 'stdout', stream)
-
-    rc = commands_runtime._run_compacted_follow(['docker', 'compose', 'logs', '-f'])
-    assert rc == 0
-    assert 'Traceback (most recent call last):' not in stream.getvalue()
-    assert 'ConnectionRefusedError: [Errno 111]' in stream.getvalue()
-
-@pytest.mark.parametrize(('no_color', 'expected_ansi'), [
-    (False, True),
-    (True, False),
-])
-def test_cli_compacted_follow_preserves_compose_color_mode(
-    monkeypatch, no_color, expected_ansi
-):
-    from infer_stack.cli import commands_runtime
-
-    config = SimpleNamespace(
-        follow=True,
-        raw=False,
-        no_color=no_color,
-        tail=None,
-        timestamps=False,
-        services=None,
-    )
-
-    class TTY(io.StringIO):
+    class Out(io.StringIO):
         def isatty(self):
-            return True
+            return tty
 
-    captured = {}
-    monkeypatch.setattr(
-        commands_runtime.LogsCLI, 'cli', lambda *args, **kwargs: config
-    )
-    monkeypatch.setattr(
-        commands_runtime,
-        '_day2_compose_base',
-        lambda config, purpose: [
-            'docker', 'compose', '-p', 'infer-stack', '-f', 'compose.yml'
-        ],
-    )
-
-    def fake_follow(cmd):
-        captured['cmd'] = cmd
-        return 0
-
-    monkeypatch.setattr(commands_runtime, '_run_compacted_follow', fake_follow)
-    monkeypatch.setattr(commands_runtime.sys, 'stdout', TTY())
-
+    monkeypatch.setattr(commands_runtime.LogsCLI, 'cli', lambda *a, **kw: config)
+    monkeypatch.setattr(commands_runtime, '_day2_backend', lambda config: Backend())
+    monkeypatch.setattr(commands_runtime, '_served_by_deployment', lambda: {})
+    monkeypatch.setattr(instances_mod, 'LogFollower', Follower)
+    stream = Out()
+    monkeypatch.setattr(commands_runtime.sys, 'stdout', stream)
     assert commands_runtime.LogsCLI.main(argv=False) == 0
-    cmd = captured['cmd']
-    logs_index = cmd.index('logs')
-    assert ('--ansi' in cmd) is expected_ansi
-    if expected_ansi:
-        ansi_index = cmd.index('--ansi')
-        assert cmd[ansi_index + 1] == 'always'
-        assert ansi_index < logs_index
-    assert ('--no-color' in cmd) is no_color
+    return stream.getvalue()
+
+
+def test_cli_follow_compacts_a_known_trace(monkeypatch):
+    lines = [line.replace('litellm-1 | ', 'litellm  | ') for line in _known_segments()[0]]
+    out = _follow_logs(monkeypatch, lines, no_color=True)
+    assert 'Traceback (most recent call last):' not in out
+    assert 'ConnectionRefusedError: [Errno 111]' in out
+
+
+@pytest.mark.parametrize('no_color', [False, True])
+def test_cli_follow_colors_prefixes_unless_asked_not_to(monkeypatch, no_color):
+    out = _follow_logs(monkeypatch, ['litellm  | hello\n'], no_color=no_color)
+    assert ('\x1b[' in out) is (not no_color)
+    assert 'hello' in out
 

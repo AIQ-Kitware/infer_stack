@@ -2,6 +2,26 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `ps`, `logs`, `status` and the TUI read the backend, on either backend
+
+`infer-stack ps` lists what the backend runs, containers or pods and the
+gateway, in one table that says what each serves; `infer-stack logs` takes an
+endpoint alias, an instance name, a container id prefix or a deployment id,
+and `-f` keeps following instances that start or restart later. Both read the
+same strict residency the controller decides with, so they work on KubeAI;
+`status` does too, and says `starting` for an instance that is up but not yet
+ready. `stack up` is now `apply` and `stack down` stops everything on either
+backend; the raw Compose verbs (`stack compose -- …`, `restart`, `pull`,
+`start`, `stop`) act on the Compose project on this host, which is the
+gateway's on KubeAI. The TUI's runtime pane (formerly "docker") follows pod
+logs, lists pods, and its Apply / Down buttons work on KubeAI.
+
+Fixed on the way: every kubectl call from the TUI failed, because the TUI
+replaced the backend's command runner with Docker's, whose environment has no
+`KUBECONFIG`; the TUI's "engines" log view included Open WebUI and Postgres;
+and a flag before a positional ate it (`logs -f qwen` followed everything,
+`acquire --yes qwen` named no endpoint), on every command.
+
 ### One acquire path
 
 The controller's pre-admission branch is gone: every backend, including the

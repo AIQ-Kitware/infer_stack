@@ -58,6 +58,21 @@ FINGERPRINT_LABEL = 'infer-stack.fingerprint'
 COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
 COMPOSE_SERVICE_LABEL = 'com.docker.compose.service'
 
+def _published_ports(ports) -> str:
+    """``14042->4000/tcp`` for each published port of a ``docker inspect``.
+
+    >>> _published_ports({'4000/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '14042'},
+    ...                                {'HostIp': '::', 'HostPort': '14042'}],
+    ...                   '8000/tcp': None})
+    '14042->4000/tcp'
+    """
+    out = []
+    for inner, bindings in sorted((ports or {}).items()):
+        for host in sorted({b.get('HostPort') for b in bindings or [] if b.get('HostPort')}):
+            out.append(f'{host}->{inner}')
+    return ', '.join(out)
+
+
 #: Container states that hold, or will reclaim on their own, a warm model: the
 #: process is up, is being restarted by Docker's restart policy, or is paused
 #: (a paused process keeps its GPU memory). ``created``, ``exited``,
@@ -112,6 +127,10 @@ class Container:
     #: ``CrashLoopBackOff``, ``ImagePullBackOff``, ``OOMKilled`` (Kubernetes).
     #: Empty when there is nothing to say, or the runtime does not say.
     reason: str = ''
+    #: When the current run started (the runtime's timestamp), for display.
+    started: str = ''
+    #: Published ports, ``host->container/proto`` joined by ``, ``; display only.
+    ports: str = ''
 
     @property
     def warm(self) -> bool:
@@ -261,6 +280,8 @@ def residency_from_inspect(raw: str, *, project: str) -> Residency:
                               or {}).get('MaximumRetryCount')) or 0),
             exit_code=(None if (item.get('State') or {}).get('ExitCode') is None
                        else int((item.get('State') or {})['ExitCode'])),
+            started=str((item.get('State') or {}).get('StartedAt') or ''),
+            ports=_published_ports((item.get('NetworkSettings') or {}).get('Ports')),
             ips=tuple(sorted(
                 str(n.get('IPAddress')) for n in
                 (((item.get('NetworkSettings') or {}).get('Networks')) or {}).values()
@@ -362,6 +383,8 @@ def residency_from_pods(raw: str) -> Residency:
             # A Deployment's pods are always restarted by the kubelet.
             restart_policy='always',
             reason=waiting or str(ended.get('reason') or ''),
+            started=str((current.get('running') or {}).get('startedAt')
+                        or status.get('startTime') or ''),
         )
         if container.deployment_id:
             grouped.setdefault(container.deployment_id, []).append(container)

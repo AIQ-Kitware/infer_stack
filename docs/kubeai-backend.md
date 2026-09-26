@@ -143,6 +143,10 @@ infer-stack release --env-file lease.env
   on new setups. Without a GPU, install the chart with
   `dev/e2e_tests/kubeai-cpu-values.yaml` (real vLLM on CPU; needs AVX-512)
   and run it with `E2E_RESOURCE_PROFILE=cpu`. Verified on k3s 2026-09-24.
+- `infer-stack ps`, `infer-stack logs [-f] <endpoint>`, `status` and the TUI's
+  runtime pane read the pods (and the gateway's containers), in the same shape
+  as on compose. `stack compose …` and `stack restart` act on the gateway's
+  Compose project; the engines are pods, restarted by the kubelet.
 - The gateway runs on the host running infer-stack, so that host is in every
   request's path. Dynamic routing (`dynamic_routing`) is compose-only; the
   KubeAI gateway uses static routes.

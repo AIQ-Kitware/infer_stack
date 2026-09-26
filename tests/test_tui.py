@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
@@ -253,7 +252,7 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # docker is a collapsible pane with Logs/Containers/Control tabs;
+            # runtime is a collapsible pane with Logs/Instances/Control tabs;
             # system is its own collapsed pane; API is a top-level tab now.
             tabs = app.query_one('#docker-tabs', TabbedContent)
             assert {p.id for p in tabs.query('TabPane')} == {
@@ -263,12 +262,10 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
             assert app.query_one('#system', Collapsible).collapsed
             top = app.query_one('#top', TabbedContent)
             assert 'tab-api' in {p.id for p in top.query('TabPane')}
-            # the containers ps view carries the docker-ps columns
+            # the instances view carries what `infer-stack ps` shows
             ps = app.query_one('#ps', DataTable)
             labels = [str(c.label) for c in ps.columns.values()]
-            assert 'status (uptime)' in labels
-            assert 'created' in labels
-            assert 'container id' in labels
+            assert labels == ['name', 'status', 'serves', 'started', 'ports']
 
     _run(scenario)
 
@@ -915,35 +912,33 @@ def test_tui_empty_catalog_shows_suggest_hint():
     _run(scenario)
 
 
-def test_tui_ps_rows_parse_status_created_and_id():
+def test_tui_instance_rows_say_what_each_serves():
+    from types import SimpleNamespace
+
+    from infer_stack.leasing.instances import Instance
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
-    sample = json.dumps([
-        {'Service': 'litellm', 'Status': 'Up 3 minutes', 'State': 'running',
-         'CreatedAt': '2026-06-19 00:00:00 -0400', 'ID': 'abcdef1234567890',
-         'Publishers': [{'PublishedPort': 14042, 'TargetPort': 4000}]},
-    ])
+    instances = [
+        Instance('vllm-qwen', 'abcdef1234567890', 'grp-1', 'restarting',
+                 restarts=2, reason='CrashLoopBackOff',
+                 started='2026-06-19T00:00:00.123Z'),
+        Instance('litellm', 'fedcba', '', 'running', ports='14042->4000/tcp'),
+    ]
 
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # stub the backend's compose seam
-            backend = controller.backend
-            import tempfile
-            f = tempfile.NamedTemporaryFile('w', suffix='.yml', delete=False)
-            f.write('services: {}\n')
-            f.close()
-            backend.compose_file = f.name
-            backend.project = 'infer-stack'
-            backend.run = lambda args: sample
-            rows = app._compose_ps_rows()
-            assert rows[0]['status'] == 'Up 3 minutes'
-            assert rows[0]['created'].startswith('2026-06-19')
-            assert rows[0]['id'] == 'abcdef123456'        # truncated to 12
-            assert '14042->4000' in rows[0]['ports']
+            app._last_deployments = [SimpleNamespace(id='grp-1', served={'qwen': {}})]
+            engine, gateway = app._ps_rows(instances)
+            assert engine['serves'] == 'qwen'
+            assert engine['status'] == 'restarting (CrashLoopBackOff, 2 restarts)'
+            assert engine['started'] == '2026-06-19 00:00:00'
+            assert gateway['serves'] == '(front door)'
+            assert gateway['ports'] == '14042->4000/tcp'
+            assert app._ps_rows(None) is None          # the runtime was unreadable
 
     _run(scenario)
 
@@ -980,11 +975,11 @@ def test_tui_collapsed_console_skips_expensive_polling():
             await pilot.pause()
             app._active_tab = 'tab-containers'
             app._collapsed['docker'] = True
-            assert 'ps' not in app._collect()          # collapsed -> no ps poll
+            assert 'instances' not in app._collect()   # collapsed -> no poll
             app._collapsed['docker'] = False
-            assert 'ps' in app._collect()              # visible -> polled
+            assert 'instances' in app._collect()       # visible -> polled
             app._active_tab = 'tab-logs'
-            assert 'ps' not in app._collect()          # other tab -> no ps poll
+            assert 'instances' in app._collect()       # the log picker needs names
             app._collapsed['system'] = True
             assert 'gpus' not in app._collect()        # system collapsed
             app._collapsed['system'] = False
@@ -1441,8 +1436,7 @@ def test_tui_up_applies_through_the_controller(tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause()
             backend = controller.backend
-            backend.compose_file = compose_file
-            backend.project = 'infer-stack'
+            backend.rendered_file = compose_file
             backend.run = lambda args: calls.append(args) or ''
             app.action_compose_up()
             await app.workers.wait_for_complete()
@@ -1704,27 +1698,22 @@ def test_gateway_services_are_excluded_from_the_default_log_view():
     """The logs pane defaults to engines, not everything.
 
     LiteLLM logs a line per proxied request, so on a busy host it scrolls the
-    engine output -- where errors actually appear -- out of the pane.
+    engine output -- where errors actually appear -- out of the pane. An
+    engine is an instance that serves a deployment; the gateway, UI, database
+    and proxy serve none, whatever they are named (a name hint used to let
+    Open WebUI and Postgres into the engines view).
     """
-    from infer_stack.tui import (
-        ALL_SERVICES,
-        ENGINE_SERVICES,
-        engine_services,
-        is_gateway_service,
-    )
+    from infer_stack.leasing.instances import Instance
+    from infer_stack.tui import ALL_SERVICES, ENGINE_SERVICES
 
-    assert is_gateway_service('litellm')
-    # Substring, not equality: a suffixed gateway service must still match, or
-    # the noisy view comes back silently.
-    assert is_gateway_service('infer-stack-litellm-1')
-    assert not is_gateway_service('vllm-qwen-qwen3-8-27b')
-
-    names = ['litellm', 'vllm-a', 'vllm-b']
-    assert engine_services(names) == ['vllm-a', 'vllm-b']
+    engine = Instance('vllm-a', 'c1', 'grp-1', 'running')
+    assert engine.is_engine
+    for name in ('litellm', 'infer-stack-litellm-1', 'open-webui', 'postgres'):
+        assert not Instance(name, 'c2', '', 'running').is_engine
     # The two sentinels must stay distinguishable from each other and from any
-    # real service name.
+    # real instance name.
     assert ENGINE_SERVICES != ALL_SERVICES
-    assert ENGINE_SERVICES not in names
+    assert ENGINE_SERVICES not in ('litellm', 'vllm-a')
 
 
 def test_named_log_process_follows_only_that_service(monkeypatch):
@@ -1733,7 +1722,8 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
     import subprocess
     import time
 
-    from infer_stack.tui import _DockerLogProc
+    from infer_stack.leasing.instances import Instance
+    from infer_stack.tui import InferStackTUI
 
     service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
     touched = []
@@ -1743,8 +1733,6 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
             self.stdout = stdout
 
     def fake_run(cmd, **kwargs):
-        if cmd[:2] == ['docker', 'ps']:
-            return _Done(f'c1 running {service}\nc2 running litellm\n')
         touched.append(cmd[-1])                   # docker logs --tail N <id>
         return _Done(b'')
 
@@ -1764,9 +1752,15 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
         def wait(self, timeout=None):
             return 0
 
+    controller, catalog = _ctx()
+    controller.backend.instances = lambda: [
+        Instance(service, 'c1', 'grp-1', 'running'),
+        Instance('litellm', 'c2', '', 'running'),
+    ]
     monkeypatch.setattr(subprocess, 'run', fake_run)
     monkeypatch.setattr(subprocess, 'Popen', lambda cmd, **kw: _Proc(cmd))
-    proc = _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
+    app = InferStackTUI(controller, catalog, interval=999)
+    proc = app._default_proc_factory()(service)
     deadline = time.monotonic() + 5
     while len(touched) < 2 and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -1811,7 +1805,10 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._service_names = lambda: ['litellm', 'vllm-a', 'vllm-b']
+            from infer_stack.leasing.instances import Instance
+            app._last_instances = [Instance('litellm', 'c0', '', 'running'),
+                                   Instance('vllm-a', 'c1', 'g1', 'running'),
+                                   Instance('vllm-b', 'c2', 'g2', 'running')]
 
             target, label = app._resolve_log_target(ENGINE_SERVICES)
             assert target == ['vllm-a', 'vllm-b']
@@ -1820,16 +1817,16 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             # A named service is passed straight through.
             assert app._resolve_log_target('litellm') == ('litellm', 'litellm')
 
-            # "all" stays None so docker compose logs gets no service argument.
+            # "everything" stays None: the follower takes every instance.
             target, label = app._resolve_log_target(ALL_SERVICES)
-            assert target is None and label == 'all services'
+            assert target is None and label == 'everything'
 
             # With no engines there is nothing to follow. Falling back to
-            # every service would show the gateway under the engines label.
+            # every instance would show the gateway under the engines label.
             from infer_stack.tui import NO_LOG_TARGET
-            app._service_names = lambda: ['litellm']
+            app._last_instances = [Instance('litellm', 'c0', '', 'running')]
             target, label = app._resolve_log_target(ENGINE_SERVICES)
-            assert target is NO_LOG_TARGET and 'no engine services' in label
+            assert target is NO_LOG_TARGET and 'no engines' in label
 
     _run(scenario)
 
@@ -1855,15 +1852,16 @@ def test_engines_view_follows_engines_that_appear_after_it_opened():
                             proc_factory=factory)
         async with app.run_test() as pilot:
             await pilot.pause()
-            services = ['litellm']
-            app._service_names = lambda: list(services)
+            from infer_stack.leasing.instances import Instance
+            app._last_instances = [Instance('litellm', 'c0', '', 'running')]
             app._collapsed['docker'] = False
             app._sync_log_services()
             app._restart_logs(app._log_service)       # the pane opens
             await pilot.pause(0.2)
             assert started == []                      # nothing to follow yet
 
-            services.append('vllm-a')                 # an engine is deployed
+            app._last_instances = [*app._last_instances,   # an engine is deployed
+                                   Instance('vllm-a', 'c1', 'g1', 'running')]
             app._sync_log_services()
             await pilot.pause(0.2)
             await pilot.pause()

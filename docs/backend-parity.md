@@ -87,7 +87,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | where a deployment lands | local planner over `nvidia-smi` | the cluster scheduler, via `resource_profile:<gpus>` |
 | GPU count from TP × PP × DP | same | same |
 | `placement.gpu_indices`, `allowed_gpus`, `skip_display_gpus` | yes | n/a: no host indices; node-scoped resource profiles are the equivalent |
-| `placement.min_vram_gib`, `infer-stack measure` | yes | warned and ignored; `measure` refused (**gap**, P4) |
+| `placement.min_vram_gib`, `infer-stack measure` | yes | **gap** (P4): `min_vram_gib` is warned and ignored; `measure` runs but is unverified on a GPU, and `--record` writes an overlay KubeAI does not read |
 | GPU allocations recorded in the ledger | yes | none: the cluster owns them |
 | more than one host | boundary | yes: the reason the backend exists |
 
@@ -118,9 +118,11 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | `doctor` | nothing to check | four checks |
-| `logs`, `ps`, `stack up` / `stack down` | docker compose wrappers | **gap** (P2): they say so and point at `kubectl` |
+| `ps`, `logs [-f] <alias \| name \| id>`, `status` health | containers | same shape; pods, and the gateway's containers |
+| `stack up` (= `apply`), `stack down` | same | same |
+| `stack compose …`, `restart` / `pull` / `start` / `stop` | the stack's Compose project | the gateway's Compose project (the engines are pods) |
 | TUI: leases, deployments, catalog editing, acquire / release / evict, API tab, settings | same | same |
-| TUI: engine log follow, the docker pane, the Up / Down buttons | `docker logs`, `docker compose ps` | **gap** (P2): empty, or "nothing rendered yet" |
+| TUI: log follow, the Instances tab, Apply / Down | containers | same, over pods |
 | TUI GPU pane | `nvidia-smi` on this host | this host, not the cluster |
 | `gc --orphans` (also inside `clean`) | yes | n/a: unlabeled Models are never touched |
 

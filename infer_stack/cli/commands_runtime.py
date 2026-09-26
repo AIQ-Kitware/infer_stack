@@ -18,11 +18,12 @@ import kwconf as kw
 
 from ..log_filter import compact_litellm_tracebacks
 from ..paths import config_root, data_root, get_setting, settings_path
+from .commands_leasing import ApplyCLI
 from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
 
 # ---------------------------------------------------------------------------
-# leasing compose project helpers (the target of the day-2 wrappers)
+# the backend behind the day-2 verbs
 # ---------------------------------------------------------------------------
 
 
@@ -32,43 +33,61 @@ def _docker_env() -> dict[str, str]:
     return docker_environment()
 
 
-def _leasing_compose_file() -> Path:
-    from ..leasing.compose import COMPOSE_FILENAME
-
-    return data_root() / 'leasing' / 'compose' / COMPOSE_FILENAME
-
-
-def _day2_compose_base(config, command: str) -> list[str]:
-    """``docker compose -p <proj> -f <leasing-file>`` base for the wrappers.
-
-    Targets the leasing Compose deployment (no ``config.yaml`` needed). Raises a
-    helpful error when nothing has been deployed yet — the file is written by
-    ``acquire`` / ``apply``.
-    """
-    from ..leasing.compose import LEASING_PROJECT
+def _day2_backend(config):
+    """The configured backend, built as the leasing verbs build it."""
+    from .commands_leasing import _make_backend
 
     _apply_path_overrides(config)
-    compose_file = _leasing_compose_file()
-    if not compose_file.exists():
-        hint = ''
-        if (get_setting('backend') or '') == 'kubeai':
-            hint = (
-                ' Note: the configured backend is kubeai — these verbs manage '
-                'the docker compose stack only; inspect the cluster with '
-                '`infer-stack doctor` / `kubectl -n <namespace> get models`.'
-            )
+    return _make_backend(config)
+
+
+def _served_by_deployment() -> dict[str, list[str]]:
+    """Deployment id -> the endpoint aliases it serves (read-only ledger)."""
+    from ..leasing import Ledger, SqliteStore, default_ledger_path
+
+    path = default_ledger_path()
+    if not path.exists():
+        return {}
+    try:
+        _, deployments = Ledger(SqliteStore(str(path))).status(virtual_expiry=True)
+    except Exception:  # noqa: BLE001 - a view never fails on the ledger
+        return {}
+    return {d.id: sorted(d.served) for d in deployments}
+
+
+def _instances(backend) -> list:
+    """What the backend runs, or a clean exit when it cannot be read."""
+    from ..leasing.residency import ResidencyUnknown
+
+    try:
+        return list(backend.instances())
+    except ResidencyUnknown as ex:
+        raise SystemExit(f'cannot read what is running: {ex}')
+
+
+def _compose_argv(config) -> list[str]:
+    """``docker compose ...`` for the Compose project on this host.
+
+    That is the stack itself on the compose backend, and the gateway on the
+    kubeai backend. Exits when there is none, or nothing is rendered yet.
+    """
+    backend = _day2_backend(config)
+    project = getattr(backend, 'compose_project', lambda: None)()
+    if project is None:
         raise SystemExit(
-            f'nothing deployed yet (no {compose_file}). '
-            f'Bring a model up first, e.g. `infer-stack acquire <endpoint>`.'
-            f'{hint}'
-        )
-    base = ['docker', 'compose']
-    # The same managed .env the backend passes, so `stack up` interpolates the
-    # master key, DB password and HF_TOKEN from it (never the caller's shell).
-    env_file = compose_file.parent / '.env'
-    if env_file.exists():
-        base += ['--env-file', str(env_file)]
-    return [*base, '-p', LEASING_PROJECT, '-f', str(compose_file)]
+            f'the {_backend_name(backend)} backend has no Compose project on this '
+            'host; use `infer-stack ps` and `infer-stack logs`')
+    if not project.compose_file.exists():
+        raise SystemExit(
+            f'nothing rendered yet (no {project.compose_file}); bring a model up '
+            'first, e.g. `infer-stack acquire <endpoint>`')
+    return project.compose_argv()
+
+
+def _backend_name(backend) -> str:
+    name = type(backend).__name__
+    return {'ComposeBackend': 'compose', 'KubeaiBackend': 'kubeai',
+            'NullBackend': 'null (dry-run)'}.get(name, name)
 
 
 # ---------------------------------------------------------------------------
@@ -122,82 +141,65 @@ def _leasing_status() -> dict[str, Any]:
         for d in deployments
     ]
     out['summary'] = (active, len(leases), live, len(deployments))
-    out['served'] = _served_models(deployments)
+    out['live_deployments'] = [d for d in deployments if d.state == DeploymentState.LIVE]
     return out
 
 
-def _running_services() -> set[str] | None:
-    """Compose service names currently running, or None if docker can't say.
+def _served_models(deployments, backend=None) -> list[tuple[str, str, str, str]]:
+    """``(endpoint, model, engine, health)`` rows for what is serving.
 
-    A single cheap `docker compose ps`. It exists because the ledger's LIVE is
-    a *belief*: a converge that fails partway (an unpullable image, a daemon
-    hiccup) leaves deployments recorded LIVE with no container behind them, and
-    the only way to notice used to be an acquire that hung on readiness.
-    Distinguishing "recorded" from "running" is the whole point of showing this.
-
-    None (not an empty set) when docker is unreachable, so the caller can say
-    "unverified" instead of falsely reporting everything down.
-    """
-    from ..leasing.compose import LEASING_PROJECT
-
-    compose_file = _leasing_compose_file()
-    if not compose_file.exists():
-        return None
-    try:
-        proc = subprocess.run(
-            ['docker', 'compose', '-p', LEASING_PROJECT, '-f', str(compose_file),
-             'ps', '--services', '--filter', 'status=running'],
-            capture_output=True, text=True, timeout=15, env=_docker_env(),
-        )
-    except Exception:  # noqa: BLE001 - status must never fail on this
-        return None
-    if proc.returncode != 0:
-        return None
-    return {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
-
-
-def _served_models(deployments) -> list[tuple[str, str, str, str]]:
-    """``(endpoint, model, gpus_or_engine, health)`` rows for what is serving.
-
-    Reads the ledger for what *should* be up and reconciles against the
-    containers that actually are, so `status` answers "what can I send a
-    request to right now" without the user having to cross-read `leases`
-    against `stack ps`.
+    Reads the ledger for what *should* be up and the backend's strict
+    residency for what is, so `status` answers "what can I send a request to
+    right now" without cross-reading `leases` against `ps`.
     """
     from ..leasing import DeploymentState
-    from ..leasing.compose import ollama_service_name_for, vllm_service_name_for
+    from ..leasing.residency import ResidencyUnknown
 
     live = [d for d in deployments if d.state == DeploymentState.LIVE]
     if not live:
         return []
-    running = _running_services()
+    residency = None
+    if backend is not None:
+        try:
+            residency = backend.residency()
+        except (ResidencyUnknown, Exception):  # noqa: BLE001 - status never fails here
+            residency = None
 
     rows: list[tuple[str, str, str, str]] = []
     for d in live:
+        if residency is None:
+            health = 'unverified'
+        elif residency.resident(d.id) is not None:
+            # Warm; a health check that has not passed yet means still loading.
+            health = ('starting' if residency.resident(d.id).health == 'starting'
+                      else 'up')
+        elif residency.containers(d.id):
+            # There, but not warm: starting, crashed, or ambiguous.
+            health = residency.containers(d.id)[0].state
+        else:
+            # The ledger says live and nothing exists. Almost always an apply
+            # that failed after the record was written.
+            health = 'STALE'
         for endpoint in sorted(d.served):
             payload = d.served.get(endpoint) or {}
             model = (payload.get('hf_model_id')
                      or payload.get('model')
                      or d.spec.get('hf_model_id') or '-')
-            if d.engine == 'ollama':
-                service = ollama_service_name_for(d.spec.get('host') or endpoint)
-            else:
-                service = vllm_service_name_for(
-                    payload.get('served_model_name') or endpoint)
-            if running is None:
-                health = 'unverified'
-            elif service in running:
-                health = 'up'
-            else:
-                # The ledger says live and nothing is running. Almost always a
-                # converge that failed after the record was written.
-                health = 'STALE'
             rows.append((endpoint, model, d.engine, health))
     return rows
 
 
 def _gather_status(config) -> dict[str, Any]:
-    compose_file = _leasing_compose_file()
+    try:
+        backend = _day2_backend(config)
+    except (SystemExit, Exception):  # noqa: BLE001 - status never fails on this
+        backend = None
+    rendered = getattr(backend, 'rendered_file', None)
+    leasing = _leasing_status()
+    if leasing.get('live_deployments'):
+        leasing['served'] = _served_models(leasing.pop('live_deployments'), backend)
+    else:
+        leasing.pop('live_deployments', None)
     return {
         'backend': str(get_setting('backend') or 'null'),
         'data_dir': str(data_root()),
@@ -206,16 +208,17 @@ def _gather_status(config) -> dict[str, Any]:
         'settings': {'path': str(settings_path()),
                      'exists': settings_path().exists()},
         'catalog': _catalog_summary(config),
-        'compose': {'path': str(compose_file), 'exists': compose_file.exists()},
-        'leasing': _leasing_status(),
+        'rendered': {'path': str(rendered) if rendered else None,
+                     'exists': bool(rendered and rendered.exists())},
+        'leasing': leasing,
     }
 
 
 _DIG_DEEPER = (
     ('infer-stack leases', 'full lease + deployment tables'),
     ('infer-stack tui', 'live dashboard (opt-in: infer-stack[tui])'),
-    ('infer-stack stack ps', 'running containers'),
-    ('infer-stack logs -f', 'tail service logs'),
+    ('infer-stack ps', 'what is running (containers or pods)'),
+    ('infer-stack logs -f <endpoint>', 'follow an engine\'s log'),
     ('infer-stack catalog show', 'what you can serve'),
 )
 
@@ -237,11 +240,14 @@ def _served_lines(served: list[tuple[str, str, str, str]]) -> list[str]:
     for endpoint, model, _engine, health in served:
         out.append(f'  {endpoint.ljust(w_ep)}  {model.ljust(w_mo)}  {health}')
     if any(r[3] == 'STALE' for r in served):
-        out.append('  STALE = the ledger records this live but no container is '
-                   'running; `infer-stack apply` or `gc`')
+        out.append('  STALE = the ledger records this live but nothing is '
+                   'running for it; `infer-stack apply` or `gc`')
+    if any(r[3] == 'starting' for r in served):
+        out.append('  starting = up, but not ready yet (loading the model); '
+                   '`infer-stack wait <endpoint>`')
     if any(r[3] == 'unverified' for r in served):
-        out.append('  unverified = could not reach docker to confirm; the '
-                   'ledger says live')
+        out.append('  unverified = the runtime could not be read to confirm; '
+                   'the ledger says live')
     return out
 
 
@@ -262,8 +268,9 @@ def _print_status_plain(d: dict[str, Any]) -> None:
           f'{"" if d["configured"] else "  (run infer-stack config init)"}')
     lz = d['leasing']
     print(f'  ledger:      {lz["path"]}{"" if lz["exists"] else "  (none yet)"}')
-    print(f'  compose:     {d["compose"]["path"]}'
-          f'{"" if d["compose"]["exists"] else "  (not rendered yet)"}')
+    if d['rendered']['path']:
+        print(f'  rendered:    {d["rendered"]["path"]}'
+              f'{"" if d["rendered"]["exists"] else "  (not rendered yet)"}')
     if lz['summary']:
         active, total_l, live, total_d = lz['summary']
         print()
@@ -309,10 +316,11 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
     if not lz['exists']:
         ledger.append('  (none yet)', style='dim')
     table.add_row('ledger', ledger)
-    compose = Text(d['compose']['path'], style='cyan')
-    if not d['compose']['exists']:
-        compose.append('  (not rendered yet)', style='dim')
-    table.add_row('compose', compose)
+    if d['rendered']['path']:
+        rendered = Text(d['rendered']['path'], style='cyan')
+        if not d['rendered']['exists']:
+            rendered.append('  (not rendered yet)', style='dim')
+        table.add_row('rendered', rendered)
     console.print(table)
 
     if lz['summary']:
@@ -332,7 +340,8 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
         served_table.add_column('model', overflow='fold')
         served_table.add_column('engine', style='dim', no_wrap=True)
         served_table.add_column('health', no_wrap=True)
-        styles = {'up': 'green', 'STALE': 'red', 'unverified': 'yellow'}
+        styles = {'up': 'green', 'starting': 'yellow', 'STALE': 'red',
+                  'unverified': 'yellow'}
         for endpoint, model, engine, health in served:
             served_table.add_row(
                 endpoint, model, engine,
@@ -343,7 +352,7 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
         console.print(served_table)
         if any(r[3] == 'STALE' for r in served):
             console.print(Text(
-                '  STALE = recorded live but no container is running; '
+                '  STALE = recorded live but nothing is running for it; '
                 '`infer-stack apply` or `gc`', style='dim'))
 
     console.print()
@@ -385,66 +394,161 @@ class StatusCLI(_PathOverridesMixin):
 
 
 # ---------------------------------------------------------------------------
-# stack — docker compose day-2-ops wrappers over the leasing project
+# ps / logs / stack: what the backend runs, on either backend
 # ---------------------------------------------------------------------------
 
 
-class _ComposeWrapperBase(_PathOverridesMixin):
-    """Common fields for ``docker compose <subcmd>`` wrappers over the leasing
-    Compose deployment."""
+class _InstancesBase(_PathOverridesMixin):
+    """Options shared by the verbs that read the backend's instances."""
 
     services = kw.Value(
         None,
         nargs='*',
         position=1,
-        help='Optional service names to filter (empty = all).',
+        help='Which instances: a service or pod name, a container id (prefix), '
+        'a deployment id, or an endpoint alias. Empty = all.',
+    )
+    backend = kw.Value(
+        None, type=str,
+        help='Backend to read (default: the configured `backend` setting).',
     )
 
 
-def _run_compacted_follow(cmd: list[str]) -> int:
-    """Stream Compose logs through the conservative LiteLLM compactor."""
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        text=True,
-        errors='replace',
-        bufsize=1,
-        env=_docker_env(),
+#: States `ps` hides unless --all: finished, or on the way out.
+_PS_HIDDEN = frozenset({'exited', 'dead', 'removing'})
+
+
+def _ps_rows(instances, served) -> list[dict[str, Any]]:
+    rows = []
+    for inst in instances:
+        rows.append({
+            'name': inst.name,
+            'id': inst.id,
+            'deployment': inst.deployment_id or None,
+            'serves': served.get(inst.deployment_id, []) if inst.deployment_id else [],
+            'state': inst.state,
+            'status': inst.status,
+            'restarts': inst.restarts,
+            'gpus': list(inst.gpus),
+            'started': inst.started or None,
+            'ports': inst.ports or None,
+            'runtime': inst.runtime,
+        })
+    return rows
+
+
+def _print_ps(rows) -> None:
+    def cell(row):
+        serves = ', '.join(row['serves']) or ('-' if row['deployment'] else '(front door)')
+        gpus = ','.join(map(str, row['gpus'])) or '-'
+        ident = row['id'][:12] if row['runtime'] == 'docker' else '-'
+        return (row['name'], row['status'], serves, gpus,
+                (row['started'] or '-')[:19], ident, row['ports'] or '-')
+
+    head = ('NAME', 'STATUS', 'SERVES', 'GPUS', 'STARTED', 'ID', 'PORTS')
+    table = [head, *(cell(r) for r in rows)]
+    widths = [max(len(str(r[i])) for r in table) for i in range(len(head))]
+    for r in table:
+        print('  '.join(str(v).ljust(w) for v, w in zip(r, widths)).rstrip())
+
+
+class PsCLI(_InstancesBase):
+    """What the backend is running: engine containers or pods, and the gateway.
+
+    One shape on every backend. An engine row names the endpoints it serves;
+    the gateway, UI and proxy show as the front door. Reads the same strict
+    residency the controller decides with, so a row here is what admission
+    sees.
+    """
+
+    __command__ = 'ps'
+
+    all = kw.Value(
+        False, isflag=True, short_alias=['a'],
+        help='Include exited and dying instances.',
     )
-    try:
-        if proc.stdout is None:  # pragma: no cover - PIPE guarantees stdout
-            return int(proc.wait())
-        for line in compact_litellm_tracebacks(proc.stdout):
-            sys.stdout.write(line)
-        return int(proc.wait())
-    except KeyboardInterrupt:
-        # The child normally receives the same SIGINT.  If it is still alive,
-        # make sure an interrupted follow does not leave Compose behind.
-        if proc.poll() is None:
-            proc.terminate()
+    services_only = kw.Value(
+        False, isflag=True, help='Print only instance names.',
+    )
+    quiet = kw.Value(
+        False, isflag=True, short_alias=['q'],
+        help='Print only ids (container ids, or pod names).',
+    )
+    json = kw.Value(False, isflag=True, help='Print the rows as JSON.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from ..leasing.instances import UnknownTarget, resolve
+
+        config = cls.cli(argv=argv, data=kwargs)
+        backend = _day2_backend(config)
+        instances = _instances(backend)
+        served = _served_by_deployment()
+        if config.services:
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        return 130
+                instances = resolve(instances, config.services, served)
+            except UnknownTarget as ex:
+                raise SystemExit(str(ex))
+        if not config.all:
+            instances = [i for i in instances if i.state not in _PS_HIDDEN]
+        rows = _ps_rows(instances, served)
+        if config.json:
+            print(json.dumps(rows, indent=2))
+        elif config.quiet:
+            for row in rows:
+                print(row['id'])
+        elif config.services_only:
+            for row in rows:
+                print(row['name'])
+        elif not rows:
+            print(f'nothing running ({_backend_name(backend)} backend); '
+                  'bring a model up with `infer-stack acquire <endpoint>`')
+        else:
+            _print_ps(rows)
+        return 0
 
 
-class LogsCLI(_ComposeWrapperBase):
-    """Tail leasing Compose service logs without typing the full docker path."""
+#: Prefix colors for `logs` on a terminal, cycled per instance name.
+_LOG_COLORS = ('36', '33', '32', '35', '34', '96', '93', '92', '95', '94')
+
+
+def _colorize(lines, *, enabled: bool):
+    """Color each ``name  | `` prefix, one color per name, like Compose did."""
+    if not enabled:
+        yield from lines
+        return
+    colors: dict[str, str] = {}
+    for line in lines:
+        name, sep, rest = line.partition('  | ')
+        if not sep:
+            yield line
+            continue
+        code = colors.setdefault(name, _LOG_COLORS[len(colors) % len(_LOG_COLORS)])
+        yield f'\x1b[{code}m{name}  |\x1b[0m {rest}'
+
+
+class LogsCLI(_InstancesBase):
+    """Engine and gateway logs, by instance, deployment or endpoint alias.
+
+    ``infer-stack logs qwen -f`` follows whatever serves the ``qwen``
+    endpoint, container or pod; with no names, every instance. Following
+    picks up instances that start later and follows a restarted one again.
+    """
 
     __command__ = 'logs'
 
     follow = kw.Value(
         False, isflag=True, short_alias=['f'],
-        help='Stream logs (docker compose logs -f).',
+        help='Keep streaming, including instances that start later.',
     )
     tail = kw.Value(
         None, type=str,
-        help="Tail the last N lines (default: all). Pass a number or 'all'.",
+        help="Only the last N lines of each (default: all). A number or 'all'.",
     )
     timestamps = kw.Value(False, isflag=True)
-    no_color = kw.Value(False, isflag=True)
+    no_color = kw.Value(False, isflag=True, help='Do not color the name prefixes.')
     raw = kw.Value(
         False,
         isflag=True,
@@ -453,74 +557,96 @@ class LogsCLI(_ComposeWrapperBase):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
+        from ..leasing.instances import (
+            LogFollower,
+            UnknownTarget,
+            history_argv,
+            resolve,
+            runtime_env,
+        )
 
-        # The compacted path pipes Compose stdout through Python. Without an
-        # explicit ANSI mode Compose sees a non-TTY pipe and drops the service
-        # colors before the compactor can preserve them. Force ANSI only for
-        # the human-facing compacted view; --no-color remains authoritative.
-        compact = config.follow and not config.raw and sys.stdout.isatty()
-        cmd = _day2_compose_base(config, 'logs')
-        if compact and not config.no_color:
-            cmd.extend(['--ansi', 'always'])
-        cmd.append('logs')
+        config = cls.cli(argv=argv, data=kwargs)
+        backend = _day2_backend(config)
+        served = _served_by_deployment()
+        names = list(config.services or [])
+
+        def pick(instances):
+            return resolve(instances, names, served) if names else instances
+
+        try:
+            chosen = pick(_instances(backend))
+        except UnknownTarget as ex:
+            raise SystemExit(str(ex))
+        color = sys.stdout.isatty() and not config.no_color
         if config.follow:
-            cmd.append('--follow')
-        if config.tail is not None:
-            cmd.extend(['--tail', str(config.tail)])
-        if config.no_color:
-            cmd.append('--no-color')
-        if config.timestamps:
-            cmd.append('--timestamps')
-        cmd.extend(config.services or [])
+            def listing():
+                try:
+                    return pick(backend.instances())
+                except UnknownTarget:
+                    return []           # the named one is between restarts
+            follower = LogFollower(listing, history=config.tail or 'all',
+                                   timestamps=bool(config.timestamps))
+            lines = follower.stdout
+            if sys.stdout.isatty() and not config.raw:
+                lines = compact_litellm_tracebacks(lines)
+            try:
+                for line in _colorize(lines, enabled=color):
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
+                return 130
+            finally:
+                follower.terminate()
+            return 0
+        if not chosen:
+            print(f'nothing running ({_backend_name(backend)} backend)')
+            return 0
+        prefix = len(chosen) > 1
+        status = 0
+        for inst in chosen:
+            argv_ = history_argv(inst, tail=config.tail,
+                                 timestamps=bool(config.timestamps))
+            if argv_ is None:
+                print(f'{inst.name}: the {_backend_name(backend)} backend keeps no logs')
+                continue
+            proc = subprocess.run(argv_, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, env=runtime_env(inst))
+            text = proc.stdout.decode('utf-8', 'replace')
+            lines = [f'{inst.name}  | {ln}\n' if prefix else f'{ln}\n'
+                     for ln in text.splitlines()]
+            for line in _colorize(lines, enabled=color and prefix):
+                sys.stdout.write(line)
+            status = status or proc.returncode
+        return int(status)
 
-        # Compact only the human-facing live view. Captures and pipelines keep
-        # Docker's exact bytes unless a future explicit compact-output mode is
-        # added; ``--raw`` is also available for interactive LiteLLM debugging.
-        if compact:
-            return _run_compacted_follow(cmd)
-        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
+class _ComposeWrapperBase(_PathOverridesMixin):
+    """``docker compose <subcmd>`` over the Compose project on this host.
 
-class PsCLI(_ComposeWrapperBase):
-    """``docker compose ps`` for the leasing deployment."""
+    The stack itself on the compose backend; the gateway on kubeai.
+    """
 
-    __command__ = 'ps'
-
-    all = kw.Value(
-        False, isflag=True, short_alias=['a'], help='Include stopped containers.'
+    services = kw.Value(
+        None,
+        nargs='*',
+        position=1,
+        help='Optional service names to filter (empty = all).',
     )
-    services_only = kw.Value(
-        False, isflag=True,
-        help='Print only service names (passes --services to docker compose).',
+    backend = kw.Value(
+        None, type=str,
+        help='Backend (default: the configured `backend` setting).',
     )
-    quiet = kw.Value(
-        False, isflag=True, short_alias=['q'], help='Print only container IDs.'
-    )
-
-    @classmethod
-    def main(cls, argv=True, **kwargs):
-        config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'ps') + ['ps']
-        if config.all:
-            cmd.append('--all')
-        if config.services_only:
-            cmd.append('--services')
-        if config.quiet:
-            cmd.append('--quiet')
-        cmd.extend(config.services or [])
-        return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class RestartCLI(_ComposeWrapperBase):
-    """``docker compose restart [services...]``."""
+    """``docker compose restart [services...]`` (the Compose project on this host)."""
 
     timeout = kw.Value(None, type=int, help='Stop timeout in seconds.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'restart') + ['restart']
+        cmd = _compose_argv(config) + ['restart']
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])
@@ -528,7 +654,7 @@ class RestartCLI(_ComposeWrapperBase):
 
 
 class PullCLI(_ComposeWrapperBase):
-    """``docker compose pull [services...]``."""
+    """``docker compose pull [services...]`` (the Compose project on this host)."""
 
     quiet = kw.Value(False, isflag=True, short_alias=['q'])
     ignore_pull_failures = kw.Value(False, isflag=True)
@@ -536,7 +662,7 @@ class PullCLI(_ComposeWrapperBase):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'pull') + ['pull']
+        cmd = _compose_argv(config) + ['pull']
         if config.quiet:
             cmd.append('--quiet')
         if config.ignore_pull_failures:
@@ -546,81 +672,119 @@ class PullCLI(_ComposeWrapperBase):
 
 
 class StartCLI(_ComposeWrapperBase):
-    """``docker compose start [services...]``."""
+    """``docker compose start [services...]`` (the Compose project on this host)."""
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'start') + ['start']
+        cmd = _compose_argv(config) + ['start']
         cmd.extend(config.services or [])
         return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
 class StopCLI(_ComposeWrapperBase):
-    """``docker compose stop [services...]``."""
+    """``docker compose stop [services...]`` (the Compose project on this host)."""
 
     timeout = kw.Value(None, type=int)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'stop') + ['stop']
+        cmd = _compose_argv(config) + ['stop']
         if config.timeout is not None:
             cmd.extend(['--timeout', str(config.timeout)])
         cmd.extend(config.services or [])
         return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
-class StackDownCLI(_ComposeWrapperBase):
-    """``docker compose down`` the leasing deployment.
+class StackComposeCLI(_PathOverridesMixin):
+    """Run any ``docker compose`` command on the Compose project on this host.
 
-    Tears the whole project down. Leasing's reconcile manages teardown
-    automatically on release; this is the manual escape hatch.
+    The raw escape hatch: the stack itself on the compose backend, the gateway
+    on kubeai. It bypasses the ledger and renders nothing, e.g.
+    ``infer-stack stack compose -- up -d litellm``.
     """
 
-    volumes = kw.Value(
-        False, isflag=True, help='Also remove named volumes (--volumes).'
+    __command__ = 'compose'
+
+    args = kw.Value(None, nargs='*', position=1,
+                    help='Arguments for docker compose (put them after --).')
+    backend = kw.Value(
+        None, type=str,
+        help='Backend (default: the configured `backend` setting).',
     )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'down') + ['down', '--remove-orphans']
-        if config.volumes:
-            cmd.append('--volumes')
+        cmd = _compose_argv(config) + list(config.args or [])
         return int(subprocess.run(cmd, env=_docker_env()).returncode)
 
 
-class StackUpCLI(_ComposeWrapperBase):
-    """``docker compose up -d`` exactly what is on disk — the raw escape hatch.
+class StackDownCLI(_PathOverridesMixin):
+    """Stop everything the backend runs, bypassing the ledger.
 
-    Brings up the on-disk compose file as-is, without touching the ledger or
-    re-rendering. Prefer ``infer-stack apply``, which re-renders from intent
-    first. Reach for ``stack up`` only to run a *hand-edited* compose file
-    verbatim.
+    The manual escape hatch: releases no lease, so a later publish brings
+    leased models back. Compose: ``docker compose down``; kubeai: deletes every
+    managed Model, then the gateway. ``--volumes`` (Compose only) also removes
+    named volumes.
     """
+
+    __command__ = 'down'
+
+    volumes = kw.Value(
+        False, isflag=True, help='Also remove named volumes (Compose only).'
+    )
+    backend = kw.Value(
+        None, type=str,
+        help='Backend (default: the configured `backend` setting).',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        cmd = _day2_compose_base(config, 'up') + ['up', '-d', '--remove-orphans']
-        cmd.extend(config.services or [])
-        return int(subprocess.run(cmd, env=_docker_env()).returncode)
+        if config.volumes:
+            cmd = _compose_argv(config) + ['down', '--remove-orphans', '--volumes']
+            return int(subprocess.run(cmd, env=_docker_env()).returncode)
+        backend = _day2_backend(config)
+        down = getattr(backend, 'down', None)
+        if down is None:
+            print(f'the {_backend_name(backend)} backend runs nothing to bring down')
+            return 0
+        down()
+        return 0
+
+
+class StackUpCLI(ApplyCLI):
+    """``apply``: bring up what the ledger says should run (both backends).
+
+    The raw form, ``docker compose up`` of the file on disk, is
+    ``infer-stack stack compose -- up -d``.
+    """
+
+    __command__ = 'up'
 
 
 class StackModalCLI(kw.ModalCLI):
-    """Day-2 ops on the running leasing deployment."""
+    """Day-2 ops on what the backend runs.
+
+    ``up`` is ``apply`` and ``down`` stops everything, on either backend. The
+    ``docker compose`` verbs (restart, pull, start, stop, and ``compose`` for
+    anything else) act on the Compose project on this host: the stack itself
+    on compose, the gateway on kubeai.
+    """
 
     __command__ = 'stack'
 
     up = StackUpCLI
     logs = LogsCLI
     ps = PsCLI
+    down = StackDownCLI
+    compose = StackComposeCLI
     restart = RestartCLI
     pull = PullCLI
     start = StartCLI
     stop = StopCLI
-    down = StackDownCLI
 
 
 class DoctorCLI(_PathOverridesMixin):

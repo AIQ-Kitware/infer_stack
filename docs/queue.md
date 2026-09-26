@@ -42,7 +42,9 @@ and `_admission_mode()` go.
 **Done when:** `_admission_mode` does not exist; the full suite passes;
 queue-semantics tests still assert the same behaviour.
 
-### 3. [ ] P2: day-2 commands and the TUI through the backend
+### 3. [x] P2: day-2 commands and the TUI through the backend
+
+Done 2026-09-26.
 
 `instances()` and `stream_logs(target, *, follow, tail)` on both backends;
 `ps`, `logs`, `stack up` / `stack down` use them, the raw compose form
@@ -79,10 +81,15 @@ fake-Compose and fake-KubeAI backends; `tests/test_parity.py` runs each
 `nvidia.com/gpu.product` / `.memory` node labels; `min_vram_gib` picks the
 smallest fitting profile when an endpoint names none.
 
+`measure` on KubeAI (moved here from P2): it already runs, but CPU vLLM prints
+no GPU memory-profiling lines, and `--record` writes Compose's measurements
+overlay, which KubeAI does not read. Decide where a cluster measurement is
+recorded, and verify `measure` in the GPU handover.
+
 **Done when:** on k3s with hand-set labels for two GPU sizes (CPU-backed
 profiles), a catalog with `min_vram_gib` and no `resource_profile` lands on
 the right profile; `dev/handover/p4_gpu_labels.sh` exists for one run on a
-real GPU node.
+real GPU node, and runs `measure` there.
 
 ### 7. [ ] P5: in-cluster gateway and a second node
 
@@ -97,13 +104,17 @@ VM, a Model pinned to it by node selector is served through the same
 gateway. `dev/handover/p5_two_hosts.sh` exists for one run across two real
 machines.
 
-### 8. [ ] The README's Compose sections
+### 8. [ ] The README's Compose sections, and the other stale docs
 
 About 33 references to verbs that no longer exist (`setup`, `up -d`,
-`switch`, `describe-profile`, `smoke-test`, `wait-ready`, `diagnose`).
+`switch`, `describe-profile`, `smoke-test`, `wait-ready`, `diagnose`), and
+top-level `restart` / `stop` / `start` / `pull` (they live under `stack`).
+*Why widened (2026-09-26):* the same verbs appear in
+`docs/persistent-caches-and-warm-restarts.md` and
+`docs/stack-graph-profiles.md`.
 
-**Done when:** every command in the README runs as written against the
-current CLI, and `grep` finds none of those verbs.
+**Done when:** every command in the README and `docs/` runs as written
+against the current CLI, and `grep` finds none of those verbs.
 
 ### 9. [ ] UX audit loop: do not stop without a passing audit
 
@@ -138,8 +149,11 @@ Seed findings, already known:
 
 - [ ] `r` does not reload catalogs, and edits to a catalog file are not
       picked up until restart.
-- [ ] `infer-stack logs` should accept a container name, a prefixed name or
-      an endpoint name.
+- [x] `infer-stack logs` should accept a container name, a prefixed name or
+      an endpoint name. Done with P2: an instance name, a container id
+      prefix, a deployment id or an endpoint alias.
+- [x] `infer-stack logs -f qwen` followed every instance: a kwconf flag took
+      the next word as its value. Fixed for every command (P2).
 - [ ] `status` shows STALE during an apply instead of "apply in progress".
 
 ### 10. [ ] Handover

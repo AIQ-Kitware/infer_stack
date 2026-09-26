@@ -12,8 +12,9 @@ polled while hidden:
   it in Open WebUI.
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
-* **docker** — a collapsible pane with **Logs** and **Containers** (the
-  ``docker ps`` view: status/uptime, created, id, ports) tabs (collapsed by
+* **runtime** — a collapsible pane with **Logs**, **Instances** (what
+  ``infer-stack ps`` shows: containers or pods, status, what each serves,
+  ports) and **Control** (Apply / Down) tabs, on either backend (collapsed by
   default; ``c`` toggles it).
 * **system** — live ``nvidia-smi`` GPUs + host CPU/mem (collapsed by default).
 * **api** — send a prompt to a *ready* model through the LiteLLM gateway
@@ -31,7 +32,7 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -69,7 +70,7 @@ from .leasing import DeploymentState, LeaseState
 from rich.markup import escape as escape_markup
 
 from . import cli_equivalent as cli
-from .log_filter import LogLineSplitter, compact_litellm_tracebacks
+from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
 # The Select value meaning "every service EXCEPT the gateway". This is the
@@ -78,12 +79,8 @@ ALL_SERVICES = ''  # the Select value meaning "every service"
 # pane before anyone can read it. The gateway's own logs are one selection away
 # when they are what you want.
 ENGINE_SERVICES = '\x00engines'
-# Substring rather than equality: compose names the gateway service `litellm`
-# today, but deployment naming has carried suffixes before and a missed match
-# silently restores the noisy view.
-GATEWAY_SERVICE_HINT = 'litellm'
 # What `_resolve_log_target` returns when a view has nothing to follow. Not
-# None: None means "every service" to `docker compose logs`.
+# None: None means "every instance".
 NO_LOG_TARGET = object()
 
 
@@ -167,15 +164,6 @@ def _select_is_blank(value: object) -> bool:
     return value is SELECT_BLANK
 
 
-def is_gateway_service(name: str) -> bool:
-    """Is this compose service the LiteLLM gateway rather than an engine?"""
-    return GATEWAY_SERVICE_HINT in str(name).lower()
-
-
-def engine_services(names) -> list[str]:
-    """Every service that is not the gateway, in the given order."""
-    return [n for n in names if not is_gateway_service(n)]
-
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
 DEFAULT_THEME = 'textual-dark'
 
@@ -255,151 +243,6 @@ INFER_THEME = Theme(
     error='#ff6b6b',
     dark=True,
 )
-
-
-class _DockerLogProc:
-    r"""Follow the project's containers: recent history, then live output.
-
-    Not ``docker compose logs -f``, and not ``docker logs -f`` either: Docker's
-    log driver stores output line by line and holds a partial line until its
-    newline, so a download bar redrawn with ``\r`` showed nothing for many
-    minutes and then arrived all at once (measured with both). ``docker
-    attach`` reads the container's output as it is written, so each container
-    gets its recent ``docker logs --tail`` (complete lines), then an attach
-    with stdin closed and signals not forwarded -- ending it never touches the
-    container.
-
-    Containers are re-listed every ``poll`` seconds: one created later (a model
-    starting, a recreate) is followed from its first line, and one that
-    restarted is attached again. ``stdout`` yields ``service  | line`` like
-    Compose. Output written between the history read and the attach (a few
-    milliseconds) can be missed.
-    """
-
-    poll = 3.0
-
-    def __init__(self, project: str, compose_file: str, service=None):
-        import queue
-        import threading
-
-        del compose_file                    # the project label is enough to find them
-        self.project = project
-        if isinstance(service, (list, tuple)):
-            self.services = {str(s) for s in service}
-        else:
-            self.services = {str(service)} if service else None
-        self._lines: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
-        self._seen: set[str] = set()
-        self._live: dict[str, subprocess.Popen] = {}
-        threading.Thread(target=self._watch, daemon=True).start()
-
-    def _containers(self) -> list[tuple[str, str, bool]]:
-        """(id, service, running) for this project's containers in view."""
-        from .leasing.compose import docker_environment
-
-        out = subprocess.run(
-            ['docker', 'ps', '-a', '--filter',
-             f'label=com.docker.compose.project={self.project}',
-             '--format', '{{.ID}} {{.State}} {{.Label "com.docker.compose.service"}}'],
-            capture_output=True, text=True, timeout=30, env=docker_environment(),
-        ).stdout
-        found = []
-        for row in out.splitlines():
-            cid, _, rest = row.strip().partition(' ')
-            state, _, svc = rest.partition(' ')
-            if cid and (self.services is None or svc in self.services):
-                found.append((cid, svc, state == 'running'))
-        return sorted(found, key=lambda row: row[1])
-
-    def _watch(self) -> None:
-        import threading
-
-        first = True
-        while not self._stop.is_set():
-            try:
-                found = self._containers()
-            except Exception:  # noqa: BLE001 - docker unreachable: try again
-                found = []
-            for cid, svc, running in found:
-                attached = cid in self._live and self._live[cid].poll() is None
-                if cid not in self._seen:
-                    # Existing containers: the recent tail. A new one: all of it.
-                    history = '200' if first else 'all'
-                elif running and not attached:
-                    history = None          # restarted: attach again, no repeat
-                else:
-                    continue
-                self._seen.add(cid)
-                threading.Thread(target=self._follow, args=(cid, svc, history, running),
-                                 daemon=True).start()
-            first = False
-            self._stop.wait(self.poll)
-
-    def _follow(self, cid: str, service: str, history: str | None, running: bool) -> None:
-        from .leasing.compose import docker_environment
-
-        prefix = f'{service}  | '
-        if history is not None:
-            try:
-                old = subprocess.run(
-                    ['docker', 'logs', '--tail', history, cid],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
-                    env=docker_environment(),
-                ).stdout.decode('utf-8', 'replace')
-            except Exception:  # noqa: BLE001
-                old = ''
-            split = LogLineSplitter(every=0.0)
-            for line in split.feed(old) + split.flush():
-                self._lines.put(prefix + line)
-        if not running or self._stop.is_set():
-            return
-        proc = subprocess.Popen(
-            ['docker', 'attach', '--no-stdin', '--sig-proxy=false', cid],
-            # Engines log to stderr, which attach passes out on its own stderr.
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=docker_environment(),
-        )
-        self._live[cid] = proc
-        self._pump(proc, prefix)
-
-    def _pump(self, proc: subprocess.Popen, prefix: str) -> None:
-        import codecs
-        import os
-
-        decode = codecs.getincrementaldecoder('utf-8')('replace').decode
-        split = LogLineSplitter()
-        assert proc.stdout is not None           # Popen(stdout=PIPE)
-        fd = proc.stdout.fileno()
-        try:
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                for line in split.feed(decode(chunk)):
-                    self._lines.put(prefix + line)
-        finally:
-            proc.stdout.close()
-        for line in split.flush():
-            self._lines.put(prefix + line)
-
-    @property
-    def stdout(self) -> Iterable[str]:
-        import queue
-
-        while not self._stop.is_set():
-            try:
-                yield self._lines.get(timeout=0.5) + '\n'
-            except queue.Empty:
-                continue
-
-    def terminate(self) -> None:
-        self._stop.set()
-        for proc in list(self._live.values()):
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:  # noqa: BLE001
-                proc.kill()
 
 
 class _Divider(Static):
@@ -1000,7 +843,7 @@ class InferStackTUI(App):
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
-        Binding('c', 'toggle_docker', 'Toggle docker', show=False),
+        Binding('c', 'toggle_docker', 'Toggle runtime', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
@@ -1088,7 +931,7 @@ class InferStackTUI(App):
         self._log_backlog: collections.deque = collections.deque(maxlen=LOG_PANE_LINES)
         self._log_dropped = 0
         # Parsed compose service names, keyed by the file's (mtime, size).
-        self._service_names_cache: tuple[tuple[float, int], list[str]] | None = None
+        self._last_instances: list = []
         # Running background actions: worker -> (label, started). Drawn by
         # _draw_activity, with the newest backend progress message.
         self._activity: dict[Any, tuple[str, float]] = {}
@@ -1227,31 +1070,32 @@ class InferStackTUI(App):
                         ('Leases', self._compose_leases),
                         ('Deployments', self._compose_deployments))
                 yield _Divider('y', self._drag_logs, id='hsplit')
-                with Collapsible(title='docker', collapsed=True, id='docker'):
+                with Collapsible(title='runtime', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
                         with TabPane('Logs', id='tab-logs'):
                             yield Select(
-                                [('(engines — no litellm)', ENGINE_SERVICES),
-                                 ('(all services)', ALL_SERVICES)],
+                                [('(engines)', ENGINE_SERVICES),
+                                 ('(everything)', ALL_SERVICES)],
                                 value=ENGINE_SERVICES, allow_blank=False,
                                 id='logsvc',
                             )
                             yield RichLog(id='logs', highlight=False,
                                           markup=False, max_lines=LOG_PANE_LINES,
                                           wrap=False)
-                        with TabPane('Containers', id='tab-containers'):
+                        with TabPane('Instances', id='tab-containers'):
                             yield DataTable(id='ps', cursor_type='row',
                                             zebra_stripes=True)
                         with TabPane('Control', id='tab-control'):
                             yield Static(
-                                'Bring the rendered compose project up or down. '
+                                'Apply brings up what the ledger says should run. '
+                                'Down stops everything and releases no lease. '
                                 'Output appears in the Logs tab.', classes='hint',
                             )
                             yield Static('', id='compose-path')
                             with Horizontal(id='compose-actions'):
-                                yield Button('Compose up', id='btn-compose-up',
+                                yield Button('Apply', id='btn-compose-up',
                                              variant='primary')
-                                yield Button('Compose down',
+                                yield Button('Down',
                                              id='btn-compose-down')
                 with Collapsible(title='system', collapsed=True, id='system'):
                     yield Static(
@@ -1376,7 +1220,7 @@ class InferStackTUI(App):
             'leases', 'held by'
         )
         self.query_one('#ps', DataTable).add_columns(
-            'service', 'status (uptime)', 'created', 'container id', 'ports'
+            'name', 'status', 'serves', 'started', 'ports'
         )
         self.query_one('#gpus', DataTable).add_columns(
             'gpu', 'name', 'util%', 'mem (used/total)', 'temp'
@@ -1395,9 +1239,9 @@ class InferStackTUI(App):
             '…', '(loading…)', '-', '-', '-'
         )
         self._gpus_rows_cache = [('__loading__',) * 5]
-        compose_file = getattr(self.controller.backend, 'compose_file', None)
+        rendered = getattr(self.controller.backend, 'rendered_file', None)
         self.query_one('#compose-path', Static).update(
-            f'compose file: {compose_file or "(not rendered yet)"}'
+            f'rendered: {rendered or "(this backend renders no file)"}'
         )
         # Capture docker's own chatter (up/down progress on stderr) into the
         # logs pane instead of letting it bleed onto the full-screen terminal.
@@ -1505,25 +1349,40 @@ class InferStackTUI(App):
     # -- theming for docker output bleed ----------------------------------
 
     def _install_quiet_docker(self) -> None:
-        """Route ``docker compose`` output to the logs pane, not the terminal."""
-        backend = self.controller.backend
-        if not hasattr(backend, 'run'):
-            return
+        """Route ``docker`` output to the logs pane, not the terminal.
 
+        Only ``docker`` commands: the kubeai backend runs ``kubectl`` through
+        the same seam, and the Docker runner's allowlisted environment has no
+        ``KUBECONFIG`` (every kubectl call from the TUI used to fail). The
+        kubeai backend's gateway is a Compose project of its own, so it is
+        wrapped too.
+        """
         from .leasing.compose import _default_docker_run
 
-        def quiet_run(args: list[str], **kwargs) -> str:
-            # Same bounded, explicit-environment runner as the CLI; only stderr
-            # is redirected to the logs pane, unless the caller takes it.
-            noisy = not any(a == 'ps' for a in args)
-            sink = (
-                (lambda line: self.call_from_thread(self._append_log, line))
-                if noisy else (lambda line: None)
-            )
-            kwargs.setdefault('stderr_lines', sink)
-            return _default_docker_run(args, **kwargs)
+        def quiet(target) -> None:
+            original = getattr(target, 'run', None)
+            if original is None:
+                return
 
-        backend.run = quiet_run
+            def quiet_run(args: list[str], **kwargs) -> str:
+                if not args or args[0] != 'docker':
+                    return original(args, **kwargs)
+                # Same bounded, explicit-environment runner as the CLI; only
+                # stderr is redirected to the logs pane, unless the caller
+                # takes it.
+                noisy = not any(a == 'ps' for a in args)
+                sink = (
+                    (lambda line: self.call_from_thread(self._append_log, line))
+                    if noisy else (lambda line: None)
+                )
+                kwargs.setdefault('stderr_lines', sink)
+                return _default_docker_run(args, **kwargs)
+
+            target.run = quiet_run
+
+        backend = self.controller.backend
+        quiet(backend)
+        quiet(getattr(backend, 'gateway', None))
         if hasattr(backend, 'progress'):
             backend.progress = self._backend_progress
 
@@ -1750,8 +1609,8 @@ class InferStackTUI(App):
                 'leases': leases, 'deployments': deployments,
                 'observed': self._observed, 'assignments': self._assignments,
             }
-            if not self._collapsed['docker'] and self._active_tab == 'tab-containers':
-                data['ps'] = self._compose_ps_rows()
+            if not self._collapsed['docker']:
+                data['instances'] = self._instance_list()
             if not self._collapsed['system']:
                 data['gpus'] = self._gpu_rows()
                 data['sysinfo'] = self._system_line()
@@ -1769,8 +1628,11 @@ class InferStackTUI(App):
         self._fill_deployments(
             data['deployments'], data['observed'], data['assignments'], data['leases']
         )
-        if 'ps' in data:
-            self._fill_ps(data['ps'])
+        if 'instances' in data:
+            if data['instances'] is not None:
+                self._last_instances = data['instances']
+            if self._active_tab == 'tab-containers':
+                self._fill_ps(self._ps_rows(data['instances']))
         if 'gpus' in data:
             self._fill_gpus(data['gpus'])
             self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
@@ -1893,7 +1755,7 @@ class InferStackTUI(App):
         # (~7 KB/s of terminal output while nothing changed).
         try:
             docker = self.query_one('#docker', Collapsible)
-            title = f'docker — {running_label}'
+            title = f'runtime — {running_label}'
             if docker.title != title:
                 docker.title = title
             for pane, text in (
@@ -1997,12 +1859,15 @@ class InferStackTUI(App):
 
     def _fill_ps(self, rows) -> None:
         table = self.query_one('#ps', DataTable)
-        new_rows = [
-            (row['service'], row['status'], row['created'] or '-',
-             row['id'] or '-', row['ports'] or '-')
-            for row in rows
-        ]
-        if not rows:
+        if rows is None:
+            new_rows = [('(cannot read the runtime)', '-', '-', '-', '-')]
+        else:
+            new_rows = [
+                (row['name'], row['status'], row['serves'] or '-',
+                 row['started'] or '-', row['ports'] or '-')
+                for row in rows
+            ]
+        if rows is not None and not rows:
             new_rows = [('(nothing running)', '-', '-', '-', '-')]
         self._diff_fill(table, new_rows, '_ps_rows_cache', id_index=0)
 
@@ -2103,75 +1968,34 @@ class InferStackTUI(App):
 
     # -- docker ps ---------------------------------------------------------
 
-    def _compose_ps_rows(self) -> list[dict[str, str]]:
-        """Best-effort ``docker compose ps`` rows."""
-        import json
-
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        run = getattr(backend, 'run', None)
-        if not path or not run or not Path(path).exists():
-            return []
-        project = getattr(backend, 'project', 'infer-stack')
+    def _instance_list(self):
+        """What the backend runs (worker thread), or ``None`` if unreadable."""
         try:
-            out = run([
-                'docker', 'compose', '-p', str(project), '-f', str(path),
-                'ps', '--format', 'json',
-            ])
-        except Exception:  # noqa: BLE001 - ps is best-effort
-            return []
-        rows: list[dict[str, Any]] = []
-        out = (out or '').strip()
-        if not out:
-            return []
-        try:
-            parsed = json.loads(out)
-            rows = parsed if isinstance(parsed, list) else [parsed]
-        except json.JSONDecodeError:
-            for line in out.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        result = []
-        for row in rows:
-            ports = _fmt_ports(row) or str(row.get('Ports') or '')
-            cid = str(row.get('ID') or '')[:12]
-            # `Status` is the docker-ps STATUS column ("Up 3 minutes") — it
-            # carries the uptime; `CreatedAt`/`RunningFor` give the age.
-            created = str(row.get('CreatedAt') or row.get('RunningFor') or '')
-            result.append({
-                'service': str(row.get('Service') or row.get('Name') or '?'),
-                'status': str(row.get('Status') or row.get('State') or '?'),
-                'created': created,
-                'id': cid,
-                'ports': ports,
-            })
-        return sorted(result, key=lambda r: r['service'])
+            return list(self.controller.backend.instances())
+        except Exception:  # noqa: BLE001 - a monitor must never crash
+            return None
 
-    # -- logs --------------------------------------------------------------
+    def _ps_rows(self, instances) -> list[dict[str, str]] | None:
+        """Rows for the Instances table (same shape as ``infer-stack ps``)."""
+        if instances is None:
+            return None
+        served = {g.id: sorted(g.served) for g in (self._last_deployments or [])}
+        return [{
+            'name': i.name,
+            'status': i.status,
+            'serves': (', '.join(served.get(i.deployment_id, []))
+                       if i.deployment_id else '(front door)'),
+            'started': (i.started or '')[:19].replace('T', ' '),
+            'ports': i.ports,
+        } for i in instances]
 
     def _service_names(self) -> list[str]:
-        """Service names from the on-disk compose file (best-effort)."""
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        if not path:
-            return []
-        try:
-            stat = Path(path).stat()
-            key = (stat.st_mtime, stat.st_size)
-            cached = self._service_names_cache
-            if cached is not None and cached[0] == key:
-                return list(cached[1])       # checked every refresh; parse on change
-            import yaml
-            data = yaml.safe_load(Path(path).read_text()) or {}
-            names = sorted((data.get('services') or {}).keys())
-            self._service_names_cache = (key, names)
-            return list(names)
-        except Exception:  # noqa: BLE001
-            return []
+        """Names of the instances last seen (refreshed by the worker)."""
+        return sorted({i.name for i in self._last_instances})
+
+    def _engine_names(self) -> list[str]:
+        """Names of the last-seen instances that serve a deployment."""
+        return sorted({i.name for i in self._last_instances if i.is_engine})
 
     def _sync_log_services(self) -> None:
         names = self._service_names()
@@ -2180,8 +2004,8 @@ class InferStackTUI(App):
         self._service_options = names
         select = self.query_one('#logsvc', Select)
         options = [
-            ('(engines — no litellm)', ENGINE_SERVICES),
-            ('(all services)', ALL_SERVICES),
+            ('(engines)', ENGINE_SERVICES),
+            ('(everything)', ALL_SERVICES),
         ] + [(n, n) for n in names]
         # Keep whatever is selected. The two sentinels are not service names,
         # so they have to be allowed through explicitly or refreshing the
@@ -2224,13 +2048,20 @@ class InferStackTUI(App):
             self._update_api_curl()
 
     def _default_proc_factory(self) -> Callable[[str | None], Any]:
-        def factory(service: str | None):
+        def factory(service):
+            from .leasing.instances import LogFollower
+
             backend = self.controller.backend
-            path = getattr(backend, 'compose_file', None)
-            project = getattr(backend, 'project', 'infer-stack')
-            if not path:
-                return None
-            return _DockerLogProc(str(project), str(path), service)
+            if isinstance(service, (list, tuple)):
+                wanted: set[str] | None = {str(s) for s in service}
+            else:
+                wanted = {str(service)} if service else None
+
+            def listing():
+                found = backend.instances()
+                return [i for i in found if wanted is None or i.name in wanted]
+
+            return LogFollower(listing)
 
         return factory
 
@@ -2264,14 +2095,14 @@ class InferStackTUI(App):
         its absence, and it stays that way once engines do appear.
         """
         if service == ENGINE_SERVICES:
-            names = engine_services(self._service_names())
+            names = self._engine_names()
             if not names:
                 return NO_LOG_TARGET, (
-                    'no engine services yet; choose (all services) '
+                    'no engines running yet; choose (everything) '
                     'for the gateway')
             return names, f'engines: {", ".join(names)}'
         if not service:
-            return None, 'all services'
+            return None, 'everything'
         return service, service
 
     def _stop_log_proc(self) -> None:
@@ -2295,7 +2126,7 @@ class InferStackTUI(App):
         if proc is None:
             self.call_from_thread(
                 self._append_log_if_current, generation,
-                '(no compose project yet — acquire a model)'
+                '(nothing to follow — acquire a model)'
             )
             return
         if generation != self._log_generation:
@@ -2863,14 +2694,10 @@ class InferStackTUI(App):
 
     # -- docker compose control -------------------------------------------
 
-    def _compose_target(self) -> tuple[Any, str, str] | None:
-        """(run, project, compose_file) for the leasing project, or None."""
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        run = getattr(backend, 'run', None)
-        if not path or not run or not Path(path).exists():
-            return None
-        return run, str(getattr(backend, 'project', 'infer-stack')), str(path)
+    def _compose_target(self):
+        """The backend's rendered file, when a render exists; else ``None``."""
+        rendered = getattr(self.controller.backend, 'rendered_file', None)
+        return rendered if rendered is not None and Path(rendered).exists() else None
 
     def action_compose_up(self) -> None:
         if self._compose_target() is None:
@@ -2897,22 +2724,17 @@ class InferStackTUI(App):
         if self._compose_target() is None:
             self._refuse('nothing rendered yet — nothing to bring down')
             return
-        self._status('docker compose down (raw: bypasses leases; releases nothing)…')
+        self._status('down (bypasses leases; releases nothing)…')
         self._cli(cli.command('stack', 'down'))
-        self._do_compose(['down', '--remove-orphans'], 'down')
+        self._do_down()
 
     @work(thread=True, exclusive=True, group='mutate')
-    def _do_compose(self, args: list[str], label: str) -> None:
-        target = self._compose_target()
-        if target is None:
-            self._after_mutation('nothing rendered yet')
-            return
-        run, project, path = target
+    def _do_down(self) -> None:
         try:
-            run(['docker', 'compose', '-p', project, '-f', path, *args])
-            msg = f'compose {label} done'
+            self.controller.backend.down()
+            msg = 'down done'
         except Exception as ex:  # noqa: BLE001
-            msg = f'compose {label} failed: {ex}'
+            msg = f'down failed: {ex}'
         self._after_mutation(msg)
 
     # -- open in browser ---------------------------------------------------
@@ -3587,18 +3409,6 @@ def _parse_kv_str(text: str) -> dict[str, Any]:
             key, _, val = item.partition('=')
             out[key.strip()] = yaml.safe_load(val)
     return out
-
-
-def _fmt_ports(row: dict) -> str:
-    """Compact published-ports string from a compose ps JSON row."""
-    pubs = row.get('Publishers') or []
-    bits = []
-    for pub in pubs:
-        published = pub.get('PublishedPort')
-        target = pub.get('TargetPort')
-        if published:
-            bits.append(f'{published}->{target}')
-    return ', '.join(bits)
 
 
 def _seconds_since_process_start() -> float | None:

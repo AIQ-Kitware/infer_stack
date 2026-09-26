@@ -1093,6 +1093,26 @@ class ComposeBackend(ConvergeScaffold):
     def compose_file(self) -> Path:
         return self.state_dir / COMPOSE_FILENAME
 
+    #: The file a render writes, whatever the backend (``status`` shows it).
+    rendered_file = compose_file
+
+    def compose_project(self):
+        """The Compose project on this host: this one."""
+        return self
+
+    def compose_argv(self) -> list[str]:
+        """``docker compose [--env-file ...] -p <project> -f <file>``: the one base.
+
+        The managed ``.env`` beside the compose file resolves the master key
+        and the other managed secrets; docker compose's own ``.env`` discovery
+        keys off the caller's working directory, so it is passed explicitly,
+        and only when present (a missing ``--env-file`` is a hard error).
+        """
+        cmd = ['docker', 'compose']
+        if self.gateway._env_path.exists():
+            cmd += ['--env-file', str(self.gateway._env_path)]
+        return [*cmd, '-p', self.project, '-f', str(self.compose_file)]
+
     # -- the front door (leasing.gateway) ------------------------------------
     # Settings the gateway owns. Kept as attributes of the backend because
     # profiles and callers set them here; they are stored in one place.
@@ -1337,17 +1357,7 @@ class ComposeBackend(ConvergeScaffold):
 
     def _compose(self, args: list[str]) -> str:
         self._ensure_state_dir()
-        cmd = ['docker', 'compose']
-        # Resolve ${LITELLM_MASTER_KEY} (and any other managed secret) from the
-        # sidecar .env beside the compose file, so secrets stay out of the YAML.
-        # docker compose's default .env discovery keys off the *current working
-        # directory* (wherever infer-stack was invoked), not the state dir, so we
-        # point it explicitly. Only when present: a litellm-less stack never
-        # writes one, and a missing --env-file path is a hard error.
-        if self.gateway._env_path.exists():
-            cmd += ['--env-file', str(self.gateway._env_path)]
-        cmd += ['-p', self.project, '-f', str(self.compose_file)]
-        return self.run([*cmd, *args])
+        return self.run([*self.compose_argv(), *args])
 
     def plan(self, desired: list[Deployment], placement=None):
         """Compute GPU placement for ``desired`` without writing or applying.
@@ -2201,6 +2211,12 @@ class ComposeBackend(ConvergeScaffold):
                 raise ResidencyUnknown(f'unexpected docker ps line: {line!r}')
             pairs.append((parts[0], parts[1].lower()))
         return tuple(sorted(pairs))
+
+    def instances(self):
+        """Every container of this project, engines first (raises if unknown)."""
+        from .instances import DOCKER, from_residency
+
+        return from_residency(self.residency(), runtime=DOCKER)
 
     def residency(self) -> Residency:
         """Strict snapshot of this project's deployment containers and their GPUs.

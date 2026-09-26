@@ -139,15 +139,17 @@ def test_render_rich_colorizes_status() -> None:
     assert '\x1b[' in out
 
 
-def test_day2_compose_base_prefers_leasing(tmp_path: Path, monkeypatch) -> None:
-    from infer_stack.cli.commands_runtime import _day2_compose_base
+def test_day2_compose_verbs_target_the_backends_project(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from infer_stack.cli.commands_runtime import _compose_argv
 
     monkeypatch.setenv('INFER_STACK_DATA_DIR', str(tmp_path))
     compose_file = tmp_path / 'leasing' / 'compose' / 'docker-compose.yml'
     compose_file.parent.mkdir(parents=True)
     compose_file.write_text('services: {}\n')
-    # leasing compose present -> targets it without needing config.yaml
-    base = _day2_compose_base(None, 'logs')
+    # The compose backend's own project; no config.yaml needed.
+    base = _compose_argv(SimpleNamespace(backend='compose'))
     assert base == [
         'docker', 'compose', '-p', 'infer-stack', '-f', str(compose_file)
     ]

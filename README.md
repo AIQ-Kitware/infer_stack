@@ -812,8 +812,10 @@ If a `kubeai` release already exists, reuse its namespace
 ### Debugging checks
 
 `infer-stack acquire` reports pod-level failures itself (`ImagePullBackOff`,
-`Unschedulable`, a crash with the engine's error quoted). For anything else,
-with `NS` the namespace and `MODEL` the Model's name (`kubectl -n $NS get models`):
+`Unschedulable`, a crash with the engine's error quoted). `infer-stack ps` lists
+the pods and `infer-stack logs -f <endpoint>` follows one, as on compose. For
+anything else, with `NS` the namespace and `MODEL` the Model's name
+(`kubectl -n $NS get models`):
 
 ```bash
 kubectl -n "$NS" describe model "$MODEL"
