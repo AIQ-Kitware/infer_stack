@@ -809,7 +809,7 @@ def test_evict_json_stdout_is_pure_json(env, capsys):
     out, err = capsys.readouterr()
     data = json.loads(out)  # must parse: no human text mixed into stdout
     assert data == {'evicted': [], 'torn_down': [], 'missing': ['ghost']}
-    assert 'no idle deployment for: ghost' in err
+    assert 'evict: ghost is not a deployment or served endpoint' in err
     assert rc == 0
 
 

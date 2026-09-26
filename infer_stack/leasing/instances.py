@@ -150,8 +150,9 @@ def resolve(instances: list[Instance], names: Iterable[str],
             or (i.deployment_id and name in served.get(i.deployment_id, ()))
         ]
         if not found:
-            known = ', '.join(sorted({i.name for i in instances})) or 'nothing'
-            raise UnknownTarget(f'no instance matches {name!r}; running: {known}')
+            known = ', '.join(sorted({i.name for i in instances}))
+            raise UnknownTarget(f'no instance matches {name!r}; '
+                                + (f'running: {known}' if known else 'nothing is running'))
         picked.extend(i for i in found if i not in picked)
     return picked
 

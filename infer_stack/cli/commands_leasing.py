@@ -1251,17 +1251,22 @@ class EvictCLI(_ApprovalMixin):
                 if missing:
                     # Diagnostic, not payload: stdout must stay pure JSON
                     # under --json (and stay grep-able human output without).
-                    print(
-                        f'no idle deployment for: {", ".join(missing)}',
-                        file=sys.stderr,
-                    )
+                    _, rows = controller.ledger.status(virtual_expiry=True)
+                    held = {name for g in rows if g.state == DeploymentState.LIVE
+                            for name in (g.id, *g.served)}
+                    for name in missing:
+                        why = ('is live: a lease holds it; release it first'
+                               if name in held else
+                               'is not a deployment or served endpoint '
+                               '(`infer-stack leases` lists them)')
+                        print(f'evict: {name} {why}', file=sys.stderr)
                 if not targets:
                     if config.json:
                         print(json.dumps(
                             {'evicted': [], 'torn_down': [],
                              'missing': missing}, indent=2))
                     else:
-                        print('nothing to evict')
+                        print('nothing evicted')
                     return 0
                 outcome = controller.evict(targets)
         except ConvergeAborted:
@@ -2309,6 +2314,12 @@ class TestCLI(_PathOverridesMixin):
                 json=payload,
                 timeout=float(config.timeout),
             )
+        except requests.exceptions.ConnectionError:
+            return _test_fail(config, base_url,
+                              'nothing is listening there (the gateway is not up)')
+        except requests.exceptions.Timeout:
+            return _test_fail(config, base_url,
+                              f'no answer within {float(config.timeout):g}s')
         except requests.exceptions.RequestException as ex:
             return _test_fail(config, base_url, f'not reachable: {ex}')
         dt = time.monotonic() - t0

@@ -815,11 +815,20 @@ def _default_docker_run(
     from .backend import BackendTimeout
 
     bound = _docker_timeout(args) if timeout is None else timeout
+    # With no stderr handler, stderr still reaches the terminal as it is
+    # written (docker's progress), through a pipe of our own so its last lines
+    # can also go into the error: "port is already allocated" belongs in the
+    # message, not only scrolled past above it.
+    tee = None
+    if stderr_lines is None:
+        tee = _StderrTee()
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, text=True, start_new_session=True,
         env=docker_environment(),
-        stderr=subprocess.PIPE if stderr_lines is not None else None,
+        stderr=subprocess.PIPE if tee is None else tee.write_end,
     )
+    if tee is not None:
+        tee.start()
     query = _read_only(args)
     if query:
         _RUNNING_QUERIES.add(proc)
@@ -853,9 +862,49 @@ def _default_docker_run(
         for line in (err or '').splitlines():
             if line.strip():
                 stderr_lines(line.rstrip())
+    if tee is not None:
+        err = tee.finish()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, args, output=out, stderr=err)
     return out
+
+
+class _StderrTee:
+    """A child's stderr, echoed to ours as it arrives, with its last lines kept."""
+
+    def __init__(self, keep: int = 20):
+        import collections
+        import os
+
+        self._read_end, self.write_end = os.pipe()
+        self._tail: collections.deque = collections.deque(maxlen=keep)
+        self._thread = None
+
+    def start(self) -> None:
+        import os
+        import threading
+
+        os.close(self.write_end)            # the child holds its copy
+
+        def pump():
+            import sys
+
+            with os.fdopen(self._read_end, 'r', errors='replace') as stream:
+                for line in stream:
+                    self._tail.append(line)
+                    try:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                    except Exception:  # noqa: BLE001 - never fail the command
+                        pass
+
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
+
+    def finish(self) -> str:
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        return ''.join(self._tail)
 
 
 def _communicate_streaming(proc, bound: float, on_line) -> tuple[str, str | None]:

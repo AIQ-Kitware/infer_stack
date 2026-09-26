@@ -219,6 +219,14 @@ dry-run root.
       output too.
 - [x] The render step logged "(not applied; `infer-stack apply` …)" in
       every acquire, right before the apply it said had not happened.
+- [x] A runtime refusal (the gateway's port taken, a daemon down) ended in
+      a Python traceback of `CalledProcessError`. Now the command, docker's
+      own last lines, and a hint (a port in use names the port); docker's
+      stderr is still shown live, through a pipe that keeps its tail.
+- [x] `evict <unknown>` printed "no idle deployment for" then "nothing to
+      evict"; it now says whether each name is held by a lease or unknown.
+      `test` on a stopped gateway printed a urllib3 dump; now "nothing is
+      listening there". `logs` said "running: nothing".
 
 ### 10. [ ] Handover
 
