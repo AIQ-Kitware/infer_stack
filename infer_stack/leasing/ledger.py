@@ -222,6 +222,22 @@ class Ledger:
             state_version=state_version,
         )
 
+    # -- the publication marker's approval (see Controller._apply_pending) ------
+
+    def clear_approved_digest(self) -> None:
+        """The approved render was applied, or deliberately abandoned."""
+        self.store.clear_approved_digest()
+
+    def publish_profile(self, profile: dict, *, approved_digest: str | None) -> None:
+        """Write the recovery profile and its pending, approved marker at once."""
+        self.store.publish_profile(profile, approved_digest=approved_digest)
+
+    def migrate_network(self, *, subnet: str, reset_addresses: bool,
+                        approved_digest: str | None) -> None:
+        """Switch the stable-address subnet and mark it pending, at once."""
+        self.store.migrate_network(subnet=subnet, reset_addresses=reset_addresses,
+                                   approved_digest=approved_digest)
+
     def acquire(
         self,
         owner: str,

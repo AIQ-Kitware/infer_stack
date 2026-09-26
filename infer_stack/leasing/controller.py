@@ -380,6 +380,17 @@ class Controller:
         except OSError as exc:
             return f'inspection failed: {exc}'
 
+    def publication_lock(self):
+        """Hold while changing state a render reads outside the ledger (the
+        managed ``.env``): the same host-wide lock every publication holds."""
+        return self._global_lock()
+
+    def invocation_profile(self) -> dict | None:
+        """The recovery profile this invocation resolves to (its settings and
+        catalogs), before any switch to a stored one; ``None`` without one."""
+        render = getattr(self.backend, 'render_profile', None)
+        return self._invocation_profile or (render() if render is not None else None)
+
     @contextlib.contextmanager
     def _global_lock(self):
         """Serialize desired-state publication, single-writer.
@@ -651,7 +662,7 @@ class Controller:
                 self.backend.preview(desired, inputs, approve=True)
             finally:
                 host.configure_network(saved)
-            self.ledger.store.migrate_network(
+            self.ledger.migrate_network(
                 subnet=subnet, reset_addresses=reset,
                 approved_digest=getattr(self.backend, 'last_preview_digest', None),
             )
@@ -1272,7 +1283,7 @@ class Controller:
                                    else 'runtime not reached'))
             return rec
         if approved:
-            self.ledger.store.clear_approved_digest()
+            self.ledger.clear_approved_digest()
         self.ledger.clear_publication_pending(marker['version'])
         rec.publication_pending = False
         return rec
@@ -1483,7 +1494,7 @@ class Controller:
             self._mark_pending(apply=apply)
             # The approved admission is being compensated away: its digest no
             # longer describes the pending desired state.
-            self.ledger.store.clear_approved_digest()
+            self.ledger.clear_approved_digest()
             rel = self.ledger.release(lease_id)
             if rel.idled_deployment_ids:
                 never_ran = self._never_ran(list(rel.idled_deployment_ids))
@@ -1938,7 +1949,7 @@ class Controller:
                 if previous is not None:
                     use(previous)
                 raise
-            self.ledger.store.publish_profile(
+            self.ledger.publish_profile(
                 profile, approved_digest=self.backend.last_preview_digest)
             self._profile_error = None
             self._applied_profile = profile

@@ -714,7 +714,7 @@ preview's digest. Test: a refused acquire on a fresh root leaves no key in
 `.env` (fails on the old code: it wrote the master key and the Open WebUI
 secret), and the next admitted acquire needs no second approval.
 
-### 21. [ ] Controller decomposition, where the authorities now show it
+### 21. [x] Controller decomposition, where the authorities now show it
 
 *Why added:* the controller holds admission, residency interpretation,
 placement, publication markers, recovery snapshots, network migration,
@@ -724,6 +724,23 @@ profile snapshots, backend capabilities), and only after 14-20.
 
 **Done when:** each extracted part needs no private cross-layer call, or
 the item records why nothing was extracted.
+
+*Decided 2026-09-27: no class extracted; the cross-layer calls removed
+instead.* After items 11-20 the controller calls no private backend member
+and builds no runtime command; the CLI's two private reaches
+(`controller._global_lock`, `_invocation_profile`) are now
+`publication_lock()` and `invocation_profile()`; the publication marker's
+approval is written through `Ledger` (`clear_approved_digest`,
+`publish_profile`, `migrate_network`), not `ledger.store`. A split would not
+remove a call today: the publication coordinator needs `_render` and
+`_admission_view`, and admission needs the profile snapshot, so each part
+would call back into the others. The boundaries the review names
+(publication/recovery, admission/reclaim, profile snapshots, backend
+capabilities) are where to cut when one of them grows. Left as it was: 15
+optional-hook `getattr(self.backend, ...)` reads that predate this section
+(`use_profile`, `render_profile`, `settle_snapshot`, the `last_*`
+attributes, ...). They could become protocol members with in-process
+defaults, as `front_door` and `route_rows` did here.
 
 ### 22. [ ] Docs and full verification
 

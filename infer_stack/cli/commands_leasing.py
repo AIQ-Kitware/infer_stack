@@ -2502,7 +2502,7 @@ class EnvCLI(_PathOverridesMixin):
             # each other's keys.
             ledger = Ledger(SqliteStore(str(default_ledger_path())))
             controller = Controller(ledger, NullBackend())
-            with controller._global_lock():
+            with controller.publication_lock():
                 if key in _SERVICE_ENV_KEYS:
                     leases, _ = ledger.status(virtual_expiry=True)
                     active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
@@ -2837,12 +2837,11 @@ class ConfigPublishCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
-        render_profile = getattr(controller.backend, 'render_profile', None)
-        if render_profile is None:
-            raise SystemExit('config publish: this backend has no render profile')
         # The profile this invocation resolves to, before the backend was
         # switched to the published one (see Controller._sync_profile).
-        profile = controller._invocation_profile or render_profile()
+        profile = controller.invocation_profile()
+        if profile is None:
+            raise SystemExit('config publish: this backend has no render profile')
         paths = _collect_names(config.catalogs)
         if paths:
             sources = []
