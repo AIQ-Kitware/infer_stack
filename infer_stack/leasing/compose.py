@@ -1897,6 +1897,10 @@ class ComposeBackend(ConvergeScaffold):
                 if source.startswith('/') and not Path(source).exists():
                     Path(source).mkdir(parents=True, exist_ok=True)
         dynamic = bool(self.litellm and self.dynamic_routing)
+        if dynamic and 'litellm' in services and not self.retire_routes():
+            return ApplyResult(runtime=False, routes=False, detail=(
+                'routes to departing upstreams could not be removed; '
+                'nothing was torn down'))
         outcome = self.selective_apply(
             services, fingerprints,
             degraded=set(sidecar.get('degraded') or ()),
@@ -1956,6 +1960,28 @@ class ComposeBackend(ConvergeScaffold):
         """None: admission already moves idle models aside when it places, so
         a Compose probe never reports ``needs_room``."""
         return []
+
+    def retire_routes(self) -> bool:
+        """Remove the gateway routes the last render dropped, before their
+        upstreams go; whether none of them is left.
+
+        Only dynamic routing publishes a route per upstream, and only a
+        running gateway serves one: otherwise there is nothing to retire (a
+        gateway that starts later reconciles its stored routes itself). The
+        first phase of :meth:`apply`, and of KubeAI's apply for its host
+        gateway, so an upstream is never torn down under a route that still
+        points at it.
+        """
+        from .gateway import ROUTE_RECONCILE_STEADY_S
+
+        if not (self.litellm and self.dynamic_routing):
+            return True
+        running = any(c.service == 'litellm' and c.warm
+                      for c in self.residency().all_containers())
+        if not running:
+            return True
+        return self.gateway._reconcile_routes(
+            deadline_s=ROUTE_RECONCILE_STEADY_S, retire_only=True)
 
     def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
         """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""

@@ -611,7 +611,7 @@ container started with: a residency failure before apply (fails on the old
 code), a decline, and a failure after apply began that converges on
 `infer-stack apply`.
 
-### 17. [ ] Dynamic routes never point at a torn-down upstream
+### 17. [x] Dynamic routes never point at a torn-down upstream
 
 *Why added:* Compose `apply()` removes departing engines, then reconciles
 routes; KubeAI deletes stale Models, then applies the gateway. If route
@@ -628,6 +628,16 @@ verify new routes. Make the replace-route gap an explicit, reported state.
 two dedicated deployments for one alias leaves the departing upstream
 running (the invariant, not just `publication_pending`), on Compose and on
 KubeAI with the host gateway.
+
+*Done 2026-09-27:* an apply's first phase, `retire_routes()`, deletes and
+verifies the routes the render drops (only with dynamic routing and a
+running gateway); if that fails the apply returns "runtime not reached" and
+tears nothing down. KubeAI retires before pruning stale Models; its
+in-cluster gateway has static routes to one upstream and retires nothing.
+A replacement whose add fails after its delete is logged by route. Tests on
+Compose and on KubeAI with a host gateway (both fail on the old code): the
+departing engine or Model keeps running while its route stays, and goes
+once the gateway recovers.
 
 ### 18. [ ] Coalescing prefers a LIVE deployment over reviving an IDLE one
 

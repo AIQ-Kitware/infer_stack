@@ -539,3 +539,77 @@ def test_apply_returns_false_for_an_unreadable_render(tmp_path):
     be.compose_file.parent.mkdir(parents=True, exist_ok=True)
     be.compose_file.write_text('services: [unclosed\n')
     assert not be.apply().runtime              # unreadable: runtime not reached
+
+
+# -- a route never outlives its upstream (queue item 17) ------------------------
+
+
+class NoDeleteGateway(RecordingGateway):
+    """The admin API refuses to delete routes (a LiteLLM or DB failure)."""
+
+    refuse = True
+
+    def post(self, url, **kw):
+        if self.refuse and url.endswith('/model/delete'):
+            return FakeResp(500, {'error': 'db unavailable'})
+        return super().post(url, **kw)
+
+
+def test_a_departing_upstream_outlives_a_route_that_could_not_be_removed(tmp_path):
+    """Two dedicated deployments behind one alias; one is released while the
+    gateway cannot delete routes. Its engine must keep running until its route
+    is gone: an engine stopped under a live route fails some of the alias's
+    requests, and nothing but the next apply would repair it."""
+    time = FakeTime()
+    gw = NoDeleteGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a, b = dep('grp-aaaaaa', served='smol', t=0), dep('grp-bbbbbb', served='smol', t=1)
+    be.converge([a, b], apply=False)
+    assert be.apply().complete
+    b_service = vllm_service_name(b, unique=True)
+    assert b_service in be.run.running and len(_managed(gw)) == 2
+
+    be.converge([a], apply=False)                   # b released
+    outcome = be.apply()
+    assert not outcome.runtime and not outcome.complete
+    assert b_service in be.run.running              # not torn down under its route
+    assert _route_id(b.id, 'smol') in _managed(gw)
+
+    gw.refuse = False                               # the gateway recovers
+    assert be.apply().complete
+    assert b_service not in be.run.running
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
+
+
+def test_kubeai_keeps_a_departing_model_while_its_route_stays(tmp_path):
+    """The same invariant behind KubeAI's host gateway: a stale Model is not
+    deleted while the gateway still routes to it."""
+    from infer_stack.backends.kubeai import KubeaiBackend
+    from test_leasing_kubeai import FakeKubectl
+
+    time = FakeTime()
+    gw = NoDeleteGateway()
+    kubectl = FakeKubectl()
+    gateway = ComposeBackend(
+        state_dir=tmp_path / 'gateway', inventory={'gpu_count': 0, 'gpus': []},
+        run=FakeDocker(), http=gw, project='infer-stack-gateway', images=IMAGES,
+        ports=PORTS, state=STATE, litellm=True, ui=False, dynamic_routing=True,
+        sleep=time.sleep, clock=time.clock,
+    )
+    be = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=kubectl, http=gw,
+                       gateway=gateway, gateway_upstream='http://10.43.0.9/openai/v1',
+                       default_resource_profile='gpu')
+    a, b = dep('grp-aaaaaa', served='smol', t=0), dep('grp-bbbbbb', served='smol', t=1)
+    be.converge([a, b], apply=False)
+    assert be.apply().complete and len(kubectl.applied) == 2
+    managed_before = _managed(gw)
+    assert len(managed_before) == 2
+
+    be.converge([a], apply=False)                   # b released
+    assert not be.apply().complete
+    assert len(kubectl.applied) == 2                # b's Model is still there
+    assert _managed(gw) == managed_before
+
+    gw.refuse = False
+    assert be.apply().complete
+    assert len(kubectl.applied) == 1 and len(_managed(gw)) == 1

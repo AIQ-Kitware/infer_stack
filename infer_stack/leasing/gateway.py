@@ -1274,6 +1274,7 @@ class Gateway(ConvergeScaffold):
 
     def _reconcile_routes(
         self, *, deadline_s: float = ROUTE_RECONCILE_BOOTSTRAP_S, delay: float = 2.0,
+        retire_only: bool = False,
     ) -> bool:
         """Make the live gateway's managed routes match the rendered route set.
 
@@ -1302,6 +1303,17 @@ class Gateway(ConvergeScaffold):
         managed route set equals the desired set; any failure is logged and
         returns ``False`` rather than raising, so the caller decides whether an
         unverified route set blocks anything.
+
+        ``retire_only`` is the first phase of an apply that tears upstreams
+        down: delete only the managed routes the render no longer has (no
+        adds, no replacements), and verify they are gone. It runs before the
+        runtime removes anything, so a route is never left pointing at an
+        upstream this apply stopped.
+
+        A replacement (same id, different semantics) is a delete then an add,
+        since ``/model/new`` does not update on every LiteLLM release. If the
+        add fails after the delete, the route is missing until the next apply:
+        that gap is logged by name, and the result is ``False``.
         """
         from .._log import logger
 
@@ -1322,11 +1334,12 @@ class Gateway(ConvergeScaffold):
                     '{:g}s; leaving it for the next apply', deadline_s,
                 )
                 return False
-            mismatched = sorted(
+            mismatched = [] if retire_only else sorted(
                 rid for rid in desired.keys() & current.keys()
                 if desired_semantics[rid] != current[rid]
             )
-            to_add_ids = sorted((desired.keys() - current.keys()) | set(mismatched))
+            to_add_ids = [] if retire_only else sorted(
+                (desired.keys() - current.keys()) | set(mismatched))
             to_delete = sorted((current.keys() - desired.keys()) | set(mismatched))
             to_add = [desired[rid] for rid in to_add_ids]
             if not (to_add or to_delete):
@@ -1346,9 +1359,16 @@ class Gateway(ConvergeScaffold):
                     deadline=deadline,
                 )
             for route in to_add:
-                ok &= self._post_route(
+                added = self._post_route(
                     '/model/new', route, route.get('model_name'), deadline=deadline,
                 )
+                rid = route['model_info']['id']
+                if not added and rid in mismatched:
+                    logger.warning(
+                        'dynamic routing: route {} ({}) was removed for replacement '
+                        'and not re-added; it is missing until the next apply',
+                        rid, route.get('model_name'))
+                ok &= added
             logger.info(
                 'dynamic routing: +{} route(s), -{} route(s), ~{} replacement(s) '
                 '(now {} desired)',

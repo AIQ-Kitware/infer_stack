@@ -981,10 +981,14 @@ class KubeaiBackend(ConvergeScaffold):
                     'reachable? See scripts/install_kubeai.sh and '
                     'docs/kubeai-backend.md.'
                 ) from ex
-        # Prune: managed Models on the cluster that the render dropped.
+        # Prune: managed Models on the cluster that the render dropped. Their
+        # gateway routes go first, so none is left pointing at a deleted Model.
         stale = [
             name for name in self._cluster_models() if name not in wanted
         ]
+        if stale and self.gateway is not None and not self.gateway.retire_routes():
+            return ApplyResult(runtime=False, routes=False, detail=(
+                'routes to departing Models could not be removed; nothing was deleted'))
         for name in sorted(stale):
             logger.info('kubectl delete model {}', name)
             self._kubectl(
