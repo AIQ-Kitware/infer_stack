@@ -1107,7 +1107,7 @@ def _declined_exit() -> SystemExit:
 
 
 class ReleaseCLI(_ApprovalMixin):
-    """Release a lease; deployments idle/teardown per their reclaim policy.
+    """Release a lease; its models stay warm or stop, per their reclaim policy.
 
     On a terminal the resulting compose change is shown and confirmed before
     docker is touched (``--yes`` skips); declining leaves the lease released in

@@ -340,6 +340,20 @@ and a raw request all worked as written.
       `clean`); such a row is `reclaimed`, and `clean` says the stack is
       already clean ("no active leases, no models up").
 
+Pass 5, consistency: product names (Open WebUI, LiteLLM, KubeAI, front
+door, keep-warm) are spelled one way in user-facing text; the TUI's panes
+and buttons use the CLI's words (leases, deployments, instances, apply,
+down, `gc --forget` as "Clear finished").
+
+- [x] `release`'s summary read "deployments idle/teardown per their reclaim
+      policy"; now "its models stay warm or stop, per their reclaim policy".
+- [ ] Considered, not changed: argparse accepts abbreviated flags, so
+      `leases --all` fails as "ambiguous option: --all could match
+      --allowed_gpus". kwconf's `__allow_abbrev__ = False` would give
+      "unrecognized arguments" instead, and would break any script that
+      abbreviates a flag today. Backwards compatibility wins; revisit with a
+      deprecation warning if it bites.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover
