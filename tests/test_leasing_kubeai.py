@@ -517,7 +517,7 @@ def test_doctor_all_green(tmp_path):
     names = [c[0] for c in checks]
     assert any('cluster' in n for n in names)
     assert any('CRD' in n for n in names)
-    assert any('gateway' in n for n in names)
+    assert any("KubeAI's API" in n for n in names)
 
 
 def test_doctor_stops_at_first_missing_dependency(tmp_path):
@@ -539,7 +539,7 @@ def test_doctor_reports_gateway_down(tmp_path):
     kubectl = FakeKubectl()
     be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=DownHttp())
     checks = be.doctor()
-    gateway = [c for c in checks if c[0].startswith('gateway')][0]
+    gateway = [c for c in checks if c[0].startswith("KubeAI's API")][0]
     assert gateway[1] is False
     assert 'port-forward' in gateway[2]
 

@@ -274,6 +274,16 @@ test logs`), plus pass 1 again.
 - [x] `logs` into a pipe or file kept the engines' color codes; with color
       off they are stripped.
 
+Audit pass 3 (2026-09-26): `dev/ux_audit.sh compose` and `kubeai` (help,
+mistakes, the day-2 sweep; 0 flags on both), and the reports read by eye.
+
+- [x] Every kubeai acquire logged "Converging 0 deployment(s): (none)" right
+      after "Converging 1 deployment(s) onto kubeai": the gateway-only
+      project narrating itself. It says "Converging the gateway project".
+- [x] `doctor` on kubeai called KubeAI's own API "gateway", beside
+      infer-stack's LiteLLM gateway; it is "KubeAI's API" now, here and in
+      the docs.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

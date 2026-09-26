@@ -444,6 +444,8 @@ class KubeaiBackend(ConvergeScaffold):
         # request names (the endpoint aliases) as on the compose backend.
         # Without it, clients talk to KubeAI directly under its Model names.
         self.gateway = gateway
+        if gateway is not None:
+            gateway.fronts_elsewhere = True
         # Builds the gateway for a placement ('host' or 'cluster'), so a
         # recovery profile can say where it runs (see use_profile).
         self.gateway_factory = gateway_factory
@@ -1086,7 +1088,7 @@ class KubeaiBackend(ConvergeScaffold):
         Everything ``acquire`` needs, checked cheaply and in dependency order,
         so a fresh setup fails as a checklist instead of a mid-acquire
         traceback: cluster reachable -> KubeAI CRD installed -> namespace
-        exists -> gateway answering at ``base_url``. Never raises.
+        exists -> KubeAI's API answering at ``base_url``. Never raises.
         """
         checks: list[tuple[str, bool, str]] = []
 
@@ -1135,5 +1137,7 @@ class KubeaiBackend(ConvergeScaffold):
                 f'`kubectl -n {self.namespace} port-forward svc/kubeai '
                 '8000:80` (or set kubeai_base_url)'
             )
-        checks.append((f'gateway at {self.base_url}', ok, detail))
+        # KubeAI's own API (what the port-forward reaches), not infer-stack's
+        # LiteLLM gateway, which starts with the first acquire.
+        checks.append((f"KubeAI's API at {self.base_url}", ok, detail))
         return checks

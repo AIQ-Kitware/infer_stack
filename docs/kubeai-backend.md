@@ -113,7 +113,7 @@ infer-stack catalog suggest --backend kubeai   # catalog on stdout, profiles on 
 ```
 
 Verify the setup before the first acquire — `doctor` checks the chain in
-dependency order (cluster reachable → CRD installed → namespace → gateway):
+dependency order (cluster reachable → CRD installed → namespace → KubeAI's API):
 
 ```bash
 infer-stack doctor

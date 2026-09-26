@@ -533,7 +533,7 @@ The short version:
 ./scripts/install_kubeai.sh kubeai-values.yaml     # the chart, with your resourceProfiles
 kubectl -n kubeai port-forward svc/kubeai 8000:80 &
 infer-stack config set backend kubeai
-infer-stack doctor                                 # cluster -> CRD -> namespace -> gateway
+infer-stack doctor                                 # cluster -> CRD -> namespace -> KubeAI's API
 infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
 ```
 

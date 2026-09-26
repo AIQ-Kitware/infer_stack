@@ -1700,6 +1700,9 @@ class ComposeBackend(ConvergeScaffold):
     #: dynamic routes, both pointing at its servers. Set before each render.
     upstream_rows: dict[str, dict[str, Any]] = {}
     upstream_routes: list[dict[str, Any]] = []
+    #: Set by an owner whose engines run elsewhere (kubeai): this project is
+    #: only the front door.
+    fronts_elsewhere = False
 
     def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
         """Route-registry rows for every endpoint of ``catalog``."""
@@ -1737,11 +1740,16 @@ class ComposeBackend(ConvergeScaffold):
 
         desired = list(desired)
         with self._converge_lock():
-            logger.info(
-                'Converging {} deployment(s): {}',
-                len(desired),
-                ', '.join(sorted(g.id for g in desired)) or '(none)',
-            )
+            if self.fronts_elsewhere:
+                # A gateway-only project (kubeai's): its owner narrates the
+                # deployments, and "0 deployment(s)" read as a contradiction.
+                logger.info('Converging the gateway project ({})', self.project)
+            else:
+                logger.info(
+                    'Converging {} deployment(s): {}',
+                    len(desired),
+                    ', '.join(sorted(g.id for g in desired)) or '(none)',
+                )
             docs = self._render_documents(desired, placement)
             plan, rendered, planned = docs['plan'], docs['rendered'], docs['planned']
             fingerprints = docs['fingerprints']

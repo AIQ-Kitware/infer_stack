@@ -813,7 +813,7 @@ class DoctorCLI(_PathOverridesMixin):
     """Preflight the configured backend: is everything acquire needs in place?
 
     Runs the backend's cheap dependency-ordered checks (for kubeai: cluster
-    reachable -> KubeAI CRD installed -> namespace exists -> gateway
+    reachable -> KubeAI CRD installed -> namespace exists -> KubeAI's API
     answering) and prints a checklist. Exits nonzero if any check fails, so
     scripts can gate on it. Backends without a preflight (null/compose) report
     that there is nothing to check.
