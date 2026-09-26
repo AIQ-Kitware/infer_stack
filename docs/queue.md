@@ -58,7 +58,7 @@ and lists its pod (checked in a real terminal, not only in tests).
 
 ### 4. [x] P3: gateway feature parity
 
-Done 2026-09-26.
+Done 2026-09-26, `7a322c1`.
 
 `routes` and `secrets rotate` resolve the backend's gateway instead of
 checking its kind; the KubeAI gateway project honours `ui`,
