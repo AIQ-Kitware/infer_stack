@@ -430,53 +430,71 @@ Both keep their own config and data roots and print PASS/FAIL per step.
 were not re-run since leasing, and 8b's `shm_size` fixes a TP failure not yet
 observed here.
 
-## Reopened 2026-09-27: outside review, part 1
+## Reopened 2026-09-27: outside review
 
-Found by a review of the finished campaign; a part 2 (publication and
-recovery, placement and profiles, destructive operations, gateway authority,
-controller decomposition, test quality) follows and may reopen more. Scope
-here: these three and their direct tests and docs, nothing broader.
+Found by a two-part review of the finished campaign. Part 1: items 11-13.
+Part 2: items 14-22, in the order the review recommends; item 11 also
+takes part 2's finding on replicated startup diagnosis. The campaign's
+completion rule changes with them: not "every *same* row has a test" but
+"every shared lifecycle invariant holds when combined with the
+backend-specific features that stress it" (item 13 and the poison cases in
+each item). Item 9's UX audit is not the closing gate for these: a terminal
+audit cannot show transaction safety under partial failure.
+
+Rules for this section: correctness before cleanup; no broad CLI polish; a
+poison test that fails on the old code with every fix; no new `hasattr`
+probes; no second KubeAI lifecycle path; backwards compatibility for cards,
+catalogs and CLI invocations that work today.
 
 ### 11. [ ] Residency: replicas are not duplicates
 
-*Why added:* `Residency.ambiguous()` means "more than one unit" and
-`resident()` returns a unit only when there is exactly one. On Compose two
+*Why added:* `Residency.ambiguous()` meant "more than one unit" and
+`resident()` returned a unit only when there was exactly one. On Compose two
 containers for one deployment is a conflict and must fail closed. On KubeAI
 `runtime.min_replicas: 2` is a supported, documented setting, and its two
 pods made the deployment `ambiguous` and not resident: releasing the last
 lease of a keep-warm replicated Model pruned it, `leases` showed it
-AMBIGUOUS, and `_pinned_endpoints` stopped protecting its definition.
+AMBIGUOUS, and `_pinned_endpoints` stopped protecting its definition. Part 2
+adds: `diagnose_startup()` returns nothing unless there is exactly one unit,
+so a replicated Model whose every pod crash-loops waits out the timeout
+instead of failing fast.
 
 **Do:** model residency at the deployment level (resident, conflicted,
 units, warm units) and keep "one physical unit" only where GPU adoption on
-Compose needs it. Compose keeps failing closed on duplicate containers;
-"could not inspect" stays distinct from "nothing running"; KubeAI gains no
-host-GPU accounting; no KubeAI branch in the controller.
+Compose needs it. Audit every "the one resident" caller: keep-warm
+admission, `_pinned_endpoints`, status, served-model rows, TUI/runtime
+views, readiness, logs, startup diagnosis. Diagnosis of a replica set: fatal
+when every unit is fatal, nothing while one is healthy. Compose keeps
+failing closed on duplicate containers; "could not inspect" stays distinct
+from "nothing running"; KubeAI gains no host-GPU accounting.
 
 **Done when:** tests show a two-replica KubeAI Model is resident and not
-conflicted; releasing its last keep-warm lease keeps it desired; `gc`
-keeps it; `leases` shows it running; its idle definition stays pinned; a
-rollout snapshot (old pod leaving, new pod up) prunes nothing; two Compose
-containers for one deployment still fail closed.
+conflicted; releasing its last keep-warm lease keeps it desired; `gc` keeps
+it; `leases` and `status` show it running; its idle definition stays pinned;
+a rollout snapshot (old pod leaving, new pod up) prunes nothing; every
+replica crash-looping fails fast with the engine's error, one healthy
+replica does not; two Compose containers for one deployment still fail
+closed; the k3s e2e has a two-replica keep-warm phase and passes.
 
 ### 12. [ ] One backend protocol, the one the controller uses
 
-*Why added:* `Controller` takes a `Backend` (the old `realize/teardown/
-observe` protocol) and casts it to `AdmissionBackend`, which inherits that
-protocol and adds Compose internals: `run` (a docker command; on KubeAI the
+*Why added:* `Controller` took a `Backend` (the old `realize/teardown/
+observe` protocol) and cast it to `AdmissionBackend`, which inherited that
+protocol and added Compose internals: `run` (a docker command; on KubeAI the
 same name runs kubectl), `_load_sidecar()` whose schema the controller
-reads, `network`, `adopted`, probed with `hasattr`. KubeAI keeps a `realize`
-that is deliberately `pass`, and would be unsafe if it did anything.
+read, `network`, `adopted`, probed with `hasattr`. KubeAI kept a `realize`
+that was deliberately `pass`, and would be unsafe if it did anything.
 
 **Do:** type `Controller` against the protocol it uses, with no cast. Move
 `realize/teardown` to a small protocol behind `SimpleAdmission`. Replace the
-Compose internals with semantic capabilities (orphan removal, stable
-network, legacy adoption) whose mechanics stay inside Compose. No new
-`hasattr` probes.
+Compose internals with semantic capabilities (stable network, legacy
+adoption, orphan removal, placement notes) whose mechanics stay inside
+Compose. No new `hasattr` probes.
 
 **Done when:** no production backend has a method that exists only to
 satisfy a protocol; the controller builds no `docker` command and reads no
-sidecar; `ty` passes without the cast.
+sidecar; `ty` checks each backend against the protocol, and fails when one
+drifts.
 
 ### 13. [ ] Parity tests: cross-feature invariants
 
@@ -484,10 +502,161 @@ sidecar; `ty` passes without the cast.
 "replicas render" and "release keeps keep-warm" each passed while their
 combination was broken. Rows of the matrix are not independent.
 
-**Do:** a few poison cases, not a matrix: the lifecycle with replica count
-above one, and a rollout snapshot. Record the rule in the roadmap: a
-backend-specific feature needs one test combining it with the common
-lifecycle.
+**Do:** a small poison suite, not a matrix: replica cardinality (multi-pod
+keep-warm, overlapping pods in a rollout, replicated crash-loop), and the
+cases items 14-19 add. The fake keeps "one Model, one pod" as its default
+and gains a replica and a scheduler mode. Record the completion rule in the
+roadmap.
 
-**Done when:** those tests are in `tests/test_parity.py` (or beside it) and
-fail against the code before item 11.
+**Done when:** the suite is in `tests/test_parity.py` (or beside it), each
+case fails on the code before its fix, and the roadmap states the rule.
+
+### 14. [ ] Scheduler-aware reclaim, not "Unschedulable means evict"
+
+*Why added:* KubeAI's readiness sets `needs_room` whenever a pod waits with
+reason `Unschedulable`, and `wait_ready` answers by evicting the
+longest-idle deployment every 30 s. `Unschedulable` also covers an
+impossible node selector, an untolerated taint, affinity, a missing
+profile, and pressure no idle Model relieves; and on several nodes an idle
+Model on node A frees nothing for a pod that fits only node B. A permanently
+impossible request can empty the warm set one Model at a time.
+
+**Do:** replace the boolean with a structured signal, or a backend
+operation that names reclaim candidates for a blocked deployment. Read the
+scheduler's condition message, not only its reason; evict only for a
+capacity shortage; only a resident idle victim in a compatible scheduling
+domain (its node could host the blocked pod, by profile or node selector)
+is a candidate. Keep: a leased deployment is never a victim; the policy
+"leased demand outranks idle keep-warm" stays in the controller.
+
+**Done when:** poison tests: an impossible node selector evicts nothing; an
+untolerated taint evicts nothing; with two profiles on two nodes the idle
+Model on the wrong node is not chosen; real reclaimable pressure evicts a
+compatible idle Model and the leased one proceeds.
+
+### 15. [ ] Publication phases: the approved digest outlives a partial apply
+
+*Why added:* `_apply_pending()` clears the approved-render digest right
+after `apply()` returns, before checking it returned `False`. Compose
+returns `False` when the runtime changed but dynamic routes did not verify:
+the publication stays pending, but the record of which render was approved
+is gone, so a renderer that changes before the retry (an upgrade) applies
+an unapproved render.
+
+**Do:** keep the digest until the publication completes, unless an explicit
+re-approval replaces it. Make the apply result say what happened (runtime
+applied, routes verified, complete) instead of `True / False / raise`, and
+only as far as the phases that differ today.
+
+**Done when:** a test: preview approves D1, the first apply changes the
+runtime and returns partial; the publication is pending with D1; the
+renderer changes to D2; an ordinary retry refuses on the digest mismatch;
+`infer-stack apply` re-approves and applies.
+
+### 16. [ ] Secret rotation is a transaction
+
+*Why added:* `rotate_gateway_key()` writes the new key into `.env`, then
+publishes, and restores the old key only on `ConvergeAborted`. A strict
+residency or render failure before apply leaves `.env` on the new key while
+LiteLLM runs the old one, so clients are handed a key that does not work.
+The tests' fake gateway reads `.env` per request, which hides it.
+
+**Do:** restore the old key on any failure before apply begins; after apply
+may have begun, keep a recoverable pending publication instead (do not
+revert the file blindly). Uses item 15's phase information.
+
+**Done when:** a gateway fake that captures its key when it (re)starts;
+tests for a declined approval, a render failure before apply (both: old
+file, old running key), and a failure after the gateway restarted (pending,
+converges on retry).
+
+### 17. [ ] Dynamic routes never point at a torn-down upstream
+
+*Why added:* Compose `apply()` removes departing engines, then reconciles
+routes; KubeAI deletes stale Models, then applies the gateway. If route
+removal fails, the publication is pending but LiteLLM still routes to a
+dead upstream, which with several dedicated deployments behind one alias
+fails some requests. Replacing a drifted route deletes before it adds, so a
+failed add leaves a gap.
+
+**Do:** order a removal as: remove and verify the routes that would dangle,
+tear down the departing upstreams, converge the desired ones, add and
+verify new routes. Make the replace-route gap an explicit, reported state.
+
+**Done when:** failure injected into route deletion while releasing one of
+two dedicated deployments for one alias leaves the departing upstream
+running (the invariant, not just `publication_pending`), on Compose and on
+KubeAI with the host gateway.
+
+### 18. [ ] Coalescing prefers a LIVE deployment over reviving an IDLE one
+
+*Why added (older than this campaign):* `plan_acquire()` takes the first
+compatible deployment by creation time among LIVE and IDLE, so an older
+IDLE deployment is revived even when a LIVE one already satisfies the
+request. 8k, then 32k, then 4k on one GPU: the 4k request revives the idle
+8k deployment and queues, although the live 32k one serves it now.
+
+**Do:** rank adequate candidates LIVE, then resident IDLE, then other IDLE,
+then create; the ledger stays the authority on eligibility and takes a
+residency hint from the controller.
+
+**Done when:** the 8k/32k/4k sequence on a one-slot backend coalesces the
+4k request onto the live 32k deployment: nothing revived, no placement, no
+queue, no runtime change.
+
+### 19. [ ] `routes seed` fails closed on a redefinition; one route API
+
+*Why added:* the registry merge is documented as additive, but a same-name
+row with a different definition wins with a warning, and `routes seed`
+skips confirmation because "seeding is additive". That silently redirects a
+public alias. `routes prune` in the CLI reaches into
+`controller._admission_view`, `gateway._load_route_registry`,
+`backend._converge_lock`, `_atomic_write` and `gateway._registry_file`.
+
+**Do:** a public route-registry operation that plans a seed or prune
+(added, unchanged, updated, conflicted) and commits it under the normal
+locks; conflicts refuse by default, an explicit override shows the change
+and asks. The CLI presents and confirms only.
+
+**Done when:** tests: seed A; seed identical A is a no-op; seed a
+conflicting A refuses and leaves the registry unchanged; the override
+reports A updated. No private names from the CLI.
+
+### 20. [ ] Preview does not write secrets
+
+*Why added:* rendering calls `master_key()`, `db_password()`,
+`webui_secret()`, which generate and write missing secrets, so a preview
+that is then refused has still changed `.env`.
+
+**Do:** initialize secrets before a pure render, or commit generated
+secrets with the publication. If kept, document the narrower guarantee.
+
+**Done when:** a refused acquire on a fresh data root leaves no `.env`, or
+the docs say exactly what a preview may write.
+
+### 21. [ ] Controller decomposition, where the authorities now show it
+
+*Why added:* the controller holds admission, residency interpretation,
+placement, publication markers, recovery snapshots, network migration,
+secret rotation, adoption, orphans, reclaim, leases and rollback. Split
+only along state machines (publication/recovery, admission/reclaim,
+profile snapshots, backend capabilities), and only after 14-20.
+
+**Done when:** each extracted part needs no private cross-layer call, or
+the item records why nothing was extracted.
+
+### 22. [ ] Docs and full verification
+
+*Why added:* the parity matrix, roadmap and `known-limitations.md` describe
+the semantics these items change; `known-limitations.md` still says KubeAI
+has no strict residency.
+
+**Do:** update them from the resulting semantics; set the roadmap status to
+"features complete, review hardening" until this section is done; run the
+full suite, `ty`, flake8, and the full k3s e2e.
+
+**Done when:** those pass and the docs match the code.
+
+Also observed while working on these: `test_an_edit_made_outside_the_tui_appears_on_the_next_refresh`
+failed once in a full-suite run and passed alone three times; timing
+around the catalog reload. Looked at under item 22 if it recurs.

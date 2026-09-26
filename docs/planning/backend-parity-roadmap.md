@@ -1,11 +1,12 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · phases P1-P6 landed 2026-09-26 (P4 and P5 end in
-a handover run on real hardware, `dev/handover/`) · **reopened 2026-09-27** by
-an outside review: residency treats KubeAI replicas as duplicates, the
-backend protocol is not the one the backends implement, and the parity suite
-misses cross-feature invariants (queue items 11-13). Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · **features complete, review hardening
+outstanding**: phases P1-P6 landed 2026-09-26 (P4 and P5 end in a handover
+run on real hardware, `dev/handover/`); a two-part outside review on
+2026-09-27 found replica residency, the backend protocol, scheduler reclaim,
+publication phases, secret rotation, route ordering, coalescing and route
+seeding to fix (queue items 11-22). Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
