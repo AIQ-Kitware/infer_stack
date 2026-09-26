@@ -579,6 +579,7 @@ def render_compose(
     route_registry: dict[str, Any] | None = None,
     dynamic_routing: bool = False,
     upstream_routes: list[dict[str, Any]] | None = None,
+    ui_run_as: str | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
 
@@ -667,6 +668,7 @@ def render_compose(
         reverse_proxy_config=reverse_proxy_config, aux_dir=aux_dir,
         catalog=catalog, route_registry=route_registry,
         dynamic_routing=dynamic_routing, upstream_routes=upstream_routes,
+        ui_run_as=ui_run_as,
     )
     services.update(front.services)
     litellm_config = front.litellm_config
@@ -1414,6 +1416,17 @@ class ComposeBackend(ConvergeScaffold):
             # The DB secret must exist before rendering, so docker compose
             # --env-file can interpolate ${LITELLM_DB_PASSWORD} at apply time.
             self.gateway.db_password()
+        ui_run_as = None
+        if self.ui:
+            from .gateway import open_webui_run_as
+
+            self.gateway.webui_secret()         # interpolated at apply, likewise
+            ui_run_as, why = open_webui_run_as(self.state['open_webui'])
+            if ui_run_as is None and not getattr(self, '_ui_root_noted', False):
+                from .._log import logger
+
+                self._ui_root_noted = True
+                logger.info('Open WebUI runs as root: {}', why)
         route_registry = None
         if self.litellm and not self.dynamic_routing:
             # Unconditional in static-superset mode: `self.catalog` may be None;
@@ -1431,7 +1444,7 @@ class ComposeBackend(ConvergeScaffold):
             reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
             project=self.project, catalog=self.catalog,
             route_registry=route_registry, dynamic_routing=self.dynamic_routing,
-            upstream_routes=self.upstream_routes,
+            upstream_routes=self.upstream_routes, ui_run_as=ui_run_as,
         )
         addresses = None
         if self.network is not None:
@@ -1782,6 +1795,15 @@ class ComposeBackend(ConvergeScaffold):
             # A render from before fingerprints: re-render (any mutation) first.
             logger.warning('apply: the render predates fingerprints; re-render, then apply')
             return False
+        # A service that runs as a user needs its bind-mount sources made by
+        # us, as that user: Docker would make a missing one as root.
+        for svc in services.values():
+            if not svc.get('user'):
+                continue
+            for volume in svc.get('volumes') or []:
+                source = str(volume).split(':', 1)[0]
+                if source.startswith('/') and not Path(source).exists():
+                    Path(source).mkdir(parents=True, exist_ok=True)
         dynamic = bool(self.litellm and self.dynamic_routing)
         outcome = self.selective_apply(
             services, fingerprints,

@@ -1850,3 +1850,23 @@ def test_default_docker_run_can_redirect_stderr_lines():
     out = _default_docker_run(['sh', '-c', 'echo out; echo err1 >&2; echo err2 >&2'],
                               timeout=10, stderr_lines=seen.append)
     assert out.strip() == 'out' and seen == ['err1', 'err2']
+
+
+def test_open_webui_runs_as_its_data_directorys_owner(tmp_path):
+    """As root it left files only root could delete (the data root could not
+    be removed without sudo); now it runs as the directory's owner, with a
+    managed session key and its static assets inside its data."""
+    import os
+
+    be = ComposeBackend(
+        state_dir=tmp_path / 'state', inventory=simulate_inventory('1x80'),
+        run=FakeDocker(), http=FakeHttp(tmp_path / 'state'), litellm=True, ui=True,
+        images={**IMAGES, 'open_webui': 'owui:test'}, ports=PORTS,
+        state=dict(STATE, open_webui=str(tmp_path / 'open-webui')),
+    )
+    be.converge([], apply=False)
+    svc = yaml.safe_load(be.compose_file.read_text())['services']['open-webui']
+    assert svc['user'] == f'{os.getuid()}:{tmp_path.stat().st_gid}'
+    assert svc['environment']['STATIC_DIR'] == '/app/backend/data/static'
+    assert svc['environment']['WEBUI_SECRET_KEY'] == '${WEBUI_SECRET_KEY}'
+    assert 'WEBUI_SECRET_KEY=' in (tmp_path / 'state' / '.env').read_text()

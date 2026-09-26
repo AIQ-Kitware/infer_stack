@@ -68,6 +68,7 @@ POSTGRES_CONTAINER_PORT = 5432
 POSTGRES_DB_NAME = 'litellm'
 POSTGRES_DB_USER = 'litellm'
 DB_PASSWORD_ENV = 'LITELLM_DB_PASSWORD'  # managed secret in the sidecar .env
+WEBUI_SECRET_ENV = 'WEBUI_SECRET_KEY'   # Open WebUI's session key, likewise
 # Marks a LiteLLM route as infer-stack-managed, so reconcile only ever deletes
 # routes it created (never a model added by hand through the UI/admin API).
 ROUTE_ID_PREFIX = 'isr-'
@@ -571,8 +572,14 @@ def _open_webui_service(
     openai_urls: list[str] | None = None,
     ollama_urls: list[str] | None = None,
     depends_on: list[str] | None = None,
+    run_as: str | None = None,
 ) -> dict[str, Any]:
     """A managed Open WebUI pointed at whatever front door is available.
+
+    ``run_as`` (``uid:gid``, see :func:`open_webui_run_as`) runs it as the
+    owner of its data directory, so what it writes there stays that owner's;
+    None keeps the image's default user (root).
+
 
     Open WebUI holds two independent kinds of connection, wired here from the
     rendered services:
@@ -610,7 +617,16 @@ def _open_webui_service(
         # Single-user workstation default; the port shouldn't be exposed
         # publicly. Tracked as a knob in dev/leasing-followups.md.
         'WEBUI_AUTH': 'False',
+        # A managed secret (the .env, like the master key): without it the
+        # image writes a generated one into its own directory, which a
+        # non-root user cannot, and a recreate would sign everyone out.
+        WEBUI_SECRET_ENV: '${' + WEBUI_SECRET_ENV + '}',
     }
+    if run_as:
+        # Its bundled static assets are copied at startup; into the data
+        # directory, which this user can write, not the image's own.
+        env['STATIC_DIR'] = '/app/backend/data/static'
+        env['HOME'] = '/tmp'
     if openai_urls:
         env['ENABLE_OPENAI_API'] = 'True'
         if len(openai_urls) == 1:
@@ -636,9 +652,46 @@ def _open_webui_service(
         'restart': 'unless-stopped',
         'labels': {ENGINE_LABEL: 'open-webui'},
     }
+    if run_as:
+        service['user'] = run_as
     if depends_on:
         service['depends_on'] = sorted(depends_on)
     return service
+
+
+def open_webui_run_as(data_path: str | Path) -> tuple[str | None, str]:
+    """``(uid:gid or None, why)``: who Open WebUI should run as.
+
+    Its data directory's owner, so a data root stays removable by whoever
+    owns it (as root, the container left files only root could delete). A
+    directory not made yet will be made by this process, so its user. None,
+    the image default (root), when the directory is root's, or when it or
+    anything directly in it belongs to someone else: a data directory written
+    by a root container before, whose files Open WebUI could no longer open.
+
+    >>> import os, tempfile
+    >>> d = tempfile.mkdtemp()
+    >>> open_webui_run_as(os.path.join(d, 'open-webui'))[0] == f'{os.getuid()}:{os.stat(d).st_gid}'
+    True
+    """
+    import os
+
+    path = Path(data_path)
+    if not path.exists():
+        parent = next((p for p in path.parents if p.exists()), Path('/'))
+        return f'{os.getuid()}:{parent.stat().st_gid}', 'new directory'
+    owner = path.stat()
+    if owner.st_uid == 0:
+        return None, f'{path} is root\'s'
+    try:
+        foreign = [p.name for p in path.iterdir() if p.lstat().st_uid != owner.st_uid]
+    except OSError:
+        foreign = ['?']
+    if foreign:
+        return None, (f'{path} holds files another user owns ({", ".join(foreign[:3])}); '
+                      f'`sudo chown -R {owner.st_uid}:{owner.st_gid} {path}` lets Open '
+                      'WebUI run as its owner')
+    return f'{owner.st_uid}:{owner.st_gid}', 'the directory\'s owner'
 
 
 def _nginx_conf(*, litellm: bool, ui: bool) -> str:
@@ -776,6 +829,7 @@ def render_front_door(
     route_registry: dict[str, Any] | None,
     dynamic_routing: bool,
     upstream_routes: list[dict[str, Any]] | None = None,
+    ui_run_as: str | None = None,
 ) -> FrontDoor:
     """Render the gateway, its database, Open WebUI and the reverse proxy.
 
@@ -893,6 +947,7 @@ def render_front_door(
             openai_urls=openai_urls,
             ollama_urls=ollama_native_urls,
             depends_on=ui_depends,
+            run_as=ui_run_as,
         )
 
     # Optional single-port HTTP reverse proxy fronting the gateway (+ UI). Needs
@@ -1053,6 +1108,14 @@ class Gateway(ConvergeScaffold):
             if self._clock() >= deadline:
                 return None
             self._sleep(2.0)
+
+    def webui_secret(self) -> str:
+        """Open WebUI's managed session key (the .env), made on first use."""
+        existing = parse_env_file(self._env_path)
+        key = ensure_secret(existing, WEBUI_SECRET_ENV)
+        if key != existing.get(WEBUI_SECRET_ENV):
+            write_env_file(self._env_path, {WEBUI_SECRET_ENV: key})
+        return key
 
     def db_password(self) -> str:
         """The managed Postgres password for LiteLLM's model store.

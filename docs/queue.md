@@ -189,9 +189,12 @@ Seed findings, already known:
 - [x] `infer-stack logs -f qwen` followed every instance: a kwconf flag took
       the next word as its value. Fixed for every command (P2).
 - [ ] `status` shows STALE during an apply instead of "apply in progress".
-- [ ] Open WebUI writes its data directory as root: removing a data root
+- [x] Open WebUI writes its data directory as root: removing a data root
       (the e2e's cleanup, or an operator's `rm -rf`) fails with permission
-      denied. Found by `dev/kubeai_e2e.sh` 2026-09-26.
+      denied. Found by `dev/kubeai_e2e.sh` 2026-09-26; fixed: it runs as the
+      directory's owner (a directory root already wrote keeps root, and the
+      log says how to `chown` it). Engine caches (vLLM as root) are the same
+      shape; not yet looked at.
 - [x] A refused acquire always ends with "free a GPU first — …", also when
       the reason is a render refusal (a served-name collision) or the
       backend is kubeai, where no GPU is ours to free. Found 2026-09-26;
