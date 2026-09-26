@@ -429,3 +429,65 @@ Both keep their own config and data roots and print PASS/FAIL per step.
 **Decided without GPUs, worth confirming on them:** 8a's recipe variants
 were not re-run since leasing, and 8b's `shm_size` fixes a TP failure not yet
 observed here.
+
+## Reopened 2026-09-27: outside review, part 1
+
+Found by a review of the finished campaign; a part 2 (publication and
+recovery, placement and profiles, destructive operations, gateway authority,
+controller decomposition, test quality) follows and may reopen more. Scope
+here: these three and their direct tests and docs, nothing broader.
+
+### 11. [ ] Residency: replicas are not duplicates
+
+*Why added:* `Residency.ambiguous()` means "more than one unit" and
+`resident()` returns a unit only when there is exactly one. On Compose two
+containers for one deployment is a conflict and must fail closed. On KubeAI
+`runtime.min_replicas: 2` is a supported, documented setting, and its two
+pods made the deployment `ambiguous` and not resident: releasing the last
+lease of a keep-warm replicated Model pruned it, `leases` showed it
+AMBIGUOUS, and `_pinned_endpoints` stopped protecting its definition.
+
+**Do:** model residency at the deployment level (resident, conflicted,
+units, warm units) and keep "one physical unit" only where GPU adoption on
+Compose needs it. Compose keeps failing closed on duplicate containers;
+"could not inspect" stays distinct from "nothing running"; KubeAI gains no
+host-GPU accounting; no KubeAI branch in the controller.
+
+**Done when:** tests show a two-replica KubeAI Model is resident and not
+conflicted; releasing its last keep-warm lease keeps it desired; `gc`
+keeps it; `leases` shows it running; its idle definition stays pinned; a
+rollout snapshot (old pod leaving, new pod up) prunes nothing; two Compose
+containers for one deployment still fail closed.
+
+### 12. [ ] One backend protocol, the one the controller uses
+
+*Why added:* `Controller` takes a `Backend` (the old `realize/teardown/
+observe` protocol) and casts it to `AdmissionBackend`, which inherits that
+protocol and adds Compose internals: `run` (a docker command; on KubeAI the
+same name runs kubectl), `_load_sidecar()` whose schema the controller
+reads, `network`, `adopted`, probed with `hasattr`. KubeAI keeps a `realize`
+that is deliberately `pass`, and would be unsafe if it did anything.
+
+**Do:** type `Controller` against the protocol it uses, with no cast. Move
+`realize/teardown` to a small protocol behind `SimpleAdmission`. Replace the
+Compose internals with semantic capabilities (orphan removal, stable
+network, legacy adoption) whose mechanics stay inside Compose. No new
+`hasattr` probes.
+
+**Done when:** no production backend has a method that exists only to
+satisfy a protocol; the controller builds no `docker` command and reads no
+sidecar; `ty` passes without the cast.
+
+### 13. [ ] Parity tests: cross-feature invariants
+
+*Why added:* the parity suite's KubeAI fake ran one pod per Model, so
+"replicas render" and "release keeps keep-warm" each passed while their
+combination was broken. Rows of the matrix are not independent.
+
+**Do:** a few poison cases, not a matrix: the lifecycle with replica count
+above one, and a rollout snapshot. Record the rule in the roadmap: a
+backend-specific feature needs one test combining it with the common
+lifecycle.
+
+**Done when:** those tests are in `tests/test_parity.py` (or beside it) and
+fail against the code before item 11.

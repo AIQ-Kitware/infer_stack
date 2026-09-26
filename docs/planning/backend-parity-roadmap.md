@@ -1,8 +1,11 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **all phases done** 2026-09-26; P4 and P5 end in
-a handover run on real hardware (`dev/handover/`). Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · phases P1-P6 landed 2026-09-26 (P4 and P5 end in
+a handover run on real hardware, `dev/handover/`) · **reopened 2026-09-27** by
+an outside review: residency treats KubeAI replicas as duplicates, the
+backend protocol is not the one the backends implement, and the parity suite
+misses cross-feature invariants (queue items 11-13). Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -39,7 +42,14 @@ it is not a sibling with its own habits.
 
 ## Phases
 
-### P0. One contract, one liveness view, one diagnosis — done
+### P0. One contract, one liveness view, one diagnosis — landed, reopened
+
+*Reopened 2026-09-27:* the contract `Controller` is typed against still
+inherits the pre-admission `realize/teardown` protocol and carries Compose
+mechanics (`run`, `_load_sidecar`, `network`, `adopted`); and the liveness
+view equates "more than one unit" with a conflict, which is wrong for
+KubeAI replicas. Queue items 11 and 12.
+
 
 The 2026-09-24 audit landed: an e2e on k3s (K0); the LiteLLM gateway
 fronting both backends, so the alias and key are the same everywhere (K1);
