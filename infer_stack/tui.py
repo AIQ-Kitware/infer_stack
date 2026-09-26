@@ -1147,8 +1147,8 @@ class InferStackTUI(App):
             yield Input(value=f'{self.ledger_interval:g}',
                         id='set-ledger-interval')
             yield Label(
-                'docker observe interval (seconds) — the "running" / GPU-placement '
-                'columns; higher = fewer `docker compose ps` calls'
+                'runtime observe interval (seconds) — the "running" / GPU columns '
+                'and the runtime pane; higher = fewer runtime queries'
             )
             yield Input(value=f'{self.observe_interval:g}',
                         id='set-observe-interval')
@@ -3208,15 +3208,25 @@ class InferStackTUI(App):
         self._raise_for_body(resp)
         return self._completion_text(resp.json())
 
-    def _curl_for(self, model: str, prompt: str) -> str:
+    def _curl_for(self, model: str, prompt: str, *, reveal_key: bool = False) -> str:
         """The equivalent ``curl`` for a chat- or text-completion, matching the
-        endpoint's served protocol, against the gateway."""
+        endpoint's served protocol, against the gateway.
+
+        The key is read at run time (``infer-stack env LITELLM_MASTER_KEY``)
+        rather than shown: the pane is on screen, and screens get shared.
+        ``reveal_key`` puts the literal key in, for the clipboard.
+        """
         import json as _json
 
         base, key = self._litellm()
         if not base:
             return '# acquire a model first — no LiteLLM gateway yet'
-        auth = f" -H 'Authorization: Bearer {key}'" if key else ''
+        if key and reveal_key:
+            auth = f" -H 'Authorization: Bearer {key}'"
+        elif key:
+            auth = ' -H "Authorization: Bearer $(infer-stack env LITELLM_MASTER_KEY)"'
+        else:
+            auth = ''
         if self._protocol_for(model) == 'completions':
             path = '/v1/completions'
             body = _json.dumps({
@@ -3294,8 +3304,11 @@ class InferStackTUI(App):
         self._do_api_list()
 
     def action_api_copy_curl(self) -> None:
-        text = str(self.query_one('#api-curl', Static).render())
-        ok = self._copy(text)
+        # The clipboard gets the literal key (works in any shell); the pane
+        # shows only how to read it.
+        model = self._selected_api_model() or '<model>'
+        prompt = self.query_one('#api-prompt', Input).value.strip() or 'hello'
+        ok = self._copy(self._curl_for(model, prompt, reveal_key=True))
         self._status('copied curl to clipboard' if ok else
                      'copy failed — install wl-copy/xclip, or enable OSC 52')
 

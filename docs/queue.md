@@ -237,6 +237,10 @@ dry-run root.
       columns on the instance-name prefix. The pane is now capped near half
       the screen (three log lines at 24 rows), pane descriptions hide below
       32 rows, and one followed instance gets no prefix.
+- [x] The TUI's API tab showed the gateway's master key in clear text in
+      its example curl. The pane now reads it at run time
+      (`$(infer-stack env LITELLM_MASTER_KEY)`); Copy curl copies the
+      literal key. The UI tab said "docker observe interval".
 
 ### 10. [ ] Handover
 

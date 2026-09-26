@@ -2221,3 +2221,28 @@ def test_an_80x24_terminal_shows_logs_and_the_tables_when_the_runtime_opens():
             assert app.query_one('#tables').region.height >= 1
 
     _run(scenario)
+
+
+def test_the_api_tab_never_shows_the_master_key():
+    """The curl on screen reads the key when run; the clipboard gets it."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._litellm = lambda: ('http://localhost:14042', 'sk-secret-key')
+            app._sync_api_models(['qwen-coder'])
+            app._update_api_curl()
+            shown = str(app.query_one('#api-curl').render())
+            assert 'sk-secret-key' not in shown
+            assert '$(infer-stack env LITELLM_MASTER_KEY)' in shown
+            copied = []
+            app._copy = lambda text: copied.append(text) or True
+            app.action_api_copy_curl()
+            assert copied and 'sk-secret-key' in copied[0]
+
+    _run(scenario)
