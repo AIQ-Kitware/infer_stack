@@ -168,15 +168,18 @@ something is still warming up vs truly live.
 > **Prefer a live dashboard?** `infer-stack tui` opens a multi-pane Textual UI
 > (run `infer-stack config init` once first):
 > a **catalog** pane to pick an endpoint and serve it (`s`/Enter), live
-> **leases** + **deployments** tables, and three collapsible panes below: **docker**
-> (a `logs -f` tail + a **Containers** `docker ps` view: status/uptime · created
-> · container id · ports), **system** (`nvidia-smi` GPUs + host CPU/mem), and
-> **api** (send a prompt to a *ready* model — only running models are listed).
-> Each pane carries its own description and buttons; expanding a pane (or its
-> tab) is what triggers its polling, so hidden data is never fetched.
+> **leases** + **deployments** tables, and two collapsible panes below:
+> **runtime** (`c`; the engines' logs, an **Instances** view of the
+> containers or pods and what each serves, and **Apply** / **Down**, on
+> either backend) and **system** (`nvidia-smi` GPUs + host CPU/mem). The
+> **API** tab sends a prompt to a *ready* model (only running models are
+> listed). Each pane carries its own description and buttons; expanding a
+> pane (or its tab) is what triggers its polling, so hidden data is never
+> fetched.
 > New here? The catalog buttons (or `g`) **Suggest** a set sized to your GPUs,
-> and `m` / `n` open wizards to add a model / endpoint by hand. **Clean up**
-> (`x`) forgets released/stopped entries. **Ctrl+click** a served endpoint
+> and `m` / `n` open wizards to add a model / endpoint by hand. **Clear finished**
+> (`x`) forgets released/stopped entries (`gc --forget`; unlike `infer-stack
+> clean`, it stops nothing). **Ctrl+click** a served endpoint
 > (or `o`) opens it in Open WebUI. Resize panes by dragging the splitter bars
 > (or `[` `]` / `-` `+`). Opt-in extra: `pip install "infer-stack[tui]"`.
 

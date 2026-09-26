@@ -73,6 +73,28 @@ RESERVED_ENGINE = 'reserved'
 # Synthetic endpoint/claim name for a reservation (it serves nothing).
 RESERVED_ENDPOINT = 'reserved-gpu'
 
+def served_name(deployment: Any) -> str:
+    """The model name a deployment's engine serves under: the one rule.
+
+    The spec's ``served_model_name``, else its first served alias, else its
+    id. The engine's ``--served-model-name``, the gateway route's upstream
+    model, the Compose service name and the KubeAI Model name all derive
+    from this, so they cannot disagree.
+
+    Example:
+        >>> from types import SimpleNamespace as NS
+        >>> served_name(NS(spec={'served_model_name': 'q'}, served={'a': {}}, id='g'))
+        'q'
+        >>> served_name(NS(spec={}, served={'b': {}, 'a': {}}, id='g'))
+        'a'
+        >>> served_name(NS(spec={}, served={}, id='g'))
+        'g'
+    """
+    return deployment.spec.get('served_model_name') or (
+        sorted(deployment.served)[0] if deployment.served else deployment.id
+    )
+
+
 def is_reservation(obj: Any) -> bool:
     """True if a :class:`Deployment` / :class:`EndpointRequest` is a GPU reservation."""
     return getattr(obj, 'engine', None) == RESERVED_ENGINE
@@ -340,8 +362,8 @@ class Deployment:
     created_at: float
     updated_at: float
     demand: int = 0
-    # The committed GPU allocation of a LIVE deployment (admission-mode
-    # backends). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
+    # The committed GPU allocation of a LIVE deployment (empty where the
+    # cluster schedules). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
     # before allocations existed). Cleared in the same transaction as any
     # transition out of LIVE.
     assigned_gpus: list[int] | None = None

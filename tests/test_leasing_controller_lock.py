@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from infer_stack.leasing.backend import SimpleAdmission
 from infer_stack.leasing import (
     Controller,
     EndpointRequest,
@@ -32,7 +33,7 @@ from infer_stack.leasing import (
 THREAD_TIMEOUT_S = 30
 
 
-class OverlapBackend:
+class OverlapBackend(SimpleAdmission):
     """A converge-style backend that records max concurrent converges."""
 
     def __init__(self) -> None:
@@ -43,7 +44,7 @@ class OverlapBackend:
         self.last_errors: tuple = ()
         self.last_assignments: dict = {}
 
-    def converge(self, desired, *, apply: bool = True) -> None:
+    def converge(self, desired, *, apply: bool = True, placement=None) -> None:
         with self._guard:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -172,7 +173,7 @@ def test_created_lock_file_and_dir_are_group_writable(tmp_path):
     assert dmode & stat.S_ISGID, f'lock dir missing setgid: {oct(dmode)}'
 
 
-class SharedOverlapBackend:
+class SharedOverlapBackend(SimpleAdmission):
     """Like OverlapBackend but records overlap into a shared counter, so two
     *separate* controllers' converges can be compared."""
 
@@ -184,7 +185,7 @@ class SharedOverlapBackend:
         self.last_assignments: dict = {}
         self._ids: set = set()
 
-    def converge(self, desired, *, apply: bool = True) -> None:
+    def converge(self, desired, *, apply: bool = True, placement=None) -> None:
         with self.guard:
             self.shared['active'] += 1
             self.shared['max'] = max(self.shared['max'], self.shared['active'])

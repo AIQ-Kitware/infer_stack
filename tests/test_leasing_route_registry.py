@@ -21,7 +21,7 @@ import yaml
 
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import Catalog, ComposeBackend, render_compose
-from infer_stack.leasing.compose import (
+from infer_stack.leasing.gateway import (
     CONFIG_HASH_LABEL,
     LITELLM_CONFIG_FILENAME,
     LITELLM_REGISTRY_FILENAME,

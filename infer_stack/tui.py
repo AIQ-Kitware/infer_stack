@@ -12,8 +12,9 @@ polled while hidden:
   it in Open WebUI.
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
-* **docker** — a collapsible pane with **Logs** and **Containers** (the
-  ``docker ps`` view: status/uptime, created, id, ports) tabs (collapsed by
+* **runtime** — a collapsible pane with **Logs**, **Instances** (what
+  ``infer-stack ps`` shows: containers or pods, status, what each serves,
+  ports) and **Control** (Apply / Down) tabs, on either backend (collapsed by
   default; ``c`` toggles it).
 * **system** — live ``nvidia-smi`` GPUs + host CPU/mem (collapsed by default).
 * **api** — send a prompt to a *ready* model through the LiteLLM gateway
@@ -31,13 +32,16 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
+from textual.lazy import Lazy
+from textual.widget import Widget
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
@@ -66,7 +70,7 @@ from .leasing import DeploymentState, LeaseState
 from rich.markup import escape as escape_markup
 
 from . import cli_equivalent as cli
-from .log_filter import LogLineSplitter, compact_litellm_tracebacks
+from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
 # The Select value meaning "every service EXCEPT the gateway". This is the
@@ -75,12 +79,8 @@ ALL_SERVICES = ''  # the Select value meaning "every service"
 # pane before anyone can read it. The gateway's own logs are one selection away
 # when they are what you want.
 ENGINE_SERVICES = '\x00engines'
-# Substring rather than equality: compose names the gateway service `litellm`
-# today, but deployment naming has carried suffixes before and a missed match
-# silently restores the noisy view.
-GATEWAY_SERVICE_HINT = 'litellm'
 # What `_resolve_log_target` returns when a view has nothing to follow. Not
-# None: None means "every service" to `docker compose logs`.
+# None: None means "every instance".
 NO_LOG_TARGET = object()
 
 
@@ -95,6 +95,63 @@ NO_LOG_TARGET = object()
 # candidate that is an actual sentinel object rather than a bool.
 #: Title of the tab that shows what the TUI itself did, and its errors.
 APP_LOG_TAB_TITLE = 'TUI log'
+# The top-level tabs, in order: keys 1-5 and the command palette reach them.
+TOP_TABS = (('Dashboard', 'tab-dashboard'), ('API', 'tab-api'), ('TUI settings', 'tab-ui'),
+            ('Settings', 'tab-settings'), (APP_LOG_TAB_TITLE, 'tab-applog'))
+
+#: The docker log pane shows at most this many lines (RichLog ``max_lines``).
+LOG_PANE_LINES = 2000
+#: How often streamed log lines are drawn: in one batch, not one UI message per
+#: line (which capped a loading engine's log at ~1800 lines/s).
+LOG_DRAIN_S = 0.1
+#: At most this many lines per drain: RichLog costs ~0.1 ms a line, and 2000 in
+#: one tick stalled the UI for 218 ms. The rest waits for the next tick.
+LOG_DRAIN_LINES = 200
+#: A UI-thread stall at least this long is reported, with what was running.
+STALL_REPORT_S = 0.5
+
+#: What a running background action is doing, shown in the activity line, by
+#: worker method. A worker not listed here (the refresh, log streams) is
+#: routine and shows nothing.
+ACTIVITY_VERBS = {
+    '_do_acquire': 'acquiring',
+    '_do_release': 'releasing',
+    '_do_release_all': 'releasing all leases',
+    '_do_evict': 'evicting',
+    '_do_evict_all': 'evicting idle deployments',
+    '_do_cleanup': 'cleaning up the ledger',
+    '_do_apply': 'applying',
+    '_do_compose': 'docker compose',
+    '_save_endpoint': 'saving endpoint',
+    '_do_suggest': 'inspecting GPUs for a suggestion',
+    '_prepare_endpoint_editor': 'inspecting GPUs',
+    '_do_api_send': 'waiting for the model',
+    '_do_api_test_all': 'testing every model',
+    '_do_api_list': 'listing models',
+}
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+
+def activity_label(description: str) -> str | None:
+    """``'acquiring qwen'`` from a worker description like ``_do_acquire('qwen')``.
+
+    Example:
+        >>> # xdoctest: +REQUIRES(module:textual)
+        >>> activity_label("_do_acquire('qwen')")
+        'acquiring qwen'
+        >>> activity_label('_do_apply()')
+        'applying'
+        >>> activity_label('_refresh_bg()') is None
+        True
+    """
+    import re
+
+    method, _, rest = str(description).partition('(')
+    verb = ACTIVITY_VERBS.get(method.strip())
+    if verb is None:
+        return None
+    first = re.match(r"\s*'([^']*)'", rest)
+    return f'{verb} {first.group(1)}' if first else verb
 
 SELECT_BLANK = next(
     (
@@ -106,18 +163,21 @@ SELECT_BLANK = next(
 )
 
 
+def _why(ex: BaseException) -> str:
+    """A failure for the status line: a refused runtime command the way the
+    CLI says it (its words, a hint), anything else as it reads."""
+    import subprocess
+
+    if isinstance(ex, subprocess.CalledProcessError):
+        from .cli import runtime_failure
+
+        return ' — '.join(line.strip() for line in runtime_failure(ex).splitlines())
+    return str(ex)
+
+
 def _select_is_blank(value: object) -> bool:
     return value is SELECT_BLANK
 
-
-def is_gateway_service(name: str) -> bool:
-    """Is this compose service the LiteLLM gateway rather than an engine?"""
-    return GATEWAY_SERVICE_HINT in str(name).lower()
-
-
-def engine_services(names) -> list[str]:
-    """Every service that is not the gateway, in the given order."""
-    return [n for n in names if not is_gateway_service(n)]
 
 SELECT_MARK = '✓'  # multi-select marker in the leases/deployments tables
 DEFAULT_THEME = 'textual-dark'
@@ -198,151 +258,6 @@ INFER_THEME = Theme(
     error='#ff6b6b',
     dark=True,
 )
-
-
-class _DockerLogProc:
-    r"""Follow the project's containers: recent history, then live output.
-
-    Not ``docker compose logs -f``, and not ``docker logs -f`` either: Docker's
-    log driver stores output line by line and holds a partial line until its
-    newline, so a download bar redrawn with ``\r`` showed nothing for many
-    minutes and then arrived all at once (measured with both). ``docker
-    attach`` reads the container's output as it is written, so each container
-    gets its recent ``docker logs --tail`` (complete lines), then an attach
-    with stdin closed and signals not forwarded -- ending it never touches the
-    container.
-
-    Containers are re-listed every ``poll`` seconds: one created later (a model
-    starting, a recreate) is followed from its first line, and one that
-    restarted is attached again. ``stdout`` yields ``service  | line`` like
-    Compose. Output written between the history read and the attach (a few
-    milliseconds) can be missed.
-    """
-
-    poll = 3.0
-
-    def __init__(self, project: str, compose_file: str, service=None):
-        import queue
-        import threading
-
-        del compose_file                    # the project label is enough to find them
-        self.project = project
-        if isinstance(service, (list, tuple)):
-            self.services = {str(s) for s in service}
-        else:
-            self.services = {str(service)} if service else None
-        self._lines: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
-        self._seen: set[str] = set()
-        self._live: dict[str, subprocess.Popen] = {}
-        threading.Thread(target=self._watch, daemon=True).start()
-
-    def _containers(self) -> list[tuple[str, str, bool]]:
-        """(id, service, running) for this project's containers in view."""
-        from .leasing.compose import docker_environment
-
-        out = subprocess.run(
-            ['docker', 'ps', '-a', '--filter',
-             f'label=com.docker.compose.project={self.project}',
-             '--format', '{{.ID}} {{.State}} {{.Label "com.docker.compose.service"}}'],
-            capture_output=True, text=True, timeout=30, env=docker_environment(),
-        ).stdout
-        found = []
-        for row in out.splitlines():
-            cid, _, rest = row.strip().partition(' ')
-            state, _, svc = rest.partition(' ')
-            if cid and (self.services is None or svc in self.services):
-                found.append((cid, svc, state == 'running'))
-        return sorted(found, key=lambda row: row[1])
-
-    def _watch(self) -> None:
-        import threading
-
-        first = True
-        while not self._stop.is_set():
-            try:
-                found = self._containers()
-            except Exception:  # noqa: BLE001 - docker unreachable: try again
-                found = []
-            for cid, svc, running in found:
-                attached = cid in self._live and self._live[cid].poll() is None
-                if cid not in self._seen:
-                    # Existing containers: the recent tail. A new one: all of it.
-                    history = '200' if first else 'all'
-                elif running and not attached:
-                    history = None          # restarted: attach again, no repeat
-                else:
-                    continue
-                self._seen.add(cid)
-                threading.Thread(target=self._follow, args=(cid, svc, history, running),
-                                 daemon=True).start()
-            first = False
-            self._stop.wait(self.poll)
-
-    def _follow(self, cid: str, service: str, history: str | None, running: bool) -> None:
-        from .leasing.compose import docker_environment
-
-        prefix = f'{service}  | '
-        if history is not None:
-            try:
-                old = subprocess.run(
-                    ['docker', 'logs', '--tail', history, cid],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
-                    env=docker_environment(),
-                ).stdout.decode('utf-8', 'replace')
-            except Exception:  # noqa: BLE001
-                old = ''
-            split = LogLineSplitter(every=0.0)
-            for line in split.feed(old) + split.flush():
-                self._lines.put(prefix + line)
-        if not running or self._stop.is_set():
-            return
-        proc = subprocess.Popen(
-            ['docker', 'attach', '--no-stdin', '--sig-proxy=false', cid],
-            # Engines log to stderr, which attach passes out on its own stderr.
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=docker_environment(),
-        )
-        self._live[cid] = proc
-        self._pump(proc, prefix)
-
-    def _pump(self, proc: subprocess.Popen, prefix: str) -> None:
-        import codecs
-        import os
-
-        decode = codecs.getincrementaldecoder('utf-8')('replace').decode
-        split = LogLineSplitter()
-        assert proc.stdout is not None           # Popen(stdout=PIPE)
-        fd = proc.stdout.fileno()
-        try:
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                for line in split.feed(decode(chunk)):
-                    self._lines.put(prefix + line)
-        finally:
-            proc.stdout.close()
-        for line in split.flush():
-            self._lines.put(prefix + line)
-
-    @property
-    def stdout(self) -> Iterable[str]:
-        import queue
-
-        while not self._stop.is_set():
-            try:
-                yield self._lines.get(timeout=0.5) + '\n'
-            except queue.Empty:
-                continue
-
-    def terminate(self) -> None:
-        self._stop.set()
-        for proc in list(self._live.values()):
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:  # noqa: BLE001
-                proc.kill()
 
 
 class _Divider(Static):
@@ -782,6 +697,30 @@ class _ConfirmScreen(ModalScreen):
         self.dismiss(event.button.id == 'ok')
 
 
+class _Section(Widget):
+    """A tab's content, built from ``compose_fn`` when it mounts.
+
+    Wrapped in :class:`textual.lazy.Lazy` for tabs hidden at launch, so the
+    first frame does not wait for widgets nobody can see yet (CSS and layout
+    of the whole tree was most of the launch time). The app is told when the
+    content exists, to fill anything it set before then.
+    """
+
+    DEFAULT_CSS = '_Section { height: 1fr; }'
+
+    def __init__(self, compose_fn: Callable[[], ComposeResult], *, id: str):
+        super().__init__(id=id)
+        self._compose_fn = compose_fn
+
+    def compose(self) -> ComposeResult:
+        yield from self._compose_fn()
+
+    def on_mount(self) -> None:
+        on_section = getattr(self.app, '_on_section_mounted', None)
+        if on_section is not None:
+            on_section(self.id)
+
+
 class InferStackTUI(App):
     """Monitor + control the leasing stack across panes."""
 
@@ -807,6 +746,9 @@ class InferStackTUI(App):
 
     /* one-line, per-pane descriptions (replaces the old global intro) */
     .desc { height: auto; color: $text-muted; padding: 0 1; }
+    /* A short terminal (see on_resize): rows go to tables and logs. */
+    .compact .desc { display: none; }
+    .compact #logsvc { margin: 0; }
     #catalog-help { height: auto; color: $text-muted; padding: 0 1; }
 
     #endpoint-actions, #lease-actions, #deployment-actions, #model-actions,
@@ -859,7 +801,11 @@ class InferStackTUI(App):
     #leases-pane { height: 14; min-height: 6; }   /* height set via _apply_sizes */
     #deployments-pane { height: 1fr; min-height: 6; }
     #leases, #deployments { height: 1fr; min-height: 3; }
-    #docker-tabs { height: 16; min-height: 8; }
+    /* tabbed pairs (_pair): the visible pane takes all the room */
+    .pair, .pair ContentSwitcher, .pair TabPane { height: 1fr; }
+    .pair TabPane { padding: 0; }
+    .pair #models, .pair #leases-pane { height: 1fr; }
+    #docker-tabs { height: 16; min-height: 8; }   /* capped by _log_height */
     #logsvc { margin: 0 0 1 0; }
     #logs, #ps { height: 1fr; background: $surface; }
     #gpus, #api-out { height: 8; background: $surface; }
@@ -875,6 +821,7 @@ class InferStackTUI(App):
     #api-extra Button { margin: 0 1 0 0; min-width: 12; }
 
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+    #activity { dock: bottom; height: 1; padding: 0 2; color: $warning; display: none; }
 
     #settings, #ui-settings { padding: 1 2; }
     #settings Label, #ui-settings Label { margin: 1 0 0 0; color: $text-muted; }
@@ -886,11 +833,20 @@ class InferStackTUI(App):
     #compose-actions Button { margin: 0 1 0 0; }
     """
 
+    #: Endpoints|models and leases|deployments as tabs (True), or as two panes
+    #: split by a draggable divider (False). Each is one switch to flip back.
+    TABBED_CATALOG = True
+    TABBED_TABLES = True
+
     BINDINGS = [
         # Truly global controls stay in the footer.
-        ('r', 'refresh', 'Refresh'),
+        ('r', 'refresh_now', 'Refresh'),
         # Global on purpose: an error can happen while any tab is in front.
         ('l', 'show_app_log', 'TUI log'),
+        # Forgets finished history in both tables, so it belongs to neither pane.
+        # Not "Clean up": `infer-stack clean` releases and tears everything
+        # down, and this only forgets finished rows (`gc --forget`).
+        ('x', 'cleanup', 'Clear finished'),
         ('tab', 'focus_next', 'Next pane'),
         ('q', 'quit', 'Quit'),
         # Pane-scoped actions: keys still work, but they live as buttons under
@@ -899,7 +855,6 @@ class InferStackTUI(App):
         Binding('d', 'release', 'Release', show=False),
         Binding('e', 'evict', 'Evict', show=False),
         Binding('a', 'release_all', 'Release all', show=False),
-        Binding('x', 'cleanup', 'Clean up', show=False),
         # Multi-select: space toggles the cursor row in the focused leases/
         # deployments table; release/evict then act on every checked row.
         Binding('space', 'toggle_select', 'Select row', show=False),
@@ -908,12 +863,15 @@ class InferStackTUI(App):
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
         Binding('y', 'copy_status', 'Copy status', show=False),
-        Binding('c', 'toggle_docker', 'Toggle docker', show=False),
+        Binding('c', 'toggle_docker', 'Toggle runtime', show=False),
         Binding('left_square_bracket', 'sidebar_narrower', 'sidebar -', show=False),
         Binding('right_square_bracket', 'sidebar_wider', 'sidebar +', show=False),
         Binding('minus', 'logs_shorter', 'logs -', show=False),
         Binding('plus', 'logs_taller', 'logs +', show=False),
         Binding('equals_sign', 'logs_taller', 'logs +', show=False),
+        # A focused Input takes digits first, so these never eat typing.
+        *(Binding(str(i), f"show_tab('{pane}')", label, show=False)
+          for i, (label, pane) in enumerate(TOP_TABS, 1)),
     ]
 
     def __init__(
@@ -925,12 +883,17 @@ class InferStackTUI(App):
         proc_factory: Callable[[str | None], Any] | None = None,
         catalog_path: str | Path | None = None,
         http: Any = None,
+        exit_after_paint: bool = False,
     ) -> None:
         super().__init__()
+        #: Quit once the first frame is drawn (``tui --exit_after_paint``).
+        self._exit_after_paint = exit_after_paint
+        #: Seconds from process start to the first drawn frame, once known.
+        self.first_frame_s: float | None = None
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
-        # Two cadences (see the UI tab): the ledger is cheap in-memory state, so
+        # Two cadences (see the TUI settings tab): the ledger is cheap in-memory state, so
         # it drives the visible refresh; ``observe()``/``plan()`` shell out to
         # docker, so they run on a slower beat and their result is cached between
         # ledger ticks. Persisted UI prefs (tui_settings.yaml) override the
@@ -955,6 +918,7 @@ class InferStackTUI(App):
         self._ps_rows_cache: list[tuple] = []
         self._gpus_rows_cache: list[tuple] = []
         self.catalog_path = Path(catalog_path).expanduser() if catalog_path else None
+        self._catalog_seen = self._catalog_stamp()   # the catalog given is this one
         self._http = http
         self._proc_factory = proc_factory or self._default_proc_factory()
         self._endpoint_names: list[str] = []
@@ -982,10 +946,29 @@ class InferStackTUI(App):
         # visible; only the current generation is allowed to append.
         self._log_generation = 0
         self._log_lines: list[str] = []  # mirror of the docker log pane, for tests
+        # Lines streamed by the log worker, drawn by the UI every LOG_DRAIN_S.
+        # (generation, line): a line from a replaced stream is dropped.
+        import collections
+        self._log_pending: collections.deque = collections.deque()
+        # Lines taken from _log_pending, not yet drawn; only the newest
+        # LOG_PANE_LINES are kept, since the pane shows no more.
+        self._log_backlog: collections.deque = collections.deque(maxlen=LOG_PANE_LINES)
+        self._log_dropped = 0
+        # Parsed compose service names, keyed by the file's (mtime, size).
+        self._last_instances: list = []
+        # Running background actions: worker -> (label, started). Drawn by
+        # _draw_activity, with the newest backend progress message.
+        self._activity: dict[Any, tuple[str, float]] = {}
+        self._activity_note = ''
+        # The UI loop's heartbeat, read by the stall watchdog thread.
+        self._beat = time.monotonic()
+        self._watchdog_stop = None
         self._app_log_lines: list[str] = []  # mirror of the TUI log pane, for tests
         self._app_log_errors = 0
         self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
+        # Follows the terminal's width (see _auto_sidebar) until resized by hand.
+        self._sidebar_set = False
         self._log_h = 16      # resizable via - + or dragging #hsplit
         self._models_h = 8    # resizable by dragging #csplit
         self._leases_h = 14   # resizable by dragging #tsplit
@@ -1013,15 +996,17 @@ class InferStackTUI(App):
         with TabbedContent(id='top'):
             with TabPane('Dashboard', id='tab-dashboard'):
                 yield from self._compose_dashboard()
+            # Hidden at launch: built right after the first frame, not before.
             with TabPane('API', id='tab-api'):
-                yield from self._compose_api()
-            with TabPane('UI', id='tab-ui'):
-                yield from self._compose_ui_settings()
+                yield Lazy(_Section(self._compose_api, id='section-api'))
+            with TabPane('TUI settings', id='tab-ui'):
+                yield Lazy(_Section(self._compose_ui_settings, id='section-ui'))
             with TabPane('Settings', id='tab-settings'):
-                yield from self._compose_settings()
+                yield Lazy(_Section(self._compose_settings, id='section-settings'))
             with TabPane(APP_LOG_TAB_TITLE, id='tab-applog'):
                 yield from self._compose_app_log()
         yield Static('', id='status')
+        yield Static('', id='activity')
         yield Footer()
 
     def _compose_app_log(self) -> ComposeResult:
@@ -1038,93 +1023,105 @@ class InferStackTUI(App):
         yield RichLog(id='applog', highlight=False, markup=True,
                       max_lines=4000, wrap=True)
 
+    def _pair(self, tabbed: bool, tabs_id: str, split_id: str, drag,
+              first: tuple[str, Any], second: tuple[str, Any]) -> ComposeResult:
+        """Two panes, as tabs or stacked around a draggable divider.
+
+        ``first``/``second`` are ``(tab label, compose function)``. Only the
+        container differs between the layouts: the panes, and every id the
+        rest of the app queries, are the same either way.
+        """
+        if tabbed:
+            with TabbedContent(id=tabs_id, classes='pair'):
+                for label, body in (first, second):
+                    with TabPane(label, id=f'pane-{label.lower()}'):
+                        yield from body()
+        else:
+            yield from first[1]()
+            yield _Divider('y', drag, id=split_id)
+            yield from second[1]()
+
+    def _compose_endpoints(self) -> ComposeResult:
+        yield Static('Endpoints: acquirable configurations', classes='desc')
+        yield Static('', id='catalog-help')
+        yield _EndpointTable(id='endpoints', cursor_type='row',
+                             zebra_stripes=True)
+        with Horizontal(id='endpoint-actions'):
+            yield Button('Acquire', id='btn-acquire', variant='primary',
+                         action='app.acquire')
+            yield Button('Add', id='btn-add-endpoint')
+            yield Button('Edit', id='btn-edit-endpoint')
+            yield Button('Remove', id='btn-remove-endpoint')
+        with Horizontal(id='suggest-actions'):
+            yield Button('✨  Suggest from my GPUs', id='btn-suggest')
+
+    def _compose_models(self) -> ComposeResult:
+        yield Static('Models: servable weights', classes='desc')
+        yield DataTable(id='models', cursor_type='row', zebra_stripes=True)
+        with Horizontal(id='model-actions'):
+            yield Button('Add', id='btn-add-model')
+            yield Button('Remove', id='btn-remove-model')
+
+    def _compose_leases(self) -> ComposeResult:
+        with Vertical(id='leases-pane'):
+            yield Static('Reservations that map to a deployment. '
+                         '(space or ctrl/shift-click to multiselect).',
+                         classes='desc')
+            yield DataTable(id='leases', cursor_type='row', zebra_stripes=True)
+            with Horizontal(id='lease-actions'):
+                yield Button('Release', id='btn-release')
+                yield Button('Release all', id='btn-release-all')
+
+    def _compose_deployments(self) -> ComposeResult:
+        with Vertical(id='deployments-pane'):
+            yield Static('Models running.', classes='desc')
+            yield DataTable(id='deployments', cursor_type='row',
+                            zebra_stripes=True)
+            with Horizontal(id='deployment-actions'):
+                yield Button('Evict', id='btn-evict')
+                yield Button('Evict all idle', id='btn-evict-all')
+
     def _compose_dashboard(self) -> ComposeResult:
         with Horizontal(id='body'):
             with Vertical(id='sidebar'):
-                yield Static(
-                    'Endpoints — runnable model + engine configs. Acquire one to '
-                    'serve it, or Suggest a set sized to your GPUs.', classes='desc',
-                )
-                yield Static('', id='catalog-help')
-                yield _EndpointTable(id='endpoints', cursor_type='row',
-                                     zebra_stripes=True)
-                with Horizontal(id='endpoint-actions'):
-                    yield Button('Acquire', id='btn-acquire', variant='primary',
-                                 action='app.acquire')
-                    yield Button('Add', id='btn-add-endpoint')
-                    yield Button('Edit', id='btn-edit-endpoint')
-                    yield Button('Remove', id='btn-remove-endpoint')
-                with Horizontal(id='suggest-actions'):
-                    yield Button('✨  Suggest from my GPUs', id='btn-suggest')
-                yield _Divider('y', self._drag_models, id='csplit')
-                yield Static(
-                    'Models — weights an endpoint can serve. Add models here, '
-                    'then point an endpoint at one.', classes='desc',
-                )
-                yield DataTable(id='models', cursor_type='row',
-                                zebra_stripes=True)
-                with Horizontal(id='model-actions'):
-                    yield Button('Add', id='btn-add-model')
-                    yield Button('Remove', id='btn-remove-model')
+                yield from self._pair(
+                    self.TABBED_CATALOG, 'catalog-tabs', 'csplit', self._drag_models,
+                    ('Endpoints', self._compose_endpoints),
+                    ('Models', self._compose_models))
             yield _Divider('x', self._drag_sidebar, id='vsplit')
             with Vertical(id='main'):
                 with Vertical(id='tables'):
-                    with Vertical(id='leases-pane'):
-                        yield Static(
-                            'Reservations you hold. Each maps to one deployment '
-                            'below (see the deployment column); many leases can '
-                            'share one. Release acts on the cursor row, or on '
-                            'every row you check (space, or ctrl/shift-click).',
-                            classes='desc',
-                        )
-                        yield DataTable(id='leases', cursor_type='row',
-                                        zebra_stripes=True)
-                        with Horizontal(id='lease-actions'):
-                            yield Button('Release', id='btn-release')
-                            yield Button('Release all', id='btn-release-all')
-                            yield Button('Clean up', id='btn-cleanup')
-                    yield _Divider('y', self._drag_tables, id='tsplit')
-                    with Vertical(id='deployments-pane'):
-                        yield Static(
-                            'Running model deployments and the GPUs they hold. '
-                            "The 'leases' column is how many leases hold each. "
-                            'Evict an idle one to free its GPU (cursor row, or '
-                            'rows checked with space / ctrl/shift-click); Evict '
-                            'all idle clears every kept-warm one; Clean up forgets '
-                            'stopped ones.', classes='desc',
-                        )
-                        yield DataTable(id='deployments', cursor_type='row',
-                                        zebra_stripes=True)
-                        with Horizontal(id='deployment-actions'):
-                            yield Button('Evict', id='btn-evict')
-                            yield Button('Evict all idle', id='btn-evict-all')
-                            yield Button('Clean up', id='btn-cleanup-deployments')
+                    yield from self._pair(
+                        self.TABBED_TABLES, 'table-tabs', 'tsplit', self._drag_tables,
+                        ('Leases', self._compose_leases),
+                        ('Deployments', self._compose_deployments))
                 yield _Divider('y', self._drag_logs, id='hsplit')
-                with Collapsible(title='docker', collapsed=True, id='docker'):
+                with Collapsible(title='runtime', collapsed=True, id='docker'):
                     with TabbedContent(id='docker-tabs'):
                         with TabPane('Logs', id='tab-logs'):
                             yield Select(
-                                [('(engines — no litellm)', ENGINE_SERVICES),
-                                 ('(all services)', ALL_SERVICES)],
+                                [('(engines)', ENGINE_SERVICES),
+                                 ('(everything)', ALL_SERVICES)],
                                 value=ENGINE_SERVICES, allow_blank=False,
                                 id='logsvc',
                             )
                             yield RichLog(id='logs', highlight=False,
-                                          markup=False, max_lines=2000,
+                                          markup=False, max_lines=LOG_PANE_LINES,
                                           wrap=False)
-                        with TabPane('Containers', id='tab-containers'):
+                        with TabPane('Instances', id='tab-containers'):
                             yield DataTable(id='ps', cursor_type='row',
                                             zebra_stripes=True)
                         with TabPane('Control', id='tab-control'):
                             yield Static(
-                                'Bring the rendered compose project up or down. '
+                                'Apply brings up what the ledger says should run. '
+                                'Down stops everything and releases no lease. '
                                 'Output appears in the Logs tab.', classes='hint',
                             )
                             yield Static('', id='compose-path')
                             with Horizontal(id='compose-actions'):
-                                yield Button('Compose up', id='btn-compose-up',
+                                yield Button('Apply', id='btn-compose-up',
                                              variant='primary')
-                                yield Button('Compose down',
+                                yield Button('Down',
                                              id='btn-compose-down')
                 with Collapsible(title='system', collapsed=True, id='system'):
                     yield Static(
@@ -1172,8 +1169,8 @@ class InferStackTUI(App):
             yield Input(value=f'{self.ledger_interval:g}',
                         id='set-ledger-interval')
             yield Label(
-                'docker observe interval (seconds) — the "running" / GPU-placement '
-                'columns; higher = fewer `docker compose ps` calls'
+                'runtime observe interval (seconds) — the "running" / GPU columns '
+                'and the runtime pane; higher = fewer runtime queries'
             )
             yield Input(value=f'{self.observe_interval:g}',
                         id='set-observe-interval')
@@ -1249,7 +1246,7 @@ class InferStackTUI(App):
             'leases', 'held by'
         )
         self.query_one('#ps', DataTable).add_columns(
-            'service', 'status (uptime)', 'created', 'container id', 'ports'
+            'name', 'status', 'serves', 'started', 'ports'
         )
         self.query_one('#gpus', DataTable).add_columns(
             'gpu', 'name', 'util%', 'mem (used/total)', 'temp'
@@ -1268,9 +1265,9 @@ class InferStackTUI(App):
             '…', '(loading…)', '-', '-', '-'
         )
         self._gpus_rows_cache = [('__loading__',) * 5]
-        compose_file = getattr(self.controller.backend, 'compose_file', None)
+        rendered = getattr(self.controller.backend, 'rendered_file', None)
         self.query_one('#compose-path', Static).update(
-            f'compose file: {compose_file or "(not rendered yet)"}'
+            f'rendered: {rendered or "(this backend renders no file)"}'
         )
         # Capture docker's own chatter (up/down progress on stderr) into the
         # logs pane instead of letting it bleed onto the full-screen terminal.
@@ -1289,33 +1286,128 @@ class InferStackTUI(App):
         self._refresh_timer = self.set_interval(
             self.ledger_interval, self.action_refresh
         )
+        self.set_interval(LOG_DRAIN_S, self._drain_logs)
+        # Held directly: query_one searches the active screen, which is a
+        # dialog's while one is open.
+        self._activity_widget = self.query_one('#activity', Static)
+        self.set_interval(0.1, self._draw_activity)
+        self._start_stall_watchdog()
         self.query_one('#endpoints', DataTable).focus()
+        self.call_after_refresh(self._first_frame_drawn)
+
+    def _first_frame_drawn(self) -> None:
+        self.first_frame_s = _seconds_since_process_start()
+        if self._exit_after_paint:
+            self.exit()
 
     def on_unmount(self) -> None:
         self._terminate_logs()
+        if self._watchdog_stop is not None:
+            self._watchdog_stop.set()
+        # Quit must not wait for the background refresh's `docker compose ps`:
+        # Python joins worker threads at exit. Read-only queries only.
+        from .leasing.compose import cancel_running_queries
+
+        cancel_running_queries()
+
+    # -- responsiveness ------------------------------------------------------
+
+    def _start_stall_watchdog(self) -> None:
+        """Report any UI-thread stall, with the stack that caused it.
+
+        A 0.1 s timer on the UI loop moves a heartbeat; a watchdog thread notices
+        when it stops, samples the UI thread's stack while it is stuck, and
+        reports the stall once it ends: its length in the TUI log, the stack in
+        the error log file. "The TUI froze" then comes with what it was doing.
+        """
+        import sys
+        import threading
+
+        ui_thread = threading.get_ident()
+        stop = threading.Event()
+        self._watchdog_stop = stop
+
+        def beat() -> None:
+            self._beat = time.monotonic()
+
+        self.set_interval(0.1, beat)
+
+        def watch() -> None:
+            import traceback
+
+            stalled_since = None
+            stack: list[str] = []
+            while not stop.wait(0.1):
+                behind = time.monotonic() - self._beat
+                if behind >= STALL_REPORT_S:
+                    if stalled_since is None:
+                        stalled_since = self._beat
+                        # The first sample, half a second in, is inside whatever
+                        # blocks; later ones can catch the loop catching up.
+                        frame = sys._current_frames().get(ui_thread)
+                        if frame is not None:
+                            stack = traceback.format_stack(frame)
+                elif stalled_since is not None:
+                    length = self._beat - stalled_since
+                    try:
+                        self.call_from_thread(self._report_stall, length, stack)
+                    except Exception:  # noqa: BLE001 - app shutting down
+                        return
+                    stalled_since, stack = None, []
+
+        threading.Thread(target=watch, name='tui-stall-watchdog', daemon=True).start()
+
+    def _report_stall(self, length: float, stack: list[str]) -> None:
+        # The innermost frames in infer_stack say what to fix; the file keeps all.
+        ours = [f for f in stack if 'infer_stack' in f] or stack
+        where = ours[-1].strip().splitlines()[0] if ours else '(no stack)'
+        path = self.error_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} '
+                             f'UI stalled {length:.1f}s\n')
+                handle.writelines(stack)
+        except OSError:
+            pass
+        self.app_log(f'UI stalled {length:.1f}s in {where} (stack: {path})', level='warn')
 
     # -- theming for docker output bleed ----------------------------------
 
     def _install_quiet_docker(self) -> None:
-        """Route ``docker compose`` output to the logs pane, not the terminal."""
-        backend = self.controller.backend
-        if not hasattr(backend, 'run'):
-            return
+        """Route ``docker`` output to the logs pane, not the terminal.
 
+        Only where the backend runs Docker with the default runner: the kubeai
+        backend runs ``kubectl`` through the same seam, and the Docker
+        runner's allowlisted environment has no ``KUBECONFIG`` (every kubectl
+        call from the TUI used to fail); an injected runner is the caller's
+        and is left alone. The kubeai backend's gateway is a Compose project
+        of its own, so it is wrapped too.
+        """
         from .leasing.compose import _default_docker_run
 
-        def quiet_run(args: list[str], **kwargs) -> str:
-            # Same bounded, explicit-environment runner as the CLI; only stderr
-            # is redirected to the logs pane, unless the caller takes it.
-            noisy = not any(a == 'ps' for a in args)
-            sink = (
-                (lambda line: self.call_from_thread(self._append_log, line))
-                if noisy else (lambda line: None)
-            )
-            kwargs.setdefault('stderr_lines', sink)
-            return _default_docker_run(args, **kwargs)
+        def quiet(target) -> None:
+            original = getattr(target, 'run', None)
+            if original is not _default_docker_run:
+                return
 
-        backend.run = quiet_run
+            def quiet_run(args: list[str], **kwargs) -> str:
+                # Same bounded, explicit-environment runner as the CLI; only
+                # stderr is redirected to the logs pane, unless the caller
+                # takes it.
+                noisy = not any(a == 'ps' for a in args)
+                sink = (
+                    (lambda line: self.call_from_thread(self._append_log, line))
+                    if noisy else (lambda line: None)
+                )
+                kwargs.setdefault('stderr_lines', sink)
+                return _default_docker_run(args, **kwargs)
+
+            target.run = quiet_run
+
+        backend = self.controller.backend
+        quiet(backend)
+        quiet(getattr(backend, 'gateway', None))
         if hasattr(backend, 'progress'):
             backend.progress = self._backend_progress
 
@@ -1326,26 +1418,91 @@ class InferStackTUI(App):
         except RuntimeError:           # already on the UI thread
             self._show_progress(message)
 
+    def _on_section_mounted(self, section_id: str | None) -> None:
+        """A deferred tab now exists: fill what was set before it did."""
+        if section_id == 'section-api':
+            self._update_api_urls()
+            self._update_api_curl()
+            self._sync_api_models(list(getattr(self, '_api_models_wanted', [])))
+
     def _show_progress(self, message: str) -> None:
         self._status(message)          # also recorded in the TUI log
+        self._activity_note = message  # and beside the running action
+
+    def _draw_activity(self) -> None:
+        """The activity line: what is running, for how long, and its progress."""
+        widget = getattr(self, '_activity_widget', None)
+        if widget is None:
+            return
+        if not self._activity:
+            if widget.display:
+                widget.display = False
+                self._activity_note = ''
+            return
+        now = time.monotonic()
+        spin = SPINNER[int(now * 10) % len(SPINNER)]
+        parts = [f'{label} · {now - started:.0f}s'
+                 for label, started in sorted(self._activity.values(), key=lambda v: v[1])]
+        note = f'  —  {self._activity_note}' if self._activity_note else ''
+        widget.update(f'{spin} ' + '  |  '.join(parts) + note)
+        widget.display = True
 
     # -- resizable panes ---------------------------------------------------
 
-    def _apply_sizes(self) -> None:
+    def _log_height(self, rows: int | None = None) -> int:
+        """The runtime pane's log height: the chosen one, capped near half the
+        screen, so on a small terminal the lease and deployment tables keep
+        rows when the pane opens (its tabs and picker take ~9 rows already)."""
+        # The tabbed area holds the tab strip (2) and the source picker (3)
+        # before any log line: 8 is those and three lines.
+        rows = rows or self.size.height or 50
+        return max(8, min(self._log_h, rows // 2 - 4))
+
+    #: Below this many rows the pane descriptions give way to tables and logs.
+    COMPACT_ROWS = 32
+
+    @staticmethod
+    def _auto_sidebar(columns: int) -> int:
+        """The catalog sidebar's width before anyone drags it.
+
+        38 fits an 80-column terminal beside the tables; a wide terminal gives
+        the catalog's columns room instead of truncating them next to empty
+        space.
+
+        >>> [InferStackTUI._auto_sidebar(c) for c in (80, 120, 160, 200, 300)]
+        [38, 40, 53, 64, 64]
+        """
+        return max(38, min(64, columns // 3))
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.set_class(event.size.height < self.COMPACT_ROWS, 'compact')
+        if not self._sidebar_set:
+            self._sidebar_w = self._auto_sidebar(event.size.width)
+        try:
+            # The event's size: the app's own still reads the old one here.
+            self._apply_sizes(event.size.height)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            pass
+
+    def _apply_sizes(self, rows: int | None = None) -> None:
         self.query_one('#sidebar').styles.width = self._sidebar_w
-        self.query_one('#docker-tabs').styles.height = self._log_h
-        self.query_one('#models').styles.height = self._models_h
-        self.query_one('#leases-pane').styles.height = self._leases_h
+        self.query_one('#docker-tabs').styles.height = self._log_height(rows)
+        # Fixed heights only matter beside a divider; a tab fills its pane.
+        if not self.TABBED_CATALOG:
+            self.query_one('#models').styles.height = self._models_h
+        if not self.TABBED_TABLES:
+            self.query_one('#leases-pane').styles.height = self._leases_h
 
     def _drag_sidebar(self, delta: int) -> None:
         # Allow the full width range (down to a sliver, up to nearly all of it),
         # not just the middle — clamp against the actual terminal width.
         hi = max(20, self.size.width - 12)
+        self._sidebar_set = True
         self._sidebar_w = max(10, min(hi, self._sidebar_w + delta))
         self._apply_sizes()
 
     def _drag_logs(self, delta: int) -> None:
-        # Dragging the divider down (delta > 0) makes the docker pane shorter.
+        # Dragging the divider down (delta > 0) makes the runtime pane shorter.
         self._log_h = max(6, min(60, self._log_h - delta))
         self._apply_sizes()
 
@@ -1444,10 +1601,14 @@ class InferStackTUI(App):
 
     def _sync_api_models(self, names: list[str]) -> None:
         """Point the API model selector at the currently-ready endpoints only."""
+        self._api_models_wanted = names
         if names == self._ready_endpoints:
             return
+        try:
+            select = self.query_one('#api-model', Select)
+        except NoMatches:
+            return          # the API tab is not built yet; filled when it is
         self._ready_endpoints = names
-        select = self.query_one('#api-model', Select)
         current = None if _select_is_blank(select.value) else select.value
         select.set_options([(n, n) for n in names])
         if current in names:
@@ -1468,9 +1629,26 @@ class InferStackTUI(App):
                 'open it in Open WebUI.'
             )
 
+    def _catalog_stamp(self):
+        """The catalog file's (mtime, size), or None when there is none."""
+        try:
+            st = self.catalog_path.stat() if self.catalog_path else None
+        except OSError:
+            return None
+        return None if st is None else (st.st_mtime_ns, st.st_size)
+
+    def _reload_catalog_if_changed(self) -> None:
+        """Pick up an edit made outside the TUI (checked on each refresh)."""
+        stamp = self._catalog_stamp()
+        if stamp is not None and stamp != getattr(self, '_catalog_seen', None):
+            self._reload_catalog()
+
     def _reload_catalog(self) -> None:
         if not self.catalog_path or not self.catalog_path.exists():
             return
+        # Remember this version even if it fails to load: a half-saved edit is
+        # reported once, not on every refresh until it is fixed.
+        self._catalog_seen = self._catalog_stamp()
         try:
             from .leasing import Catalog
             self.catalog = Catalog.load(self.catalog_path)
@@ -1509,8 +1687,8 @@ class InferStackTUI(App):
                 'leases': leases, 'deployments': deployments,
                 'observed': self._observed, 'assignments': self._assignments,
             }
-            if not self._collapsed['docker'] and self._active_tab == 'tab-containers':
-                data['ps'] = self._compose_ps_rows()
+            if not self._collapsed['docker']:
+                data['instances'] = self._instance_list()
             if not self._collapsed['system']:
                 data['gpus'] = self._gpu_rows()
                 data['sysinfo'] = self._system_line()
@@ -1528,8 +1706,11 @@ class InferStackTUI(App):
         self._fill_deployments(
             data['deployments'], data['observed'], data['assignments'], data['leases']
         )
-        if 'ps' in data:
-            self._fill_ps(data['ps'])
+        if 'instances' in data:
+            if data['instances'] is not None:
+                self._last_instances = data['instances']
+            if self._active_tab == 'tab-containers':
+                self._fill_ps(self._ps_rows(data['instances']))
         if 'gpus' in data:
             self._fill_gpus(data['gpus'])
             self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
@@ -1615,7 +1796,7 @@ class InferStackTUI(App):
 
     def _apply_poll_settings(self) -> None:
         """Restart the refresh timer at the current ledger cadence and force the
-        next observe to run, so changes from the UI tab take effect at once."""
+        next observe to run, so changes from the TUI settings tab take effect at once."""
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
         self._refresh_timer = self.set_interval(
@@ -1628,8 +1809,17 @@ class InferStackTUI(App):
         data = self._collect()
         self.call_from_thread(self._render, data)
 
+    def action_refresh_now(self) -> None:
+        """The `r` key: a refresh the user asked for (the timer calls
+        ``action_refresh`` directly, and must not fill the TUI log). It also
+        rereads the catalog, edited or not."""
+        self._cli(cli.command('status'))
+        self._reload_catalog()
+        self.action_refresh()
+
     def action_refresh(self) -> None:
         self._sync_pane_state()   # capture pane state on the UI thread first
+        self._reload_catalog_if_changed()
         self._refresh_bg()
 
     def _update_summary(self, leases, deployments, observed) -> None:
@@ -1640,16 +1830,34 @@ class InferStackTUI(App):
         # "0 running" — say we're still observing instead of silently lying.
         observing = self._observed_at is None
         running_label = 'observing…' if observing else f'{running} running'
+        # Assign only on change: Textual repaints a pane whenever its border
+        # title is set, even to the same text, and these two panes hold the
+        # lease and deployment tables -- most of the screen, every tick
+        # (~7 KB/s of terminal output while nothing changed).
         try:
-            self.query_one('#docker', Collapsible).title = (
-                f'docker — {running_label}'
-            )
-            self.query_one('#leases-pane').border_title = (
-                f'leases — {active} active / {len(leases)}'
-            )
-            self.query_one('#deployments-pane').border_title = (
-                f'deployments — {running_label} / {len(deployments)}'
-            )
+            docker = self.query_one('#docker', Collapsible)
+            title = f'runtime — {running_label}'
+            if docker.title != title:
+                docker.title = title
+            for pane, text in (
+                ('#leases-pane', f'leases — {active} active / {len(leases)}'),
+                ('#deployments-pane',
+                 f'deployments — {running_label} / {len(deployments)}'),
+            ):
+                widget = self.query_one(pane)
+                if widget.border_title != text:
+                    widget.border_title = text
+            if self.TABBED_TABLES:
+                # A hidden tab's counts show on its label.
+                tabs = self.query_one('#table-tabs', TabbedContent)
+                for pane_id, text in (
+                    ('pane-leases', f'Leases {active}/{len(leases)}'),
+                    ('pane-deployments', f'Deployments {"…" if observing else running}'
+                                        f'/{len(deployments)}'),
+                ):
+                    tab = tabs.get_tab(pane_id)
+                    if str(tab.label) != text:
+                        tab.label = text
         except Exception:  # noqa: BLE001
             pass
 
@@ -1732,12 +1940,15 @@ class InferStackTUI(App):
 
     def _fill_ps(self, rows) -> None:
         table = self.query_one('#ps', DataTable)
-        new_rows = [
-            (row['service'], row['status'], row['created'] or '-',
-             row['id'] or '-', row['ports'] or '-')
-            for row in rows
-        ]
-        if not rows:
+        if rows is None:
+            new_rows = [('(cannot read the runtime)', '-', '-', '-', '-')]
+        else:
+            new_rows = [
+                (row['name'], row['status'], row['serves'] or '-',
+                 row['started'] or '-', row['ports'] or '-')
+                for row in rows
+            ]
+        if rows is not None and not rows:
             new_rows = [('(nothing running)', '-', '-', '-', '-')]
         self._diff_fill(table, new_rows, '_ps_rows_cache', id_index=0)
 
@@ -1838,68 +2049,36 @@ class InferStackTUI(App):
 
     # -- docker ps ---------------------------------------------------------
 
-    def _compose_ps_rows(self) -> list[dict[str, str]]:
-        """Best-effort ``docker compose ps`` rows."""
-        import json
-
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        run = getattr(backend, 'run', None)
-        if not path or not run or not Path(path).exists():
-            return []
-        project = getattr(backend, 'project', 'infer-stack')
+    def _instance_list(self):
+        """What the backend runs (worker thread), or ``None`` if unreadable."""
         try:
-            out = run([
-                'docker', 'compose', '-p', str(project), '-f', str(path),
-                'ps', '--format', 'json',
-            ])
-        except Exception:  # noqa: BLE001 - ps is best-effort
-            return []
-        rows: list[dict[str, Any]] = []
-        out = (out or '').strip()
-        if not out:
-            return []
-        try:
-            parsed = json.loads(out)
-            rows = parsed if isinstance(parsed, list) else [parsed]
-        except json.JSONDecodeError:
-            for line in out.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        result = []
-        for row in rows:
-            ports = _fmt_ports(row) or str(row.get('Ports') or '')
-            cid = str(row.get('ID') or '')[:12]
-            # `Status` is the docker-ps STATUS column ("Up 3 minutes") — it
-            # carries the uptime; `CreatedAt`/`RunningFor` give the age.
-            created = str(row.get('CreatedAt') or row.get('RunningFor') or '')
-            result.append({
-                'service': str(row.get('Service') or row.get('Name') or '?'),
-                'status': str(row.get('Status') or row.get('State') or '?'),
-                'created': created,
-                'id': cid,
-                'ports': ports,
-            })
-        return sorted(result, key=lambda r: r['service'])
+            return list(self.controller.backend.instances())
+        except Exception:  # noqa: BLE001 - a monitor must never crash
+            return None
 
-    # -- logs --------------------------------------------------------------
+    def _ps_rows(self, instances) -> list[dict[str, str]] | None:
+        """Rows for the Instances table (same shape as ``infer-stack ps``)."""
+        from .leasing.instances import local_time
+
+        if instances is None:
+            return None
+        served = {g.id: sorted(g.served) for g in (self._last_deployments or [])}
+        return [{
+            'name': i.name,
+            'status': i.status,
+            'serves': (', '.join(served.get(i.deployment_id, []))
+                       if i.deployment_id else '(front door)'),
+            'started': local_time(i.started),
+            'ports': i.ports,
+        } for i in instances]
 
     def _service_names(self) -> list[str]:
-        """Service names from the on-disk compose file (best-effort)."""
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        if not path:
-            return []
-        try:
-            import yaml
-            data = yaml.safe_load(Path(path).read_text()) or {}
-            return sorted((data.get('services') or {}).keys())
-        except Exception:  # noqa: BLE001
-            return []
+        """Names of the instances last seen (refreshed by the worker)."""
+        return sorted({i.name for i in self._last_instances})
+
+    def _engine_names(self) -> list[str]:
+        """Names of the last-seen instances that serve a deployment."""
+        return sorted({i.name for i in self._last_instances if i.is_engine})
 
     def _sync_log_services(self) -> None:
         names = self._service_names()
@@ -1908,8 +2087,8 @@ class InferStackTUI(App):
         self._service_options = names
         select = self.query_one('#logsvc', Select)
         options = [
-            ('(engines — no litellm)', ENGINE_SERVICES),
-            ('(all services)', ALL_SERVICES),
+            ('(engines)', ENGINE_SERVICES),
+            ('(everything)', ALL_SERVICES),
         ] + [(n, n) for n in names]
         # Keep whatever is selected. The two sentinels are not service names,
         # so they have to be allowed through explicitly or refreshing the
@@ -1952,13 +2131,20 @@ class InferStackTUI(App):
             self._update_api_curl()
 
     def _default_proc_factory(self) -> Callable[[str | None], Any]:
-        def factory(service: str | None):
+        def factory(service):
+            from .leasing.instances import LogFollower
+
             backend = self.controller.backend
-            path = getattr(backend, 'compose_file', None)
-            project = getattr(backend, 'project', 'infer-stack')
-            if not path:
-                return None
-            return _DockerLogProc(str(project), str(path), service)
+            if isinstance(service, (list, tuple)):
+                wanted: set[str] | None = {str(s) for s in service}
+            else:
+                wanted = {str(service)} if service else None
+
+            def listing():
+                found = backend.instances()
+                return [i for i in found if wanted is None or i.name in wanted]
+
+            return LogFollower(listing, prefix='auto')
 
         return factory
 
@@ -1973,6 +2159,8 @@ class InferStackTUI(App):
         log = self.query_one('#logs', RichLog)
         log.clear()
         self._log_lines = []
+        self._log_backlog.clear()
+        self._log_dropped = 0
         target, label = self._resolve_log_target(service)
         if target is NO_LOG_TARGET:
             log.write(f'— {label} —')
@@ -1990,14 +2178,14 @@ class InferStackTUI(App):
         its absence, and it stays that way once engines do appear.
         """
         if service == ENGINE_SERVICES:
-            names = engine_services(self._service_names())
+            names = self._engine_names()
             if not names:
                 return NO_LOG_TARGET, (
-                    'no engine services yet; choose (all services) '
+                    'no engines running; choose (everything) '
                     'for the gateway')
             return names, f'engines: {", ".join(names)}'
         if not service:
-            return None, 'all services'
+            return None, 'everything'
         return service, service
 
     def _stop_log_proc(self) -> None:
@@ -2021,7 +2209,7 @@ class InferStackTUI(App):
         if proc is None:
             self.call_from_thread(
                 self._append_log_if_current, generation,
-                '(no compose project yet — acquire a model)'
+                '(nothing to follow — acquire a model)'
             )
             return
         if generation != self._log_generation:
@@ -2033,9 +2221,10 @@ class InferStackTUI(App):
         self._log_proc = proc
         try:
             for line in compact_litellm_tracebacks(proc.stdout):
-                self.call_from_thread(
-                    self._append_log_if_current, generation, line.rstrip('\n')
-                )
+                if generation != self._log_generation:
+                    break
+                # Drawn in batches by _drain_logs; deque.append is thread-safe.
+                self._log_pending.append((generation, line.rstrip('\n')))
         except Exception:  # noqa: BLE001 - stream ends when the proc dies
             pass
         finally:
@@ -2048,8 +2237,36 @@ class InferStackTUI(App):
         self._append_log(line)
 
     def _append_log(self, line: str) -> None:
-        self._log_lines.append(line)
-        self.query_one('#logs', RichLog).write(line)
+        self._write_log_lines([line])
+
+    def _write_log_lines(self, lines: list[str]) -> None:
+        self._log_lines.extend(lines)
+        if len(self._log_lines) > 2 * LOG_PANE_LINES:
+            del self._log_lines[:-LOG_PANE_LINES]
+        # Engines color their output (vLLM's "(APIServer pid=1)" prefix): as
+        # a plain string the escape codes garbled the line; as ANSI they are
+        # colors, and _log_lines keeps the raw text for search and copy.
+        from rich.text import Text
+
+        self.query_one('#logs', RichLog).write(Text.from_ansi('\n'.join(lines)))
+
+    def _drain_logs(self) -> None:
+        """Draw streamed lines: a bounded batch per tick, newest lines kept."""
+        pending, backlog = self._log_pending, self._log_backlog
+        while pending:
+            generation, line = pending.popleft()
+            if generation != self._log_generation:
+                continue
+            if len(backlog) == backlog.maxlen:
+                self._log_dropped += 1          # the oldest undrawn line falls off
+            backlog.append(line)
+        if not backlog:
+            return
+        batch = [backlog.popleft() for _ in range(min(LOG_DRAIN_LINES, len(backlog)))]
+        if self._log_dropped:
+            batch.insert(0, f'… {self._log_dropped} earlier line(s) not shown')
+            self._log_dropped = 0
+        self._write_log_lines(batch)
 
     # -- the TUI's own log -------------------------------------------------
 
@@ -2109,6 +2326,25 @@ class InferStackTUI(App):
             if self._app_log_errors else APP_LOG_TAB_TITLE
         )
 
+    def action_show_tab(self, pane: str) -> None:
+        """Bring a top-level tab to the front (keys 1-5, the palette)."""
+        if pane == 'tab-applog':
+            self.action_show_app_log()
+            return
+        from textual.widgets._tabbed_content import ContentTabs
+
+        top = self.query_one('#top', TabbedContent)
+        top.active = pane
+        # Focus the tab bar, as action_show_app_log focuses its log: a table
+        # still focused on the dashboard would pull the dashboard back.
+        top.query_one(ContentTabs).focus()
+
+    def get_system_commands(self, screen):
+        yield from super().get_system_commands(screen)
+        for i, (label, pane) in enumerate(TOP_TABS, 1):
+            yield SystemCommand(f'Go to {label}', f'Show the {label} tab (key {i})',
+                                lambda pane=pane: self.action_show_tab(pane))
+
     def action_show_app_log(self) -> None:
         """Jump to the TUI log (what the status line and the toast point at)."""
         self.query_one('#top', TabbedContent).active = 'tab-applog'
@@ -2162,6 +2398,14 @@ class InferStackTUI(App):
 
         worker = event.worker
         name = worker.name or worker.group or 'worker'
+        if event.state is WorkerState.RUNNING:
+            label = activity_label(worker.description)
+            if label is not None:
+                self._activity[worker] = (label, time.monotonic())
+                self._draw_activity()
+        elif event.state in (WorkerState.SUCCESS, WorkerState.ERROR,
+                             WorkerState.CANCELLED):
+            self._activity.pop(worker, None)
         if event.state is WorkerState.ERROR:
             error = getattr(worker, 'error', None)
             if error is not None:
@@ -2441,8 +2685,6 @@ class InferStackTUI(App):
             'btn-release-all': self.action_release_all,
             'btn-evict': self.action_evict,
             'btn-evict-all': self.action_evict_all,
-            'btn-cleanup': self.action_cleanup,
-            'btn-cleanup-deployments': self.action_cleanup,
             'btn-suggest': self.action_suggest,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
@@ -2483,6 +2725,7 @@ class InferStackTUI(App):
             return
         self.ledger_interval = ledger
         self.observe_interval = max(observe, ledger)  # observe never beats ledger
+        self.app_log('CLI: none; poll intervals are a TUI-only preference')
         self._apply_poll_settings()
         prefs = load_tui_settings()
         prefs['ledger_interval'] = self.ledger_interval
@@ -2494,7 +2737,7 @@ class InferStackTUI(App):
                 f'{self.observe_interval:g}s → {path}'
             )
         except Exception as ex:  # noqa: BLE001
-            self._status(f'save UI settings failed: {ex}')
+            self._status(f'save TUI settings failed: {ex}')
 
     def _on_save_settings(self) -> None:
         from .paths import load_settings, save_settings
@@ -2512,6 +2755,10 @@ class InferStackTUI(App):
             )
             path = save_settings(s)
             self._status(f'saved settings → {path}')
+            self._cli(*(cli.command('config', 'set', key, str(s[key]).lower()
+                                    if isinstance(s[key], bool) else s[key])
+                        for key in ('backend', 'data_dir', 'ui', 'reverse_proxy',
+                                    'skip_display_gpus') if key in s))
         except Exception as ex:  # noqa: BLE001
             self._status(f'save settings failed: {ex}')
 
@@ -2548,21 +2795,16 @@ class InferStackTUI(App):
         self._do_evict_all()
 
     def action_cleanup(self) -> None:
-        self._status('cleaning up released/expired leases + stopped deployments…')
-        self.app_log('CLI: none yet; this only forgets finished rows in '
-                     'the ledger (nothing running changes)')
+        self._status('clearing finished rows: released/expired leases, stopped deployments…')
+        self._cli(cli.command('gc', '--forget'))
         self._do_cleanup()
 
     # -- docker compose control -------------------------------------------
 
-    def _compose_target(self) -> tuple[Any, str, str] | None:
-        """(run, project, compose_file) for the leasing project, or None."""
-        backend = self.controller.backend
-        path = getattr(backend, 'compose_file', None)
-        run = getattr(backend, 'run', None)
-        if not path or not run or not Path(path).exists():
-            return None
-        return run, str(getattr(backend, 'project', 'infer-stack')), str(path)
+    def _compose_target(self):
+        """The backend's rendered file, when a render exists; else ``None``."""
+        rendered = getattr(self.controller.backend, 'rendered_file', None)
+        return rendered if rendered is not None and Path(rendered).exists() else None
 
     def action_compose_up(self) -> None:
         if self._compose_target() is None:
@@ -2582,29 +2824,24 @@ class InferStackTUI(App):
             msg = ('apply done' if not rec.publication_pending
                    else 'apply did not fully take effect; still pending')
         except Exception as ex:  # noqa: BLE001
-            msg = f'apply failed: {ex}'
+            msg = f'apply failed: {_why(ex)}'
         self._after_mutation(msg)
 
     def action_compose_down(self) -> None:
         if self._compose_target() is None:
             self._refuse('nothing rendered yet — nothing to bring down')
             return
-        self._status('docker compose down (raw: bypasses leases; releases nothing)…')
+        self._status('down (bypasses leases; releases nothing)…')
         self._cli(cli.command('stack', 'down'))
-        self._do_compose(['down', '--remove-orphans'], 'down')
+        self._do_down()
 
     @work(thread=True, exclusive=True, group='mutate')
-    def _do_compose(self, args: list[str], label: str) -> None:
-        target = self._compose_target()
-        if target is None:
-            self._after_mutation('nothing rendered yet')
-            return
-        run, project, path = target
+    def _do_down(self) -> None:
         try:
-            run(['docker', 'compose', '-p', project, '-f', path, *args])
-            msg = f'compose {label} done'
+            self.controller.backend.down()
+            msg = 'down done'
         except Exception as ex:  # noqa: BLE001
-            msg = f'compose {label} failed: {ex}'
+            msg = f'down failed: {_why(ex)}'
         self._after_mutation(msg)
 
     # -- open in browser ---------------------------------------------------
@@ -2614,8 +2851,8 @@ class InferStackTUI(App):
         return f'{base}/?models={endpoint}' if base else None
 
     def _openwebui_url(self) -> str | None:
-        port = getattr(self.controller.backend, 'ui_port', None)
-        return f'http://localhost:{port}' if port else None
+        from .leasing.gateway import front_door_urls
+        return front_door_urls(self.controller.backend)[1]
 
     def _served_endpoints(self) -> set[str]:
         try:
@@ -2953,9 +3190,12 @@ class InferStackTUI(App):
     # -- API tester --------------------------------------------------------
 
     def _litellm(self) -> tuple[str | None, str | None]:
+        """``(OpenAI base URL ending in /v1, master key)``: what `env` prints."""
+        from .leasing.gateway import front_door_urls
+
         backend = self.controller.backend
-        port = getattr(backend, 'litellm_port', None)
-        if not port:
+        base, _ = front_door_urls(backend)
+        if not base:
             return None, None
         key = None
         mk = getattr(backend, 'master_key', None)
@@ -2963,7 +3203,7 @@ class InferStackTUI(App):
             key = mk() if callable(mk) else None
         except Exception:  # noqa: BLE001
             key = None
-        return f'http://localhost:{port}', key
+        return base, key
 
     def _http_client(self) -> Any:
         if self._http is not None:
@@ -3023,11 +3263,11 @@ class InferStackTUI(App):
             raise RuntimeError('no LiteLLM gateway (needs the compose backend)')
         headers = {'Authorization': f'Bearer {key}'} if key else {}
         if self._protocol_for(model) == 'completions':
-            url = f'{base}/v1/completions'
+            url = f'{base}/completions'
             body = {'model': model, 'prompt': prompt,
                     'max_tokens': 128, 'temperature': 0}
         else:
-            url = f'{base}/v1/chat/completions'
+            url = f'{base}/chat/completions'
             body = {'model': model,
                     'messages': [{'role': 'user', 'content': prompt}],
                     'max_tokens': 128, 'temperature': 0}
@@ -3036,23 +3276,33 @@ class InferStackTUI(App):
         self._raise_for_body(resp)
         return self._completion_text(resp.json())
 
-    def _curl_for(self, model: str, prompt: str) -> str:
+    def _curl_for(self, model: str, prompt: str, *, reveal_key: bool = False) -> str:
         """The equivalent ``curl`` for a chat- or text-completion, matching the
-        endpoint's served protocol, against the gateway."""
+        endpoint's served protocol, against the gateway.
+
+        The key is read at run time (``infer-stack env LITELLM_MASTER_KEY``)
+        rather than shown: the pane is on screen, and screens get shared.
+        ``reveal_key`` puts the literal key in, for the clipboard.
+        """
         import json as _json
 
         base, key = self._litellm()
         if not base:
             return '# acquire a model first — no LiteLLM gateway yet'
-        auth = f" -H 'Authorization: Bearer {key}'" if key else ''
+        if key and reveal_key:
+            auth = f" -H 'Authorization: Bearer {key}'"
+        elif key:
+            auth = ' -H "Authorization: Bearer $(infer-stack env LITELLM_MASTER_KEY)"'
+        else:
+            auth = ''
         if self._protocol_for(model) == 'completions':
-            path = '/v1/completions'
+            path = '/completions'
             body = _json.dumps({
                 'model': model or '<model>',
                 'prompt': prompt or 'hello',
             })
         else:
-            path = '/v1/chat/completions'
+            path = '/chat/completions'
             body = _json.dumps({
                 'model': model or '<model>',
                 'messages': [{'role': 'user', 'content': prompt or 'hello'}],
@@ -3067,7 +3317,7 @@ class InferStackTUI(App):
         ui = self._openwebui_url()
         parts = []
         if base:
-            parts.append(f'gateway: {base}/v1')
+            parts.append(f'gateway: {base}')
         if ui:
             parts.append(f'open webui: {ui}')
         text = '   ·   '.join(parts) or '(acquire a model to get a gateway URL)'
@@ -3090,7 +3340,10 @@ class InferStackTUI(App):
         self.query_one('#api-out', RichLog).write(line)
 
     def _selected_api_model(self) -> str | None:
-        value = self.query_one('#api-model', Select).value
+        try:
+            value = self.query_one('#api-model', Select).value
+        except NoMatches:
+            return None     # the API tab is built right after the first frame
         return None if _select_is_blank(value) else str(value)
 
     def action_api_send(self) -> None:
@@ -3101,6 +3354,7 @@ class InferStackTUI(App):
         prompt = (self.query_one('#api-prompt', Input).value.strip()
                   or 'Say hello in one short sentence.')
         self._api_log(f'> [{model}] {prompt}')
+        self._cli(cli.command('test', model, '--prompt', prompt))
         self._do_api_send(model, prompt)
 
     def action_api_test_all(self) -> None:
@@ -3109,15 +3363,20 @@ class InferStackTUI(App):
             self._refuse('no ready models to test (acquire one first)')
             return
         self._api_log(f'— testing {len(models)} ready model(s) —')
+        self._cli(*(cli.command('test', model) for model in models))
         self._do_api_test_all(models)
 
     def action_api_list_models(self) -> None:
         self._api_log('> GET /v1/models  (what the gateway routes)')
+        self._cli(cli.MODELS_CURL)
         self._do_api_list()
 
     def action_api_copy_curl(self) -> None:
-        text = str(self.query_one('#api-curl', Static).render())
-        ok = self._copy(text)
+        # The clipboard gets the literal key (works in any shell); the pane
+        # shows only how to read it.
+        model = self._selected_api_model() or '<model>'
+        prompt = self.query_one('#api-prompt', Input).value.strip() or 'hello'
+        ok = self._copy(self._curl_for(model, prompt, reveal_key=True))
         self._status('copied curl to clipboard' if ok else
                      'copy failed — install wl-copy/xclip, or enable OSC 52')
 
@@ -3152,7 +3411,7 @@ class InferStackTUI(App):
         try:
             headers = {'Authorization': f'Bearer {key}'} if key else {}
             resp = self._http_client().get(
-                f'{base}/v1/models', headers=headers, timeout=30)
+                f'{base}/models', headers=headers, timeout=30)
             self._raise_for_body(resp)
             ids = [m.get('id') for m in (resp.json().get('data') or [])]
             self.call_from_thread(
@@ -3189,7 +3448,7 @@ class InferStackTUI(App):
                 'engine may still be loading'
             )
         except Exception as ex:  # noqa: BLE001
-            msg = f'acquire {name} failed: {ex}'
+            msg = f'acquire {name} failed: {_why(ex)}'
         self.call_from_thread(self._finish_acquire, name, msg)
 
     def _finish_acquire(self, name: str, message: str) -> None:
@@ -3207,7 +3466,7 @@ class InferStackTUI(App):
             self._lease_sel.clear()
             msg = f'released {len(ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
-            msg = f'release failed: {ex}'
+            msg = f'release failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3216,7 +3475,7 @@ class InferStackTUI(App):
             out = self.controller.release_leases(None)
             msg = f'released {len(out.released_lease_ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
-            msg = f'release --all failed: {ex}'
+            msg = f'release --all failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3233,7 +3492,7 @@ class InferStackTUI(App):
                 msg = (f'none of the {len(ids)} selected were idle — '
                        'release their leases first')
         except Exception as ex:  # noqa: BLE001
-            msg = f'evict failed: {ex}'
+            msg = f'evict failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3245,17 +3504,17 @@ class InferStackTUI(App):
             msg = (f'evicted {n} idle deployment(s)' if n
                    else 'no idle deployments to evict')
         except Exception as ex:  # noqa: BLE001
-            msg = f'evict all failed: {ex}'
+            msg = f'evict all failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
     def _do_cleanup(self) -> None:
         try:
             n_leases, n_deployments = self.controller.prune()
-            msg = (f'cleaned up {n_leases} released/expired lease(s) + '
+            msg = (f'cleared {n_leases} released/expired lease(s) + '
                    f'{n_deployments} stopped deployment(s)')
         except Exception as ex:  # noqa: BLE001
-            msg = f'cleanup failed: {ex}'
+            msg = f'clear finished failed: {_why(ex)}'
         self._after_mutation(msg)
 
     def _after_mutation(self, message: str) -> None:
@@ -3275,16 +3534,20 @@ def _parse_kv_str(text: str) -> dict[str, Any]:
     return out
 
 
-def _fmt_ports(row: dict) -> str:
-    """Compact published-ports string from a compose ps JSON row."""
-    pubs = row.get('Publishers') or []
-    bits = []
-    for pub in pubs:
-        published = pub.get('PublishedPort')
-        target = pub.get('TargetPort')
-        if published:
-            bits.append(f'{published}->{target}')
-    return ', '.join(bits)
+def _seconds_since_process_start() -> float | None:
+    """Wall time since this process started (Linux ``/proc``), else ``None``."""
+    import os
+
+    try:
+        with open('/proc/self/stat') as handle:
+            # Field 22 counts clock ticks since boot; the command name (field 2)
+            # may contain spaces, so split after its closing parenthesis.
+            start_ticks = int(handle.read().rsplit(')', 1)[1].split()[19])
+        with open('/proc/uptime') as handle:
+            uptime = float(handle.read().split()[0])
+        return uptime - start_ticks / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def run_tui(
@@ -3293,6 +3556,7 @@ def run_tui(
     *,
     interval: float = 3.0,
     catalog_path: str | Path | None = None,
+    exit_after_paint: bool = False,
 ) -> int:
     """Run the TUI against a built controller + catalog. Returns an exit code."""
     # The narration loguru sink writes to stderr, which would corrupt the
@@ -3304,7 +3568,14 @@ def run_tui(
     except Exception:  # noqa: BLE001
         pass
     app: Any = InferStackTUI(
-        controller, catalog, interval=interval, catalog_path=catalog_path
+        controller, catalog, interval=interval, catalog_path=catalog_path,
+        exit_after_paint=exit_after_paint,
     )
     app.run()
+    if exit_after_paint:
+        first = app.first_frame_s
+        exited = _seconds_since_process_start()
+        print(f'first frame {first:.2f}s after process start; exited at {exited:.2f}s'
+              if first is not None and exited is not None
+              else 'first frame drawn (process start time unavailable)')
     return 0

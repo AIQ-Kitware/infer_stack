@@ -29,6 +29,10 @@ Schema (all sections optional except as referenced)::
         # endpoint (GPU count is appended automatically from tp*pp*dp); falls
         # back to `config set kubeai_resource_profile <name>`.
         #   runtime: {resource_profile: nvidia-gpu-rtx-4090, ...}
+        # compose backend only: the container's /dev/shm (Docker's default is
+        # 64 MiB; vLLM's workers share memory when a model spans GPUs). Not
+        # set, nothing is rendered; KubeAI mounts a memory-backed /dev/shm.
+        #   runtime: {tensor_parallel_size: 4, shm_size: 16g}
         # An image with its own launcher (Compose only), described in data;
         # see infer_stack/leasing/launch.py for the fields and templates.
         #   runtime: {image: ..., command: [single],
@@ -284,10 +288,29 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
 
 
 def _runtime_errors(ep: EndpointSpec) -> list[str]:
-    """Validate the generic launch fields (see :mod:`.launch`)."""
+    """Validate the generic launch fields (see :mod:`.launch`) and ``shm_size``.
+
+    >>> ep = EndpointSpec(name='e', engine='vllm', model='m', runtime={'shm_size': '16g'})
+    >>> _runtime_errors(ep)
+    []
+    >>> ep.runtime['shm_size'] = 'lots'
+    >>> _runtime_errors(ep)[0].split(':')[0]
+    "endpoint 'e'"
+    """
+    import re
+
     from .launch import launch_errors
 
-    return launch_errors(ep.name, ep.engine, ep.runtime)
+    errors = launch_errors(ep.name, ep.engine, ep.runtime)
+    shm = (ep.runtime or {}).get('shm_size')
+    if shm is not None:
+        if ep.engine != VLLM:
+            errors.append(f"endpoint '{ep.name}': runtime.shm_size is for vllm "
+                          'endpoints')
+        elif not re.fullmatch(r'\d+(\.\d+)?\s*[kmg]?b?', str(shm), re.IGNORECASE):
+            errors.append(f"endpoint '{ep.name}': runtime.shm_size must be a size "
+                          f"such as 16g or 8gb, not {shm!r}")
+    return errors
 
 
 @dataclass

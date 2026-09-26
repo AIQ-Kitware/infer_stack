@@ -179,7 +179,9 @@ def test_a_ledger_change_between_preview_and_commit_retries(tmp_path):          
     assert len(calls) == 2 and ledger.get_deployment(out.deployments[0].id).assigned_gpus == [0]
 
 
-def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):         # 35
+def test_unknown_residency_admits_nothing(tmp_path):         # 35
+    """The render after a commit needs residency, so admission refuses without
+    it, even for a request that needs no new GPU."""
     from infer_stack.leasing.residency import ResidencyUnknown
 
     ledger, ctl, _ = make(tmp_path)
@@ -189,12 +191,11 @@ def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):     
         raise ResidencyUnknown('docker ps failed')
 
     ctl.backend.residency = unknown
-    with pytest.raises(PlacementError, match='residency is unknown'):
+    with pytest.raises(PlacementError, match='cannot be read'):
         ctl.acquire('x', CAT.resolve_names(['two']), wait=False, apply=False)
-    # Coalescing onto the LIVE, allocated deployment needs no new GPU. Its render
-    # still needs residency, so stage it without rendering residency-dependent state.
     overlay = ledger.plan_acquire(CAT.resolve_names(['one']))
-    assert ctl._admit(overlay, None) == ({}, [])
+    allocations, reasons = ctl._admit(overlay, None)
+    assert allocations == {} and reasons
 
 
 # -- P5: allocations and renew ----------------------------------------------------------
@@ -317,7 +318,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
     first = ctl.acquire('x', cat.resolve_names(['a']), wait=False)
     gid = first.deployments[0].id
     served = dict(ledger.get_deployment(gid).served)
-    registry = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    registry = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
 
     def decline(planned):
         raise ConvergeAborted('no')
@@ -327,7 +328,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
         ctl.acquire('y', cat.resolve_names(['b']), wait=False)    # would add alias b
     assert len(ledger.status()[0]) == 1
     assert ledger.get_deployment(gid).served == served
-    now = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    now = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
     assert now == registry
 
 

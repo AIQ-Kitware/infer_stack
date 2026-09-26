@@ -11,9 +11,8 @@ process loads a model.
 ### Ollama model store — `state.ollama -> /root/.ollama`
 
 Ollama downloads GGUF/model blobs into `/root/.ollama`. The Compose template
-mounts `state.ollama` there whenever the Ollama provider is enabled. Direct
-Ollama profiles therefore survive `down`, `up`, `switch`, and `render` without
-re-pulling models.
+mounts `<data dir>/ollama` there for every Ollama daemon, so pulled tags
+survive container replacement, `release`, and `infer-stack stack down`.
 
 Ollama model residency is controlled by daemon/request settings such as
 `keep_alive` / `OLLAMA_KEEP_ALIVE`. A short keep-alive can let a mostly idle
@@ -40,10 +39,10 @@ dtype, etc.). On a cold container with an empty cache, vLLM has to
 re-compile; on a warm restart against the same configuration, those artifacts
 are reused.
 
-Default host path: `/data/service/docker/infer-stack/vllm-cache`. Override via
-`state.vllm_cache` in `config.yaml` or by editing the rendered deployment
-plan. The path is created on first volume mount; no manual `mkdir` is
-required.
+Host path: `<data dir>/vllm-cache/cfg-<hash>`, one subdirectory per serve
+configuration (`infer-stack paths` shows the data dir). It moves with the data
+dir (`infer-stack config set data_dir <path>`); there is no separate setting.
+The path is created on first volume mount; no manual `mkdir` is required.
 
 The cache key is keyed on the engine configuration. Changing `max_model_len`,
 `tensor_parallel_size`, `gpu_memory_utilization`, the optimization level,
@@ -58,11 +57,13 @@ The Compose template also persists the other obvious startup caches that sit
 outside `VLLM_CACHE_ROOT`:
 
 - `state.torch_cache -> /root/.cache/torch` for PyTorch / TorchInductor
-  artifacts, with `TORCH_HOME` and `TORCHINDUCTOR_CACHE_DIR` set explicitly.
-- `state.triton_cache -> /root/.cache/triton` for Triton kernels, with
-  `TRITON_CACHE_DIR` set explicitly.
-- `state.cuda_cache -> /root/.cache/nvidia/ComputeCache` for NVIDIA driver
-  JIT artifacts, with `CUDA_CACHE_PATH` set explicitly.
+  artifacts.
+- `state.triton_cache -> /root/.triton` for Triton kernels.
+- `state.cuda_cache -> /root/.nv` for NVIDIA driver JIT artifacts.
+
+Each is mounted at the tool's default location; no cache environment
+variables are set. Unlike the vLLM cache, these are shared across serve
+configurations, because their entries are content-addressed.
 
 These caches reduce repeated compile/JIT work, but they do not make model
 switching instantaneous. A vLLM process still has to import Python modules,
@@ -81,53 +82,52 @@ the vLLM engine process, because vLLM serves one model configuration per
 process in this stack. That is why even tiny models can take tens of seconds
 to come back healthy: the expensive work is not just downloading weights.
 
-## Shared memory: `ipc: host`
+## Shared memory
 
-vLLM uses shared memory for tensor-parallel communication and worker IPC.
-Docker's default `--shm-size` (64 MiB) is far too small. The Compose
-template sets `ipc: host` on every vLLM service, matching the upstream vLLM
-Docker guidance and giving the engine the host's shared-memory budget.
+vLLM's workers share memory when a model spans GPUs (tensor or pipeline
+parallel), and Docker gives a container a 64 MiB `/dev/shm`. Upstream vLLM's
+Docker guidance is `ipc: host` or a `shm_size` of a few GiB. On Compose, set
+it per endpoint:
 
-If your environment forbids host IPC (multi-tenant cluster policy, etc.),
-replace `ipc: host` in the rendered Compose with an explicit `shm_size`
-sized for your tensor-parallel topology — typically a few GiB for TP > 1.
+```yaml
+runtime: {tensor_parallel_size: 4, shm_size: 16g}
+```
+
+It is opt-in: an endpoint without it renders exactly as before, so the
+upgrade recreates no running engine. A parallel engine without it logs one
+warning naming the key, and `catalog suggest` sets it on the multi-GPU
+entries it adds. KubeAI needs nothing: its vLLM pods mount a memory-backed
+`/dev/shm` (checked on KubeAI v0.23.4).
 
 ## Minimal-restart workflow
 
-LiteLLM deliberately does **not** depend on provider health in the rendered
-Compose file. That prevents Compose from restarting LiteLLM every time a vLLM
-runtime container is replaced during a model swap. The CLI refreshes LiteLLM's
-route table through its admin API when possible; smoke tests retry briefly
-while the selected upstream model finishes loading.
+LiteLLM deliberately does **not** depend on engine health in the rendered
+Compose file, and its route table already names every catalog endpoint. So
+replacing a vLLM container during a model swap neither restarts LiteLLM nor
+rewrites its config.
 
-When you are iterating on a single profile and don't want to bounce the whole
-stack:
+To refresh one engine without bouncing the gateway or Open WebUI:
 
 ```bash
-# Pull refreshed images through the rendered Compose wrapper.
-infer-stack pull vllm-<profile>
+# Pull a refreshed image for one service (names from `infer-stack ps`).
+infer-stack stack pull vllm-<alias>
 
-# Restart just the one service through the wrapper. This avoids bouncing
-# Postgres / LiteLLM / Open WebUI.
-infer-stack restart vllm-<profile>
+# Restart just that service.
+infer-stack stack restart vllm-<alias>
 ```
 
-For a full stack restart (e.g. after `infer-stack render` against a new
-profile), `infer-stack down && infer-stack up -d` is the safe path; persistent
-volumes and bind mounts (Postgres, Open WebUI data, Ollama model store, and
-vLLM caches) are not touched by `down`.
+`infer-stack apply` re-renders from the ledger and recreates only services
+whose definition changed. `infer-stack stack down` followed by `infer-stack
+apply` is a full restart; the bind-mounted state (Open WebUI data, Ollama
+model store, vLLM caches) is not touched by `stack down`.
 
-For direct Ollama model pulls, operate on the shared daemon instead of replacing
-the container:
-
-```bash
-infer-stack ollama-pull qwen3.5:4b
-```
+Ollama tags are pulled into the running daemon when an endpoint that serves
+them is acquired, so adding a tag never replaces the container.
 
 ## Verifying the cache is being reused
 
-After a warm restart, a populated `state.vllm_cache` directory will contain
-subdirectories keyed by configuration hash. The vLLM startup logs print
+After a warm restart, `<data dir>/vllm-cache` contains one `cfg-<hash>`
+subdirectory per serve configuration. The vLLM startup logs print
 "Using cached compiled graph" (or similar; exact wording varies by version)
 when the cache is hit. If you see a long compile pass on every restart,
 check that the volume mount is actually pointing at the persistent path and

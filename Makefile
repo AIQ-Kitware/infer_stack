@@ -1,34 +1,18 @@
 PYTHON ?= python
-EXAMPLE ?= single-node
-
-init:
-	$(PYTHON) manage.py init
-
-render:
-	$(PYTHON) manage.py render
-
-deploy:
-	$(PYTHON) manage.py deploy
+# The KubeAI chart values: your resourceProfiles (see docs/kubeai-backend.md).
+VALUES ?= kubeai-values.yaml
 
 status:
 	$(PYTHON) manage.py status
 
-smoke-test:
-	$(PYTHON) manage.py smoke-test
-
-example-single-node:
-	cp examples/single-node/config.yaml ./config.yaml
-	cp examples/single-node/models.yaml ./models.yaml
-	@echo "Copied single-node example into repo root. Edit hostname/model ids as needed."
+render:
+	$(PYTHON) manage.py render
 
 bootstrap-k3s:
 	bash scripts/bootstrap_k3s.sh
 
 install-kubeai:
-	bash scripts/install_kubeai.sh generated/kubeai/kubeai-values.yaml kubeai
-
-bootstrap-single-node: example-single-node bootstrap-k3s
-	@echo "Single-node example copied and K3s bootstrapped. Next: python manage.py render && python manage.py deploy"
+	bash scripts/install_kubeai.sh $(VALUES) kubeai
 
 port-forward-kubeai:
 	kubectl -n kubeai port-forward svc/kubeai 8000:80

@@ -33,6 +33,10 @@ class Readiness:
     ready: bool
     detail: str = ''
     fatal: bool = False
+    #: The endpoint is waiting for resources held by others (a Kubernetes pod
+    #: the scheduler cannot place). The controller then frees room by
+    #: evicting idle keep-warm deployments, which no lease holds.
+    needs_room: bool = False
 
 
 class BackendTimeout(RuntimeError):
@@ -70,15 +74,31 @@ class PlacementError(Exception):
     controller rolls back the just-created lease before raising, so a request
     that cannot be satisfied does not linger as a phantom ``live`` deployment with no
     container behind it. ``reasons`` carries the planner's per-deployment messages.
+
+    ``capacity`` says whether free GPUs would have let it in, as opposed to a
+    request no amount of room admits (a render refusal, an unreadable
+    runtime, a host too small): only then is "free a GPU" the advice.
     """
 
-    def __init__(self, deployment_ids, reasons):
+    def __init__(self, deployment_ids, reasons, *, capacity: bool = True):
         self.deployment_ids = list(deployment_ids)
         self.reasons = list(reasons)
+        self.capacity = bool(capacity)
         super().__init__(
             '; '.join(self.reasons)
             or f'could not place: {", ".join(self.deployment_ids)}'
         )
+
+
+def allocates_gpus(backend) -> bool:
+    """Whether ``backend`` allocates host GPU indices itself.
+
+    True for Compose, which places on this host and records the GPUs each
+    deployment holds. False for a backend whose cluster schedules (KubeAI):
+    admission commits an empty allocation, and no GPU is ever "unresolved".
+    The one place the controller and the CLI ask this.
+    """
+    return bool(getattr(backend, 'allocates_gpus', True))
 
 
 @runtime_checkable
@@ -126,15 +146,16 @@ class ConvergeBackend(Backend, Protocol):
     * ``last_assignments`` — deployment id -> GPU indices (empty for backends
       where the cluster schedules).
 
-    Backends without this surface fall back to the per-deployment
-    ``realize``/``teardown`` path in :meth:`Controller._render`.
+    A backend with only ``realize``/``teardown`` gets this surface from
+    :class:`SimpleAdmission`.
     """
 
     last_unplaced: set[str]
     last_errors: list[str]
     last_assignments: dict[str, list[int]]
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None):
         """Render the desired set to backend state; optionally apply it."""
         ...
 
@@ -150,14 +171,17 @@ class ConvergeBackend(Backend, Protocol):
 
 @runtime_checkable
 class AdmissionBackend(ConvergeBackend, Protocol):
-    """The surface admission mode uses (see ``Controller._admission_mode``).
+    """The surface the controller drives: every acquire goes through admission.
 
-    Today only :class:`~infer_stack.leasing.compose.ComposeBackend` has it:
-    strict residency, an in-memory placement ``preview``, and the Compose
-    network and adoption state the controller hands it. The controller
-    reaches these through ``Controller._admitting``, only after the
-    capability check, so the type checker sees one named capability instead
-    of attributes a minimal :class:`Backend` does not have.
+    Both real backends have it: strict residency and an in-memory
+    ``preview``; :class:`SimpleAdmission` supplies it for backends that
+    neither place nor inspect (the dry-run and test backends). Compose also takes the stable-address network and the
+    container-adoption table from the controller (``network``,
+    ``on_addresses``, ``adopted``); those are Compose-only, and the
+    controller hands them over only to a backend that declares them. The
+    controller reaches these through ``Controller._admitting``, only after
+    the capability check, so the type checker sees one named capability
+    instead of attributes a minimal :class:`Backend` does not have.
     """
 
     network: dict[str, Any] | None
@@ -167,6 +191,13 @@ class AdmissionBackend(ConvergeBackend, Protocol):
 
     def residency(self) -> Any:
         """A strict :class:`~infer_stack.leasing.residency.Residency`, or raise."""
+        ...
+
+    def instances(self) -> list[Any]:
+        """Every running unit, as :class:`~infer_stack.leasing.instances.Instance`.
+
+        Built from :meth:`residency`, so it raises when that does.
+        """
         ...
 
     def preview(self, desired: list[Deployment], placement: Any = None, *,
@@ -250,8 +281,36 @@ class ConvergeScaffold:
 
         self._atomic_write(self._state_file, json.dumps(data, indent=2))
 
+    #: Digest of files an admission preview already had approved.
+    _preapproved: str | None = None
+    #: Digest of the files the last render produced (approved-digest guard).
+    last_planned_digest: str | None = None
+    #: Digest of the files the last preview produced.
+    last_preview_digest: str | None = None
+
+    @staticmethod
+    def _planned_digest(planned: dict) -> str:
+        import hashlib
+        import json
+
+        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
+        return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+    def _preview_approval(self, planned: dict, *, approve: bool) -> None:
+        """Record a preview's digest; with ``approve``, ask now, not after commit.
+
+        The render that follows the commit skips the prompt when it produces
+        the same files (see :meth:`_approve_changes`).
+        """
+        self.last_preview_digest = self._planned_digest(planned)
+        if approve:
+            self._approve_changes(planned)
+            self._preapproved = self.last_preview_digest
+
     def _approve_changes(self, planned: dict) -> None:
         """Show pending rendered-state changes and confirm them.
+
+        Files a preview already had approved (same digest) pass silently once.
 
         ``planned`` maps target paths to their new content. When nothing
         actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
@@ -261,6 +320,9 @@ class ConvergeScaffold:
         """
         from .._log import logger
 
+        preapproved, self._preapproved = self._preapproved, None
+        if preapproved is not None and self._planned_digest(planned) == preapproved:
+            return
         changed = {
             p: text
             for p, text in planned.items()
@@ -283,7 +345,113 @@ class ConvergeScaffold:
             )
 
 
-class MemoryBackend:
+@dataclass
+class RenderPreview:
+    """The render half of a :meth:`SimpleAdmission.preview`: what it refused."""
+
+    unrenderable: set[str]
+    errors: list[str]
+
+
+class SimpleAdmission:
+    """The admission surface for a backend that neither places nor inspects.
+
+    For in-process backends (the dry-run and test backends): they allocate no
+    GPUs, their :meth:`residency` is what :meth:`observe` reports (each
+    deployment one warm instance), and converge/apply is ``realize`` /
+    ``teardown`` over the rendered set. A subclass that emulates capacity
+    overrides :meth:`plan`; one that emulates render failures overrides
+    :meth:`refuse`. Everything else goes through the one admission path the
+    real backends use.
+    """
+
+    allocates_gpus = False
+    last_preview_digest: str | None = None
+
+    def plan(self, desired: list[Deployment], placement: Any = None):
+        """Which of ``desired`` fit; here, all of them, on no GPU."""
+        from .placement import GpuPlan
+
+        return GpuPlan(assignments={g.id: [] for g in desired})
+
+    def refuse(self, desired: list[Deployment]) -> dict[str, str]:
+        """``{deployment id: reason}`` for what cannot be rendered; none here."""
+        return {}
+
+    def residency(self):
+        from .residency import Container, Residency
+
+        return Residency(by_deployment={
+            gid: (Container(container_id=gid, deployment_id=gid,
+                            state='running', labelled=True),)
+            for gid in sorted(self.observe())
+        })
+
+    def instances(self):
+        """One in-process instance per realized deployment; no log to read."""
+        from .instances import MEMORY, from_residency
+
+        return from_residency(self.residency(), runtime=MEMORY)
+
+    def _preview(self, desired: list[Deployment], placement: Any = None):
+        desired = list(desired)
+        plan = self.plan(desired, placement)
+        refused = self.refuse(desired)
+        return plan, RenderPreview(set(refused), [f'{g}: {why}' for g, why in refused.items()])
+
+    def preview(self, desired: list[Deployment], placement: Any = None, *,
+                approve: bool = False):
+        plan, rendered = self._preview(desired, placement)
+        self.last_preview_digest = repr(sorted(
+            (gid, list(gpus)) for gid, gpus in plan.assignments.items()
+            if gid not in rendered.unrenderable))
+        return plan, rendered
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None):
+        """Record the renderable, placed part of ``desired``; ``apply`` realizes it."""
+        desired = list(desired)
+        plan, rendered = self._preview(desired, placement)
+        self.last_errors = list(plan.errors) + list(rendered.errors)
+        self.last_unplaced = {
+            g.id for g in desired
+            if g.id not in plan.assignments or g.id in rendered.unrenderable}
+        self.last_assignments = (dict(plan.assignments)
+                                 if self.allocates_gpus else {})
+        self._rendered = {g.id: g for g in desired if g.id not in self.last_unplaced}
+        known = getattr(self, '_known', {})
+        known.update({g.id: g for g in desired})
+        self._known = known
+        if apply:
+            self.apply()
+
+    def apply(self) -> None:
+        """Realize what the last converge rendered; tear down the rest."""
+        rendered = getattr(self, '_rendered', {})
+        for gid in sorted(self.observe() - set(rendered)):
+            deployment = getattr(self, '_known', {}).get(gid)
+            if deployment is not None:
+                self.teardown(deployment)
+        for gid, deployment in rendered.items():
+            if gid not in self.observe():
+                self.realize(deployment)
+
+    # Set by converge (the controller reads them with a default before then).
+    last_unplaced: set[str]
+    last_errors: list[str]
+    last_assignments: dict[str, list[int]]
+
+    def observe(self) -> set[str]:  # pragma: no cover - provided by the backend
+        raise NotImplementedError
+
+    def realize(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def teardown(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+
+class MemoryBackend(SimpleAdmission):
     """In-memory backend that records calls and has configurable readiness.
 
     Not a real serving backend — it never starts a process. It exists so the
@@ -347,7 +515,7 @@ class MemoryBackend:
             self.ready_overrides[(deployment_id, endpoint)] = ready
 
 
-class NullBackend:
+class NullBackend(SimpleAdmission):
     """A no-op backend that serves nothing — for ``--dry-run`` and ``leases``.
 
     It never starts a process. ``observe`` returns the empty set, so the

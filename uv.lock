@@ -8,9 +8,6 @@ resolution-markers = [
     "python_full_version >= '4'",
 ]
 
-[options]
-exclude-newer = "2026-06-04T04:00:00Z"
-
 [[package]]
 name = "certifi"
 version = "2026.5.20"
@@ -257,7 +254,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -278,11 +275,11 @@ name = "infer-stack"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
+    { name = "kwconf" },
     { name = "loguru" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
-    { name = "scriptconfig" },
     { name = "ubelt" },
 ]
 
@@ -300,6 +297,7 @@ tui = [
 [package.metadata]
 requires-dist = [
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "kwconf", specifier = ">=0.11.0" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "pytest", marker = "extra == 'tests'", specifier = ">=7.0" },
     { name = "pytest-codeblocks", marker = "extra == 'tests'", specifier = ">=0.17" },
@@ -307,7 +305,6 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.31" },
     { name = "rich", specifier = ">=13.0" },
-    { name = "scriptconfig", specifier = ">=0.9" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=0.50" },
     { name = "ubelt", specifier = ">=1.3" },
     { name = "xdoctest", marker = "extra == 'tests'", specifier = ">=1.1.5" },
@@ -333,6 +330,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
+]
+
+[[package]]
+name = "kwconf"
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/77/20ce9cf65bc20e769db9a506e72e291f7a38ee766393110858a15e93ea1b/kwconf-0.11.0.tar.gz", hash = "sha256:cd8e9192a3c0e54750368980f9bf6b02676f75b76ac3830b656e977cc55f988f", size = 172077, upload-time = "2026-08-07T15:25:34.385Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/7a/4b4a1c503cc621eb2256e5d18385ccfb546f536008cdb4db0189426f5e77/kwconf-0.11.0-py3-none-any.whl", hash = "sha256:4691afdf7173ca0d42302a2cf17910917ac3bd02729e0b2f2cb2aa1e3b2ee18b", size = 110488, upload-time = "2026-08-07T15:25:32.964Z" },
 ]
 
 [[package]]
@@ -653,19 +659,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
-]
-
-[[package]]
-name = "scriptconfig"
-version = "0.9.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pyyaml", marker = "python_full_version < '4'" },
-    { name = "ubelt" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/4c/6d0ecc5e29b498dc6b5402a0c561e97dd00ce1aeebdc5e494cc5fa8a0b6b/scriptconfig-0.9.1.tar.gz", hash = "sha256:9766c2ee601c4b8d97753ba13a914f8c0a212da4f6d2aec18ad628fd8b53d7ef", size = 112424, upload-time = "2026-03-02T17:33:34.405Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/57/00/2bf691dfc2b0170013d466fcdbbfc9d036e26d6049d74efaf7775401321d/scriptconfig-0.9.1-py3-none-any.whl", hash = "sha256:4b69e2f4eb681ec4480e9bb5d6c82d2f8c82a9badc703a261ee8940736101d86", size = 87103, upload-time = "2026-03-02T17:33:31.394Z" },
 ]
 
 [[package]]

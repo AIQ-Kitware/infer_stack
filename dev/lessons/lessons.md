@@ -95,3 +95,49 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   absent.
 - **Applies when:** writing or reviewing any multi-threaded test that uses a
   barrier, latch, or queue rendezvous.
+
+- **Lesson:** A test that needs a large file for its *size* should create it
+  sparse (`file.truncate(n)`), and remove its temp dir. `os.path.getsize`
+  reports the full size, but no disk is used. Writing real bytes leaks gigabytes
+  per run unless the test cleans up.
+- **Evidence / MWE:** 21f5e09. The `weight_floor_gib` doctest wrote two 2 GiB
+  files into `mkdtemp()` and never removed them. A day of suite runs left
+  49 GB in `/tmp` on the guest, k3s tainted its node for disk pressure, and
+  KubeAI's pods were evicted. With sparse files the doctest takes 0.15 s and
+  leaves nothing behind.
+- **Applies when:** a test exercises size-dependent logic (VRAM floors, disk
+  checks, download sizes).
+
+- **Lesson:** A kwconf flag (`isflag=True`) takes an optional value, so a
+  flag written before a positional swallows it: `logs -f qwen` parsed as
+  `follow='qwen'` with no names. infer-stack's flags are all boolean, so
+  `_FlagSafeMixin` hands a non-boolean string back to the positional list.
+- **Evidence / MWE:** `tests/test_day2.py::test_a_flag_never_swallows_the_positional_after_it`;
+  `infer_stack/cli/options.py` (`reclaim_swallowed_positionals`). Found live
+  2026-09-26: `logs -f <alias>` followed every instance.
+- **Applies when:** a kwconf command has both flags and positional
+  arguments.
+
+- **Lesson:** `producer | grep -q pattern` under `set -o pipefail` can fail
+  although the pattern matched: `grep -q` exits at the first match and the
+  producer's next write dies of SIGPIPE (141). Write to a file, then grep it.
+- **Evidence / MWE:** `dev/lessons/mwe/grep_q_pipefail.sh` prints 141 for
+  the pipeline and 0 for the file.
+- **Applies when:** an e2e or handover script checks a command's output with
+  `grep -q` under `set -euo pipefail`.
+
+- **Lesson:** On a disk other work keeps nearly full, a k3s node that dips
+  under the 5% eviction threshold stays tainted `disk-pressure` after the
+  space comes back: the kubelet's default minimum reclaim adds 10%, so the
+  taint clears only at 15% free. Freeing your own files is not enough; set
+  `eviction-minimum-reclaim` to a fixed size (1Gi) on a dev cluster.
+- **Evidence / MWE:** 2026-09-26 on the guest: ten UX-audit data roots
+  (0.9 GB each) pushed the disk over; after deleting them the node sat at
+  12.8% free, still tainted, for 10 minutes, KubeAI's controller Pending.
+  `kubectl get --raw /api/v1/nodes/<node>/proxy/configz` showed
+  `evictionMinimumReclaim: 10%`. With `kubelet-arg:
+  eviction-minimum-reclaim=imagefs.available=1Gi,nodefs.available=1Gi` in
+  `/etc/rancher/k3s/config.yaml` and a k3s restart, the taint cleared.
+  `dev/k3s_agent_container.sh` passes the same to the second node.
+- **Applies when:** a dev cluster shares its disk with anything else, and
+  whenever a test or audit keeps large artifacts in `/tmp`.

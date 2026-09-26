@@ -2,6 +2,169 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### `/dev/shm` for vLLM on Compose, and the old recipes as suggestions
+
+`runtime.shm_size` (e.g. `16g`) sets a vLLM container's `/dev/shm` on the
+Compose backend; Docker's default is 64 MiB, and vLLM's workers share memory
+when a model spans GPUs. It is opt-in, so no running engine is recreated; a
+parallel engine without it logs a warning, and `catalog suggest` sets it on
+multi-GPU entries. The pre-leasing `docs/demos/`, `recipies/` and `examples/`
+are removed: their 4 x 96 GB vLLM tuning is now three suggestion variants
+(`qwen3.5-122b-a10b-tp4-128k`, `qwen3.5-122b-a10b-fp8-tp4-262k`,
+`qwen3.6-35b-a3b-tp2-262k`).
+
+### The gateway can run inside the cluster
+
+`infer-stack config set kubeai_gateway cluster` runs the LiteLLM gateway as a
+Deployment and a NodePort Service in the KubeAI namespace instead of on the
+host running infer-stack, so no single host is in every request's path and
+no `kubectl port-forward` is needed: an env file's `OPENAI_BASE_URL` is a
+node's address on the NodePort (or `kubeai_gateway_url`), and every node
+answers. It is the same gateway, key and route registry; `secrets rotate`
+updates its Secret and rolls it, `doctor` checks it, and `stack down`
+removes it. It takes static routes only. `docs/kubeai-backend.md` gains
+"Add a workstation", the runbook for a second GPU machine.
+
+### KubeAI picks a resource profile by GPU size
+
+On the kubeai backend, an endpoint with `placement.min_vram_gib` and no
+`resource_profile` gets the smallest resource profile whose nodes' GPUs are
+that large, read from GPU Feature Discovery's `nvidia.com/gpu.memory` label;
+before, `min_vram_gib` was warned about and ignored. `infer-stack measure
+--record` works there too, and a recorded measurement feeds the same choice.
+`infer-stack catalog suggest` on kubeai sizes the catalog to the cluster's
+largest GPU node and proposes a resource profile per GPU product for the
+helm values. `dev/k3s_agent_container.sh` adds a second (simulated) node to
+a development cluster.
+
+### A parity suite for the two backends
+
+`tests/test_parity.py` runs one scenario per row that `docs/backend-parity.md`
+marks *same*, on the compose backend over a fake Docker and on the kubeai
+backend over a fake kubectl, from the client contract to the TUI. The TUI no
+longer swaps an injected Docker runner for the real one.
+
+### The gateway in front of a cluster is the compose gateway
+
+On the kubeai backend the gateway now takes the same settings as on compose:
+Open WebUI (`ui`, on by default), the reverse proxy, and dynamic routing,
+under which each deployment is its own Model (`<name>-<id tail>`), so the
+same model acquired `--dedicated` twice runs as two Models behind one alias.
+Catalog endpoints are routed before they run, as on compose, so a new Model
+no longer recreates the gateway. The gateway's changes are shown and
+approved with the acquire's, before its lease commits. `routes list / seed /
+prune` work on kubeai and show a cluster route's upstream (they showed `?`),
+and `gc --orphans` and `clean --orphans` run there (and find nothing: the
+backend only reads its own labelled pods).
+
+### `ps`, `logs`, `status` and the TUI read the backend, on either backend
+
+`infer-stack ps` lists what the backend runs, containers or pods and the
+gateway, in one table that says what each serves; `infer-stack logs` takes an
+endpoint alias, an instance name, a container id prefix or a deployment id,
+and `-f` keeps following instances that start or restart later. Both read the
+same strict residency the controller decides with, so they work on KubeAI;
+`status` does too, and says `starting` for an instance that is up but not yet
+ready. `stack up` is now `apply` and `stack down` stops everything on either
+backend; the raw Compose verbs (`stack compose -- …`, `restart`, `pull`,
+`start`, `stop`) act on the Compose project on this host, which is the
+gateway's on KubeAI. The TUI's runtime pane (formerly "docker") follows pod
+logs, lists pods, and its Apply / Down buttons work on KubeAI.
+
+Fixed on the way: every kubectl call from the TUI failed, because the TUI
+replaced the backend's command runner with Docker's, whose environment has no
+`KUBECONFIG`; the TUI's "engines" log view included Open WebUI and Postgres;
+and a flag before a positional ate it (`logs -f qwen` followed everything,
+`acquire --yes qwen` named no endpoint), on every command.
+
+### One acquire path
+
+The controller's pre-admission branch is gone: every backend, including the
+dry-run backend, acquires, renders, renews and publishes through admission.
+A backend with only `realize` / `teardown` gets the admission surface from
+`SimpleAdmission`. Two behaviours changed with it. While residency cannot
+be read, no acquire is admitted; before, a request needing no new GPU was
+admitted and then failed at its render, after the lease was committed. And
+`routes prune` computes the desired set with the same view the render uses.
+
+### KubeAI acquires go through admission, as Compose's do
+
+An acquire on the KubeAI backend is now previewed in memory and commits its
+lease only if every deployment renders, the same path Compose takes. A
+refused acquire (no resource profile, an ollama endpoint, a served-name
+collision) writes no lease and runs no `kubectl`; before, the lease was
+committed, rendered, and then rolled back. A `--queue` acquire of such an
+endpoint fails at once instead of waiting out its timeout. The cluster
+schedules, so a KubeAI deployment commits an empty GPU allocation; `leases`
+still shows no GPU for it, and a `--no-apply` acquire now reports it as
+cluster-scheduled rather than unplaced. An idle
+keep-warm Model is kept only while its pod has started, as a keep-warm
+container is on Compose. The approval digest moved into the scaffold both
+backends share, and one function now answers whether a backend allocates
+GPUs. Removing the older acquire branch, which only test fakes still use,
+is the next step (roadmap P1b).
+
+### Compose and KubeAI: a parity matrix and a roadmap
+
+`docs/backend-parity.md` states the relationship the two backends are meant
+to have (KubeAI is Compose plus a scheduler: more information supplied, more
+tools installed, the same catalog, verbs, env file and TUI) and records, row
+by row, where that holds today, where it does not, and which differences are
+deliberate. `docs/planning/backend-parity-roadmap.md` plans the rest in five
+phases with exit criteria, from one acquire path to the gateway inside the
+cluster for a multi-workstation run. The README's KubeAI section, which still
+described the pre-leasing `setup` / `deploy` workflow and a live patch that
+is no longer needed, now points at the current docs and keeps only the
+cluster prerequisites and the `kubectl` debugging checks.
+
+### Endpoints|models and leases|deployments are tabs
+
+The sidebar shows Endpoints and Models as two tabs instead of two panes split
+by a divider, so the endpoint list gets the whole height; the main area does
+the same for Leases and Deployments. A tab's label carries its counts
+(`Leases 1/3`), so the hidden one is still readable. Each pair is one switch
+(`InferStackTUI.TABBED_CATALOG`, `TABBED_TABLES`); setting it to `False`
+restores the draggable split, and both layouts are tested.
+
+### One Clean up, in the footer, with a CLI command behind it
+
+The leases and deployments panes each had a Clean up button, and both did the
+same thing: forget released/expired leases and stopped deployments. Nothing
+running changes. That is now one `x Clean up` in the footer, and the same
+action on the CLI is `infer-stack gc --forget`.
+
+The TUI log now names the CLI command for the actions that were missing one:
+`r` (`status`), Clean up (`gc --forget`), saving settings (`config set …`),
+and the API tab's send, test-all (`test <alias>`) and model list (a `curl`
+that reads the key through `infer-stack env` and never prints it). Poll
+intervals are TUI-only, and the log says so.
+
+### The CLI is built on kwconf instead of scriptconfig
+
+kwconf is scriptconfig's successor, which aiq-magnet, cmd_queue and kwdagger
+already use. `Value`, `ModalCLI` and `__command__` carry over; `DataConfig`
+is now `Config`. One behavioural difference needed care: kwconf reads the
+strings `null`, `true` and numbers on the command line as values, so
+`--backend null` arrived as `None`. Options whose choices are strings now
+take `type=str`. The program name stays `infer-stack` in usage and errors
+(`__prog__`).
+
+`uv.lock` and `requirements/locks/tests.txt` were regenerated: kwconf 0.11.0
+added, scriptconfig removed. The uv `exclude-newer` cutoff (2026-06-04), which
+predated every kwconf release, is removed; the locked versions are unchanged.
+
+### The TUI stops repainting what did not change
+
+Every refresh tick repainted the lease and deployment panes, because setting
+a pane's border title repaints it even when the text is unchanged: about
+7 KB/s of terminal output with nothing on screen changing, which is what an
+SSH session feels. Titles are now set only on change (75 bytes/s idle).
+Streamed engine logs are drawn in batches of up to 200 lines every 100 ms
+instead of one UI message per line, and a flood keeps its newest lines. A
+watchdog reports any UI-thread stall over 0.5 s in the TUI log, with the
+stack it was stuck in written to the error log file. `dev/profile_tui.py`
+measures event-loop lag for idle, docker-pane and log-flood cases.
+
 ### Ledger reads are safe across threads
 
 The ledger shares one SQLite connection between threads, but only write
@@ -22,6 +185,73 @@ and `gc --orphans`, so it adds no new teardown path. The use case is a batch
 scheduler with its own GPU accounting: a lease held outside it, manual or
 keep-warm, occupies a GPU the scheduler believes is free, and the job it
 places there cannot start.
+
+### An idle keep-warm model gives way to a leased one on KubeAI too
+
+The rule: a keep-warm model that no lease holds is always a candidate for
+eviction when a model with a lease needs a resource. Compose admission already
+applied it when placing. On KubeAI the cluster schedules and never evicts, so
+a leased Model could sit `Unschedulable` behind idle warm ones until its
+timeout. A readiness probe can now report `needs_room`; the wait then evicts
+the longest-idle deployment, one per 30 s, never a leased one, and never
+after the wait's deadline. Verified on k3s: a leased Model that did not fit
+beside an idle one was ready 107 s later, with the idle one evicted.
+
+### The gateway is its own module
+
+The front door (LiteLLM config and service, route registry, dynamic-route
+reconciliation, the managed keys, Open WebUI, the reverse proxy) moved out of
+`leasing/compose.py` into `leasing/gateway.py`, with a `Gateway` object that
+`ComposeBackend` owns (`backend.gateway`). The service naming rules moved to
+`leasing/naming.py`. Backends now hand the gateway their route rows rather
+than the gateway reading backend state. Rendered output is unchanged
+(verified byte for byte), and `compose.py` is about a third smaller. Code
+that imported gateway names from `infer_stack.leasing.compose` should import
+them from `infer_stack.leasing.gateway`; the public naming helpers are still
+importable from `compose`.
+
+### The kubeai backend fails fast on an engine that cannot start
+
+The crash diagnosis (restart count, exit code, and the engine log classified
+as fatal, transient or unknown) was Docker-only, so on a cluster a model that
+could never start held its lease for the whole timeout. It now lives in
+`infer_stack/leasing/diagnosis.py` and both backends use it. The kubeai
+backend reads pods through a new strict `residency()` (a kubectl failure
+raises instead of reading as "nothing running") and quotes the crashed run's
+log (`kubectl logs --previous`). A not-ready wait names the pod's reason, such
+as `Unschedulable` or `ImagePullBackOff`. vLLM rejecting a flag (`error:
+unrecognized arguments`) is now recognised as fatal on both backends; before,
+it waited for two restarts.
+
+`runtime.env` now works on the kubeai backend (the Model's `spec.env`, with
+the same templates and reserved names). The served-name rule lives in one
+place, `leasing.models.served_name`. Two gateway route builders fell back to
+the deployment id where the engine used the first served alias, so a
+deployment without `served_model_name` routed to a name its engine did not
+serve.
+
+`gc --orphans` and `network migrate` now refuse a non-compose backend
+explicitly. They had used "the backend has `residency`" to mean compose.
+
+### The kubeai backend puts the LiteLLM gateway in front of the cluster
+
+On the kubeai backend a client had to name a model by its KubeAI Model name
+(a DNS slug of the served name), not the endpoint alias. Cards send the
+alias, so a card that ran on the compose backend got HTTP 404 on a cluster
+(verified on k3s). The kubeai backend now runs the same LiteLLM gateway,
+routing each alias to its Model: one `OPENAI_BASE_URL`, the managed key, and
+the alias as the model name on both backends. `secrets rotate` works on it.
+`--no-litellm` keeps the old direct access. New setting:
+`kubeai_gateway_upstream`, for a gateway that cannot reach the cluster
+Service's IP.
+
+The profile-era KubeAI renderer (`infer_stack.backends.render_kubeai_artifacts`)
+is removed. Nothing called it since the profile path was excised; the kubeai
+backend is the one renderer for KubeAI.
+
+`dev/kubeai_e2e.sh` now sends the alias as a card does, and fails when the
+request fails. Before, a failed generation fell through to PASS: the check
+sat in a `&&` list, where `set -e` does not apply.
 
 ### Custom container launches are catalog data, not recipes
 

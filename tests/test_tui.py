@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
@@ -30,6 +29,19 @@ def _ctx():
     catalog = Catalog.from_dict(CATALOG)
     controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
     return controller, catalog
+
+
+def _front(backend, litellm_port=14042, ui_port=None):
+    """Give a NullBackend a gateway front door at these ports."""
+    import tempfile
+
+    from infer_stack.leasing.gateway import Gateway
+
+    ports = {'litellm': litellm_port or 0, 'open_webui': ui_port or 0}
+    gateway = Gateway(tempfile.mkdtemp(), ports=ports,
+                      litellm=bool(litellm_port), ui=bool(ui_port))
+    backend.front_door = lambda: type('Front', (), {'gateway': gateway})()
+    backend.master_key = lambda: 'sk-test'
 
 
 class _FakeProc:
@@ -253,7 +265,7 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # docker is a collapsible pane with Logs/Containers/Control tabs;
+            # runtime is a collapsible pane with Logs/Instances/Control tabs;
             # system is its own collapsed pane; API is a top-level tab now.
             tabs = app.query_one('#docker-tabs', TabbedContent)
             assert {p.id for p in tabs.query('TabPane')} == {
@@ -263,12 +275,10 @@ def test_tui_docker_pane_has_logs_and_containers_tabs():
             assert app.query_one('#system', Collapsible).collapsed
             top = app.query_one('#top', TabbedContent)
             assert 'tab-api' in {p.id for p in top.query('TabPane')}
-            # the containers ps view carries the docker-ps columns
+            # the instances view carries what `infer-stack ps` shows
             ps = app.query_one('#ps', DataTable)
             labels = [str(c.label) for c in ps.columns.values()]
-            assert 'status (uptime)' in labels
-            assert 'created' in labels
-            assert 'container id' in labels
+            assert labels == ['name', 'status', 'serves', 'started', 'ports']
 
     _run(scenario)
 
@@ -373,35 +383,65 @@ def test_tui_monitor_panes_are_collapsible():
     _run(scenario)
 
 
-def test_tui_leases_deployments_are_separate_panes():
+def _split_layout():
+    """The TUI with both pane pairs stacked around dividers instead of tabbed."""
+    from infer_stack.tui import InferStackTUI
+
+    class Split(InferStackTUI):
+        TABBED_CATALOG = False
+        TABBED_TABLES = False
+    return Split
+
+
+@pytest.mark.parametrize('tabbed', [True, False])
+def test_tui_pane_pairs_are_tabs_or_split(tabbed):
+    """Either layout has the same panes and ids; only the container differs."""
     from textual.containers import Vertical
+    from textual.css.query import NoMatches
+    from textual.widgets import TabbedContent
 
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
+    out = controller.acquire('bob', catalog.resolve_names(['qwen-coder']))
+    assert out.lease
+    cls = InferStackTUI if tabbed else _split_layout()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
-        async with app.run_test() as pilot:
+        app = cls(controller, catalog, interval=999, proc_factory=lambda svc: None)
+        async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            # leases/deployments are their own panes split by a drag handle,
-            # not collapsibles.
-            assert isinstance(app.query_one('#leases-pane'), Vertical)
-            assert isinstance(app.query_one('#deployments-pane'), Vertical)
-            assert app.query_one('#tsplit')
+            app.action_refresh()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            for pane in ('#leases-pane', '#deployments-pane'):
+                assert isinstance(app.query_one(pane), Vertical)
+            for table in ('#endpoints', '#models', '#leases', '#deployments'):
+                assert app.query_one(table)
+            dividers = []
+            for divider in ('#csplit', '#tsplit'):
+                try:
+                    dividers.append(app.query_one(divider))
+                except NoMatches:
+                    pass
+            if tabbed:
+                assert not dividers
+                tabs = app.query_one('#table-tabs', TabbedContent)
+                assert str(tabs.get_tab('pane-leases').label) == 'Leases 1/1'
+                # the pane in front gets the whole height, not a fixed 14 rows
+                assert app.query_one('#leases-pane').size.height > 14
+            else:
+                assert len(dividers) == 2
 
     _run(scenario)
 
 
 def test_tui_panes_drag_resize():
-    from infer_stack.tui import InferStackTUI
-
     controller, catalog = _ctx()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
+        app = _split_layout()(controller, catalog, interval=999,
+                              proc_factory=lambda svc: None)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             w0, h0 = app._sidebar_w, app._log_h
@@ -420,13 +460,11 @@ def test_tui_panes_drag_resize():
 
 
 def test_tui_dividers_have_a_grab_area():
-    from infer_stack.tui import InferStackTUI
-
     controller, catalog = _ctx()
 
     async def scenario():
-        app = InferStackTUI(controller, catalog, interval=999,
-                            proc_factory=lambda svc: None)
+        app = _split_layout()(controller, catalog, interval=999,
+                              proc_factory=lambda svc: None)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             # A 0-size divider can't be grabbed; both must span their cross-axis.
@@ -887,35 +925,35 @@ def test_tui_empty_catalog_shows_suggest_hint():
     _run(scenario)
 
 
-def test_tui_ps_rows_parse_status_created_and_id():
+def test_tui_instance_rows_say_what_each_serves():
+    from types import SimpleNamespace
+
+    from infer_stack.leasing.instances import Instance
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
-    sample = json.dumps([
-        {'Service': 'litellm', 'Status': 'Up 3 minutes', 'State': 'running',
-         'CreatedAt': '2026-06-19 00:00:00 -0400', 'ID': 'abcdef1234567890',
-         'Publishers': [{'PublishedPort': 14042, 'TargetPort': 4000}]},
-    ])
+    instances = [
+        Instance('vllm-qwen', 'abcdef1234567890', 'grp-1', 'restarting',
+                 restarts=2, reason='CrashLoopBackOff',
+                 started='2026-06-19T00:00:00.123Z'),
+        Instance('litellm', 'fedcba', '', 'running', ports='14042->4000/tcp'),
+    ]
 
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999,
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # stub the backend's compose seam
-            backend = controller.backend
-            import tempfile
-            f = tempfile.NamedTemporaryFile('w', suffix='.yml', delete=False)
-            f.write('services: {}\n')
-            f.close()
-            backend.compose_file = f.name
-            backend.project = 'infer-stack'
-            backend.run = lambda args: sample
-            rows = app._compose_ps_rows()
-            assert rows[0]['status'] == 'Up 3 minutes'
-            assert rows[0]['created'].startswith('2026-06-19')
-            assert rows[0]['id'] == 'abcdef123456'        # truncated to 12
-            assert '14042->4000' in rows[0]['ports']
+            app._last_deployments = [SimpleNamespace(id='grp-1', served={'qwen': {}})]
+            engine, gateway = app._ps_rows(instances)
+            assert engine['serves'] == 'qwen'
+            assert engine['status'] == 'restarting (CrashLoopBackOff, 2 restarts)'
+            # Shown in local time, like every other time a person reads here.
+            from infer_stack.leasing.instances import local_time
+            assert engine['started'] == local_time('2026-06-19T00:00:00Z')
+            assert gateway['serves'] == '(front door)'
+            assert gateway['ports'] == '14042->4000/tcp'
+            assert app._ps_rows(None) is None          # the runtime was unreadable
 
     _run(scenario)
 
@@ -952,11 +990,11 @@ def test_tui_collapsed_console_skips_expensive_polling():
             await pilot.pause()
             app._active_tab = 'tab-containers'
             app._collapsed['docker'] = True
-            assert 'ps' not in app._collect()          # collapsed -> no ps poll
+            assert 'instances' not in app._collect()   # collapsed -> no poll
             app._collapsed['docker'] = False
-            assert 'ps' in app._collect()              # visible -> polled
+            assert 'instances' in app._collect()       # visible -> polled
             app._active_tab = 'tab-logs'
-            assert 'ps' not in app._collect()          # other tab -> no ps poll
+            assert 'instances' in app._collect()       # the log picker needs names
             app._collapsed['system'] = True
             assert 'gpus' not in app._collect()        # system collapsed
             app._collapsed['system'] = False
@@ -975,9 +1013,9 @@ def test_tui_open_builds_openwebui_url():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.ui_port = 13000
+            _front(controller.backend, None, 13000)
             assert app._ui_url('qwen-coder') == (
-                'http://localhost:13000/?models=qwen-coder'
+                'http://127.0.0.1:13000/?models=qwen-coder'
             )
 
     _run(scenario)
@@ -1012,7 +1050,7 @@ def test_tui_api_tester_sends_via_injected_http():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             # only ready (running) models are offered; simulate one being ready
             app._sync_api_models(['qwen-coder'])
             assert app.query_one('#api-model', Select).value == 'qwen-coder'
@@ -1053,7 +1091,7 @@ def test_tui_api_send_surfaces_http_error_body():
                             proc_factory=lambda svc: None, http=_HTTP())
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['qwen-coder'])
             assert app.query_one('#api-model', Select).value == 'qwen-coder'
             app.action_api_send()
@@ -1076,8 +1114,7 @@ def test_tui_api_urls_render_without_markup_error():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
-            controller.backend.ui_port = 13000
+            _front(controller.backend, 14042, 13000)
             app._update_api_urls()
             await pilot.pause()
             text = str(app.query_one('#api-urls').render())  # must not raise
@@ -1110,7 +1147,7 @@ def test_tui_api_list_models_and_curl():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['qwen-coder'])
             app._update_api_curl()
             curl = str(app.query_one('#api-curl').render())
@@ -1167,7 +1204,7 @@ def test_tui_api_tester_respects_completions_protocol():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['legacy-completions'])
             assert app.query_one('#api-model', Select).value == 'legacy-completions'
             # curl preview reflects the completions surface
@@ -1229,6 +1266,36 @@ def test_tui_cleanup_prunes_released_and_stopped(tmp_path):
     _run(scenario)
     leases, _ = controller.ledger.status()
     assert not any(str(le.state) == 'released' for le in leases)
+
+
+def test_clean_up_is_one_footer_key_that_logs_its_cli_command():
+    """One Clean up, on `x` in the footer, and each action names its command."""
+    from textual.widgets import Button
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            seen['buttons'] = [b.id for b in app.query(Button)
+                               if 'cleanup' in (b.id or '')]
+            seen['footer'] = [b for b in app.BINDINGS if isinstance(b, tuple)]
+            await pilot.press('x')
+            await app.workers.wait_for_complete()
+            await pilot.press('r')
+            await pilot.pause()
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert seen['buttons'] == []
+    assert ('x', 'cleanup', 'Clear finished') in seen['footer']    # tuples show in the footer
+    assert 'CLI: infer-stack gc --forget' in seen['applog']
+    assert 'CLI: infer-stack status' in seen['applog']
 
 
 def test_tui_evict_all_idle_button():
@@ -1383,8 +1450,7 @@ def test_tui_up_applies_through_the_controller(tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause()
             backend = controller.backend
-            backend.compose_file = compose_file
-            backend.project = 'infer-stack'
+            backend.rendered_file = compose_file
             backend.run = lambda args: calls.append(args) or ''
             app.action_compose_up()
             await app.workers.wait_for_complete()
@@ -1407,7 +1473,8 @@ def test_tui_logs_stream_from_injected_source():
         async with app.run_test() as pilot:
             await pilot.pause()
             app._restart_logs(ALL_SERVICES)           # the gateway's own lines
-            await app.workers.wait_for_complete()     # drain the log stream
+            await app.workers.wait_for_complete()     # the stream has ended
+            app._drain_logs()                         # lines are drawn in batches
             await pilot.pause()
             assert any('ready' in line for line in app._log_lines)
 
@@ -1436,6 +1503,7 @@ def test_tui_compacts_registered_litellm_traceback():
             await pilot.pause()
             app._restart_logs(ALL_SERVICES)           # the gateway's own lines
             await app.workers.wait_for_complete()
+            app._drain_logs()                         # lines are drawn in batches
             await pilot.pause()
             text = '\n'.join(app._log_lines)
             assert 'Traceback (most recent call last):' not in text
@@ -1564,6 +1632,10 @@ def test_tui_table_rebuild_preserves_scroll_offset():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
+            # The mount-time background refresh must land first, or it can
+            # repaint all 40 rows after the rebuild below (an intermittent fail).
+            await app.workers.wait_for_complete()
+            await pilot.pause()
             table = app.query_one('#leases', DataTable)
             assert table.row_count == 40
             # Scroll a few rows down, away from the top.
@@ -1640,27 +1712,22 @@ def test_gateway_services_are_excluded_from_the_default_log_view():
     """The logs pane defaults to engines, not everything.
 
     LiteLLM logs a line per proxied request, so on a busy host it scrolls the
-    engine output -- where errors actually appear -- out of the pane.
+    engine output -- where errors actually appear -- out of the pane. An
+    engine is an instance that serves a deployment; the gateway, UI, database
+    and proxy serve none, whatever they are named (a name hint used to let
+    Open WebUI and Postgres into the engines view).
     """
-    from infer_stack.tui import (
-        ALL_SERVICES,
-        ENGINE_SERVICES,
-        engine_services,
-        is_gateway_service,
-    )
+    from infer_stack.leasing.instances import Instance
+    from infer_stack.tui import ALL_SERVICES, ENGINE_SERVICES
 
-    assert is_gateway_service('litellm')
-    # Substring, not equality: a suffixed gateway service must still match, or
-    # the noisy view comes back silently.
-    assert is_gateway_service('infer-stack-litellm-1')
-    assert not is_gateway_service('vllm-qwen-qwen3-8-27b')
-
-    names = ['litellm', 'vllm-a', 'vllm-b']
-    assert engine_services(names) == ['vllm-a', 'vllm-b']
+    engine = Instance('vllm-a', 'c1', 'grp-1', 'running')
+    assert engine.is_engine
+    for name in ('litellm', 'infer-stack-litellm-1', 'open-webui', 'postgres'):
+        assert not Instance(name, 'c2', '', 'running').is_engine
     # The two sentinels must stay distinguishable from each other and from any
-    # real service name.
+    # real instance name.
     assert ENGINE_SERVICES != ALL_SERVICES
-    assert ENGINE_SERVICES not in names
+    assert ENGINE_SERVICES not in ('litellm', 'vllm-a')
 
 
 def test_named_log_process_follows_only_that_service(monkeypatch):
@@ -1669,7 +1736,8 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
     import subprocess
     import time
 
-    from infer_stack.tui import _DockerLogProc
+    from infer_stack.leasing.instances import Instance
+    from infer_stack.tui import InferStackTUI
 
     service = 'vllm-qwen3-8-27b-dbirks-hyperqwen'
     touched = []
@@ -1679,8 +1747,6 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
             self.stdout = stdout
 
     def fake_run(cmd, **kwargs):
-        if cmd[:2] == ['docker', 'ps']:
-            return _Done(f'c1 running {service}\nc2 running litellm\n')
         touched.append(cmd[-1])                   # docker logs --tail N <id>
         return _Done(b'')
 
@@ -1700,9 +1766,15 @@ def test_named_log_process_follows_only_that_service(monkeypatch):
         def wait(self, timeout=None):
             return 0
 
+    controller, catalog = _ctx()
+    controller.backend.instances = lambda: [
+        Instance(service, 'c1', 'grp-1', 'running'),
+        Instance('litellm', 'c2', '', 'running'),
+    ]
     monkeypatch.setattr(subprocess, 'run', fake_run)
     monkeypatch.setattr(subprocess, 'Popen', lambda cmd, **kw: _Proc(cmd))
-    proc = _DockerLogProc('infer-stack', '/tmp/docker-compose.yml', service)
+    app = InferStackTUI(controller, catalog, interval=999)
+    proc = app._default_proc_factory()(service)
     deadline = time.monotonic() + 5
     while len(touched) < 2 and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -1747,7 +1819,10 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._service_names = lambda: ['litellm', 'vllm-a', 'vllm-b']
+            from infer_stack.leasing.instances import Instance
+            app._last_instances = [Instance('litellm', 'c0', '', 'running'),
+                                   Instance('vllm-a', 'c1', 'g1', 'running'),
+                                   Instance('vllm-b', 'c2', 'g2', 'running')]
 
             target, label = app._resolve_log_target(ENGINE_SERVICES)
             assert target == ['vllm-a', 'vllm-b']
@@ -1756,16 +1831,16 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             # A named service is passed straight through.
             assert app._resolve_log_target('litellm') == ('litellm', 'litellm')
 
-            # "all" stays None so docker compose logs gets no service argument.
+            # "everything" stays None: the follower takes every instance.
             target, label = app._resolve_log_target(ALL_SERVICES)
-            assert target is None and label == 'all services'
+            assert target is None and label == 'everything'
 
             # With no engines there is nothing to follow. Falling back to
-            # every service would show the gateway under the engines label.
+            # every instance would show the gateway under the engines label.
             from infer_stack.tui import NO_LOG_TARGET
-            app._service_names = lambda: ['litellm']
+            app._last_instances = [Instance('litellm', 'c0', '', 'running')]
             target, label = app._resolve_log_target(ENGINE_SERVICES)
-            assert target is NO_LOG_TARGET and 'no engine services' in label
+            assert target is NO_LOG_TARGET and 'no engines running' in label
 
     _run(scenario)
 
@@ -1791,15 +1866,16 @@ def test_engines_view_follows_engines_that_appear_after_it_opened():
                             proc_factory=factory)
         async with app.run_test() as pilot:
             await pilot.pause()
-            services = ['litellm']
-            app._service_names = lambda: list(services)
+            from infer_stack.leasing.instances import Instance
+            app._last_instances = [Instance('litellm', 'c0', '', 'running')]
             app._collapsed['docker'] = False
             app._sync_log_services()
             app._restart_logs(app._log_service)       # the pane opens
             await pilot.pause(0.2)
             assert started == []                      # nothing to follow yet
 
-            services.append('vllm-a')                 # an engine is deployed
+            app._last_instances = [*app._last_instances,   # an engine is deployed
+                                   Instance('vllm-a', 'c1', 'g1', 'running')]
             app._sync_log_services()
             await pilot.pause(0.2)
             await pilot.pause()
@@ -2003,3 +2079,281 @@ def test_tui_log_shows_the_cli_command_for_an_action_and_backend_progress():
     _run(scenario)
     assert 'CLI: infer-stack release --all --yes' in seen['applog']
     assert 'pulling img: 1 of 4 layers' in seen['applog']
+
+
+def test_a_ui_thread_stall_is_reported_with_where_it_happened(tmp_path, monkeypatch):
+    """"The TUI froze" must come with what it was doing."""
+    import time
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    monkeypatch.setattr(InferStackTUI, 'error_log_path', lambda self: tmp_path / 'e.log')
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.3)
+            original = app._update_summary
+
+            def slow(*args, **kwargs):
+                time.sleep(0.9)                   # a blocking call on the UI thread
+                return original(*args, **kwargs)
+
+            app._update_summary = slow
+            app._refresh_now()
+            app._update_summary = original
+            await pilot.pause(0.5)                # the watchdog reports after it ends
+            seen['applog'] = '\n'.join(app._app_log_lines)
+
+    _run(scenario)
+    assert 'UI stalled' in seen['applog']
+    assert 'in slow' in seen['applog'] or 'tui.py' in seen['applog']
+    assert 'time.sleep(0.9)' in (tmp_path / 'e.log').read_text()
+
+
+def test_a_log_flood_is_drawn_in_bounded_batches():
+    from infer_stack.tui import ALL_SERVICES, LOG_PANE_LINES, InferStackTUI
+
+    controller, catalog = _ctx()
+    lines = [f'vllm-x  | loading shard {i}\n' for i in range(5000)]
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: _FakeProc(lines))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._restart_logs(ALL_SERVICES)
+            await app.workers.wait_for_complete()
+            for _ in range(20):                   # a bounded batch per tick
+                app._drain_logs()
+            await pilot.pause()
+            shown = list(app._log_lines)
+            assert len(shown) <= 2 * LOG_PANE_LINES
+            assert shown[-1].endswith('loading shard 4999')        # newest kept
+            assert any('earlier line(s) not shown' in s for s in shown)
+
+    _run(scenario)
+
+
+def test_a_running_action_shows_in_the_activity_line_until_it_ends():
+    """A slow action is visibly working: spinner, what, and for how long."""
+    import threading
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    name = next(iter(catalog.endpoints))
+    gate = threading.Event()
+    real_acquire = controller.acquire
+
+    def slow_acquire(*args, **kwargs):
+        gate.wait(5)
+        return real_acquire(*args, **kwargs)
+
+    controller.acquire = slow_acquire
+    seen = {}
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._start_acquire(name)
+            await pilot.pause(0.3)
+            line = app.query_one('#activity')
+            seen['during'] = (line.display, str(line.render()))
+            gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause(0.3)
+            seen['after'] = line.display
+
+    _run(scenario)
+    shown, text = seen['during']
+    assert shown and f'acquiring {name}' in text and 's' in text
+    assert seen['after'] is False
+
+
+def test_an_edit_made_outside_the_tui_appears_on_the_next_refresh(tmp_path):
+    """The catalog file is reread when it changes (and on `r`); a broken save
+    is reported once, not on every refresh."""
+    import copy
+
+    import yaml
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None,
+                            catalog_path=str(catalog_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            edited = copy.deepcopy(CATALOG)
+            edited['endpoints']['qwen-extra'] = dict(edited['endpoints']['qwen-fast'])
+            catalog_path.write_text(yaml.safe_dump(edited))
+            app.action_refresh()
+            await pilot.pause()
+            assert 'qwen-extra' in app._endpoint_names
+
+            refused = []
+            app._refuse = lambda msg, **kw: refused.append(msg)
+            catalog_path.write_text('endpoints: [not, a, mapping\n')
+            app.action_refresh()
+            app.action_refresh()
+            assert len(refused) == 1 and 'catalog reload failed' in refused[0]
+            assert 'qwen-extra' in app._endpoint_names       # the last good one stays
+
+    _run(scenario)
+
+
+def test_an_80x24_terminal_shows_logs_and_the_tables_when_the_runtime_opens():
+    """At 80x24 the runtime pane used to take every row (the tables vanished),
+    and then, capped naively, left none for the log itself."""
+    from textual.widgets import Collapsible
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            assert app.has_class('compact')           # descriptions give way
+            app.query_one('#docker', Collapsible).collapsed = False
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one('#logs').region.height >= 3
+            assert app.query_one('#tables').region.height >= 1
+
+    _run(scenario)
+
+
+def test_the_api_tab_never_shows_the_master_key():
+    """The curl on screen reads the key when run; the clipboard gets it."""
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._litellm = lambda: ('http://127.0.0.1:14042/v1', 'sk-secret-key')
+            app._sync_api_models(['qwen-coder'])
+            app._update_api_curl()
+            shown = str(app.query_one('#api-curl').render())
+            assert 'sk-secret-key' not in shown
+            assert '$(infer-stack env LITELLM_MASTER_KEY)' in shown
+            copied = []
+            app._copy = lambda text: copied.append(text) or True
+            app.action_api_copy_curl()
+            assert copied and 'sk-secret-key' in copied[0]
+
+    _run(scenario)
+
+
+def test_colored_engine_output_reads_cleanly_in_the_logs_pane():
+    """vLLM colors its "(APIServer pid=1)" prefix; the escape codes used to
+    garble the line in the pane."""
+    from textual.widgets import RichLog
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            from textual.widgets import Collapsible
+
+            app.query_one('#docker', Collapsible).collapsed = False
+            await pilot.pause()
+            app._write_log_lines(['\x1b[1;36m(APIServer pid=1)\x1b[0;0m INFO engines: model loaded'])
+            await pilot.pause()
+            text = '\n'.join(strip.text for strip in app.query_one('#logs', RichLog).lines)
+            assert '(APIServer pid=1) INFO engines: model loaded' in text
+            assert '\x1b' not in text and '[1;36m' not in text
+
+    _run(scenario)
+
+
+def test_tui_sidebar_follows_terminal_width_until_resized_by_hand():
+    # Pass 5 of the UX audit: at 200 columns the catalog sidebar stayed 38
+    # wide and cut its gpu column to "aut" beside 160 columns of empty table.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.pause()
+            assert app.query_one('#sidebar').size.width == 64
+            await pilot.press('right_square_bracket')
+            await pilot.pause()
+            assert app._sidebar_w == 68
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            assert app._sidebar_w == 68          # a hand-set width is kept
+
+    _run(scenario)
+
+
+def test_tui_number_keys_and_palette_reach_every_top_tab():
+    # Pass 5 of the UX audit: API, UI and Settings were reachable only by
+    # mouse or by tabbing into the tab bar; the palette knew none of them.
+    from textual.widgets import TabbedContent
+
+    from infer_stack.tui import TOP_TABS, InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            top = app.query_one('#top', TabbedContent)
+            for i, (_, pane) in reversed(list(enumerate(TOP_TABS, 1))):
+                await pilot.press(str(i))
+                await pilot.pause()
+                assert top.active == pane
+            titles = [c.title for c in app.get_system_commands(app.screen)]
+            assert {f'Go to {label}' for label, _ in TOP_TABS} <= set(titles)
+
+    _run(scenario)
+
+
+def test_tui_log_pane_grows_when_the_terminal_does():
+    # Pass 5 of the UX audit: started at 80x24 and enlarged to 200x50, the
+    # runtime pane kept its small-screen height (one log line) because the
+    # resize handler read the app's size before it updated.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            small = app.query_one('#docker-tabs').styles.height.value
+            await pilot.resize_terminal(200, 50)
+            await pilot.pause()
+            assert app.query_one('#docker-tabs').styles.height.value > small
+            assert app.query_one('#docker-tabs').styles.height.value == app._log_height(50)
+
+    _run(scenario)

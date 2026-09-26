@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from .. import __version__
 from ..paths import config_root, data_root, settings_path
@@ -24,7 +24,7 @@ from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
 
 
-class VersionCLI(scfg.DataConfig):
+class VersionCLI(kw.Config):
     """Print the installed infer-stack version."""
 
     __command__ = 'version'
@@ -48,7 +48,7 @@ def _iter_subcommands(modal: Any):
         if attr.startswith('_'):
             continue
         if isinstance(val, type) and issubclass(
-            val, (scfg.DataConfig, scfg.ModalCLI)
+            val, (kw.Config, kw.ModalCLI)
         ):
             name = getattr(val, '__command__', None) or attr.replace('_', '-')
             out[name] = val
@@ -64,7 +64,7 @@ def _doc_one_line(cls: Any) -> str:
 
 
 def _is_group(sub: Any) -> bool:
-    return isinstance(sub, type) and issubclass(sub, scfg.ModalCLI)
+    return isinstance(sub, type) and issubclass(sub, kw.ModalCLI)
 
 
 def _build_tree(modal: Any, node: Any) -> None:
@@ -86,7 +86,7 @@ def _build_tree(modal: Any, node: Any) -> None:
             _build_tree(sub, child)
 
 
-class HelpTreeCLI(scfg.DataConfig):
+class HelpTreeCLI(kw.Config):
     """Print the full nested command tree with one-line descriptions."""
 
     __command__ = 'tree'
@@ -106,7 +106,7 @@ class HelpTreeCLI(scfg.DataConfig):
         return 0
 
 
-class HelpModalCLI(scfg.ModalCLI):
+class HelpModalCLI(kw.ModalCLI):
     """Help utilities (use ``infer-stack <command> --help`` for per-command help)."""
 
     __command__ = 'help'
@@ -207,12 +207,12 @@ class ConfigPathsCLI(_PathOverridesMixin):
 
     __command__ = 'paths'
 
-    target: Any = scfg.Value(
+    target: Any = kw.Value(
         'all',
         position=1,
         help='Path group to show: all, config, data, or leasing.',
     )
-    json: Any = scfg.Value(
+    json: Any = kw.Value(
         False,
         isflag=True,
         help='Emit the path groups as JSON instead of human-readable text.',
@@ -362,6 +362,19 @@ BACKEND_SETTINGS = {
     'kubeai_resource_profile':
         'Fallback KubeAI resourceProfiles name for catalog endpoints whose '
         'runtime omits resource_profile.',
+    'kubeai_gateway_upstream':
+        'URL the LiteLLM gateway uses to reach KubeAI (default: the kubeai '
+        "Service's cluster IP, reachable from a cluster node; set an ingress "
+        'URL when the gateway runs off the cluster).',
+    'kubeai_gateway':
+        'Where the LiteLLM gateway runs: `host` (default; a Compose project on '
+        'this host) or `cluster` (a Deployment + NodePort Service in the KubeAI '
+        'namespace, reachable from every node).',
+    'kubeai_gateway_node_port':
+        'NodePort of the in-cluster gateway (default: 30442).',
+    'kubeai_gateway_url':
+        'Where clients reach the in-cluster gateway, e.g. an ingress URL '
+        "(default: the first node's address on the NodePort).",
 }
 
 
@@ -388,17 +401,17 @@ class ConfigInitCLI(_PathOverridesMixin):
     """
 
     __command__ = 'init'
-    yes = scfg.Value(
+    yes = kw.Value(
         False, isflag=True, alias=['y'],
         help='Non-interactive: write without prompting/confirming.',
     )
-    fresh = scfg.Value(
+    fresh = kw.Value(
         False, isflag=True,
         help='Start over: ignore any existing config and write a clean one from '
         'defaults (discards other persisted settings too).',
     )
-    backend = scfg.Value(
-        None, choices=['compose', 'kubeai', 'null'],
+    backend = kw.Value(
+        None, type=str, choices=['compose', 'kubeai', 'null'],
         help='Preset the default backend (skips that prompt).',
     )
 
@@ -481,7 +494,8 @@ class ConfigInitCLI(_PathOverridesMixin):
         base.update(values)
         save_settings(base)
         print(f'wrote settings -> {path}')
-        print('next: `infer-stack catalog init` to add models/endpoints')
+        print('next: `infer-stack catalog suggest --apply` (a catalog sized to this '
+              "host's GPUs), then `infer-stack acquire <endpoint>`")
         return 0
 
 
@@ -489,8 +503,8 @@ class ConfigSetCLI(_PathOverridesMixin):
     """Persist a durable default, e.g. ``config set backend compose``."""
 
     __command__ = 'set'
-    key = scfg.Value(None, position=1, type=str)
-    value = scfg.Value(None, position=2, type=str)
+    key = kw.Value(None, position=1, type=str)
+    value = kw.Value(None, position=2, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -517,7 +531,7 @@ class ConfigGetCLI(_PathOverridesMixin):
     """Print one setting's value (or all settings)."""
 
     __command__ = 'get'
-    key = scfg.Value(None, position=1, type=str)
+    key = kw.Value(None, position=1, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -584,7 +598,7 @@ class ConfigEditCLI(_PathOverridesMixin):
 from .commands_leasing import ConfigPublishCLI  # noqa: E402
 
 
-class ConfigModalCLI(scfg.ModalCLI):
+class ConfigModalCLI(kw.ModalCLI):
     """Inspect + manage infer-stack configuration (paths + durable settings)."""
 
     __command__ = 'config'

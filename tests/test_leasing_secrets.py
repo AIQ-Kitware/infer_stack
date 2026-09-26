@@ -14,8 +14,11 @@ import yaml
 from infer_stack.env_utils import parse_env_file
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import Controller, Ledger, SqliteStore
-from infer_stack.leasing.compose import (
-    API_KEY_ENV, SALT_KEY_ENV, ComposeBackend, set_master_key,
+from infer_stack.leasing.compose import ComposeBackend
+from infer_stack.leasing.gateway import (
+    API_KEY_ENV,
+    SALT_KEY_ENV,
+    set_master_key,
 )
 from infer_stack.leasing.profile import ProfileMismatch
 from infer_stack.leasing.residency import FINGERPRINT_LABEL
@@ -52,7 +55,7 @@ def make(tmp_path):
 
 
 def env(ctl):
-    return parse_env_file(ctl.backend._env_path)
+    return parse_env_file(ctl.backend.gateway._env_path)
 
 
 def gateway(ctl):

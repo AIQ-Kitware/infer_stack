@@ -225,6 +225,22 @@ def test_release_evict_tears_down_immediately(env, capsys):
     assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
+def test_gc_forget_drops_only_finished_rows(env, capsys):
+    """`gc --forget` is the TUI's Clean up: history goes, live rows stay."""
+    from infer_stack.cli.commands_leasing import GcCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--evict'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    capsys.readouterr()
+    assert GcCLI.main(argv=['--ledger', env.db, '--forget', '--json']) == 0
+    assert json.loads(capsys.readouterr().out) == {'leases': 1, 'deployments': 1}
+    data = _leases_json(env, capsys)
+    assert [le['owner'] for le in data['leases']] == ['b']
+    assert [g['state'] for g in data['deployments']] != ['stopped']
+    assert len(data['deployments']) == 1
+
+
 def test_acquire_without_ttl_is_standing_lease(env, capsys):
     # No --ttl -> an infinite (standing-service) lease owned by the caller.
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
@@ -793,7 +809,7 @@ def test_evict_json_stdout_is_pure_json(env, capsys):
     out, err = capsys.readouterr()
     data = json.loads(out)  # must parse: no human text mixed into stdout
     assert data == {'evicted': [], 'torn_down': [], 'missing': ['ghost']}
-    assert 'no idle deployment for: ghost' in err
+    assert 'evict: ghost is not a deployment or served endpoint' in err
     assert rc == 0
 
 
@@ -951,8 +967,7 @@ def test_routes_prune_drops_stale(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     rc = RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json'])
     assert rc == 0
-    raw = capsys.readouterr().out  # `Write .env to ...` may precede the JSON
-    out = json.loads(raw[raw.index('{'):])
+    out = json.loads(capsys.readouterr().out)   # --json output is only the JSON
     assert out['dropped'] == ['beta']
     assert out['kept'] == ['alpha']
 
@@ -969,7 +984,7 @@ def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkey
     from infer_stack.leasing.backend import MemoryBackend
 
     class RoutesNeverVerify(MemoryBackend):
-        def converge(self, desired, *, apply=True):
+        def converge(self, desired, *, apply=True, placement=None):
             self.last_unplaced, self.last_errors, self.last_assignments = [], [], {}
 
         def apply(self):
@@ -1106,6 +1121,24 @@ def test_clean_force_releases_leases_and_evicts_keep_warm(env, capsys):
     assert all(d['state'] == 'stopped' for d in data['deployments'])
 
 
+
+def test_a_released_stop_deployment_is_neither_missing_nor_left_to_clean(env, capsys):
+    # UX audit pass 5, the README's first run: after `release --all` tore a
+    # `reclaim: stop` model down, `leases` warned NOT-RUNNING and `clean`
+    # offered to tear it down again. It is IDLE in the ledger by design.
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    catalog = yaml.safe_load(open(env.cat))
+    catalog['endpoints']['reranker']['reclaim'] = {'policy': 'stop'}
+    open(env.cat, 'w').write(yaml.safe_dump(catalog))
+    AcquireCLI.main(argv=['reranker', *_base(env)])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    capsys.readouterr()
+    LeasesCLI.main(argv=['--ledger', env.db])
+    assert 'NOT-RUNNING' not in capsys.readouterr().out
+    assert CleanCLI.main(argv=['--ledger', env.db]) == 0
+    assert 'already clean' in capsys.readouterr().out
+
 def test_clean_reports_an_already_clean_stack(env, capsys):
     from infer_stack.cli.commands_leasing import CleanCLI
 
@@ -1123,3 +1156,16 @@ def test_clean_json_dry_run_is_pure_json(env, capsys):
     assert data['dry_run'] is True
     assert [le['endpoints'] for le in data['leases']] == [['qwen-coder']]
     assert data['deployments'][0]['served'] == ['qwen-coder']
+
+
+def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
+    # UX audit pass 6: a cleanup trap after a failed acquire ran
+    # `release --env-file lease.env` on a file never written: a traceback.
+    missing = str(tmp_path / 'lease.env')
+    with pytest.raises(SystemExit, match='release: no env-file at .*did not finish'):
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+    with pytest.raises(SystemExit, match='renew: no env-file at'):
+        RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
+    (tmp_path / 'lease.env').write_text('export OPENAI_BASE_URL=x\n')
+    with pytest.raises(SystemExit, match='names no lease'):
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])

@@ -8,7 +8,7 @@ the models it needs, block until ready, and release after:
     infer-stack run --endpoint qwen-coder -- python my_node.py
     infer-stack release --env-file is.env
     infer-stack acquire qwen-coder      # standing service (no --ttl)
-    infer-stack leases                  # status of leases + deployment deployments
+    infer-stack leases                  # status of leases + deployments
 
 Until the Compose/KubeAI backends land, the default ``--backend null`` is a
 dry-run: the ledger does all the real bookkeeping (coalescing, demand, TTL) but
@@ -26,7 +26,7 @@ import sys
 from typing import Any
 from pathlib import Path
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from ..env_utils import parse_env_file, write_env_file
 from ..leasing import (
@@ -277,6 +277,43 @@ def _make_backend(config, *, interactive: bool = False):
     if name == 'kubeai':
         from ..backends.kubeai import KubeaiBackend
 
+        def make_gateway(placement: str):
+            """The LiteLLM front door for a placement: 'host' or 'cluster'."""
+            if placement == 'cluster':
+                from ..backends.kubeai import _default_kubectl_run
+                from ..backends.kubeai_gateway import DEFAULT_NODE_PORT, ClusterGateway
+
+                return ClusterGateway(
+                    state_dir=data_root() / 'leasing' / 'kubeai-cluster-gateway',
+                    namespace=get_setting('kubeai_namespace') or 'kubeai',
+                    run=_default_kubectl_run,
+                    node_port=int(get_setting('kubeai_gateway_node_port')
+                                  or DEFAULT_NODE_PORT),
+                    url=get_setting('kubeai_gateway_url') or None,
+                    assume_yes=_resolve_assume_yes(config, interactive=interactive),
+                )
+            # The same LiteLLM front door as the compose backend, fronting the
+            # cluster: one base_url, the managed key, and endpoint aliases as
+            # request names. Its own state dir and compose project, so it can
+            # never touch a compose stack's containers on the same host. It
+            # takes the same settings as on compose (UI, reverse proxy,
+            # dynamic routing); only the engines are elsewhere.
+            rp_enabled, rp_port, rp_config = _resolve_reverse_proxy(config)
+            return ComposeBackend(
+                state_dir=data_root() / 'leasing' / 'kubeai-gateway',
+                inventory={'gpu_count': 0, 'gpus': []},
+                project='infer-stack-gateway',
+                litellm=True,
+                ui=_resolve_ui(config),
+                reverse_proxy=rp_enabled,
+                reverse_proxy_port=rp_port,
+                reverse_proxy_config=rp_config,
+                dynamic_routing=_resolve_dynamic_routing(config),
+                assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            )
+
+        gateway = (make_gateway(get_setting('kubeai_gateway') or 'host')
+                   if _resolve_litellm(config) else None)
         backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
@@ -284,6 +321,9 @@ def _make_backend(config, *, interactive: bool = False):
             default_resource_profile=get_setting('kubeai_resource_profile')
             or None,
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
+            gateway=gateway,
+            gateway_upstream=get_setting('kubeai_gateway_upstream') or None,
+            gateway_factory=make_gateway if gateway is not None else None,
         )
         try:
             backend.catalog = _load_catalog(config)   # frozen into the profile
@@ -392,10 +432,27 @@ def _resolve(catalog, names, *, sharing=None):
         raise SystemExit(str(ex))
 
 
-def _resolve_lease(config) -> str | None:
+def _resolve_lease(config, verb: str) -> str | None:
+    """The lease id given directly, or the one an ``--env-file`` records.
+
+    A missing env-file is the usual cleanup-trap case: the acquire that would
+    have written it failed (and rolled back), so there is nothing of it to
+    release. Said so, not a traceback.
+    """
+    from ..leasing.envfile import LEASE_ENV
+
     sid = getattr(config, 'lease', None)
-    if not sid and getattr(config, 'env_file', None):
-        sid = read_lease_id(config.env_file)
+    env_file = getattr(config, 'env_file', None)
+    if not sid and env_file:
+        path = Path(env_file).expanduser()
+        if not path.is_file():
+            raise SystemExit(
+                f'{verb}: no env-file at {path}; the acquire that writes it did '
+                'not finish, so it holds no lease (`infer-stack leases` lists '
+                'what is held)')
+        sid = read_lease_id(path)
+        if not sid:
+            raise SystemExit(f'{verb}: {path} names no lease ({LEASE_ENV})')
     return sid
 
 
@@ -458,7 +515,14 @@ def _public_descriptor(descriptor: dict) -> dict:
 
 
 def _compose_file_path(controller) -> str | None:
+    """The compose file, on the compose backend only (JSON's ``compose_file``)."""
     path = getattr(controller.backend, 'compose_file', None)
+    return str(path) if path else None
+
+
+def _rendered_path(controller) -> str | None:
+    """The file a render writes, on any backend: compose project or Models."""
+    path = getattr(controller.backend, 'rendered_file', None)
     return str(path) if path else None
 
 
@@ -487,6 +551,7 @@ def _emit_staged(config, controller, outcome) -> int:
             'applied': False,
             'descriptor': _public_descriptor(descriptor),
             'compose_file': _compose_file_path(controller),
+            'rendered_file': _rendered_path(controller),
             'placement': [
                 {'deployment': g.id, 'served': sorted(g.served),
                  'gpus': assignments.get(g.id)}
@@ -495,13 +560,18 @@ def _emit_staged(config, controller, outcome) -> int:
         }, indent=2))
         return 0
     print(f'staged {outcome.lease.id} (owner={outcome.lease.owner}) — not applied')
+    from ..leasing.backend import allocates_gpus
+
+    local = allocates_gpus(controller.backend)
     for g in outcome.deployments:
         eps = ', '.join(sorted(g.served)) or g.id
-        print(f'  {eps}: {_gpu_where(assignments.get(g.id))}  ({g.id})')
-    path = _compose_file_path(controller)
-    if path:
-        print(f'  compose: {path}')
+        where = _gpu_where(assignments.get(g.id)) if local else 'cluster-scheduled'
+        print(f'  {eps}: {where}  ({g.id})')
+    rendered = _rendered_path(controller)
+    if rendered:
+        print(f'  rendered: {rendered}')
     print('  apply:   infer-stack apply           # bring the staged set up')
+    path = _compose_file_path(controller)
     if path:
         # The file carries `name: infer-stack`, so plain docker works too.
         print(f'  ...or:   docker compose -f {path} up -d')
@@ -695,11 +765,13 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
         lines += [f'  {r}' for r in ex.reasons] or [
             f'  {", ".join(ex.deployment_ids)}'
         ]
-        lines.append(
-            '  free a GPU first — `infer-stack leases` to see what holds them, '
-            'then `infer-stack release`/`evict`. (Every GPU, including any '
-            'display-attached one, is used unless you set --skip-display-gpus.)'
-        )
+        if ex.capacity:
+            lines.append(
+                '  free a GPU first — `infer-stack leases` to see what holds them, '
+                'then `infer-stack release`/`evict`, or wait for one with --queue. '
+                '(Every GPU, including any display-attached one, is used unless '
+                'you set --skip-display-gpus.)'
+            )
         raise SystemExit('\n'.join(lines))
     return _emit_acquire(config, controller, outcome)
 
@@ -710,39 +782,39 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 
 
 class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
-    backend = scfg.Value(
+    backend = kw.Value(
         None,
-        choices=['null', 'compose', 'kubeai'],
+        type=str, choices=['null', 'compose', 'kubeai'],
         help='Serving backend: "null" (dry-run), "compose" (single-host '
         'docker), or "kubeai" (cluster; see docs/kubeai-backend.md). '
         'Defaults to `config set backend …`, else "null".',
     )
-    ledger = scfg.Value(
+    ledger = kw.Value(
         None, type=str, help='Path to the lease ledger sqlite db.'
     )
-    require_generation = scfg.Value(
+    require_generation = kw.Value(
         False,
         isflag=True,
         help='Deprecated/no-op: readiness now ALWAYS verifies a real generation '
         '(a listed alias or a running container is not proof the model serves). '
         'Accepted for compatibility.',
     )
-    litellm = scfg.Value(
+    litellm = kw.Value(
         None,
         isflag=True,
         help='Render the LiteLLM gateway — one OpenAI base_url fronting every '
-        'endpoint alias (compose backend). On by default; use --no-litellm for '
+        'endpoint alias. On by default; use --no-litellm for '
         'a lean stack where Open WebUI talks to the upstreams (e.g. an Ollama '
         'daemon) directly. Overrides `config set litellm …`.',
     )
-    ui = scfg.Value(
+    ui = kw.Value(
         None,
         isflag=True,
-        help='Render a managed Open WebUI in front of the gateway (compose '
-        'backend). On by default; use --no-ui to skip. Overrides '
-        '`config set ui …`.',
+        help='Render a managed Open WebUI in front of the gateway (on this host; '
+        'not with kubeai_gateway cluster). On by default; use --no-ui to skip. '
+        'Overrides `config set ui …`.',
     )
-    reverse_proxy = scfg.Value(
+    reverse_proxy = kw.Value(
         None,
         isflag=True,
         alias=['reverse-proxy'],
@@ -751,7 +823,7 @@ class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMix
         '(localhost / trusted networks only). Port + bring-your-own nginx.conf '
         'live in the `reverse_proxy` setting (`config set` / `config edit`).',
     )
-    dynamic_routing = scfg.Value(
+    dynamic_routing = kw.Value(
         None,
         isflag=True,
         alias=['dynamic-routing'],
@@ -771,63 +843,66 @@ class _ApprovalMixin(_LeasingCommonMixin):
     terminal; ``--yes`` (or a non-TTY) applies without prompting.
     """
 
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Path to catalog.yaml. release/gc/evict reconcile the gateway too, '
         'so pass the same catalog as acquire to keep the static superset route '
         'table (no gateway blip); omitted, it falls back to the default-path '
         'catalog, else legacy per-deployment routing.',
     )
-    yes = scfg.Value(
+    yes = kw.Value(
         False, isflag=True, alias=['y'],
-        help='Apply compose changes without showing the diff / prompting '
-        '(compose backend). Implied when stdout is not a terminal.',
+        help='Apply the rendered changes (the compose project, or the KubeAI '
+        'Models and gateway) without showing the diff / prompting. Implied when '
+        'stdout is not a terminal.',
     )
 
 
 class _AcquireFlagsMixin(_LeasingCommonMixin):
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    base_url = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    base_url = kw.Value(
         'http://127.0.0.1:14042/v1',
         type=str,
         help='Base URL written into the endpoint descriptor (dry-run placeholder).',
     )
-    api_key_env = scfg.Value(
+    api_key_env = kw.Value(
         'LITELLM_MASTER_KEY',
         type=str,
         help='Name of the env var holding the API key (kept out of artifacts).',
     )
-    wait = scfg.Value(
+    wait = kw.Value(
         True, isflag=True, help='Block until ready (use --no-wait to skip).'
     )
-    queue = scfg.Value(
+    queue = kw.Value(
         False, isflag=True,
         help='Admission queue: if every GPU is busy, WAIT for one to free '
         '(up to --timeout) instead of failing fast. Each retry sweeps the '
         'ledger, so a crashed job\'s TTL-expired lease is reclaimed while '
         'waiting. Intended for batch/pipeline fan-out; interactive use '
-        'defaults off (fail fast with a clear "no GPU" error).',
+        'defaults off (fail fast with a clear "no GPU" error). On kubeai the '
+        'cluster is the queue: admitted at once, and a Pending pod waits.',
     )
-    apply = scfg.Value(
+    apply = kw.Value(
         True,
         isflag=True,
-        help='Apply the render (docker compose up). Use --no-apply to *stage* '
-        'only: declare the lease and write the on-disk compose project + '
-        'placement WITHOUT starting it, then `infer-stack apply` to bring it up '
-        '(compose backend). --no-apply implies no readiness wait and no diff '
-        'prompt; `release` discards a staged lease.',
+        help='Apply the render (bring it up). Use --no-apply to *stage* only: '
+        'declare the lease and write the rendered state (the compose project, '
+        'or the KubeAI Models) WITHOUT starting it, then `infer-stack apply` to '
+        'bring it up. --no-apply implies no readiness wait and no diff prompt; '
+        '`release` discards a staged lease.',
     )
-    timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    env_file = scfg.Value(
+    timeout = kw.Value(600, type=float, help='Readiness wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    env_file = kw.Value(
         None, type=str, help='Write the sourceable endpoint env-file here.'
     )
-    yes = scfg.Value(
+    yes = kw.Value(
         False, isflag=True, alias=['y'],
-        help='Apply compose changes without showing the diff / prompting '
-        '(compose backend). Implied when stdout is not a terminal.',
+        help='Apply the rendered changes (the compose project, or the KubeAI '
+        'Models and gateway) without showing the diff / prompting. Implied when '
+        'stdout is not a terminal.',
     )
-    json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
+    json = kw.Value(False, isflag=True, help='Emit JSON instead of text.')
 
 
 # ---------------------------------------------------------------------------
@@ -839,11 +914,11 @@ class AcquireCLI(_AcquireFlagsMixin):
     """Acquire a lease on one or more endpoints/bundles, bring them up, wait.
 
     ``acquire NAME…`` is the everyday verb. It takes a lease on each endpoint or
-    bundle, renders the compose project (the LiteLLM gateway + one container per
-    model + a managed Open WebUI), brings it up, and blocks until every endpoint
-    is ready. Run it again with more names to add models side by side — the
-    gateway and UI stay put. Placement, ``docker compose``, and readiness are
-    narrated on stderr.
+    bundle, renders what serves it (the LiteLLM gateway, one engine per model:
+    a container on compose, a Model on kubeai, and a managed Open WebUI),
+    brings it up, and blocks until every endpoint is ready. Run it again with
+    more names to add models side by side — the gateway and UI stay put.
+    Placement, the apply, and readiness are narrated on stderr.
 
     With no ``--ttl`` the lease is infinite — a standing service you tear down
     explicitly (``release`` / ``evict``). Pass ``--ttl`` (e.g. ``2h``, ``30m``)
@@ -854,13 +929,13 @@ class AcquireCLI(_AcquireFlagsMixin):
     when done. (For a one-shot "acquire, run a command, release", use
     ``infer-stack run`` instead.)
 
-    The work is render (write the on-disk compose project) then apply (``docker
-    compose up``). ``--no-apply`` does just the render so you can see what
-    would run before pulling the trigger (then ``infer-stack apply``).
-    ``--no-wait`` applies but returns immediately so several models load in
-    parallel (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a
-    terminal you are shown the compose diff and asked before applying; ``--yes``
-    skips that prompt (and it is skipped automatically off a TTY).
+    The work is render (write the rendered state to disk) then apply (bring
+    it up). ``--no-apply`` does just the render so you can see what would run
+    before pulling the trigger (then ``infer-stack apply``). ``--no-wait``
+    applies but returns immediately so several models load in parallel
+    (``wait`` for them later). ``--no-ui`` skips Open WebUI. On a terminal you
+    are shown the diff and asked before anything is committed; ``--yes`` skips
+    that prompt (and it is skipped automatically off a TTY).
     """
 
     __command__ = 'acquire'
@@ -885,19 +960,19 @@ class AcquireCLI(_AcquireFlagsMixin):
         infer-stack leases
     """
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
     )
-    ttl = scfg.Value(
+    ttl = kw.Value(
         None, type=str, help='Soft TTL (e.g. 2h, 30m); default infinite.'
     )
-    owner = scfg.Value(None, type=str, help='Lease owner (default: $USER).')
-    dedicated = scfg.Value(
+    owner = kw.Value(None, type=str, help='Lease owner (default: $USER).')
+    dedicated = kw.Value(
         False,
         isflag=True,
         help='Force a dedicated deployment instead of coalescing.',
     )
-    reserve_gpus = scfg.Value(
+    reserve_gpus = kw.Value(
         0,
         type=int,
         alias=['reserve-gpus'],
@@ -922,10 +997,11 @@ class AcquireCLI(_AcquireFlagsMixin):
 
 
 class RenderCLI(_LeasingCommonMixin):
-    """Write the on-disk compose project for the current desired set — no up.
+    """Write the rendered state for the current desired set, without bringing it up.
 
-    Lease-free and idempotent: ``render`` re-materializes the manifest (compose
-    file + gateway config + GPU placement) from whatever is *already* declared,
+    Lease-free and idempotent: ``render`` re-materializes what would run (the
+    compose project and gateway config with GPU placement, or the KubeAI Models
+    and gateway) from whatever is *already* declared,
     WITHOUT starting anything — to inspect what would run, or refresh a file you
     touched by hand. It creates no lease; to stage a *new* endpoint use ``acquire
     --no-apply`` (which declares it too). Apply with ``infer-stack apply``.
@@ -933,23 +1009,24 @@ class RenderCLI(_LeasingCommonMixin):
 
     __command__ = 'render'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=False)
         rec = controller.reconcile(apply=False)
-        path = _compose_file_path(controller)
+        path = _rendered_path(controller)
         if config.json:
             print(json.dumps({
                 'applied': False,
-                'compose_file': path,
+                'compose_file': _compose_file_path(controller),
+                'rendered_file': path,
                 'placement': rec.assignments,
                 'unplaced': rec.unplaced,
             }, indent=2))
             return 0
-        print(f'rendered desired set -> {path or "(backend has no on-disk project)"}')
+        print(f'rendered desired set -> {path or "(this backend renders no file)"}')
         for gid, gpus in sorted(rec.assignments.items()):
             print(f'  {gid}: {_gpu_where(gpus)}')
         for err in rec.placement_errors:
@@ -965,21 +1042,20 @@ class ApplyCLI(_ApprovalMixin):
     declared (by ``acquire``) onto the backend. It is the *trigger*
     for a staged ``acquire --no-apply`` and the re-sync button after a manual edit
     or a backend hiccup; idempotent (a second apply with nothing changed is a
-    no-op). On a terminal it shows the compose diff and asks (``--yes`` skips).
-    The rendered file carries ``name: infer-stack``, so ``docker compose -f
-    <file> up -d`` is an exact equivalent. (``infer-stack stack up`` is the
-    lower-level "run exactly what is on disk" hatch; ``apply`` re-renders from
-    intent first.)
+    no-op). On a terminal it shows the diff and asks (``--yes`` skips).
+    ``infer-stack stack up`` is the same command. On compose, ``infer-stack
+    stack compose -- up -d`` runs exactly what is on disk without re-rendering
+    from intent first.
     """
 
     __command__ = 'apply'
 
-    wait = scfg.Value(
+    wait = kw.Value(
         False, isflag=True, help='Also block until ready after bringing it up.'
     )
-    timeout = scfg.Value(600, type=float, help='Readiness wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    json = scfg.Value(False, isflag=True)
+    timeout = kw.Value(600, type=float, help='Readiness wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1048,7 +1124,7 @@ def _declined_exit() -> SystemExit:
 
 
 class ReleaseCLI(_ApprovalMixin):
-    """Release a lease; deployments idle/teardown per their reclaim policy.
+    """Release a lease; its models stay warm or stop, per their reclaim policy.
 
     On a terminal the resulting compose change is shown and confirmed before
     docker is touched (``--yes`` skips); declining leaves the lease released in
@@ -1059,22 +1135,22 @@ class ReleaseCLI(_ApprovalMixin):
 
     __command__ = 'release'
 
-    lease = scfg.Value(
+    lease = kw.Value(
         None, position=1, type=str, help='Lease id (or use --env-file).'
     )
-    env_file = scfg.Value(
+    env_file = kw.Value(
         None, type=str, help='Read the lease id from this env-file.'
     )
-    all = scfg.Value(
+    all = kw.Value(
         False, isflag=True,
         help='Release every active lease (the whole stack idles/tears down).',
     )
-    evict = scfg.Value(
+    evict = kw.Value(
         False, isflag=True,
         help='Also evict (tear down) the released deployment(s) now, even if their '
         'reclaim policy is keep-warm — frees the GPU immediately.',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1088,7 +1164,7 @@ class ReleaseCLI(_ApprovalMixin):
                 raise SystemExit('release: --all takes no lease/--env-file')
             targets = None
         else:
-            sid = _resolve_lease(config)
+            sid = _resolve_lease(config, 'release')
             if not sid:
                 raise SystemExit(
                     'release: give a lease id, --env-file, or --all'
@@ -1167,12 +1243,12 @@ class EvictCLI(_ApprovalMixin):
 
     __command__ = 'evict'
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Endpoint alias or deployment id to evict.',
     )
-    all = scfg.Value(False, isflag=True, help='Evict every idle deployment.')
-    json = scfg.Value(False, isflag=True)
+    all = kw.Value(False, isflag=True, help='Evict every idle deployment.')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1192,17 +1268,22 @@ class EvictCLI(_ApprovalMixin):
                 if missing:
                     # Diagnostic, not payload: stdout must stay pure JSON
                     # under --json (and stay grep-able human output without).
-                    print(
-                        f'no idle deployment for: {", ".join(missing)}',
-                        file=sys.stderr,
-                    )
+                    _, rows = controller.ledger.status(virtual_expiry=True)
+                    held = {name for g in rows if g.state == DeploymentState.LIVE
+                            for name in (g.id, *g.served)}
+                    for name in missing:
+                        why = ('is live: a lease holds it; release it first'
+                               if name in held else
+                               'is not a deployment or served endpoint '
+                               '(`infer-stack leases` lists them)')
+                        print(f'evict: {name} {why}', file=sys.stderr)
                 if not targets:
                     if config.json:
                         print(json.dumps(
                             {'evicted': [], 'torn_down': [],
                              'missing': missing}, indent=2))
                     else:
-                        print('nothing to evict')
+                        print('nothing evicted')
                     return 0
                 outcome = controller.evict(targets)
         except ConvergeAborted:
@@ -1232,21 +1313,27 @@ class GcCLI(_ApprovalMixin):
     blocking ``acquire`` (``--queue``) already does this implicitly while it waits.
     ``--evict`` additionally tears down idle *keep-warm* deployments (like ``evict
     --all``). On a terminal the teardown is shown and confirmed (``--yes`` skips).
+    ``--forget`` only drops finished rows from the ledger (the TUI's Clean up).
     """
 
     __command__ = 'gc'
 
-    evict = scfg.Value(
+    evict = kw.Value(
         False, isflag=True,
         help='Also tear down idle keep-warm deployments (like `evict --all`), '
         'not just leaked/expired demand.',
     )
-    orphans = scfg.Value(
+    orphans = kw.Value(
         False, isflag=True,
         help='Instead: remove containers in the project that infer-stack does not '
         'manage (listed and confirmed first; --yes skips the prompt).',
     )
-    json = scfg.Value(False, isflag=True)
+    forget = kw.Value(
+        False, isflag=True,
+        help='Instead: forget released/expired leases and stopped deployments '
+        'from the ledger. History only; nothing running changes.',
+    )
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1254,9 +1341,18 @@ class GcCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
+        if config.forget:
+            n_leases, n_deployments = controller.prune()
+            if config.json:
+                print(json.dumps({'leases': n_leases,
+                                  'deployments': n_deployments}, indent=2))
+            else:
+                print(f'gc --forget: forgot {n_leases} released/expired lease(s), '
+                      f'{n_deployments} stopped deployment(s)')
+            return 0
         if config.orphans:
-            if not callable(getattr(controller.backend, 'residency', None)):
-                raise SystemExit('gc --orphans needs the compose backend')
+            # Unlabelled units in residency. The kubeai backend reads only the
+            # pods carrying its label, so it never has any.
 
             def confirm(found):
                 print(f'gc --orphans: {len(found)} unmanaged container(s):')
@@ -1321,16 +1417,16 @@ class CleanCLI(_LeasingCommonMixin):
         infer-stack clean -f --no-orphans   # leave unmanaged containers alone
     """
 
-    force = scfg.Value(
+    force = kw.Value(
         False, isflag=True, short_alias=['f'],
         help='Actually release and tear down. Without it, clean only reports.',
     )
-    orphans = scfg.Value(
+    orphans = kw.Value(
         True, isflag=True,
         help='Also remove containers in the project that infer-stack does not '
         'manage (--no-orphans keeps them).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1341,11 +1437,14 @@ class CleanCLI(_LeasingCommonMixin):
         controller = _open_controller(config, interactive=False)
         leases, deployments = controller.ledger.status(virtual_expiry=True)
         active = [le for le in leases if le.state == LeaseState.ACTIVE]
-        held = [g for g in deployments
-                if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)]
         observed, assignments = _placement_view(controller)
-        can_orphan = bool(config.orphans) and callable(
-            getattr(controller.backend, 'residency', None))
+        # An idle `stop` deployment with nothing running was already torn
+        # down by its release: nothing is left to do but forget it (-f does).
+        held = [g for g in deployments
+                if g.state in (DeploymentState.LIVE, DeploymentState.IDLE)
+                and (controller.keeps_up(g) or g.id in observed)]
+        # On any backend: one that selects its units by label (kubeai) has none.
+        can_orphan = bool(config.orphans)
 
         found: list = []
 
@@ -1371,17 +1470,16 @@ class CleanCLI(_LeasingCommonMixin):
                 print(json.dumps(plan, indent=2))
                 return 0
             if not (active or held or found):
-                print('clean: already clean (no leases, no deployments, no orphans)')
+                print('clean: already clean (no active leases, no models up, no orphans)')
                 return 0
             print('clean: would release and tear down (dry run; -f to do it)')
             for le in active:
                 print(f'  release   {le.id}  owner={le.owner}  '
                       f'{",".join(le.endpoints)}')
             for g in held:
-                gpus = assignments.get(g.id)
                 print(f'  tear down {g.id}  {g.state}'
                       f'{" running" if g.id in observed else ""}'
-                      f'  gpus={gpus if gpus is not None else "-"}'
+                      f'  gpus={_gpu_label(g.id, observed, assignments)}'
                       f'  {",".join(sorted(g.served))}')
             for c in found:
                 print(f'  remove    {c.container_id[:12]}  {c.service or "?"}  '
@@ -1417,8 +1515,7 @@ class CleanCLI(_LeasingCommonMixin):
 
 
 class WaitCLI(_LeasingCommonMixin):
-    """Block until served endpoints are ready — the companion to ``acquire
-    --no-wait``.
+    """Block until served endpoints are ready (the companion to ``acquire --no-wait``).
 
     Fan out, then wait: ``acquire --no-wait smol17b-1`` + ``acquire --no-wait
     smol135-1`` kick both deployments off in parallel (each converges and starts
@@ -1432,13 +1529,13 @@ class WaitCLI(_LeasingCommonMixin):
 
     __command__ = 'wait'
 
-    names = scfg.Value(
+    names = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Endpoint names to wait for (default: every live deployment).',
     )
-    timeout = scfg.Value(600, type=float, help='Overall wait timeout (s).')
-    interval = scfg.Value(5, type=float, help='Readiness poll interval (s).')
-    json = scfg.Value(False, isflag=True)
+    timeout = kw.Value(600, type=float, help='Overall wait timeout (s).')
+    interval = kw.Value(5, type=float, help='Readiness poll interval (s).')
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1487,8 +1584,10 @@ class WaitCLI(_LeasingCommonMixin):
 
 
 class MeasureCLI(_LeasingCommonMixin):
-    """Measure an endpoint's real per-GPU VRAM requirement from the engine's
-    own memory-profiling log (docs/planning/vram-aware-placement.md §3).
+    """Measure an endpoint's real per-GPU VRAM requirement from its engine's log.
+
+    Reads the engine's own memory-profiling log
+    (docs/planning/vram-aware-placement.md §3).
 
     Parses vLLM's profiling breakdown (weights + non-torch + activation peak)
     — deliberately NOT ``nvidia-smi memory.used``, which only reflects the
@@ -1507,35 +1606,35 @@ class MeasureCLI(_LeasingCommonMixin):
 
     __command__ = 'measure'
 
-    endpoint = scfg.Value(
+    endpoint = kw.Value(
         None, position=1, required=True, type=str,
         help='Catalog endpoint to measure.',
     )
-    record = scfg.Value(
+    record = kw.Value(
         False, isflag=True,
         help='Record the result into the measurements overlay '
         '(consulted automatically at plan time when the catalog declares '
         'nothing for this endpoint).',
     )
-    kv_gib = scfg.Value(
+    kv_gib = kw.Value(
         2.0, type=float,
         help='KV-cache budget (GiB) added on top of the non-KV profile. '
         'A serving choice (max_model_len / max_num_seqs), not a model fact.',
     )
-    margin = scfg.Value(
+    margin = kw.Value(
         0.05, type=float,
         help='Safety-margin fraction over the non-KV profile '
         '(allocator fragmentation, engine drift).',
     )
-    timeout = scfg.Value(
+    timeout = kw.Value(
         900, type=float,
         help='Readiness timeout when the endpoint must be brought up first (s).',
     )
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Catalog path (default: <config-root>/catalog.yaml).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1552,8 +1651,8 @@ class MeasureCLI(_LeasingCommonMixin):
         logs_fn = getattr(backend, 'deployment_logs', None)
         if logs_fn is None:
             raise SystemExit(
-                'measure needs the compose backend '
-                '(the engine container log is the measurement source).'
+                'measure reads the engine\'s log, and this backend runs no engine '
+                '(set `--backend compose` or `kubeai`).'
             )
         catalog = _requests_catalog(controller, config)
         name = config.endpoint
@@ -1627,8 +1726,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 store = getattr(backend, 'measurements', None)
                 if store is None:
                     raise SystemExit(
-                        '--record needs the compose backend measurements '
-                        'overlay.'
+                        '--record: this backend keeps no measurements overlay.'
                     )
                 store.record(
                     key, value, endpoint=name, profile=profile,
@@ -1673,8 +1771,9 @@ class MeasureCLI(_LeasingCommonMixin):
 
 
 class TuiCLI(_LeasingCommonMixin):
-    """Launch the Textual TUI: a live monitor of the stack with controls to
-    serve / release / evict models.
+    """Launch the Textual TUI: a live monitor of the stack, with controls.
+
+    Serve, release and evict models, and follow their logs.
 
     Mostly a monitor — the lease + deployment tables (desired state vs running, GPUs)
     refresh live — with key-bound controls: ``s`` serve, ``d`` release, ``a``
@@ -1684,8 +1783,14 @@ class TuiCLI(_LeasingCommonMixin):
 
     __command__ = 'tui'
 
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    interval = scfg.Value(3.0, type=float, help='Auto-refresh interval (s).')
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    interval = kw.Value(3.0, type=float, help='Auto-refresh interval (s).')
+    exit_after_paint = kw.Value(
+        False, isflag=True,
+        help='Quit as soon as the first frame is drawn, then print when that '
+             'was (for measuring startup: `time infer-stack tui '
+             '--exit_after_paint`).',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -1714,6 +1819,7 @@ class TuiCLI(_LeasingCommonMixin):
         return run_tui(
             controller, catalog,
             interval=float(config.interval), catalog_path=str(catalog_path),
+            exit_after_paint=bool(config.exit_after_paint),
         )
 
 
@@ -1722,15 +1828,15 @@ class RenewCLI(_LeasingCommonMixin):
 
     __command__ = 'renew'
 
-    lease = scfg.Value(None, position=1, type=str, help='Lease id.')
-    env_file = scfg.Value(None, type=str)
-    ttl = scfg.Value(None, type=str, help='New soft TTL (e.g. 2h); empty=infinite.')
+    lease = kw.Value(None, position=1, type=str, help='Lease id.')
+    env_file = kw.Value(None, type=str)
+    ttl = kw.Value(None, type=str, help='New soft TTL (e.g. 2h); empty=infinite.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        sid = _resolve_lease(config)
+        sid = _resolve_lease(config, 'renew')
         if not sid:
             raise SystemExit('renew: give a lease id or --env-file')
         # Through the controller: a renew can revive an idle deployment, which
@@ -1768,26 +1874,26 @@ class RunCLI(_LeasingCommonMixin):
 
     __command__ = 'run'
 
-    catalog = scfg.Value(None, type=str, help='Path to catalog.yaml.')
-    endpoint = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    endpoint = kw.Value(
         None,
         type=str,
         alias=['endpoints'],
         help='Comma-separated endpoint or bundle names.',
     )
-    base_url = scfg.Value('http://127.0.0.1:14042/v1', type=str)
-    api_key_env = scfg.Value('LITELLM_MASTER_KEY', type=str)
-    owner = scfg.Value(None, type=str)
-    ttl = scfg.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
-    timeout = scfg.Value(600, type=float)
-    interval = scfg.Value(5, type=float)
-    queue = scfg.Value(
+    base_url = kw.Value('http://127.0.0.1:14042/v1', type=str)
+    api_key_env = kw.Value('LITELLM_MASTER_KEY', type=str)
+    owner = kw.Value(None, type=str)
+    ttl = kw.Value('2h', type=str, help='Soft TTL backstop (default 2h).')
+    timeout = kw.Value(600, type=float)
+    interval = kw.Value(5, type=float)
+    queue = kw.Value(
         False, isflag=True,
         help='Admission queue: wait (up to --timeout) for a GPU to free '
         'instead of failing fast when the fleet is full. Recommended for '
         'pipeline fan-out, where many jobs contend for a few GPUs.',
     )
-    command = scfg.Value(
+    command = kw.Value(
         [], nargs='*', position=1, type=str, help='Command to run (after --).'
     )
 
@@ -1841,8 +1947,26 @@ class RunCLI(_LeasingCommonMixin):
             controller.release(outcome.lease.id)
 
 
-def _lease_ttl(le) -> str:
-    return 'inf' if le.expires_at is None else f'@{le.expires_at:.0f}'
+def _lease_ttl(le, now: float | None = None) -> str:
+    """Time left on a lease, for a person: ``1h59m``, ``12m``, ``expired``.
+
+    >>> from types import SimpleNamespace
+    >>> [_lease_ttl(SimpleNamespace(expires_at=e), now=1000.0)
+    ...  for e in (None, 8140.0, 1720.0, 1045.0, 900.0)]
+    ['inf', '1h59m', '12m', '45s', 'expired']
+    """
+    import time
+
+    if le.expires_at is None:
+        return 'inf'
+    left = le.expires_at - (time.time() if now is None else now)
+    if left <= 0:
+        return 'expired'
+    if left >= 3600:
+        return f'{int(left // 3600)}h{int(left % 3600 // 60):02d}m'
+    if left >= 60:
+        return f'{int(left // 60)}m'
+    return f'{int(left)}s'
 
 
 def _placement_view(controller):
@@ -1860,28 +1984,23 @@ def _placement_view(controller):
     except Exception:  # noqa: BLE001 - status must never crash
         pass
     assignments: dict[str, list[int]] = {}
-    if controller._admission_mode():
-        # Committed allocations, and idle residents' physical GPUs; the
-        # legacy planner view would show placements admission would not make.
-        _, deployments = controller.ledger.status(virtual_expiry=True)
+    from ..leasing.backend import allocates_gpus
+
+    if not allocates_gpus(backend):
+        return observed, assignments      # the cluster places; no GPU indices
+    # Committed allocations, and idle residents' physical GPUs.
+    _, deployments = controller.ledger.status(virtual_expiry=True)
+    for g in deployments:
+        if g.assigned_gpus is not None:
+            assignments[g.id] = list(g.assigned_gpus)
+    try:
+        residency = backend.residency()
         for g in deployments:
-            if g.assigned_gpus is not None:
-                assignments[g.id] = list(g.assigned_gpus)
-        try:
-            residency = backend.residency()
-            for g in deployments:
-                c = residency.resident(g.id)
-                if g.id not in assignments and c is not None:
-                    assignments[g.id] = list(c.gpus)
-        except Exception:  # noqa: BLE001
-            pass
-        return observed, assignments
-    plan = getattr(backend, 'plan', None)
-    if plan is not None:
-        try:
-            assignments = dict(plan(controller.desired_deployments()).assignments)
-        except Exception:  # noqa: BLE001
-            pass
+            c = residency.resident(g.id)
+            if g.id not in assignments and c is not None:
+                assignments[g.id] = list(c.gpus)
+    except Exception:  # noqa: BLE001
+        pass
     return observed, assignments
 
 
@@ -1978,7 +2097,7 @@ def _print_leases_rich(leases, deployments, observed, assignments, console) -> N
 
 
 class LeasesCLI(_LeasingCommonMixin):
-    """Show current leases and deployment deployments (the leasing-model status).
+    """Show current leases and deployments (the leasing-model status).
 
     Two tables. **leases** are who asked for what (id, owner, state, ttl,
     endpoints). **deployments** are the actual deployments behind them — one deployment is
@@ -2005,7 +2124,7 @@ class LeasesCLI(_LeasingCommonMixin):
         infer-stack leases --json   # JSON (adds running + gpus per deployment)
     """
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2094,9 +2213,32 @@ def _postgres_initialised() -> bool:
     return path.is_dir() and any(path.iterdir())
 
 
-def _secret_env_path() -> Path:
-    """The managed compose secrets file (.env that docker compose auto-loads)."""
-    return data_root() / 'leasing' / 'compose' / '.env'
+def _gateway_state(config) -> tuple[Path, str]:
+    """``(managed .env, base URL)`` of the configured backend's gateway.
+
+    The compose stack's own; on kubeai the gateway's, on this host or in the
+    cluster (whose base URL is a node's NodePort). A backend with no gateway
+    falls back to the compose location and the default port. One place, so
+    `env`, `test` and a script built from `env` cannot disagree.
+    """
+    from ..config import DEFAULT_PORTS
+
+    from ..leasing.gateway import front_door_urls
+
+    try:
+        backend = _make_backend(config)
+    except Exception:  # noqa: BLE001 - a lookup must not fail on the backend
+        backend = None
+    base_url, _ = front_door_urls(backend)
+    if backend is not None and base_url is not None:
+        return backend.front_door().gateway._env_path, base_url
+    return (data_root() / 'leasing' / 'compose' / '.env',
+            f'http://127.0.0.1:{DEFAULT_PORTS["litellm"]}/v1')
+
+
+def _secret_env_path(config=None) -> Path:
+    """The gateway's managed secrets file (see :func:`_gateway_state`)."""
+    return _gateway_state(config)[0]
 
 
 def _front_door(config) -> tuple[str, str | None]:
@@ -2106,20 +2248,23 @@ def _front_door(config) -> tuple[str, str | None]:
     `test` is cheap and doesn't need GPU detection or a backend object. An
     explicit ``--base-url`` overrides the derived URL.
     """
-    from ..config import DEFAULT_PORTS
+    from urllib.parse import urlparse
 
+    env_path, derived = _gateway_state(config)
     base_url = getattr(config, 'base_url', None)
     if not base_url:
-        port = int(getattr(config, 'port', None) or DEFAULT_PORTS['litellm'])
-        base_url = f'http://127.0.0.1:{port}/v1'
+        base_url = derived
+        port = getattr(config, 'port', None)
+        if port:
+            base_url = urlparse(derived)._replace(
+                netloc=f'{urlparse(derived).hostname}:{int(port)}').geturl()
     key = None
-    env_path = _secret_env_path()
     if env_path.exists():
         key = parse_env_file(env_path).get('LITELLM_MASTER_KEY')
     return base_url.rstrip('/'), key
 
 
-def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
+def _front_door_env(stored: dict[str, str], config=None) -> dict[str, str]:
     """The front-door values ``env`` answers without them being stored.
 
     A base URL is not a secret and has nothing to be read *out* of: it is
@@ -2144,7 +2289,7 @@ def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
 
     base_url = stored.get('OPENAI_BASE_URL')
     if not base_url:
-        base_url, _ = _front_door(None)
+        base_url, _ = _front_door(config)
     entries = {'OPENAI_BASE_URL': base_url}
     port = urlparse(base_url).port
     if port is not None:
@@ -2163,27 +2308,27 @@ class TestCLI(_PathOverridesMixin):
 
     __command__ = 'test'
 
-    catalog = scfg.Value(
+    catalog = kw.Value(
         None, type=str,
         help='Catalog path, used only to look up the endpoint protocol.',
     )
-    name = scfg.Value(
+    name = kw.Value(
         None, position=1, type=str, help='Endpoint alias to test (e.g. chat).'
     )
-    prompt = scfg.Value(
+    prompt = kw.Value(
         'Reply with the single word: ready.', type=str, help='Prompt to send.'
     )
-    max_tokens = scfg.Value(32, type=int)
-    timeout = scfg.Value(60, type=float, help='Request timeout (s).')
-    base_url = scfg.Value(
+    max_tokens = kw.Value(32, type=int)
+    timeout = kw.Value(60, type=float, help='Request timeout (s).')
+    base_url = kw.Value(
         None, type=str, help='Override the gateway base URL (…/v1).'
     )
-    port = scfg.Value(
+    port = kw.Value(
         None, type=int, help='Override the gateway port (default: 14042).'
     )
-    json = scfg.Value(False, isflag=True, help='Emit JSON instead of text.')
-    protocol = scfg.Value(
-        None, choices=['chat', 'completions'],
+    json = kw.Value(False, isflag=True, help='Emit JSON instead of text.')
+    protocol = kw.Value(
+        None, type=str, choices=['chat', 'completions'],
         help="Which surface to hit. Default: the endpoint's declared "
              '`protocol` from the catalog, falling back to chat.',
     )
@@ -2232,6 +2377,12 @@ class TestCLI(_PathOverridesMixin):
                 json=payload,
                 timeout=float(config.timeout),
             )
+        except requests.exceptions.ConnectionError:
+            return _test_fail(config, base_url,
+                              'nothing is listening there (the gateway is not up)')
+        except requests.exceptions.Timeout:
+            return _test_fail(config, base_url,
+                              f'no answer within {float(config.timeout):g}s')
         except requests.exceptions.RequestException as ex:
             return _test_fail(config, base_url, f'not reachable: {ex}')
         dt = time.monotonic() - t0
@@ -2325,11 +2476,11 @@ class EnvCLI(_PathOverridesMixin):
 
     __command__ = 'env'
 
-    arg = scfg.Value(
+    arg = kw.Value(
         None, position=1, type=str,
         help='KEY to read its value, or KEY=VALUE to set it. Empty = path.',
     )
-    export = scfg.Value(
+    export = kw.Value(
         False, isflag=True, help='Print every entry as `export KEY=value`.'
     )
 
@@ -2337,7 +2488,7 @@ class EnvCLI(_PathOverridesMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        env_path = _secret_env_path()
+        env_path = _secret_env_path(config)
 
         # Write: `env KEY=VALUE`
         if config.arg and '=' in config.arg:
@@ -2368,7 +2519,7 @@ class EnvCLI(_PathOverridesMixin):
                         'the gateway out of its database'
                     )
                 if key == 'LITELLM_MASTER_KEY':
-                    from ..leasing.compose import set_master_key
+                    from ..leasing.gateway import set_master_key
                     try:
                         # Pins the salt first, so DB-stored routes stay readable.
                         set_master_key(env_path, value)
@@ -2387,7 +2538,7 @@ class EnvCLI(_PathOverridesMixin):
         # Read: `env KEY` / `env --export`. A stored value always beats the
         # derived one -- writing the key is how you override the front door.
         env = parse_env_file(env_path) if env_path.exists() else {}
-        derived = _front_door_env(env)
+        derived = _front_door_env(env, config)
         if config.arg:
             if config.arg in env:
                 print(env[config.arg])
@@ -2419,17 +2570,18 @@ class EnvCLI(_PathOverridesMixin):
 
 
 def _require_compose_backend(controller):
-    """The controller's ComposeBackend, or a SystemExit for other backends.
+    """What holds the gateway's route registry (its front door).
 
-    The route registry is a compose-backend concept (it feeds the static-superset
-    LiteLLM gateway); ``--backend null``/``kubeai`` have no registry to touch."""
-    backend = controller.backend
-    if not isinstance(backend, ComposeBackend):
+    The stack itself on the compose backend; on kubeai the gateway, on this
+    host or in the cluster. A SystemExit for a backend with no gateway (null,
+    or ``litellm false``)."""
+    project = getattr(controller.backend, 'front_door', lambda: None)()
+    if project is None or not getattr(project, 'litellm', False):
         raise SystemExit(
-            'the `routes` commands require the compose backend '
-            '(set `--backend compose` or `config set backend compose`)'
+            'the `routes` commands need a LiteLLM gateway (the compose or kubeai '
+            'backend, with `litellm` on)'
         )
-    return backend
+    return project
 
 
 def _live_endpoints(controller) -> set[str]:
@@ -2447,7 +2599,8 @@ class RoutesListCLI(_LeasingCommonMixin):
     """Print the accumulated LiteLLM route registry (static-superset mode).
 
     One row per persisted route: its alias, engine, served-model/tag, the
-    upstream compose service it derives, and whether a live deployment is
+    upstream it routes to (a compose service, or a KubeAI cluster's gateway
+    under the Model's name), and whether a live deployment is
     currently backing it. Routes with no live backer still list (that is the
     point — a released endpoint stays routable/testable); their upstream simply
     errors until something serves it.
@@ -2455,21 +2608,16 @@ class RoutesListCLI(_LeasingCommonMixin):
 
     __command__ = 'list'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from ..leasing.compose import (
-            OLLAMA_CONTAINER_PORT,
-            VLLM_CONTAINER_PORT,
-            ollama_service_name_for,
-            vllm_service_name_for,
-        )
+        from ..leasing.gateway import registry_route_entry
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
         backend = _require_compose_backend(controller)
-        registry = backend._load_route_registry()
+        registry = backend.gateway._load_route_registry()
         entries = registry.get('entries', {})
         live = _live_endpoints(controller)
 
@@ -2477,22 +2625,13 @@ class RoutesListCLI(_LeasingCommonMixin):
         for name in sorted(entries):
             row = entries[name]
             engine = row.get('engine')
-            if engine == 'vllm':
-                served = row.get('served') or name
-                upstream = (
-                    f'http://{vllm_service_name_for(served)}:'
-                    f'{VLLM_CONTAINER_PORT}/v1'
-                )
-                target = served
-            elif engine == 'ollama':
-                target = row.get('model') or name
-                host = row.get('host') or name
-                upstream = (
-                    f'http://{ollama_service_name_for(host)}:'
-                    f'{OLLAMA_CONTAINER_PORT}'
-                )
-            else:
+            entry = registry_route_entry(name, row)   # what the gateway renders
+            if entry is None:
                 target, upstream = '?', '?'
+            else:
+                params = entry['litellm_params']
+                target = params['model'].split('/', 1)[-1]
+                upstream = params['api_base']
             rows.append({
                 'name': name,
                 'engine': engine,
@@ -2520,8 +2659,10 @@ class RoutesListCLI(_LeasingCommonMixin):
 
 
 class RoutesPruneCLI(_ApprovalMixin):
-    """Forget stale routes: rewrite the registry to *invoking catalog ∪ live*,
-    then converge (one accepted gateway recreate).
+    """Forget stale routes: keep only the invoking catalog's and the live ones.
+
+    Rewrites the registry to *invoking catalog ∪ live*, then converges (one
+    accepted gateway recreate).
 
     The registry is append-only by design (that is what keeps the gateway config
     byte-stable), so pruning is the explicit, operator-driven "forget" verb —
@@ -2536,18 +2677,13 @@ class RoutesPruneCLI(_ApprovalMixin):
 
     __command__ = 'prune'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..diff_prompt import confirm_writes
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.compose import (
-            LITELLM_REGISTRY_VERSION,
-            _dump_route_registry,
-            _registry_incoming_from_catalog,
-            _registry_incoming_from_deployments,
-        )
+        from ..leasing.gateway import LITELLM_REGISTRY_VERSION, _dump_route_registry
 
         config = cls.cli(argv=argv, data=kwargs)
         # interactive=False so reconcile auto-applies the compose diff; the
@@ -2556,13 +2692,14 @@ class RoutesPruneCLI(_ApprovalMixin):
         backend = _require_compose_backend(controller)
 
         def prune_plan() -> tuple[dict, dict, list[str]]:
-            desired = controller.desired_deployments()
-            plan = backend.plan(desired)
-            keep: dict = {}
-            if backend.catalog is not None:
-                keep.update(_registry_incoming_from_catalog(backend.catalog))
-            keep.update(_registry_incoming_from_deployments(desired, plan.assignments))
-            current = backend._load_route_registry().get('entries', {})
+            # The desired set exactly as the next render sees it, and the rows
+            # that render merges: the catalog's and the live deployments'.
+            # Any: _require_compose_backend above confirmed a gateway, and
+            # both backends that have one supply route rows.
+            engines: Any = controller.backend
+            desired, inputs = controller._admission_view(engines.residency())
+            keep = dict(engines.route_rows(desired, inputs))
+            current = backend.gateway._load_route_registry().get('entries', {})
             return current, keep, sorted(set(current) - set(keep))
 
         # Preview outside the lock (the prompt must not hold it); the change
@@ -2579,7 +2716,7 @@ class RoutesPruneCLI(_ApprovalMixin):
             for name in dropped:
                 print(f'  - {name}')
             ok = confirm_writes(
-                {backend._registry_file: _dump_route_registry(pruned)},
+                {backend.gateway._registry_file: _dump_route_registry(pruned)},
                 assume_yes=False,
                 title='infer-stack routes prune',
             )
@@ -2597,7 +2734,7 @@ class RoutesPruneCLI(_ApprovalMixin):
             entries = {k: v for k, v in current.items() if k not in drop}
             with backend._converge_lock():
                 backend._atomic_write(
-                    backend._registry_file,
+                    backend.gateway._registry_file,
                     _dump_route_registry(
                         {'version': LITELLM_REGISTRY_VERSION, 'entries': entries}),
                 )
@@ -2633,17 +2770,16 @@ class RoutesSeedCLI(_ApprovalMixin):
 
     __command__ = 'seed'
 
-    catalogs = scfg.Value(
+    catalogs = kw.Value(
         None, nargs='+', position=1, type=str,
         help='One or more catalog.yaml files whose endpoints to merge into the '
         'route registry.',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..leasing.backend import ConvergeAborted
-        from ..leasing.compose import _registry_incoming_from_catalog
 
         config = cls.cli(argv=argv, data=kwargs)
         paths = _collect_names(config.catalogs)
@@ -2653,6 +2789,8 @@ class RoutesSeedCLI(_ApprovalMixin):
         # there is no destructive gate to confirm).
         controller = _open_controller(config, interactive=False)
         backend = _require_compose_backend(controller)
+        # Any: a gateway exists (checked above), and its backend supplies rows.
+        engines: Any = controller.backend
 
         incoming: dict = {}
         for raw in paths:
@@ -2663,14 +2801,16 @@ class RoutesSeedCLI(_ApprovalMixin):
                 cat = Catalog.load(path)
             except CatalogError as ex:
                 raise SystemExit(f'invalid catalog {path}: {ex}')
-            incoming.update(_registry_incoming_from_catalog(cat))
+            # The engine backend's rows for it: compose upstreams on compose,
+            # the cluster's Models on kubeai.
+            incoming.update(engines.catalog_route_rows(cat))
         if not incoming:
             raise SystemExit(
                 'routes seed: the named catalog(s) resolved no routable endpoints'
             )
 
         def change():
-            before = set(backend._load_route_registry().get('entries', {}))
+            before = set(backend.gateway._load_route_registry().get('entries', {}))
             backend.merge_route_registry(incoming)
             return sorted(set(incoming) - before)
 
@@ -2712,16 +2852,16 @@ class ConfigPublishCLI(_ApprovalMixin):
 
     __command__ = 'publish'
 
-    catalogs = scfg.Value(
+    catalogs = kw.Value(
         [], nargs='*', position=1, type=str,
         help='Catalog files to publish as one union (default: --catalog, or the '
         'default-path catalog).',
     )
-    pull = scfg.Value(
+    pull = kw.Value(
         True, isflag=True,
         help='Pre-pull every image the profile references (default; --no-pull skips).',
     )
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2792,8 +2932,8 @@ class NetworkMigrateCLI(_ApprovalMixin):
 
     __command__ = 'migrate'
 
-    subnet = scfg.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
-    force = scfg.Value(False, isflag=True, help='Migrate even with active leases.')
+    subnet = kw.Value(None, type=str, help='IPv4 subnet, e.g. 172.30.0.0/24 (required).')
+    force = kw.Value(False, isflag=True, help='Migrate even with active leases.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2804,8 +2944,9 @@ class NetworkMigrateCLI(_ApprovalMixin):
         if not config.subnet:
             raise SystemExit('network migrate: --subnet is required')
         controller = _open_controller(config, interactive=True)
-        if not callable(getattr(controller.backend, 'residency', None)):
-            raise SystemExit('network migrate needs the compose backend')
+        if not hasattr(controller.backend, 'network'):
+            raise SystemExit('network migrate gives compose containers stable '
+                             'addresses; this backend runs none (n/a on kubeai)')
         try:
             rec = controller.network_migrate(config.subnet, force=bool(config.force))
         except ProfileMismatch as ex:
@@ -2828,7 +2969,7 @@ class NetworkCheckCLI(_LeasingCommonMixin):
 
     __command__ = 'check'
 
-    json = scfg.Value(False, isflag=True)
+    json = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2858,7 +2999,7 @@ class SecretsRotateCLI(_ApprovalMixin):
 
     __command__ = 'rotate'
 
-    force = scfg.Value(False, isflag=True, help='Rotate even with active leases.')
+    force = kw.Value(False, isflag=True, help='Rotate even with active leases.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -2870,7 +3011,7 @@ class SecretsRotateCLI(_ApprovalMixin):
         # Any: rotate_gateway_key below refuses a backend without a gateway,
         # so past it these gateway methods exist.
         backend: Any = controller.backend
-        old = backend.master_key() if isinstance(backend, ComposeBackend) else None
+        old = backend.master_key() if getattr(backend, 'litellm', False) else None
         try:
             rec = controller.rotate_gateway_key(force=bool(config.force))
         except ProfileMismatch as ex:
@@ -2892,13 +3033,14 @@ class SecretsRotateCLI(_ApprovalMixin):
                              'rejects the OLD key')
         else:
             print('  gateway: new key accepted, old key rejected')
-        if getattr(backend, 'ui', False):
+        front = getattr(backend, 'compose_project', lambda: None)()
+        if getattr(front, 'ui', False):
             print('  Open WebUI may keep the old key in its own settings: '
                   'update it under Admin > Settings > Connections')
         return 0
 
 
-class SecretsModalCLI(scfg.ModalCLI):
+class SecretsModalCLI(kw.ModalCLI):
     """Manage the gateway's secrets."""
 
     __command__ = 'secrets'
@@ -2906,7 +3048,7 @@ class SecretsModalCLI(scfg.ModalCLI):
     rotate = SecretsRotateCLI
 
 
-class NetworkModalCLI(scfg.ModalCLI):
+class NetworkModalCLI(kw.ModalCLI):
     """Stable per-service addressing (migrate) and the upstream routing check."""
 
     __command__ = 'network'
@@ -2915,7 +3057,7 @@ class NetworkModalCLI(scfg.ModalCLI):
     check = NetworkCheckCLI
 
 
-class RoutesModalCLI(scfg.ModalCLI):
+class RoutesModalCLI(kw.ModalCLI):
     """Inspect + manage the LiteLLM route registry (static-superset mode).
 
     The registry accumulates every catalog's and every live deployment's routes

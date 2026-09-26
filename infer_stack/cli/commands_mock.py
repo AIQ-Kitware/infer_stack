@@ -10,18 +10,18 @@ from __future__ import annotations
 
 from typing import Any
 
-import scriptconfig as scfg
+import kwconf as kw
 import ubelt as ub
 
 
-class MockServeCLI(scfg.DataConfig):
+class MockServeCLI(kw.Config):
     """
     Serve a deterministic OpenAI-compatible mock inference endpoint.
     """
 
     __command__ = 'serve'
 
-    config_fpath = scfg.Value(
+    config_fpath = kw.Value(
         None,
         position=1,
         help=ub.paragraph(
@@ -35,14 +35,14 @@ class MockServeCLI(scfg.DataConfig):
         ),
     )
 
-    host = scfg.Value('127.0.0.1', help='Bind address.')
+    host = kw.Value('127.0.0.1', help='Bind address.')
 
-    port = scfg.Value(
+    port = kw.Value(
         8100,
         help='Bind port.  Use 0 to pick a free port and print it.',
     )
 
-    mode = scfg.Value(
+    mode = kw.Value(
         None,
         help=ub.paragraph(
             """
@@ -57,13 +57,13 @@ class MockServeCLI(scfg.DataConfig):
         ),
     )
 
-    require_auth = scfg.Value(
+    require_auth = kw.Value(
         False,
         isflag=True,
         help='Reject requests without a valid bearer token.',
     )
 
-    api_key = scfg.Value(
+    api_key = kw.Value(
         None,
         help=ub.paragraph(
             """
@@ -74,11 +74,11 @@ class MockServeCLI(scfg.DataConfig):
         ),
     )
 
-    list_modes = scfg.Value(
+    list_modes = kw.Value(
         False, isflag=True, help='Print the available response modes and exit.',
     )
 
-    seed = scfg.Value(
+    seed = kw.Value(
         None,
         help=ub.paragraph(
             """
@@ -88,7 +88,7 @@ class MockServeCLI(scfg.DataConfig):
         ),
     )
 
-    print_url = scfg.Value(
+    print_url = kw.Value(
         True,
         isflag=True,
         help='Print the bound base URL on startup.',
@@ -158,7 +158,7 @@ class MockServeCLI(scfg.DataConfig):
             server.stop()
 
 
-class MockModalCLI(scfg.ModalCLI):
+class MockModalCLI(kw.ModalCLI):
     """
     Deterministic mock inference server for tests and dry runs.
     """

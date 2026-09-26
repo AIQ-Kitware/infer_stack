@@ -3180,3 +3180,135 @@ labels are stable enough to key residency on.
 **Takeaway.** Before unifying internals, check what callers see. Two backends
 that share 90% of their code but answer to different names are two products
 to the people using them.
+
+## 2026-09-24 12:54:30 -0400
+
+**Intent.** The user approved the backend-unification plan, asked for the
+work on a branch (`dev/backend-unification`), and authorised installing k3s
+on the guest to test KubeAI for real. Model: Claude Opus 5.5 (1M context).
+
+**What happened.** K0: k3s plus KubeAI 0.23.4, using the chart's `cpu`
+profile. It runs real vLLM on CPU, which beats the simulator: KubeAI builds
+vLLM's own command line, and the simulator's CLI would have refused it. The
+backend passed unchanged on its first real run since July. K1: the kubeai
+backend now owns a gateway-only ComposeBackend and feeds it generic
+`upstream` route rows. Before, a card's alias got 404 from KubeAI; after,
+the same request answered. K2 and K4: strict pod residency, and the crash
+diagnosis moved into a backend-neutral module. A Model whose vLLM rejected a
+flag failed in 52 s instead of the 800 s timeout. K5: one served-name rule.
+It fixed a real disagreement between the engine and two route builders.
+Removed the dead profile-era KubeAI renderer.
+
+**What I got wrong along the way.** I wrote a second e2e script before
+finding `dev/kubeai_e2e.sh`, a duplicate authority created in the middle of
+a de-duplication task, and folded it back in. That script's generation check
+could never fail (a `curl | grep && echo` list, where `set -e` does not
+fire), so it "passed" on a 404. The plan's claim that KubeAI's lenient
+`observe()` was a bug was wrong: Compose's is lenient by the same contract.
+I corrected the plan.
+
+**Open: K3 (one acquire path).** It is feasible: only 12 controller tests and
+the null backend depend on the old path. It carries a semantic decision the
+user should make. On a cluster nothing displaces an idle keep-warm Model, so
+the September starvation incident can recur on KubeAI unless admission
+evicts idle keep-warm Models when a new one cannot be scheduled.
+
+**Takeaways.** (1) A test that has never failed is not evidence. Make it
+fail on purpose first; GATEWAY=0 is that switch here. (2) "Has method X" is
+a poor stand-in for "is backend Y": when a second backend gains X, every
+such check silently changes meaning.
+
+## 2026-09-24 14:39:35 -0400
+
+**Intent.** Make infer-stack more elegant, architecture first and the TUI
+after. The user agreed that the Compose backend's real seam is gateway vs.
+engines. Model: Claude Opus 5.5 (1M context).
+
+**What I did.** Four steps on `dev/backend-unification`, each green before
+the next: naming rules into `naming.py`, the gateway's module code into
+`gateway.py`, a `Gateway` class for its state, and `render_front_door`.
+The one real design change: the registry merge no longer reads backend
+state. Backends supply rows and the gateway only merges them, which removed
+the `upstream_routes` side-channel I had added for KubeAI in K1. Settings the
+gateway reads became backend properties onto the single `Gateway`, because
+`use_profile` and tests set them on the backend after construction. Two
+copies would drift.
+
+**How I checked a pure refactor.** Unit tests alone are weak evidence for
+moved code, so I also rendered six stack configurations with the old and new
+code and compared bytes (identical), then ran the real Compose gateway,
+`secrets rotate` and the KubeAI e2e.
+
+**What went wrong.** My first byte comparison "passed" on two empty files,
+because the script crashed in both runs. I caught it only because the byte
+count was 0. More serious: the weight-floor doctest I wrote earlier wrote
+4 GiB of real zeros into /tmp on every run and never cleaned up. A day of
+test runs filled 49 GB, k3s went into disk pressure and evicted KubeAI.
+Fixed with sparse files.
+
+**Takeaways.** (1) A comparison of outputs must check the outputs exist:
+equality of two failures is not evidence. (2) Test fixtures that need large
+files should be sparse. Size was the property under test, not the bytes.
+
+## 2026-09-26 13:05:00 -0400
+
+**Intent.** Execute the backend-parity queue (`docs/queue.md`): the roadmap
+phases that can be built and verified without a GPU or a second machine,
+refactoring duplicate authorities on the way, and not stopping before a
+passing UX audit. Model: Claude Opus 5.5 (Claude Code).
+
+**What landed.** P1b deleted the pre-admission acquire branch: a
+`SimpleAdmission` mixin gives the dry-run and test backends the admission
+surface, so the controller has one path. P2 put `ps`, `logs`, `status` and
+the TUI behind an `Instance` view built from residency, on both backends.
+P3 made the gateway in front of a cluster the compose gateway (UI, proxy,
+dynamic routing, one approval). P6 is a parity suite, one test per *same*
+row. P4 picks a KubeAI resource profile by GPU size from node labels.
+
+**Decisions.** The review split P1: a `preview` alone would have dropped
+every KubeAI lease, because the admission view assumed GPU accounting, so
+"does this backend allocate GPUs" became one function. Under dynamic
+routing a KubeAI Model is named per deployment with compose's own tail
+rule, rather than a new scheme. A profile's size is what its node selector
+selects; the chart's selector-less profiles deliberately have none, because
+guessing a size for "anywhere" would pick wrong silently.
+
+**What surprised me.** Three bugs older than this work surfaced only in a
+real terminal or a real cluster: the TUI replaced kubeai's kubectl runner
+with Docker's (no KUBECONFIG, so every kubectl call failed), a kwconf flag
+swallowed the positional after it on every command, and the TUI swapped an
+injected runner for the real Docker. Fakes passed throughout; each was
+found by running the thing. The e2e also failed once on its own
+`grep -q` + pipefail pattern (lessons.md).
+
+**Risks.** The kubeai recovery profile now nests the gateway's profile;
+old profiles (a bare boolean) keep this process's settings. P4 is verified
+with fake labels only; `dev/handover/p4_gpu_labels.sh` is the real test.
+
+**Takeaways.** (1) When a refactor removes a branch, first run the whole
+suite with the other branch forced on: the failures list exactly what to
+migrate. (2) A seam that wraps a runner must wrap only what it owns; a
+wrapper that replaces is a second authority. (3) Put every e2e check's
+output in a file before testing it.
+
+## 2026-09-26 — UX audit passes 5 and 6
+
+**Did.** Pass 5 (both audit scripts, the TUI by eye on both backends at
+80x24 and 200x50, the README's first run from empty roots, a naming grep)
+found eight things, each fixed with a test: instance start times in UTC,
+the TUI deriving the gateway URL itself (a duplicate authority; now
+`Gateway.urls()`), top tabs unreachable from the keyboard, a sidebar and
+log pane that ignored the terminal's size, and a released `reclaim: stop`
+deployment reported as missing (now `Controller.keeps_up`). Pass 6 found a
+traceback on `release --env-file` for a file never written.
+
+**Environment.** Pass 6's kubeai run failed because the dev cluster's node
+went into disk pressure: my audit roots filled the shared disk. Deleting
+them did not clear the taint (minimum reclaim, lessons.md). I wrote
+`/etc/rancher/k3s/config.yaml` with a 1Gi minimum reclaim and restarted k3s;
+remove the file to undo it.
+
+**Takeaways.** (1) An audit that passes when its command is missing is not
+an audit: the script now refuses to start without `infer-stack` on PATH.
+(2) Read a report whole: the one pass-5 finding I nearly missed was a line
+my own `sed` range skipped.
