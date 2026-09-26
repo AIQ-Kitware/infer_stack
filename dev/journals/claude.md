@@ -3249,3 +3249,44 @@ Fixed with sparse files.
 **Takeaways.** (1) A comparison of outputs must check the outputs exist:
 equality of two failures is not evidence. (2) Test fixtures that need large
 files should be sparse. Size was the property under test, not the bytes.
+
+## 2026-09-26 13:05:00 -0400
+
+**Intent.** Execute the backend-parity queue (`docs/queue.md`): the roadmap
+phases that can be built and verified without a GPU or a second machine,
+refactoring duplicate authorities on the way, and not stopping before a
+passing UX audit. Model: Claude Opus 5.5 (Claude Code).
+
+**What landed.** P1b deleted the pre-admission acquire branch: a
+`SimpleAdmission` mixin gives the dry-run and test backends the admission
+surface, so the controller has one path. P2 put `ps`, `logs`, `status` and
+the TUI behind an `Instance` view built from residency, on both backends.
+P3 made the gateway in front of a cluster the compose gateway (UI, proxy,
+dynamic routing, one approval). P6 is a parity suite, one test per *same*
+row. P4 picks a KubeAI resource profile by GPU size from node labels.
+
+**Decisions.** The review split P1: a `preview` alone would have dropped
+every KubeAI lease, because the admission view assumed GPU accounting, so
+"does this backend allocate GPUs" became one function. Under dynamic
+routing a KubeAI Model is named per deployment with compose's own tail
+rule, rather than a new scheme. A profile's size is what its node selector
+selects; the chart's selector-less profiles deliberately have none, because
+guessing a size for "anywhere" would pick wrong silently.
+
+**What surprised me.** Three bugs older than this work surfaced only in a
+real terminal or a real cluster: the TUI replaced kubeai's kubectl runner
+with Docker's (no KUBECONFIG, so every kubectl call failed), a kwconf flag
+swallowed the positional after it on every command, and the TUI swapped an
+injected runner for the real Docker. Fakes passed throughout; each was
+found by running the thing. The e2e also failed once on its own
+`grep -q` + pipefail pattern (lessons.md).
+
+**Risks.** The kubeai recovery profile now nests the gateway's profile;
+old profiles (a bare boolean) keep this process's settings. P4 is verified
+with fake labels only; `dev/handover/p4_gpu_labels.sh` is the real test.
+
+**Takeaways.** (1) When a refactor removes a branch, first run the whole
+suite with the other branch forced on: the failures list exactly what to
+migrate. (2) A seam that wraps a runner must wrap only what it owns; a
+wrapper that replaces is a second authority. (3) Put every e2e check's
+output in a file before testing it.

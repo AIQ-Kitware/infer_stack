@@ -107,3 +107,21 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   leaves nothing behind.
 - **Applies when:** a test exercises size-dependent logic (VRAM floors, disk
   checks, download sizes).
+
+- **Lesson:** A kwconf flag (`isflag=True`) takes an optional value, so a
+  flag written before a positional swallows it: `logs -f qwen` parsed as
+  `follow='qwen'` with no names. infer-stack's flags are all boolean, so
+  `_FlagSafeMixin` hands a non-boolean string back to the positional list.
+- **Evidence / MWE:** `tests/test_day2.py::test_a_flag_never_swallows_the_positional_after_it`;
+  `infer_stack/cli/options.py` (`reclaim_swallowed_positionals`). Found live
+  2026-09-26: `logs -f <alias>` followed every instance.
+- **Applies when:** a kwconf command has both flags and positional
+  arguments.
+
+- **Lesson:** `producer | grep -q pattern` under `set -o pipefail` can fail
+  although the pattern matched: `grep -q` exits at the first match and the
+  producer's next write dies of SIGPIPE (141). Write to a file, then grep it.
+- **Evidence / MWE:** `dev/lessons/mwe/grep_q_pipefail.sh` prints 141 for
+  the pipeline and 0 for the file.
+- **Applies when:** an e2e or handover script checks a command's output with
+  `grep -q` under `set -euo pipefail`.

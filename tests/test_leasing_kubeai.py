@@ -921,3 +921,92 @@ def test_the_front_doors_settings_are_in_the_recovery_profile(tmp_path):
     assert other.gateway.ui is True and other.dynamic_routing is True
     other.use_profile({**profile, 'gateway': True})     # a profile from before
     assert other.dynamic_routing is True                 # keeps what it has
+
+
+# -- placement information: profiles chosen by GPU size (P4) ------------------
+
+SIZED_PROFILES = {
+    'small': {'nodeSelector': {'nvidia.com/gpu.product': 'FAKE-24G'}},
+    'big': {'nodeSelector': {'nvidia.com/gpu.product': 'FAKE-80G'}},
+    'generic': {'limits': {'nvidia.com/gpu': '1'}},          # the chart's kind
+}
+
+
+def _gpu_node(name, product, mib, count=2):
+    return {'metadata': {'name': name, 'labels': {
+                'nvidia.com/gpu.product': product, 'nvidia.com/gpu.memory': str(mib)}},
+            'status': {'allocatable': {'nvidia.com/gpu': str(count)}}}
+
+
+class SizedKubectl(FakeKubectl):
+    """A cluster with a 24 GiB node and an 80 GiB node, and the chart's config."""
+
+    def __call__(self, args):
+        if len(args) > 4 and args[3] == 'get' and args[4] == 'nodes':
+            return json.dumps({'items': [_gpu_node('a', 'FAKE-24G', 24576),
+                                         _gpu_node('b', 'FAKE-80G', 81920)]})
+        if len(args) > 4 and args[3] == 'get' and args[4] == 'configmap':
+            system = yaml.safe_dump({'resourceProfiles': SIZED_PROFILES})
+            return json.dumps({'data': {'system.yaml': system}})
+        return super().__call__(args)
+
+
+def _sized(gid, min_vram, **runtime):
+    dep = vllm(gid, profile=None, **runtime)
+    dep.spec['placement'] = {'min_vram_gib': min_vram}
+    return dep
+
+
+def test_min_vram_gib_picks_the_smallest_profile_that_fits(tmp_path):
+    kubectl = SizedKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    be.converge([_sized('grp-a', 40), _sized('grp-b', 10)])
+    profiles = {doc['metadata']['labels']['infer-stack/deployment']: doc['spec']['resourceProfile']
+                for doc in kubectl.applied.values()}
+    assert profiles == {'grp-a': 'big:1', 'grp-b': 'small:1'}
+
+
+def test_an_explicit_profile_wins_and_too_large_is_refused(tmp_path):
+    kubectl = SizedKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    explicit = _sized('grp-a', 40, resource_profile='generic')
+    be.converge([explicit, _sized('grp-b', 200)], apply=False)
+    assert be.last_unplaced == {'grp-b'}
+    assert any('no resource profile has GPUs that large' in e for e in be.last_errors)
+    (doc,) = yaml.safe_load_all(be.models_file.read_text())
+    assert doc['spec']['resourceProfile'] == 'generic:1'
+
+
+def test_sizing_reads_the_cluster_only_when_asked(tmp_path):
+    kubectl = SizedKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    be.converge([vllm('grp-a')], apply=False)
+    assert not any('nodes' in call or 'configmap' in call for call in kubectl.calls)
+
+
+def test_catalog_suggest_on_kubeai_sizes_to_the_cluster(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli import commands_catalog, commands_leasing
+
+    kubectl = SizedKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    monkeypatch.setattr(commands_leasing, '_make_backend', lambda config, **kw: be)
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path / 'config'))
+    assert commands_catalog.CatalogSuggestCLI.main(argv=['--backend', 'kubeai']) == 0
+    out, err = capsys.readouterr()
+    assert "largest GPU node" in err
+    values = yaml.safe_load(err[err.index('resourceProfiles:'):])['resourceProfiles']
+    assert values['nvidia-fake-80g']['nodeSelector'] == {'nvidia.com/gpu.product': 'FAKE-80G'}
+    assert 'gpu_indices' not in out                    # no host indices on a cluster
+
+
+def test_a_recorded_measurement_picks_the_profile(tmp_path):
+    """`measure --record` works on kubeai: the overlay fills min_vram_gib."""
+    from infer_stack.leasing.vram import measurement_key_for_spec
+
+    kubectl = SizedKubectl()
+    be = KubeaiBackend(state_dir=tmp_path, run=kubectl, http=FakeHttp(kubectl))
+    dep = vllm('grp-a', profile=None)
+    be.measurements.record(measurement_key_for_spec(dep.spec), 50.0, endpoint='grp-a')
+    be.converge([dep], apply=False)
+    (doc,) = yaml.safe_load_all(be.models_file.read_text())
+    assert doc['spec']['resourceProfile'] == 'big:1'

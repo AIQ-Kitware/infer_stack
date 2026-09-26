@@ -87,6 +87,23 @@ endpoints:
       resource_profile: nvidia-gpu-rtx-4090   # -> nvidia-gpu-rtx-4090:2
 ```
 
+### Sizing: `min_vram_gib` picks a profile
+
+An endpoint that names no `resource_profile` but declares
+`placement.min_vram_gib` (or has one recorded by `infer-stack measure
+--record`) gets the smallest resource profile whose GPUs are that large. A
+profile's GPU size is the `nvidia.com/gpu.memory` label (set by GPU Feature
+Discovery) of the nodes its `nodeSelector` selects; a profile without a
+`nodeSelector`, like the chart's generic ones, has no size and is never
+picked this way. With none large enough, the `kubeai_resource_profile`
+default is used, or the acquire is refused with the sizes it found.
+`infer-stack catalog suggest` proposes one sized profile per GPU product in
+the cluster, ready for the helm values:
+
+```bash
+infer-stack catalog suggest --backend kubeai   # catalog on stdout, profiles on stderr
+```
+
 Verify the setup before the first acquire — `doctor` checks the chain in
 dependency order (cluster reachable → CRD installed → namespace → gateway):
 

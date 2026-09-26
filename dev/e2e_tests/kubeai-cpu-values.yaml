@@ -14,3 +14,25 @@ resourceProfiles:
     requests:
       cpu: 64
       memory: "16Gi"
+  # Two "GPU sizes" on CPU, for the sizing check (E2E_SIZED=1 in
+  # dev/kubeai_e2e.sh): each selects the nodes labelled with one fake GPU
+  # product, as a real profile selects nvidia.com/gpu.product. `sized-80g`
+  # tolerates dev/k3s_agent_container.sh's taint, so it lands on that node.
+  sized-24g:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
+    nodeSelector:
+      nvidia.com/gpu.product: "FAKE-24G"
+  sized-80g:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
+    nodeSelector:
+      nvidia.com/gpu.product: "FAKE-80G"
+    tolerations:
+    - key: infer-stack.test/simulated
+      operator: Exists
+      effect: NoSchedule

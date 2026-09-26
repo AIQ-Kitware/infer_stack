@@ -88,7 +88,8 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | where a deployment lands | local planner over `nvidia-smi` | the cluster scheduler, via `resource_profile:<gpus>` |
 | GPU count from TP × PP × DP | same | same |
 | `placement.gpu_indices`, `allowed_gpus`, `skip_display_gpus` | yes | n/a: no host indices; node-scoped resource profiles are the equivalent |
-| `placement.min_vram_gib`, `infer-stack measure` | yes | **gap** (P4): `min_vram_gib` is warned and ignored; `measure` runs but is unverified on a GPU, and `--record` writes an overlay KubeAI does not read |
+| `placement.min_vram_gib` (declared, or recorded by `measure --record`) | picks GPUs that large | ≈ picks the smallest resource profile whose nodes' GPUs are that large (GFD's `nvidia.com/gpu.memory` label); verified with fake labels, a real-GPU run is `dev/handover/p4_gpu_labels.sh` |
+| `catalog suggest` | sized to this host's GPUs | ≈ sized to the largest GPU node, plus a `resourceProfiles` block per GPU product |
 | GPU allocations recorded in the ledger | yes | none: the cluster owns them |
 | more than one host | boundary | yes: the reason the backend exists |
 

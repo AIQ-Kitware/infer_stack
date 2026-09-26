@@ -1594,8 +1594,8 @@ class MeasureCLI(_LeasingCommonMixin):
         logs_fn = getattr(backend, 'deployment_logs', None)
         if logs_fn is None:
             raise SystemExit(
-                'measure needs the compose backend '
-                '(the engine container log is the measurement source).'
+                'measure reads the engine\'s log, and this backend runs no engine '
+                '(set `--backend compose` or `kubeai`).'
             )
         catalog = _requests_catalog(controller, config)
         name = config.endpoint
@@ -1669,8 +1669,7 @@ class MeasureCLI(_LeasingCommonMixin):
                 store = getattr(backend, 'measurements', None)
                 if store is None:
                     raise SystemExit(
-                        '--record needs the compose backend measurements '
-                        'overlay.'
+                        '--record: this backend keeps no measurements overlay.'
                     )
                 store.record(
                     key, value, endpoint=name, profile=profile,

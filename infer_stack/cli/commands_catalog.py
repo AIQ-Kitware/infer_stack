@@ -269,6 +269,12 @@ class CatalogSuggestCLI(
     Pure + offline: ``--simulate-hardware 2x80`` suggests for hardware you do not
     have in front of you.
 
+    On the kubeai backend the hardware is the cluster's: GPU Feature
+    Discovery's node labels (``nvidia.com/gpu.product`` / ``.memory``) and each
+    node's allocatable GPUs. The catalog is sized to the largest GPU node, and
+    a ``resourceProfiles`` block (one per GPU product, selecting its nodes) is
+    printed for the helm values, so ``min_vram_gib`` can pick a profile by size.
+
         infer-stack catalog suggest                      # render only (no write)
         infer-stack catalog suggest --simulate-hardware 4x48
         infer-stack catalog suggest --apply              # merge into the catalog
@@ -284,6 +290,11 @@ class CatalogSuggestCLI(
         False, isflag=True,
         help='With --apply, overwrite catalog entries that already exist.',
     )
+    backend = kw.Value(
+        None, type=str,
+        help='Whose hardware (default: the configured `backend` setting): this '
+        "host's GPUs, or on kubeai the cluster's.",
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -292,16 +303,40 @@ class CatalogSuggestCLI(
             migrate_known_suggestion_aliases,
             suggest_catalog,
         )
-        from .commands_leasing import _resolve_skip_display
+        from ..paths import get_setting
+        from .commands_leasing import _make_backend, _resolve_skip_display
         from .context import effective_inventory
 
         config = cls.cli(argv=argv, data=kwargs)
-        inventory = effective_inventory(config) or detect_inventory()
+        profiles: dict = {}
+        cluster = (config.backend or get_setting('backend')) == 'kubeai'
+        inventory = effective_inventory(config)
+        if inventory is None and cluster:
+            backend = _make_backend(config)
+            inventory, profiles = backend.suggestion_inventory()
+            if not inventory['gpus']:
+                print(
+                    'no cluster node reports GPUs: suggest needs each GPU node\'s '
+                    'allocatable nvidia.com/gpu and GPU Feature Discovery\'s '
+                    'nvidia.com/gpu.product / .memory labels (the NVIDIA device '
+                    'plugin with gfd.enabled=true; see the README). Pass '
+                    '--simulate-hardware NxM to plan without them.',
+                    file=sys.stderr,
+                )
+                return 1
+        inventory = inventory or detect_inventory()
         gpus = inventory.get('gpus') or []
-        skip_display = _resolve_skip_display(config)
+        skip_display = _resolve_skip_display(config) and not cluster
         frag = suggest_catalog(
             inventory, reserve_display_gpu='auto' if skip_display else False
         )
+        if cluster:
+            # A cluster has no host GPU indices: the profile says where.
+            for endpoint in frag['endpoints'].values():
+                placement = endpoint.get('placement') or {}
+                placement.pop('gpu_indices', None)
+                if not placement:
+                    endpoint.pop('placement', None)
 
         max_mem = max((g.get('memory_gib') or 0 for g in gpus), default=0)
         n_display = sum(1 for g in gpus if g.get('display_active'))
@@ -322,6 +357,10 @@ class CatalogSuggestCLI(
 
         text = yaml.safe_dump(frag, sort_keys=False, default_flow_style=False)
 
+        if cluster:
+            hw = f'the cluster\'s largest GPU node: {hw}'
+        values = (yaml.safe_dump({'resourceProfiles': profiles}, sort_keys=False)
+                  if profiles else '')
         if not config.apply:
             print(
                 f'# suggested for: {hw}  ({usable} usable)\n'
@@ -330,6 +369,10 @@ class CatalogSuggestCLI(
                 file=sys.stderr,
             )
             _print_yaml(text)
+            if values:
+                print('# helm values for the KubeAI chart (merge, then '
+                      '`scripts/install_kubeai.sh <values>`):\n' + values,
+                      file=sys.stderr)
             return 0
 
         # --apply: additive merge into the catalog (keep existing entries).
@@ -356,6 +399,10 @@ class CatalogSuggestCLI(
                 f'  kept existing (pass --force to overwrite): '
                 f'{", ".join(skipped)}'
             )
+        if values:
+            print('resource profiles for the KubeAI chart (merge into your helm '
+                  'values, then `scripts/install_kubeai.sh <values>`):')
+            print(values, end='')
         return 0
 
 

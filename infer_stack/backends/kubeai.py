@@ -156,6 +156,103 @@ def _model_doc(
     return doc
 
 
+#: GPU Feature Discovery's node labels: the GPU model, and per-GPU memory (MiB).
+GPU_PRODUCT_LABEL = 'nvidia.com/gpu.product'
+GPU_MEMORY_LABEL = 'nvidia.com/gpu.memory'
+GPU_RESOURCE = 'nvidia.com/gpu'
+
+
+def node_gpus(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each node's GPUs, from its labels and allocatable: ``{node: facts}``.
+
+    ``facts`` is ``{'product', 'memory_gib', 'count', 'labels'}``; a node with
+    no memory label has ``memory_gib`` None.
+
+    >>> n = {'metadata': {'name': 'a', 'labels': {GPU_PRODUCT_LABEL: 'L4',
+    ...                                            GPU_MEMORY_LABEL: '23034'}},
+    ...      'status': {'allocatable': {GPU_RESOURCE: '2'}}}
+    >>> node_gpus([n])['a']['memory_gib'], node_gpus([n])['a']['count']
+    (22.49, 2)
+    """
+    out = {}
+    for node in nodes:
+        meta = node.get('metadata') or {}
+        labels = dict(meta.get('labels') or {})
+        memory = labels.get(GPU_MEMORY_LABEL)
+        try:
+            memory_gib = round(int(memory) / 1024, 2) if memory else None
+        except ValueError:
+            memory_gib = None
+        count = str(((node.get('status') or {}).get('allocatable') or {}).get(GPU_RESOURCE) or '')
+        out[str(meta.get('name'))] = {
+            'product': labels.get(GPU_PRODUCT_LABEL),
+            'memory_gib': memory_gib,
+            'count': int(count) if count.isdigit() else 0,
+            'labels': labels,
+        }
+    return out
+
+
+def sized_profiles(profiles: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> dict[str, float]:
+    """Per-GPU memory (GiB) of each resource profile that says where it runs.
+
+    A profile's size is the smallest ``nvidia.com/gpu.memory`` among the nodes
+    its ``nodeSelector`` selects. A profile without a ``nodeSelector`` (the
+    chart's generic ones) could land anywhere, so it has no size and is never
+    picked by size.
+
+    >>> nodes = {'a': {'memory_gib': 24.0, 'labels': {'gpu': 'small'}},
+    ...          'b': {'memory_gib': 80.0, 'labels': {'gpu': 'big'}}}
+    >>> sized_profiles({'small': {'nodeSelector': {'gpu': 'small'}},
+    ...                 'big': {'nodeSelector': {'gpu': 'big'}},
+    ...                 'anywhere': {}}, nodes)
+    {'big': 80.0, 'small': 24.0}
+    """
+    sizes = {}
+    for name, profile in sorted((profiles or {}).items()):
+        selector = (profile or {}).get('nodeSelector') or {}
+        if not selector:
+            continue
+        found = [facts['memory_gib'] for facts in nodes.values()
+                 if facts.get('memory_gib')
+                 and all(facts['labels'].get(k) == str(v) for k, v in selector.items())]
+        if found:
+            sizes[name] = min(found)
+    return sizes
+
+
+def pick_profile(explicit: str | None, min_vram_gib: float | None,
+                 sized: dict[str, float], default: str | None) -> tuple[str | None, str]:
+    """``(profile, why)`` for one deployment.
+
+    An endpoint's own ``resource_profile`` wins. Else, with ``min_vram_gib``,
+    the smallest sized profile whose GPUs have that much memory. Else the
+    ``kubeai_resource_profile`` default. ``why`` says which rule chose, or
+    why nothing could.
+
+    >>> sized = {'small': 24.0, 'big': 80.0}
+    >>> pick_profile(None, 40, sized, 'cpu')
+    ('big', 'min_vram_gib 40 GiB -> big (80 GiB GPUs)')
+    >>> pick_profile(None, 10, sized, None)[0], pick_profile('mine', 40, sized, None)[0]
+    ('small', 'mine')
+    >>> pick_profile(None, 100, sized, None)
+    (None, 'min_vram_gib 100 GiB: no resource profile has GPUs that large (big 80 GiB, small 24 GiB)')
+    """
+    if explicit:
+        return explicit, 'runtime.resource_profile'
+    if min_vram_gib:
+        fitting = sorted((size, name) for name, size in sized.items()
+                         if size >= float(min_vram_gib))
+        if fitting:
+            size, name = fitting[0]
+            return name, f'min_vram_gib {min_vram_gib:g} GiB -> {name} ({size:g} GiB GPUs)'
+        if not default:
+            known = ', '.join(f'{n} {g:g} GiB' for n, g in sorted(sized.items())) or 'none sized'
+            return None, (f'min_vram_gib {min_vram_gib:g} GiB: no resource profile has '
+                          f'GPUs that large ({known})')
+    return default, 'kubeai_resource_profile'
+
+
 class RenderedModels:
     """Output of the render half: manifest text + bookkeeping maps."""
 
@@ -165,6 +262,8 @@ class RenderedModels:
         self.request_names: dict[str, str] = {}  # endpoint -> CR name
         self.unrenderable: set[str] = set()
         self.errors: list[str] = []
+        #: deployment id -> which rule chose its resource profile.
+        self.profile_reasons: dict[str, str] = {}
 
     @property
     def text(self) -> str:
@@ -179,6 +278,7 @@ def render_models(
     namespace: str,
     default_resource_profile: str | None,
     unique_names: bool = False,
+    sized: dict[str, float] | None = None,
 ) -> RenderedModels:
     """Render the desired set into KubeAI ``Model`` docs (pure, no I/O).
 
@@ -215,10 +315,10 @@ def render_models(
                 'VLLM Model does not. Use --backend compose for this endpoint.'
             )
             continue
-        profile = (
-            runtime.get('resource_profile') or default_resource_profile or ''
-        )
-        if not str(profile).strip():
+        min_vram = (deployment.spec.get('placement') or {}).get('min_vram_gib')
+        profile, why = pick_profile(runtime.get('resource_profile'), min_vram,
+                                    sized or {}, default_resource_profile)
+        if not str(profile or '').strip():
             out.unrenderable.add(deployment.id)
             out.errors.append(
                 f'{deployment.id}: no resource profile — set '
@@ -226,8 +326,10 @@ def render_models(
                 'resourceProfiles key from your KubeAI helm values, e.g. '
                 "'nvidia-gpu-rtx-4090') or `config set "
                 'kubeai_resource_profile <name>` as the default.'
+                + (f' ({why})' if min_vram else '')
             )
             continue
+        out.profile_reasons[deployment.id] = why
         name = model_name(deployment, unique=unique_names)
         if name in out.models:
             out.unrenderable.add(deployment.id)
@@ -322,6 +424,12 @@ class KubeaiBackend(ConvergeScaffold):
         # IP, which containers on a cluster node can reach; a gateway off the
         # cluster needs an ingress URL here.
         self.gateway_upstream = gateway_upstream
+        # `infer-stack measure --record` writes here, as on compose; a
+        # measurement fills an endpoint's missing min_vram_gib, which picks
+        # its resource profile by size.
+        from ..leasing.vram import Measurements
+
+        self.measurements = Measurements(self.state_dir / 'measurements.json')
 
     # -- state-dir plumbing --------------------------------------------------
 
@@ -473,6 +581,92 @@ class KubeaiBackend(ConvergeScaffold):
     #: and admission commits an empty allocation for every deployment.
     allocates_gpus = False
 
+    #: Seconds a read of the cluster's GPU facts is reused: resource profiles
+    #: and node labels change rarely, and a render reads them once.
+    GPU_FACTS_TTL = 60.0
+    #: The KubeAI chart's configuration, which holds its resourceProfiles.
+    CONFIG_MAP = 'kubeai-config'
+
+    def gpu_facts(self) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+        """``(each node's GPUs, each sized profile's GPU GiB)`` from the cluster.
+
+        Empty when the cluster cannot say (no GPU labels, no chart config):
+        sizing then falls back to the default profile, as before.
+        """
+        import time
+
+        cached = getattr(self, '_gpu_facts_cache', None)
+        if cached is not None and time.monotonic() - cached[0] < self.GPU_FACTS_TTL:
+            return cached[1]
+        try:
+            nodes = (json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
+                     .get('items') or [])
+            config = json.loads(self._kubectl(
+                ['get', 'configmap', self.CONFIG_MAP, '-o', 'json']) or '{}')
+            system = yaml.safe_load(((config.get('data') or {}).get('system.yaml')) or '') or {}
+            facts = node_gpus(nodes)
+            sized = sized_profiles(system.get('resourceProfiles') or {}, facts)
+        except Exception:  # noqa: BLE001 - sizing is best-effort, never fatal
+            facts, sized = {}, {}
+        self._gpu_facts_cache = (time.monotonic(), (facts, sized))
+        return facts, sized
+
+    def suggestion_inventory(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """``(inventory, resourceProfiles)`` for ``catalog suggest``.
+
+        The inventory is the GPUs of the largest GPU node (a Model runs on one
+        node, so that is the biggest thing it can use), shaped like a host
+        inventory. The profiles are one per GPU product in the cluster, each
+        selecting that product's nodes: what the helm values need for
+        ``min_vram_gib`` to choose by size.
+        """
+        facts, _ = self.gpu_facts()
+        gpu_nodes = [f for f in facts.values() if f['count'] and f['memory_gib']]
+        if not gpu_nodes:
+            return {'gpu_count': 0, 'gpus': []}, {}
+        best = max(gpu_nodes, key=lambda f: (f['count'] * f['memory_gib'], f['memory_gib']))
+        gpus = [{'index': i, 'name': best['product'] or 'GPU',
+                 'memory_gib': best['memory_gib'],
+                 'memory_mib': int(best['memory_gib'] * 1024),
+                 'display_active': False} for i in range(best['count'])]
+        profiles = {}
+        for f in sorted(gpu_nodes, key=lambda f: f['memory_gib']):
+            product = f['product'] or 'gpu'
+            profiles[f'nvidia-{dns_slug(product)}'] = {
+                'imageName': 'nvidia-gpu',
+                'runtimeClassName': 'nvidia',
+                'requests': {GPU_RESOURCE: '1'},
+                'limits': {GPU_RESOURCE: '1'},
+                'nodeSelector': {GPU_PRODUCT_LABEL: product},
+            }
+        return {'gpu_count': len(gpus), 'gpus': gpus}, profiles
+
+    def _enrich_min_vram(self, desired) -> None:
+        """Fill a missing ``min_vram_gib`` from a recorded measurement (in memory).
+
+        The compose resolution order: a catalog-declared value wins, else the
+        measurements overlay. Never persisted.
+        """
+        from ..leasing.vram import measurement_key_for_spec
+
+        for g in desired:
+            placement = dict(g.spec.get('placement') or {})
+            if g.engine != 'vllm' or placement.get('min_vram_gib'):
+                continue
+            measured = self.measurements.get_min_vram_gib(measurement_key_for_spec(g.spec))
+            if measured:
+                placement.update(min_vram_gib=measured, min_vram_source='measured')
+                g.spec['placement'] = placement
+
+    def _needs_sizing(self, desired) -> bool:
+        """Whether any deployment asks for its profile by GPU memory."""
+        for g in desired:
+            runtime = g.spec.get('runtime') or {}
+            if (g.spec.get('placement') or {}).get('min_vram_gib') and not runtime.get(
+                    'resource_profile'):
+                return True
+        return False
+
     def _render_documents(self, desired: list[Deployment]):
         """``(plan, rendered, planned)`` in memory: the one KubeAI render.
 
@@ -481,11 +675,14 @@ class KubeaiBackend(ConvergeScaffold):
         """
         from ..leasing.placement import GpuPlan
 
+        desired = list(desired)
+        self._enrich_min_vram(desired)
         rendered = render_models(
-            list(desired),
+            desired,
             namespace=self.namespace,
             default_resource_profile=self.default_resource_profile,
             unique_names=self.dynamic_routing,
+            sized=self.gpu_facts()[1] if self._needs_sizing(desired) else None,
         )
         plan = GpuPlan(
             assignments={g.id: [] for g in desired if g.id not in rendered.unrenderable},
@@ -539,19 +736,11 @@ class KubeaiBackend(ConvergeScaffold):
                 self.namespace,
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            for g in desired:
-                # Warn-and-ignore by decision (vram-aware-placement.md,
-                # Resolutions #3): k8s owns placement on this backend; the
-                # equivalent mechanism is the resourceProfile / resource
-                # requests, not our single-host planner.
-                if (g.spec.get('placement') or {}).get('min_vram_gib'):
-                    logger.warning(
-                        '  {}: placement.min_vram_gib is ignored on the '
-                        'kubeai backend (k8s owns placement — express the '
-                        'requirement via the resource profile instead)',
-                        g.id,
-                    )
             plan, rendered, planned = self._render_documents(desired)
+            for gid, why in sorted(rendered.profile_reasons.items()):
+                if why.startswith('min_vram_gib'):
+                    # The cluster places, within the profile chosen by size.
+                    logger.info('  {}: resource profile by {}', gid, why)
             self.last_errors = list(rendered.errors)
             self.last_unplaced = set(rendered.unrenderable)
             self.last_assignments = {}      # the cluster places

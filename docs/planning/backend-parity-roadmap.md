@@ -1,8 +1,8 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1–P3, P6 done** 2026-09-26 · P4, P5 not
-started. Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · **P1–P4, P6 done** 2026-09-26 (P4's GPU run is
+a handover) · P5 not started. Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -183,6 +183,17 @@ information.
 the right profile on a cluster with two sizes.
 **Size:** small. Shrinks "the information you add"; skip if nobody runs a
 mixed-GPU cluster.
+
+**P4 done 2026-09-26** on two k3s nodes (the second a container,
+`dev/k3s_agent_container.sh`) with fake GPU labels: `min_vram_gib 40` got
+the 80 GiB profile and scheduled on that node, `10` got the 24 GiB one and
+answered, and `catalog suggest` proposed a profile per product
+(`E2E_SIZED=1 dev/kubeai_e2e.sh`). A profile's size is its selected nodes'
+`nvidia.com/gpu.memory`; the chart's generic profiles have no selector, so
+no size. KubeAI keeps its own measurements overlay and fills a missing
+`min_vram_gib` from it, as compose does, so `measure --record` feeds the
+choice. Real GPU labels, a GPU serving the chosen profile, and `measure`
+reading vLLM's memory lines are `dev/handover/p4_gpu_labels.sh`.
 
 ### P5. The multi-workstation shape
 

@@ -2,6 +2,18 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### KubeAI picks a resource profile by GPU size
+
+On the kubeai backend, an endpoint with `placement.min_vram_gib` and no
+`resource_profile` gets the smallest resource profile whose nodes' GPUs are
+that large, read from GPU Feature Discovery's `nvidia.com/gpu.memory` label;
+before, `min_vram_gib` was warned about and ignored. `infer-stack measure
+--record` works there too, and a recorded measurement feeds the same choice.
+`infer-stack catalog suggest` on kubeai sizes the catalog to the cluster's
+largest GPU node and proposes a resource profile per GPU product for the
+helm values. `dev/k3s_agent_container.sh` adds a second (simulated) node to
+a development cluster.
+
 ### A parity suite for the two backends
 
 `tests/test_parity.py` runs one scenario per row that `docs/backend-parity.md`

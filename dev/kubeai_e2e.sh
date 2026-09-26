@@ -27,6 +27,10 @@
 #   E2E_DYNAMIC            1 (default): finish with dynamic routing, two
 #                          --dedicated leases of one model (two Models at once).
 #   E2E_UI_PORT            Open WebUI's port on this host (default 13000).
+#   E2E_SIZED              1: check min_vram_gib picks a profile by GPU size,
+#                          on two nodes with fake GPU labels. Needs
+#                          dev/k3s_agent_container.sh up (E2E_SIZED_NODE names
+#                          the node; default k3s-agent-b).
 set -euo pipefail
 
 MODEL="${E2E_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
@@ -49,6 +53,13 @@ cleanup() {
   run_is release --all --yes >/dev/null 2>&1
   run_is gc --evict --yes >/dev/null 2>&1
   run_is stack down >/dev/null 2>&1          # the gateway, UI and database too
+  if [ "${SIZED_LABELLED:-0}" = 1 ]; then       # the fake GPU labels, off again
+    for node in "$NODE_A" "$NODE_B"; do
+      kubectl label node "$node" nvidia.com/gpu.product- nvidia.com/gpu.memory- >/dev/null 2>&1
+    done
+    kubectl patch node "$NODE_B" --subresource=status --type=json \
+      -p '[{"op":"remove","path":"/status/capacity/nvidia.com~1gpu"}]' >/dev/null 2>&1
+  fi
   # nothing managed may remain on the cluster, pass or fail
   leftover=$(kubectl -n "$NAMESPACE" get models.kubeai.org \
       -l infer-stack/managed=true -o name 2>/dev/null | wc -l)
@@ -175,8 +186,11 @@ if [ "${E2E_MAKE_ROOM:-0}" = 1 ]; then
 EOF
   run_is acquire e2e-warm --yes --timeout "$TIMEOUT" --env-file "$WORK/warm.env"
   run_is release --env-file "$WORK/warm.env" --yes     # idle, still resident
-  if ! run_is acquire e2e-big --yes --timeout "$TIMEOUT" \
-        --env-file "$WORK/big.env" 2>&1 | tee "$WORK/big.log" | grep -q 'ready: True'; then
+  # Into a file first: `grep -q` quits at its match, and under pipefail the
+  # writer's SIGPIPE would fail the check.
+  run_is acquire e2e-big --yes --timeout "$TIMEOUT" \
+      --env-file "$WORK/big.env" > "$WORK/big.log" 2>&1 || true
+  if ! grep -q 'ready: True' "$WORK/big.log"; then
     echo '!! the leased model never became ready' >&2; exit 1
   fi
   grep -q 'making room for leased demand' "$WORK/big.log" \
@@ -185,9 +199,75 @@ EOF
   run_is release --env-file "$WORK/big.env" --yes
 fi
 
+if [ "${E2E_SIZED:-0}" = 1 ]; then
+  # Needs a second node (dev/k3s_agent_container.sh up) and the sized-*
+  # profiles of dev/e2e_tests/kubeai-cpu-values.yaml. Fake GPU labels stand
+  # in for GPU Feature Discovery's; cleanup removes them.
+  echo '== min_vram_gib picks the smallest resource profile whose GPUs fit'
+  NODE_A=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+  NODE_B="${E2E_SIZED_NODE:-k3s-agent-b}"
+  kubectl label node "$NODE_A" nvidia.com/gpu.product=FAKE-24G nvidia.com/gpu.memory=24576 --overwrite >/dev/null
+  kubectl label node "$NODE_B" nvidia.com/gpu.product=FAKE-80G nvidia.com/gpu.memory=81920 --overwrite >/dev/null
+  kubectl patch node "$NODE_B" --subresource=status --type=merge \
+    -p '{"status":{"capacity":{"nvidia.com/gpu":"2"}}}' >/dev/null
+  SIZED_LABELLED=1
+  cat >> "$WORK/config/catalog.yaml" <<EOF
+  e2e-sized-big:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: stop}
+    placement: {min_vram_gib: 40}
+    runtime: {max_model_len: 2048}
+  e2e-sized-small:
+    engine: vllm
+    model: e2e-tiny
+    reclaim: {policy: stop}
+    placement: {min_vram_gib: 10}
+    runtime: {max_model_len: 2048}
+EOF
+  where() {   # <endpoint> -> "<resourceProfile> <node>" of its Model's pod
+    for _ in $(seq 60); do
+      out=$(kubectl -n "$NAMESPACE" get models.kubeai.org -l infer-stack/managed=true -o json \
+        | python3 -c '
+import json, sys
+for m in json.load(sys.stdin)["items"]:
+    if sys.argv[1].replace("/", "-").lower() in m["metadata"]["name"]:
+        print(m["metadata"]["name"], m["spec"]["resourceProfile"])' "$1")
+      name=${out%% *}; profile=${out##* }
+      node=$(kubectl -n "$NAMESPACE" get pods -l "model=$name" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+      [ -n "$node" ] && { echo "$profile $node"; return; }
+      sleep 2
+    done
+    echo "$profile unscheduled"
+  }
+  run_is acquire e2e-sized-big --wait false --yes --env-file "$WORK/big-sized.env" >/dev/null
+  got=$(where e2e-sized-big)
+  [ "$got" = "sized-80g:1 $NODE_B" ] || { echo "!! 40 GiB went to: $got" >&2; exit 1; }
+  echo "   min_vram_gib 40 -> $got"
+  run_is acquire e2e-sized-small --yes --timeout "$TIMEOUT" --env-file "$WORK/small-sized.env" \
+    > "$WORK/small-sized.log" 2>&1 || true
+  grep -q 'ready: True' "$WORK/small-sized.log" \
+    || { echo '!! the 10 GiB endpoint never became ready' >&2; exit 1; }
+  got=$(where e2e-sized-small)
+  [ "$got" = "sized-24g:1 $NODE_A" ] || { echo "!! 10 GiB went to: $got" >&2; exit 1; }
+  echo "   min_vram_gib 10 -> $got, and it answers"
+  run_is catalog suggest --backend kubeai > "$WORK/suggest.yaml" 2> "$WORK/suggest.err"
+  grep -q 'nvidia-fake-80g' "$WORK/suggest.err" \
+    || { cat "$WORK/suggest.err" >&2; echo '!! suggest proposed no profile for FAKE-80G' >&2; exit 1; }
+  echo '   catalog suggest proposes a resource profile per GPU product'
+  run_is release --env-file "$WORK/big-sized.env" --yes >/dev/null
+  run_is release --env-file "$WORK/small-sized.env" --yes >/dev/null
+fi
+
 if [ "${GATEWAY:-1}" = 1 ] && [ "${E2E_DYNAMIC:-1}" = 1 ]; then
   echo '== dynamic routing: two --dedicated leases on one model, two Models, one alias'
   run_is stack down >/dev/null 2>&1          # the gateway comes back with Postgres
+  # A routing-mode change is adopted only by a quiescent stack: wait for the
+  # last managed pod (a released Model's) to be gone.
+  for _ in $(seq 90); do
+    [ -z "$(kubectl -n "$NAMESPACE" get pods -l infer-stack/managed=true -o name)" ] && break
+    sleep 2
+  done
   run_is config set dynamic_routing true
   for n in 1 2; do
     run_is acquire "$ALIAS" --dedicated --yes --ttl 30m --timeout "$TIMEOUT" \

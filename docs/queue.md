@@ -79,7 +79,12 @@ fake-Compose and fake-KubeAI backends; `tests/test_parity.py` runs each
 
 **Done when:** every *same* row has a parity test, and the CI suite runs it.
 
-### 6. [ ] P4: placement from node labels (verified with faked labels)
+### 6. [x] P4: placement from node labels (verified with faked labels)
+
+Done 2026-09-26; the GPU run is `dev/handover/p4_gpu_labels.sh`.
+*Why reordered:* two GPU sizes need two nodes (a node has one
+`nvidia.com/gpu.memory` label), so item 7's simulated second node
+(`dev/k3s_agent_container.sh`) was built first, here.
 
 `catalog suggest` on KubeAI proposes `resourceProfiles` from
 `nvidia.com/gpu.product` / `.memory` node labels; `min_vram_gib` picks the
@@ -159,6 +164,12 @@ Seed findings, already known:
 - [x] `infer-stack logs -f qwen` followed every instance: a kwconf flag took
       the next word as its value. Fixed for every command (P2).
 - [ ] `status` shows STALE during an apply instead of "apply in progress".
+- [ ] Open WebUI writes its data directory as root: removing a data root
+      (the e2e's cleanup, or an operator's `rm -rf`) fails with permission
+      denied. Found by `dev/kubeai_e2e.sh` 2026-09-26.
+- [ ] A refused acquire always ends with "free a GPU first — …", also when
+      the reason is a render refusal (a served-name collision) or the
+      backend is kubeai, where no GPU is ours to free. Found 2026-09-26.
 
 ### 10. [ ] Handover
 
