@@ -146,7 +146,7 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   the live checkout, so editing the tree while it runs can break it midway.
   Run long e2e passes from a copy: `cp -r infer_stack dev/... $SNAP` and
   `PYTHONPATH=$SNAP` (it precedes the editable install's path entry).
-- **Evidence / MWE:** 2026-09-27: a `dev/kubeai_e2e.sh` run failed at its
+- **Evidence / MWE:** 2026-09-26: a `dev/kubeai_e2e.sh` run failed at its
   routes step with `ImportError: cannot import name 'Backend'` while the
   backend protocol was being renamed, and its cleanup failed the same way,
   leaving a Model and the gateway containers behind. The rerun from a copy

@@ -430,7 +430,7 @@ Both keep their own config and data roots and print PASS/FAIL per step.
 were not re-run since leasing, and 8b's `shm_size` fixes a TP failure not yet
 observed here.
 
-## Reopened 2026-09-27: outside review
+## Reopened 2026-09-26: outside review
 
 Found by a two-part review of the finished campaign. Part 1: items 11-13.
 Part 2: items 14-22, in the order the review recommends; item 11 also
@@ -476,7 +476,7 @@ replica crash-looping fails fast with the engine's error, one healthy
 replica does not; two Compose containers for one deployment still fail
 closed; the k3s e2e has a two-replica keep-warm phase and passes.
 
-*Done 2026-09-27 (35be92c):* `Residency.replicated` (true for pods) with
+*Done 2026-09-26 (35be92c):* `Residency.replicated` (true for pods) with
 `is_resident`, `is_conflicted`, `warm_units`, `resident_gpus`, and
 `unique_unit` kept for GPU adoption only; every caller audited;
 `diagnose_startup(..., replicated=)` fails fast only when every replica has
@@ -503,7 +503,7 @@ satisfy a protocol; the controller builds no `docker` command and reads no
 sidecar; `ty` checks each backend against the protocol, and fails when one
 drifts.
 
-*Done 2026-09-27 (35be92c):* `ServingBackend` is the controller's protocol
+*Done 2026-09-26 (35be92c):* `ServingBackend` is the controller's protocol
 (no cast); `Realizer` holds `realize/teardown` for `SimpleAdmission` only;
 KubeAI's no-op methods are gone; `HostRuntime` (Compose:
 `network_table/configure_network`, `subnet_clashes`, `rendered_services`,
@@ -527,7 +527,7 @@ roadmap.
 **Done when:** the suite is in `tests/test_parity.py` (or beside it), each
 case fails on the code before its fix, and the roadmap states the rule.
 
-*Done 2026-09-27:* the KubeAI fake runs `minReplicas` pods, injects rollout
+*Done 2026-09-26:* the KubeAI fake runs `minReplicas` pods, injects rollout
 pods, and has a scheduler mode (nodes, pending pods with a message). Poison
 cases: replicated keep-warm, rollout snapshot, replicated crash-loop,
 Compose duplicates (`tests/test_parity.py`); scheduler selector, taint,
@@ -564,7 +564,7 @@ untolerated taint evicts nothing; with two profiles on two nodes the idle
 Model on the wrong node is not chosen; real reclaimable pressure evicts a
 compatible idle Model and the leased one proceeds.
 
-*Done 2026-09-27:* KubeAI's probe sets `needs_room` only when the
+*Done 2026-09-26:* KubeAI's probe sets `needs_room` only when the
 scheduler's message names an `Insufficient` resource (the message is now in
 residency); `ServingBackend.reclaim_candidates(blocked, idle)` names idle
 Models with a pod on a node the blocked pod could use (node selector,
@@ -592,7 +592,7 @@ runtime and returns partial; the publication is pending with D1; the
 renderer changes to D2; an ordinary retry refuses on the digest mismatch;
 `infer-stack apply` re-approves and applies.
 
-*Done 2026-09-27:* `apply()` returns an `ApplyResult` (`runtime`, `routes`,
+*Done 2026-09-26:* `apply()` returns an `ApplyResult` (`runtime`, `routes`,
 `detail`; `None`/`True`/`False` still map onto it). The controller clears
 the approved digest and the marker only on a complete result. Found on the
 way: KubeAI's `apply` dropped its host gateway's result, so unverified
@@ -617,7 +617,7 @@ tests for a declined approval, a render failure before apply (both: old
 file, old running key), and a failure after the gateway restarted (pending,
 converges on retry).
 
-*Done 2026-09-27:* the controller records when an apply begins; a rotation
+*Done 2026-09-26:* the controller records when an apply begins; a rotation
 whose publication fails before that restores the old key (any failure, not
 only a decline), and after it keeps the new key with the publication
 pending and interrupted. Tests use a gateway that accepts the key its
@@ -643,7 +643,7 @@ two dedicated deployments for one alias leaves the departing upstream
 running (the invariant, not just `publication_pending`), on Compose and on
 KubeAI with the host gateway.
 
-*Done 2026-09-27:* an apply's first phase, `retire_routes()`, deletes and
+*Done 2026-09-26:* an apply's first phase, `retire_routes()`, deletes and
 verifies the routes the render drops (only with dynamic routing and a
 running gateway); if that fails the apply returns "runtime not reached" and
 tears nothing down. KubeAI retires before pruning stale Models; its
@@ -669,7 +669,7 @@ residency hint from the controller.
 4k request onto the live 32k deployment: nothing revived, no placement, no
 queue, no runtime change.
 
-*Done 2026-09-27:* `Ledger.plan_acquire(requests, resident=)` ranks
+*Done 2026-09-26:* `Ledger.plan_acquire(requests, resident=)` ranks
 adequate candidates LIVE, then created in this plan, then resident IDLE,
 then other IDLE, creation order within each; the controller passes
 `residency.is_resident`. Tests: the 8k/32k/4k sequence coalesces onto the
@@ -694,7 +694,7 @@ and asks. The CLI presents and confirms only.
 conflicting A refuses and leaves the registry unchanged; the override
 reports A updated. No private names from the CLI.
 
-*Done 2026-09-27:* `leasing/routes.py` plans a seed (added, unchanged,
+*Done 2026-09-26:* `leasing/routes.py` plans a seed (added, unchanged,
 conflicted) or a prune (dropped); `Controller.plan_route_seed/prune` and
 `commit_route_seed/prune` recheck under the lock and publish through
 `publish_change`; the gateway exposes `route_registry()`,
@@ -719,7 +719,7 @@ secrets with the publication. If kept, document the narrower guarantee.
 **Done when:** a refused acquire on a fresh data root leaves no `.env`, or
 the docs say exactly what a preview may write.
 
-*Done 2026-09-27:* the gateway's secrets go through one `_managed_secret`;
+*Done 2026-09-26:* the gateway's secrets go through one `_managed_secret`;
 inside `staging_secrets()` (Compose `preview`, the in-cluster gateway's
 `preview`) a missing secret is generated in memory and not written, and the
 next writing call persists that same value. Fingerprints read
@@ -739,7 +739,7 @@ profile snapshots, backend capabilities), and only after 14-20.
 **Done when:** each extracted part needs no private cross-layer call, or
 the item records why nothing was extracted.
 
-*Decided 2026-09-27: no class extracted; the cross-layer calls removed
+*Decided 2026-09-26: no class extracted; the cross-layer calls removed
 instead.* After items 11-20 the controller calls no private backend member
 and builds no runtime command; the CLI's two private reaches
 (`controller._global_lock`, `_invocation_profile`) are now

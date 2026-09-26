@@ -4,7 +4,7 @@
 `dev/backend-unification` · **features complete, review hardening
 outstanding**: phases P1-P6 landed 2026-09-26 (P4 and P5 end in a handover
 run on real hardware, `dev/handover/`); a two-part outside review on
-2026-09-27 found replica residency, the backend protocol, scheduler reclaim,
+2026-09-26 found replica residency, the backend protocol, scheduler reclaim,
 publication phases, secret rotation, route ordering, coalescing and route
 seeding to fix (queue items 11-22). Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
@@ -35,7 +35,7 @@ it is not a sibling with its own habits.
   when combined with the backend-specific features that stress it (replicas,
   scheduler pressure, partial applies, route failures). Each such feature
   gets at least one test combining it with the common lifecycle; the
-  2026-09-27 review found a replicated keep-warm Model pruned on release
+  2026-09-26 review found a replicated keep-warm Model pruned on release
   although both of those rows passed alone.
 
 - **Superset, not sibling.** KubeAI gains what Compose has. Where a Compose
@@ -53,7 +53,7 @@ it is not a sibling with its own habits.
 
 ### P0. One contract, one liveness view, one diagnosis — landed, reopened
 
-*Reopened 2026-09-27:* the contract `Controller` is typed against still
+*Reopened 2026-09-26:* the contract `Controller` is typed against still
 inherits the pre-admission `realize/teardown` protocol and carries Compose
 mechanics (`run`, `_load_sidecar`, `network`, `adopted`); and the liveness
 view equates "more than one unit" with a conflict, which is wrong for
