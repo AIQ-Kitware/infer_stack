@@ -1,5 +1,7 @@
 # SmolLM2 backend switch test on GPU 1
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../../README.md).
+
 This is a copy/paste smoke path for a workstation where GPU 1 is available.
 It uses only built-in profiles and `infer-stack` runtime commands.
 

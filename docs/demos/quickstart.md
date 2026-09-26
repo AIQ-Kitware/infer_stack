@@ -1,5 +1,7 @@
 # Quickstart — vLLM + LiteLLM on an RTX 3090 workstation
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../../README.md).
+
 This guide brings up the traditional vLLM-backed stack on a single-GPU
 workstation where GPU 0 may be reserved for the desktop and GPU 1 is free for
 inference. It starts with the tiniest vLLM model to prove the plumbing works,

@@ -1,5 +1,7 @@
 # CI smoke test
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../../README.md).
+
 Walks through the canonical `infer-stack` workflow end-to-end: pick a
 profile, render the deployment, inspect the rendered artifacts, and
 exercise a few read-only inspection commands.

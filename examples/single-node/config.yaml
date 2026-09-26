@@ -1,3 +1,5 @@
+# Pre-leasing: a stack-profile config for the removed profile CLI; it is
+# not read by infer-stack any more. See the README for the catalog.
 name: single-node-kubeai
 backend: kubeai
 active_profile: qwen-single-node

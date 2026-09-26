@@ -1,5 +1,7 @@
 # Compose recipe: Qwen3.5-122B-A10B-FP8 on a 4x96GB host
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../README.md).
+
 This is the shortest working end-to-end example for serving **Qwen/Qwen3.5-122B-A10B-FP8** on a machine with **4 x 96GB GPUs** using the **Compose** backend.
 
 This profile uses:

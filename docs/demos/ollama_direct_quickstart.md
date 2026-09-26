@@ -1,5 +1,7 @@
 # Quickstart — direct Ollama on a dual GTX 1080 Ti host
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../../README.md).
+
 This quickstart brings up the simplest local stack for Pascal-era GPUs:
 
 ```text

@@ -1,3 +1,5 @@
+# Pre-leasing: a stack-profile config for the removed profile CLI; it is
+# not read by infer-stack any more. See the README for the catalog.
 vllm_models:
   qwen-small:
     hf_model_id: Qwen/Qwen2.5-7B-Instruct

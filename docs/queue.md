@@ -115,7 +115,9 @@ VM, a Model pinned to it by node selector is served through the same
 gateway. `dev/handover/p5_two_hosts.sh` exists for one run across two real
 machines.
 
-### 8. [ ] The README's Compose sections, and the other stale docs
+### 8. [x] The README's Compose sections, and the other stale docs
+
+Done 2026-09-26, `e1c68f3`.
 
 About 33 references to verbs that no longer exist (`setup`, `up -d`,
 `switch`, `describe-profile`, `smoke-test`, `wait-ready`, `diagnose`), and
@@ -126,6 +128,24 @@ top-level `restart` / `stop` / `start` / `pull` (they live under `stack`).
 
 **Done when:** every command in the README and `docs/` runs as written
 against the current CLI, and `grep` finds none of those verbs.
+
+### 8a. [ ] Decide: rewrite or delete the pre-leasing recipes
+
+*Why added (2026-09-26):* `docs/demos/`, `recipies/` and `examples/` (about
+2,000 lines) are hardware recipes for the removed profile CLI; the Makefile
+targets that used them are gone. Each now opens with a "Pre-leasing" banner
+saying its commands no longer run. Rewriting them as catalog entries needs
+the hardware they describe; deleting them loses tuning notes. **The
+operator's call.**
+
+### 8b. [ ] Decide: `/dev/shm` for vLLM containers
+
+*Why added (2026-09-26):* the leasing renderer sets neither `ipc: host` nor
+`shm_size`, so a vLLM container gets Docker's 64 MiB `/dev/shm`; the
+pre-leasing template had `ipc: host`, and vLLM's own Docker instructions use
+it for tensor parallelism. Adding it changes every vLLM service's
+fingerprint, so the next apply recreates running engines. Needs a TP=2 run
+on a GPU host to confirm the symptom first. **The operator's call.**
 
 ### 9. [ ] UX audit loop: do not stop without a passing audit
 
@@ -163,6 +183,9 @@ Seed findings, already known:
 - [x] `infer-stack logs` should accept a container name, a prefixed name or
       an endpoint name. Done with P2: an instance name, a container id
       prefix, a deployment id or an endpoint alias.
+- [x] `logs --no-color` silently kept color: kwconf reads a leading `no-` as
+      negation, so a flag *named* `no_color` never saw it. Now `color`, whose
+      `--no-color` works. Found by the README rewrite 2026-09-26.
 - [x] `infer-stack logs -f qwen` followed every instance: a kwconf flag took
       the next word as its value. Fixed for every command (P2).
 - [ ] `status` shows STALE during an apply instead of "apply in progress".

@@ -1,5 +1,7 @@
 # Qwen profiles for a 3090 workstation
 
+> **Pre-leasing.** This page uses the stack-profile CLI (`setup`, `up`, `deploy`, `switch`, `smoke-test`, `config.yaml` profiles), which was removed. Its commands no longer run. The model and vLLM settings may still inform a catalog entry; the current workflow is in the [README](../../README.md).
+
 These built-in profiles are intended for quick GPU-1 testing on a workstation-class
 RTX 3090 host.
 
