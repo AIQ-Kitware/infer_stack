@@ -218,6 +218,10 @@ class ClusterGateway(ConvergeScaffold):
         self._kubectl(['apply', '-f', str(self.manifests_file)])
         self._kubectl(['rollout', 'status', f'deployment/{NAME}', '--timeout=300s'])
 
+    def settle_snapshot(self) -> None:
+        """Nothing local: this gateway is Kubernetes objects, applied declaratively."""
+        return None
+
     def retire_routes(self) -> bool:
         """Nothing to retire: this gateway's routes are static and point at
         KubeAI's one upstream, which no Model's removal takes away."""

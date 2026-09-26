@@ -1209,6 +1209,15 @@ class KubeaiBackend(ConvergeScaffold):
     #: No containers of this host to manage: the cluster owns network and pods.
     host_runtime = None
 
+    def settle_snapshot(self):
+        """The host gateway's Compose containers, or ``None``.
+
+        ``kubectl apply`` is declarative server-side and leaves nothing half
+        done, but a gateway on this host is a Compose project whose Docker
+        work can outlive a killed client, exactly as on the compose backend.
+        """
+        return self.gateway.settle_snapshot() if self.gateway is not None else None
+
     def down(self) -> None:
         """Delete every infer-stack-managed Model (explicit stop), and the gateway."""
         for name in sorted(self._cluster_models()):

@@ -254,6 +254,19 @@ class ServingBackend(Protocol):
         """
         ...
 
+    def settle_snapshot(self) -> Any:
+        """A sample of runtime work that can outlive a killed client, or ``None``.
+
+        After an interrupted apply the controller samples this until two
+        consecutive samples are equal (``Controller._wait_for_settled_runtime``).
+        ``None`` means nothing of the kind to wait for: an in-process backend,
+        or a cluster whose apply is declarative server-side. A backend that
+        drives a local runtime anywhere (KubeAI's host gateway is a Compose
+        project) must return its sample, not ``None``. Raises when the runtime
+        cannot be read.
+        """
+        ...
+
     def placement_notes(self) -> dict[str, list[str]]:
         """What the last render recorded about placement, for health views:
         ``degraded`` (committed GPUs no longer valid) and ``displaced`` (idle
@@ -475,6 +488,9 @@ class SimpleAdmission:
 
     def placement_notes(self) -> dict[str, list[str]]:
         return {}
+
+    def settle_snapshot(self) -> None:
+        return None                     # in-process: nothing outlives a call
 
     def reclaim_candidates(self, blocked: Deployment,
                            idle: list[Deployment]) -> list[str]:

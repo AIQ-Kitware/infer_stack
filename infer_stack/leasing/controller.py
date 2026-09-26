@@ -1295,14 +1295,14 @@ class Controller:
         cannot be read, a container still ``removing``, or a runtime that keeps
         changing past :data:`SETTLE_DEADLINE_S` raises
         :class:`~infer_stack.leasing.backend.RuntimeUnsettled` and leaves the
-        change pending. Backends without ``settle_snapshot`` (KubeAI's apply is
-        declarative server-side) skip the check.
+        change pending. A backend whose ``settle_snapshot`` returns ``None``
+        has nothing local to wait for (an in-process backend, or KubeAI with
+        its gateway in the cluster); KubeAI with a host gateway returns that
+        gateway's Compose containers and is waited on like Compose.
         """
         from .backend import RuntimeUnsettled
 
-        snapshot = getattr(self.backend, 'settle_snapshot', None)
-        if snapshot is None:
-            return
+        snapshot = self.backend.settle_snapshot
         deadline = self.clock() + SETTLE_DEADLINE_S
         previous = None
         while True:
@@ -1313,6 +1313,8 @@ class Controller:
                     f'cannot read the runtime after an interrupted apply: {ex}; '
                     'the change stays pending'
                 ) from ex
+            if current is None:
+                return                      # nothing local that could still be running
             busy = any(state == 'removing' for _, state in current)
             if previous is not None and current == previous and not busy:
                 return

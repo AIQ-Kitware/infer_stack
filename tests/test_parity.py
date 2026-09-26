@@ -667,3 +667,38 @@ def test_reclaimable_pressure_evicts_a_compatible_idle_model_and_the_lease_proce
                            {'nodeSelector': {'gpu': 'a100'}}, until_gone=ids['warm-a'])
     assert _idle(stack, ids) == {'warm-b'}
     assert result.ready
+
+
+# Interrupted applies: KubeAI's host gateway is a Compose runtime, so its
+# Docker work can outlive a killed client exactly as on Compose (re-review 1).
+
+
+def test_kubeai_settles_its_host_gateway_after_an_interrupted_apply(tmp_path):
+    from infer_stack.leasing.backend import BackendTimeout, RuntimeUnsettled
+
+    stack = _kubeai(tmp_path)
+    clock = {'now': 0.0}
+    stack.ctl.clock = lambda: clock['now']
+    stack.ctl.sleep = lambda s: clock.__setitem__('now', clock['now'] + s)
+    real = stack.front.apply
+    calls = []
+
+    def timed_out():
+        calls.append('apply')
+        raise BackendTimeout('docker compose up timed out')
+
+    stack.front.apply = timed_out
+    with pytest.raises(BackendTimeout):
+        stack.acquire('one')
+    assert stack.ctl.ledger.publication_pending()['interrupted']
+
+    samples = iter(range(1000))                    # Docker still changing
+    stack.front.settle_snapshot = lambda: ((f'c{next(samples)}', 'running'),)
+    stack.front.apply = real
+    with pytest.raises(RuntimeUnsettled):
+        stack.ctl.apply_now()
+    assert calls == ['apply']                      # no second Compose operation
+
+    stack.front.settle_snapshot = lambda: (('c1', 'running'),)   # settled
+    stack.ctl.apply_now()
+    assert stack.ctl.ledger.publication_pending() is None
