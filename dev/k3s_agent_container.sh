@@ -18,6 +18,10 @@ set -euo pipefail
 ACTION="${1:-up}"
 NAME="${2:-k3s-agent-b}"
 CONTAINER="infer-stack-${NAME}"
+# The node shares the host's disk. The kubelet's default minimum reclaim (10%
+# above the 5% hard threshold) cannot be met on a disk other work keeps full,
+# so one dip left the node tainted disk-pressure for good.
+RECLAIM='eviction-minimum-reclaim=imagefs.available=1Gi,nodefs.available=1Gi'
 
 case "$ACTION" in
   up)
@@ -28,7 +32,8 @@ case "$ACTION" in
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     docker run -d --name "$CONTAINER" --privileged --hostname "$NAME" \
       -e K3S_URL="https://${server_ip}:6443" -e K3S_TOKEN="$token" \
-      --tmpfs /run --tmpfs /var/run "$image" agent --node-name "$NAME" >/dev/null
+      --tmpfs /run --tmpfs /var/run "$image" agent --node-name "$NAME" \
+      --kubelet-arg "$RECLAIM" >/dev/null
     for _ in $(seq 60); do
       kubectl get node "$NAME" >/dev/null 2>&1 && break
       sleep 2

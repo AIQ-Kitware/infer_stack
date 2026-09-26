@@ -125,3 +125,19 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   the pipeline and 0 for the file.
 - **Applies when:** an e2e or handover script checks a command's output with
   `grep -q` under `set -euo pipefail`.
+
+- **Lesson:** On a disk other work keeps nearly full, a k3s node that dips
+  under the 5% eviction threshold stays tainted `disk-pressure` after the
+  space comes back: the kubelet's default minimum reclaim adds 10%, so the
+  taint clears only at 15% free. Freeing your own files is not enough; set
+  `eviction-minimum-reclaim` to a fixed size (1Gi) on a dev cluster.
+- **Evidence / MWE:** 2026-09-26 on the guest: ten UX-audit data roots
+  (0.9 GB each) pushed the disk over; after deleting them the node sat at
+  12.8% free, still tainted, for 10 minutes, KubeAI's controller Pending.
+  `kubectl get --raw /api/v1/nodes/<node>/proxy/configz` showed
+  `evictionMinimumReclaim: 10%`. With `kubelet-arg:
+  eviction-minimum-reclaim=imagefs.available=1Gi,nodefs.available=1Gi` in
+  `/etc/rancher/k3s/config.yaml` and a k3s restart, the taint cleared.
+  `dev/k3s_agent_container.sh` passes the same to the second node.
+- **Applies when:** a dev cluster shares its disk with anything else, and
+  whenever a test or audit keeps large artifacts in `/tmp`.

@@ -3290,3 +3290,25 @@ suite with the other branch forced on: the failures list exactly what to
 migrate. (2) A seam that wraps a runner must wrap only what it owns; a
 wrapper that replaces is a second authority. (3) Put every e2e check's
 output in a file before testing it.
+
+## 2026-09-26 — UX audit passes 5 and 6
+
+**Did.** Pass 5 (both audit scripts, the TUI by eye on both backends at
+80x24 and 200x50, the README's first run from empty roots, a naming grep)
+found eight things, each fixed with a test: instance start times in UTC,
+the TUI deriving the gateway URL itself (a duplicate authority; now
+`Gateway.urls()`), top tabs unreachable from the keyboard, a sidebar and
+log pane that ignored the terminal's size, and a released `reclaim: stop`
+deployment reported as missing (now `Controller.keeps_up`). Pass 6 found a
+traceback on `release --env-file` for a file never written.
+
+**Environment.** Pass 6's kubeai run failed because the dev cluster's node
+went into disk pressure: my audit roots filled the shared disk. Deleting
+them did not clear the taint (minimum reclaim, lessons.md). I wrote
+`/etc/rancher/k3s/config.yaml` with a 1Gi minimum reclaim and restarted k3s;
+remove the file to undo it.
+
+**Takeaways.** (1) An audit that passes when its command is missing is not
+an audit: the script now refuses to start without `infer-stack` on PATH.
+(2) Read a report whole: the one pass-5 finding I nearly missed was a line
+my own `sed` range skipped.
