@@ -1108,11 +1108,20 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
     from infer_stack.leasing import EndpointRequest, LeaseState, vllm_structural
     from infer_stack.leasing.backend import ConvergeAborted
 
-    class DeclineBackend:
+    from infer_stack.leasing.backend import SimpleAdmission
+
+    class DeclineBackend(SimpleAdmission):
+        """The operator declines the diff, which admission asks at preview."""
+
         def observe(self):
             return set()
 
-        def converge(self, desired):
+        def preview(self, desired, placement=None, *, approve=False):
+            if approve:
+                raise ConvergeAborted('declined')
+            return super().preview(desired, placement)
+
+        def converge(self, desired, *, apply=True, placement=None):
             raise ConvergeAborted('declined')
 
     led = Ledger(SqliteStore(tmp_path / 'ledger.db'))

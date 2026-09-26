@@ -19,7 +19,7 @@ from infer_stack.leasing import (
     SqliteStore,
     vllm_structural,
 )
-from infer_stack.leasing.backend import PlacementError, Readiness
+from infer_stack.leasing.backend import PlacementError, Readiness, SimpleAdmission
 from infer_stack.leasing.placement import GpuPlan
 
 
@@ -45,39 +45,32 @@ def _id_factory():
     return factory
 
 
-class BudgetBackend:
+class BudgetBackend(SimpleAdmission):
     """Places up to ``budget`` deployments (1 slot each); the rest are unplaced.
 
-    A converge-style fake: ``converge`` recomputes the placed/unplaced split from
-    the desired set each call, so freeing demand (a release) lets a queued
-    deployment in on the next reconcile.
+    Capacity is its :meth:`plan`, which admission consults before committing
+    anything, so freeing demand (a release) lets a queued deployment in on
+    the next attempt. It allocates GPUs, so admission accounts for them.
     """
+
+    allocates_gpus = True
 
     def __init__(self, budget: int):
         self.budget = budget
         self.realized: dict[str, object] = {}  # what is "running" (post-apply)
-        self._placed: dict[str, object] = {}   # what the last render decided to run
         self.apply_calls = 0
-        self.last_unplaced: list[str] = []
-        self.last_errors: list[str] = []
-        self.last_assignments: dict[str, list[int]] = {}
 
-    def converge(self, desired, apply: bool = True) -> None:
+    def plan(self, desired, placement=None):
         placed = list(desired)[: self.budget]
-        unplaced = list(desired)[self.budget :]
-        # Render always records the placed set; bringing it "up" is apply()'s job
-        # (the render/apply split). Legacy apply=True still realizes in one shot.
-        self._placed = {g.id: g for g in placed}
-        if apply:
-            self.realized = dict(self._placed)
-        self.last_assignments = {g.id: [i] for i, g in enumerate(placed)}
-        self.last_unplaced = [g.id for g in unplaced]
-        self.last_errors = [f'{g.id}: no free GPU' for g in unplaced]
+        return GpuPlan(
+            assignments={g.id: [i] for i, g in enumerate(placed)},
+            errors=[f'{g.id}: no free GPU' for g in list(desired)[self.budget:]],
+        )
 
     def apply(self) -> None:
         """Bring the last-rendered set 'up' (idempotent)."""
         self.apply_calls += 1
-        self.realized = dict(self._placed)
+        super().apply()
 
     def observe(self) -> set[str]:
         return set(self.realized)
@@ -85,11 +78,11 @@ class BudgetBackend:
     def probe_ready(self, deployment, endpoint) -> Readiness:
         return Readiness(deployment.id in self.realized, 'ok')
 
-    def realize(self, deployment) -> None:  # unused by converge backends
-        pass
+    def realize(self, deployment) -> None:
+        self.realized[deployment.id] = deployment
 
     def teardown(self, deployment) -> None:
-        pass
+        self.realized.pop(deployment.id, None)
 
 
 def vreq(endpoint, *, reclaim='stop'):

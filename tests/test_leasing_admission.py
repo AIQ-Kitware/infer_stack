@@ -179,7 +179,9 @@ def test_a_ledger_change_between_preview_and_commit_retries(tmp_path):          
     assert len(calls) == 2 and ledger.get_deployment(out.deployments[0].id).assigned_gpus == [0]
 
 
-def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):         # 35
+def test_unknown_residency_admits_nothing(tmp_path):         # 35
+    """The render after a commit needs residency, so admission refuses without
+    it, even for a request that needs no new GPU."""
     from infer_stack.leasing.residency import ResidencyUnknown
 
     ledger, ctl, _ = make(tmp_path)
@@ -189,12 +191,11 @@ def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):     
         raise ResidencyUnknown('docker ps failed')
 
     ctl.backend.residency = unknown
-    with pytest.raises(PlacementError, match='residency is unknown'):
+    with pytest.raises(PlacementError, match='cannot be read'):
         ctl.acquire('x', CAT.resolve_names(['two']), wait=False, apply=False)
-    # Coalescing onto the LIVE, allocated deployment needs no new GPU. Its render
-    # still needs residency, so stage it without rendering residency-dependent state.
     overlay = ledger.plan_acquire(CAT.resolve_names(['one']))
-    assert ctl._admit(overlay, None) == ({}, [])
+    allocations, reasons = ctl._admit(overlay, None)
+    assert allocations == {} and reasons
 
 
 # -- P5: allocations and renew ----------------------------------------------------------

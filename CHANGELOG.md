@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### One acquire path
+
+The controller's pre-admission branch is gone: every backend, including the
+dry-run backend, acquires, renders, renews and publishes through admission.
+A backend with only `realize` / `teardown` gets the admission surface from
+`SimpleAdmission`. Two behaviours changed with it. While residency cannot
+be read, no acquire is admitted; before, a request needing no new GPU was
+admitted and then failed at its render, after the lease was committed. And
+`routes prune` computes the desired set with the same view the render uses.
+
 ### KubeAI acquires go through admission, as Compose's do
 
 An acquire on the KubeAI backend is now previewed in memory and commits its

@@ -1,10 +1,9 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **P1a done** 2026-09-25 · P1b–P5 not started ·
-P6 is ongoing.
+`dev/backend-unification` · **P1 done** 2026-09-26 · P2–P5 not started ·
+P6 is ongoing. Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
-**Execution order:** [../queue.md](../queue.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
 2026-09-24 audit (`dev/tmp/plan-backend-unification-2026-09-24.md`).
@@ -91,11 +90,18 @@ gained the step "an unrenderable endpoint is refused before anything is
 written" (a `--queue` acquire, no lease, no Model), and still passes the
 make-room step, which now runs on the admission path.
 
-**P1b. Delete the legacy branch** (with P6).
+**P1b. Delete the legacy branch.**
 `MemoryBackend` / `NullBackend` and the test fakes get a trivial
 `residency` and `preview`; then the non-admission branches and
-`_admission_mode()` go. Until then the legacy path serves only test fakes
-and `realize`/`teardown` backends, and no new code may depend on it.
+`_admission_mode()` go.
+
+**P1b done 2026-09-26.** `SimpleAdmission` (in `leasing/backend.py`) gives
+a backend with only `realize` / `teardown` the admission surface; a fake
+that emulates capacity overrides its `plan`, one that emulates a render
+failure its `refuse`. The controller has one acquire, render, renew and
+publish path. Rollback after a commit is still reachable (the runtime can
+change between preview and render) and keeps its tests, on a fake whose
+render refuses what its preview admitted.
 
 **Exit:** P1a: `_admission_mode()` is true for both real backends; a render
 failure on KubeAI rolls the lease back before any `kubectl`; e2e passes.
@@ -193,8 +199,11 @@ worse. A blocker is fixed whatever its size.
 | "this backend allocates GPUs" | inferred from which methods a backend has | **fixed** (P1a): `allocates_gpus()` in `leasing/backend.py`, read by the controller and the CLI |
 | approval digest and pre-approval | a copy inside `ComposeBackend` | **fixed** (P1a): `ConvergeScaffold`, shared |
 | KubeAI render vs its plan | `converge` rendered inline | **fixed** (P1a): one `_render_documents` behind `converge`, `preview` and `plan_on_idle_host` |
-| the acquire path | admission and a legacy branch in five places | deferred to P1b |
-| `_render`'s one-shot `converge(desired)` fallback, which applies | a second render contract for old backends | deferred to P1b: it goes with the legacy branch |
+| the acquire path | admission and a legacy branch in five places | **fixed** (P1b) |
+| `_render`'s one-shot `converge(desired)` fallback, which applies | a second render contract for old backends | **fixed** (P1b): removed |
+| "can anything be admitted while residency is unknown" | `_admit` admitted requests needing no new GPU; the render after the commit then failed without residency | **fixed** (P1b): nothing is admitted, and nothing is committed |
+| the desired set | `desired_deployments()` beside the admission view; `routes prune` used the former | **fixed** (P1b): one view, `_admission_view` |
+| a crashed acquire's placement scope | recorded in the marker and re-applied by a recovery render, although admission never records one | **fixed** (P1b): a stale scope is dropped |
 | the KubeAI gateway's approval | the gateway project asks its own diff approval at render, after the lease commits, not in the admission preview | deferred to P3. Same result under `--yes`; interactively, a declined gateway change rolls the lease back after the commit |
 
 ## Not in scope

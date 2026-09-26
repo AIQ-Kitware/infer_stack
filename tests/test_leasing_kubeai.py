@@ -409,7 +409,6 @@ def test_acquire_missing_profile_commits_nothing(tmp_path):
 def test_kubeai_takes_the_admission_path(tmp_path):
     """One acquire path: KubeAI admits by preview and commits no GPUs."""
     ctl, be, kubectl = make_controller(tmp_path)
-    assert ctl._admission_mode()
     out = ctl.acquire('alice', [_req('qwen')], wait=False)
     (deployment,) = out.deployments
     assert deployment.assigned_gpus == []     # committed, and empty

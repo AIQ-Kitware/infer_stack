@@ -25,7 +25,7 @@ from infer_stack.leasing import (
     SqliteStore,
     vllm_structural,
 )
-from infer_stack.leasing.backend import Readiness
+from infer_stack.leasing.backend import Readiness, SimpleAdmission
 
 
 
@@ -46,7 +46,7 @@ def _vreq(endpoint: str) -> EndpointRequest:
     )
 
 
-class SharedStackBackend:
+class SharedStackBackend(SimpleAdmission):
     """Models the one shared compose project across separate controllers.
 
     ``converge(apply=False)`` (render) writes the desired union to shared
@@ -63,7 +63,7 @@ class SharedStackBackend:
         self.last_errors: list[str] = []
         self.last_assignments: dict[str, list[int]] = {}
 
-    def converge(self, desired, *, apply: bool = True) -> None:
+    def converge(self, desired, *, apply: bool = True, placement=None) -> None:
         ids = {g.id for g in desired}
         with self.guard:
             self.shared['rendered'] = set(ids)
@@ -440,20 +440,38 @@ def test_no_apply_rollback_never_applies_over_an_older_pending_apply(tmp_path):
 
 
 class _NoRoomBackend(SharedStackBackend):
-    """Converge fake that can never place an endpoint named ``big``."""
+    """Can never place an endpoint named ``big``; preview and render agree."""
 
-    def converge(self, desired, *, apply: bool = True) -> None:
-        placeable = [g for g in desired if 'big' not in g.served]
-        self.last_unplaced = [g.id for g in desired if 'big' in g.served]
-        super().converge(placeable, apply=apply)
+    def refuse(self, desired):
+        return {g.id: 'no room' for g in desired if 'big' in g.served}
+
+    def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+        refused = self.refuse(desired)
+        self.last_unplaced = list(refused)
+        super().converge([g for g in desired if g.id not in refused], apply=apply)
 
 
-def test_placement_rollback_evicts_and_rerenders(tmp_path):
-    """Regression: a failed placement must fully roll back — lease released, the
-    never-ran deployments evicted (not left idle-keep-warm, which would pin them
-    in the desired set), the placed sibling removed from the on-disk render, and
-    the publication marker cleared."""
-    from infer_stack.leasing import DeploymentState, LeaseState
+class _RenderRefusesBackend(_NoRoomBackend):
+    """Its preview admits ``big``; its render then refuses it.
+
+    The one way an admitted acquire still fails after its lease is committed
+    (the runtime changed between preview and render), so the rollback tests
+    use it.
+    """
+
+    def refuse(self, desired):
+        return {}
+
+    def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+        refused = [g.id for g in desired if 'big' in g.served]
+        SharedStackBackend.converge(
+            self, [g for g in desired if g.id not in refused], apply=apply)
+        self.last_unplaced = refused
+
+
+def test_a_refused_acquire_commits_nothing(tmp_path):
+    """Admission refuses before anything is written: no lease, no deployment,
+    nothing rendered, no marker."""
     from infer_stack.leasing.backend import PlacementError
 
     db = str(tmp_path / 'ledger.db')
@@ -461,13 +479,34 @@ def test_placement_rollback_evicts_and_rerenders(tmp_path):
     ledger = Ledger(SqliteStore(db))
     ctl = Controller(ledger, _NoRoomBackend(shared, threading.Lock()))
 
+    with pytest.raises(PlacementError, match='no room'):
+        ctl.acquire('alice', [_vreq('ok'), _vreq('big')], wait=False)
+
+    assert ledger.status() == ([], [])
+    assert shared['rendered'] == set()
+    assert shared['realized'] == set()
+    assert ledger.publication_pending() is None
+
+
+def test_a_render_refusal_after_commit_rolls_back_and_rerenders(tmp_path):
+    """Regression: a render that refuses what admission admitted must fully
+    roll back: lease released, the never-ran deployments evicted (not left
+    idle keep-warm, which would pin them in the desired set), the placed
+    sibling removed from the render, and the publication marker cleared."""
+    from infer_stack.leasing import DeploymentState, LeaseState
+    from infer_stack.leasing.backend import PlacementError
+
+    db = str(tmp_path / 'ledger.db')
+    shared = {'rendered': set(), 'realized': set(), 'apply_calls': 0}
+    ledger = Ledger(SqliteStore(db))
+    ctl = Controller(ledger, _RenderRefusesBackend(shared, threading.Lock()))
+
     with pytest.raises(PlacementError):
         ctl.acquire('alice', [_vreq('ok'), _vreq('big')], wait=False)
 
     leases, deployments = ledger.status()
     assert [le.state for le in leases] == [LeaseState.RELEASED]
     assert {g.state for g in deployments} == {DeploymentState.STOPPED}
-    # 'ok' was rendered by the failed acquire; the rollback re-render removed it.
     assert shared['rendered'] == set()
     assert shared['realized'] == set()
     assert ledger.publication_pending() is None
@@ -475,8 +514,8 @@ def test_placement_rollback_evicts_and_rerenders(tmp_path):
 
 def test_rollback_keeps_coalesced_warm_deployment_resident(tmp_path):
     """A failed acquire that coalesced onto a pre-existing warm (idle keep-warm)
-    deployment must roll that deployment back to IDLE — not evict the resident
-    model someone else may still want warm."""
+    deployment must leave it IDLE — not evict the resident model someone else
+    may still want warm."""
     from infer_stack.leasing import DeploymentState
     from infer_stack.leasing.backend import PlacementError
 
@@ -514,7 +553,7 @@ def test_converge_aborted_rollback_rerenders(tmp_path):
             self.converge_calls = 0
             self.declined = False
 
-        def converge(self, desired, *, apply: bool = True) -> None:
+        def converge(self, desired, *, apply: bool = True, placement=None) -> None:
             self.converge_calls += 1
             if desired and not self.declined:
                 self.declined = True
@@ -558,13 +597,13 @@ def _warm_then_failed_acquire(tmp_path, residency):
 
     shared = _shared()
 
-    class Backend(_NoRoomBackend):
+    class Backend(_RenderRefusesBackend):
         pass
 
-    Backend.residency = lambda self: residency(self)
     ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared, Backend)
     warm = ctl.acquire('alice', [_vreq('m')], wait=False)
     ctl.release(warm.lease.id)
+    Backend.residency = lambda self: residency(self)
     shared['realized'] = set()        # observe() now says "nothing" (as on a docker error)
     with pytest.raises(PlacementError):
         ctl.acquire('bob', [_vreq('m'), _vreq('big')], wait=False)
@@ -743,16 +782,13 @@ def test_release_all_releases_every_active_lease_in_one_apply(tmp_path):
 # -- transitional: rollback under unknown residency keeps a phantom warm candidate --
 
 
-def test_transitional_unknown_residency_rollback_keeps_an_idle_candidate(tmp_path):
-    """Behaviour of backends WITHOUT admission mode (no preview), kept by design.
+def test_unknown_residency_admits_nothing(tmp_path):
+    """Without a strict view of what runs, nothing is admitted or written.
 
-    A brand-new acquire fails; rollback cannot read residency, so it refuses to
-    evict (the safe direction). On such backends the desired set still contains
-    that IDLE deployment, so a later apply starts it with no lease behind it.
-    Admission-mode backends (Compose) never commit a failed acquire and never
-    start idle deployments: see tests/test_leasing_admission.py.
+    (Before one acquire path, a backend without admission committed the
+    lease, failed, and left an IDLE candidate a later apply started with no
+    lease behind it.)
     """
-    from infer_stack.leasing import DeploymentState
     from infer_stack.leasing.backend import PlacementError
     from infer_stack.leasing.residency import ResidencyUnknown
 
@@ -763,9 +799,8 @@ def test_transitional_unknown_residency_rollback_keeps_an_idle_candidate(tmp_pat
             raise ResidencyUnknown('docker ps failed')
 
     ledger, ctl = _fresh(str(tmp_path / 'ledger.db'), shared, Backend)
-    with pytest.raises(PlacementError):
-        ctl.acquire('alice', [_vreq('fresh'), _vreq('big')], wait=False)
-    fresh = next(g for g in ledger.status()[1] if 'fresh' in g.served)
-    assert fresh.state == DeploymentState.IDLE          # not evicted
-    ctl.apply_now()
-    assert fresh.id in shared['realized']               # started without a lease (P9 fixes)
+    with pytest.raises(PlacementError, match='cannot be read'):
+        ctl.acquire('alice', [_vreq('fresh')], wait=False)
+    assert ledger.status() == ([], [])
+    assert ledger.publication_pending() is None
+    assert shared['realized'] == set()

@@ -419,19 +419,6 @@ class Controller:
 
     # -- reconcile ---------------------------------------------------------
 
-    def desired_deployments(self) -> list[Deployment]:
-        """Deployments that should currently be running."""
-        _, deployments = self.ledger.status()
-        desired: list[Deployment] = []
-        for deployment in deployments:
-            if deployment.state == DeploymentState.LIVE:
-                desired.append(deployment)
-            elif deployment.state == DeploymentState.IDLE:
-                policy = deployment.spec.get('reclaim', self.reclaim_default)
-                if policy == KEEP_WARM:
-                    desired.append(deployment)
-        return desired
-
     def _infeasible_alone(self, deployments, requested: set) -> dict:
         """Which of this lease's deployments cannot be placed even on an idle host.
 
@@ -469,77 +456,36 @@ class Controller:
     def _render(self) -> ReconcileResult:
         """Render the desired state to disk WITHOUT the slow apply.
 
-        The caller MUST hold :meth:`_global_lock`. For a converge-style backend
-        (Compose) this writes the compose project (placement + files) but does
-        not ``docker compose up`` -- that is :meth:`_apply_pending`, under the
-        same lock hold. A per-deployment ``realize``/``teardown`` backend has no
-        such split, so it realizes here; those backends expose no ``apply``.
+        The caller MUST hold :meth:`_global_lock`. This writes the backend's
+        rendered state (the compose project, the Model manifests) but does not
+        bring it up -- that is :meth:`_apply_pending`, under the same lock hold.
         """
         self.ledger.sweep()
-        placement = None
-        if self._admission_mode():
-            # Residency decides which idle keep-warm deployments are candidates
-            # at all; unknown residency fails the render (the change stays
-            # pending) rather than guessing which warm models exist.
-            residency = self._admitting.residency()
-            self._backfill_allocations(residency)
-            self._prepare_network()
-            desired, placement = self._admission_view(residency)
-            if hasattr(self.backend, 'adopted'):
-                self._admitting.adopted = self._prune_adopted(residency)
-        else:
-            desired = self.desired_deployments()
-        # Bound once rather than probed with hasattr: the capability check is
-        # the same, and the bound method keeps its type instead of narrowing
-        # to `object` the way an attribute reached through hasattr does.
-        converge = getattr(self.backend, 'converge', None)
-        if converge is not None:
-            before = set(self.backend.observe())
-            try:
-                if placement is not None:
-                    converge(desired, apply=False, placement=placement)
-                else:
-                    converge(desired, apply=False)
-            except TypeError:
-                # Legacy converge(desired) with no apply kwarg renders+applies
-                # in one shot (no separate apply()); accept that here.
-                converge(desired)
-            after = set(self.backend.observe())
-            rec = ReconcileResult(
-                realized=sorted(after - before),
-                torn_down=sorted(before - after),
-                unplaced=sorted(
-                    getattr(self.backend, 'last_unplaced', ()) or ()
-                ),
-                placement_errors=list(
-                    getattr(self.backend, 'last_errors', ()) or ()
-                ),
-                assignments=dict(
-                    getattr(self.backend, 'last_assignments', {}) or {}
-                ),
-                applied=False,
-                displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
-                degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
-            )
-            if placement is not None and hasattr(self.backend, 'adopted'):
-                self._adopt_existing(residency)
-            return rec
-        desired_ids = {g.id for g in desired}
-        actual = self.backend.observe()
-        result = ReconcileResult()
-        for deployment in desired:
-            if deployment.id not in actual:
-                self.backend.realize(deployment)
-                result.realized.append(deployment.id)
-        stale = actual - desired_ids
-        if stale:
-            by_id = {g.id: g for g in self.ledger.status()[1]}
-            for gid in stale:
-                deployment = by_id.get(gid)
-                if deployment is not None:
-                    self.backend.teardown(deployment)
-                    result.torn_down.append(gid)
-        return result
+        # Residency decides which idle keep-warm deployments are candidates at
+        # all; unknown residency fails the render (the change stays pending)
+        # rather than guessing which warm models exist.
+        residency = self._admitting.residency()
+        self._backfill_allocations(residency)
+        self._prepare_network()
+        desired, placement = self._admission_view(residency)
+        if hasattr(self.backend, 'adopted'):
+            self._admitting.adopted = self._prune_adopted(residency)
+        before = set(self.backend.observe())
+        self._admitting.converge(desired, apply=False, placement=placement)
+        after = set(self.backend.observe())
+        rec = ReconcileResult(
+            realized=sorted(after - before),
+            torn_down=sorted(before - after),
+            unplaced=sorted(getattr(self.backend, 'last_unplaced', ()) or ()),
+            placement_errors=list(getattr(self.backend, 'last_errors', ()) or ()),
+            assignments=dict(getattr(self.backend, 'last_assignments', {}) or {}),
+            applied=False,
+            displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
+            degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
+        )
+        if hasattr(self.backend, 'adopted'):
+            self._adopt_existing(residency)
+        return rec
 
     # -- serialised publication --------------------------------------------
     #
@@ -555,8 +501,7 @@ class Controller:
 
     # -- admission (plan steps P5, P6, P9) ------------------------------------
     #
-    # Backends with strict residency and an in-memory preview (Compose and
-    # KubeAI) get admission semantics:
+    # Every acquire, renew and publication goes through admission:
     #   * a LIVE deployment holds a committed allocation (assigned_gpus);
     #   * an IDLE keep-warm deployment is only an optional candidate, and only
     #     while it is uniquely resident; it yields its GPUs to demand and is
@@ -566,8 +511,8 @@ class Controller:
     # Where the cluster schedules (KubeAI, ``allocates_gpus`` false) every
     # deployment commits an empty allocation: admission then decides only
     # renderability, and a Pending pod is a wait reason, not an unplaced
-    # error. Test fakes without residency/preview keep the previous path
-    # (roadmap P1b removes it).
+    # error. Backends that neither place nor inspect (dry-run, tests) get the
+    # same surface from SimpleAdmission.
 
     def _stored_state(self, lease_id: str):
         """A lease's state as stored (not virtually expired), or ``None``."""
@@ -578,16 +523,10 @@ class Controller:
     def _admitting(self) -> AdmissionBackend:
         """``self.backend`` as the admission surface.
 
-        Only for code that runs after :meth:`_admission_mode` (or an
-        equivalent capability check) said the backend has it.
+        Every backend the controller drives has it (the real ones, and
+        :class:`~infer_stack.leasing.backend.SimpleAdmission` for the rest).
         """
         return cast(AdmissionBackend, self.backend)
-
-    def _admission_mode(self) -> bool:
-        return all(
-            callable(getattr(self.backend, name, None))
-            for name in ('residency', 'preview', 'converge')
-        )
 
     def _admission_view(
         self, residency, *, overlay=None, virtual_expiry: bool = False
@@ -753,11 +692,10 @@ class Controller:
             except Exception:  # noqa: BLE001 - a view must always render
                 sidecar = {}
         residency, residency_error = None, None
-        if callable(getattr(self.backend, 'residency', None)):
-            try:
-                residency = self._admitting.residency()
-            except ResidencyUnknown as ex:
-                residency_error = str(ex)
+        try:
+            residency = self._admitting.residency()
+        except ResidencyUnknown as ex:
+            residency_error = str(ex)
         degraded = set(sidecar.get('degraded') or ())
         displaced = set(sidecar.get('displaced') or ())
         rows = []
@@ -773,7 +711,7 @@ class Controller:
             elif g.id in displaced and g.state == DeploymentState.IDLE:
                 condition = 'displaced'
             elif (g.state == DeploymentState.LIVE and g.assigned_gpus is None
-                  and self._admission_mode() and residency is not None
+                  and residency is not None
                   and residency.resident(g.id) is None):
                 condition = 'unresolved'
             elif residency is not None:
@@ -818,7 +756,7 @@ class Controller:
     def _adopt_existing(self, residency) -> None:
         """One-time migration: adopt project containers from before ownership labels.
 
-        Runs after the first admission-mode render on a ledger. A container
+        Runs after the first render on a ledger. A container
         without infer-stack's service and fingerprint labels is adopted, with
         the fingerprint of this render, if it is infrastructure the render
         still has, or a deployment container whose deployment is LIVE on the
@@ -920,10 +858,13 @@ class Controller:
                 adopted[gid] = list(resident.gpus)      # IDLE->LIVE keeps its GPUs
             else:
                 need.append(gid)
-        if residency is None and (need or adopted):
+        if residency is None:
+            # The render after the commit needs residency too, so nothing can
+            # be admitted without it; refusing here commits nothing.
             return {}, [
-                'Docker residency is unknown, so only requests that need no new '
-                'GPU are admitted; retry when `docker ps` works'
+                'what is running cannot be read right now (the runtime did not '
+                'answer), so nothing is admitted; retry when `infer-stack leases` '
+                'shows no residency error'
             ]
         if need:
             unresolved = self._unresolved_allocations(exclude=set(overlay.deployments))
@@ -1205,8 +1146,7 @@ class Controller:
             self._applied_profile = stored
 
     def _mark_pending(
-        self, *, apply: bool, placement_context: dict | None = None,
-        create_profile: bool = True,
+        self, *, apply: bool, create_profile: bool = True,
     ) -> dict:
         """Record that desired state is about to change (caller holds the lock).
 
@@ -1215,31 +1155,16 @@ class Controller:
         ever turns ``apply_requested`` on: a staged change never cancels an
         apply already requested (promotion, see the plan's D23).
 
-        If an earlier acquire died between committing and its first render, its
-        placement scope is still in the marker: render once with that scope
-        first, so its deployment is placed where that caller was allowed.
+        A placement scope left in the marker by pre-admission code is dropped:
+        a row that code committed without an allocation stays unresolved and is
+        never placed, so no render needs that caller's scope.
         """
         if create_profile:
             self._sync_profile(create=True)
         current = self.ledger.publication_pending()
         if current and current.get('placement_context'):
-            self._render_in_scope(current['placement_context'])
-        return self.ledger.mark_publication_pending(
-            apply_requested=apply, placement_context=placement_context,
-        )
-
-    def _render_in_scope(self, context: dict) -> None:
-        """Render with another caller's admission scope, then forget the scope.
-
-        The scope is cleared only after a render that succeeded (and so pinned
-        the placement). A declined or failed render propagates and keeps it,
-        so no later caller can place that deployment within its own scope.
-        """
-        scope = getattr(self.backend, 'placement_scope', None)
-        if scope is not None:
-            with scope(context):
-                self._render()
-        self.ledger.clear_placement_context()
+            self.ledger.clear_placement_context()
+        return self.ledger.mark_publication_pending(apply_requested=apply)
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
         """Apply the last render if the marker requests it; clear on success.
@@ -1254,12 +1179,7 @@ class Controller:
         marker = self.ledger.publication_pending()
         if marker is None:
             return rec
-        apply_fn = getattr(self.backend, 'apply', None)
-        if apply_fn is None:
-            # realize/teardown backends applied during the render itself.
-            self.ledger.clear_publication_pending(marker['version'])
-            rec.publication_pending = False
-            return rec
+        apply_fn = self._admitting.apply
         if not marker['apply_requested']:
             rec.publication_pending = True    # staged; never applied here
             return rec
@@ -1467,19 +1387,14 @@ class Controller:
     def _never_ran(self, deployment_ids: list[str]) -> list[str]:
         """Which of these deployments definitely have no container at all.
 
-        Uses strict residency where the backend has it: a deployment with any
-        container, in any state, is kept, and if Docker cannot be read nothing
-        is reported (so nothing warm is ever evicted on a failed look). Backends
-        without residency fall back to ``observe()``.
+        Uses strict residency: a deployment with any container, in any state,
+        is kept, and if the runtime cannot be read nothing is reported (so
+        nothing warm is ever evicted on a failed look).
         """
-        residency = getattr(self.backend, 'residency', None)
-        if residency is None:
-            running = set(self.backend.observe())
-            return [gid for gid in deployment_ids if gid not in running]
         from .residency import ResidencyUnknown
 
         try:
-            snap = residency()
+            snap = self._admitting.residency()
         except ResidencyUnknown:
             return []
         return [gid for gid in deployment_ids if not snap.containers(gid)]
@@ -1593,106 +1508,12 @@ class Controller:
             grabs. Head-of-line GPU reservation is a follow-up; for the small-fleet
             case (few GPUs, rare multi-GPU jobs) plain queueing is sufficient.
         """
-        from .backend import ConvergeAborted, PlacementError
-
-        if self._admission_mode():
-            result, rec = self._acquire_by_admission(
-                owner, requests, ttl_seconds=ttl_seconds, apply=apply,
-                wait_for_placement=wait_for_placement,
-                placement_timeout=timeout if placement_timeout is None else placement_timeout,
-                placement_interval=interval if placement_interval is None else placement_interval,
-            )
-            return self._finish_acquire(result, rec, apply=apply, wait=wait,
-                                        timeout=timeout, interval=interval)
-
-        # Intent, ledger write, render and (once placed) apply all under one lock
-        # hold, so a second caller blocks before touching sqlite and no render
-        # can change the files this apply reads. The readiness wait and the
-        # admission-queue sleep stay OUTSIDE the lock.
-        with self._global_lock():
-            self._sync_profile(create=True)
-            stored_profile = self.ledger.profile()
-            candidate_profile = self._acquire_profile_candidate()
-            if candidate_profile is not None:
-                self._use_profile_candidate(candidate_profile)
-            try:
-                validate = getattr(self.backend, 'validate_requests', None)
-                if validate is not None:
-                    validate(requests)      # before desired state is written
-            except BaseException:
-                if candidate_profile is not None:
-                    self._restore_stored_profile(stored_profile)
-                raise
-            if candidate_profile is not None:
-                # The user catalog is authoritative. Persist the compatible
-                # recovery inputs now; the desired-state marker belongs to the
-                # acquire immediately below, not to this snapshot refresh.
-                self._commit_profile_candidate(candidate_profile)
-            context = getattr(self.backend, 'placement_context', lambda: None)()
-            self._mark_pending(apply=apply, placement_context=context)
-            result = self.ledger.acquire(
-                owner, requests, ttl_seconds=ttl_seconds
-            )
-            try:
-                try:
-                    rec = self._render()
-                finally:
-                    # Rendered (placement pinned) or about to roll back: either
-                    # way a recovery no longer needs this caller's scope.
-                    if context is not None:
-                        self.ledger.clear_placement_context()
-            except ConvergeAborted:
-                # The operator declined the compose changes -- don't leave the
-                # just-created lease dangling in the ledger.
-                self._rollback_acquire(result.lease.id, apply=apply)
-                raise
-            # If a deployment this lease just requested could not be placed (e.g. no
-            # free GPU), either queue for one (wait_for_placement) or -- the default --
-            # roll the lease back and report the planner's reason, so the deployment
-            # never lingers as a phantom ``live`` with nothing behind it.
-            requested = {g.id for g in result.deployments}
-            unplaced = requested & set(rec.unplaced)
-            if not unplaced:
-                rec = self._apply_admitted(rec, result.lease.id, apply=apply)
-        if unplaced and wait_for_placement and apply:
-            # Never queue for capacity that cannot exist. Re-plan this lease's
-            # deployments ALONE on an idle host: if they do not fit there, no
-            # amount of waiting will help, and waiting is actively harmful --
-            # the lease holds whatever it did place for the whole timeout, so a
-            # request that was never satisfiable can block ones that are.
-            #
-            # Only the aggregate case needs this. A single deployment too large
-            # for any card is already caught by the planner's permanent branch;
-            # what is missed is a lease whose deployments cannot fit TOGETHER,
-            # e.g. a 4-GPU model plus a 1-GPU extractor on a 4-GPU host.
-            infeasible = self._infeasible_alone(result.deployments, requested)
-            if infeasible:
-                self._rollback_acquire(result.lease.id, apply=apply)
-                raise PlacementError(sorted(infeasible.keys()),
-                                     sorted(infeasible.values()))
-            p_timeout = timeout if placement_timeout is None else placement_timeout
-            p_interval = (
-                interval if placement_interval is None else placement_interval
-            )
-            deadline = self.clock() + p_timeout
-            while unplaced and self.clock() < deadline:
-                self.sleep(p_interval)
-                # Re-render under the lock: each retry sweeps (reclaiming a crashed
-                # job's TTL-expired lease) and re-plans against the freed GPUs.
-                with self._global_lock():
-                    self._mark_pending(apply=True)   # the render sweeps
-                    rec = self._render()
-                    unplaced = requested & set(rec.unplaced)
-                    if not unplaced:
-                        rec = self._apply_admitted(rec, result.lease.id, apply=True)
-        if unplaced:
-            self._rollback_acquire(result.lease.id, apply=apply)
-            reasons = [
-                e
-                for e in rec.placement_errors
-                if any(e.startswith(gid) for gid in unplaced)
-            ]
-            raise PlacementError(sorted(unplaced), reasons)
+        result, rec = self._acquire_by_admission(
+            owner, requests, ttl_seconds=ttl_seconds, apply=apply,
+            wait_for_placement=wait_for_placement,
+            placement_timeout=timeout if placement_timeout is None else placement_timeout,
+            placement_interval=interval if placement_interval is None else placement_interval,
+        )
         return self._finish_acquire(result, rec, apply=apply, wait=wait,
                                     timeout=timeout, interval=interval)
 
@@ -1700,7 +1521,7 @@ class Controller:
         self, owner, requests, *, ttl_seconds, apply, wait_for_placement,
         placement_timeout, placement_interval,
     ):
-        """Admission-mode acquire: preview in memory, commit only if admissible.
+        """The acquire: preview in memory, commit only if admissible.
 
         Each attempt runs under the lock: sweep (itself a published mutation),
         observe residency, overlay the request on the ledger, and preview
@@ -1750,7 +1571,6 @@ class Controller:
                         self._commit_profile_candidate(candidate_profile)
                     # Allocations are committed with the lease, so no placement
                     # scope needs recording for recovery.
-                    context = None
                     self._mark_pending(apply=apply)
                     try:
                         result = self.ledger.acquire(
@@ -1763,11 +1583,7 @@ class Controller:
                     except AdmissionConflict:
                         continue            # the ledger moved; preview again
                     try:
-                        try:
-                            rec = self._render()
-                        finally:
-                            if context is not None:
-                                self.ledger.clear_placement_context()
+                        rec = self._render()
                     except ConvergeAborted:
                         self._rollback_acquire(result.lease.id, apply=apply)
                         raise
@@ -1946,68 +1762,43 @@ class Controller:
                     f'config publish needs a quiescent stack: {len(active)} active '
                     f'lease(s) ({", ".join(active[:3])}); release them first'
                 )
-            residency = getattr(self.backend, 'residency', None)
-            if residency is not None:
-                try:
-                    snap = residency()
-                except ResidencyUnknown as ex:
-                    raise ProfileMismatch(
-                        f'config publish cannot confirm the stack is quiescent: {ex}'
-                    ) from ex
-                running = sorted({c.deployment_id for c in snap.all_containers()
-                                  if c.deployment_id})
-                if running:
-                    raise ProfileMismatch(
-                        'config publish needs a quiescent stack: deployment '
-                        f'container(s) exist for {", ".join(running[:3])}; '
-                        '`infer-stack evict --all` first'
-                    )
-            if self._admission_mode():
-                # A PURE preview first: the real render persists append-only
-                # state (route registry, addresses), which must not happen for
-                # a candidate whose publication has not committed.
-                previous = self._applied_profile
-                use(profile)
-                try:
-                    residency = self._admitting.residency()
-                    self._prepare_network()
-                    desired, inputs = self._admission_view(
-                        residency, virtual_expiry=True
-                    )
-                    self._admitting.preview(desired, inputs, approve=True)
-                except BaseException:
-                    if previous is not None:
-                        use(previous)
-                    raise
-                self.ledger.store.publish_profile(
-                    profile, approved_digest=self._admitting.last_preview_digest)
-                self._profile_error = None
-                self._applied_profile = profile
-                self._invocation_profile = profile
-                self._profile_drift_warned = False
-                return self._publish()
-            # Backends without a preview (KubeAI): render, then commit.
-            # No implicit profile here: on a fresh ledger a declined preview
-            # must leave neither a profile nor a marker behind.
-            existed = self.ledger.publication_pending() is not None
-            marker = self._mark_pending(apply=True, create_profile=False)
+            try:
+                snap = self._admitting.residency()
+            except ResidencyUnknown as ex:
+                raise ProfileMismatch(
+                    f'config publish cannot confirm the stack is quiescent: {ex}'
+                ) from ex
+            running = sorted({c.deployment_id for c in snap.all_containers()
+                              if c.deployment_id})
+            if running:
+                raise ProfileMismatch(
+                    'config publish needs a quiescent stack: deployment '
+                    f'container(s) exist for {", ".join(running[:3])}; '
+                    '`infer-stack evict --all` first'
+                )
+            # A PURE preview first: the real render persists append-only
+            # state (route registry, addresses), which must not happen for
+            # a candidate whose publication has not committed.
             previous = self._applied_profile
             use(profile)
             try:
-                rec = self._render()
+                residency = self._admitting.residency()
+                self._prepare_network()
+                desired, inputs = self._admission_view(
+                    residency, virtual_expiry=True
+                )
+                self._admitting.preview(desired, inputs, approve=True)
             except BaseException:
                 if previous is not None:
                     use(previous)
-                if not existed:
-                    self.ledger.clear_publication_pending(marker['version'])
                 raise
             self.ledger.store.publish_profile(
-                profile, approved_digest=getattr(self.backend, 'last_planned_digest', None))
+                profile, approved_digest=self._admitting.last_preview_digest)
             self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile
             self._profile_drift_warned = False
-            return self._apply_pending(rec)
+            return self._publish()
 
     def prune(self) -> tuple[int, int]:
         """Forget released/expired leases and stopped deployments, under the lock.
@@ -2027,7 +1818,7 @@ class Controller:
         nothing.
 
         **Slow path, under the lock:** a deployment went IDLE, so the renew is a
-        desired-state change. In admission mode it is re-admitted: the IDLE
+        desired-state change, so it is re-admitted: the IDLE
         deployment adopts its resident GPUs, or is placed fresh; if neither is
         possible the renew fails with :class:`PlacementError` and writes
         nothing. The lease is re-validated as ACTIVE under the lock first.
@@ -2038,52 +1829,36 @@ class Controller:
         if fast is not False:
             return RenewOutcome(fast, [])
         with self._global_lock():
-            if self._admission_mode():
-                lease = self.ledger.get_lease(lease_id)
-                if lease is None or lease.state != LeaseState.ACTIVE:
-                    return RenewOutcome(None, [])
-                from .residency import ResidencyUnknown
-
-                try:
-                    residency = self._admitting.residency()
-                except ResidencyUnknown:
-                    residency = None
-                overlay = self.ledger.plan_acquire([])
-                for gid in dict.fromkeys(lease.deployment_ids):
-                    deployment = self.ledger.get_deployment(gid)
-                    if deployment is not None and deployment.state == DeploymentState.IDLE:
-                        deployment.state = DeploymentState.LIVE
-                        overlay.deployments[gid] = deployment
-                        overlay.revived.append(gid)
-                if not overlay.revived:
-                    return RenewOutcome(
-                        self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
-                allocations, reasons = self._admit(overlay, residency)
-                if reasons:
-                    raise PlacementError(list(overlay.revived), reasons)
-                self._mark_pending(apply=True)
-                if self._admission_digest:
-                    self.ledger.mark_publication_pending(
-                        apply_requested=True, approved_digest=self._admission_digest)
-                renewed = self.ledger.renew(
-                    lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
-                rec = self._publish()
-                return RenewOutcome(renewed, list(overlay.revived), rec)
             lease = self.ledger.get_lease(lease_id)
-            reviving = []
-            if lease is not None and lease.state == LeaseState.ACTIVE:
-                for gid in dict.fromkeys(lease.deployment_ids):
-                    deployment = self.ledger.get_deployment(gid)
-                    if deployment is not None and deployment.state == DeploymentState.IDLE:
-                        reviving.append(gid)
-            if not reviving:
+            if lease is None or lease.state != LeaseState.ACTIVE:
+                return RenewOutcome(None, [])
+            from .residency import ResidencyUnknown
+
+            try:
+                residency = self._admitting.residency()
+            except ResidencyUnknown:
+                residency = None
+            overlay = self.ledger.plan_acquire([])
+            for gid in dict.fromkeys(lease.deployment_ids):
+                deployment = self.ledger.get_deployment(gid)
+                if deployment is not None and deployment.state == DeploymentState.IDLE:
+                    deployment.state = DeploymentState.LIVE
+                    overlay.deployments[gid] = deployment
+                    overlay.revived.append(gid)
+            if not overlay.revived:
                 return RenewOutcome(
-                    self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [],
-                )
+                    self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
+            allocations, reasons = self._admit(overlay, residency)
+            if reasons:
+                raise PlacementError(list(overlay.revived), reasons)
             self._mark_pending(apply=True)
-            renewed = self.ledger.renew(lease_id, ttl_seconds=ttl_seconds)
+            if self._admission_digest:
+                self.ledger.mark_publication_pending(
+                    apply_requested=True, approved_digest=self._admission_digest)
+            renewed = self.ledger.renew(
+                lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
             rec = self._publish()
-        return RenewOutcome(renewed, reviving, rec)
+            return RenewOutcome(renewed, list(overlay.revived), rec)
 
     def evict(self, deployment_ids: Iterable[str] | None = None) -> EvictOutcome:
         """Force-evict idle (released) deployments now, overriding keep-warm.

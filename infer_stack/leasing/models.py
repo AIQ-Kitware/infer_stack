@@ -362,8 +362,8 @@ class Deployment:
     created_at: float
     updated_at: float
     demand: int = 0
-    # The committed GPU allocation of a LIVE deployment (admission-mode
-    # backends). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
+    # The committed GPU allocation of a LIVE deployment (empty where the
+    # cluster schedules). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
     # before allocations existed). Cleared in the same transaction as any
     # transition out of LIVE.
     assigned_gpus: list[int] | None = None

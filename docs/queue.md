@@ -30,7 +30,9 @@ commit as the change they describe.
 
 Done 2026-09-25, `d6a19c4`.
 
-### 2. [ ] P1b: delete the legacy acquire branch
+### 2. [x] P1b: delete the legacy acquire branch
+
+Done 2026-09-26.
 
 `MemoryBackend`, `NullBackend` and the test fakes (queue, lock, serialised
 publication) get a trivial `residency` and `preview`. Then the

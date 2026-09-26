@@ -985,7 +985,7 @@ def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkey
     from infer_stack.leasing.backend import MemoryBackend
 
     class RoutesNeverVerify(MemoryBackend):
-        def converge(self, desired, *, apply=True):
+        def converge(self, desired, *, apply=True, placement=None):
             self.last_unplaced, self.last_errors, self.last_assignments = [], [], {}
 
         def apply(self):

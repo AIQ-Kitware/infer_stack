@@ -2141,28 +2141,6 @@ class ComposeBackend(ConvergeScaffold):
         sources = profile.get('catalogs') or []
         self.catalog = CatalogUnion.from_sources(sources) if sources else None
 
-    def placement_context(self) -> dict[str, Any] | None:
-        """This caller's admission scope, stored with a pending acquire."""
-        if self.allowed_gpus is None:
-            return None
-        return {'allowed_gpus': list(self.allowed_gpus)}
-
-    def placement_scope(self, context: dict[str, Any] | None):
-        """Temporarily render with another caller's admission scope."""
-        import contextlib
-
-        @contextlib.contextmanager
-        def scope():
-            saved = self.allowed_gpus
-            if context and 'allowed_gpus' in context:
-                self.allowed_gpus = context['allowed_gpus']
-            try:
-                yield
-            finally:
-                self.allowed_gpus = saved
-
-        return scope()
-
     def validate_requests(self, requests) -> None:
         """Refuse requests the published catalog union does not define identically."""
         from .profile import validate_requests_against

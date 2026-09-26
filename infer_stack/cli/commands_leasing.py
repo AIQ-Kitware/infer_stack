@@ -1906,28 +1906,19 @@ def _placement_view(controller):
 
     if not allocates_gpus(backend):
         return observed, assignments      # the cluster places; no GPU indices
-    if controller._admission_mode():
-        # Committed allocations, and idle residents' physical GPUs; the
-        # legacy planner view would show placements admission would not make.
-        _, deployments = controller.ledger.status(virtual_expiry=True)
+    # Committed allocations, and idle residents' physical GPUs.
+    _, deployments = controller.ledger.status(virtual_expiry=True)
+    for g in deployments:
+        if g.assigned_gpus is not None:
+            assignments[g.id] = list(g.assigned_gpus)
+    try:
+        residency = backend.residency()
         for g in deployments:
-            if g.assigned_gpus is not None:
-                assignments[g.id] = list(g.assigned_gpus)
-        try:
-            residency = backend.residency()
-            for g in deployments:
-                c = residency.resident(g.id)
-                if g.id not in assignments and c is not None:
-                    assignments[g.id] = list(c.gpus)
-        except Exception:  # noqa: BLE001
-            pass
-        return observed, assignments
-    plan = getattr(backend, 'plan', None)
-    if plan is not None:
-        try:
-            assignments = dict(plan(controller.desired_deployments()).assignments)
-        except Exception:  # noqa: BLE001
-            pass
+            c = residency.resident(g.id)
+            if g.id not in assignments and c is not None:
+                assignments[g.id] = list(c.gpus)
+    except Exception:  # noqa: BLE001
+        pass
     return observed, assignments
 
 
@@ -2602,8 +2593,9 @@ class RoutesPruneCLI(_ApprovalMixin):
         backend = _require_compose_backend(controller)
 
         def prune_plan() -> tuple[dict, dict, list[str]]:
-            desired = controller.desired_deployments()
-            plan = backend.plan(desired)
+            # The desired set exactly as the next render sees it.
+            desired, inputs = controller._admission_view(backend.residency())
+            plan = backend.plan(desired, inputs)
             keep: dict = {}
             if backend.catalog is not None:
                 keep.update(_registry_incoming_from_catalog(backend.catalog))

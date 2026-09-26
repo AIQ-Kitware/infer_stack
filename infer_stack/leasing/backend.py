@@ -141,15 +141,16 @@ class ConvergeBackend(Backend, Protocol):
     * ``last_assignments`` — deployment id -> GPU indices (empty for backends
       where the cluster schedules).
 
-    Backends without this surface fall back to the per-deployment
-    ``realize``/``teardown`` path in :meth:`Controller._render`.
+    A backend with only ``realize``/``teardown`` gets this surface from
+    :class:`SimpleAdmission`.
     """
 
     last_unplaced: set[str]
     last_errors: list[str]
     last_assignments: dict[str, list[int]]
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None):
         """Render the desired set to backend state; optionally apply it."""
         ...
 
@@ -165,10 +166,11 @@ class ConvergeBackend(Backend, Protocol):
 
 @runtime_checkable
 class AdmissionBackend(ConvergeBackend, Protocol):
-    """The surface admission mode uses (see ``Controller._admission_mode``).
+    """The surface the controller drives: every acquire goes through admission.
 
     Both real backends have it: strict residency and an in-memory
-    ``preview``. Compose also takes the stable-address network and the
+    ``preview``; :class:`SimpleAdmission` supplies it for backends that
+    neither place nor inspect (the dry-run and test backends). Compose also takes the stable-address network and the
     container-adoption table from the controller (``network``,
     ``on_addresses``, ``adopted``); those are Compose-only, and the
     controller hands them over only to a backend that declares them. The
@@ -331,7 +333,107 @@ class ConvergeScaffold:
             )
 
 
-class MemoryBackend:
+@dataclass
+class RenderPreview:
+    """The render half of a :meth:`SimpleAdmission.preview`: what it refused."""
+
+    unrenderable: set[str]
+    errors: list[str]
+
+
+class SimpleAdmission:
+    """The admission surface for a backend that neither places nor inspects.
+
+    For in-process backends (the dry-run and test backends): they allocate no
+    GPUs, their :meth:`residency` is what :meth:`observe` reports (each
+    deployment one warm instance), and converge/apply is ``realize`` /
+    ``teardown`` over the rendered set. A subclass that emulates capacity
+    overrides :meth:`plan`; one that emulates render failures overrides
+    :meth:`refuse`. Everything else goes through the one admission path the
+    real backends use.
+    """
+
+    allocates_gpus = False
+    last_preview_digest: str | None = None
+
+    def plan(self, desired: list[Deployment], placement: Any = None):
+        """Which of ``desired`` fit; here, all of them, on no GPU."""
+        from .placement import GpuPlan
+
+        return GpuPlan(assignments={g.id: [] for g in desired})
+
+    def refuse(self, desired: list[Deployment]) -> dict[str, str]:
+        """``{deployment id: reason}`` for what cannot be rendered; none here."""
+        return {}
+
+    def residency(self):
+        from .residency import Container, Residency
+
+        return Residency(by_deployment={
+            gid: (Container(container_id=gid, deployment_id=gid,
+                            state='running', labelled=True),)
+            for gid in sorted(self.observe())
+        })
+
+    def _preview(self, desired: list[Deployment], placement: Any = None):
+        desired = list(desired)
+        plan = self.plan(desired, placement)
+        refused = self.refuse(desired)
+        return plan, RenderPreview(set(refused), [f'{g}: {why}' for g, why in refused.items()])
+
+    def preview(self, desired: list[Deployment], placement: Any = None, *,
+                approve: bool = False):
+        plan, rendered = self._preview(desired, placement)
+        self.last_preview_digest = repr(sorted(
+            (gid, list(gpus)) for gid, gpus in plan.assignments.items()
+            if gid not in rendered.unrenderable))
+        return plan, rendered
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None):
+        """Record the renderable, placed part of ``desired``; ``apply`` realizes it."""
+        desired = list(desired)
+        plan, rendered = self._preview(desired, placement)
+        self.last_errors = list(plan.errors) + list(rendered.errors)
+        self.last_unplaced = {
+            g.id for g in desired
+            if g.id not in plan.assignments or g.id in rendered.unrenderable}
+        self.last_assignments = (dict(plan.assignments)
+                                 if self.allocates_gpus else {})
+        self._rendered = {g.id: g for g in desired if g.id not in self.last_unplaced}
+        known = getattr(self, '_known', {})
+        known.update({g.id: g for g in desired})
+        self._known = known
+        if apply:
+            self.apply()
+
+    def apply(self) -> None:
+        """Realize what the last converge rendered; tear down the rest."""
+        rendered = getattr(self, '_rendered', {})
+        for gid in sorted(self.observe() - set(rendered)):
+            deployment = getattr(self, '_known', {}).get(gid)
+            if deployment is not None:
+                self.teardown(deployment)
+        for gid, deployment in rendered.items():
+            if gid not in self.observe():
+                self.realize(deployment)
+
+    # Set by converge (the controller reads them with a default before then).
+    last_unplaced: set[str]
+    last_errors: list[str]
+    last_assignments: dict[str, list[int]]
+
+    def observe(self) -> set[str]:  # pragma: no cover - provided by the backend
+        raise NotImplementedError
+
+    def realize(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def teardown(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+
+class MemoryBackend(SimpleAdmission):
     """In-memory backend that records calls and has configurable readiness.
 
     Not a real serving backend — it never starts a process. It exists so the
@@ -395,7 +497,7 @@ class MemoryBackend:
             self.ready_overrides[(deployment_id, endpoint)] = ready
 
 
-class NullBackend:
+class NullBackend(SimpleAdmission):
     """A no-op backend that serves nothing — for ``--dry-run`` and ``leases``.
 
     It never starts a process. ``observe`` returns the empty set, so the

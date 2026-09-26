@@ -281,25 +281,16 @@ def test_publish_on_a_fresh_ledger_that_does_not_complete_stores_nothing(tmp_pat
     assert ledger.publication_pending() is None
 
 
-def test_a_declined_recovery_render_keeps_the_crashed_acquires_scope(tmp_path):
-    from infer_stack.leasing.backend import ConvergeAborted
-
+def test_a_stale_scope_from_pre_admission_code_is_dropped(tmp_path):
+    """No render needs a crashed legacy acquire's scope: its row stays
+    unresolved (see above), so the next change simply clears it."""
     a = Catalog.from_dict(cat('alpha'))
     ledger, ctl = controller(tmp_path, catalog=a)
     ctl.gc()
     ledger.mark_publication_pending(apply_requested=True,
                                     placement_context={'allowed_gpus': [3]})
-    ledger.acquire('x', a.resolve_names(['alpha']))
-    _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
-
-    def decline(planned):
-        raise ConvergeAborted('no')
-
-    ctl2.backend._approve_changes = decline
-    with pytest.raises(ConvergeAborted):
-        ctl2.gc()
-    assert ledger.publication_pending()['placement_context'] == {'allowed_gpus': [3]}
-
+    ctl.acquire('x', a.resolve_names(['alpha']), wait=False, apply=False)
+    assert ledger.publication_pending()['placement_context'] is None
 
 def test_cli_catalog_edit_then_acquire_needs_no_publish_step(tmp_path, monkeypatch):
     from infer_stack.cli import commands_leasing as cl
