@@ -1826,7 +1826,7 @@ def test_log_target_resolves_the_engines_sentinel_to_service_names():
             from infer_stack.tui import NO_LOG_TARGET
             app._last_instances = [Instance('litellm', 'c0', '', 'running')]
             target, label = app._resolve_log_target(ENGINE_SERVICES)
-            assert target is NO_LOG_TARGET and 'no engines' in label
+            assert target is NO_LOG_TARGET and 'no engines running' in label
 
     _run(scenario)
 
@@ -2244,5 +2244,32 @@ def test_the_api_tab_never_shows_the_master_key():
             app._copy = lambda text: copied.append(text) or True
             app.action_api_copy_curl()
             assert copied and 'sk-secret-key' in copied[0]
+
+    _run(scenario)
+
+
+def test_colored_engine_output_reads_cleanly_in_the_logs_pane():
+    """vLLM colors its "(APIServer pid=1)" prefix; the escape codes used to
+    garble the line in the pane."""
+    from textual.widgets import RichLog
+
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            from textual.widgets import Collapsible
+
+            app.query_one('#docker', Collapsible).collapsed = False
+            await pilot.pause()
+            app._write_log_lines(['\x1b[1;36m(APIServer pid=1)\x1b[0;0m INFO engines: model loaded'])
+            await pilot.pause()
+            text = '\n'.join(strip.text for strip in app.query_one('#logs', RichLog).lines)
+            assert '(APIServer pid=1) INFO engines: model loaded' in text
+            assert '\x1b' not in text and '[1;36m' not in text
 
     _run(scenario)

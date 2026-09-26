@@ -241,6 +241,10 @@ dry-run root.
       its example curl. The pane now reads it at run time
       (`$(infer-stack env LITELLM_MASTER_KEY)`); Copy curl copies the
       literal key. The UI tab said "docker observe interval".
+- [x] TUI: a refused runtime command showed as a `CalledProcessError`
+      repr full of paths (same fix as the CLI's), and colored engine output
+      (vLLM's `(APIServer pid=1)`) was garbled in the logs pane. Checked on
+      kubeai at 80x24: acquire, the pod's log, release-all, from the TUI.
 
 ### 10. [ ] Handover
 

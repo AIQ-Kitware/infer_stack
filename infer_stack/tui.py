@@ -160,6 +160,18 @@ SELECT_BLANK = next(
 )
 
 
+def _why(ex: BaseException) -> str:
+    """A failure for the status line: a refused runtime command the way the
+    CLI says it (its words, a hint), anything else as it reads."""
+    import subprocess
+
+    if isinstance(ex, subprocess.CalledProcessError):
+        from .cli import runtime_failure
+
+        return ' — '.join(line.strip() for line in runtime_failure(ex).splitlines())
+    return str(ex)
+
+
 def _select_is_blank(value: object) -> bool:
     return value is SELECT_BLANK
 
@@ -2140,7 +2152,7 @@ class InferStackTUI(App):
             names = self._engine_names()
             if not names:
                 return NO_LOG_TARGET, (
-                    'no engines running yet; choose (everything) '
+                    'no engines running; choose (everything) '
                     'for the gateway')
             return names, f'engines: {", ".join(names)}'
         if not service:
@@ -2202,7 +2214,12 @@ class InferStackTUI(App):
         self._log_lines.extend(lines)
         if len(self._log_lines) > 2 * LOG_PANE_LINES:
             del self._log_lines[:-LOG_PANE_LINES]
-        self.query_one('#logs', RichLog).write('\n'.join(lines))
+        # Engines color their output (vLLM's "(APIServer pid=1)" prefix): as
+        # a plain string the escape codes garbled the line; as ANSI they are
+        # colors, and _log_lines keeps the raw text for search and copy.
+        from rich.text import Text
+
+        self.query_one('#logs', RichLog).write(Text.from_ansi('\n'.join(lines)))
 
     def _drain_logs(self) -> None:
         """Draw streamed lines: a bounded batch per tick, newest lines kept."""
@@ -2759,7 +2776,7 @@ class InferStackTUI(App):
             msg = ('apply done' if not rec.publication_pending
                    else 'apply did not fully take effect; still pending')
         except Exception as ex:  # noqa: BLE001
-            msg = f'apply failed: {ex}'
+            msg = f'apply failed: {_why(ex)}'
         self._after_mutation(msg)
 
     def action_compose_down(self) -> None:
@@ -2776,7 +2793,7 @@ class InferStackTUI(App):
             self.controller.backend.down()
             msg = 'down done'
         except Exception as ex:  # noqa: BLE001
-            msg = f'down failed: {ex}'
+            msg = f'down failed: {_why(ex)}'
         self._after_mutation(msg)
 
     # -- open in browser ---------------------------------------------------
@@ -3380,7 +3397,7 @@ class InferStackTUI(App):
                 'engine may still be loading'
             )
         except Exception as ex:  # noqa: BLE001
-            msg = f'acquire {name} failed: {ex}'
+            msg = f'acquire {name} failed: {_why(ex)}'
         self.call_from_thread(self._finish_acquire, name, msg)
 
     def _finish_acquire(self, name: str, message: str) -> None:
@@ -3398,7 +3415,7 @@ class InferStackTUI(App):
             self._lease_sel.clear()
             msg = f'released {len(ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
-            msg = f'release failed: {ex}'
+            msg = f'release failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3407,7 +3424,7 @@ class InferStackTUI(App):
             out = self.controller.release_leases(None)
             msg = f'released {len(out.released_lease_ids)} lease(s)'
         except Exception as ex:  # noqa: BLE001
-            msg = f'release --all failed: {ex}'
+            msg = f'release --all failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3424,7 +3441,7 @@ class InferStackTUI(App):
                 msg = (f'none of the {len(ids)} selected were idle — '
                        'release their leases first')
         except Exception as ex:  # noqa: BLE001
-            msg = f'evict failed: {ex}'
+            msg = f'evict failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3436,7 +3453,7 @@ class InferStackTUI(App):
             msg = (f'evicted {n} idle deployment(s)' if n
                    else 'no idle deployments to evict')
         except Exception as ex:  # noqa: BLE001
-            msg = f'evict all failed: {ex}'
+            msg = f'evict all failed: {_why(ex)}'
         self._after_mutation(msg)
 
     @work(thread=True, exclusive=True, group='mutate')
@@ -3446,7 +3463,7 @@ class InferStackTUI(App):
             msg = (f'cleaned up {n_leases} released/expired lease(s) + '
                    f'{n_deployments} stopped deployment(s)')
         except Exception as ex:  # noqa: BLE001
-            msg = f'cleanup failed: {ex}'
+            msg = f'cleanup failed: {_why(ex)}'
         self._after_mutation(msg)
 
     def _after_mutation(self, message: str) -> None:
