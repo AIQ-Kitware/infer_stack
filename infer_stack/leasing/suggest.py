@@ -379,6 +379,28 @@ def derive_runtime(
     return runtime
 
 
+#: A simulator endpoint for a host without a GPU (``catalog suggest
+#: --simulator``): llm-d-inference-sim answers like vLLM with random text, so
+#: the whole workflow (acquire, the gateway, a request, release) runs here.
+#: Never a result. The same entry as dev/e2e_tests/catalog-mock.yaml's.
+SIMULATOR_FRAGMENT: dict[str, Any] = {
+    'models': {'smol135': {'source': 'hf://HuggingFaceTB/SmolLM2-135M-Instruct'}},
+    'endpoints': {'mock-smol': {
+        'engine': 'vllm',
+        'model': 'smol135',
+        'runtime': {
+            'image': 'ghcr.io/llm-d/llm-d-inference-sim:v0.9.0',
+            'max_model_len': 2048,
+            'max_num_seqs': 8,
+            'simulator': {'kind': 'llm-d-sim', 'mode': 'random', 'seed': 20260731,
+                          'time_to_first_token': '120ms',
+                          'inter_token_latency': '8ms', 'startup_duration': '10s'},
+        },
+        'reclaim': {'policy': 'stop'},
+    }},
+}
+
+
 # ---------------------------------------------------------------------------
 # the top-level pure function
 # ---------------------------------------------------------------------------

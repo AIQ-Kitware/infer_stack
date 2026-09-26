@@ -295,6 +295,12 @@ class CatalogSuggestCLI(
         help='Whose hardware (default: the configured `backend` setting): this '
         "host's GPUs, or on kubeai the cluster's.",
     )
+    simulator = kw.Value(
+        False, isflag=True,
+        help='Suggest a simulator endpoint instead (`mock-smol`): it answers '
+        "like vLLM with random text and needs no GPU, to try infer-stack's "
+        'workflow on any host. Never for results.',
+    )
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -308,6 +314,13 @@ class CatalogSuggestCLI(
         from .context import effective_inventory
 
         config = cls.cli(argv=argv, data=kwargs)
+        if config.simulator:
+            import copy
+
+            from ..leasing.suggest import SIMULATOR_FRAGMENT
+
+            return _merge_or_print(config, copy.deepcopy(SIMULATOR_FRAGMENT),
+                                   'a simulator: no GPU needed, random text, never results')
         profiles: dict = {}
         cluster = (config.backend or get_setting('backend')) == 'kubeai'
         inventory = effective_inventory(config)
@@ -350,7 +363,10 @@ class CatalogSuggestCLI(
             print(
                 f'no pooled model fits the detected hardware ({hw}). '
                 'Pass --simulate-hardware NxM to plan for a bigger box, or add '
-                'models by hand with `catalog model add`.',
+                'models by hand with `catalog model add`.'
+                + ('' if gpus else ' With no GPU here, `infer-stack catalog suggest '
+                   '--simulator --apply` adds an endpoint that answers like vLLM '
+                   '(random text), to try the workflow.'),
                 file=sys.stderr,
             )
             return 0
@@ -404,6 +420,32 @@ class CatalogSuggestCLI(
                   'values, then `scripts/install_kubeai.sh <values>`):')
             print(values, end='')
         return 0
+
+
+def _merge_or_print(config, frag: dict, what: str) -> int:
+    """Print a suggested catalog fragment, or with ``--apply`` merge it."""
+    text = yaml.safe_dump(frag, sort_keys=False, default_flow_style=False)
+    if not config.apply:
+        print(f'# suggested: {what}; re-run with --apply to merge', file=sys.stderr)
+        _print_yaml(text)
+        return 0
+    path = _catalog_path(config)
+    data = _load_raw(path)
+    added, skipped = [], []
+    for section in ('models', 'endpoints'):
+        for name, value in frag[section].items():
+            if name in data[section] and not config.force:
+                skipped.append(f'{section[:-1]}:{name}')
+                continue
+            data[section][name] = value
+            added.append(f'{section[:-1]}:{name}')
+    _save_raw(path, data, dry_run=False)
+    print(f'merged suggestion into {path}  ({what})')
+    if added:
+        print(f'  added: {", ".join(added)}')
+    if skipped:
+        print(f'  kept existing (pass --force to overwrite): {", ".join(skipped)}')
+    return 0
 
 
 class CatalogPathCLI(_PathOverridesMixin):

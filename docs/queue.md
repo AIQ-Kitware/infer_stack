@@ -245,6 +245,14 @@ dry-run root.
       repr full of paths (same fix as the CLI's), and colored engine output
       (vLLM's `(APIServer pid=1)`) was garbled in the logs pane. Checked on
       kubeai at 80x24: acquire, the pod's log, release-all, from the TUI.
+- [x] First run, README literally, on a host with no GPU: `catalog suggest`
+      found nothing and offered only simulated hardware (endpoints that
+      cannot run here), so step 3 had nothing to acquire; `config init`
+      pointed at `catalog init`, not the README's next step. Now `catalog
+      suggest --simulator` adds a simulator endpoint (named in suggest's
+      message when there is no GPU, and in the README), and `config init`
+      points at `suggest`. Checked: init, suggest --simulator --apply,
+      acquire, test, release, from nothing.
 
 ### 10. [ ] Handover
 

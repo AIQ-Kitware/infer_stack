@@ -19,6 +19,10 @@ infer-stack catalog suggest --apply
 infer-stack acquire <endpoint>
 ```
 
+No GPU here? `infer-stack catalog suggest --simulator --apply` adds
+`mock-smol`, a simulator that answers like vLLM with random text, so the same
+three steps run on any host with Docker ([docs/mock-endpoints.md](docs/mock-endpoints.md)).
+
 `settings.yaml` (`infer-stack config …`) and `catalog.yaml` are the user
 configuration. Leasing keeps an
 internal frozen recovery snapshot so a crash cannot re-render committed state

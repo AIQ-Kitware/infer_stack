@@ -494,7 +494,8 @@ class ConfigInitCLI(_PathOverridesMixin):
         base.update(values)
         save_settings(base)
         print(f'wrote settings -> {path}')
-        print('next: `infer-stack catalog init` to add models/endpoints')
+        print('next: `infer-stack catalog suggest --apply` (a catalog sized to this '
+              "host's GPUs), then `infer-stack acquire <endpoint>`")
         return 0
 
 

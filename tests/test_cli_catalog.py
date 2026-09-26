@@ -382,3 +382,13 @@ def test_suggest_no_fit_writes_nothing(tmp_path, capsys):
     err = capsys.readouterr().err
     assert 'no pooled model fits' in err
     assert not (tmp_path / 'catalog.yaml').exists()
+
+
+def test_suggest_simulator_gives_a_gpu_free_first_run(tmp_path):
+    """On a host without a GPU the documented first run dead-ended; the
+    simulator endpoint makes the same steps run anywhere."""
+    CatalogInitCLI.main(argv=_opts(tmp_path))
+    assert CatalogSuggestCLI.main(argv=[*_opts(tmp_path), '--simulator', '--apply']) == 0
+    cat = Catalog.load(cat_path(tmp_path))
+    (request,) = cat.resolve_names(['mock-smol'])
+    assert request.spec['runtime']['simulator']['kind'] == 'llm-d-sim'
