@@ -4,6 +4,7 @@
 `dev/backend-unification` · **P1a done** 2026-09-25 · P1b–P5 not started ·
 P6 is ongoing.
 **Current state:** [../backend-parity.md](../backend-parity.md).
+**Execution order:** [../queue.md](../queue.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
 2026-09-24 audit (`dev/tmp/plan-backend-unification-2026-09-24.md`).
