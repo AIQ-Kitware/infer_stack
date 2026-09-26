@@ -44,7 +44,7 @@ queue-semantics tests still assert the same behaviour.
 
 ### 3. [x] P2: day-2 commands and the TUI through the backend
 
-Done 2026-09-26.
+Done 2026-09-26, `c2d393b`.
 
 `instances()` and `stream_logs(target, *, follow, tail)` on both backends;
 `ps`, `logs`, `stack up` / `stack down` use them, the raw compose form
