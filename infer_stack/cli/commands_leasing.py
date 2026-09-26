@@ -2203,12 +2203,15 @@ def _gateway_state(config) -> tuple[Path, str]:
     """
     from ..config import DEFAULT_PORTS
 
+    from ..leasing.gateway import front_door_urls
+
     try:
-        front = getattr(_make_backend(config), 'front_door', lambda: None)()
+        backend = _make_backend(config)
     except Exception:  # noqa: BLE001 - a lookup must not fail on the backend
-        front = None
-    if front is not None and getattr(front, 'litellm', False):
-        return front.gateway._env_path, f'{front.gateway._gateway_base()}/v1'
+        backend = None
+    base_url, _ = front_door_urls(backend)
+    if backend is not None and base_url is not None:
+        return backend.front_door().gateway._env_path, base_url
     return (data_root() / 'leasing' / 'compose' / '.env',
             f'http://127.0.0.1:{DEFAULT_PORTS["litellm"]}/v1')
 

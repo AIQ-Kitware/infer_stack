@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -95,6 +95,9 @@ NO_LOG_TARGET = object()
 # candidate that is an actual sentinel object rather than a bool.
 #: Title of the tab that shows what the TUI itself did, and its errors.
 APP_LOG_TAB_TITLE = 'TUI log'
+# The top-level tabs, in order: keys 1-5 and the command palette reach them.
+TOP_TABS = (('Dashboard', 'tab-dashboard'), ('API', 'tab-api'), ('TUI settings', 'tab-ui'),
+            ('Settings', 'tab-settings'), (APP_LOG_TAB_TITLE, 'tab-applog'))
 
 #: The docker log pane shows at most this many lines (RichLog ``max_lines``).
 LOG_PANE_LINES = 2000
@@ -866,6 +869,9 @@ class InferStackTUI(App):
         Binding('minus', 'logs_shorter', 'logs -', show=False),
         Binding('plus', 'logs_taller', 'logs +', show=False),
         Binding('equals_sign', 'logs_taller', 'logs +', show=False),
+        # A focused Input takes digits first, so these never eat typing.
+        *(Binding(str(i), f"show_tab('{pane}')", label, show=False)
+          for i, (label, pane) in enumerate(TOP_TABS, 1)),
     ]
 
     def __init__(
@@ -887,7 +893,7 @@ class InferStackTUI(App):
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
-        # Two cadences (see the UI tab): the ledger is cheap in-memory state, so
+        # Two cadences (see the TUI settings tab): the ledger is cheap in-memory state, so
         # it drives the visible refresh; ``observe()``/``plan()`` shell out to
         # docker, so they run on a slower beat and their result is cached between
         # ledger ticks. Persisted UI prefs (tui_settings.yaml) override the
@@ -961,6 +967,8 @@ class InferStackTUI(App):
         self._app_log_errors = 0
         self._api_lines: list[str] = []  # mirror of the API output, for tests
         self._sidebar_w = 38  # resizable via [ ] or dragging #vsplit
+        # Follows the terminal's width (see _auto_sidebar) until resized by hand.
+        self._sidebar_set = False
         self._log_h = 16      # resizable via - + or dragging #hsplit
         self._models_h = 8    # resizable by dragging #csplit
         self._leases_h = 14   # resizable by dragging #tsplit
@@ -991,7 +999,7 @@ class InferStackTUI(App):
             # Hidden at launch: built right after the first frame, not before.
             with TabPane('API', id='tab-api'):
                 yield Lazy(_Section(self._compose_api, id='section-api'))
-            with TabPane('UI', id='tab-ui'):
+            with TabPane('TUI settings', id='tab-ui'):
                 yield Lazy(_Section(self._compose_ui_settings, id='section-ui'))
             with TabPane('Settings', id='tab-settings'):
                 yield Lazy(_Section(self._compose_settings, id='section-settings'))
@@ -1453,8 +1461,23 @@ class InferStackTUI(App):
     #: Below this many rows the pane descriptions give way to tables and logs.
     COMPACT_ROWS = 32
 
+    @staticmethod
+    def _auto_sidebar(columns: int) -> int:
+        """The catalog sidebar's width before anyone drags it.
+
+        38 fits an 80-column terminal beside the tables; a wide terminal gives
+        the catalog's columns room instead of truncating them next to empty
+        space.
+
+        >>> [InferStackTUI._auto_sidebar(c) for c in (80, 120, 160, 200, 300)]
+        [38, 40, 53, 64, 64]
+        """
+        return max(38, min(64, columns // 3))
+
     def on_resize(self, event: events.Resize) -> None:
         self.set_class(event.size.height < self.COMPACT_ROWS, 'compact')
+        if not self._sidebar_set:
+            self._sidebar_w = self._auto_sidebar(event.size.width)
         try:
             self._apply_sizes()
         except Exception:  # noqa: BLE001 - not mounted yet
@@ -1473,6 +1496,7 @@ class InferStackTUI(App):
         # Allow the full width range (down to a sliver, up to nearly all of it),
         # not just the middle — clamp against the actual terminal width.
         hi = max(20, self.size.width - 12)
+        self._sidebar_set = True
         self._sidebar_w = max(10, min(hi, self._sidebar_w + delta))
         self._apply_sizes()
 
@@ -1771,7 +1795,7 @@ class InferStackTUI(App):
 
     def _apply_poll_settings(self) -> None:
         """Restart the refresh timer at the current ledger cadence and force the
-        next observe to run, so changes from the UI tab take effect at once."""
+        next observe to run, so changes from the TUI settings tab take effect at once."""
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
         self._refresh_timer = self.set_interval(
@@ -2301,6 +2325,25 @@ class InferStackTUI(App):
             if self._app_log_errors else APP_LOG_TAB_TITLE
         )
 
+    def action_show_tab(self, pane: str) -> None:
+        """Bring a top-level tab to the front (keys 1-5, the palette)."""
+        if pane == 'tab-applog':
+            self.action_show_app_log()
+            return
+        from textual.widgets._tabbed_content import ContentTabs
+
+        top = self.query_one('#top', TabbedContent)
+        top.active = pane
+        # Focus the tab bar, as action_show_app_log focuses its log: a table
+        # still focused on the dashboard would pull the dashboard back.
+        top.query_one(ContentTabs).focus()
+
+    def get_system_commands(self, screen):
+        yield from super().get_system_commands(screen)
+        for i, (label, pane) in enumerate(TOP_TABS, 1):
+            yield SystemCommand(f'Go to {label}', f'Show the {label} tab (key {i})',
+                                lambda pane=pane: self.action_show_tab(pane))
+
     def action_show_app_log(self) -> None:
         """Jump to the TUI log (what the status line and the toast point at)."""
         self.query_one('#top', TabbedContent).active = 'tab-applog'
@@ -2693,7 +2736,7 @@ class InferStackTUI(App):
                 f'{self.observe_interval:g}s → {path}'
             )
         except Exception as ex:  # noqa: BLE001
-            self._status(f'save UI settings failed: {ex}')
+            self._status(f'save TUI settings failed: {ex}')
 
     def _on_save_settings(self) -> None:
         from .paths import load_settings, save_settings
@@ -2807,8 +2850,8 @@ class InferStackTUI(App):
         return f'{base}/?models={endpoint}' if base else None
 
     def _openwebui_url(self) -> str | None:
-        port = getattr(self.controller.backend, 'ui_port', None)
-        return f'http://localhost:{port}' if port else None
+        from .leasing.gateway import front_door_urls
+        return front_door_urls(self.controller.backend)[1]
 
     def _served_endpoints(self) -> set[str]:
         try:
@@ -3146,9 +3189,12 @@ class InferStackTUI(App):
     # -- API tester --------------------------------------------------------
 
     def _litellm(self) -> tuple[str | None, str | None]:
+        """``(OpenAI base URL ending in /v1, master key)``: what `env` prints."""
+        from .leasing.gateway import front_door_urls
+
         backend = self.controller.backend
-        port = getattr(backend, 'litellm_port', None)
-        if not port:
+        base, _ = front_door_urls(backend)
+        if not base:
             return None, None
         key = None
         mk = getattr(backend, 'master_key', None)
@@ -3156,7 +3202,7 @@ class InferStackTUI(App):
             key = mk() if callable(mk) else None
         except Exception:  # noqa: BLE001
             key = None
-        return f'http://localhost:{port}', key
+        return base, key
 
     def _http_client(self) -> Any:
         if self._http is not None:
@@ -3216,11 +3262,11 @@ class InferStackTUI(App):
             raise RuntimeError('no LiteLLM gateway (needs the compose backend)')
         headers = {'Authorization': f'Bearer {key}'} if key else {}
         if self._protocol_for(model) == 'completions':
-            url = f'{base}/v1/completions'
+            url = f'{base}/completions'
             body = {'model': model, 'prompt': prompt,
                     'max_tokens': 128, 'temperature': 0}
         else:
-            url = f'{base}/v1/chat/completions'
+            url = f'{base}/chat/completions'
             body = {'model': model,
                     'messages': [{'role': 'user', 'content': prompt}],
                     'max_tokens': 128, 'temperature': 0}
@@ -3249,13 +3295,13 @@ class InferStackTUI(App):
         else:
             auth = ''
         if self._protocol_for(model) == 'completions':
-            path = '/v1/completions'
+            path = '/completions'
             body = _json.dumps({
                 'model': model or '<model>',
                 'prompt': prompt or 'hello',
             })
         else:
-            path = '/v1/chat/completions'
+            path = '/chat/completions'
             body = _json.dumps({
                 'model': model or '<model>',
                 'messages': [{'role': 'user', 'content': prompt or 'hello'}],
@@ -3270,7 +3316,7 @@ class InferStackTUI(App):
         ui = self._openwebui_url()
         parts = []
         if base:
-            parts.append(f'gateway: {base}/v1')
+            parts.append(f'gateway: {base}')
         if ui:
             parts.append(f'open webui: {ui}')
         text = '   ·   '.join(parts) or '(acquire a model to get a gateway URL)'
@@ -3364,7 +3410,7 @@ class InferStackTUI(App):
         try:
             headers = {'Authorization': f'Bearer {key}'} if key else {}
             resp = self._http_client().get(
-                f'{base}/v1/models', headers=headers, timeout=30)
+                f'{base}/models', headers=headers, timeout=30)
             self._raise_for_body(resp)
             ids = [m.get('id') for m in (resp.json().get('data') or [])]
             self.call_from_thread(

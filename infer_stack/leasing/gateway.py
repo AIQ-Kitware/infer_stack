@@ -1232,6 +1232,25 @@ class Gateway(ConvergeScaffold):
                 )
         return merged
 
+    def urls(self) -> tuple[str | None, str | None]:
+        """``(OpenAI base URL, Open WebUI URL)``; ``None`` for one that is off.
+
+        The one derivation of where a client goes: the env-file descriptor,
+        ``env``, ``test`` and the TUI all read it (see :func:`front_door_urls`).
+
+        >>> import tempfile
+        >>> gw = Gateway(tempfile.mkdtemp(), ports={'litellm': 14042, 'open_webui': 13000},
+        ...              litellm=True, ui=True)
+        >>> gw.urls()
+        ('http://127.0.0.1:14042/v1', 'http://127.0.0.1:13000')
+        >>> Gateway(tempfile.mkdtemp(), litellm=True, ui=False,
+        ...         base_url='http://10.0.0.5:30442/').urls()
+        ('http://10.0.0.5:30442/v1', None)
+        """
+        base = f'{self._gateway_base()}/v1' if self.litellm else None
+        ui = f'http://127.0.0.1:{self.ui_port}' if self.ui else None
+        return base, ui
+
     def _gateway_base(self) -> str:
         where = self.base_url
         if where is None:
@@ -1449,18 +1468,17 @@ class Gateway(ConvergeScaffold):
         single base URL, but a managed Open WebUI (if on) is still a useful
         access point, so report just its URL rather than ``None``.
         """
-        if not self.litellm:
-            if self.ui:
-                return {'ui_url': f'http://127.0.0.1:{self.ui_port}'}
-            return None
+        base_url, ui_url = self.urls()
+        if base_url is None:
+            return {'ui_url': ui_url} if ui_url else None
         info: dict[str, Any] = {
-            'base_url': f'{self._gateway_base()}/v1',
+            'base_url': base_url,
             'api_key_env': API_KEY_ENV,
             'api_key': self.master_key(),
             'request_names': {ep: ep for ep in endpoints},
         }
-        if self.ui:
-            info['ui_url'] = f'http://127.0.0.1:{self.ui_port}'
+        if ui_url:
+            info['ui_url'] = ui_url
         if self.reverse_proxy:
             # The unified front door: one origin, UI at / and the API at /v1.
             info['proxy_url'] = f'http://127.0.0.1:{self.reverse_proxy_port}'
@@ -1474,3 +1492,23 @@ class Gateway(ConvergeScaffold):
         for w in warnings:
             logger.warning('  route registry: {}', w)
         return merged
+
+
+def front_door_urls(backend) -> tuple[str | None, str | None]:
+    """``(OpenAI base URL, Open WebUI URL)`` of ``backend``'s front door.
+
+    Whatever holds the gateway answers: the compose project itself, or on
+    kubeai the gateway on this host or in the cluster. ``(None, None)`` for a
+    backend with no gateway, or when asking fails (the cluster's node address
+    is read with kubectl): a URL lookup must not fail its caller.
+
+    >>> from infer_stack.leasing import NullBackend
+    >>> front_door_urls(NullBackend())
+    (None, None)
+    """
+    try:
+        front = getattr(backend, 'front_door', lambda: None)()
+        gateway = getattr(front, 'gateway', None)
+        return gateway.urls() if gateway is not None else (None, None)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None, None

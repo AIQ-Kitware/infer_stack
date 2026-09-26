@@ -31,6 +31,19 @@ def _ctx():
     return controller, catalog
 
 
+def _front(backend, litellm_port=14042, ui_port=None):
+    """Give a NullBackend a gateway front door at these ports."""
+    import tempfile
+
+    from infer_stack.leasing.gateway import Gateway
+
+    ports = {'litellm': litellm_port or 0, 'open_webui': ui_port or 0}
+    gateway = Gateway(tempfile.mkdtemp(), ports=ports,
+                      litellm=bool(litellm_port), ui=bool(ui_port))
+    backend.front_door = lambda: type('Front', (), {'gateway': gateway})()
+    backend.master_key = lambda: 'sk-test'
+
+
 class _FakeProc:
     """Stands in for a `docker compose logs -f` process."""
 
@@ -1000,9 +1013,9 @@ def test_tui_open_builds_openwebui_url():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.ui_port = 13000
+            _front(controller.backend, None, 13000)
             assert app._ui_url('qwen-coder') == (
-                'http://localhost:13000/?models=qwen-coder'
+                'http://127.0.0.1:13000/?models=qwen-coder'
             )
 
     _run(scenario)
@@ -1037,7 +1050,7 @@ def test_tui_api_tester_sends_via_injected_http():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             # only ready (running) models are offered; simulate one being ready
             app._sync_api_models(['qwen-coder'])
             assert app.query_one('#api-model', Select).value == 'qwen-coder'
@@ -1078,7 +1091,7 @@ def test_tui_api_send_surfaces_http_error_body():
                             proc_factory=lambda svc: None, http=_HTTP())
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['qwen-coder'])
             assert app.query_one('#api-model', Select).value == 'qwen-coder'
             app.action_api_send()
@@ -1101,8 +1114,7 @@ def test_tui_api_urls_render_without_markup_error():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
-            controller.backend.ui_port = 13000
+            _front(controller.backend, 14042, 13000)
             app._update_api_urls()
             await pilot.pause()
             text = str(app.query_one('#api-urls').render())  # must not raise
@@ -1135,7 +1147,7 @@ def test_tui_api_list_models_and_curl():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['qwen-coder'])
             app._update_api_curl()
             curl = str(app.query_one('#api-curl').render())
@@ -1192,7 +1204,7 @@ def test_tui_api_tester_respects_completions_protocol():
                             proc_factory=lambda svc: None, http=http)
         async with app.run_test() as pilot:
             await pilot.pause()
-            controller.backend.litellm_port = 14042
+            _front(controller.backend, 14042)
             app._sync_api_models(['legacy-completions'])
             assert app.query_one('#api-model', Select).value == 'legacy-completions'
             # curl preview reflects the completions surface
@@ -2236,7 +2248,7 @@ def test_the_api_tab_never_shows_the_master_key():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._litellm = lambda: ('http://localhost:14042', 'sk-secret-key')
+            app._litellm = lambda: ('http://127.0.0.1:14042/v1', 'sk-secret-key')
             app._sync_api_models(['qwen-coder'])
             app._update_api_curl()
             shown = str(app.query_one('#api-curl').render())
@@ -2273,5 +2285,53 @@ def test_colored_engine_output_reads_cleanly_in_the_logs_pane():
             text = '\n'.join(strip.text for strip in app.query_one('#logs', RichLog).lines)
             assert '(APIServer pid=1) INFO engines: model loaded' in text
             assert '\x1b' not in text and '[1;36m' not in text
+
+    _run(scenario)
+
+
+def test_tui_sidebar_follows_terminal_width_until_resized_by_hand():
+    # Pass 5 of the UX audit: at 200 columns the catalog sidebar stayed 38
+    # wide and cut its gpu column to "aut" beside 160 columns of empty table.
+    from infer_stack.tui import InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.pause()
+            assert app.query_one('#sidebar').size.width == 64
+            await pilot.press('right_square_bracket')
+            await pilot.pause()
+            assert app._sidebar_w == 68
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            assert app._sidebar_w == 68          # a hand-set width is kept
+
+    _run(scenario)
+
+
+def test_tui_number_keys_and_palette_reach_every_top_tab():
+    # Pass 5 of the UX audit: API, UI and Settings were reachable only by
+    # mouse or by tabbing into the tab bar; the palette knew none of them.
+    from textual.widgets import TabbedContent
+
+    from infer_stack.tui import TOP_TABS, InferStackTUI
+
+    controller, catalog = _ctx()
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999,
+                            proc_factory=lambda svc: None)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            top = app.query_one('#top', TabbedContent)
+            for i, (_, pane) in reversed(list(enumerate(TOP_TABS, 1))):
+                await pilot.press(str(i))
+                await pilot.pause()
+                assert top.active == pane
+            titles = [c.title for c in app.get_system_commands(app.screen)]
+            assert {f'Go to {label}' for label, _ in TOP_TABS} <= set(titles)
 
     _run(scenario)

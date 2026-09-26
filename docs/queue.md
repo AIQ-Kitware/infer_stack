@@ -304,6 +304,23 @@ Audit pass 5 (2026-09-26): `dev/ux_audit.sh` on both backends.
       lines on kubeai no longer trip the Compose-wording check: that gateway
       is a Compose project and needs it.
 
+Pass 5, the TUI by eye (compose, 80x24 and 200x50):
+
+- [x] At 200 columns the catalog sidebar stayed 38 wide and cut its gpu
+      column to "aut" beside an empty 160-column table. It now follows the
+      terminal (38 up to 64 columns) until resized by hand.
+- [x] API, UI and Settings were reachable only by mouse or by tabbing into
+      the tab bar; the command palette found none of them. Keys 1-5 and
+      "Go to <tab>" palette entries now reach every top tab.
+- [x] The API tab showed `http://localhost:14042/v1` while `env` and `test`
+      say `127.0.0.1`: the TUI derived the gateway and Open WebUI URLs from
+      the backend's ports itself, which is wrong for the in-cluster gateway
+      (a node's NodePort) and found no Open WebUI on kubeai. A duplicate
+      authority; now `Gateway.urls()` is the one derivation, and the env
+      file, `env`, `test` and the TUI all read it through the front door.
+- [x] The tab named "UI" held the TUI's own refresh settings, beside "open
+      webui" everywhere else. Renamed "TUI settings", like "TUI log".
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover
