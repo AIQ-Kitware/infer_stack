@@ -1143,3 +1143,15 @@ def test_doctor_checks_the_host_gateways_docker_too(tmp_path):
     names = [name for name, ok, _ in be.doctor()]
     assert 'gateway: docker daemon reachable' in names
     assert not any('image vllm' in n or 'GPUs visible' in n for n in names)
+
+
+def test_the_host_gateways_unverified_routes_leave_the_apply_incomplete(tmp_path):
+    """KubeAI's apply used to drop its gateway's result: a publication whose
+    routes did not verify was cleared as complete (queue item 15)."""
+    from infer_stack.leasing.backend import ApplyResult
+
+    be, _ = make_gateway_backend(tmp_path)
+    be.converge([vllm('grp-a', served='a')], apply=False)
+    be.gateway.apply = lambda: ApplyResult(routes=False, detail='routes not verified')
+    outcome = be.apply()
+    assert outcome.runtime and not outcome.routes and not outcome.complete

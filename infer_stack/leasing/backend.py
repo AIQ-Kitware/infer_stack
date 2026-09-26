@@ -44,6 +44,45 @@ class Readiness:
     needs_room: bool = False
 
 
+@dataclass(frozen=True)
+class ApplyResult:
+    """How far an apply got: the runtime, then the gateway's routes.
+
+    A publication is complete only when both hold. ``runtime`` false: the
+    runtime was not brought to the render (an unreadable render, a render
+    from before fingerprints). ``routes`` false: the runtime reached the
+    render but the gateway's routes (dynamic routing) were not verified. In
+    either case the publication stays pending, and so does the approval of
+    the render it is applying. Failures raise instead; this is for the
+    outcomes that are not errors.
+
+    >>> ApplyResult.of(None).complete, ApplyResult.of(False).runtime
+    (True, False)
+    >>> ApplyResult(routes=False).complete
+    False
+    """
+
+    runtime: bool = True
+    routes: bool = True
+    detail: str = ''
+
+    @property
+    def complete(self) -> bool:
+        return self.runtime and self.routes
+
+    @classmethod
+    def of(cls, value: ApplyResult | bool | None) -> ApplyResult:
+        """An apply's return value as a result; ``None``/``True`` is complete."""
+        if isinstance(value, ApplyResult):
+            return value
+        return cls() if value is not False else cls(runtime=False)
+
+    def __and__(self, other: ApplyResult) -> ApplyResult:
+        """Both parts of one apply (KubeAI's Models, then its gateway)."""
+        return ApplyResult(self.runtime and other.runtime, self.routes and other.routes,
+                           '; '.join(d for d in (self.detail, other.detail) if d))
+
+
 class BackendTimeout(RuntimeError):
     """A backend command exceeded its time bound and was killed.
 
@@ -204,12 +243,14 @@ class ServingBackend(Protocol):
         """Render the desired set to backend state; optionally apply it."""
         ...
 
-    def apply(self) -> bool | None:
+    def apply(self) -> ApplyResult | bool | None:
         """Converge reality to the last render (idempotent, slow half).
 
-        Return ``False`` if the apply did not fully take effect (the controller
-        keeps the change pending and retries); ``True`` or ``None`` otherwise.
-        Raise on backend failure, which also leaves the change pending.
+        Return an :class:`ApplyResult` saying how far it got; ``None`` or
+        ``True`` means complete, ``False`` means the runtime was not reached.
+        The controller keeps the change pending, and its approval, until a
+        complete result. Raise on backend failure, which also leaves the
+        change pending.
         """
         ...
 

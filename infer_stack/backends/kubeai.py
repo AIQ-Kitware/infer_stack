@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 import yaml
 
-from ..leasing.backend import ConvergeScaffold, Readiness
+from ..leasing.backend import ApplyResult, ConvergeScaffold, Readiness
 from ..leasing.compose import dns_slug, vllm_service_dict
 from ..leasing.models import Deployment
 from ..probe import openai_ready
@@ -951,18 +951,19 @@ class KubeaiBackend(ConvergeScaffold):
                 self.gateway = self.gateway_factory(wanted)
             self.gateway.use_profile(front)
 
-    def apply(self) -> None:
-        """Converge the cluster to the last render: apply + prune.
+    def apply(self) -> ApplyResult:
+        """Converge the cluster to the last render: apply + prune, then the gateway.
 
         Reads the on-disk manifest last written by :meth:`converge` (render)
         and applies it — it does NOT re-render (compose parity: the controller
         coalesces applies under its own lock/generation). Then deletes any
         infer-stack-managed Model the render no longer contains. Idempotent.
+        The result includes the gateway's (its routes, with dynamic routing).
         """
         from .._log import logger
 
         if not self.models_file.exists():
-            return
+            return ApplyResult()
         text = self.models_file.read_text()
         wanted = set(self._load_sidecar().get('models') or {})
         if text.strip():
@@ -990,7 +991,8 @@ class KubeaiBackend(ConvergeScaffold):
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
         if self.gateway is not None:
-            self.gateway.apply()
+            return ApplyResult() & ApplyResult.of(self.gateway.apply())
+        return ApplyResult()
 
     def residency(self):
         """The managed Models' pods, strictly: raises rather than guess.

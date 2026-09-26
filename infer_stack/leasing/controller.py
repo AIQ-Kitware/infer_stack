@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
-from .backend import HostRuntime, ServingBackend
+from .backend import ApplyResult, HostRuntime, ServingBackend
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
 
@@ -85,6 +85,8 @@ class ReconcileResult:
     # desired state was staged (--no-apply, render) or its apply did not fully
     # succeed. The next applying operation, or `infer-stack apply`, publishes it.
     publication_pending: bool = False
+    # Whether the runtime reached the render (routes may still be unverified).
+    runtime_applied: bool = False
     # Admission mode: idle keep-warm residents that yielded their GPUs, and
     # LIVE deployments whose committed allocation is no longer valid.
     displaced: list[str] = field(default_factory=list)
@@ -198,6 +200,9 @@ class Controller:
         # Set only by apply_now(): the operator explicitly re-approves a render
         # that differs from an earlier approved digest.
         self._explicit_apply = False
+        # Set when an apply is invoked: whether a failed publication may have
+        # changed the runtime (secret rotation reads it; see rotate_gateway_key).
+        self._apply_began = False
         self._admission_digest: str | None = None
         #: Whether the last refused admission was for lack of GPUs.
         self._admission_capacity = False
@@ -1228,8 +1233,9 @@ class Controller:
         if marker['interrupted']:
             self._wait_for_settled_runtime()
         before = set(self.backend.observe())
+        self._apply_began = True
         try:
-            ok = apply_fn()
+            outcome = ApplyResult.of(apply_fn())
         except BaseException as ex:
             from .compose import ApplyAborted
 
@@ -1240,21 +1246,24 @@ class Controller:
                 apply_requested=True, interrupted=not isinstance(ex, ApplyAborted))
             rec.publication_pending = True
             raise
-        if approved:
-            # The approved render reached Docker; a retry for routes (or any
-            # later change) renders from newer state and needs no re-approval.
-            self.ledger.store.clear_approved_digest()
         after = set(self.backend.observe())
         rec.realized = sorted(set(rec.realized) | (after - before))
         rec.torn_down = sorted(set(rec.torn_down) | (before - after))
         rec.applied = True
-        if ok is False:
+        rec.runtime_applied = outcome.runtime
+        if not outcome.complete:
+            # The publication is not done, so neither is the approval of its
+            # render: a retry re-renders, and a render that drifted (an
+            # upgrade in between) must be approved again, not applied.
             rec.publication_pending = True
             logger.warning(
-                'apply did not fully take effect; the change stays pending and '
-                'the next acquire/release or `infer-stack apply` retries it'
-            )
+                'apply did not fully take effect ({}); the change stays pending and '
+                'the next acquire/release or `infer-stack apply` retries it',
+                outcome.detail or ('routes not verified' if outcome.runtime
+                                   else 'runtime not reached'))
             return rec
+        if approved:
+            self.ledger.store.clear_approved_digest()
         self.ledger.clear_publication_pending(marker['version'])
         rec.publication_pending = False
         return rec

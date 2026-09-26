@@ -466,3 +466,37 @@ def test_a_failed_apply_rollback_drops_the_admission_digest(tmp_path):
     assert ledger.publication_pending()['approved_digest'] is None
     acquire(ctl, 'two')                                          # an ordinary publisher proceeds
     assert ledger.publication_pending() is None
+
+
+def test_a_partial_apply_keeps_the_approval_so_a_drifted_render_is_refused(tmp_path):
+    """Queue item 15: the approved digest outlives an apply that did not finish.
+
+    The first apply reaches the runtime but its routes do not verify, so the
+    publication stays pending. The renderer then changes (an upgrade): an
+    ordinary retry must refuse the unapproved render, and `infer-stack apply`
+    is the deliberate re-approval.
+    """
+    from infer_stack.leasing.backend import ApplyResult, ConvergeScaffold
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, ctl, docker = make(tmp_path)
+    real = ctl.backend.apply
+
+    def partial():
+        real()                                       # the runtime changes...
+        return ApplyResult(routes=False)             # ...its routes do not verify
+
+    ctl.backend.apply = partial
+    acquire(ctl, 'one')
+    approved = ledger.publication_pending()['approved_digest']
+    assert approved and approved == ctl.backend.last_planned_digest
+    assert docker.containers                         # the runtime did change
+
+    ctl.backend.apply = real
+    original = ConvergeScaffold._planned_digest
+    ctl.backend._planned_digest = lambda planned: 'v2-' + original(planned)  # an upgrade
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()                                     # an ordinary retry
+    assert ledger.publication_pending()['approved_digest'] == approved
+    ctl.apply_now()                                  # the explicit re-approval
+    assert ledger.publication_pending() is None

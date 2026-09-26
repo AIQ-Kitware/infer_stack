@@ -51,7 +51,7 @@ from ..config import DEFAULT_PORTS, PINNED_IMAGES, default_state_paths
 from ..env_utils import parse_env_file
 from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
-from .backend import ConvergeScaffold, Readiness
+from .backend import ApplyResult, ConvergeScaffold, Readiness
 from .gateway import (
     LITELLM_CONFIG_FILENAME,
     LITELLM_SERVICE,
@@ -1850,41 +1850,43 @@ class ComposeBackend(ConvergeScaffold):
         self.apply()
         return plan
 
-    def apply(self) -> bool:
-        """Bring the already-rendered compose project up; return whether it fully succeeded.
+    def apply(self) -> ApplyResult:
+        """Bring the already-rendered compose project up; say how far it got.
 
         Reads the on-disk compose file last written by :meth:`converge` (render)
         and applies it -- it does NOT re-render. The controller serialises render
         and apply under its host-wide lock, so the file cannot change underneath
         this call. Idempotent: a no-op when reality already matches the file.
 
-        Returns ``False`` when the apply did not fully take effect, so the
-        controller keeps the change pending and retries it:
+        An incomplete :class:`~infer_stack.leasing.backend.ApplyResult` keeps
+        the change pending, and the controller retries it:
 
-        * the rendered file cannot be read;
-        * in dynamic-routing mode, the gateway's routes could not be reconciled
-          and verified within budget. The budget is short when the gateway was
-          already running (steady state), and long when this apply is bringing
-          it up (bootstrap: it waits on Postgres health and runs DB migrations).
+        * ``runtime`` false: the rendered file cannot be read, or predates
+          fingerprints;
+        * ``routes`` false: in dynamic-routing mode, the gateway's routes could
+          not be reconciled and verified within budget. The budget is short
+          when the gateway was already running (steady state), and long when
+          this apply is bringing it up (bootstrap: it waits on Postgres health
+          and runs DB migrations).
 
         Docker failures and timeouts raise, and leave the change pending too.
         """
         from .._log import logger
 
         if not self.compose_file.exists():
-            return True
+            return ApplyResult()
         try:
             doc = yaml.safe_load(self.compose_file.read_text()) or {}
         except Exception:  # noqa: BLE001 - reported as "not applied", never raised
             logger.warning('apply: rendered compose file is unreadable; change stays pending')
-            return False
+            return ApplyResult(runtime=False, detail='the rendered compose file is unreadable')
         services = doc.get('services') or {}
         sidecar = self._load_sidecar()
         fingerprints = sidecar.get('fingerprints')
         if fingerprints is None or set(fingerprints) != set(services):
             # A render from before fingerprints: re-render (any mutation) first.
             logger.warning('apply: the render predates fingerprints; re-render, then apply')
-            return False
+            return ApplyResult(runtime=False, detail='the render predates fingerprints')
         # A service that runs as a user needs its bind-mount sources made by
         # us, as that user: Docker would make a missing one as root.
         for svc in services.values():
@@ -1902,11 +1904,14 @@ class ComposeBackend(ConvergeScaffold):
             networks=doc.get('networks') or {},
         )
         if dynamic and 'litellm' in services:
-            return self.gateway._reconcile_routes(
+            verified = self.gateway._reconcile_routes(
                 deadline_s=ROUTE_RECONCILE_STEADY_S if 'litellm' in outcome.kept_services
                 else ROUTE_RECONCILE_BOOTSTRAP_S,
             )
-        return True
+            if not verified:
+                return ApplyResult(routes=False,
+                                   detail='the gateway routes were not verified')
+        return ApplyResult()
 
     #: Service-level ownership adopted at migration: container id ->
     #: {service, fingerprint}. Set by the controller from the ledger.

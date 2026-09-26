@@ -559,7 +559,7 @@ request the short resource. Compose returns none, the in-process backends
 all. `_make_room` keeps the policy. Four parity poison tests; three fail on
 the old code.
 
-### 15. [ ] Publication phases: the approved digest outlives a partial apply
+### 15. [x] Publication phases: the approved digest outlives a partial apply
 
 *Why added:* `_apply_pending()` clears the approved-render digest right
 after `apply()` returns, before checking it returned `False`. Compose
@@ -577,6 +577,14 @@ only as far as the phases that differ today.
 runtime and returns partial; the publication is pending with D1; the
 renderer changes to D2; an ordinary retry refuses on the digest mismatch;
 `infer-stack apply` re-approves and applies.
+
+*Done 2026-09-27:* `apply()` returns an `ApplyResult` (`runtime`, `routes`,
+`detail`; `None`/`True`/`False` still map onto it). The controller clears
+the approved digest and the marker only on a complete result. Found on the
+way: KubeAI's `apply` dropped its host gateway's result, so unverified
+routes behind KubeAI cleared the marker; it now returns both. Tests: the
+partial-apply/renderer-drift case (fails on the old controller: the digest
+was gone) and the KubeAI propagation.
 
 ### 16. [ ] Secret rotation is a transaction
 
