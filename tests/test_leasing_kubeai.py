@@ -1121,3 +1121,16 @@ def test_a_render_refusal_is_not_a_capacity_problem(tmp_path):
     with pytest.raises(PlacementError) as ei:
         ctl.acquire('alice', [_req('qwen', profile=None)], wait=False)
     assert ei.value.capacity is False
+
+
+def test_env_and_test_use_the_kubeai_gateways_key(tmp_path, monkeypatch):
+    """They read a hard-coded compose .env, so `test` got 401 on kubeai and
+    `env LITELLM_MASTER_KEY` printed nothing."""
+    from infer_stack.cli import commands_leasing
+
+    be, _ = make_front_door_backend(tmp_path)
+    monkeypatch.setattr(commands_leasing, '_make_backend', lambda config, **kw: be)
+    key = be.master_key()
+    env_path, base = commands_leasing._gateway_state(None)
+    assert env_path == be.gateway.gateway._env_path
+    assert commands_leasing._front_door(None) == (base.rstrip('/'), key)

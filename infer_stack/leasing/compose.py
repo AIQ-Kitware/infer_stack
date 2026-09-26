@@ -1749,7 +1749,8 @@ class ComposeBackend(ConvergeScaffold):
             self.last_displaced = list(plan.displaced)
             self.last_degraded = list(plan.degraded)
             for gid, gpus in sorted(plan.assignments.items()):
-                logger.info('  placed {} on GPU(s) {}', gid, gpus or '(cpu)')
+                logger.info('  placed {} {}', gid,
+                            f'on GPU(s) {gpus}' if gpus else 'without a GPU')
             for err in plan.errors:
                 logger.warning('  placement: {}', err)
             for note in plan.warnings:

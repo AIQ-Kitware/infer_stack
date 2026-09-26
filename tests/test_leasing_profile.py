@@ -570,7 +570,7 @@ def test_env_writes_hold_the_publication_lock(tmp_path, monkeypatch):
             handle.close()
 
     monkeypatch.setattr(cl, 'write_env_file', write)
-    monkeypatch.setattr(cl, '_secret_env_path', lambda: tmp_path / '.env')
+    monkeypatch.setattr(cl, '_secret_env_path', lambda config=None: tmp_path / '.env')
     assert cl.EnvCLI.main(argv=['HF_TOKEN=x']) == 0
     assert held == [True]
 

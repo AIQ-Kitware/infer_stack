@@ -1457,10 +1457,9 @@ class CleanCLI(_LeasingCommonMixin):
                 print(f'  release   {le.id}  owner={le.owner}  '
                       f'{",".join(le.endpoints)}')
             for g in held:
-                gpus = assignments.get(g.id)
                 print(f'  tear down {g.id}  {g.state}'
                       f'{" running" if g.id in observed else ""}'
-                      f'  gpus={gpus if gpus is not None else "-"}'
+                      f'  gpus={_gpu_label(g.id, observed, assignments)}'
                       f'  {",".join(sorted(g.served))}')
             for c in found:
                 print(f'  remove    {c.container_id[:12]}  {c.service or "?"}  '
@@ -1928,8 +1927,26 @@ class RunCLI(_LeasingCommonMixin):
             controller.release(outcome.lease.id)
 
 
-def _lease_ttl(le) -> str:
-    return 'inf' if le.expires_at is None else f'@{le.expires_at:.0f}'
+def _lease_ttl(le, now: float | None = None) -> str:
+    """Time left on a lease, for a person: ``1h59m``, ``12m``, ``expired``.
+
+    >>> from types import SimpleNamespace
+    >>> [_lease_ttl(SimpleNamespace(expires_at=e), now=1000.0)
+    ...  for e in (None, 8140.0, 1720.0, 1045.0, 900.0)]
+    ['inf', '1h59m', '12m', '45s', 'expired']
+    """
+    import time
+
+    if le.expires_at is None:
+        return 'inf'
+    left = le.expires_at - (time.time() if now is None else now)
+    if left <= 0:
+        return 'expired'
+    if left >= 3600:
+        return f'{int(left // 3600)}h{int(left % 3600 // 60):02d}m'
+    if left >= 60:
+        return f'{int(left // 60)}m'
+    return f'{int(left)}s'
 
 
 def _placement_view(controller):
@@ -2176,9 +2193,29 @@ def _postgres_initialised() -> bool:
     return path.is_dir() and any(path.iterdir())
 
 
-def _secret_env_path() -> Path:
-    """The managed compose secrets file (.env that docker compose auto-loads)."""
-    return data_root() / 'leasing' / 'compose' / '.env'
+def _gateway_state(config) -> tuple[Path, str]:
+    """``(managed .env, base URL)`` of the configured backend's gateway.
+
+    The compose stack's own; on kubeai the gateway's, on this host or in the
+    cluster (whose base URL is a node's NodePort). A backend with no gateway
+    falls back to the compose location and the default port. One place, so
+    `env`, `test` and a script built from `env` cannot disagree.
+    """
+    from ..config import DEFAULT_PORTS
+
+    try:
+        front = getattr(_make_backend(config), 'front_door', lambda: None)()
+    except Exception:  # noqa: BLE001 - a lookup must not fail on the backend
+        front = None
+    if front is not None and getattr(front, 'litellm', False):
+        return front.gateway._env_path, f'{front.gateway._gateway_base()}/v1'
+    return (data_root() / 'leasing' / 'compose' / '.env',
+            f'http://127.0.0.1:{DEFAULT_PORTS["litellm"]}/v1')
+
+
+def _secret_env_path(config=None) -> Path:
+    """The gateway's managed secrets file (see :func:`_gateway_state`)."""
+    return _gateway_state(config)[0]
 
 
 def _front_door(config) -> tuple[str, str | None]:
@@ -2188,20 +2225,23 @@ def _front_door(config) -> tuple[str, str | None]:
     `test` is cheap and doesn't need GPU detection or a backend object. An
     explicit ``--base-url`` overrides the derived URL.
     """
-    from ..config import DEFAULT_PORTS
+    from urllib.parse import urlparse
 
+    env_path, derived = _gateway_state(config)
     base_url = getattr(config, 'base_url', None)
     if not base_url:
-        port = int(getattr(config, 'port', None) or DEFAULT_PORTS['litellm'])
-        base_url = f'http://127.0.0.1:{port}/v1'
+        base_url = derived
+        port = getattr(config, 'port', None)
+        if port:
+            base_url = urlparse(derived)._replace(
+                netloc=f'{urlparse(derived).hostname}:{int(port)}').geturl()
     key = None
-    env_path = _secret_env_path()
     if env_path.exists():
         key = parse_env_file(env_path).get('LITELLM_MASTER_KEY')
     return base_url.rstrip('/'), key
 
 
-def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
+def _front_door_env(stored: dict[str, str], config=None) -> dict[str, str]:
     """The front-door values ``env`` answers without them being stored.
 
     A base URL is not a secret and has nothing to be read *out* of: it is
@@ -2226,7 +2266,7 @@ def _front_door_env(stored: dict[str, str]) -> dict[str, str]:
 
     base_url = stored.get('OPENAI_BASE_URL')
     if not base_url:
-        base_url, _ = _front_door(None)
+        base_url, _ = _front_door(config)
     entries = {'OPENAI_BASE_URL': base_url}
     port = urlparse(base_url).port
     if port is not None:
@@ -2425,7 +2465,7 @@ class EnvCLI(_PathOverridesMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        env_path = _secret_env_path()
+        env_path = _secret_env_path(config)
 
         # Write: `env KEY=VALUE`
         if config.arg and '=' in config.arg:
@@ -2475,7 +2515,7 @@ class EnvCLI(_PathOverridesMixin):
         # Read: `env KEY` / `env --export`. A stored value always beats the
         # derived one -- writing the key is how you override the front door.
         env = parse_env_file(env_path) if env_path.exists() else {}
-        derived = _front_door_env(env)
+        derived = _front_door_env(env, config)
         if config.arg:
             if config.arg in env:
                 print(env[config.arg])

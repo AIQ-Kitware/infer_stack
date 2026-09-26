@@ -527,9 +527,16 @@ _LOG_COLORS = ('36', '33', '32', '35', '34', '96', '93', '92', '95', '94')
 
 
 def _colorize(lines, *, enabled: bool):
-    """Color each ``name  | `` prefix, one color per name, like Compose did."""
+    """Color each ``name  | `` prefix, one color per name, like Compose did.
+
+    Disabled (a pipe, a file, ``--no-color``), the engines' own color codes
+    go too: they are noise in a file and break a grep.
+    """
     if not enabled:
-        yield from lines
+        from ..log_filter import _ANSI_ESCAPE_RE
+
+        for line in lines:
+            yield _ANSI_ESCAPE_RE.sub('', line)
         return
     colors: dict[str, str] = {}
     for line in lines:
@@ -629,7 +636,7 @@ class LogsCLI(_InstancesBase):
             text = proc.stdout.decode('utf-8', 'replace')
             lines = [f'{inst.name}  | {ln}\n' if prefix else f'{ln}\n'
                      for ln in text.splitlines()]
-            for line in _colorize(lines, enabled=color and prefix):
+            for line in _colorize(lines, enabled=color):
                 sys.stdout.write(line)
             status = status or proc.returncode
         return int(status)

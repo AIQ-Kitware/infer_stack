@@ -252,3 +252,13 @@ def test_one_followed_instance_needs_no_name_prefix(monkeypatch):
             break
     follower.terminate()
     assert lines == ['first\n', 'second\n']
+
+
+def test_logs_into_a_pipe_drop_the_engines_color_codes(monkeypatch, capsys):
+    import subprocess
+
+    rt = _cli(monkeypatch, _Backend([POD]), {'grp-1': ['qwen']})
+    monkeypatch.setattr(subprocess, 'run', lambda argv, **kw: SimpleNamespace(
+        stdout=b'\x1b[1;36m(APIServer pid=1)\x1b[0;0m INFO ready\n', returncode=0))
+    assert rt.LogsCLI.main(argv=['qwen']) == 0
+    assert capsys.readouterr().out == '(APIServer pid=1) INFO ready\n'

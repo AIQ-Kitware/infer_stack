@@ -259,6 +259,21 @@ dry-run root.
       example's resource profile had no GPU request or runtime class,
       which the README warns makes a pod start without CUDA.
 
+Audit pass 2 (2026-09-26): the day-2 commands swept on both backends with a
+live model each (`leases status ps env doctor clean gc renew routes wait
+test logs`), plus pass 1 again.
+
+- [x] `infer-stack test` failed on kubeai with HTTP 401, and `env
+      LITELLM_MASTER_KEY` read nothing there (and so did the TUI's curl):
+      both read a hard-coded compose `.env`. They now ask the configured
+      backend's gateway for its `.env` and base URL (the in-cluster
+      gateway's NodePort included).
+- [x] `leases` showed a lease's TTL as `ttl=@1790450980`; now `ttl=1h59m`
+      (JSON keeps the timestamp). `clean`'s dry run said `gpus=[]` where
+      `leases` says `cpu`, and converge logged "on GPU(s) (cpu)".
+- [x] `logs` into a pipe or file kept the engines' color codes; with color
+      off they are stripped.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover
