@@ -1,12 +1,13 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **features complete, review hardening
-outstanding**: phases P1-P6 landed 2026-09-26 (P4 and P5 end in a handover
-run on real hardware, `dev/handover/`); a two-part outside review on
-2026-09-26 found replica residency, the backend protocol, scheduler reclaim,
-publication phases, secret rotation, route ordering, coalescing and route
-seeding to fix (queue items 11-22). Execution order: [../queue.md](../queue.md).
+`dev/backend-unification` · **features complete, review hardening done**:
+phases P1-P6 landed 2026-09-26 (P4 and P5 end in a handover run on real
+hardware, `dev/handover/`); a two-part outside review the same day found
+replica residency, the backend protocol, scheduler reclaim, publication
+phases, secret rotation, route ordering, coalescing and route seeding to
+fix, done as queue items 11-22 (verified on k3s; item 21 records why the
+controller was not split). Execution order: [../queue.md](../queue.md).
 **Current state:** [../backend-parity.md](../backend-parity.md).
 **Origin:** the scale-up run needs more than one workstation, and the
 KubeAI backend had drifted from Compose for three months before the
@@ -51,7 +52,7 @@ it is not a sibling with its own habits.
 
 ## Phases
 
-### P0. One contract, one liveness view, one diagnosis — landed, reopened
+### P0. One contract, one liveness view, one diagnosis — done (reopened and closed 2026-09-26)
 
 *Reopened 2026-09-26:* the contract `Controller` is typed against still
 inherits the pre-admission `realize/teardown` protocol and carries Compose

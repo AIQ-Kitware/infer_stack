@@ -756,7 +756,7 @@ optional-hook `getattr(self.backend, ...)` reads that predate this section
 attributes, ...). They could become protocol members with in-process
 defaults, as `front_door` and `route_rows` did here.
 
-### 22. [ ] Docs and full verification
+### 22. [x] Docs and full verification
 
 *Why added:* the parity matrix, roadmap and `known-limitations.md` describe
 the semantics these items change; `known-limitations.md` still says KubeAI
@@ -767,6 +767,14 @@ has no strict residency.
 full suite, `ty`, flake8, and the full k3s e2e.
 
 **Done when:** those pass and the docs match the code.
+
+*Done 2026-09-26:* the parity matrix, the roadmap (principle, authorities,
+status) and `known-limitations.md` describe the new semantics; CHANGELOG
+entry. Verified: the full suite, `ty` and flake8 pass; the full k3s e2e
+(`E2E_SIZED=1 E2E_REMOTE_NODE=1`, dynamic routing and the in-cluster
+gateway on by default, the new replica phase) passed from a frozen copy;
+`dev/ux_audit.sh` reports 0 flags on both backends, and the only non-zero
+exits are its deliberate mistakes.
 
 Also observed while working on these: `test_an_edit_made_outside_the_tui_appears_on_the_next_refresh`
 failed in two of five full-suite runs and never alone. It counted every
