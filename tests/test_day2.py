@@ -156,6 +156,9 @@ def test_status_health_comes_from_residency(monkeypatch):
                                           'crashing': 'exited', 'gone': 'STALE'}
     rows = _served_models([dep('up')], _Backend([], residency=None))
     assert rows[0][3] == 'unverified'
+    # Recorded but not applied yet (an apply is running): not STALE.
+    rows = _served_models([dep('gone')], _Backend([], residency=residency), pending=True)
+    assert rows[0][3] == 'pending'
 
 
 def test_stack_down_stops_the_backend_on_either_backend(monkeypatch):

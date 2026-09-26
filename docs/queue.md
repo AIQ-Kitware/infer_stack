@@ -188,7 +188,9 @@ Seed findings, already known:
       `--no-color` works. Found by the README rewrite 2026-09-26.
 - [x] `infer-stack logs -f qwen` followed every instance: a kwconf flag took
       the next word as its value. Fixed for every command (P2).
-- [ ] `status` shows STALE during an apply instead of "apply in progress".
+- [x] `status` shows STALE during an apply instead of "apply in progress".
+      Fixed: `pending` while the publication marker says the change is not
+      applied yet; STALE only when nothing is pending.
 - [x] Open WebUI writes its data directory as root: removing a data root
       (the e2e's cleanup, or an operator's `rm -rf`) fails with permission
       denied. Found by `dev/kubeai_e2e.sh` 2026-09-26; fixed: it runs as the

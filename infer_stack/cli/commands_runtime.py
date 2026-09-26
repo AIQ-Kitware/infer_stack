@@ -127,7 +127,9 @@ def _leasing_status() -> dict[str, Any]:
     if not path.exists():
         return out
     try:
-        leases, deployments = Ledger(SqliteStore(str(path))).status(virtual_expiry=True)
+        ledger = Ledger(SqliteStore(str(path)))
+        leases, deployments = ledger.status(virtual_expiry=True)
+        out['pending'] = ledger.publication_pending() is not None
     except Exception:  # noqa: BLE001
         return out
     active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)
@@ -145,7 +147,8 @@ def _leasing_status() -> dict[str, Any]:
     return out
 
 
-def _served_models(deployments, backend=None) -> list[tuple[str, str, str, str]]:
+def _served_models(deployments, backend=None, *,
+                   pending: bool = False) -> list[tuple[str, str, str, str]]:
     """``(endpoint, model, engine, health)`` rows for what is serving.
 
     Reads the ledger for what *should* be up and the backend's strict
@@ -176,9 +179,12 @@ def _served_models(deployments, backend=None) -> list[tuple[str, str, str, str]]
         elif residency.containers(d.id):
             # There, but not warm: starting, crashed, or ambiguous.
             health = residency.containers(d.id)[0].state
+        elif pending:
+            # Recorded, not applied yet: an apply is running, or a failed one
+            # left the change for `infer-stack apply`.
+            health = 'pending'
         else:
-            # The ledger says live and nothing exists. Almost always an apply
-            # that failed after the record was written.
+            # The ledger says live, nothing exists, and no change is pending.
             health = 'STALE'
         for endpoint in sorted(d.served):
             payload = d.served.get(endpoint) or {}
@@ -197,7 +203,8 @@ def _gather_status(config) -> dict[str, Any]:
     rendered = getattr(backend, 'rendered_file', None)
     leasing = _leasing_status()
     if leasing.get('live_deployments'):
-        leasing['served'] = _served_models(leasing.pop('live_deployments'), backend)
+        leasing['served'] = _served_models(leasing.pop('live_deployments'), backend,
+                                           pending=bool(leasing.get('pending')))
     else:
         leasing.pop('live_deployments', None)
     return {
@@ -242,6 +249,9 @@ def _served_lines(served: list[tuple[str, str, str, str]]) -> list[str]:
     if any(r[3] == 'STALE' for r in served):
         out.append('  STALE = the ledger records this live but nothing is '
                    'running for it; `infer-stack apply` or `gc`')
+    if any(r[3] == 'pending' for r in served):
+        out.append('  pending = recorded but not applied yet: an apply is running, '
+                   'or `infer-stack apply` finishes it')
     if any(r[3] == 'starting' for r in served):
         out.append('  starting = up, but not ready yet (loading the model); '
                    '`infer-stack wait <endpoint>`')
@@ -340,8 +350,8 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
         served_table.add_column('model', overflow='fold')
         served_table.add_column('engine', style='dim', no_wrap=True)
         served_table.add_column('health', no_wrap=True)
-        styles = {'up': 'green', 'starting': 'yellow', 'STALE': 'red',
-                  'unverified': 'yellow'}
+        styles = {'up': 'green', 'starting': 'yellow', 'pending': 'yellow',
+                  'STALE': 'red', 'unverified': 'yellow'}
         for endpoint, model, engine, health in served:
             served_table.add_row(
                 endpoint, model, engine,
