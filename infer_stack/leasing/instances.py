@@ -39,6 +39,8 @@ class Instance:
     #: ``healthy`` / ``starting`` / ``unhealthy``, when the runtime has a check.
     health: str = ''
     gpus: tuple[int, ...] = ()
+    #: Docker only: a device request for every GPU, not a list of indices.
+    all_gpus: bool = False
     started: str = ''
     ports: str = ''
     runtime: str = DOCKER
@@ -98,7 +100,8 @@ def from_residency(residency, *, runtime: str = DOCKER, namespace: str = '',
         out.append(Instance(
             name=name, id=c.container_id, deployment_id=c.deployment_id,
             state=c.state, restarts=c.restart_count, reason=c.reason,
-            health=c.health, gpus=tuple(c.gpus), started=c.started, ports=c.ports,
+            health=c.health, gpus=tuple(c.gpus), all_gpus=bool(c.all_gpus),
+            started=c.started, ports=c.ports,
             runtime=runtime, namespace=namespace, container=container,
         ))
     return sorted(out, key=lambda i: (not i.is_engine, i.name, i.id))

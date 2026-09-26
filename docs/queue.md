@@ -368,6 +368,14 @@ flags; kubeai 2.
       removes its data root and keeps the report, whose long outputs keep
       their tail (where a failure says why). `doctor` named the dead API.
 
+Audit pass 7 (2026-09-26): `dev/ux_audit.sh` on both backends, 0 flags;
+both reports read whole.
+
+- [x] For the same GPU-less mock, `leases` and `clean` said `gpus=cpu` and
+      `ps` said `-`. `ps` now uses the same words: `cpu` for a Docker engine
+      with no GPU, `all` for one that requests every GPU, `-` for a pod
+      (the cluster picks) or a front-door service.
+
 ### 10. [ ] Handover
 
 Summarize for the operator: what was verified here, and the two handover

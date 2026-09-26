@@ -442,6 +442,7 @@ def _ps_rows(instances, served) -> list[dict[str, Any]]:
             'status': inst.status,
             'restarts': inst.restarts,
             'gpus': list(inst.gpus),
+            'all_gpus': inst.all_gpus,
             'started': inst.started or None,
             'ports': inst.ports or None,
             'runtime': inst.runtime,
@@ -449,12 +450,34 @@ def _ps_rows(instances, served) -> list[dict[str, Any]]:
     return rows
 
 
+def _gpus_cell(row) -> str:
+    """``ps``'s GPUS cell, in the words ``leases`` uses for the same thing.
+
+    A Docker engine with no device request runs on the CPU (``leases`` says
+    ``gpus=cpu``); one that requests every GPU says ``all``. A pod's GPUs are
+    the cluster's to pick, and a front-door service holds none: ``-``.
+
+    >>> row = {'gpus': [], 'all_gpus': False, 'deployment': 'grp-1', 'runtime': 'docker'}
+    >>> _gpus_cell(row), _gpus_cell({**row, 'gpus': [0, 1]}), _gpus_cell({**row, 'all_gpus': True})
+    ('cpu', '0,1', 'all')
+    >>> _gpus_cell({**row, 'deployment': None}), _gpus_cell({**row, 'runtime': 'kubernetes'})
+    ('-', '-')
+    """
+    if row['gpus']:
+        return ','.join(map(str, row['gpus']))
+    if row.get('all_gpus'):
+        return 'all'
+    if row['deployment'] and row['runtime'] == 'docker':
+        return 'cpu'
+    return '-'
+
+
 def _print_ps(rows) -> None:
     from ..leasing.instances import local_time
 
     def cell(row):
         serves = ', '.join(row['serves']) or ('-' if row['deployment'] else '(front door)')
-        gpus = ','.join(map(str, row['gpus'])) or '-'
+        gpus = _gpus_cell(row)
         ident = row['id'][:12] if row['runtime'] == 'docker' else '-'
         return (row['name'], row['status'], serves, gpus,
                 local_time(row['started'] or '') or '-', ident, row['ports'] or '-')
