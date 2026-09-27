@@ -345,3 +345,23 @@ def test_rotation_completes_behind_kubeai_with_a_dynamic_host_gateway(tmp_path):
     assert new != old
     assert gateway.gateway_accepts(new) and not gateway.gateway_accepts(old)
     assert ledger.publication_pending() is None
+
+
+def test_the_old_key_may_linger_briefly_behind_a_rollout(monkeypatch):
+    """A rollout completes while the old pod still answers for a moment; the
+    rotation's check waits for the rejection instead of failing on it."""
+    import time
+
+    from infer_stack.cli.commands_leasing import _old_key_rejected
+
+    monkeypatch.setattr(time, 'sleep', lambda s: None)
+
+    class Lingering:
+        def __init__(self, answers):
+            self.answers = list(answers)
+
+        def gateway_accepts(self, key, wait=0.0):
+            return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+    assert _old_key_rejected(Lingering([True, True, False]), 'k')
+    assert not _old_key_rejected(Lingering([True]), 'k', within=0.0)

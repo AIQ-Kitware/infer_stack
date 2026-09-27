@@ -865,7 +865,7 @@ Each with a test that fails on the code before it:
 
 A third review found one cross-feature blocker and three small items.
 
-### 24. [ ] `secrets rotate` under a running dynamic-routing gateway
+### 24. [x] `secrets rotate` under a running dynamic-routing gateway
 
 *Why added:* rotation writes K1 to `.env` before publishing; the dynamic
 apply first retires routes on the still-running gateway, whose admin API
@@ -882,12 +882,26 @@ succeeds: `.env` is K1, the gateway accepts K1 and rejects K0, routes
 verify, no marker; on Compose and KubeAI's host gateway; and the e2e rotates
 once while the host dynamic gateway is the front door.
 
-### 25. [ ] `SimpleAdmission` keeps `last_planned_digest`; the guard fails closed
+*Done 2026-09-26 (45e0e1c):* route retirement (the phase before the gateway
+is recreated) authenticates with the key the running LiteLLM container
+holds, read from its environment by `docker inspect`, through
+`Gateway.live_credential()`; everything after recreation uses the `.env`
+key. No new durable state, so a crash mid-rotation recovers the same way.
+Unit tests on Compose and on KubeAI with a host gateway use a fake whose
+admin API answers only the key its container started with (both fail on
+the old code); the e2e rotates inside the dynamic-routing phase with one
+dedicated lease live, and the alias answers with the new key.
+
+### 25. [x] `SimpleAdmission` keeps `last_planned_digest`; the guard fails closed
 
 *Why added:* the in-process backends never set `last_planned_digest`, and
 the approval guard skips when it is empty, so an approved digest was not
 checked there. **Done when:** converge sets it from the same digest as
 preview, and an approved digest with no rendered digest refuses.
+
+*Done 2026-09-26 (3abb2ff):* `SimpleAdmission._digest(plan, rendered)` for
+both; the guard is `approved and rendered != approved`. Six test backends
+that override `converge` had not kept the contract; they do now.
 
 ### 26. [x] Say what `leases` health reports
 

@@ -2954,6 +2954,24 @@ class NetworkCheckCLI(_LeasingCommonMixin):
         return 4 if any(r['status'] == 'routing-fault' for r in result.values()) else 0
 
 
+def _old_key_rejected(backend, key, *, within: float = 60.0) -> bool:
+    """Whether the gateway comes to reject ``key`` within ``within`` seconds.
+
+    A replaced gateway can still answer for a moment: a Kubernetes rollout is
+    complete while the old pod is terminating and still behind the Service,
+    so one early "accepted" is not a failure. Polled, bounded.
+    """
+    import time
+
+    deadline = time.monotonic() + within
+    while True:
+        if backend.gateway_accepts(key) is False:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2.0)
+
+
 class SecretsRotateCLI(_ApprovalMixin):
     """Replace the LiteLLM master key and restart the gateway with it.
 
@@ -2995,7 +3013,7 @@ class SecretsRotateCLI(_ApprovalMixin):
             print('  gateway not running: it will use the new key when it starts')
         elif not accepted:
             raise SystemExit('secrets rotate: the gateway rejects the new key')
-        elif backend.gateway_accepts(old) is not False:
+        elif not _old_key_rejected(backend, old):
             raise SystemExit('secrets rotate: could not confirm the gateway '
                              'rejects the OLD key')
         else:
