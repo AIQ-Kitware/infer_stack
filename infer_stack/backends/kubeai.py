@@ -652,42 +652,52 @@ class KubeaiBackend(ConvergeScaffold):
         """The gateway manages routes live, so each deployment is its own Model."""
         return bool(self.gateway is not None and getattr(self.gateway, 'dynamic_routing', False))
 
-    def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
-        """Registry rows sending each vLLM catalog endpoint to its Model.
+    def catalog_routes(self, catalog) -> list:
+        """The routes every endpoint of ``catalog`` gets: each vLLM endpoint to
+        its Model through KubeAI, each external one to its own server.
 
         The static superset, as on compose: the gateway's config then stays
         byte-stable as models come and go, so it is never recreated for one.
         """
-        from ..leasing.gateway import UPSTREAM_ROUTE, _registry_incoming_from_catalog
+        from ..leasing.gateway import catalog_routes
+        from ..leasing.routes import GatewayRoute
 
         if catalog is None or self.gateway is None:
-            return {}
+            return []
         base = self._upstream_url()
-        return {
-            alias: {'engine': UPSTREAM_ROUTE,
-                    'served': model_name_for(row.get('served') or alias),
-                    'api_base': base}
-            for alias, row in _registry_incoming_from_catalog(catalog).items()
-            if row.get('engine') == 'vllm'
-        }
 
-    def route_rows(self, desired: list[Deployment], placement=None) -> dict[str, dict[str, Any]]:
-        """The registry rows a render of ``desired`` merges (``routes prune``
-        keeps exactly these): the catalog's, and every rendered Model's."""
-        return self._front_door_inputs(desired, self._render_documents(desired)[1])[0]
+        def managed(alias, request):
+            if request.engine != 'vllm':
+                return None
+            served = request.served.get('served_model_name') or alias
+            return GatewayRoute(alias, 'openai', model_name_for(served), base)
+
+        return catalog_routes(catalog, managed)
+
+    def routes(self, desired: list[Deployment], placement=None) -> list:
+        """The routes a render of ``desired`` gives the gateway (``routes list``):
+        its whole table, the route registry included."""
+        if self.gateway is None:
+            return []
+        self._set_front_door(desired, self._render_documents(desired)[1])
+        if getattr(self.gateway, 'in_cluster', False):
+            return self.gateway.static_routes()
+        return self.gateway.routes([])
 
     def _front_door_inputs(self, desired, rendered: RenderedModels):
-        """``(registry rows, dynamic routes)`` for the gateway, from a render.
+        """``(static routes, dynamic routes)`` the gateway adds, from a render.
 
-        Static routing: one row per alias, to the Model serving it. Dynamic
-        routing: one route per (deployment, endpoint), each to its own Model,
-        so same-model ``--dedicated`` Models share the alias and LiteLLM
-        balances across them.
+        Static routing: one route per alias, to the Model serving it, over the
+        catalog's. Dynamic routing: one route per (deployment, endpoint), each
+        to its own Model, so same-model ``--dedicated`` Models share the alias
+        and LiteLLM balances across them. External endpoints route to their
+        own servers either way, never through KubeAI.
         """
-        from ..leasing.gateway import UPSTREAM_ROUTE, upstream_route
+        from ..leasing.gateway import catalog_routes, upstream_route
+        from ..leasing.routes import GatewayRoute, route_table
 
         if self.gateway is None:
-            return {}, []
+            return [], []
         base = self._upstream_url()
         if self.dynamic_routing:
             by_id = {g.id: g for g in desired}
@@ -696,19 +706,22 @@ class KubeaiBackend(ConvergeScaffold):
                 for name, gid in sorted(rendered.models.items())
                 for endpoint in sorted(by_id[gid].served)
             ]
-            return {}, routes
-        rows = self.catalog_route_rows(self.catalog)
-        rows.update({
-            alias: {'engine': UPSTREAM_ROUTE, 'served': name, 'api_base': base}
-            for alias, name in rendered.request_names.items()
-        })
-        return rows, []
+            return [], routes + catalog_routes(self.catalog, dynamic=True)
+        catalog = self.catalog_routes(self.catalog)
+        defined = {r.alias for r in catalog}
+        # A Model serving a catalog alias is that endpoint's route; one serving
+        # an alias no catalog defines is the cluster's own (the gateway
+        # remembers those past release, as it does ad-hoc deployments).
+        models = [GatewayRoute(alias, 'openai', name, base,
+                               origin='catalog' if alias in defined else 'upstream')
+                  for alias, name in rendered.request_names.items()]
+        return route_table(catalog, models), []
 
     def _set_front_door(self, desired, rendered: RenderedModels) -> None:
         """Hand the gateway its inputs for the next render or preview."""
-        rows, routes = self._front_door_inputs(desired, rendered)
-        self.gateway.upstream_rows = rows
-        self.gateway.upstream_routes = routes
+        static, dynamic = self._front_door_inputs(desired, rendered)
+        self.gateway.extra_routes = static
+        self.gateway.extra_dynamic_routes = dynamic
 
     # -- converge-style surface ------------------------------------------------
 

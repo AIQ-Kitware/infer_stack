@@ -2,6 +2,29 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### External endpoints; gateway routes derived from the published catalogs
+
+- A catalog endpoint can name an OpenAI-compatible server infer-stack does
+  not run: `external: {api_base, model, api_key_env}` (or `catalog endpoint
+  add NAME --external-api-base ... --external-model ...`). It has no model,
+  lease or deployment; the gateway routes its alias to that server, sending
+  the key named by `api_key_env` (the name only is stored). Runtime options
+  beside `external:` are refused, and `api_key_env` may not name one of
+  infer-stack's own secrets.
+- Published endpoint definitions outlive quiescence: an acquire merges its
+  catalogs into the published union instead of replacing it, so an unrelated
+  runbook no longer unpublishes another's endpoints. `routes prune` is the
+  explicit removal.
+- Gateway routes are derived at every render from the published union and
+  the placed deployments. `litellm_registry.json` now keeps only the routes
+  of deployments no catalog defines (remembered past release, as before);
+  rows an older version wrote are still routed. `routes seed` publishes
+  catalogs, `routes prune` unpublishes, and `routes list` shows each route's
+  origin. A state dir from before the registry is no longer seeded from its
+  `litellm_config.yaml`.
+- With dynamic routing, an external endpoint's route has a stable id from its
+  alias, so pointing it at another server replaces one route.
+
 ### Hardening from a review of the backend-parity work
 
 - A KubeAI Model with several replicas (`min_replicas`) is resident like one

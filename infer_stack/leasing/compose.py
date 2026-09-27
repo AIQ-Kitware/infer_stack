@@ -15,17 +15,15 @@ talks to ``http://host:<litellm>/v1`` and asks for the public endpoint name.
 That is what makes the endpoint descriptor's ``base_url`` correct (the backend
 supplies it via :meth:`ComposeBackend.access`).
 
-In static-superset mode the gateway's ``model_list`` is rendered from an
-**append-only route registry** (``litellm_registry.json`` in the shared state
-dir): every converge merges the invoking catalog plus every live deployment
-(across all runbooks sharing the stack) into the registry and renders from the
-whole thing. That makes the render a function of accumulated shared state — not
-of which runbook invoked the converge — so a cross-catalog converge can no
-longer strip another's live routes and, once every catalog has merged once, the
-config is byte-stable (the gateway is never recreated). See
-:meth:`ComposeBackend._update_route_registry` and
-:func:`_litellm_model_list_from_registry`; ``infer-stack routes`` inspects/seeds/
-prunes it; ``docs/litellm-gateway-routing.md`` has the full story.
+The gateway's routes are derived at every render, never stored: one per
+endpoint of the published catalog union (every runbook's catalogs, kept in
+the recovery profile) and one per placed deployment
+(:func:`~infer_stack.leasing.gateway.front_door_routes`). The render is then a
+function of shared state, not of which runbook invoked it, so a cross-catalog
+converge cannot strip another's routes and the config is byte-stable as
+models come and go (the gateway is not recreated). ``infer-stack routes``
+lists, seeds and prunes them; ``docs/litellm-gateway-routing.md`` has the
+full story.
 
 Docker and HTTP are invoked through injected seams (``run`` / ``http_get``), so
 all logic here is unit-testable without docker or a network. The real
@@ -52,6 +50,7 @@ from ..env_utils import parse_env_file
 from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
 from .backend import ApplyResult, ConvergeScaffold, Readiness
+from .routes import GatewayRoute
 from .gateway import (
     API_KEY_ENV,
     LITELLM_CONFIG_FILENAME,
@@ -61,8 +60,9 @@ from .gateway import (
     ROUTE_RECONCILE_STEADY_S,
     SALT_KEY_ENV,
     Gateway,
-    _registry_incoming_from_catalog,
-    _registry_incoming_from_deployments,
+    catalog_routes,
+    front_door_routes,
+    remembered_rows,
     render_front_door,
 )
 from .launch import env_string, fill, translate_legacy
@@ -609,9 +609,9 @@ def render_compose(
     aux_dir: str | Path | None = None,
     project: str = LEASING_PROJECT,
     catalog: Any = None,
-    route_registry: dict[str, Any] | None = None,
     dynamic_routing: bool = False,
-    upstream_routes: list[dict[str, Any]] | None = None,
+    routes: list[GatewayRoute] | None = None,
+    dynamic_routes: list[GatewayRoute] | None = None,
     ui_run_as: str | None = None,
 ) -> RenderedCompose:
     """Render a compose project for the placed deployments.
@@ -620,6 +620,10 @@ def render_compose(
     ``litellm`` is set, a front-door service + config is added so every endpoint
     alias is reachable at one ``base_url``. When ``ui`` is also set, a managed
     Open WebUI is rendered in front of that gateway.
+
+    The gateway's ``routes`` (static) or ``dynamic_routes`` are the caller's
+    (:func:`~infer_stack.leasing.gateway.front_door_routes`); left out, they
+    are derived from ``catalog`` and the placed deployments alone.
 
     The project name is baked into the file as a top-level ``name:`` so a plain
     ``docker compose -f docker-compose.yml up`` (infer-stack not involved) lands
@@ -689,9 +693,11 @@ def render_compose(
             ollama_native_urls.append(f'http://{name}:{OLLAMA_CONTAINER_PORT}')
         service_map[name] = deployment.id
 
+    if routes is None and dynamic_routes is None:
+        routes, dynamic_routes = front_door_routes(
+            deployments, assignments, catalog=catalog, dynamic=dynamic_routing)
     front = render_front_door(
-        deployments, assignments,
-        engine_services=list(service_map),
+        routes or [],
         vllm_v1_urls=vllm_v1_urls, ollama_native_urls=ollama_native_urls,
         images=images, state=state,
         litellm=litellm, litellm_port=litellm_port,
@@ -699,8 +705,7 @@ def render_compose(
         ui=ui, ui_port=ui_port,
         reverse_proxy=reverse_proxy, reverse_proxy_port=reverse_proxy_port,
         reverse_proxy_config=reverse_proxy_config, aux_dir=aux_dir,
-        catalog=catalog, route_registry=route_registry,
-        dynamic_routing=dynamic_routing, upstream_routes=upstream_routes,
+        dynamic_routing=dynamic_routing, dynamic_routes=dynamic_routes,
         ui_run_as=ui_run_as,
     )
     services.update(front.services)
@@ -1184,7 +1189,7 @@ class ComposeBackend(ConvergeScaffold):
         return self
 
     def front_door(self):
-        """What holds the gateway's keys and route registry: this project."""
+        """What holds the gateway's keys and routes: this project."""
         return self
 
     def compose_argv(self) -> list[str]:
@@ -1295,9 +1300,6 @@ class ComposeBackend(ConvergeScaffold):
 
     def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
         return self.gateway.gateway_accepts(key, wait=wait)
-
-    def merge_route_registry(self, incoming: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        return self.gateway.merge_route_registry(incoming)
 
     def access(self, endpoints: list[str]) -> dict[str, Any] | None:
         """Where a client reaches these endpoints: the front door."""
@@ -1513,13 +1515,7 @@ class ComposeBackend(ConvergeScaffold):
 
                 self._ui_root_noted = True
                 logger.info('Open WebUI runs as root: {}', why)
-        route_registry = None
-        if self.litellm and not self.dynamic_routing:
-            # Unconditional in static-superset mode: `self.catalog` may be None;
-            # the incoming set is then deployments-only, and the render still
-            # comes from the accumulated registry, so a catalog-less converge
-            # cannot strip routes or blip.
-            route_registry = self._merged_route_registry(desired, plan.assignments)
+        routes, dynamic_routes = self._front_door_routes(desired, plan.assignments)
         rendered = render_compose(
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
@@ -1529,8 +1525,8 @@ class ComposeBackend(ConvergeScaffold):
             reverse_proxy_port=self.reverse_proxy_port,
             reverse_proxy_config=self.reverse_proxy_config, aux_dir=self.state_dir,
             project=self.project, catalog=self.catalog,
-            route_registry=route_registry, dynamic_routing=self.dynamic_routing,
-            upstream_routes=self.upstream_routes, ui_run_as=ui_run_as,
+            dynamic_routing=self.dynamic_routing, routes=routes,
+            dynamic_routes=dynamic_routes, ui_run_as=ui_run_as,
         )
         addresses = None
         if self.network is not None:
@@ -1557,8 +1553,8 @@ class ComposeBackend(ConvergeScaffold):
         )
         planned[self.compose_file] = yaml.safe_dump(rendered.compose, sort_keys=False)
         return {'plan': plan, 'rendered': rendered, 'planned': planned,
-                'fingerprints': fingerprints, 'route_registry': route_registry,
-                'addresses': addresses}
+                'fingerprints': fingerprints, 'addresses': addresses,
+                'remember': self._remembered_rows(desired, plan.assignments)}
 
     #: Stable addressing (plan step P7), set by the controller once
     #: `network migrate` has run: ``{'subnet': ..., 'addresses': {service: ip}}``.
@@ -1719,49 +1715,49 @@ class ComposeBackend(ConvergeScaffold):
         except Exception:
             return ''
 
-    def _merged_route_registry(
+    def _front_door_routes(
         self, desired: list[Deployment], assignments: dict[str, list[int]]
-    ) -> dict[str, Any]:
-        """The route registry merged with this backend's rows, in memory.
+    ) -> tuple[list[GatewayRoute], list[GatewayRoute]]:
+        """``(static, dynamic)`` routes of a render: the published catalog
+        union's endpoints and every placed deployment (``desired`` spans all
+        runbooks via the shared ledger), over the route registry, under what
+        the owner of engines elsewhere supplies."""
+        if not self.litellm:
+            return [], []
+        return front_door_routes(
+            desired, assignments, catalog=self.catalog, dynamic=self.dynamic_routing,
+            registry=[] if self.dynamic_routing else self.gateway.registry_routes(),
+            extra=self.extra_routes, extra_dynamic=self.extra_dynamic_routes)
 
-        The rows are this backend's to supply: every catalog endpoint, and every
-        placed deployment (``desired`` spans all runbooks via the shared ledger,
-        so a live cross-runbook deployment stays routable, and past release).
-        """
-        incoming = self.catalog_route_rows(self.catalog)
-        incoming.update(_registry_incoming_from_deployments(desired, assignments))
-        incoming.update(self.upstream_rows)
-        return self.gateway.merged_route_registry(incoming)
+    def _remembered_rows(self, desired, assignments) -> dict[str, dict[str, Any]]:
+        """The registry rows an approved static render adds: its routed
+        deployments' (and the owner's Models') aliases no published catalog
+        defines."""
+        if not self.litellm or self.dynamic_routing:
+            return {}
+        defined = set(getattr(self.catalog, 'endpoints', None) or {})
+        return remembered_rows(desired, assignments, defined=defined,
+                               extra=self.extra_routes)
 
-    #: Render inputs from the owner of engines this project does not run (the
-    #: kubeai backend, whose gateway this is): static route-registry rows and
-    #: dynamic routes, both pointing at its servers. Set before each render.
-    upstream_rows: dict[str, dict[str, Any]] = {}
-    upstream_routes: list[dict[str, Any]] = []
+    #: Routes from the owner of engines this project does not run (the kubeai
+    #: backend, whose gateway this is): static and dynamic, both pointing at
+    #: its servers. Set before each render.
+    extra_routes: list[GatewayRoute] = []
+    extra_dynamic_routes: list[GatewayRoute] = []
     #: Set by an owner whose engines run elsewhere (kubeai): this project is
     #: only the front door.
     fronts_elsewhere = False
 
-    def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
-        """Route-registry rows for every endpoint of ``catalog``."""
-        return {} if catalog is None else _registry_incoming_from_catalog(catalog)
+    def catalog_routes(self, catalog) -> list[GatewayRoute]:
+        """The routes every endpoint of ``catalog`` gets here."""
+        return catalog_routes(catalog)
 
-    def route_rows(self, desired: list[Deployment], placement=None) -> dict[str, dict[str, Any]]:
-        """The rows a render of ``desired`` merges: catalog, placed deployments,
-        and the owner's upstream rows (``routes prune`` keeps exactly these)."""
-        assignments = self.plan(desired, placement).assignments
-        rows = self.catalog_route_rows(self.catalog)
-        rows.update(_registry_incoming_from_deployments(desired, assignments))
-        rows.update(self.upstream_rows)
-        return rows
-
-    def _update_route_registry(
-        self, desired: list[Deployment], assignments: dict[str, list[int]]
-    ) -> dict[str, Any]:
-        """Merge and persist the route registry; return it (kept for callers)."""
-        merged = self._merged_route_registry(desired, assignments)
-        self.gateway._save_route_registry(merged)
-        return merged
+    def routes(self, desired: list[Deployment], placement=None) -> list[GatewayRoute]:
+        """The routes a render of ``desired`` gives the gateway (``routes list``):
+        the static table, or the dynamic routes."""
+        static, dynamic = self._front_door_routes(
+            desired, self.plan(desired, placement).assignments)
+        return dynamic if self.dynamic_routing else static
 
     def converge(self, desired: list[Deployment], *, apply: bool = True, placement=None):
         """Place + render the desired union, then optionally apply it.
@@ -1815,12 +1811,11 @@ class ComposeBackend(ConvergeScaffold):
 
             self.last_planned_digest = self._planned_digest(planned)
             self._approve_changes(planned)  # may raise ConvergeAborted
-            # Only after approval: persist new addresses and the merged route
-            # registry, then the files.
+            # Only after approval: persist new addresses and remembered
+            # routes, then the files.
             if docs['addresses'] is not None and self.on_addresses is not None:
                 self.on_addresses(docs['addresses'])
-            if docs['route_registry'] is not None:
-                self.gateway._save_route_registry(docs['route_registry'])
+            self.gateway.remember(docs['remember'])
             for path, text in planned.items():
                 if path != self.compose_file:
                     self._atomic_write(path, text)

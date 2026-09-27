@@ -74,14 +74,18 @@ Three owners, never mixed in one map:
 | Routes | Derived from | Stored |
 |---|---|---|
 | catalog routes | the published union | no: derived at render |
-| deployment routes (static) | live deployments whose endpoint no published catalog defines | no: derived at render |
+| deployment routes (static) | placed deployments | remembered in `litellm_registry.json` past release, only for an alias no published catalog defines |
 | dynamic routes | placed deployments, and external targets | reconciled into LiteLLM's DB (as today) |
-| legacy rows | an existing `litellm_registry.json` from before this change (seeded siblings, a migrated `litellm_config.yaml`) | read-only compatibility; `routes prune` drops them |
+| older registry rows | a `litellm_registry.json` an older version wrote (catalog rows, seeded siblings) | read, lowest precedence; `routes prune` drops the ones nothing uses |
 
 The registry file stops being written with catalog-derived rows: once the
-union is durable, it carries nothing the union does not. Existing files are
-still read, so an upgrade loses no route; `routes list` marks their rows as
-legacy. `routes seed FILE...` becomes "merge these catalogs into the
+union is durable, it carries nothing the union does not. It keeps one owner:
+ad-hoc deployments (no catalog defines them), whose route must outlive their
+release or releasing one recreates the gateway (a blip for every client).
+*Revised in implementation:* the first draft derived those only while live;
+`test_converge_to_empty_keeps_the_front_door` showed the blip. Existing files
+are still read, so an upgrade loses no route; `routes list` marks their rows
+`registry`. `routes seed FILE...` becomes "merge these catalogs into the
 published union" (same user-visible effect: the gateway serves their
 aliases; conflicts refuse unless `--replace`). `CatalogUnion` then decides
 conflicts from endpoint semantics alone, and the import of
@@ -160,16 +164,18 @@ request is sent to the external upstream.
 
 ## What goes away
 
-- catalog-derived and deployment-derived rows in `litellm_registry.json`
-  (the file becomes read-only legacy input);
+- catalog-derived rows in `litellm_registry.json` (it keeps only ad-hoc
+  deployments' routes);
 - `CatalogUnion`'s route-row comparison and its import of
   `_registry_incoming_from_catalog`;
 - the `upstream` pseudo-engine (`UPSTREAM_ROUTE`): a KubeAI or external route
   is a `GatewayRoute` of kind `openai` with an api_base;
 - the registry row shapes `{engine, served, host}` and their second
   interpreter in `routes list`: one `GatewayRoute` and one renderer;
-- `render_front_door`'s catalog-superset and legacy placed-deployment
-  branches, reached only by tests (the tests move to the route planner);
+- `render_front_door`'s four route strategies: it takes a route table, or
+  dynamic routes, from `front_door_routes`;
+- the seed-from-`litellm_config.yaml` upgrade path (it would make every
+  rendered route permanent once the registry stopped being written);
 - `backend.access(endpoints) -> dict`: the front door gives connection info,
   endpoints give request names, an `AccessResult` combines them;
 - a descriptor that needs a lease (`INFER_STACK_LEASE_ID` is written only

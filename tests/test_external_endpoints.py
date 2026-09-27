@@ -94,3 +94,137 @@ def test_the_cli_adds_an_external_endpoint_and_refuses_runtime_options(tmp_path,
     for flags in (['--engine', 'vllm'], ['--gpu', '0'], ['--reclaim', 'stop']):
         with pytest.raises(SystemExit, match='runs nothing'):
             EndpointAddCLI.main(argv=[*common, '--force', *flags])
+
+
+# -- routes: one GatewayRoute per alias, whoever runs it ----------------------------
+
+
+def _compose(tmp_path, cat, **kw):
+    from test_leasing_profile import backend
+
+    return backend(tmp_path / 'state', catalog=cat, **kw)
+
+
+def test_an_external_endpoint_routes_to_its_own_server_with_its_key_by_name(tmp_path):
+    be = _compose(tmp_path, Catalog.from_dict(catalog(remote=REMOTE)))
+    be.converge([], apply=False)
+    config = yaml.safe_load((be.state_dir / 'litellm_config.yaml').read_text())
+    routes = {e['model_name']: e['litellm_params'] for e in config['model_list']}
+    assert routes['remote'] == {'model': 'openai/Qwen/Qwen3-32B',
+                                'api_base': 'http://box:8000/v1',
+                                'api_key': 'os.environ/REMOTE_QWEN_KEY'}
+    assert routes['local']['api_key'] == 'EMPTY'     # managed entries unchanged
+    assert not (be.state_dir / 'litellm_registry.json').exists()
+
+
+def test_a_dynamic_external_route_has_a_stable_id_from_its_alias(tmp_path):
+    import json
+
+    from infer_stack.leasing.gateway import _route_id
+
+    moved = {**REMOTE, 'external': {**REMOTE['external'], 'api_base': 'http://other:8000/v1'}}
+    ids = []
+    for target in (REMOTE, moved):
+        be = _compose(tmp_path, Catalog.from_dict(catalog(remote=target)), dynamic_routing=True)
+        be.converge([], apply=False)
+        (route,) = json.loads((be.state_dir / 'litellm_routes.json').read_text())
+        ids.append(route['model_info']['id'])
+        assert route['model_info']['infer_stack_key_env'] == 'REMOTE_QWEN_KEY'
+    # Redefining the server replaces one route under one id.
+    assert ids[0] == ids[1] == _route_id('external', 'remote')
+
+
+def test_route_semantics_cover_the_key_name():
+    from infer_stack.leasing.gateway import Gateway
+    from infer_stack.leasing.routes import GatewayRoute
+
+    a = GatewayRoute('r', 'openai', 'm', 'http://b/v1', key_env='K1', route_id='isr-x').entry()
+    b = GatewayRoute('r', 'openai', 'm', 'http://b/v1', key_env='K2', route_id='isr-x').entry()
+    assert Gateway._route_semantics(a) != Gateway._route_semantics(b)
+
+
+def test_kubeai_routes_an_external_endpoint_directly_not_through_the_cluster(tmp_path):
+    from test_leasing_kubeai import UPSTREAM, make_front_door_backend
+
+    be, _ = make_front_door_backend(tmp_path)
+    be.catalog = Catalog.from_dict(catalog(remote=REMOTE))
+    routes = {r.alias: r for r in be.routes([])}
+    assert routes['remote'].api_base == 'http://box:8000/v1'
+    assert routes['remote'].origin == 'external'
+    assert routes['local'].api_base == UPSTREAM
+
+
+# -- publication: routes seed publishes, routes prune unpublishes -------------------
+
+
+def _ctl(tmp_path, cat, docker=None):
+    from test_leasing_profile import controller
+
+    return controller(tmp_path, catalog=cat, docker=docker)
+
+
+def _published(ledger):
+    return sorted(n for s in (ledger.profile() or {}).get('catalogs') or []
+                  for n in (s.get('endpoints') or {}))
+
+
+def test_seed_publishes_an_external_endpoint_and_prune_unpublishes_it(tmp_path):
+    mine = Catalog.from_dict(catalog())
+    ledger, ctl = _ctl(tmp_path, mine)
+    other = Catalog.from_dict({'endpoints': {'remote': REMOTE}})
+    plan = ctl.plan_route_seed([other])
+    assert list(plan.added) == ['remote']
+    ctl.commit_route_seed(plan)
+    assert _published(ledger) == ['local', 'remote']
+    view = {r.alias: r.origin for r in ctl.route_view()}
+    assert view == {'local': 'catalog', 'remote': 'external'}
+
+    plan = ctl.plan_route_prune()                 # the invocation knows only 'local'
+    assert plan.dropped == ['remote']
+    dropped, _ = ctl.commit_route_prune(plan)
+    assert dropped == ['remote']
+    assert _published(ledger) == ['local']
+    assert [r.alias for r in ctl.route_view()] == ['local']
+
+
+def test_prune_keeps_what_a_live_deployment_serves(tmp_path):
+    from test_leasing_compose import FakeDocker
+
+    docker = FakeDocker()
+    both = Catalog.from_dict(catalog(remote=REMOTE))
+    ledger, ctl = _ctl(tmp_path, both, docker)
+    ctl.acquire('w', both.resolve_names(['local']), wait=False)
+    _, other = _ctl(tmp_path, Catalog.from_dict({'endpoints': {'remote': REMOTE}}), docker)
+    assert other.plan_route_prune().dropped == []   # local is live, remote is mine
+
+
+def test_seed_never_redefines_an_endpoint_a_resident_deployment_runs(tmp_path):
+    from infer_stack.leasing.profile import ProfileMismatch
+    from test_leasing_compose import FakeDocker
+
+    docker = FakeDocker()
+    mine = Catalog.from_dict(catalog())
+    _, ctl = _ctl(tmp_path, mine, docker)
+    ctl.acquire('w', mine.resolve_names(['local']), wait=False)
+    changed = catalog()
+    changed['endpoints']['local']['runtime'] = {'max_model_len': 8}
+    plan = ctl.plan_route_seed([Catalog.from_dict(changed)])
+    assert list(plan.conflicted) == ['local']
+    with pytest.raises(ProfileMismatch, match='resident deployment'):
+        ctl.commit_route_seed(plan, replace=True)
+
+
+def test_kubeai_catalog_routes_are_not_remembered_but_ad_hoc_models_are(tmp_path):
+    import json
+
+    from test_leasing_kubeai import make_front_door_backend, vllm
+
+    be, _ = make_front_door_backend(tmp_path)
+    be.catalog = Catalog.from_dict(catalog())
+    local = vllm('grp-l', served='local')
+    local.served = {'local': {'served_model_name': 'local', 'protocol': 'chat'}}
+    adhoc = vllm('grp-a', served='Org/Adhoc')
+    adhoc.served = {'adhoc': {'served_model_name': 'Org/Adhoc', 'protocol': 'chat'}}
+    be.converge([local, adhoc], apply=False)
+    registry = json.loads((tmp_path / 'gateway' / 'litellm_registry.json').read_text())
+    assert set(registry['entries']) == {'adhoc'}

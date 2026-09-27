@@ -1,15 +1,17 @@
-"""Tests for the append-only LiteLLM route registry (static-superset mode).
+"""Gateway routes: derived at render, one layer per owner.
 
-The registry accumulates the semantic route inputs (served name / engine / host)
-of every catalog *and* live deployment ever merged across the runbooks that share
-one state dir, and the gateway ``model_list`` is rendered from the whole registry.
-The headline property under test: once every catalog has been merged once, a
-converge under any runbook renders a byte-identical gateway config, so the gateway
-is never recreated and no cross-catalog converge can strip another's live routes.
+The gateway's static ``model_list`` is derived at every render from the
+published catalog union (every runbook's endpoints) and the placed
+deployments, over the route registry, which now keeps only the routes of
+deployments no published catalog defines (remembered past release, so
+releasing one does not recreate the gateway) plus any rows from before.
+The headline property: the rendered config depends on endpoint definitions,
+not on which models are up or which runbook converged, so the gateway is not
+recreated as models come and go.
 
-Driven by the same stateful fake-docker seam as ``test_leasing_compose.py``; no
-real docker, GPUs, or network. Converges run ``apply=False`` so only the render
-half (which owns the registry read-merge-write) executes — deterministic and fast.
+Driven by the same stateful fake-docker seam as ``test_leasing_compose.py``;
+no real docker, GPUs, or network. Converges run ``apply=False``: only the
+render half (which reads the registry and remembers rows) executes.
 """
 
 from __future__ import annotations
@@ -20,23 +22,25 @@ import json
 import yaml
 
 from infer_stack.hardware import simulate_inventory
-from infer_stack.leasing import Catalog, ComposeBackend, render_compose
+from infer_stack.leasing import Catalog, ComposeBackend
 from infer_stack.leasing.gateway import (
     CONFIG_HASH_LABEL,
     LITELLM_CONFIG_FILENAME,
     LITELLM_REGISTRY_FILENAME,
     LITELLM_ROUTES_FILENAME,
-    _litellm_model_list,
-    _litellm_model_list_from_registry,
-    _merge_route_registry,
-    _registry_incoming_from_catalog,
-    _registry_incoming_from_deployments,
+    catalog_routes,
+    deployment_routes,
+    front_door_routes,
+    registry_routes,
+    remembered_rows,
 )
 from infer_stack.leasing.models import (
     RESERVED_ENGINE,
     Deployment,
     DeploymentState,
 )
+from infer_stack.leasing.profile import CatalogUnion
+from infer_stack.leasing.routes import GatewayRoute, route_table
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
 IMAGES = {
@@ -72,13 +76,27 @@ def vllm_ep(endpoint, *, served=None, t=0.0):
     )
 
 
-def _catalog(endpoint, *, model='m'):
-    return Catalog.from_dict(
-        {
-            'models': {model: {'source': f'hf://org/{model}'}},
-            'endpoints': {endpoint: {'engine': 'vllm', 'model': model}},
-        }
-    )
+def _catalog_dict(endpoint, *, model='m', served=None):
+    spec = {'engine': 'vllm', 'model': model}
+    if served:
+        spec['served_name'] = served
+    return {'models': {model: {'source': f'hf://org/{model}'}},
+            'endpoints': {endpoint: spec}}
+
+
+def _catalog(endpoint, *, model='m', served=None):
+    return Catalog.from_dict(_catalog_dict(endpoint, model=model, served=served))
+
+
+def _write_registry(tmp_path, entries, *, version=1):
+    path = tmp_path / LITELLM_REGISTRY_FILENAME
+    path.write_text(json.dumps({'version': version, 'entries': entries},
+                               sort_keys=True, indent=2) + '\n')
+    return path
+
+
+def _litellm_service(tmp_path):
+    return yaml.safe_load((tmp_path / 'docker-compose.yml').read_text())['services']['litellm']
 
 
 class FakeDocker:
@@ -135,293 +153,203 @@ def capture_warnings():
         logger.disable('infer_stack')
 
 
-# -- 1. merge idempotence --------------------------------------------------
+# -- 1. precedence: registry < catalog < deployment < upstream -------------
 
 
-def test_merge_idempotent_byte_identical(tmp_path):
-    cat = _catalog('alpha')
-    be = make_backend(tmp_path, catalog=cat)
+def test_route_table_precedence():
+    old = GatewayRoute('a', 'openai', 'old', 'http://old/v1', origin='registry')
+    cat = GatewayRoute('a', 'openai', 'cat', 'http://cat/v1')
+    dep = GatewayRoute('a', 'openai', 'dep', 'http://dep/v1', origin='deployment')
+    up = GatewayRoute('a', 'openai', 'up', 'http://up/v1', origin='upstream')
+    assert route_table([old], [cat], [dep], [up]) == [up]
+    assert route_table([up], [old]) == [old]           # later layer wins
+    assert [r.alias for r in route_table([cat], [old.__class__('b', 'openai', 'x', 'y')])] == ['a', 'b']
+
+
+def test_catalog_endpoints_are_not_stored(tmp_path):
+    """The published union is the one store of endpoint definitions: a render
+    derives their routes, and the registry keeps none of them."""
+    be = make_backend(tmp_path, catalog=_catalog('alpha'))
     be.converge([vllm_ep('alpha')], apply=False)
-    first = (tmp_path / LITELLM_REGISTRY_FILENAME).read_bytes()
+    assert _aliases(tmp_path) == ['alpha']
+    assert not (tmp_path / LITELLM_REGISTRY_FILENAME).exists()
+
+
+# -- 2. byte stability (the headline property) ------------------------------
+
+
+def test_config_is_byte_stable_as_models_come_and_go(tmp_path):
+    union = CatalogUnion.from_sources([_catalog_dict('alpha'), _catalog_dict('beta')])
+    be = make_backend(tmp_path, catalog=union)
     be.converge([vllm_ep('alpha')], apply=False)
-    second = (tmp_path / LITELLM_REGISTRY_FILENAME).read_bytes()
-    assert first == second  # merging the same inputs twice is a no-op
-
-
-def test_merge_incoming_wins_on_conflict_pure():
-    existing = {'version': 1, 'entries': {'a': {'engine': 'vllm', 'served': 'a'}}}
-    merged, warnings = _merge_route_registry(
-        existing, {'a': {'engine': 'vllm', 'served': 'a2'}}
-    )
-    assert merged['entries']['a'] == {'engine': 'vllm', 'served': 'a2'}
-    assert warnings and 'redefined' in warnings[0]
-
-
-def test_merge_additive_never_removes_pure():
-    existing = {'version': 1, 'entries': {'a': {'engine': 'vllm', 'served': 'a'}}}
-    merged, _ = _merge_route_registry(
-        existing, {'b': {'engine': 'vllm', 'served': 'b'}}
-    )
-    assert set(merged['entries']) == {'a', 'b'}
-
-
-# -- 2. hash stability across catalog alternation (the headline property) ---
-
-
-def test_hash_stable_across_alternation(tmp_path):
-    """Converge catalog A, then B, then A again on one shared state dir. Renders
-    2 and 3 must produce a byte-identical ``litellm_config.yaml`` AND an equal
-    litellm service dict / CONFIG_HASH_LABEL — the label is what drives recreate.
-    """
-    be_a = make_backend(tmp_path, catalog=_catalog('alpha'))
-    be_b = make_backend(tmp_path, catalog=_catalog('beta'))
-
-    be_a.converge([vllm_ep('alpha')], apply=False)  # render 1: {alpha}
-    be_b.converge([vllm_ep('beta')], apply=False)   # render 2: {alpha, beta}
-    cfg_2 = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-    svc_2 = yaml.safe_load(
-        (tmp_path / 'docker-compose.yml').read_text()
-    )['services']['litellm']
-
-    be_a.converge([vllm_ep('alpha')], apply=False)  # render 3: still {alpha, beta}
-    cfg_3 = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-    svc_3 = yaml.safe_load(
-        (tmp_path / 'docker-compose.yml').read_text()
-    )['services']['litellm']
-
-    assert cfg_2 == cfg_3  # gateway config byte-stable across the alternation
-    assert svc_2 == svc_3
-    assert (
-        svc_2['labels'][CONFIG_HASH_LABEL] == svc_3['labels'][CONFIG_HASH_LABEL]
-    )
-
-
-# -- 3. union correctness --------------------------------------------------
-
-
-def test_union_routes_both_catalogs_sorted(tmp_path):
-    be_a = make_backend(tmp_path, catalog=_catalog('alpha'))
-    be_b = make_backend(tmp_path, catalog=_catalog('beta'))
-    be_a.converge([vllm_ep('alpha')], apply=False)
-    be_b.converge([vllm_ep('beta')], apply=False)
+    cfg_1 = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
+    svc_1 = _litellm_service(tmp_path)
+    be.converge([vllm_ep('beta')], apply=False)
+    be.converge([], apply=False)
+    assert (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes() == cfg_1
+    assert _litellm_service(tmp_path)['labels'][CONFIG_HASH_LABEL] == \
+        svc_1['labels'][CONFIG_HASH_LABEL]
     assert _aliases(tmp_path) == ['alpha', 'beta']
 
 
-# -- 4. live non-catalog deployment persists across a foreign converge ------
+def test_hash_stable_across_runbook_alternation(tmp_path):
+    """Runbook A, then B, then A again on one ledger: the published union holds
+    both catalogs, so renders 2 and 3 are byte-identical."""
+    from test_leasing_profile import cat, controller
+
+    a, b = Catalog.from_dict(cat('alpha')), Catalog.from_dict(cat('beta'))
+    _, ctl_a = controller(tmp_path, catalog=a)
+    ctl_a.acquire('a', a.resolve_names(['alpha']), wait=False)
+    _, ctl_b = controller(tmp_path, catalog=b)
+    ctl_b.acquire('b', b.resolve_names(['beta']), wait=False)
+    config = tmp_path / 'state' / LITELLM_CONFIG_FILENAME
+    cfg_2 = config.read_bytes()
+    _, ctl_a2 = controller(tmp_path, catalog=a)
+    ctl_a2.acquire('a2', a.resolve_names(['alpha']), wait=False)
+    assert config.read_bytes() == cfg_2
+    assert sorted(e['model_name'] for e in yaml.safe_load(cfg_2)['model_list']) == \
+        ['alpha', 'beta']
+
+
+# -- 3. a non-catalog deployment is remembered past its release -------------
 
 
 def test_live_non_catalog_deployment_stays_routed(tmp_path):
-    """A deployment absent from the invoking catalog is merged from the desired
-    set and remains routed on a later converge under a different catalog."""
-    be_a = make_backend(tmp_path, catalog=_catalog('alpha'))
-    # 'extra' is not in catalog A — it enters the registry via the desired set.
-    be_a.converge([vllm_ep('alpha'), vllm_ep('extra')], apply=False)
-    assert 'extra' in _aliases(tmp_path)
-
-    be_b = make_backend(tmp_path, catalog=_catalog('beta'))
-    be_b.converge([vllm_ep('beta')], apply=False)  # 'extra' no longer live
-    # Persisted past its live window and past a foreign converge.
-    assert _aliases(tmp_path) == ['alpha', 'beta', 'extra']
-
-
-# -- 5. conflict: incoming wins, warning, bytes change ---------------------
-
-
-def test_conflict_incoming_wins_and_changes_bytes(tmp_path):
+    """A deployment no published catalog defines is remembered in the registry,
+    so it stays routed after release and releasing it does not recreate the
+    gateway."""
     be = make_backend(tmp_path, catalog=_catalog('alpha'))
-    be.converge([vllm_ep('alpha', served='v1')], apply=False)
+    be.converge([vllm_ep('alpha'), vllm_ep('extra')], apply=False)
     before = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-
-    with capture_warnings() as warnings:
-        be.converge([vllm_ep('alpha', served='v2')], apply=False)
-    after = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-
-    assert before != after  # a genuinely changed definition => one recreate
-    assert _registry(tmp_path)['entries']['alpha']['served'] == 'v2'
-    assert any('redefined' in m for m in warnings)
+    assert set(_registry(tmp_path)['entries']) == {'extra'}   # alpha is derived
+    be.converge([vllm_ep('alpha')], apply=False)              # 'extra' released
+    assert (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes() == before
+    assert _aliases(tmp_path) == ['alpha', 'extra']
 
 
-# -- 6. seeding from a pre-existing litellm_config.yaml (upgrade migration) -
+def test_a_published_definition_wins_over_a_registry_row(tmp_path):
+    """A registry row (e.g. one an older binary wrote for a catalog endpoint)
+    is the lowest layer: the published definition renders instead."""
+    _write_registry(tmp_path, {'alpha': {'engine': 'vllm', 'served': 'v1'}})
+    be = make_backend(tmp_path, catalog=_catalog('alpha', served='v2'))
+    be.converge([], apply=False)
+    (entry,) = _model_list(tmp_path)
+    assert entry['litellm_params']['model'] == 'openai/v2'
 
 
-def test_seed_from_existing_config_preserves_vllm_routes(tmp_path):
-    """A state dir upgraded in place: a rendered ``litellm_config.yaml`` exists
-    but no registry. The first converge under a *disjoint* catalog must still
-    route the old vLLM aliases (recovered by seeding). Ollama rows are skipped."""
-    legacy = {
-        'model_list': [
-            {
-                'model_name': 'old-vllm',
-                'litellm_params': {
-                    'model': 'openai/old-served',
-                    'api_base': 'http://vllm-old-served:8000/v1',
-                    'api_key': 'EMPTY',
-                },
-            },
-            {
-                'model_name': 'old-ollama',
-                'litellm_params': {
-                    'model': 'ollama/llama3:8b',
-                    'api_base': 'http://ollama-gpuhost:11434',
-                },
-            },
-        ]
-    }
-    (tmp_path / LITELLM_CONFIG_FILENAME).write_text(yaml.safe_dump(legacy))
-    assert not (tmp_path / LITELLM_REGISTRY_FILENAME).exists()
-
-    be = make_backend(tmp_path, catalog=_catalog('beta'))
-    be.converge([vllm_ep('beta')], apply=False)
-
-    aliases = _aliases(tmp_path)
-    assert 'old-vllm' in aliases   # vLLM row recovered exactly
-    assert 'beta' in aliases       # the new catalog merged in
-    assert 'old-ollama' not in aliases  # Ollama row skipped (host not invertible)
+# -- 4. registry rows from an older binary are still routed -----------------
 
 
-# -- 7. corrupt registry: fail-open, rebuilt from seed + catalog -----------
+def test_catalog_less_converge_renders_existing_registry_rows(tmp_path):
+    """An upgraded state dir whose registry holds catalog rows: a catalog-less
+    converge still routes them (nothing is lost on upgrade), and the file is
+    not rewritten."""
+    _write_registry(tmp_path, {'alpha': {'engine': 'vllm', 'served': 'alpha'},
+                               'tiny': {'engine': 'ollama', 'model': 'tinyllama',
+                                        'host': 'gpuhost'}})
+    original = (tmp_path / LITELLM_REGISTRY_FILENAME).read_bytes()
+    bare = make_backend(tmp_path, catalog=None)
+    bare.converge([], apply=False)
+    assert _aliases(tmp_path) == ['alpha', 'tiny']
+    assert (tmp_path / LITELLM_REGISTRY_FILENAME).read_bytes() == original
 
 
-def test_corrupt_registry_is_rebuilt(tmp_path):
+def test_corrupt_registry_is_ignored(tmp_path):
     (tmp_path / LITELLM_REGISTRY_FILENAME).write_text('{ this is not json')
     be = make_backend(tmp_path, catalog=_catalog('alpha'))
     be.converge([vllm_ep('alpha')], apply=False)  # must not raise
     assert _aliases(tmp_path) == ['alpha']
-    # A non-map ``entries`` is likewise structurally unusable -> rebuilt.
     (tmp_path / LITELLM_REGISTRY_FILENAME).write_text('{"entries": [1, 2, 3]}')
     be.converge([vllm_ep('alpha')], apply=False)
     assert _aliases(tmp_path) == ['alpha']
 
 
-# -- 8. dynamic-routing isolation ------------------------------------------
+def test_unknown_version_is_read_and_never_rewritten(tmp_path):
+    """A registry from a newer schema is rendered as-is with a warning and
+    never rewritten, even when a render has a row to remember."""
+    path = _write_registry(tmp_path, {'old': {'engine': 'vllm', 'served': 'old'}},
+                           version=99)
+    original = path.read_bytes()
+    be = make_backend(tmp_path, catalog=_catalog('alpha'))
+    with capture_warnings() as warnings:
+        be.converge([vllm_ep('alpha'), vllm_ep('extra')], apply=False)
+    assert path.read_bytes() == original
+    assert _aliases(tmp_path) == ['alpha', 'extra', 'old']
+    assert any('unknown schema version' in m for m in warnings)
+
+
+# -- 5. dynamic routing ------------------------------------------------------
 
 
 def test_dynamic_routing_creates_no_registry(tmp_path):
     be = make_backend(tmp_path, dynamic_routing=True)
     be.converge([vllm_ep('alpha')], apply=False)
     assert not (tmp_path / LITELLM_REGISTRY_FILENAME).exists()
-    # dynamic routing still renders its own desired route set file.
     assert (tmp_path / LITELLM_ROUTES_FILENAME).exists()
 
 
-# -- 11. catalog-less converge renders from the accumulated registry --------
+# -- 6. derivations agree ----------------------------------------------------
 
 
-def test_catalog_less_converge_renders_full_registry(tmp_path):
-    """Seed a registry via a catalog-full converge, then converge with
-    ``catalog=None`` (as a bare release/gc does). The render must still contain
-    the full registry (no fall-through to the legacy empty-when-no-deployments
-    branch), bytes unchanged."""
-    be = make_backend(tmp_path, catalog=_catalog('alpha'))
-    be.converge([vllm_ep('alpha')], apply=False)
-    before = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-
-    bare = make_backend(tmp_path, catalog=None)
-    bare.converge([], apply=False)  # no catalog, no live deployments
-    after = (tmp_path / LITELLM_CONFIG_FILENAME).read_bytes()
-
-    assert _aliases(tmp_path) == ['alpha']  # NOT [] -> registry, not legacy
-    assert before == after  # byte-stable: no strip, no blip
-
-
-# -- 12. engine filter: RESERVED_ENGINE contributes no row ------------------
-
-
-def test_reserved_engine_contributes_no_row():
+def test_reserved_engine_routes_nowhere():
     reserved = Deployment(
         'grp-r', 'ck-r', RESERVED_ENGINE, 'dedicated', {},
         {'engine': RESERVED_ENGINE, 'reserved_gpu_count': 1},
         {'reserved-gpu': {}}, DeploymentState.LIVE, 0.0, 0.0,
     )
-    incoming = _registry_incoming_from_deployments(
-        [reserved, vllm_ep('alpha')], {'grp-r': [0], 'grp-alpha': [1]}
-    )
-    assert set(incoming) == {'alpha'}  # reserved skipped, mirrors render loop
+    placed = {'grp-r': [0], 'grp-alpha': [1]}
+    assert [r.alias for r in deployment_routes([reserved, vllm_ep('alpha')], placed)] == ['alpha']
+    assert set(remembered_rows([reserved, vllm_ep('alpha')], placed, defined=set())) == {'alpha'}
 
 
-# -- 13. multi-alias deployment: two rows, one shared upstream --------------
-
-
-def test_multi_alias_deployment_matches_legacy_render():
-    dep = Deployment(
+def test_remembered_rows_render_back_to_the_live_route():
+    """A remembered row renders exactly the route its deployment had, so a
+    release never moves the rendered bytes (vLLM, multi-alias, and Ollama)."""
+    multi = Deployment(
         'grp-m', 'ck-m', 'vllm', 'shared-compatible', {},
-        {
-            'engine': 'vllm',
-            'hf_model_id': 'org/model',
-            'served_model_name': 'shared',
-            'runtime': {'tensor_parallel_size': 1},
-            'reclaim': 'keep-warm',
-        },
-        {
-            'ep1': {'served_model_name': 'shared'},
-            'ep2': {'served_model_name': 'shared'},
-        },
+        {'engine': 'vllm', 'hf_model_id': 'org/model', 'served_model_name': 'shared',
+         'runtime': {'tensor_parallel_size': 1}, 'reclaim': 'keep-warm'},
+        {'ep1': {'served_model_name': 'shared'}, 'ep2': {'served_model_name': 'shared'}},
         DeploymentState.LIVE, 0.0, 0.0,
     )
-    assignments = {'grp-m': [0]}
-    incoming = _registry_incoming_from_deployments([dep], assignments)
-    assert incoming == {
-        'ep1': {'engine': 'vllm', 'served': 'shared'},
-        'ep2': {'engine': 'vllm', 'served': 'shared'},
-    }
-    registry = {'version': 1, 'entries': incoming}
-    rendered = _litellm_model_list_from_registry(registry)
-    legacy = _litellm_model_list([dep], assignments)
-    assert sorted(rendered, key=lambda e: e['model_name']) == sorted(
-        legacy, key=lambda e: e['model_name']
+    tiny = Deployment(
+        'grp-o', 'ck-o', 'ollama', 'shared-compatible', {},
+        {'engine': 'ollama', 'host': 'gpuhost'}, {'tiny': {'model': 'tinyllama'}},
+        DeploymentState.LIVE, 0.0, 0.0,
     )
+    placed = {'grp-m': [0], 'grp-o': [1]}
+    live = deployment_routes([multi, tiny], placed)
+    rows = remembered_rows([multi, tiny], placed, defined=set())
+    assert registry_routes({'entries': rows}) == sorted(live, key=lambda r: r.alias)
+    upstream = GatewayRoute('k', 'openai', 'model-k', 'http://kubeai/openai/v1',
+                            origin='upstream')
+    rows = remembered_rows([], {}, defined=set(), extra=[upstream])
+    assert registry_routes({'entries': rows}) == [upstream]
 
 
-# -- 14. unknown-version tolerance -----------------------------------------
+def test_catalog_and_live_routes_coincide():
+    assert catalog_routes(_catalog('alpha')) == deployment_routes(
+        [vllm_ep('alpha')], {'grp-alpha': [0]})
 
 
-def test_unknown_version_preserved_not_reseeded(tmp_path):
-    """A registry from a newer schema (``version: 99``) with a valid ``entries``
-    map is rendered as-is with a warning and NOT rewritten/reseeded — a binary
-    rollback must not discard the accumulated union."""
-    registry = {
-        'version': 99,
-        'entries': {'alpha': {'engine': 'vllm', 'served': 'alpha'}},
-    }
-    path = tmp_path / LITELLM_REGISTRY_FILENAME
-    path.write_text(json.dumps(registry, sort_keys=True, indent=2) + '\n')
-    original = path.read_bytes()
-
-    # Converge with the same catalog+deployment already in the registry, so the
-    # merge is a no-op and the file must not be rewritten (version stays 99).
-    be = make_backend(tmp_path, catalog=_catalog('alpha'))
-    with capture_warnings() as warnings:
-        be.converge([vllm_ep('alpha')], apply=False)
-
-    assert path.read_bytes() == original  # not rewritten/reseeded
-    assert _registry(tmp_path)['version'] == 99
-    assert 'alpha' in _aliases(tmp_path)
-    assert any('unknown schema version' in m for m in warnings)
+def test_dynamic_routes_are_one_per_managed_id():
+    external = Catalog.from_dict({'endpoints': {'box': {'external': {
+        'api_base': 'http://box:9000/v1', 'model': 'Org/Big', 'api_key_env': 'BOX_KEY'}}}})
+    static, dynamic = front_door_routes([vllm_ep('alpha')], {'grp-alpha': [0]},
+                                        catalog=external, dynamic=True)
+    assert static == []
+    assert [r.alias for r in dynamic] == ['alpha', 'box']
+    assert len({r.route_id for r in dynamic}) == 2
 
 
-# -- 10. concurrency smoke: two backends, one state dir, no lost update -----
+# -- 7. concurrency smoke ----------------------------------------------------
 
 
 def test_concurrency_smoke_no_lost_update(tmp_path):
-    """Two backends sharing one state dir converge different catalogs (serialized
-    by the per-state-dir flock the converge already takes). The final registry
-    file must contain BOTH catalogs' routes — neither converge clobbers the
-    other's contribution."""
+    """Two backends sharing one state dir remember different ad-hoc
+    deployments (serialized by the converge flock): both rows survive."""
     be_a = make_backend(tmp_path, catalog=_catalog('alpha'))
     be_b = make_backend(tmp_path, catalog=_catalog('beta'))
-    be_a.converge([vllm_ep('alpha')], apply=False)
-    be_b.converge([vllm_ep('beta')], apply=False)
-    entries = _registry(tmp_path)['entries']
-    assert set(entries) == {'alpha', 'beta'}
-
-
-# -- extra: catalog vs live reduce to the identical row --------------------
-
-
-def test_catalog_and_live_rows_coincide():
-    cat = _catalog('alpha')
-    from_cat = _registry_incoming_from_catalog(cat)
-    from_live = _registry_incoming_from_deployments(
-        [vllm_ep('alpha')], {'grp-alpha': [0]}
-    )
-    assert from_cat == from_live == {'alpha': {'engine': 'vllm', 'served': 'alpha'}}
+    be_a.converge([vllm_ep('one')], apply=False)
+    be_b.converge([vllm_ep('two')], apply=False)
+    assert set(_registry(tmp_path)['entries']) == {'one', 'two'}

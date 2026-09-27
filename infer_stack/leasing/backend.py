@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from .models import Deployment
+from .routes import GatewayRoute
 
 
 @dataclass
@@ -335,17 +336,17 @@ class ServingBackend(Protocol):
         ...
 
     def front_door(self) -> FrontDoor | None:
-        """What holds the LiteLLM gateway (its keys and route registry), or
+        """What holds the LiteLLM gateway (its keys and routes), or
         ``None`` for a backend without one."""
         ...
 
-    def route_rows(self, desired: list[Deployment], placement: Any = None
-                   ) -> dict[str, dict[str, Any]]:
-        """The gateway route rows a render of ``desired`` merges in."""
+    def routes(self, desired: list[Deployment], placement: Any = None
+               ) -> list[GatewayRoute]:
+        """The gateway routes a render of ``desired`` produces."""
         ...
 
-    def catalog_route_rows(self, catalog: Any) -> dict[str, dict[str, Any]]:
-        """The route rows every endpoint of ``catalog`` would get."""
+    def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
+        """The routes every endpoint of ``catalog`` would get here."""
         ...
 
     def reclaim_candidates(self, blocked: Deployment,
@@ -570,12 +571,12 @@ class SimpleAdmission:
     def front_door(self) -> FrontDoor | None:
         return None                     # no gateway in-process
 
-    def route_rows(self, desired: list[Deployment], placement: Any = None
-                   ) -> dict[str, dict[str, Any]]:
-        return {}
+    def routes(self, desired: list[Deployment], placement: Any = None
+               ) -> list[GatewayRoute]:
+        return []
 
-    def catalog_route_rows(self, catalog: Any) -> dict[str, dict[str, Any]]:
-        return {}
+    def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
+        return []
 
     def plan(self, desired: list[Deployment], placement: Any = None):
         """Which of ``desired`` fit; here, all of them, on no GPU."""

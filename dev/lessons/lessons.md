@@ -153,3 +153,16 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   printed the copy's `infer_stack.__file__` and passed while edits continued.
 - **Applies when:** a long e2e or audit runs in tmux while work continues in
   the same checkout.
+
+- **Lesson:** Code that runs inside `converge` must not take the backend's
+  converge flock again. `flock` locks belong to an open file description, so a
+  second open of the same lock file in the same process waits on itself for
+  ever; nothing times out and pytest just hangs. Helpers called from a
+  converge assume the caller holds the lock (and say so); only entry points
+  called from outside take it.
+- **Evidence / MWE:** 2026-09-27: `Gateway.remember` opened with
+  `with self._converge_lock():` and was called from `ComposeBackend.converge`,
+  which already held it. `tests/test_leasing_compose.py` hung with no output
+  until killed; removing the inner lock made it finish in 4 s.
+- **Applies when:** adding a gateway/backend helper that writes state under
+  the state dir and may be reached from a render or converge.

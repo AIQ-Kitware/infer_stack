@@ -289,7 +289,7 @@ worse. A blocker is fixed whatever its size.
 | how the TUI runs a runtime command | it replaced the backend's runner with Docker's, whose allowlisted environment has no `KUBECONFIG`: every kubectl call from the TUI failed | **fixed** (P2): only `docker` commands are wrapped |
 | the KubeAI gateway's approval | the gateway project asked its own diff approval at render, after the lease committed | **fixed** (P3): previewed and approved with the acquire's |
 | KubeAI's route rows | written into the registry before any approval, and only for live Models (so every new Model recreated the gateway) | **fixed** (P3): render inputs, persisted after approval; the catalog's rows too, so no blip |
-| a route's upstream | derived twice, in the render and in `routes list` (which showed `?` for a cluster route) | **fixed** (P3): `registry_route_entry` |
+| a route's upstream | derived twice, in the render and in `routes list` (which showed `?` for a cluster route) | **fixed** (P3); since campaign 2 one `GatewayRoute` and one renderer (`GatewayRoute.entry`) |
 | a deployment's Model name | derived in five places | **fixed** (P3): `model_name()` |
 | "is this the compose backend" in the CLI | `isinstance(…, ComposeBackend)` for `routes`, `gc --orphans`, `clean`, `network migrate`, `secrets rotate` | **fixed** (P3): the capability each needs (`compose_project()`, residency labels, `network`, `litellm`); since item 12, `backend.host_runtime` |
 | how many units a deployment may have | "more than one is ambiguous", written into the shared residency | **fixed** (item 11): `Residency.replicated`, set by the runtime that built it; only GPU adoption asks for a unique unit |

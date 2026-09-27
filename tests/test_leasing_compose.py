@@ -812,16 +812,18 @@ def _two_endpoint_catalog():
 def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
     """The no-blip property at the rendering level: with a catalog, the LiteLLM
     config + service spec do NOT change when the live model set changes, so
-    `docker compose up` would not recreate the gateway (no blip)."""
+    `docker compose up` would not recreate the gateway (no blip). The
+    deployments serve catalog endpoints, as every acquire under a catalog
+    does."""
     cat = _two_endpoint_catalog()
     # alpha live, then beta live -- two different desired sets, same catalog.
     rc_a = render_compose(
-        [vllm('grp-a', served='alpha')], {'grp-a': [0]},
+        [vllm('alpha', served='alpha')], {'alpha': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
     rc_b = render_compose(
-        [vllm('grp-b', served='beta')], {'grp-b': [0]},
+        [vllm('beta', served='beta')], {'beta': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
@@ -883,14 +885,14 @@ def test_untouched_model_stable_when_another_swaps_gpu(tmp_path):
     """
     cat = _three_endpoint_catalog()
     rc1 = render_compose(
-        [vllm('grp-c', served='cee'), vllm('grp-a', served='alpha')],
-        {'grp-c': [2], 'grp-a': [0]},
+        [vllm('cee', served='cee'), vllm('alpha', served='alpha')],
+        {'cee': [2], 'alpha': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
     rc2 = render_compose(
-        [vllm('grp-c', served='cee'), vllm('grp-b', served='beta')],
-        {'grp-c': [2], 'grp-b': [0]},
+        [vllm('cee', served='cee'), vllm('beta', served='beta')],
+        {'cee': [2], 'beta': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )

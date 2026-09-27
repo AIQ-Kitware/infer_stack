@@ -1828,77 +1828,181 @@ class Controller:
                 'kubeai backend, with `litellm` on)')
         return front.gateway
 
-    def route_registry(self) -> dict:
-        """The route registry as stored (``routes list``)."""
-        return self._route_gateway().route_registry()
+    def route_view(self) -> list:
+        """The routes the gateway serves now (``routes list``): derived from the
+        published catalogs, the placed deployments and any legacy registry,
+        exactly as the next render derives them."""
+        from .residency import ResidencyUnknown
+
+        self._route_gateway()
+        try:
+            residency = self.backend.residency()
+        except ResidencyUnknown:
+            residency = None
+        desired, inputs = self._admission_view(residency, virtual_expiry=True)
+        return self.backend.routes(desired, inputs)
+
+    def _published_sources(self) -> list[dict]:
+        """The published catalog union's sources (the stored profile's, else
+        the ones this invocation would freeze)."""
+        profile = self.ledger.profile() or self.invocation_profile() or {}
+        return list(profile.get('catalogs') or [])
+
+    def _meanings(self, union) -> dict:
+        """``{alias: Meaning}`` for every endpoint of ``union``."""
+        from .catalog import CatalogError
+        from .routes import Meaning
+
+        if union is None:
+            return {}
+        routes = {r.alias: r for r in self.backend.catalog_routes(union)}
+        meanings = {}
+        for name in sorted(union.endpoints):
+            try:
+                key = union.resolve_endpoint(name).semantic_key()
+            except CatalogError:
+                continue
+            meanings[name] = Meaning(routes.get(name), key)
+        return meanings
+
+    def _published_meanings(self) -> dict:
+        """What every published alias means: route registry rows, then the
+        published union's definitions over them."""
+        from .profile import CatalogUnion
+        from .routes import Meaning
+
+        meanings = {r.alias: Meaning(r) for r in self._route_gateway().registry_routes()}
+        sources = self._published_sources()
+        meanings.update(self._meanings(CatalogUnion.from_sources(sources) if sources else None))
+        return meanings
+
+    def _store_catalogs(self, catalogs: list[dict]) -> None:
+        """Replace the published union (caller holds the lock, marker set)."""
+        stored = self.ledger.profile() or self.invocation_profile()
+        if stored is None:
+            return
+        profile = {**stored, 'catalogs': catalogs}
+        if profile != stored:
+            self._commit_profile_candidate(profile)
+            self._use_profile_candidate(profile)
 
     def plan_route_seed(self, catalogs: Iterable) -> RoutePlan:
-        """What seeding these catalogs' routes would add, keep, or redefine."""
+        """What publishing these catalogs would add, keep, or redefine.
+        Raises :class:`~infer_stack.leasing.profile.CatalogConflict` if they
+        disagree among themselves."""
+        from .profile import CatalogUnion, catalog_sources
         from .routes import plan_seed
 
-        gateway = self._route_gateway()
-        incoming: dict[str, dict] = {}
-        for catalog in catalogs:
-            incoming.update(self.backend.catalog_route_rows(catalog))
-        return plan_seed(gateway.route_entries(), incoming)
+        self._route_gateway()
+        sources = [s for c in catalogs for s in catalog_sources(c)]
+        incoming = self._meanings(CatalogUnion.from_sources(sources) if sources else None)
+        plan = plan_seed(self._published_meanings(), incoming)
+        plan.sources = sources
+        return plan
 
     def commit_route_seed(self, plan: RoutePlan, *, replace: bool = False
                           ) -> tuple[RoutePlan, ReconcileResult]:
-        """Add the plan's routes and publish; redefine conflicts only with
-        ``replace``. Rechecked under the lock: a conflict that appeared since
-        the plan refuses too (:class:`~infer_stack.leasing.routes.RouteConflict`)
-        and nothing is written."""
+        """Merge the plan's catalogs into the published union and publish;
+        redefine conflicts only with ``replace``, and never one a resident
+        workload runs. Rechecked under the lock: a conflict that appeared
+        since the plan refuses too
+        (:class:`~infer_stack.leasing.routes.RouteConflict`) and nothing is
+        written."""
+        from .profile import CatalogConflict, ProfileMismatch, adopt_catalog_sources
+        from .residency import ResidencyUnknown
         from .routes import RouteConflict, plan_seed
 
         gateway = self._route_gateway()
-        fresh = plan_seed(gateway.route_entries(), plan.incoming)
+        fresh = plan_seed(self._published_meanings(), plan.incoming)
         if fresh.conflicted and not replace:
             raise RouteConflict(sorted(fresh.conflicted))
 
         def preflight():
             # Under the lock, before the marker: a conflict another process
             # made since the plan refuses without leaving a publication pending.
-            now = plan_seed(gateway.route_entries(), plan.incoming)
+            now = plan_seed(self._published_meanings(), plan.incoming)
             if now.conflicted and not replace:
                 raise RouteConflict(sorted(now.conflicted))
 
         def change():
-            now = plan_seed(gateway.route_entries(), plan.incoming)
-            entries = gateway.route_entries()
-            entries.update(now.added)
-            if replace:
-                entries.update({name: new for name, (_, new) in now.conflicted.items()})
-            if entries != gateway.route_entries():
-                gateway.replace_route_entries(entries)
+            now = plan_seed(self._published_meanings(), plan.incoming)
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            pinned = self._pinned_endpoints(residency)
+            try:
+                catalogs = adopt_catalog_sources(
+                    self._published_sources(), plan.sources, pinned)
+            except CatalogConflict as ex:
+                blocked = sorted(set(ex.names) & pinned) or sorted(ex.names)
+                raise ProfileMismatch(
+                    f'routes seed would redefine {", ".join(map(repr, blocked))}, '
+                    'which a resident deployment is running; evict it first '
+                    f'(`infer-stack evict {blocked[0]}`)') from ex
+            self._store_catalogs(catalogs)
+            # A published definition supersedes a registry row of the same name.
+            legacy = gateway.route_entries()
+            kept = {k: v for k, v in legacy.items() if k not in plan.incoming}
+            if kept != legacy:
+                gateway.replace_route_entries(kept)
             return now
 
         return self.publish_change(change, preflight=preflight)
 
-    def plan_route_prune(self) -> RoutePlan:
-        """Which routes a prune drops: all but the catalog's and the live ones,
-        exactly as the next render would keep them."""
+    def _prune_keep(self) -> set[str]:
+        """Aliases a prune keeps: the invocation's catalogs', and every one a
+        deployment the next render places (or a resident one) serves."""
+        from .profile import CatalogUnion
+        from .residency import ResidencyUnknown
+
+        mine = (self.invocation_profile() or {}).get('catalogs') or []
+        keep = set(CatalogUnion.from_sources(mine).endpoints) if mine else set()
+        try:
+            residency = self.backend.residency()
+        except ResidencyUnknown:
+            residency = None
+        desired, _ = self._admission_view(residency, virtual_expiry=True)
+        keep.update(ep for g in desired for ep in g.served)
+        return keep | self._pinned_endpoints(residency)
+
+    def _prunable(self) -> list[str]:
+        from .profile import CatalogUnion
         from .routes import plan_prune
 
-        gateway = self._route_gateway()
-        desired, inputs = self._admission_view(self.backend.residency())
-        return plan_prune(gateway.route_entries(), self.backend.route_rows(desired, inputs))
+        sources = self._published_sources()
+        current = set(self._route_gateway().route_entries())
+        if sources:
+            current |= set(CatalogUnion.from_sources(sources).endpoints)
+        return plan_prune(current, self._prune_keep()).dropped
+
+    def plan_route_prune(self) -> RoutePlan:
+        """Which aliases a prune unpublishes: every published definition and
+        registry row but the invocation's catalogs' and the ones deployments
+        serve."""
+        return RoutePlan(dropped=self._prunable())
 
     def commit_route_prune(self, plan: RoutePlan) -> tuple[list[str], ReconcileResult]:
-        """Drop the plan's routes that are still unneeded, and publish. A route
-        that became needed since the plan is kept."""
-        from .routes import plan_prune
+        """Unpublish the plan's aliases that are still unneeded, and publish.
+        One that became needed since the plan is kept."""
+        from .profile import drop_catalog_names
 
         gateway = self._route_gateway()
         confirmed = set(plan.dropped)
 
         def change():
-            desired, inputs = self._admission_view(self.backend.residency())
-            current = gateway.route_entries()
-            still = plan_prune(current, self.backend.route_rows(desired, inputs)).dropped
-            drop = sorted(confirmed & set(still))
+            drop = sorted(confirmed & set(self._prunable()))
             if drop:
-                gateway.replace_route_entries(
-                    {k: v for k, v in current.items() if k not in drop})
+                legacy = gateway.route_entries()
+                kept = {k: v for k, v in legacy.items() if k not in drop}
+                if kept != legacy:
+                    gateway.replace_route_entries(kept)
+                sources = self._published_sources()
+                # A bundle naming an unpublished endpoint goes with it.
+                bundles = {b for src in sources
+                           for b, members in (src.get('bundles') or {}).items()
+                           if set(members or []) & set(drop)}
+                self._store_catalogs(drop_catalog_names(sources, set(drop) | bundles))
             return drop
 
         return self.publish_change(change)
@@ -1908,8 +2012,9 @@ class Controller:
                        ) -> tuple[_T, ReconcileResult]:
         """Run ``change`` and publish, as one serialised desired-state mutation.
 
-        For changes to backend state that the render reads (the route registry,
-        via ``routes seed`` / ``routes prune``). ``change`` runs under the lock
+        For changes to state the render reads outside the ledger (the published
+        catalogs and the legacy route registry, via ``routes seed`` / ``routes
+        prune``). ``change`` runs under the lock
         after the marker is set, so a crash leaves it pending like any other
         mutation. Returns ``(change's result, reconcile result)``.
 

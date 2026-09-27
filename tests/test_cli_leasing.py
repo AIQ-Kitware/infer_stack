@@ -895,7 +895,7 @@ def _patch_backend(monkeypatch, state_dir, catalog=None):
 
 
 def test_routes_seed_then_list(tmp_path, monkeypatch, capsys):
-    """seed two sibling catalogs into the registry, then list shows both."""
+    """seed two sibling catalogs (publish them), then list shows both."""
     from infer_stack.cli.commands_leasing import RoutesListCLI, RoutesSeedCLI
 
     state = tmp_path / 'state'
@@ -918,9 +918,19 @@ def test_routes_seed_then_list(tmp_path, monkeypatch, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert sorted(r['name'] for r in out['routes']) == ['alpha', 'beta']
-    # Seeding then rendering left the gateway config listing both, unchanged on a
-    # re-list (no converge on list): the registry file is byte-stable.
-    assert (state / 'litellm_registry.json').exists()
+    assert {r['origin'] for r in out['routes']} == {'catalog'}
+    # Seeding published the catalogs; the registry stores none of their routes.
+    assert sorted(_published(db)) == ['alpha', 'beta']
+    assert not (state / 'litellm_registry.json').exists()
+
+
+def _published(db):
+    """The published catalog union's endpoints: ``{alias: spec}``."""
+    from infer_stack.leasing import Ledger, SqliteStore
+
+    profile = Ledger(SqliteStore(db)).profile() or {}
+    return {name: spec for source in profile.get('catalogs') or []
+            for name, spec in (source.get('endpoints') or {}).items()}
 
 
 def test_routes_seed_requires_compose_backend(tmp_path, capsys):
@@ -1174,7 +1184,7 @@ def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
 def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monkeypatch, capsys):
     """Queue item 19: seeding a new alias is additive; seeding a different
     definition of an existing alias redirects its clients, so it refuses by
-    default and leaves the registry as it was."""
+    default and leaves the published catalogs as they were."""
     from infer_stack.cli.commands_leasing import RoutesSeedCLI
 
     state = tmp_path / 'state'
@@ -1195,19 +1205,19 @@ def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monk
 
     rc, out = seed(str(first))
     assert rc == 0 and out['added'] == ['alpha']
-    registry = (state / 'litellm_registry.json').read_text()
+    published = _published(db)
 
     rc, out = seed(str(first))                                  # identical: a no-op
     assert out['added'] == [] and out['unchanged'] == ['alpha']
-    assert (state / 'litellm_registry.json').read_text() == registry
+    assert _published(db) == published
 
     with pytest.raises(SystemExit, match='refused'):
         RoutesSeedCLI.main(argv=['--ledger', db, str(second), '--yes'])
-    assert (state / 'litellm_registry.json').read_text() == registry   # unchanged
+    assert _published(db) == published                          # unchanged
 
     rc, out = seed(str(second), '--replace')
     assert rc == 0 and out['updated'] == ['alpha']
-    assert (state / 'litellm_registry.json').read_text() != registry
+    assert _published(db)['alpha']['served_name'] == 'alpha-v2'
 
 
 def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, monkeypatch):

@@ -29,10 +29,12 @@ import yaml
 
 from ..config import PINNED_IMAGES
 from ..leasing.backend import ConvergeScaffold
+from ..leasing.routes import GatewayRoute, route_table
 from ..leasing.gateway import (
     API_KEY_ENV,
     LITELLM_CONTAINER_PORT,
     Gateway,
+    remembered_rows,
     render_front_door,
 )
 
@@ -83,8 +85,8 @@ class ClusterGateway(ConvergeScaffold):
                                base_url=self.base_url)
         self.catalog = None
         #: Render inputs from the kubeai backend (see ComposeBackend's).
-        self.upstream_rows: dict[str, dict[str, Any]] = {}
-        self.upstream_routes: list[dict[str, Any]] = []
+        self.extra_routes: list[GatewayRoute] = []
+        self.extra_dynamic_routes: list[GatewayRoute] = []
         self._node_address: str | None = None
 
     # -- where it is ---------------------------------------------------------
@@ -154,24 +156,24 @@ class ClusterGateway(ConvergeScaffold):
     def access(self, endpoints: list[str]) -> dict[str, Any] | None:
         return self.gateway.access(endpoints)
 
-    def merge_route_registry(self, incoming):
-        return self.gateway.merge_route_registry(incoming)
+    def catalog_routes(self, catalog) -> list[GatewayRoute]:
+        return []              # the kubeai backend supplies its own routes
 
-    def catalog_route_rows(self, catalog) -> dict[str, dict[str, Any]]:
-        return {}              # the kubeai backend supplies its own rows
+    def static_routes(self) -> list[GatewayRoute]:
+        """The static route table: the registry under the backend's routes."""
+        return route_table(self.gateway.registry_routes(), self.extra_routes)
 
     # -- render / apply -----------------------------------------------------
 
-    def _render_documents(self) -> tuple[dict[Path, str], dict[str, Any]]:
-        """``(planned files, merged registry)`` in memory: the one render."""
-        registry = self.gateway.merged_route_registry(dict(self.upstream_rows))
+    def _render_documents(self) -> dict[Path, str]:
+        """The planned files, in memory: the one render."""
         front = render_front_door(
-            [], {}, engine_services=[], vllm_v1_urls=[], ollama_native_urls=[],
+            self.static_routes(), vllm_v1_urls=[], ollama_native_urls=[],
             images=self.images, state={}, litellm=True,
             litellm_port=LITELLM_CONTAINER_PORT, litellm_master_key=None,
             litellm_salt_key=False, ui=False, ui_port=0, reverse_proxy=False,
             reverse_proxy_port=0, reverse_proxy_config=None, aux_dir=self.state_dir,
-            catalog=None, route_registry=registry, dynamic_routing=False,
+            dynamic_routing=False,
         )
         config = front.litellm_config or ''
         key_hash = hashlib.sha256(self.master_key().encode()).hexdigest()[:12]
@@ -179,22 +181,24 @@ class ClusterGateway(ConvergeScaffold):
             namespace=self.namespace, image=self.images['litellm'], config=config,
             key_hash=key_hash, node_port=self.node_port)
         text = '---\n'.join(yaml.safe_dump(d, sort_keys=False) for d in docs)
-        return {self.manifests_file: text}, registry
+        return {self.manifests_file: text}
 
     def preview(self, desired=(), placement=None, *, approve: bool = False):
         """Render without writing; with ``approve``, show the diff now."""
         with self.gateway.staging_secrets():
-            planned, _ = self._render_documents()
+            planned = self._render_documents()
         self._preview_approval(planned, approve=approve)
         return None, None
 
     def converge(self, desired=(), *, apply: bool = True, placement=None):
-        """Render the gateway's objects (and persist the registry after approval)."""
+        """Render the gateway's objects, and write them after approval."""
         with self._converge_lock():
-            planned, registry = self._render_documents()
+            planned = self._render_documents()
             self.last_planned_digest = self._planned_digest(planned)
             self._approve_changes(planned)
-            self.gateway._save_route_registry(registry)
+            self.gateway.remember(remembered_rows(
+                [], {}, defined=set(getattr(self.catalog, 'endpoints', None) or {}),
+                extra=self.extra_routes))
             for path, text in planned.items():
                 self._atomic_write(path, text)
         if apply:

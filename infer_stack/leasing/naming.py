@@ -38,7 +38,8 @@ def vllm_service_name_for(served: str) -> str:
     stability is what lets the LiteLLM gateway carry a *static* route table (one
     per catalog endpoint) whose upstream hosts match the containers when they
     come up — so adding/removing models does not rewrite the gateway's config and
-    the gateway is never recreated (no "blip"); see :func:`_litellm_model_list`.
+    the gateway is never recreated (no "blip"); see
+    :func:`~infer_stack.leasing.gateway.front_door_routes`.
     """
     return f'vllm-{_dns_slug(served)}'
 

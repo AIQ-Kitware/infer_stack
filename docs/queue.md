@@ -1150,7 +1150,21 @@ calls the upstream model the public name. YAML `public_name`/`served_name`
 unchanged. New code (endpoints, routes, access) uses alias / upstream model /
 deployment id.
 
-### 32. [ ] One semantic `GatewayRoute`
+### 32. [x] One semantic `GatewayRoute`
+
+*Done 2026-09-27.* `GatewayRoute` (`leasing/routes.py`) with one renderer,
+`entry()`; `front_door_routes` derives the static table (registry < catalog
+< deployment < upstream) or the dynamic set (one per managed id) for Compose,
+KubeAI's host gateway and the in-cluster gateway alike. `render_front_door`
+takes routes; its catalog-superset and legacy branches and
+`UPSTREAM_ROUTE` are gone (older registry rows spelled `upstream` still
+read). The registry stores only ad-hoc deployments' routes (decision 2,
+revised: see the design doc). Backend protocol: `routes()` /
+`catalog_routes()` replace `route_rows()` / `catalog_route_rows()`. `routes
+seed` merges into the published union (refuses conflicts unless
+`--replace`, never a pinned one), `routes prune` unpublishes, `routes list`
+shows origins. External routes (item 33's static half, and the dynamic id)
+came with it: they route to their own server on every backend.
 
 *Step 1 done 2026-09-27 (decision 1):* `adopt_catalog_sources` merges the
 invocation's catalogs into the published union on every acquire: a changed
@@ -1170,6 +1184,9 @@ storage for everything. Delete `render_front_door` branches that only tests
 reach (cleanup B), never a supported mode.
 
 ### 33. [ ] External routes in static and dynamic routing
+*Partly done with 32:* static and dynamic routes, the `('external', alias)`
+id, the key name in `model_info` for reconcile. Left: survival tests (gc,
+release, dedicated going away) and retirement through a real reconcile.
 Dynamic mode: an external route is standing desired state with a stable
 managed id from its logical owner, the endpoint alias (decision 28.5), not
 from target semantics; the semantic route decides whether it is replaced. It survives zero leases,

@@ -3376,3 +3376,37 @@ catch it. (2) Physical state and serving state are different questions;
 once residency became physical, every reader that meant "is it serving"
 needed its own summary. (3) A race test must inject the other writer at the
 lock, not before the call; otherwise an earlier unlocked check passes it.
+
+## 2026-09-27 — campaign 2, item 32: one GatewayRoute, routes derived at render
+
+**Intent.** Replace the route plumbing (registry rows of three shapes, four
+`render_front_door` strategies, `UPSTREAM_ROUTE`, KubeAI's parallel
+`upstream_rows`) with one route type, and make the published catalog union
+the only store of endpoint definitions (design decision 2). Model: Claude
+Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** `GatewayRoute` with one renderer; `front_door_routes` derives the
+static table or the dynamic set for all three gateways; `routes seed` /
+`prune` publish into and unpublish from the union; external endpoints route
+to their own servers on every backend, with a dynamic id from their alias.
+
+**Changed my mind.** The design said deployment routes would be derived only
+while live. The first full run failed
+`test_converge_to_empty_keeps_the_front_door`: releasing an ad-hoc
+deployment then recreated the gateway, a blip for every client. The registry
+keeps that one owner (routes of aliases no catalog defines), and the design
+doc says so. Also dropped the seed-from-`litellm_config.yaml` migration:
+with catalog rows no longer written, reseeding from our own rendered config
+would have made every route permanent.
+
+**Mistakes.** `Gateway.remember` took the converge flock inside a converge
+and hung the suite (lesson added). A `pkill -f pytest` pattern matched my
+own shell and killed the edit in the same command; the edit had to be
+reapplied.
+
+**Takeaways.** (1) A "derive, do not store" rule needs checking against
+every property the store was providing: the registry was also what kept the
+gateway byte-stable across an ad-hoc release. (2) Tests that called
+`render_compose` with deployments that serve no catalog endpoint were
+testing a branch production never took; making the deployments serve the
+catalog's aliases made them test the real property.

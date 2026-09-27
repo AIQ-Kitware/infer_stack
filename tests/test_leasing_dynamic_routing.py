@@ -27,10 +27,15 @@ from infer_stack.leasing.compose import vllm_service_name
 from infer_stack.leasing.gateway import (
     POSTGRES_SERVICE,
     ROUTE_ID_PREFIX,
-    _litellm_routes,
+    deployment_routes,
     _route_id,
 )
 from infer_stack.leasing.models import Deployment, DeploymentState
+
+
+def _litellm_routes(deployments, assignments):
+    """The rendered dynamic route entries of the placed deployments."""
+    return [r.entry() for r in deployment_routes(deployments, assignments, dynamic=True)]
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
 IMAGES = {

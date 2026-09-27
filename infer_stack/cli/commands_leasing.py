@@ -2571,13 +2571,13 @@ class EnvCLI(_PathOverridesMixin):
 
 
 def _routes_or_exit(call):
-    """Run a route-registry operation; its refusals become CLI errors."""
+    """Run a routes operation; its refusals become CLI errors."""
     from ..leasing.profile import ProfileMismatch
     from ..leasing.routes import RouteConflict
 
     try:
         return call()
-    except (ProfileMismatch, RouteConflict) as ex:
+    except (ProfileMismatch, RouteConflict, CatalogError) as ex:
         raise SystemExit(f'routes: {ex}')
 
 
@@ -2592,15 +2592,33 @@ def _live_endpoints(controller) -> set[str]:
     }
 
 
-class RoutesListCLI(_LeasingCommonMixin):
-    """Print the accumulated LiteLLM route registry (static-superset mode).
+def _route_engine(route) -> str:
+    """The ``engine`` column ``routes list --json`` has always had: ``vllm``
+    or ``ollama`` for an engine this project runs, ``upstream`` for a
+    server it does not (a KubeAI cluster), ``external`` for an external
+    endpoint."""
+    from ..leasing.naming import VLLM_CONTAINER_PORT, vllm_service_name_for
 
-    One row per persisted route: its alias, engine, served-model/tag, the
-    upstream it routes to (a compose service, or a KubeAI cluster's gateway
-    under the Model's name), and whether a live deployment is
-    currently backing it. Routes with no live backer still list (that is the
-    point — a released endpoint stays routable/testable); their upstream simply
-    errors until something serves it.
+    if route.kind == 'ollama':
+        return 'ollama'
+    if route.origin in ('external', 'upstream'):
+        return route.origin
+    ours = f'http://{vllm_service_name_for(route.model)}:{VLLM_CONTAINER_PORT}/v1'
+    return 'vllm' if route.api_base == ours or route.origin == 'deployment' else 'upstream'
+
+
+class RoutesListCLI(_LeasingCommonMixin):
+    """Print the gateway's routes, and where each comes from.
+
+    One row per alias: where it routes (a compose service, a KubeAI cluster's
+    gateway under the Model's name, or an external server), its origin --
+    ``catalog`` or ``external`` (a published catalog endpoint),
+    ``deployment`` (a placed deployment no published catalog defines),
+    ``upstream`` (KubeAI) or ``legacy`` (a row of a route registry from
+    before routes were derived; ``routes prune`` drops those) -- and whether
+    a live deployment backs it. A catalog route with no live backer still
+    lists: a released endpoint stays routable, and its upstream errors until
+    something serves it. With dynamic routing, one row per managed route.
     """
 
     __command__ = 'list'
@@ -2609,65 +2627,50 @@ class RoutesListCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from ..leasing.gateway import registry_route_entry
-
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        registry = _routes_or_exit(controller.route_registry)
-        entries = registry.get('entries', {})
+        routes = _routes_or_exit(controller.route_view)
         live = _live_endpoints(controller)
 
-        rows = []
-        for name in sorted(entries):
-            row = entries[name]
-            engine = row.get('engine')
-            entry = registry_route_entry(name, row)   # what the gateway renders
-            if entry is None:
-                target, upstream = '?', '?'
-            else:
-                params = entry['litellm_params']
-                target = params['model'].split('/', 1)[-1]
-                upstream = params['api_base']
-            rows.append({
-                'name': name,
-                'engine': engine,
-                'target': target,
-                'upstream': upstream,
-                'live': name in live,
-            })
+        rows = [{
+            'name': r.alias,
+            'engine': _route_engine(r),
+            'origin': r.origin,
+            'target': r.model,
+            'upstream': r.api_base,
+            'live': r.alias in live,
+        } for r in routes]
 
         if config.json:
-            print(json.dumps(
-                {'version': registry.get('version'), 'routes': rows}, indent=2
-            ))
+            print(json.dumps({'routes': rows}, indent=2))
             return 0
         if not rows:
-            print('route registry is empty (no converge has run yet)')
+            print('no routes (nothing is published or placed yet)')
             return 0
-        print(f'{len(rows)} route(s) in the registry:')
+        print(f'{len(rows)} route(s):')
         for r in rows:
             flag = 'live' if r['live'] else '   -'
             print(
-                f'  [{flag}] {r["name"]:<28} {r["engine"]:<7} '
+                f'  [{flag}] {r["name"]:<28} {r["origin"]:<10} '
                 f'{r["target"]:<24} -> {r["upstream"]}'
             )
         return 0
 
 
 class RoutesPruneCLI(_ApprovalMixin):
-    """Forget stale routes: keep only the invoking catalog's and the live ones.
+    """Unpublish stale endpoints: keep only the invoking catalog's and the live ones.
 
-    Rewrites the registry to *invoking catalog ∪ live*, then converges (one
-    accepted gateway recreate).
+    Drops every published catalog endpoint (and legacy registry row) that the
+    invoking catalog does not define and no deployment serves, then
+    publishes: their routes go on the next render.
 
-    The registry is append-only by design (that is what keeps the gateway config
-    byte-stable), so pruning is the explicit, operator-driven "forget" verb —
-    automatic pruning is deliberately excluded because any catalog-keyed rule
-    reintroduces the cross-catalog alternation churn this whole mechanism exists
-    to avoid.
+    Published endpoints outlive the runbook that published them (that is what
+    keeps another runbook's routes, and an external endpoint with no lease,
+    in place), so this is the explicit, operator-driven removal; nothing
+    prunes automatically.
 
-    A prune run from the WRONG ``INFER_STACK_CONFIG_DIR`` would silently drop
-    every other runbook's routes, so the exact drop list is shown and confirmed
+    A prune run from the WRONG ``INFER_STACK_CONFIG_DIR`` would drop every
+    other runbook's endpoints, so the exact drop list is shown and confirmed
     first (``--yes`` / a non-terminal skips the prompt).
     """
 
@@ -2687,20 +2690,20 @@ class RoutesPruneCLI(_ApprovalMixin):
         # rechecks under the lock and drops only what is still unneeded.
         plan = _routes_or_exit(controller.plan_route_prune)
         if not plan.dropped:
-            print('routes prune: nothing to drop (registry already minimal)')
+            print('routes prune: nothing to drop')
             return 0
         skip_prompt = bool(config.yes) or not sys.stdout.isatty()
         if not skip_prompt:
-            print('routes prune will DROP these routes:')
+            print('routes prune will UNPUBLISH these endpoints:')
             for name in plan.dropped:
                 print(f'  - {name}')
             if input('drop them? [y/N] ').strip().lower() not in ('y', 'yes'):
-                raise SystemExit('aborted: registry not pruned')
+                raise SystemExit('aborted: nothing unpublished')
         try:
             dropped, rec = _routes_or_exit(lambda: controller.commit_route_prune(plan))
         except ConvergeAborted:
             raise SystemExit('aborted: compose changes not applied')
-        kept = sorted(_routes_or_exit(controller.route_registry).get('entries', {}))
+        kept = sorted(r.alias for r in _routes_or_exit(controller.route_view))
         if config.json:
             print(json.dumps({'dropped': dropped, 'kept': kept,
                               'publication_pending': rec.publication_pending}, indent=2))
@@ -2711,34 +2714,32 @@ class RoutesPruneCLI(_ApprovalMixin):
 
 
 class RoutesSeedCLI(_ApprovalMixin):
-    """Merge extra catalog files' routes into the registry, then converge.
+    """Publish other catalog files' endpoints, so the gateway routes them.
 
-    The operational key to blip-free concurrency: seed *all* the overlapping
-    runbooks' catalogs once while the stack is idle, and then no converge from
-    any of them ever recreates the gateway (the registry is already the full
-    union). Works before ``stack up`` too — the follow-up reconcile brings the
-    standing gateway up with the complete route table, which is exactly what
-    pre-seeding is for.
+    Merges the named catalogs into the published catalog union (the one
+    store of endpoint definitions, shared by every runbook on this stack),
+    then publishes. The operational key to blip-free concurrency: seed *all*
+    the overlapping runbooks' catalogs once while the stack is idle, and no
+    converge from any of them recreates the gateway afterwards. Works before
+    ``stack up`` too.
 
-    Unlike a normal converge (which only ever merges the *invoking* process's own
-    catalog), this folds in sibling catalogs you name explicitly.
-
-    Adding an alias is additive; redefining one already in the registry
-    redirects its clients, so that is refused and nothing is written unless
-    ``--replace`` is given (which shows each change and asks on a terminal).
+    Adding an alias is additive; redefining one already published (or in a
+    legacy registry) redirects its clients, so that is refused and nothing is
+    written unless ``--replace`` is given (which shows each change and asks
+    on a terminal). An endpoint a resident deployment runs is never
+    redefined.
     """
 
     __command__ = 'seed'
 
     replace = kw.Value(
         False, isflag=True,
-        help='Redefine aliases the registry already routes elsewhere.',
+        help='Redefine aliases already published with another meaning.',
     )
 
     catalogs = kw.Value(
         None, nargs='+', position=1, type=str,
-        help='One or more catalog.yaml files whose endpoints to merge into the '
-        'route registry.',
+        help='One or more catalog.yaml files whose endpoints to publish.',
     )
     json = kw.Value(False, isflag=True)
 
@@ -2765,7 +2766,7 @@ class RoutesSeedCLI(_ApprovalMixin):
         plan = _routes_or_exit(lambda: controller.plan_route_seed(catalogs))
         if not plan.incoming:
             raise SystemExit(
-                'routes seed: the named catalog(s) resolved no routable endpoints'
+                'routes seed: the named catalog(s) define no endpoints'
             )
         if plan.conflicted:
             # stderr under --json, which must stay one JSON document on stdout.
@@ -2775,11 +2776,11 @@ class RoutesSeedCLI(_ApprovalMixin):
             for name, (old, new) in sorted(plan.conflicted.items()):
                 print(f'  ~ {name}: {old} -> {new}', file=out)
             if not config.replace:
-                raise SystemExit('routes seed: refused, the registry is unchanged '
+                raise SystemExit('routes seed: refused, nothing was published '
                                  '(pass --replace to redefine them)')
             if not (bool(config.yes) or not sys.stdout.isatty()):
                 if input('redefine them? [y/N] ').strip().lower() not in ('y', 'yes'):
-                    raise SystemExit('aborted: registry unchanged')
+                    raise SystemExit('aborted: nothing published')
         try:
             done, rec = _routes_or_exit(
                 lambda: controller.commit_route_seed(plan, replace=bool(config.replace)))
@@ -3043,12 +3044,12 @@ class NetworkModalCLI(kw.ModalCLI):
 
 
 class RoutesModalCLI(kw.ModalCLI):
-    """Inspect + manage the LiteLLM route registry (static-superset mode).
+    """Inspect the LiteLLM gateway's routes; publish and unpublish endpoints.
 
-    The registry accumulates every catalog's and every live deployment's routes
-    across the runbooks that share one stack, so a cross-catalog converge cannot
-    strip another's live routes and the gateway config stays byte-stable. See
-    docs/litellm-gateway-routing.md.
+    Routes are derived from the published catalog union (every runbook's
+    endpoints on this stack) and the placed deployments, so a cross-catalog
+    converge cannot strip another's routes and the gateway config stays
+    byte-stable. See docs/litellm-gateway-routing.md.
     """
 
     __command__ = 'routes'
