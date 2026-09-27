@@ -390,8 +390,9 @@ class Controller:
     def invocation_profile(self) -> dict | None:
         """The recovery profile this invocation resolves to (its settings and
         catalogs), before any switch to a stored one; ``None`` without one."""
-        render = getattr(self.backend, 'render_profile', None)
-        return self._invocation_profile or (render() if render is not None else None)
+        recovery = self.backend.recovery_profile
+        return self._invocation_profile or (
+            recovery.render_profile() if recovery is not None else None)
 
     @contextlib.contextmanager
     def _global_lock(self):
@@ -446,14 +447,10 @@ class Controller:
         """Which of this lease's deployments cannot be placed even on an idle host.
 
         Returns ``{deployment_id: reason}``, empty when the whole set fits.
-        Backends without an idle-host planner (null, kubeai) return empty --
-        the check is an optimisation over waiting, never a new failure mode.
+        The check is an optimisation over waiting, never a new failure mode.
         """
-        plan_alone = getattr(self.backend, 'plan_on_idle_host', None)
-        if plan_alone is None:
-            return {}
         try:
-            plan = plan_alone(list(deployments))
+            plan = self.backend.plan_on_idle_host(list(deployments))
         except Exception as ex:  # noqa: BLE001 -- never fail an acquire on the check
             # Waiting (the old behavior) is still correct, so a broken check
             # must not break acquire. But it must not be silent either: a
@@ -497,15 +494,17 @@ class Controller:
         before = set(self.backend.observe())
         self.backend.converge(desired, apply=False, placement=placement)
         after = set(self.backend.observe())
+        notes = self.backend.placement_notes()
         rec = ReconcileResult(
             realized=sorted(after - before),
             torn_down=sorted(before - after),
-            unplaced=sorted(getattr(self.backend, 'last_unplaced', ()) or ()),
-            placement_errors=list(getattr(self.backend, 'last_errors', ()) or ()),
-            assignments=dict(getattr(self.backend, 'last_assignments', {}) or {}),
+            unplaced=sorted(self.backend.last_unplaced),
+            placement_errors=list(self.backend.last_errors),
+            assignments=dict(self.backend.last_assignments),
             applied=False,
-            displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
-            degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
+            # The render's own record, the one authority for these facts.
+            displaced=list(notes.get('displaced') or ()),
+            degraded=list(notes.get('degraded') or ()),
         )
         if host is not None:
             self._adopt_existing(residency, host)
@@ -666,7 +665,7 @@ class Controller:
                 host.configure_network(saved)
             self.ledger.migrate_network(
                 subnet=subnet, reset_addresses=reset,
-                approved_digest=getattr(self.backend, 'last_preview_digest', None),
+                approved_digest=self.backend.last_preview_digest,
             )
             return self._publish()
 
@@ -693,8 +692,8 @@ class Controller:
         """
         from .profile import ProfileMismatch
 
-        rotate = getattr(self.backend, 'rotate_master_key', None)
-        if rotate is None or not getattr(self.backend, 'litellm', False):
+        front = self.backend.front_door()
+        if front is None or not front.litellm:
             raise ProfileMismatch('no LiteLLM gateway to rotate a key for')
         with self._global_lock():
             leases, _ = self.ledger.status(virtual_expiry=True)
@@ -705,16 +704,16 @@ class Controller:
                     '(release them, or pass --force)'
                 )
             self._mark_pending(apply=True)
-            replaced = rotate()
+            replaced = front.rotate_master_key()
             self._apply_began = False
             try:
                 rec = self._publish()
             except BaseException:
                 if not self._apply_began:
-                    getattr(self.backend, 'restore_env')(replaced)
+                    front.restore_env(replaced)
                 raise
             if rec.applied and not rec.runtime_applied:
-                getattr(self.backend, 'restore_env')(replaced)
+                front.restore_env(replaced)
                 raise ProfileMismatch(
                     'the key was not changed: the gateway was not recreated ('
                     + (rec.apply_detail or 'the runtime was not reached')
@@ -988,7 +987,7 @@ class Controller:
             # Its digest goes into the pending marker, so a recovery after a
             # crash (and perhaps an upgrade) cannot apply something else.
             self.backend.preview(desired, inputs, approve=True)
-            self._admission_digest = getattr(self.backend, 'last_preview_digest', None)
+            self._admission_digest = self.backend.last_preview_digest
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
         return allocations, reasons
@@ -1028,10 +1027,10 @@ class Controller:
         """
         from .profile import catalog_sources
 
-        render = getattr(self.backend, 'render_profile', None)
-        if render is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             return
-        base = dict(self._invocation_profile or render())
+        base = dict(self._invocation_profile or recovery.render_profile())
         base['catalogs'] = catalog_sources(catalog)
         self._invocation_profile = base
         self._profile_drift_warned = False
@@ -1151,9 +1150,9 @@ class Controller:
         return candidate if candidate != stored else None
 
     def _use_profile_candidate(self, profile: dict) -> None:
-        use = getattr(self.backend, 'use_profile', None)
-        if use is not None:
-            use(profile)
+        recovery = self.backend.recovery_profile
+        if recovery is not None:
+            recovery.use_profile(profile)
 
     def _commit_profile_candidate(self, profile: dict) -> None:
         """Persist an already-previewed acquire profile without publishing alone.
@@ -1185,11 +1184,10 @@ class Controller:
         from .._log import logger
         from .profile import profile_drift
 
-        render = getattr(self.backend, 'render_profile', None)
-        use = getattr(self.backend, 'use_profile', None)
-        read = getattr(self.ledger, 'profile', None)
-        if render is None or use is None or read is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             return
+        render, use, read = recovery.render_profile, recovery.use_profile, self.ledger.profile
         if create and self._profile_error is not None:
             raise self._profile_error
         stored = read()
@@ -1259,7 +1257,7 @@ class Controller:
             rec.publication_pending = True    # staged; never applied here
             return rec
         approved = marker.get('approved_digest')
-        rendered = getattr(self.backend, 'last_planned_digest', None)
+        rendered = self.backend.last_planned_digest
         if approved and rendered and rendered != approved:
             if not self._explicit_apply:
                 from .profile import ProfileMismatch
@@ -1657,9 +1655,7 @@ class Controller:
                 if candidate_profile is not None:
                     self._use_profile_candidate(candidate_profile)
                 try:
-                    validate = getattr(self.backend, 'validate_requests', None)
-                    if validate is not None:
-                        validate(requests)
+                    self.backend.validate_requests(requests)
                     overlay = self.ledger.plan_acquire(
                         requests,
                         resident=residency.is_resident if residency is not None else None)
@@ -1825,7 +1821,7 @@ class Controller:
         from .profile import ProfileMismatch
 
         front = self.backend.front_door()
-        if front is None or not getattr(front, 'litellm', False):
+        if front is None or not front.litellm:
             raise ProfileMismatch(
                 'the `routes` commands need a LiteLLM gateway (the compose or '
                 'kubeai backend, with `litellm` on)')
@@ -1940,9 +1936,10 @@ class Controller:
         from .profile import ProfileMismatch
         from .residency import ResidencyUnknown
 
-        use = getattr(self.backend, 'use_profile', None)
-        if use is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             raise ProfileMismatch('this backend has no publishable profile')
+        use = recovery.use_profile
         stored = self.ledger.profile()
         if stored is not None and stored.get('backend') != profile.get('backend'):
             # The quiescence check below can only see the NEW backend's

@@ -1228,6 +1228,11 @@ class KubeaiBackend(ConvergeScaffold):
     #: No containers of this host to manage: the cluster owns network and pods.
     host_runtime = None
 
+    @property
+    def recovery_profile(self) -> KubeaiBackend:
+        """This backend is its own :class:`~infer_stack.leasing.backend.RecoveryProfile`."""
+        return self
+
     def settle_snapshot(self):
         """The host gateway's Compose containers, or ``None``.
 

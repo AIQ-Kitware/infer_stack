@@ -142,7 +142,7 @@ def allocates_gpus(backend) -> bool:
     admission commits an empty allocation, and no GPU is ever "unresolved".
     The one place the controller and the CLI ask this.
     """
-    return bool(getattr(backend, 'allocates_gpus', True))
+    return bool(backend.allocates_gpus)
 
 
 class HostRuntime(Protocol):
@@ -183,6 +183,48 @@ class HostRuntime(Protocol):
         ...
 
 
+class FrontDoor(Protocol):
+    """The LiteLLM gateway as the controller and the CLI address it.
+
+    ``backend.front_door()`` returns one, or ``None`` for a backend without a
+    gateway: the Compose project itself, KubeAI's gateway on this host or in
+    the cluster. Keys, the route registry, and "does it accept this key" live
+    here, not as copies on every serving backend.
+    """
+
+    #: Whether LiteLLM is on (a front door can be Open WebUI alone).
+    litellm: bool
+    #: The gateway's state: settings, managed keys, the route registry.
+    gateway: Any
+
+    def master_key(self) -> str:
+        ...
+
+    def rotate_master_key(self) -> dict[str, str | None]:
+        """Write a fresh key; return what it replaced (for :meth:`restore_env`)."""
+        ...
+
+    def restore_env(self, values: dict[str, str | None]) -> None:
+        ...
+
+    def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
+        ...
+
+
+class RecoveryProfile(Protocol):
+    """A backend's recovery snapshot: what it would render, and adopting one.
+
+    ``backend.recovery_profile`` is one of these, or ``None`` (the in-process
+    backends have no settings to snapshot).
+    """
+
+    def render_profile(self) -> dict[str, Any]:
+        ...
+
+    def use_profile(self, profile: dict[str, Any]) -> None:
+        ...
+
+
 @runtime_checkable
 class ServingBackend(Protocol):
     """What the :class:`Controller` needs from a serving backend.
@@ -208,6 +250,25 @@ class ServingBackend(Protocol):
     last_errors: list[str]
     last_assignments: dict[str, list[int]]
     last_preview_digest: str | None
+    #: The digest of the last render's files: the approval guard compares it
+    #: with the approved one, so every backend must keep it current.
+    last_planned_digest: str | None
+    #: Whether this backend owns host GPU indices (Compose) or the cluster
+    #: does (KubeAI). Required: a wrong default would claim host GPUs.
+    allocates_gpus: bool
+
+    @property
+    def recovery_profile(self) -> RecoveryProfile | None:
+        """This backend's recovery snapshot, or ``None`` (see :class:`RecoveryProfile`)."""
+        ...
+
+    def plan_on_idle_host(self, desired: list[Deployment]) -> Any:
+        """Placement for ``desired`` alone, as if nothing else ran (a plan)."""
+        ...
+
+    def validate_requests(self, requests: list[Any]) -> None:
+        """Refuse requests this backend can never serve (raise); else nothing."""
+        ...
 
     @property
     def host_runtime(self) -> HostRuntime | None:
@@ -273,7 +334,7 @@ class ServingBackend(Protocol):
         residents that yielded their GPUs). Empty where nothing is placed."""
         ...
 
-    def front_door(self) -> Any:
+    def front_door(self) -> FrontDoor | None:
         """What holds the LiteLLM gateway (its keys and route registry), or
         ``None`` for a backend without one."""
         ...
@@ -483,8 +544,17 @@ class SimpleAdmission:
 
     allocates_gpus = False
     last_preview_digest: str | None = None
-    #: No containers on this host to manage.
+    last_planned_digest: str | None = None
+    #: No containers on this host to manage, no settings to snapshot.
     host_runtime: HostRuntime | None = None
+    recovery_profile: RecoveryProfile | None = None
+
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Nothing else competes in-process: the ordinary plan."""
+        return self.plan(desired)
+
+    def validate_requests(self, requests: list[Any]) -> None:
+        """Every request is servable in-process."""
 
     def placement_notes(self) -> dict[str, list[str]]:
         return {}
@@ -497,7 +567,7 @@ class SimpleAdmission:
         """One scheduling domain in-process: any idle deployment frees room."""
         return [g.id for g in idle]
 
-    def front_door(self) -> Any:
+    def front_door(self) -> FrontDoor | None:
         return None                     # no gateway in-process
 
     def route_rows(self, desired: list[Deployment], placement: Any = None
@@ -575,10 +645,10 @@ class SimpleAdmission:
             if gid not in self.observe():
                 self.realize(deployment)
 
-    # Set by converge (the controller reads them with a default before then).
-    last_unplaced: set[str]
-    last_errors: list[str]
-    last_assignments: dict[str, list[int]]
+    # Replaced (never mutated) by each converge.
+    last_unplaced: set[str] = set()
+    last_errors: list[str] = []
+    last_assignments: dict[str, list[int]] = {}
 
     def observe(self) -> set[str]:  # pragma: no cover - provided by the backend
         raise NotImplementedError
@@ -687,6 +757,7 @@ def _conforms() -> None:  # pragma: no cover - read by the type checker only
     the protocol fails the type check rather than a run.
     """
     from ..backends.kubeai import KubeaiBackend
+    from ..backends.kubeai_gateway import ClusterGateway
     from .compose import ComposeBackend
 
     def compose(backend: ComposeBackend) -> ServingBackend:
@@ -702,4 +773,16 @@ def _conforms() -> None:  # pragma: no cover - read by the type checker only
         return backend
 
     def host(backend: ComposeBackend) -> HostRuntime:
+        return backend
+
+    def compose_front(backend: ComposeBackend) -> FrontDoor:
+        return backend
+
+    def cluster_front(backend: ClusterGateway) -> FrontDoor:
+        return backend
+
+    def compose_profile(backend: ComposeBackend) -> RecoveryProfile:
+        return backend
+
+    def kubeai_profile(backend: KubeaiBackend) -> RecoveryProfile:
         return backend

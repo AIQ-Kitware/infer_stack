@@ -1141,8 +1141,6 @@ class ComposeBackend(ConvergeScaffold):
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()  # desired deployment ids placement skipped
         self.last_assignments: dict[str, list[int]] = {}  # deployment id -> GPU ids
-        self.last_displaced: list[str] = []  # optional residents that yielded
-        self.last_degraded: list[str] = []   # invalid committed allocations
         self._pulled: set[str] = set()  # (deployment:tag) pulled this process
         # VRAM facts (docs/planning/vram-aware-placement.md Phase 3): the
         # measured-requirement overlay + a per-process cache of weight-bytes
@@ -1793,8 +1791,6 @@ class ComposeBackend(ConvergeScaffold):
             plan, rendered, planned = docs['plan'], docs['rendered'], docs['planned']
             fingerprints = docs['fingerprints']
             self.last_assignments = dict(plan.assignments)
-            self.last_displaced = list(plan.displaced)
-            self.last_degraded = list(plan.degraded)
             for gid, gpus in sorted(plan.assignments.items()):
                 logger.info('  placed {} {}', gid,
                             f'on GPU(s) {gpus}' if gpus else 'without a GPU')
@@ -1925,6 +1921,14 @@ class ComposeBackend(ConvergeScaffold):
     #: Service-level ownership adopted at migration: container id ->
     #: {service, fingerprint}. Set by the controller from the ledger.
     adopted: dict[str, dict[str, str]] = {}
+
+    #: This backend places on this host's GPUs and records them.
+    allocates_gpus = True
+
+    @property
+    def recovery_profile(self) -> ComposeBackend:
+        """This backend is its own :class:`~infer_stack.leasing.backend.RecoveryProfile`."""
+        return self
 
     # -- HostRuntime: what only containers on this host have -----------------
 

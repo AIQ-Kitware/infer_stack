@@ -321,10 +321,11 @@ def test_a_lease_that_merely_needs_room_still_queues():
     assert backend.idle_plan_calls == 1  # consulted once, said "keep waiting"
 
 
-def test_backend_without_an_idle_planner_is_unaffected():
-    """null/kubeai have no plan_on_idle_host: the check is skipped, not failed."""
+def test_an_in_process_idle_planner_is_the_ordinary_plan():
+    """Every backend has plan_on_idle_host (it is part of the protocol); the
+    in-process one is its ordinary plan, so a lease that fits alone is
+    feasible, as when the check used to be skipped."""
     ctl, backend, _, _ = _make(budget=1, sleep=_advance_only)
-    assert not hasattr(backend, 'plan_on_idle_host')
     a = ctl.acquire('alice', [vreq('A')])
     assert ctl._infeasible_alone(a.deployments, {g.id for g in a.deployments}) == {}
 
