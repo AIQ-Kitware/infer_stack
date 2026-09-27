@@ -3347,3 +3347,32 @@ lifecycle. (2) When a boolean crosses a boundary, ask what the caller does
 with the cases it merges; `True/False` and `needs_room` each merged cases
 that needed opposite actions. (3) Run long e2e passes from a frozen copy
 (lessons.md).
+
+## 2026-09-26 20:23:05 -0400 — re-review: second-order cases
+
+**Intent.** The re-review closed most of items 11-22 and reopened five, plus
+a route-seed race, for states the richer abstractions exposed but did not
+carry through; and it classified the optional backend hooks instead of
+promoting them all. Model: Claude Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** In the order the reviewer asked, each with a test failing on the
+code before it: KubeAI settles its host gateway after an interrupted apply
+(the safety bug: `settle_snapshot` was an optional probe KubeAI lacked);
+rotation keys on "the runtime changed", not "apply was called"; an explicit
+re-approval is durable; replicas are judged from their own logs and
+`deployment_health` separates serving from residency; reclaim fails closed
+on schedulers and constraints it does not model; a race-time seed conflict
+leaves no marker; the hooks are required state, common operations, or two
+typed nullable capabilities (`recovery_profile`, `FrontDoor`).
+
+**Mistake.** One commit went in with a failing test: the chain ran pytest
+and then committed regardless. Fixed forward in the next commit; later
+commits gate on pytest's exit code.
+
+**Takeaways.** (1) An optional structural probe is a silent default: absent
+meant "nothing to settle" and "owns host GPUs", both wrong for a backend
+that simply had not implemented them. Required members make the checker
+catch it. (2) Physical state and serving state are different questions;
+once residency became physical, every reader that meant "is it serving"
+needed its own summary. (3) A race test must inject the other writer at the
+lock, not before the call; otherwise an earlier unlocked check passes it.
