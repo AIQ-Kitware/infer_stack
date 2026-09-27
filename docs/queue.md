@@ -1349,6 +1349,79 @@ docs, not only CLI help. Journal: fake lease vs access above leasing;
 state; direct remote vs stable front door. Full suite, `ty`, flake8, UX
 audits, the relevant real e2e.
 
+## Campaign 2 review (2026-09-27, reviewed through `21ade9a`)
+
+The architecture stands; these are places where the publication/profile
+transaction model had not caught up with published catalogs being real
+desired state. Items 42-45 must be fixed before campaign 2 is closed.
+
+### 42. [ ] The first profile, and a profile candidate, commit with publication intent
+`_sync_profile(create=True)` persists an absent profile at once, before
+preview, approval or marker. Since `profile.catalogs` is the published
+endpoint set, that publishes the invocation's endpoints outside the
+transaction: a crash or a declined approval leaves them durable with no
+marker. Acquire has the same gap on an existing profile (candidate, marker
+and lease are three transactions). Do: an absent profile is a candidate,
+never a write; a non-endpoint mutation (gc, release, apply) on a fresh
+ledger persists settings with no catalogs, together with its marker; an
+acquire commits profile + marker + lease in one transaction; external-only
+access already uses `publish_profile`. Poison tests: fresh external access
+declined (no profile, marker, route); crash before the commit; fresh managed
+acquire declined (no lease, no profile); first access commits profile and
+marker together; `gc` on a fresh ledger publishes no endpoint.
+
+### 43. [ ] Access readiness includes route publication
+External-only `access` returns ready when LiteLLM answers the master key,
+even if the route reconcile failed (`routes=False`, publication pending).
+Carry the publication result into `AccessResult`; ready requires it
+complete and the front door authenticated; never a request to the upstream.
+Readiness tri-state (`None` = not checked, e.g. `--no-wait`). Poison: route
+reconcile fails, auth succeeds -> not ready, nonzero, pending; a retry that
+succeeds makes it ready.
+
+### 44. [ ] Missing external keys refuse publication, whatever the command
+Only `access` and `routes seed` check; renders warn. An unrelated
+`acquire`/`apply`/`release`/`gc`/`config publish` can recreate the gateway
+without a key a published route needs. Validate the full desired route set
+at the render (both gateways), before any mutation; a typed front-door
+operation, not callers reading the gateway's `.env` path.
+
+### 45. [ ] Pinning protects every resident alias, not only catalog ones
+`routes seed --replace` (and an acquire's catalog adoption) can publish a
+new meaning for an alias a resident ad-hoc deployment serves (no catalog
+definition, registry-only or dynamic route). Pinning is an endpoint rule:
+refuse any change to what a resident alias means, whatever source held it.
+Poison: resident ad-hoc `qwen`, `routes seed --replace` qwen -> external,
+dynamic routing: refuse, no catalog/registry change, no marker.
+
+### 46. [ ] Finish `FrontDoorControl`
+Upper layers still reach `front.gateway` (`missing_keys`, `_env_path`,
+registry rows) and backend-level gateway proxies; the secrets CLI uses
+`getattr(backend, 'litellm')`, `backend.master_key()`. Give the capability
+the operations callers need; drop `gateway: Any` from it and proxies whose
+only job was exposing the gateway.
+
+### 47. [ ] Published catalog state: one mutation API (design candidate)
+`profile.catalogs` is a list of source snapshots edited by
+`adopt_catalog_sources`, `drop_catalog_names`, bundle repair. Candidate: one
+`PublishedCatalogSet` API for every mutation (serialization unchanged).
+Record; do only if more bugs appear here.
+
+### 48. [ ] `routes list` is desired state; say so
+It derives routes from published definitions and deployments, not from the
+gateway. Label it desired, show whether a publication is pending; a live
+inspection, if ever, is a separate command.
+
+### 49. [ ] External `api_base`: stricter parsing, networking documented
+`urlsplit`: http(s), a hostname, no whitespace. Document that `api_base` is
+resolved in the gateway's network (container or pod): `localhost` is the
+gateway itself.
+
+### 50. [ ] Pre-registry state directories: decide the migration explicitly
+The seed-from-`litellm_config.yaml` path was dropped as incidental. Decide:
+a one-time versioned migration of only what has no other source, or none,
+recorded with the reason.
+
 ## Non-goals
 Direct external access (a second access mode where the alias stops being
 the model name) is a possible later optimization, not campaign 2.
