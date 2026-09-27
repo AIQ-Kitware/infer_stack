@@ -776,3 +776,16 @@ def test_a_catalog_matching_the_resident_deployment_is_not_a_redefinition(tmp_pa
     _, other = _ctl(tmp_path, cat, docker)
     other.acquire('me', cat.resolve_requests(['local']), wait=False, apply=False)
     assert 'qwen' in _published(ledger)
+
+
+def test_routes_list_says_it_is_desired_state_and_when_publication_is_pending(cli, capsys):
+    from infer_stack.leasing import Ledger, SqliteStore
+
+    assert cli.cl.AccessCLI.main(argv=['remote', *cli.base]) == 0
+    capsys.readouterr()
+    cli.cl.RoutesListCLI.main(argv=[*cli.base[:2], '--json'])
+    data = json.loads(capsys.readouterr().out)
+    assert data['state'] == 'desired' and data['publication_pending'] is False
+    Ledger(SqliteStore(cli.base[1])).mark_publication_pending(apply_requested=True)
+    cli.cl.RoutesListCLI.main(argv=cli.base[:2])
+    assert 'publication pending' in capsys.readouterr().out

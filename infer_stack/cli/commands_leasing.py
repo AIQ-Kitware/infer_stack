@@ -2780,7 +2780,13 @@ def _route_engine(route) -> str:
 
 
 class RoutesListCLI(_LeasingCommonMixin):
-    """Print the gateway's routes, and where each comes from.
+    """Print the routes the gateway is to serve, and where each comes from.
+
+    This is desired state, derived from the published endpoints and the
+    deployments the next render places; it is what the gateway has once the
+    last publication completed. While one is pending (``publication
+    pending`` below), the gateway may not have them yet: ``infer-stack
+    apply`` finishes it.
 
     One row per alias: where it routes (a compose service, a KubeAI cluster's
     gateway under the Model's name, or an external server), its origin --
@@ -2803,6 +2809,7 @@ class RoutesListCLI(_LeasingCommonMixin):
         controller = _open_controller(config)
         routes = _routes_or_exit(controller.route_view)
         live = _live_endpoints(controller)
+        pending = controller.ledger.publication_pending() is not None
 
         rows = [{
             'name': r.alias,
@@ -2814,12 +2821,16 @@ class RoutesListCLI(_LeasingCommonMixin):
         } for r in routes]
 
         if config.json:
-            print(json.dumps({'routes': rows}, indent=2))
+            print(json.dumps({'state': 'desired', 'publication_pending': pending,
+                              'routes': rows}, indent=2))
             return 0
+        if pending:
+            print('publication pending: the gateway may not have these yet '
+                  '(`infer-stack apply` finishes it)')
         if not rows:
             print('no routes (nothing is published or placed yet)')
             return 0
-        print(f'{len(rows)} route(s):')
+        print(f'{len(rows)} route(s) the gateway is to serve:')
         for r in rows:
             flag = 'live' if r['live'] else '   -'
             print(

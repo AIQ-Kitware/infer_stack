@@ -1436,22 +1436,37 @@ the operations callers need; drop `gateway: Any` from it and proxies whose
 only job was exposing the gateway.
 
 ### 47. [ ] Published catalog state: one mutation API (design candidate)
+*Recorded 2026-09-27, not done:* today the mutations are
+`adopt_catalog_sources`, `drop_catalog_names` (with its bundle rule) and
+`merge_catalog_sources`, all in `profile.py`, each validated by rebuilding
+the union. Revisit if another bug lands here.
 `profile.catalogs` is a list of source snapshots edited by
 `adopt_catalog_sources`, `drop_catalog_names`, bundle repair. Candidate: one
 `PublishedCatalogSet` API for every mutation (serialization unchanged).
 Record; do only if more bugs appear here.
 
-### 48. [ ] `routes list` is desired state; say so
+### 48. [x] `routes list` is desired state; say so
+*Done 2026-09-27:* help, text and JSON (`state: desired`,
+`publication_pending`) say so; a pending publication is announced above the
+table. No live inspection command.
 It derives routes from published definitions and deployments, not from the
 gateway. Label it desired, show whether a publication is pending; a live
 inspection, if ever, is a separate command.
 
-### 49. [ ] External `api_base`: stricter parsing, networking documented
+### 49. [x] External `api_base`: stricter parsing, networking documented
+*Done 2026-09-27:* `urlsplit` (http(s), a hostname, a valid port, no
+whitespace); README and the design doc say `api_base` is resolved in the
+gateway's network, with the same-host Docker bridge example (the one
+`dev/external_e2e.sh` uses).
 `urlsplit`: http(s), a hostname, no whitespace. Document that `api_base` is
 resolved in the gateway's network (container or pod): `localhost` is the
 gateway itself.
 
-### 50. [ ] Pre-registry state directories: decide the migration explicitly
+### 50. [x] Pre-registry state directories: decide the migration explicitly
+*Decided 2026-09-27: no migration*, recorded in `known-limitations.md` with
+the reason (seeding would restore the duplicate authority; catalog routes
+come back from their runbooks or `routes seed`; such states also predate the
+recovery profile). Reopen if a real installation needs it.
 The seed-from-`litellm_config.yaml` path was dropped as incidental. Decide:
 a one-time versioned migration of only what has no other source, or none,
 recorded with the reason.

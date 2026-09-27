@@ -52,9 +52,12 @@ ad-hoc deployment) and a genuinely changed endpoint definition.
 
 ### Managing routes: `infer-stack routes`
 
-- `infer-stack routes list`: every route the next render has (alias, origin,
-  upstream model, upstream, and whether a live deployment backs it). Origins
-  are `catalog`, `external`, `deployment`, `upstream` (KubeAI) and `registry`.
+- `infer-stack routes list`: the routes the gateway is to serve (alias,
+  origin, upstream model, upstream, and whether a live deployment backs it).
+  It is desired state, derived from the published endpoints and placed
+  deployments, and says when a publication is pending (the gateway may not
+  have them yet; `infer-stack apply` finishes it). Origins are `catalog`,
+  `external`, `deployment`, `upstream` (KubeAI) and `registry`.
 - `infer-stack routes seed <catalog.yaml> [...]`: publish sibling runbooks'
   catalogs (merge them into the published union) and publish once. The
   operational key to blip-free concurrency: **seed all overlapping runbooks'

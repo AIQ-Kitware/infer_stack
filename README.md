@@ -176,6 +176,9 @@ infer-stack access qwen-remote --env-file qwen.env
 source qwen.env                                 # OPENAI_BASE_URL, OPENAI_API_KEY, ...
 ```
 
+`api_base` is resolved from inside the gateway's container or pod:
+`localhost` there is the gateway itself, so a server on the same host is
+reached through the Docker bridge address (e.g. `http://172.17.0.1:8000/v1`).
 See [docs/planning/external-endpoints.md](docs/planning/external-endpoints.md).
 
 ```yaml

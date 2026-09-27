@@ -86,7 +86,7 @@ def external_errors(name: str, raw: dict[str, Any], external: Any) -> list[str]:
         errors.append(f"endpoint {name!r}: unknown external key(s) {unknown} "
                       '(api_base, model, api_key_env)')
     base = external.get('api_base')
-    if not isinstance(base, str) or not re.match(r'https?://[^/\s]+', base):
+    if not _is_http_url(base):
         errors.append(f"endpoint {name!r}: external.api_base must be an http(s) URL, "
                       f'not {base!r}')
     if not external.get('model') or not isinstance(external.get('model'), str):
@@ -101,6 +101,25 @@ def external_errors(name: str, raw: dict[str, Any], external: Any) -> list[str]:
             errors.append(f"endpoint {name!r}: external.api_key_env may not be "
                           f"{key_env}, one of infer-stack's own secrets")
     return errors
+
+
+def _is_http_url(value: Any) -> bool:
+    """An absolute http(s) URL with a host, no whitespace, a valid port.
+
+    >>> [_is_http_url(v) for v in ('http://box:8000/v1', 'https://h/v1', 'box:8000',
+    ...  'http:///v1', 'http://a b/v1', 'ftp://h/', 'http://h:99999/', None)]
+    [True, True, False, False, False, False, False, False]
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return False
+    try:
+        parts = urlsplit(value)
+        parts.port                      # raises on a malformed port
+    except ValueError:
+        return False
+    return parts.scheme in ('http', 'https') and bool(parts.hostname)
 
 
 @dataclass(frozen=True)

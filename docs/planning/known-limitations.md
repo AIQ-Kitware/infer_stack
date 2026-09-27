@@ -171,6 +171,20 @@ the cluster's nodes (verified with a second node in a container; a run
 across two real machines is `dev/handover/p5_two_hosts.sh`). One deployment
 spanning machines (tensor parallel across nodes) is supported on neither.
 
+### State from before the route registry is not migrated (design boundary)
+
+A state directory whose gateway predates `litellm_registry.json` (it has a
+rendered `litellm_config.yaml` and no registry) is no longer seeded from
+that config. Decided 2026-09-27 (queue item 50): seeding it again would make
+every rendered route permanent registry state, the duplicate authority the
+published catalogs replaced, and what it could recover has another source:
+catalog endpoints are republished by their runbooks' next acquire (or at
+once, `infer-stack routes seed CATALOG...`), and an ad-hoc deployment's
+route by its next acquire. What is lost is an ad-hoc route whose deployment
+is gone and whose runbook never runs again, whose upstream was already
+gone. Such state directories also predate the recovery profile (2026-09-16;
+the registry is from 2026-07-13), so they could not be resumed anyway.
+
 ### The in-cluster gateway routes only (current, deferred)
 
 With `kubeai_gateway cluster` the LiteLLM gateway is a Deployment and a

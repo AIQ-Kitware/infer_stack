@@ -24,6 +24,17 @@ infer-stack access qwen --env-file qwen.env  # publish the route; no lease
 source qwen.env && my-eval --model "$INFER_STACK_ENDPOINT_QWEN"
 ```
 
+**`api_base` is resolved by the gateway, not by your shell.** LiteLLM runs
+in a container (Compose, KubeAI's host gateway) or a pod (the in-cluster
+gateway), so `http://localhost:8000/v1` means the gateway itself, not the
+host you typed it on. A server on the same host is reached through the
+host's address as the gateway's network sees it: on Compose, the Docker
+bridge (`http://172.17.0.1:8000/v1` on a default install; `ip -4 addr show
+docker0`), with the server listening on that interface, not only on
+127.0.0.1; from the in-cluster gateway, a node address or a Service name.
+A server elsewhere is reached by any name or address the gateway can
+resolve. `infer-stack test <alias>` checks the whole path.
+
 Switching `qwen` back to a managed runtime (`engine: vllm`, `model: ...`)
 changes neither the alias nor these commands: `access` then takes a lease and
 waits for the model, and the env-file gains `INFER_STACK_LEASE_ID`. A bundle
