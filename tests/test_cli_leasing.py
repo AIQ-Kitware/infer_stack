@@ -1208,3 +1208,33 @@ def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monk
     rc, out = seed(str(second), '--replace')
     assert rc == 0 and out['updated'] == ['alpha']
     assert (state / 'litellm_registry.json').read_text() != registry
+
+
+def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, monkeypatch):
+    """Re-review 7: another process redefines the alias between the plan and
+    the commit; the commit refuses, writes nothing, and leaves no pending
+    publication behind."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.routes import RouteConflict
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
+    controller = cl._open_controller(config, interactive=False)
+    plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    gateway = controller.backend.front_door().gateway
+    real_lock = controller._global_lock
+
+    def racing_lock():
+        # The other process wins the lock first and redefines alpha.
+        gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'elsewhere'}})
+        return real_lock()
+
+    controller._global_lock = racing_lock
+    with pytest.raises(RouteConflict):
+        controller.commit_route_seed(plan)
+    assert controller.ledger.publication_pending() is None
+    assert gateway.route_entries() == {'alpha': {'engine': 'vllm', 'served': 'elsewhere'}}

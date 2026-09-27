@@ -1858,10 +1858,15 @@ class Controller:
         if fresh.conflicted and not replace:
             raise RouteConflict(sorted(fresh.conflicted))
 
-        def change():
+        def preflight():
+            # Under the lock, before the marker: a conflict another process
+            # made since the plan refuses without leaving a publication pending.
             now = plan_seed(gateway.route_entries(), plan.incoming)
             if now.conflicted and not replace:
                 raise RouteConflict(sorted(now.conflicted))
+
+        def change():
+            now = plan_seed(gateway.route_entries(), plan.incoming)
             entries = gateway.route_entries()
             entries.update(now.added)
             if replace:
@@ -1870,7 +1875,7 @@ class Controller:
                 gateway.replace_route_entries(entries)
             return now
 
-        return self.publish_change(change)
+        return self.publish_change(change, preflight=preflight)
 
     def plan_route_prune(self) -> RoutePlan:
         """Which routes a prune drops: all but the catalog's and the live ones,
@@ -1901,15 +1906,22 @@ class Controller:
 
         return self.publish_change(change)
 
-    def publish_change(self, change: Callable[[], _T]) -> tuple[_T, ReconcileResult]:
+    def publish_change(self, change: Callable[[], _T], *,
+                       preflight: Callable[[], None] | None = None
+                       ) -> tuple[_T, ReconcileResult]:
         """Run ``change`` and publish, as one serialised desired-state mutation.
 
         For changes to backend state that the render reads (the route registry,
         via ``routes seed`` / ``routes prune``). ``change`` runs under the lock
         after the marker is set, so a crash leaves it pending like any other
         mutation. Returns ``(change's result, reconcile result)``.
+
+        ``preflight`` runs under the lock before the marker is set: a check
+        that refuses there (raises) leaves no publication pending.
         """
         with self._global_lock():
+            if preflight is not None:
+                preflight()
             self._mark_pending(apply=True)
             result = change()
             rec = self._publish()
