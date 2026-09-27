@@ -1893,12 +1893,31 @@ class Controller:
         from .profile import CatalogUnion, catalog_sources
         from .routes import plan_seed
 
-        self._route_gateway()
+        gateway = self._route_gateway()
         sources = [s for c in catalogs for s in catalog_sources(c)]
-        incoming = self._meanings(CatalogUnion.from_sources(sources) if sources else None)
+        union = CatalogUnion.from_sources(sources) if sources else None
+        self._require_keys(gateway, union)
+        incoming = self._meanings(union)
         plan = plan_seed(self._published_meanings(), incoming)
         plan.sources = sources
         return plan
+
+    @staticmethod
+    def _require_keys(gateway, catalog) -> None:
+        """Refuse to publish an external endpoint whose key variable has no
+        value in the managed ``.env`` (docs/planning/external-endpoints.md,
+        decision 4): the gateway would send an empty key."""
+        from .endpoints import key_references
+        from .profile import ProfileMismatch
+
+        refs = key_references(catalog)
+        missing = gateway.missing_keys(sorted(refs))
+        if missing:
+            name = missing[0]
+            raise ProfileMismatch(
+                f'endpoint {refs[name][0]!r} sends ${name} as its key, which '
+                f'{gateway._env_path} does not set; set it first: '
+                f'`infer-stack env {name}=...`')
 
     def commit_route_seed(self, plan: RoutePlan, *, replace: bool = False
                           ) -> tuple[RoutePlan, ReconcileResult]:

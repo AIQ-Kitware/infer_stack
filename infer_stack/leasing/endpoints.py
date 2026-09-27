@@ -118,6 +118,26 @@ class ExternalTarget:
     kind = 'external'
 
 
+def key_references(catalog: Any) -> dict[str, list[str]]:
+    """``{variable: [endpoint alias, ...]}`` for every external endpoint of
+    ``catalog`` that names a key.
+
+    >>> from infer_stack.leasing.catalog import Catalog
+    >>> key_references(Catalog.from_dict({'endpoints': {'r': {'external': {
+    ...     'api_base': 'http://b/v1', 'model': 'm', 'api_key_env': 'R_KEY'}}}}))
+    {'R_KEY': ['r']}
+    """
+    refs: dict[str, list[str]] = {}
+    for alias in sorted(getattr(catalog, 'endpoints', None) or {}):
+        try:
+            target = catalog.resolve_endpoint(alias).target
+        except Exception:  # noqa: BLE001 - an invalid endpoint names no key
+            continue
+        if isinstance(target, ExternalTarget) and target.api_key_env:
+            refs.setdefault(target.api_key_env, []).append(alias)
+    return refs
+
+
 @dataclass(frozen=True)
 class ResolvedEndpoint:
     """One endpoint's meaning: ``alias`` (what clients request), ``protocol``

@@ -168,6 +168,11 @@ def deployment_routes(
     return routes
 
 
+def route_key_envs(routes: Sequence[GatewayRoute]) -> list[str]:
+    """The variables ``routes`` send as upstream keys, sorted."""
+    return sorted({r.key_env for r in routes if r.key_env})
+
+
 def front_door_routes(
     deployments: list[Deployment], assignments: dict[str, list[int]], *,
     catalog: Any = None, dynamic: bool = False,
@@ -342,7 +347,6 @@ def _postgres_service(
 
 
 def _litellm_service(
-    service_names: list[str],
     host_port: int,
     images: dict[str, str],
     aux_dir: str,
@@ -351,6 +355,7 @@ def _litellm_service(
     *,
     dynamic_routing: bool = False,
     salt_key: bool = False,
+    key_envs: Sequence[str] = (),
 ) -> dict[str, Any]:
     # Reference the managed key via ${...} rather than baking the literal secret
     # into the compose YAML. Its value lives in the sidecar .env next to the
@@ -377,6 +382,12 @@ def _litellm_service(
             f'@{POSTGRES_SERVICE}:{POSTGRES_CONTAINER_PORT}/{POSTGRES_DB_NAME}'
         )
         environment['STORE_MODEL_IN_DB'] = 'True'
+    for name in sorted(set(key_envs)):
+        # An external route's key, by name: LiteLLM resolves `os.environ/NAME`
+        # from its own environment, and Compose interpolates the value from the
+        # managed .env, so the fingerprint (which hashes the values a stanza
+        # references) recreates the gateway when the key changes.
+        environment[name] = '${' + name + '}'
     labels = {ENGINE_LABEL: 'litellm'}
     if config_hash is not None:
         # LiteLLM reads its routing config once at startup; the file is bind-
@@ -408,9 +419,6 @@ def _litellm_service(
         service['depends_on'] = {
             POSTGRES_SERVICE: {'condition': 'service_healthy'}
         }
-    elif service_names:
-        # Only wait on upstreams when there are any (zero models -> empty gateway).
-        service['depends_on'] = sorted(service_names)
     return service
 
 
@@ -746,7 +754,6 @@ def render_front_door(
         if dynamic_routing:
             services[POSTGRES_SERVICE] = _postgres_service(images, state)
         services[LITELLM_SERVICE] = _litellm_service(
-            [],
             litellm_port,
             images,
             str(aux_dir or '.'),
@@ -754,6 +761,7 @@ def render_front_door(
             config_hash=config_hash,
             dynamic_routing=dynamic_routing,
             salt_key=litellm_salt_key,
+            key_envs=route_key_envs([*routes, *(dynamic_routes or [])]),
         )
 
     # Open WebUI is its own standing front door, rendered whenever ``ui`` is set
@@ -1037,6 +1045,23 @@ class Gateway(ConvergeScaffold):
         """The registry's entries: public alias -> route row."""
         entries = self.route_registry().get('entries')
         return dict(entries) if isinstance(entries, dict) else {}
+
+    def missing_keys(self, names: Sequence[str]) -> list[str]:
+        """Which of ``names`` the managed ``.env`` does not set (or sets empty)."""
+        env = self.managed_env()
+        return [n for n in names if not env.get(n)]
+
+    def warn_missing_keys(self, routes: Sequence[GatewayRoute]) -> None:
+        """Log each route whose key variable has no value (once per render)."""
+        from .._log import logger
+
+        missing = set(self.missing_keys(route_key_envs(routes)))
+        for route in routes:
+            if route.key_env in missing:
+                logger.warning(
+                    '  route {} sends ${}, which {} does not set; set it with '
+                    '`infer-stack env {}=...`, then `infer-stack apply`',
+                    route.alias, route.key_env, self._env_path, route.key_env)
 
     def registry_routes(self) -> list[GatewayRoute]:
         """The registry's routes, the lowest-precedence route layer."""

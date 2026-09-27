@@ -1516,6 +1516,8 @@ class ComposeBackend(ConvergeScaffold):
                 self._ui_root_noted = True
                 logger.info('Open WebUI runs as root: {}', why)
         routes, dynamic_routes = self._front_door_routes(desired, plan.assignments)
+        if self.litellm:
+            self.gateway.warn_missing_keys([*routes, *dynamic_routes])
         rendered = render_compose(
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,

@@ -24,6 +24,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   `litellm_config.yaml`.
 - With dynamic routing, an external endpoint's route has a stable id from its
   alias, so pointing it at another server replaces one route.
+- An external key reaches the gateway by name: the host gateway's
+  environment lists it (a changed value recreates the gateway on `apply`),
+  the in-cluster gateway's Secret holds it (a change rolls the pod). `env
+  NAME=...` says when the gateway picks it up; `routes seed` refuses a key
+  with no value.
+- A runbook whose catalog is already published no longer warns that its
+  catalogs differ from the recovery snapshot.
 
 ### Hardening from a review of the backend-parity work
 

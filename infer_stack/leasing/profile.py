@@ -200,22 +200,57 @@ def catalog_sources(catalog: Any) -> list[dict[str, Any]]:
 def profile_drift(published: dict[str, Any], invocation: dict[str, Any]) -> list[str]:
     """Keys where this invocation's settings differ from the recovery snapshot.
 
-    Catalogs drift only when the invocation names one that is not part of the
-    published union; naming a subset is the normal multi-runbook case.
+    Catalogs drift only when the invocation defines an endpoint the published
+    union does not define identically (by meaning, not by source bytes: the
+    union's sources are rewritten as catalogs merge); defining a subset is the
+    normal multi-runbook case.
+
+    Example:
+        >>> ep = {'engine': 'vllm', 'model': 'm'}
+        >>> src = lambda **eps: {'models': {'m': {'source': 'hf://o/m'}}, 'endpoints': eps}
+        >>> published = {'catalogs': [src(a=ep, b=ep)]}
+        >>> profile_drift(published, {'catalogs': [src(a=ep)]})
+        []
+        >>> profile_drift(published, {'catalogs': [{'endpoints': {}}]})
+        []
+        >>> profile_drift(published, {'catalogs': [src(c=ep)]})
+        ['catalogs']
     """
     drift = []
     for key in sorted(set(published) | set(invocation)):
         if key in {'version'}:
             continue
         if key == 'catalogs':
-            have = {canonical_digest(s) for s in published.get(key) or []}
-            want = {canonical_digest(s) for s in invocation.get(key) or []}
-            if not want <= have:
+            if not _catalogs_within(invocation.get(key) or [], published.get(key) or []):
                 drift.append(key)
             continue
         if published.get(key) != invocation.get(key):
             drift.append(key)
     return drift
+
+
+def _catalogs_within(want: list[dict[str, Any]], have: list[dict[str, Any]]) -> bool:
+    """Whether every endpoint ``want`` defines, ``have`` defines identically."""
+    have_digests = {canonical_digest(s) for s in have}
+    if all(canonical_digest(s) in have_digests for s in want):
+        return True
+    try:
+        mine = CatalogUnion.from_sources(want) if want else None
+        theirs = CatalogUnion.from_sources(have) if have else None
+    except CatalogError:
+        return False
+    if mine is None:
+        return True
+    for name in mine.endpoints:
+        if theirs is None or name not in theirs.endpoints:
+            return False
+        try:
+            if (mine.resolve_endpoint(name).semantic_key()
+                    != theirs.resolve_endpoint(name).semantic_key()):
+                return False
+        except CatalogError:
+            return False
+    return True
 
 
 def merge_catalog_sources(

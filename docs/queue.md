@@ -1183,10 +1183,12 @@ publication mechanisms (static registry vs dynamic reconciliation), not one
 storage for everything. Delete `render_front_door` branches that only tests
 reach (cleanup B), never a supported mode.
 
-### 33. [ ] External routes in static and dynamic routing
-*Partly done with 32:* static and dynamic routes, the `('external', alias)`
-id, the key name in `model_info` for reconcile. Left: survival tests (gc,
-release, dedicated going away) and retirement through a real reconcile.
+### 33. [x] External routes in static and dynamic routing
+*Done 2026-09-27* (with 32): static and dynamic routes on every backend, the
+`('external', alias)` id, the key name in `model_info` for reconcile. Tests:
+the route survives dedicated deployments coming and going, zero deployments,
+release and gc; redefinition replaces one route in place; unpublishing
+deletes it (`tests/test_external_endpoints.py`).
 Dynamic mode: an external route is standing desired state with a stable
 managed id from its logical owner, the endpoint alias (decision 28.5), not
 from target semantics; the semantic route decides whether it is replaced. It survives zero leases,
@@ -1194,7 +1196,16 @@ releases, other acquires, gc, a dedicated deployment going away. Route
 retirement (item 17) stays intact; infer-stack never tears down an external
 upstream, only its route.
 
-### 34. [ ] External credentials by env reference
+### 34. [x] External credentials by env reference
+*Done 2026-09-27.* Host gateway: `NAME: ${NAME}` in LiteLLM's environment,
+so the fingerprint recreates it when the value changes. In-cluster: the
+Secret carries each routed key, and the pod's key-hash covers them (the hash
+is unchanged when there are none). `env NAME=...` says the gateway uses it
+after `infer-stack apply`. `routes seed` refuses a key with no value, and a
+render warns. Real LiteLLM: `dev/external_e2e.sh` (static and dynamic, key
+rotation against a mock that accepts one key) passes on the guest.
+Also fixed: `profile_drift` compared catalog sources by bytes, so after a
+seed every command warned "catalogs" drifted; it now compares meaning.
 `api_key_env` only; never a literal key in the catalog, registry, rendered
 route or logs. Render as a LiteLLM env reference; the gateway container
 receives the variable from the managed `.env` (`infer-stack env KEY=...`).

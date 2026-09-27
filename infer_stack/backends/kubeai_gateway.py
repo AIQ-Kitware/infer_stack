@@ -36,6 +36,7 @@ from ..leasing.gateway import (
     Gateway,
     remembered_rows,
     render_front_door,
+    route_key_envs,
 )
 
 NAME = 'infer-stack-gateway'
@@ -159,6 +160,13 @@ class ClusterGateway(ConvergeScaffold):
     def catalog_routes(self, catalog) -> list[GatewayRoute]:
         return []              # the kubeai backend supplies its own routes
 
+    def _secret_values(self, routes: list[GatewayRoute]) -> dict[str, str]:
+        """What the Secret holds: the master key, and each routed external
+        key that has a value (never written into the manifests)."""
+        env = self.gateway.managed_env()
+        keys = {n: env[n] for n in route_key_envs(routes) if env.get(n)}
+        return {API_KEY_ENV: self.master_key(), **keys}
+
     def static_routes(self) -> list[GatewayRoute]:
         """The static route table: the registry under the backend's routes."""
         return route_table(self.gateway.registry_routes(), self.extra_routes)
@@ -176,7 +184,9 @@ class ClusterGateway(ConvergeScaffold):
             dynamic_routing=False,
         )
         config = front.litellm_config or ''
-        key_hash = hashlib.sha256(self.master_key().encode()).hexdigest()[:12]
+        routes = self.static_routes()
+        self.gateway.warn_missing_keys(routes)
+        key_hash = secret_hash(self._secret_values(routes))
         docs = gateway_manifests(
             namespace=self.namespace, image=self.images['litellm'], config=config,
             key_hash=key_hash, node_port=self.node_port)
@@ -212,7 +222,8 @@ class ClusterGateway(ConvergeScaffold):
 
         if not self.manifests_file.exists():
             return
-        secret = yaml.safe_dump(secret_manifest(self.namespace, self.master_key()))
+        secret = yaml.safe_dump(secret_manifest(
+            self.namespace, self._secret_values(self.static_routes())))
         path = self.state_dir / SECRET_FILENAME
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as handle:
@@ -275,11 +286,28 @@ class ClusterGateway(ConvergeScaffold):
         self.images['litellm'] = profile.get('image') or self.images['litellm']
 
 
-def secret_manifest(namespace: str, key: str) -> dict[str, Any]:
-    """The master key as a Secret (applied, never rendered into a diff)."""
+def secret_manifest(namespace: str, values: dict[str, str]) -> dict[str, Any]:
+    """The gateway's secrets as a Secret (applied, never rendered into a diff):
+    the master key, and the external keys its routes send by name."""
     return {'apiVersion': 'v1', 'kind': 'Secret',
             'metadata': {'name': NAME, 'namespace': namespace},
-            'type': 'Opaque', 'stringData': {API_KEY_ENV: key}}
+            'type': 'Opaque', 'stringData': dict(values)}
+
+
+def secret_hash(values: dict[str, str]) -> str:
+    """The pod-template annotation that rolls the gateway when a Secret value
+    changes. With only the master key it is that key's hash, as before.
+
+    >>> secret_hash({API_KEY_ENV: 'k'}) == hashlib.sha256(b'k').hexdigest()[:12]
+    True
+    >>> secret_hash({API_KEY_ENV: 'k', 'X': '1'}) != secret_hash({API_KEY_ENV: 'k', 'X': '2'})
+    True
+    """
+    extra = {k: v for k, v in values.items() if k != API_KEY_ENV}
+    material = values.get(API_KEY_ENV, '')
+    if extra:
+        material += '\x00' + json.dumps(extra, sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
 
 
 def gateway_manifests(*, namespace: str, image: str, config: str, key_hash: str,

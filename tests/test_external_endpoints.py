@@ -169,9 +169,15 @@ def _published(ledger):
 
 
 def test_seed_publishes_an_external_endpoint_and_prune_unpublishes_it(tmp_path):
+    from infer_stack.env_utils import write_env_file
+    from infer_stack.leasing.profile import ProfileMismatch
+
     mine = Catalog.from_dict(catalog())
     ledger, ctl = _ctl(tmp_path, mine)
     other = Catalog.from_dict({'endpoints': {'remote': REMOTE}})
+    with pytest.raises(ProfileMismatch, match=r'infer-stack env REMOTE_QWEN_KEY='):
+        ctl.plan_route_seed([other])              # no key: nothing to send
+    write_env_file(ctl.backend.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
     plan = ctl.plan_route_seed([other])
     assert list(plan.added) == ['remote']
     ctl.commit_route_seed(plan)
@@ -228,3 +234,146 @@ def test_kubeai_catalog_routes_are_not_remembered_but_ad_hoc_models_are(tmp_path
     be.converge([local, adhoc], apply=False)
     registry = json.loads((tmp_path / 'gateway' / 'litellm_registry.json').read_text())
     assert set(registry['entries']) == {'adhoc'}
+
+
+# -- item 33: an external route is standing desired state ---------------------------
+
+
+def _dynamic(tmp_path, cat, http):
+    from test_leasing_dynamic_routing import FakeDocker, IMAGES, PORTS, STATE
+
+    from infer_stack.hardware import simulate_inventory
+    from infer_stack.leasing.compose import ComposeBackend
+
+    return ComposeBackend(state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+                          run=FakeDocker(), http=http, images=IMAGES, ports=PORTS,
+                          state=STATE, ui=False, dynamic_routing=True, catalog=cat)
+
+
+def test_a_dynamic_external_route_survives_deployments_coming_and_going(tmp_path):
+    from test_leasing_dynamic_routing import RecordingGateway, _managed, dep
+
+    from infer_stack.leasing.gateway import _route_id
+
+    gw = RecordingGateway()
+    be = _dynamic(tmp_path, Catalog.from_dict({'endpoints': {'remote': REMOTE}}), gw)
+    ext = _route_id('external', 'remote')
+    a, b = dep('grp-aaaaaa', served='smol', t=0), dep('grp-bbbbbb', served='smol', t=1)
+    be.converge([a, b], apply=True)                   # two dedicated deployments
+    assert _managed(gw) == {ext, _route_id(a.id, 'smol'), _route_id(b.id, 'smol')}
+    gw.calls.clear()
+    be.converge([a], apply=True)                      # a dedicated one goes away
+    be.converge([], apply=True)                       # zero deployments
+    assert _managed(gw) == {ext}
+    assert all(rid != ext for _, rid in gw.calls)     # never touched
+
+
+def test_redefining_or_unpublishing_an_external_endpoint_changes_one_route(tmp_path):
+    from test_leasing_dynamic_routing import RecordingGateway, _managed
+
+    from infer_stack.leasing.gateway import _route_id
+
+    gw = RecordingGateway()
+    ext = _route_id('external', 'remote')
+    _dynamic(tmp_path, Catalog.from_dict({'endpoints': {'remote': REMOTE}}), gw).converge(
+        [], apply=True)
+    moved = {'remote': {**REMOTE, 'external': {**REMOTE['external'],
+                                               'api_base': 'http://other:8000/v1'}}}
+    gw.calls.clear()
+    _dynamic(tmp_path, Catalog.from_dict({'endpoints': moved}), gw).converge([], apply=True)
+    assert gw.calls == [('delete', ext), ('new', ext)]            # replaced in place
+    assert gw.models[ext]['litellm_params']['api_base'] == 'http://other:8000/v1'
+    gw.calls.clear()
+    _dynamic(tmp_path, None, gw).converge([], apply=True)          # unpublished
+    assert gw.calls == [('delete', ext)] and _managed(gw) == set()
+
+
+def test_release_and_gc_leave_an_external_route_published(tmp_path):
+    from test_leasing_compose import FakeDocker
+
+    both = Catalog.from_dict(catalog(remote=REMOTE))
+    ledger, ctl = _ctl(tmp_path, both, FakeDocker())
+    out = ctl.acquire('w', both.resolve_names(['local']), wait=False)
+    ctl.release(out.lease.id)
+    ctl.gc()
+    assert {r.alias: r.origin for r in ctl.route_view()}['remote'] == 'external'
+    assert _published(ledger) == ['local', 'remote']
+
+
+# -- item 34: credentials by reference -----------------------------------------------
+
+
+def test_the_host_gateway_gets_the_key_by_name_and_recreates_when_it_changes(tmp_path):
+    from infer_stack.env_utils import write_env_file
+    from infer_stack.leasing.compose import FINGERPRINT_LABEL
+
+    be = _compose(tmp_path, Catalog.from_dict(catalog(remote=REMOTE)))
+    write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'one'})
+    be.converge([], apply=False)
+    text = be.compose_file.read_text()
+    litellm = yaml.safe_load(text)['services']['litellm']
+    assert litellm['environment']['REMOTE_QWEN_KEY'] == '${REMOTE_QWEN_KEY}'
+    assert 'one' not in text                                  # the name, never the value
+    before = litellm['labels'][FINGERPRINT_LABEL]
+    write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'two'})
+    be.converge([], apply=False)
+    after = yaml.safe_load(be.compose_file.read_text())['services']['litellm']
+    assert after['labels'][FINGERPRINT_LABEL] != before       # recreated on apply
+
+
+def test_managed_only_gateways_render_exactly_as_before(tmp_path):
+    be = _compose(tmp_path, Catalog.from_dict(catalog()))
+    be.converge([], apply=False)
+    env = yaml.safe_load(be.compose_file.read_text())['services']['litellm']['environment']
+    assert set(env) == {'LITELLM_MASTER_KEY'}
+
+
+def test_a_render_warns_about_a_key_with_no_value(tmp_path):
+    from test_leasing_route_registry import capture_warnings
+
+    be = _compose(tmp_path, Catalog.from_dict(catalog(remote=REMOTE)))
+    with capture_warnings() as warnings:
+        be.converge([], apply=False)
+    assert any('REMOTE_QWEN_KEY' in m and 'infer-stack env' in m for m in warnings)
+
+
+def test_the_cluster_gateway_puts_keys_in_its_secret_and_rolls_on_a_change(tmp_path):
+    from infer_stack.backends.kubeai_gateway import ClusterGateway
+    from infer_stack.env_utils import write_env_file
+    from infer_stack.leasing.gateway import catalog_routes
+
+    calls = []
+    gw = ClusterGateway(state_dir=tmp_path, namespace='kubeai', url='http://gw:30442',
+                        run=lambda argv: calls.append(argv) or '')
+    gw.extra_routes = catalog_routes(Catalog.from_dict({'endpoints': {'remote': REMOTE}}))
+
+    def rendered(value):
+        write_env_file(gw.gateway._env_path, {'REMOTE_QWEN_KEY': value})
+        text = gw._render_documents()[gw.manifests_file]
+        assert value not in text                                  # never in a manifest
+        deploy = [d for d in yaml.safe_load_all(text) if d['kind'] == 'Deployment'][0]
+        return deploy['spec']['template']['metadata']['annotations']['infer-stack/key-hash']
+
+    assert rendered('one') != rendered('two')
+    gw.converge()
+    secret = yaml.safe_load((tmp_path / 'gateway-secret.yaml').read_text())
+    assert secret['stringData']['REMOTE_QWEN_KEY'] == 'two'
+    assert 'LITELLM_MASTER_KEY' in secret['stringData']
+
+
+def test_env_says_when_a_published_key_takes_effect(tmp_path, monkeypatch, capsys):
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import Ledger, SqliteStore
+    from infer_stack.leasing.profile import catalog_sources
+
+    db = tmp_path / 'ledger.db'
+    ledger = Ledger(SqliteStore(str(db)))
+    ledger.set_profile({'backend': 'compose', 'catalogs': catalog_sources(
+        Catalog.from_dict(catalog(remote=REMOTE)))})
+    monkeypatch.setattr(cl, 'default_ledger_path', lambda: db)
+    monkeypatch.setattr(cl, '_secret_env_path', lambda config=None: tmp_path / '.env')
+    assert cl.EnvCLI.main(argv=['REMOTE_QWEN_KEY=sk-x']) == 0
+    out = capsys.readouterr().out
+    assert "remote send(s) $REMOTE_QWEN_KEY" in out and 'infer-stack apply' in out
+    assert cl.EnvCLI.main(argv=['UNRELATED=1']) == 0
+    assert 'apply' not in capsys.readouterr().out

@@ -2443,6 +2443,19 @@ def _test_fail(config, base_url: str, reason: str) -> int:
     return 1
 
 
+def _published_key_users(ledger, key: str) -> list[str]:
+    """The published external endpoints that send ``key`` as their key."""
+    from ..leasing.endpoints import key_references
+    from ..leasing.profile import CatalogUnion
+
+    sources = (ledger.profile() or {}).get('catalogs') or []
+    try:
+        union = CatalogUnion.from_sources(sources) if sources else None
+    except CatalogError:
+        return []
+    return key_references(union).get(key, [])
+
+
 class EnvCLI(_PathOverridesMixin):
     """The managed env-file: print its path, read a value, or set one.
 
@@ -2529,6 +2542,11 @@ class EnvCLI(_PathOverridesMixin):
                 else:
                     write_env_file(env_path, {key: value})
             print(f'set {key} ({env_path})')
+            users = _published_key_users(ledger, key)
+            if users:
+                # A file write, not a publication: say when it takes effect.
+                print(f'{", ".join(users)} send(s) ${key} as the upstream key; '
+                      'the gateway uses the new value after `infer-stack apply`')
             return 0
 
         # Path first and foremost (it may not exist yet — that's fine).

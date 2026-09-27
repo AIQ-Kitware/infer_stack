@@ -3410,3 +3410,18 @@ gateway byte-stable across an ad-hoc release. (2) Tests that called
 `render_compose` with deployments that serve no catalog endpoint were
 testing a branch production never took; making the deployments serve the
 catalog's aliases made them test the real property.
+
+## 2026-09-27 — items 33-34: external routes, keys by name, a real-LiteLLM e2e
+
+**Did.** Survival and replacement tests for external routes; keys by name
+on both gateways (host env interpolation + fingerprint, in-cluster Secret +
+key-hash); `env` says when a key takes effect; `routes seed` refuses a key
+with no value. `dev/external_e2e.sh` drives a real LiteLLM against the mock
+OpenAI server on the guest, static and dynamic, through a key rotation.
+
+**Found by the e2e, not the unit tests.** After `routes seed`, every command
+warned that the catalogs drifted: `profile_drift` compared sources by digest,
+and merging rewrites the union's sources. It now compares endpoint meaning.
+Also: LiteLLM's upstream request lowercases `authorization`, and Postgres
+leaves its data dir owned by its own uid (the script removes it through a
+container).
