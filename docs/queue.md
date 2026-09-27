@@ -923,6 +923,47 @@ there, and `status` shows `starting`. The docstrings of `observe_state` and
 
 *Done 2026-09-26:* recorded there as current, deferred.
 
+
+## Still open outside the numbered items (logged 2026-09-27)
+
+Everything known to be open that is not a numbered item above or in
+campaign 2. None blocks campaign 2.
+
+- [ ] **GPU handover runs (operator).** `dev/handover/p4_gpu_labels.sh` on a
+  GPU k3s node (GFD labels feed sizing, `measure --record`) and
+  `dev/handover/p5_two_hosts.sh` across two real machines (pod-to-pod over
+  the real network, the NodePort on the second node, rotation with a Model
+  served). Verified here only with fake labels and a node in a container.
+- [ ] **Confirm 8a and 8b on GPUs.** The three 4 x 96 GB suggestion variants
+  were not re-run since leasing; `runtime.shm_size` fixes a TP > 1 failure
+  never observed here. Serve one variant and a TP=2 endpoint with and
+  without `shm_size`.
+- [ ] **vLLM caches written as root.** The Open WebUI fix (seed item under 9)
+  noted that engine caches under the data root are the same shape (vLLM runs
+  as root, so an operator's `rm -rf` of a data root fails); not looked at.
+- [ ] **In-cluster gateway: deferred features (P5).** Dynamic routing and
+  Open WebUI with `kubeai_gateway cluster` (they need Postgres and a UI in the
+  cluster), and an Ingress (`kubeai_gateway_url` accepts one; none tested).
+- [ ] **`routes seed --replace` compare-and-swap.** Deferred; see
+  `known-limitations.md`. Carry the expected old row in the plan and ask
+  again on a mismatch under the lock.
+- [ ] **CLI capability probes that decide behaviour.** The controller has no
+  optional-hook `getattr` left, but the CLI still branches on
+  `getattr(backend, ...)` for `down`, `doctor`, `compose_project`,
+  `rendered_file`/`compose_file`, `deployment_logs` and `access` (the last is
+  campaign 2's cleanup D). By the re-review's rule a `getattr` default may
+  serve display, never a decision: make the deciding ones protocol members
+  or typed capabilities.
+- [ ] **TUI catalog-reload flake.** The fix counts only catalog refusals; the
+  cause (a background worker refusing meanwhile) was inferred, not
+  reproduced. Reopen if it recurs.
+- [ ] **Commit history before merge (maintainer's call).** `30a62bb` has one
+  failing test, fixed by `122f1b4`; squash them if every commit must be green.
+- [ ] **Guest VM state to remember.** `/etc/rancher/k3s/config.yaml` sets a
+  1Gi eviction minimum reclaim for the dev cluster (undo: remove it, restart
+  k3s); the second node is recreated by `dev/k3s_agent_container.sh` with the
+  same setting.
+
 ---
 
 # Campaign 2: external endpoints, and access above leasing

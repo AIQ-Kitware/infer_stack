@@ -165,8 +165,10 @@ asks for it.
 
 ### Multi-node placement (current)
 
-Placement is per host. Spanning one deployment across machines, or scheduling
-across several hosts, is not supported.
+The compose backend places on one host. The kubeai backend schedules across
+the cluster's nodes (verified with a second node in a container; a run
+across two real machines is `dev/handover/p5_two_hosts.sh`). One deployment
+spanning machines (tensor parallel across nodes) is supported on neither.
 
 ### Forged ownership labels are outside the threat model (design boundary)
 
