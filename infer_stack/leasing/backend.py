@@ -608,12 +608,19 @@ class SimpleAdmission:
         refused = self.refuse(desired)
         return plan, RenderPreview(set(refused), [f'{g}: {why}' for g, why in refused.items()])
 
+    @staticmethod
+    def _digest(plan, rendered) -> str:
+        """What an in-process render amounts to: who is placed where. One
+        representation for the preview and the converge, so the approval
+        guard compares like with like."""
+        return repr(sorted(
+            (gid, list(gpus)) for gid, gpus in plan.assignments.items()
+            if gid not in rendered.unrenderable))
+
     def preview(self, desired: list[Deployment], placement: Any = None, *,
                 approve: bool = False):
         plan, rendered = self._preview(desired, placement)
-        self.last_preview_digest = repr(sorted(
-            (gid, list(gpus)) for gid, gpus in plan.assignments.items()
-            if gid not in rendered.unrenderable))
+        self.last_preview_digest = self._digest(plan, rendered)
         return plan, rendered
 
     def converge(self, desired: list[Deployment], *, apply: bool = True,
@@ -621,6 +628,7 @@ class SimpleAdmission:
         """Record the renderable, placed part of ``desired``; ``apply`` realizes it."""
         desired = list(desired)
         plan, rendered = self._preview(desired, placement)
+        self.last_planned_digest = self._digest(plan, rendered)
         self.last_errors = list(plan.errors) + list(rendered.errors)
         self.last_unplaced = {
             g.id for g in desired

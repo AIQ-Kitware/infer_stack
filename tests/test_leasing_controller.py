@@ -273,3 +273,35 @@ def test_a_resident_idle_deployment_beats_an_older_one_that_is_gone():
     out = ctl.acquire('c', [vreq('m', max_model_len=4096)])
 
     assert out.deployments[0].id == new_id
+
+
+# -- the approval guard in-process (queue item 25) ---------------------------------
+
+
+def test_in_process_converge_records_the_digest_its_preview_approved():
+    ctl, backend, _ = make_controller(ready=True)
+    ctl.acquire('a', [vreq('m')])
+    assert backend.last_planned_digest is not None
+    assert backend.last_planned_digest == backend.last_preview_digest
+
+
+def test_an_approved_render_with_no_rendered_digest_is_refused():
+    import pytest
+
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ctl, backend, _ = make_controller(ready=True)
+    ctl.acquire('a', [vreq('m')])
+    ctl.ledger.mark_publication_pending(apply_requested=True, approved_digest='d1')
+    real = type(backend).converge
+
+    def forgetful(self, desired, **kw):
+        real(self, desired, **kw)
+        self.last_planned_digest = None              # a backend that lost track
+
+    type(backend).converge = forgetful
+    try:
+        with pytest.raises(ProfileMismatch, match='approved'):
+            ctl.gc()
+    finally:
+        type(backend).converge = real

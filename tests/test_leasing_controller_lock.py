@@ -45,6 +45,10 @@ class OverlapBackend(SimpleAdmission):
         self.last_assignments: dict = {}
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+        # The protocol's digest contract, as SimpleAdmission keeps it.
+
+        self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         with self._guard:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -186,6 +190,10 @@ class SharedOverlapBackend(SimpleAdmission):
         self._ids: set = set()
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+        # The protocol's digest contract, as SimpleAdmission keeps it.
+
+        self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         with self.guard:
             self.shared['active'] += 1
             self.shared['max'] = max(self.shared['max'], self.shared['active'])

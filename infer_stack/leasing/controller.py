@@ -1258,7 +1258,9 @@ class Controller:
             return rec
         approved = marker.get('approved_digest')
         rendered = self.backend.last_planned_digest
-        if approved and rendered and rendered != approved:
+        # Fail closed: an approved render and no digest for this one is not
+        # proof they are the same.
+        if approved and rendered != approved:
             if not self._explicit_apply:
                 from .profile import ProfileMismatch
 
@@ -1272,7 +1274,8 @@ class Controller:
             # applying, so a partial apply leaves THIS render approved and an
             # ordinary retry of it proceeds (a later, different one still
             # needs approval).
-            self.ledger.reapprove_render(rendered)
+            if rendered is not None:
+                self.ledger.reapprove_render(rendered)
             approved = rendered
         if marker['interrupted']:
             self._wait_for_settled_runtime()

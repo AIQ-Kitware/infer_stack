@@ -64,6 +64,10 @@ class SharedStackBackend(SimpleAdmission):
         self.last_assignments: dict[str, list[int]] = {}
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+        # The protocol's digest contract, as SimpleAdmission keeps it.
+
+        self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         ids = {g.id for g in desired}
         with self.guard:
             self.shared['rendered'] = set(ids)
@@ -446,6 +450,10 @@ class _NoRoomBackend(SharedStackBackend):
         return {g.id: 'no room' for g in desired if 'big' in g.served}
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+        # The protocol's digest contract, as SimpleAdmission keeps it.
+
+        self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         refused = self.refuse(desired)
         self.last_unplaced = list(refused)
         super().converge([g for g in desired if g.id not in refused], apply=apply)
@@ -463,6 +471,10 @@ class _RenderRefusesBackend(_NoRoomBackend):
         return {}
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+        # The protocol's digest contract, as SimpleAdmission keeps it.
+
+        self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         refused = [g.id for g in desired if 'big' in g.served]
         SharedStackBackend.converge(
             self, [g for g in desired if g.id not in refused], apply=apply)
@@ -554,6 +566,10 @@ def test_converge_aborted_rollback_rerenders(tmp_path):
             self.declined = False
 
         def converge(self, desired, *, apply: bool = True, placement=None) -> None:
+
+            # The protocol's digest contract, as SimpleAdmission keeps it.
+
+            self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
             self.converge_calls += 1
             if desired and not self.declined:
                 self.declined = True
