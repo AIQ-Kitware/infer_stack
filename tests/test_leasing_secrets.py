@@ -228,3 +228,17 @@ def test_a_failure_after_apply_began_keeps_the_new_key_and_converges(tmp_path):
     ctl.apply_now()                                # the pending publication converges
     assert ctl.backend.gateway_accepts(new) and not ctl.backend.gateway_accepts(old)
     assert ledger.publication_pending() is None
+
+
+def test_an_apply_that_cleanly_misses_the_runtime_keeps_the_old_key(tmp_path):
+    """Re-review 2: `ApplyResult(runtime=False)` returned without an
+    exception; the gateway was not recreated, so .env must not move ahead."""
+    from infer_stack.leasing.backend import ApplyResult
+
+    ledger, ctl = make_started(tmp_path)
+    old = env(ctl)[API_KEY_ENV]
+    ctl.backend.apply = lambda: ApplyResult(runtime=False, detail='render unreadable')
+    with pytest.raises(ProfileMismatch, match='key was not changed.*render unreadable'):
+        ctl.rotate_gateway_key()
+    assert env(ctl)[API_KEY_ENV] == old
+    assert ctl.backend.gateway_accepts(env(ctl)[API_KEY_ENV])   # what clients get works

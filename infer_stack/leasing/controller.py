@@ -86,8 +86,10 @@ class ReconcileResult:
     # desired state was staged (--no-apply, render) or its apply did not fully
     # succeed. The next applying operation, or `infer-stack apply`, publishes it.
     publication_pending: bool = False
-    # Whether the runtime reached the render (routes may still be unverified).
+    # Whether the runtime reached the render (routes may still be unverified),
+    # and the apply's own words when it did not fully take effect.
     runtime_applied: bool = False
+    apply_detail: str = ''
     # Admission mode: idle keep-warm residents that yielded their GPUs, and
     # LIVE deployments whose committed allocation is no longer valid.
     displaced: list[str] = field(default_factory=list)
@@ -682,7 +684,12 @@ class Controller:
         goes back into the managed ``.env``: otherwise clients would be handed
         a key the gateway rejects. Once the apply began, the gateway may
         already run the new key; the file keeps it, and the pending
-        publication converges the runtime to it on the next apply.
+        publication converges the runtime to it on the next apply. An apply
+        that returns having not reached the runtime (``ApplyResult.runtime``
+        false: an unreadable render, routes that could not be retired) did
+        not recreate the gateway either, so the old key goes back too and the
+        rotation is refused with the apply's reason: the file must never
+        name a key the running gateway rejects.
         """
         from .profile import ProfileMismatch
 
@@ -701,11 +708,18 @@ class Controller:
             replaced = rotate()
             self._apply_began = False
             try:
-                return self._publish()
+                rec = self._publish()
             except BaseException:
                 if not self._apply_began:
                     getattr(self.backend, 'restore_env')(replaced)
                 raise
+            if rec.applied and not rec.runtime_applied:
+                getattr(self.backend, 'restore_env')(replaced)
+                raise ProfileMismatch(
+                    'the key was not changed: the gateway was not recreated ('
+                    + (rec.apply_detail or 'the runtime was not reached')
+                    + '); retry once `infer-stack apply` succeeds')
+            return rec
 
     def observe_state(self) -> dict:
         """A read-only health view for ``leases`` / ``status`` (plan step P10).
@@ -1271,6 +1285,7 @@ class Controller:
         rec.torn_down = sorted(set(rec.torn_down) | (before - after))
         rec.applied = True
         rec.runtime_applied = outcome.runtime
+        rec.apply_detail = outcome.detail
         if not outcome.complete:
             # The publication is not done, so neither is the approval of its
             # render: a retry re-renders, and a render that drifted (an
