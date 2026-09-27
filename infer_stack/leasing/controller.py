@@ -1255,15 +1255,22 @@ class Controller:
             return rec
         approved = marker.get('approved_digest')
         rendered = getattr(self.backend, 'last_planned_digest', None)
-        if approved and rendered and rendered != approved and not self._explicit_apply:
-            from .profile import ProfileMismatch
+        if approved and rendered and rendered != approved:
+            if not self._explicit_apply:
+                from .profile import ProfileMismatch
 
-            rec.publication_pending = True
-            raise ProfileMismatch(
-                'the rendered state differs from what was approved at publication '
-                '(e.g. infer-stack was upgraded in between); review and approve it '
-                'with `infer-stack apply`'
-            )
+                rec.publication_pending = True
+                raise ProfileMismatch(
+                    'the rendered state differs from what was approved at publication '
+                    '(e.g. infer-stack was upgraded in between); review and approve it '
+                    'with `infer-stack apply`'
+                )
+            # `infer-stack apply` approved this render: record it before
+            # applying, so a partial apply leaves THIS render approved and an
+            # ordinary retry of it proceeds (a later, different one still
+            # needs approval).
+            self.ledger.reapprove_render(rendered)
+            approved = rendered
         if marker['interrupted']:
             self._wait_for_settled_runtime()
         before = set(self.backend.observe())

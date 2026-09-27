@@ -228,6 +228,11 @@ class Ledger:
         """The approved render was applied, or deliberately abandoned."""
         self.store.clear_approved_digest()
 
+    def reapprove_render(self, digest: str) -> None:
+        """An operator approved this render over the one the marker records
+        (``infer-stack apply``); it is now the approved one, durably."""
+        self.store.set_approved_digest(digest)
+
     def publish_profile(self, profile: dict, *, approved_digest: str | None) -> None:
         """Write the recovery profile and its pending, approved marker at once."""
         self.store.publish_profile(profile, approved_digest=approved_digest)

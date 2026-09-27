@@ -435,11 +435,16 @@ class SqliteStore:
     def clear_approved_digest(self) -> None:
         """The approved render was applied, or deliberately abandoned (a
         rollback); the digest no longer describes the pending state."""
+        self.set_approved_digest(None)
+
+    def set_approved_digest(self, digest: str | None) -> None:
+        """Replace the pending marker's approved digest in place (same
+        version: the pending change is the same one, only its approval moved)."""
         with self.transaction():
             current = self._read_publication_pending()
-            if current is None or current.get('approved_digest') is None:
+            if current is None or current.get('approved_digest') == digest:
                 return
-            current['approved_digest'] = None
+            current['approved_digest'] = digest
             self._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
                 (json.dumps(current, sort_keys=True),),

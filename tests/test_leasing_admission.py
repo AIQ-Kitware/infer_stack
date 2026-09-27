@@ -524,3 +524,36 @@ def test_a_refused_acquire_writes_no_secret(tmp_path):
     acquire(ctl, 'one')
     assert parse_env_file(env)['LITELLM_MASTER_KEY'] == backend.master_key()
     assert ledger.publication_pending() is None      # no second approval needed
+
+
+def test_an_explicit_reapproval_survives_its_own_partial_apply(tmp_path):
+    """Re-review 4: `infer-stack apply` approving D2 over D1 must be durable,
+    so a partial D2 apply leaves D2 approved; D3 still needs approval."""
+    from infer_stack.leasing.backend import ApplyResult, ConvergeScaffold
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, ctl, docker = make(tmp_path)
+    real = ctl.backend.apply
+
+    def partial():
+        real()
+        return ApplyResult(routes=False)
+
+    ctl.backend.apply = partial
+    acquire(ctl, 'one')                                    # D1 approved, partial
+    original = ConvergeScaffold._planned_digest
+    ctl.backend._planned_digest = lambda planned: 'v2-' + original(planned)   # D2
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()
+    ctl.apply_now()                                        # approves D2; partial again
+    d2 = ctl.backend.last_planned_digest
+    assert ledger.publication_pending()['approved_digest'] == d2
+    ctl.backend.apply = real
+    ctl.gc()                                               # an ordinary retry of D2
+    assert ledger.publication_pending() is None
+
+    ctl.backend.apply = partial                            # D3 needs its own approval
+    acquire(ctl, 'two')
+    ctl.backend._planned_digest = lambda planned: 'v3-' + original(planned)
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()
