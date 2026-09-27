@@ -851,7 +851,8 @@ Each with a test that fails on the code before it:
   approved (in place, same marker version) before applying.
 - **11 (b8b3542):** replicas classified from their own logs (`_pod_logs`),
   fatal only when each is; `deployment_health()` (up / starting / restarting
-  / conflicted) feeds `status` and `observe_state`, which flags RESTARTING.
+  / conflicted) is what `status` shows; `observe_state` takes only
+  `restarting` from it and `leases` flags RESTARTING (item 26).
 - **14 (55c1f96):** `eligible_nodes()` returns unknown (evict nothing) for a
   non-default `schedulerName`, required pod (anti-)affinity, or a hard
   topology spread; tested through a profile's `scheduler_name`.
@@ -888,12 +889,19 @@ the approval guard skips when it is empty, so an approved digest was not
 checked there. **Done when:** converge sets it from the same digest as
 preview, and an approved digest with no rendered digest refuses.
 
-### 26. [ ] Say what `leases` health reports
+### 26. [x] Say what `leases` health reports
 
 *Why added:* `observe_state` takes only `restarting` from
 `deployment_health`, while the docs say the summary "feeds" it. **Done
 when:** code and docs agree.
 
-### 27. [ ] Record the `routes seed --replace` confirmation race as deferred
+*Done 2026-09-26:* the behaviour stays: `leases` flags a crash loop, the
+state that needs an operator; a deployment still starting reads `running`
+there, and `status` shows `starting`. The docstrings of `observe_state` and
+`deployment_health` and the item 11 note now say so.
+
+### 27. [x] Record the `routes seed --replace` confirmation race as deferred
 
 **Done when:** it is in `known-limitations.md`.
+
+*Done 2026-09-26:* recorded there as current, deferred.

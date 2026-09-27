@@ -310,3 +310,13 @@ migrated keep Docker's dynamic addresses.
 - after a misroute, stop traffic for about five minutes before retrying;
 - setting `AIOHTTP_TTL_DNS_CACHE` low on the gateway narrows the window but does
   not close it.
+
+### `routes seed --replace` confirms against a snapshot (current, deferred)
+
+`routes seed --replace` shows each redefinition (`A0 -> A1`) and asks, then
+commits under the publication lock. If another process changes the alias
+to `A2` in between, the commit writes `A1` over `A2` without showing `A2`:
+the replace is "replace whatever is there", not compare-and-swap. A
+conflict that appears without `--replace` still refuses, and leaves no
+publication pending. A strict version would carry the expected old row in
+the plan and ask again on a mismatch under the lock.

@@ -734,10 +734,13 @@ class Controller:
         * ``unresolved``: LIVE from before allocations, with no unique container;
         * ``reclaimed``: idle under ``stop``, and its container is gone, as
           intended (see :meth:`keeps_up`);
-        * ``restarting``: resident, but every unit is crash-looping;
+        * ``restarting``: resident, but every unit is crash-looping (the one
+          serving state taken from
+          :func:`~infer_stack.leasing.residency.deployment_health`: it needs
+          an operator, and ``leases`` flags it);
         * ``running`` / ``not-running``: whether it is resident (any replica
-          warm), from :func:`~infer_stack.leasing.residency.deployment_health`
-          for whether it serves.
+          warm). A deployment still starting is ``running`` here, since
+          startup needs no one; ``status`` shows ``starting``.
         """
         from .profile import profile_drift
         from .residency import ResidencyUnknown, deployment_health

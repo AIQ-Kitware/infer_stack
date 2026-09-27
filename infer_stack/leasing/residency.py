@@ -263,6 +263,9 @@ def deployment_health(residency: Residency, deployment_id: str) -> str | None:
     * ``starting``: none up, some running but not ready yet, or created;
     * ``restarting``: every warm unit crash-looping (restarting);
     * ``conflicted``: units that may not coexist (see :meth:`Residency.is_conflicted`);
+
+    ``status`` shows it as is; ``leases`` (``Controller.observe_state``)
+    takes only ``restarting`` from it, the state that needs an operator.
     * otherwise the units' states (``exited``, ``removing`` ...), or ``None``
       when the deployment has no unit.
 
