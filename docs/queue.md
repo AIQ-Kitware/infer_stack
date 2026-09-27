@@ -951,6 +951,8 @@ campaign 2. None blocks campaign 2.
 - [ ] **In-cluster gateway: deferred features (P5).** Dynamic routing and
   Open WebUI with `kubeai_gateway cluster` (they need Postgres and a UI in the
   cluster), and an Ingress (`kubeai_gateway_url` accepts one; none tested).
+  *2026-09-27:* recorded in `known-limitations.md` (current, deferred). A new
+  feature, not a fix: build it only against a reviewed plan.
 - [x] **`routes seed --replace` compare-and-swap.** *Done 2026-09-27:* the
   plan carries each alias's shown meaning; under the lock a changed one
   refuses (`RouteConflict(changed=True)`), writes nothing, leaves no marker.

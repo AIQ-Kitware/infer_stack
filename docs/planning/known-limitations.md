@@ -171,6 +171,15 @@ the cluster's nodes (verified with a second node in a container; a run
 across two real machines is `dev/handover/p5_two_hosts.sh`). One deployment
 spanning machines (tensor parallel across nodes) is supported on neither.
 
+### The in-cluster gateway routes only (current, deferred)
+
+With `kubeai_gateway cluster` the LiteLLM gateway is a Deployment and a
+NodePort Service with static routes. Dynamic routing and Open WebUI need
+the host placement (`kubeai_gateway host`): in the cluster they would need
+Postgres and a UI there, which P5 deferred. `kubeai_gateway_url` accepts an
+Ingress URL, but no Ingress has been tested. External endpoints work in both
+placements (their keys go into the gateway's Secret).
+
 ### Forged ownership labels are outside the threat model (design boundary)
 
 infer-stack identifies its containers by the Compose project and its own labels.
