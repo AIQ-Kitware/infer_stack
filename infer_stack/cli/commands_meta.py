@@ -134,6 +134,49 @@ def _entry(label: str, path: Path, *, kind: str) -> dict[str, str]:
     }
 
 
+def _foreign_owner(path: Path, *, limit: int = 5000) -> int | None:
+    """The uid of the first file under ``path`` another user owns, or ``None``.
+
+    Engines run as root in their containers (vLLM, Ollama), so the caches
+    they fill are root's, and removing a data root then fails with
+    "permission denied". Bounded: at most ``limit`` entries are looked at.
+
+    >>> import tempfile
+    >>> _foreign_owner(Path(tempfile.mkdtemp())) is None
+    True
+    """
+    import os
+
+    me = os.getuid()
+    seen = 0
+    try:
+        for root, dirs, files in os.walk(path):
+            for name in (*dirs, *files):
+                seen += 1
+                try:
+                    owner = os.lstat(os.path.join(root, name)).st_uid
+                except OSError:
+                    continue
+                if owner != me:
+                    return owner
+                if seen >= limit:
+                    return None
+    except OSError:
+        return None
+    return None
+
+
+def _state_entry(label: str, path: Path) -> dict[str, str]:
+    """A state directory, flagged when another user (root) owns files in it."""
+    entry = _entry(label, path, kind='dir')
+    if entry['status'] == 'exists':
+        owner = _foreign_owner(path)
+        if owner is not None:
+            entry['status'] = 'foreign-owned'
+            entry['owner'] = str(owner)
+    return entry
+
+
 def _status_style(status: str) -> str:
     if status == 'exists':
         return 'green'
@@ -240,8 +283,12 @@ class ConfigPathsCLI(_PathOverridesMixin):
                        kind='file'),
             ]
         if target in {'all', 'data'}:
+            from ..config import default_state_paths
+
             groups['data'] = [
                 _entry('data_root', data_root(), kind='dir'),
+                *(_state_entry(name, Path(path))
+                  for name, path in default_state_paths().items()),
             ]
         if target in {'all', 'leasing'}:
             compose_dir = data_root() / 'leasing' / 'compose'
@@ -279,6 +326,16 @@ class ConfigPathsCLI(_PathOverridesMixin):
             _render_rich(groups, console)
         else:
             _render_plain(groups)
+        foreign = [e for entries in groups.values() for e in entries
+                   if e['status'] == 'foreign-owned']
+        if foreign:
+            import os
+
+            print('\nforeign-owned: an engine container (running as root) wrote '
+                  'these, so deleting them as you fails; to take them back:')
+            for e in foreign:
+                print(f"  docker run --rm -v {e['path']}:/d busybox "
+                      f"chown -R {os.getuid()}:{os.getgid()} /d")
         return 0
 
 

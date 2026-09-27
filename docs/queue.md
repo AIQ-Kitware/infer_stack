@@ -938,9 +938,16 @@ campaign 2. None blocks campaign 2.
   were not re-run since leasing; `runtime.shm_size` fixes a TP > 1 failure
   never observed here. Serve one variant and a TP=2 endpoint with and
   without `shm_size`.
-- [ ] **vLLM caches written as root.** The Open WebUI fix (seed item under 9)
+- [x] **vLLM caches written as root.** The Open WebUI fix (seed item under 9)
   noted that engine caches under the data root are the same shape (vLLM runs
-  as root, so an operator's `rm -rf` of a data root fails); not looked at.
+  as root, so an operator's `rm -rf` of a data root fails).
+  *Done 2026-09-27 (VM part):* `infer-stack paths` now lists every state
+  directory (its docstring promised the caches; it showed only the data
+  root), marks one holding another user's files `foreign-owned`, and prints
+  the `docker run --rm -v DIR:/d busybox chown -R uid:gid /d` that takes it
+  back (verified: a root-owned model directory blocked `rm -rf`; after the
+  printed command it did not). Running vLLM itself as the owner would change
+  a GPU runtime this VM cannot verify; not done.
 - [ ] **In-cluster gateway: deferred features (P5).** Dynamic routing and
   Open WebUI with `kubeai_gateway cluster` (they need Postgres and a UI in the
   cluster), and an Ingress (`kubeai_gateway_url` accepts one; none tested).
