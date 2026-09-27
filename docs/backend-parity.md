@@ -62,7 +62,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | one `OPENAI_BASE_URL`, the managed key, the alias as model name | same | same through the gateway; with `litellm false`, Model names and no key |
-| `secrets rotate` | same; a failure before the apply began restores the old key, after it the pending publication converges to the new one | same |
+| `secrets rotate` | same; a failure before the apply began, or an apply that did not reach the runtime, restores the old key; after the runtime changed, the pending publication converges to the new one | same |
 | env file (`INFER_STACK_*`, `OPENAI_*`) | same | same |
 | readiness is a real generation through the front door | same | same |
 
@@ -77,12 +77,12 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | a preview (admission, `config publish`) writes nothing, not even a first secret | same | same |
 | an apply reports how far it got (runtime, routes); the publication and its approved render stay pending until both | same | same, the host gateway's routes included |
 | `--no-apply` / `apply` / `render` | same | same |
-| unleased keep-warm yields to leased demand | at placement | ≈ during the wait, one per 30 s: only when the scheduler reports a capacity shortage, and only an idle Model on a node the pod could use, holding the resource that is short (longest idle first) |
+| unleased keep-warm yields to leased demand | at placement | ≈ during the wait, one per 30 s: only when the scheduler reports a capacity shortage, and only an idle Model on a node the pod could use, holding the resource that is short (longest idle first); nothing for a pod on another scheduler or with pod (anti-)affinity or a hard spread |
 | crash-loop fail-fast, the engine's error quoted | same | same (pods, `kubectl logs --previous`) |
 | image-pull progress | yes | n/a: the kubelet pulls; `ImagePullBackOff` is a reported wait reason |
 | strict `residency()` for decisions, lenient `observe()` for reports | same: two containers for one deployment are a conflict, and decisions fail closed | same: several pods for one Model are its replicas (or a rollout), resident while any is warm |
 | coalescing: an adequate LIVE deployment before a resident IDLE one before any other IDLE one | same | same |
-| recovery after an interrupted apply (settle check) | yes | ≈ `kubectl apply` is idempotent; nothing is left half-created |
+| recovery after an interrupted apply (settle check) | yes | same for the host gateway (a Compose project); `kubectl apply` itself is idempotent |
 
 ### Placement
 
@@ -125,7 +125,7 @@ a different mechanism. **gap**: missing on one side and on the roadmap.
 | | Compose | KubeAI |
 |---|---|---|
 | `doctor` | nothing to check | four checks |
-| `ps`, `logs [-f] <alias \| name \| id>`, `status` health | containers | same shape; pods, and the gateway's containers |
+| `ps`, `logs [-f] <alias \| name \| id>`, `status` health | containers | same shape; pods, and the gateway's containers; health is serving (up / starting / restarting), not residency |
 | `stack up` (= `apply`), `stack down` | same | same |
 | `stack compose …`, `restart` / `pull` / `start` / `stop` | the stack's Compose project | the gateway's Compose project (the engines are pods) |
 | TUI: leases, deployments, catalog editing, acquire / release / evict, API tab, settings | same | same |

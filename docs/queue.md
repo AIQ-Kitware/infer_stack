@@ -446,7 +446,7 @@ poison test that fails on the old code with every fix; no new `hasattr`
 probes; no second KubeAI lifecycle path; backwards compatibility for cards,
 catalogs and CLI invocations that work today.
 
-### 11. [ ] Residency: replicas are not duplicates (reopened by the re-review)
+### 11. [x] Residency: replicas are not duplicates (reopened by the re-review, closed)
 
 *Why added:* `Residency.ambiguous()` meant "more than one unit" and
 `resident()` returned a unit only when there was exactly one. On Compose two
@@ -541,7 +541,7 @@ LIVE-over-IDLE coalescing (`test_leasing_controller.py`); seed conflicts
 the positive control for reclaimable pressure, which passes on both.
 The rule is in the roadmap's Principles.
 
-### 14. [ ] Scheduler-aware reclaim, not "Unschedulable means evict" (reopened by the re-review)
+### 14. [x] Scheduler-aware reclaim, not "Unschedulable means evict" (reopened by the re-review, closed)
 
 *Why added:* KubeAI's readiness sets `needs_room` whenever a pod waits with
 reason `Unschedulable`, and `wait_ready` answers by evicting the
@@ -573,7 +573,7 @@ request the short resource. Compose returns none, the in-process backends
 all. `_make_room` keeps the policy. Four parity poison tests; three fail on
 the old code.
 
-### 15. [ ] Publication phases: the approved digest outlives a partial apply (reopened by the re-review)
+### 15. [x] Publication phases: the approved digest outlives a partial apply (reopened by the re-review, closed)
 
 *Why added:* `_apply_pending()` clears the approved-render digest right
 after `apply()` returns, before checking it returned `False`. Compose
@@ -600,7 +600,7 @@ routes behind KubeAI cleared the marker; it now returns both. Tests: the
 partial-apply/renderer-drift case (fails on the old controller: the digest
 was gone) and the KubeAI propagation.
 
-### 16. [ ] Secret rotation is a transaction (reopened by the re-review)
+### 16. [x] Secret rotation is a transaction (reopened by the re-review, closed)
 
 *Why added:* `rotate_gateway_key()` writes the new key into `.env`, then
 publishes, and restores the old key only on `ConvergeAborted`. A strict
@@ -728,7 +728,7 @@ preview's digest. Test: a refused acquire on a fresh root leaves no key in
 `.env` (fails on the old code: it wrote the master key and the Open WebUI
 secret), and the next admitted acquire needs no second approval.
 
-### 21. [ ] Controller decomposition, where the authorities now show it (reopened by the re-review)
+### 21. [x] Controller decomposition, where the authorities now show it (reopened by the re-review, closed)
 
 *Why added:* the controller holds admission, residency interpretation,
 placement, publication markers, recovery snapshots, network migration,
@@ -832,4 +832,30 @@ bug first (a safety bug), then 16, 15, 11, 14, 23, then the rest of 21.
   typed `front_door() -> FrontDoor | None`. Rule: a `getattr` default may
   serve display, never a correctness decision.
 
-### 23. [ ] A race-time `routes seed` conflict leaves no marker
+### 23. [x] A race-time `routes seed` conflict leaves no marker
+
+*Done 2026-09-26 (30a62bb, 122f1b4):* `publish_change(..., preflight=)` runs
+a check under the lock before the marker; route seed rechecks there. Test
+injects the other process's write when the lock is taken (the old code left
+the marker). The stale `--replace` display is not fixed.
+
+### Re-review closure (2026-09-26)
+
+Each with a test that fails on the code before it:
+
+- **21, settlement (4b8783b):** `settle_snapshot()` is required; KubeAI
+  delegates to its host gateway, `None` for an in-cluster one and in-process.
+- **16 (4476573):** an apply returning `runtime=False` restores the old key
+  and refuses with the apply's reason (`ReconcileResult.apply_detail`).
+- **15 (768d924):** `infer-stack apply` over a changed render records it as
+  approved (in place, same marker version) before applying.
+- **11 (b8b3542):** replicas classified from their own logs (`_pod_logs`),
+  fatal only when each is; `deployment_health()` (up / starting / restarting
+  / conflicted) feeds `status` and `observe_state`, which flags RESTARTING.
+- **14 (55c1f96):** `eligible_nodes()` returns unknown (evict nothing) for a
+  non-default `schedulerName`, required pod (anti-)affinity, or a hard
+  topology spread; tested through a profile's `scheduler_name`.
+- **21, hooks (2f9adc4):** as classified above. No `getattr(self.backend,
+  ...)` remains in the controller; `ty` checks `FrontDoor` and
+  `RecoveryProfile` conformance, and removing Compose's `allocates_gpus`
+  fails it.
