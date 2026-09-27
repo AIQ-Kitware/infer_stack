@@ -198,13 +198,34 @@ class FrontDoorControl(Protocol):
     ``backend.front_door()`` returns one, or ``None`` for a backend without a
     gateway: the Compose project itself, KubeAI's gateway on this host or in
     the cluster. Keys, the route registry, and "does it accept this key" live
-    here, not as copies on every serving backend.
+    here, not as copies on every serving backend; callers never reach the
+    gateway object behind it.
     """
 
     #: Whether LiteLLM is on (a front door can be Open WebUI alone).
     litellm: bool
-    #: The gateway's state: settings, managed keys, the route registry.
-    gateway: Any
+
+    @property
+    def env_path(self) -> Path:
+        """The managed ``.env`` holding the gateway's keys (``infer-stack env``)."""
+        ...
+
+    def require_route_keys(self, routes: list[GatewayRoute]) -> None:
+        """Refuse (:class:`~infer_stack.leasing.gateway.MissingRouteKey`) when a
+        route sends a key variable the managed ``.env`` does not set."""
+        ...
+
+    def registry_routes(self) -> list[GatewayRoute]:
+        """The route registry's routes (ad-hoc deployments, older rows)."""
+        ...
+
+    def route_entries(self) -> dict[str, dict[str, Any]]:
+        """The route registry's rows: alias -> row."""
+        ...
+
+    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
+        """Write the route registry's rows."""
+        ...
 
     def master_key(self) -> str:
         ...

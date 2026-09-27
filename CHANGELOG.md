@@ -31,6 +31,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   with no value.
 - A runbook whose catalog is already published no longer warns that its
   catalogs differ from the recovery snapshot.
+- A published external endpoint whose key has no value refuses every
+  publication (acquire, apply, config publish, ...) before anything changes,
+  with the `infer-stack env NAME=...` to fix it; no command recreates the
+  gateway without the key.
 - Publishing endpoints is transactional: an acquire commits its catalogs
   with its lease and publication marker, and a fresh ledger's first snapshot
   is written with its first marker, never before. `gc`, `release` and

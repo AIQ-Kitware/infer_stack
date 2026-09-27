@@ -623,18 +623,6 @@ class KubeaiBackend(ConvergeScaffold):
     def litellm_port(self) -> int | None:
         return self.gateway.litellm_port if self.gateway is not None else None
 
-    def master_key(self) -> str:
-        return self.gateway.master_key()
-
-    def rotate_master_key(self) -> dict[str, str]:
-        return self.gateway.rotate_master_key()
-
-    def restore_env(self, values) -> None:
-        self.gateway.restore_env(values)
-
-    def gateway_accepts(self, key: str, *, wait: float = 0.0):
-        return self.gateway.gateway_accepts(key, wait=wait)
-
     def _upstream_url(self) -> str:
         """Where the gateway sends requests for this cluster's Models."""
         if not self.gateway_upstream and getattr(self.gateway, 'in_cluster', False):

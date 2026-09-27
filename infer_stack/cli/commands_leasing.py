@@ -2384,7 +2384,9 @@ def _gateway_state(config) -> tuple[Path, str]:
         backend = None
     base_url, _ = front_door_urls(backend)
     if backend is not None and base_url is not None:
-        return backend.front_door().gateway._env_path, base_url
+        front = backend.front_door()
+        if front is not None:
+            return front.env_path, base_url
     return (data_root() / 'leasing' / 'compose' / '.env',
             f'http://127.0.0.1:{DEFAULT_PORTS["litellm"]}/v1')
 
@@ -3126,7 +3128,7 @@ class NetworkCheckCLI(_LeasingCommonMixin):
         return 4 if any(r['status'] == 'routing-fault' for r in result.values()) else 0
 
 
-def _old_key_rejected(backend, key, *, within: float = 60.0) -> bool:
+def _old_key_rejected(front, key, *, within: float = 60.0) -> bool:
     """Whether the gateway comes to reject ``key`` within ``within`` seconds.
 
     A replaced gateway can still answer for a moment: a Kubernetes rollout is
@@ -3137,7 +3139,7 @@ def _old_key_rejected(backend, key, *, within: float = 60.0) -> bool:
 
     deadline = time.monotonic() + within
     while True:
-        if backend.gateway_accepts(key) is False:
+        if front.gateway_accepts(key) is False:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -3165,10 +3167,9 @@ class SecretsRotateCLI(_ApprovalMixin):
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
-        # Any: rotate_gateway_key below refuses a backend without a gateway,
-        # so past it these gateway methods exist.
-        backend: Any = controller.backend
-        old = backend.master_key() if getattr(backend, 'litellm', False) else None
+        backend = controller.backend
+        front = backend.front_door()
+        old = front.master_key() if front is not None and front.litellm else None
         try:
             rec = controller.rotate_gateway_key(force=bool(config.force))
         except ProfileMismatch as ex:
@@ -3179,13 +3180,15 @@ class SecretsRotateCLI(_ApprovalMixin):
         if rec.publication_pending:
             print('  the gateway has not restarted yet; run `infer-stack apply`')
             return 3
-        new = backend.master_key()
-        accepted = backend.gateway_accepts(new, wait=60.0)
+        if front is None:                  # rotate_gateway_key refused already
+            return 1
+        new = front.master_key()
+        accepted = front.gateway_accepts(new, wait=60.0)
         if accepted is None:
             print('  gateway not running: it will use the new key when it starts')
         elif not accepted:
             raise SystemExit('secrets rotate: the gateway rejects the new key')
-        elif not _old_key_rejected(backend, old):
+        elif not _old_key_rejected(front, old):
             raise SystemExit('secrets rotate: could not confirm the gateway '
                              'rejects the OLD key')
         else:

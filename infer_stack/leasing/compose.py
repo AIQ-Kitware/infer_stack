@@ -1304,6 +1304,22 @@ class ComposeBackend(ConvergeScaffold):
     def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
         return self.gateway.gateway_accepts(key, wait=wait)
 
+    @property
+    def env_path(self) -> Path:
+        return self.gateway.env_path
+
+    def require_route_keys(self, routes) -> None:
+        self.gateway.require_route_keys(routes)
+
+    def registry_routes(self):
+        return self.gateway.registry_routes()
+
+    def route_entries(self) -> dict[str, dict[str, Any]]:
+        return self.gateway.route_entries()
+
+    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
+        self.gateway.replace_route_entries(entries)
+
     def connection_info(self):
         """Where a client reaches these endpoints: the front door."""
         return self.gateway.connection_info()
@@ -1524,7 +1540,8 @@ class ComposeBackend(ConvergeScaffold):
                 logger.info('Open WebUI runs as root: {}', why)
         routes, dynamic_routes = self._front_door_routes(desired, plan.assignments)
         if self.litellm:
-            self.gateway.warn_missing_keys([*routes, *dynamic_routes])
+            # Before any approval or apply, whichever command is publishing.
+            self.gateway.require_route_keys([*routes, *dynamic_routes])
         rendered = render_compose(
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,

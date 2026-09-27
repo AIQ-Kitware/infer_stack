@@ -154,6 +154,22 @@ class ClusterGateway(ConvergeScaffold):
     def gateway_accepts(self, key: str, *, wait: float = 0.0):
         return self.gateway.gateway_accepts(key, wait=wait)
 
+    @property
+    def env_path(self) -> Path:
+        return self.gateway.env_path
+
+    def require_route_keys(self, routes) -> None:
+        self.gateway.require_route_keys(routes)
+
+    def registry_routes(self):
+        return self.gateway.registry_routes()
+
+    def route_entries(self) -> dict[str, dict[str, Any]]:
+        return self.gateway.route_entries()
+
+    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
+        self.gateway.replace_route_entries(entries)
+
     def connection_info(self):
         return self.gateway.connection_info()
 
@@ -185,7 +201,7 @@ class ClusterGateway(ConvergeScaffold):
         )
         config = front.litellm_config or ''
         routes = self.static_routes()
-        self.gateway.warn_missing_keys(routes)
+        self.gateway.require_route_keys(routes)
         key_hash = secret_hash(self._secret_values(routes))
         docs = gateway_manifests(
             namespace=self.namespace, image=self.images['litellm'], config=config,

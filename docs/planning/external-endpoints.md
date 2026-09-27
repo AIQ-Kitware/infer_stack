@@ -150,7 +150,9 @@ an external-only request with a pointer to `access`.
   `LITELLM_DB_PASSWORD`, `WEBUI_SECRET_KEY`, `HF_TOKEN`): a catalog must not
   be able to send the gateway's own credentials to a server it names. A
   referenced name with no value fails before apply; provider keys are never
-  generated.
+  generated. *Implemented at the render* (queue item 44): every publication,
+  whichever command caused it, refuses while a published route's key has no
+  value, so an unrelated operation cannot recreate the gateway without it.
 
 ### 5. Stable route identity
 

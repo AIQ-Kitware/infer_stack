@@ -35,6 +35,7 @@ from .naming import (
     vllm_service_name_for,
 )
 from .residency import ENGINE_LABEL
+from .profile import ProfileMismatch
 from .routes import GatewayRoute, route_table
 
 LITELLM_CONTAINER_PORT = 4000
@@ -166,6 +167,24 @@ def deployment_routes(
                     origin='deployment',
                     route_id=_route_id(deployment.id, endpoint) if dynamic else None))
     return routes
+
+
+class MissingRouteKey(ProfileMismatch):
+    """A route sends a key variable the managed ``.env`` does not set.
+
+    Raised by the render, before anything is approved or applied, whichever
+    command published: a gateway recreated without the key would send an
+    empty one (docs/planning/external-endpoints.md, decision 4).
+    """
+
+    def __init__(self, missing: dict[str, list[str]], env_path: Path):
+        self.missing = dict(missing)
+        name, aliases = next(iter(sorted(self.missing.items())))
+        super().__init__(
+            f'{", ".join(repr(a) for a in aliases)} sends ${name} as its upstream '
+            f'key, which {env_path} does not set; set it first '
+            f'(`infer-stack env {name}=...`) or unpublish the endpoint '
+            '(`infer-stack routes prune`)')
 
 
 def route_key_envs(routes: Sequence[GatewayRoute]) -> list[str]:
@@ -1051,17 +1070,21 @@ class Gateway(ConvergeScaffold):
         env = self.managed_env()
         return [n for n in names if not env.get(n)]
 
-    def warn_missing_keys(self, routes: Sequence[GatewayRoute]) -> None:
-        """Log each route whose key variable has no value (once per render)."""
-        from .._log import logger
+    @property
+    def env_path(self) -> Path:
+        """The managed ``.env`` (public spelling of ``_env_path``)."""
+        return self._env_path
 
+    def require_route_keys(self, routes: Sequence[GatewayRoute]) -> None:
+        """Raise :class:`MissingRouteKey` if any route's key has no value."""
         missing = set(self.missing_keys(route_key_envs(routes)))
+        if not missing:
+            return
+        users: dict[str, list[str]] = {}
         for route in routes:
             if route.key_env in missing:
-                logger.warning(
-                    '  route {} sends ${}, which {} does not set; set it with '
-                    '`infer-stack env {}=...`, then `infer-stack apply`',
-                    route.alias, route.key_env, self._env_path, route.key_env)
+                users.setdefault(route.key_env, []).append(route.alias)
+        raise MissingRouteKey(users, self._env_path)
 
     def registry_routes(self) -> list[GatewayRoute]:
         """The registry's routes, the lowest-precedence route layer."""

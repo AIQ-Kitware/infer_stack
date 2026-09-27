@@ -216,6 +216,7 @@ def main(argv=None) -> int:
 
     from ..leasing import LeaseLockError
     from ..leasing.backend import BackendTimeout
+    from ..leasing.gateway import MissingRouteKey
 
     try:
         rv = ManageCLI.main(argv=argv)
@@ -229,6 +230,9 @@ def main(argv=None) -> int:
         # committed, or left the change pending for `infer-stack apply`.
         raise SystemExit(runtime_failure(exc))
     except BackendTimeout as exc:
+        raise SystemExit(str(exc))
+    except MissingRouteKey as exc:
+        # Any publishing verb: the render refused before anything changed.
         raise SystemExit(str(exc))
     return int(rv) if rv is not None else 0
 

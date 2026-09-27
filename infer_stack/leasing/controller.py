@@ -30,7 +30,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
-from .backend import ApplyResult, ConnectionInfo, HostRuntime, ServingBackend
+from .backend import (
+    ApplyResult,
+    ConnectionInfo,
+    FrontDoorControl,
+    HostRuntime,
+    ServingBackend,
+)
 from .routes import RoutePlan
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
@@ -1723,7 +1729,6 @@ class Controller:
         server. If the front door never answers, the lease this call took is
         released and ``front_door_ready`` is ``False``.
         """
-        from .endpoints import ExternalTarget
         from .profile import ProfileMismatch
 
         aliases = [e.alias for e in endpoints]
@@ -1736,13 +1741,6 @@ class Controller:
                     f'{"is" if len(external) == 1 else "are"} served by an external '
                     'server, reached only through the LiteLLM front door; this '
                     'backend has none (turn `litellm` on)')
-            missing = front.gateway.missing_keys(sorted({
-                e.target.api_key_env for e in external
-                if isinstance(e.target, ExternalTarget) and e.target.api_key_env}))
-            if missing:
-                raise ProfileMismatch(
-                    f'${missing[0]} has no value in {front.gateway._env_path}; set it '
-                    f'first: `infer-stack env {missing[0]}=...`')
         managed = [e.to_request(sharing_override=sharing) for e in endpoints if e.managed]
         outcome = None
         if managed:
@@ -2024,8 +2022,8 @@ class Controller:
 
     # -- the gateway's route registry (routes seed / prune) ----------------
 
-    def _route_gateway(self):
-        """The front door's gateway, or a ProfileMismatch saying there is none."""
+    def _route_gateway(self) -> FrontDoorControl:
+        """The front door, or a ProfileMismatch saying there is none."""
         from .profile import ProfileMismatch
 
         front = self.backend.front_door()
@@ -2033,7 +2031,7 @@ class Controller:
             raise ProfileMismatch(
                 'the `routes` commands need a LiteLLM gateway (the compose or '
                 'kubeai backend, with `litellm` on)')
-        return front.gateway
+        return front
 
     def route_view(self) -> list:
         """The routes the gateway serves now (``routes list``): derived from the
@@ -2108,22 +2106,17 @@ class Controller:
         plan.sources = sources
         return plan
 
-    @staticmethod
-    def _require_keys(gateway, catalog) -> None:
-        """Refuse to publish an external endpoint whose key variable has no
-        value in the managed ``.env`` (docs/planning/external-endpoints.md,
-        decision 4): the gateway would send an empty key."""
-        from .endpoints import key_references
-        from .profile import ProfileMismatch
+    def _require_keys(self, front: FrontDoorControl, catalog) -> None:
+        """Refuse a seed when the routes it would publish -- everything
+        published plus ``catalog`` -- send a key with no value. Checked before
+        the marker: the render refuses too, but only after the seed stored its
+        catalogs."""
+        from .profile import CatalogUnion
 
-        refs = key_references(catalog)
-        missing = gateway.missing_keys(sorted(refs))
-        if missing:
-            name = missing[0]
-            raise ProfileMismatch(
-                f'endpoint {refs[name][0]!r} sends ${name} as its key, which '
-                f'{gateway._env_path} does not set; set it first: '
-                f'`infer-stack env {name}=...`')
+        sources = self._published_sources()
+        published = CatalogUnion.from_sources(sources) if sources else None
+        front.require_route_keys([*self.backend.catalog_routes(published),
+                                  *self.backend.catalog_routes(catalog)])
 
     def commit_route_seed(self, plan: RoutePlan, *, replace: bool = False
                           ) -> tuple[RoutePlan, ReconcileResult]:
@@ -2157,6 +2150,10 @@ class Controller:
                                if n not in shown or not (shown[n] == old))
                 if moved:
                     raise RouteConflict(moved, changed=True)
+            from .profile import CatalogUnion
+
+            self._require_keys(gateway, CatalogUnion.from_sources(plan.sources)
+                               if plan.sources else None)
 
         def change():
             now = plan_seed(self._published_meanings(), plan.incoming)

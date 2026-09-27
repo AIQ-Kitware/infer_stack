@@ -111,7 +111,7 @@ def test_an_acquire_commits_its_catalog_with_its_lease(tmp_path):
     more['endpoints']['other'] = {'engine': 'vllm', 'model': 'm',
                                   'runtime': {'max_model_len': 1024}}
     wider = Catalog.from_dict(more)
-    _, ctl2 = controller(tmp_path, catalog=wider)
+    _, ctl2 = _keyed(tmp_path, wider)
 
     def crash(*args, **kwargs):
         raise RuntimeError('killed')

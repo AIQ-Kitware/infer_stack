@@ -102,10 +102,14 @@ def test_the_cli_adds_an_external_endpoint_and_refuses_runtime_options(tmp_path,
 # -- routes: one GatewayRoute per alias, whoever runs it ----------------------------
 
 
-def _compose(tmp_path, cat, **kw):
+def _compose(tmp_path, cat, *, key=True, **kw):
+    """A compose backend; ``key`` writes the remote's key into its .env."""
     from test_leasing_profile import backend
 
-    return backend(tmp_path / 'state', catalog=cat, **kw)
+    be = backend(tmp_path / 'state', catalog=cat, **kw)
+    if key:
+        write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+    return be
 
 
 def test_an_external_endpoint_routes_to_its_own_server_with_its_key_by_name(tmp_path):
@@ -160,10 +164,14 @@ def test_kubeai_routes_an_external_endpoint_directly_not_through_the_cluster(tmp
 # -- publication: routes seed publishes, routes prune unpublishes -------------------
 
 
-def _ctl(tmp_path, cat, docker=None):
+def _ctl(tmp_path, cat, docker=None, *, key=True):
+    """A controller on a compose stack; ``key`` writes the remote's key."""
     from test_leasing_profile import controller
 
-    return controller(tmp_path, catalog=cat, docker=docker)
+    ledger, ctl = controller(tmp_path, catalog=cat, docker=docker)
+    if key:
+        write_env_file(ctl.backend.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+    return ledger, ctl
 
 
 def _published(ledger):
@@ -176,7 +184,7 @@ def test_seed_publishes_an_external_endpoint_and_prune_unpublishes_it(tmp_path):
     from infer_stack.leasing.profile import ProfileMismatch
 
     mine = Catalog.from_dict(catalog())
-    ledger, ctl = _ctl(tmp_path, mine)
+    ledger, ctl = _ctl(tmp_path, mine, key=False)
     other = Catalog.from_dict({'endpoints': {'remote': REMOTE}})
     with pytest.raises(ProfileMismatch, match=r'infer-stack env REMOTE_QWEN_KEY='):
         ctl.plan_route_seed([other])              # no key: nothing to send
@@ -250,9 +258,11 @@ def _dynamic(tmp_path, cat, http):
     from infer_stack.hardware import simulate_inventory
     from infer_stack.leasing.compose import ComposeBackend
 
-    return ComposeBackend(state_dir=tmp_path, inventory=simulate_inventory('4x80'),
-                          run=FakeDocker(), http=http, images=IMAGES, ports=PORTS,
-                          state=STATE, ui=False, dynamic_routing=True, catalog=cat)
+    be = ComposeBackend(state_dir=tmp_path, inventory=simulate_inventory('4x80'),
+                        run=FakeDocker(), http=http, images=IMAGES, ports=PORTS,
+                        state=STATE, ui=False, dynamic_routing=True, catalog=cat)
+    write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+    return be
 
 
 def test_a_dynamic_external_route_survives_deployments_coming_and_going(tmp_path):
@@ -333,13 +343,13 @@ def test_managed_only_gateways_render_exactly_as_before(tmp_path):
     assert set(env) == {'LITELLM_MASTER_KEY'}
 
 
-def test_a_render_warns_about_a_key_with_no_value(tmp_path):
-    from test_leasing_route_registry import capture_warnings
+def test_a_render_refuses_a_route_whose_key_has_no_value(tmp_path):
+    from infer_stack.leasing.gateway import MissingRouteKey
 
-    be = _compose(tmp_path, Catalog.from_dict(catalog(remote=REMOTE)))
-    with capture_warnings() as warnings:
+    be = _compose(tmp_path, Catalog.from_dict(catalog(remote=REMOTE)), key=False)
+    with pytest.raises(MissingRouteKey, match='infer-stack env REMOTE_QWEN_KEY='):
         be.converge([], apply=False)
-    assert any('REMOTE_QWEN_KEY' in m and 'infer-stack env' in m for m in warnings)
+    assert not be.compose_file.exists()                  # nothing written
 
 
 def test_the_cluster_gateway_puts_keys_in_its_secret_and_rolls_on_a_change(tmp_path):
@@ -430,9 +440,10 @@ def test_access_to_an_external_endpoint_needs_the_front_door_and_its_key(tmp_pat
     from infer_stack.leasing.profile import ProfileMismatch
 
     cat = Catalog.from_dict(catalog(remote=REMOTE))
-    _, ctl = _ctl(tmp_path, cat)
+    ledger, ctl = _ctl(tmp_path, cat, key=False)
     with pytest.raises(ProfileMismatch, match='infer-stack env REMOTE_QWEN_KEY='):
         ctl.access('me', cat.resolve(['remote']))
+    assert ledger.profile() is None                    # refused before any commit
     _, lean = _ctl(tmp_path / 'lean', cat)
     lean.backend.litellm = False
     with pytest.raises(ProfileMismatch, match='LiteLLM front door'):
@@ -658,3 +669,55 @@ def test_unchecked_access_is_not_called_ready(tmp_path):
     cat = Catalog.from_dict(catalog(remote=REMOTE))
     _, ctl = _keyed(tmp_path, cat)
     assert ctl.access('me', cat.resolve(['remote']), wait=False).ready is None
+
+
+
+# -- item 44: a missing key refuses every publication --------------------------------
+
+
+def _remove_key(ctl):
+    path = ctl.backend.gateway._env_path
+    path.write_text(''.join(line + '\n' for line in path.read_text().splitlines()
+                            if not line.startswith('REMOTE_QWEN_KEY=')))
+
+
+@pytest.mark.parametrize('operation', ['acquire', 'apply', 'seed', 'config publish'])
+def test_an_unrelated_publication_refuses_when_a_published_key_is_gone(tmp_path, operation):
+    """A working external endpoint, then its key removed: no later publication
+    (whatever it is for) may recreate the gateway without it."""
+    from infer_stack.leasing.gateway import MissingRouteKey
+
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    ledger, ctl = _ctl(tmp_path, cat)
+    ctl.access('me', cat.resolve(['remote']))
+    config = (ctl.backend.state_dir / 'litellm_config.yaml').read_text()
+    _remove_key(ctl)
+    before = ledger.status()
+    profile = ledger.profile()
+    with pytest.raises(MissingRouteKey):
+        if operation == 'acquire':
+            ctl.acquire('me', cat.resolve_requests(['local']), wait=False)
+        elif operation == 'apply':
+            ctl.apply_now()
+        elif operation == 'seed':
+            extra = Catalog.from_dict({'models': {'x': {'source': 'hf://o/x'}},
+                                       'endpoints': {'x': {'engine': 'vllm', 'model': 'x'}}})
+            ctl.commit_route_seed(ctl.plan_route_seed([extra]))
+        else:
+            ctl.publish_profile({**ledger.profile(), 'ui': False})
+    assert (ctl.backend.state_dir / 'litellm_config.yaml').read_text() == config
+    assert ledger.status() == before and ledger.profile() == profile
+    if operation != 'apply':                             # apply retries a pending one
+        assert ledger.publication_pending() is None
+
+
+def test_the_cluster_gateway_refuses_a_route_whose_key_has_no_value(tmp_path):
+    from infer_stack.backends.kubeai_gateway import ClusterGateway
+    from infer_stack.leasing.gateway import MissingRouteKey, catalog_routes
+
+    gw = ClusterGateway(state_dir=tmp_path, namespace='kubeai', url='http://gw:30442',
+                        run=lambda argv: '')
+    gw.extra_routes = catalog_routes(Catalog.from_dict({'endpoints': {'remote': REMOTE}}))
+    with pytest.raises(MissingRouteKey):
+        gw.converge()
+    assert not gw.manifests_file.exists()

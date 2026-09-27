@@ -666,7 +666,7 @@ def test_rotating_the_key_recreates_the_gateway_in_front_of_the_cluster(tmp_path
     ctl = Controller(ledger, be)
     out = ctl.acquire('alice', [_req('qwen', profile='cpu')], wait=False)
     ctl.release(out.lease.id)
-    old = be.master_key()
+    old = be.front_door().master_key()
 
     def fingerprint():
         doc = yaml.safe_load(be.gateway.compose_file.read_text())
@@ -674,7 +674,7 @@ def test_rotating_the_key_recreates_the_gateway_in_front_of_the_cluster(tmp_path
 
     before = fingerprint()
     ctl.rotate_gateway_key()
-    assert be.master_key() != old
+    assert be.front_door().master_key() != old
     assert fingerprint() != before
 
 
@@ -1074,7 +1074,7 @@ def test_the_key_is_a_secret_never_a_diff_and_rotating_it_rolls_the_pods(tmp_pat
 
     be, kubectl = make_cluster_gateway_backend(tmp_path)
     be.converge([])
-    key = be.master_key()
+    key = be.front_door().master_key()
     assert key not in be.gateway.manifests_file.read_text()
     secret = be.gateway.state_dir / 'gateway-secret.yaml'
     assert stat.S_IMODE(secret.stat().st_mode) == 0o600
@@ -1085,7 +1085,7 @@ def test_the_key_is_a_secret_never_a_diff_and_rotating_it_rolls_the_pods(tmp_pat
         return tmpl['metadata']['annotations']['infer-stack/key-hash']
 
     before = key_hash()
-    be.rotate_master_key()
+    be.front_door().rotate_master_key()
     be.converge([])
     assert key_hash() != before
 
@@ -1132,7 +1132,7 @@ def test_env_and_test_use_the_kubeai_gateways_key(tmp_path, monkeypatch):
 
     be, _ = make_front_door_backend(tmp_path)
     monkeypatch.setattr(commands_leasing, '_make_backend', lambda config, **kw: be)
-    key = be.master_key()
+    key = be.front_door().master_key()
     env_path, base = commands_leasing._gateway_state(None)
     assert env_path == be.gateway.gateway._env_path
     assert commands_leasing._front_door(None) == (base.rstrip('/'), key)
