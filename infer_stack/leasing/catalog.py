@@ -77,7 +77,7 @@ from typing import Any
 import yaml
 
 from .launch import launch_identity, translate_legacy
-from .endpoints import ManagedTarget, ResolvedEndpoint
+from .endpoints import ExternalTarget, ManagedTarget, ResolvedEndpoint, external_errors
 from .models import (
     EndpointRequest,
     Sharing,
@@ -183,6 +183,11 @@ class EndpointSpec:
     # errors()). ``min_vram_gib`` is the portable eligibility declaration;
     # ``gpu_indices`` is an optional exact local pin from the TUI/CLI.
     placement: dict[str, Any] = field(default_factory=dict)
+    #: An OpenAI-compatible server that already runs (``external:``), or
+    #: ``None`` for a runtime infer-stack realizes. Ownership, not an engine.
+    external: ExternalTarget | None = None
+    #: The endpoint's mapping as written, for validating an external one.
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 def _parse_sharing(value: Any) -> str:
@@ -368,6 +373,19 @@ class Catalog:
         endpoints = {}
         for name, spec in (data.get('endpoints') or {}).items():
             spec = spec or {}
+            if 'external' in spec:
+                ext = spec.get('external')
+                endpoints[name] = EndpointSpec(
+                    name=name, engine='', model='',
+                    protocol=_parse_protocol(spec.get('protocol')),
+                    external=(ExternalTarget(
+                        api_base=str(ext.get('api_base') or ''),
+                        model=str(ext.get('model') or ''),
+                        api_key_env=ext.get('api_key_env'))
+                        if isinstance(ext, dict) else None),
+                    raw=dict(spec),
+                )
+                continue
             endpoints[name] = EndpointSpec(
                 name=name,
                 engine=spec.get('engine', VLLM),
@@ -412,6 +430,9 @@ class Catalog:
     def errors(self) -> list[str]:
         errors: list[str] = []
         for ep in self.endpoints.values():
+            if 'external' in ep.raw:
+                errors.extend(external_errors(ep.name, ep.raw, ep.raw.get('external')))
+                continue
             if ep.engine == VLLM:
                 if not ep.model:
                     errors.append(
@@ -507,6 +528,8 @@ class Catalog:
         if name not in self.endpoints:
             raise self._unknown_endpoint_error(name)
         ep = self.endpoints[name]
+        if ep.external is not None:
+            return ResolvedEndpoint(ep.name, ep.protocol, ep.external)
         share = sharing or ep.sharing
         if ep.engine == VLLM:
             request = self._resolve_vllm(ep, share)
@@ -537,8 +560,11 @@ class Catalog:
     ) -> list[EndpointRequest]:
         """Ledger requests for a mix of endpoint and bundle names
         (``sharing`` overrides the catalog's, e.g. ``--dedicated``)."""
-        return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
-                for n in self.expand(names)]
+        try:
+            return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
+                    for n in self.expand(names)]
+        except ValueError as ex:        # an external member: no lease request
+            raise CatalogError(str(ex)) from ex
 
     #: The name from before :meth:`resolve_requests`; kept for its callers.
     resolve_names = resolve_requests

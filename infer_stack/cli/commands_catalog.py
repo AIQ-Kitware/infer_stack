@@ -648,6 +648,13 @@ class EndpointAddCLI(_CatalogCommon):
     model just gets the next index instead of colliding. Give an explicit
     ``NAME`` when you want a stable alias decoupled from the model (e.g. ``chat``
     you can re-point).
+
+    ``--external-api-base`` and ``--external-model`` instead register a server
+    that already runs elsewhere (OpenAI-compatible): infer-stack routes the
+    alias to it through the gateway and runs nothing, so none of the runtime
+    options apply. ``--external-api-key-env`` names the variable holding its
+    key (set it with ``infer-stack env NAME=...``); the key itself is never
+    written to the catalog.
     """
 
     __command__ = 'add'
@@ -655,7 +662,20 @@ class EndpointAddCLI(_CatalogCommon):
         None, position=1, type=str,
         help='Endpoint alias (default: {model}-N, auto-incrementing).',
     )
-    engine = kw.Value('vllm', type=str, choices=['vllm', 'ollama'])
+    engine = kw.Value(None, type=str, choices=['vllm', 'ollama'],
+                      help='How infer-stack runs it (default: vllm).')
+    external_api_base = kw.Value(
+        None, type=str,
+        help='An OpenAI-compatible server that already runs, e.g. '
+             'http://box:8000/v1 (with --external-model; runs nothing).',
+    )
+    external_model = kw.Value(
+        None, type=str, help='The model name that external server expects.',
+    )
+    external_api_key_env = kw.Value(
+        None, type=str,
+        help="Variable holding the external server's key (its name, not the key).",
+    )
     model = kw.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
     host = kw.Value(None, type=str, help='Runtime host (ollama).')
     public_name = kw.Value(
@@ -706,6 +726,8 @@ class EndpointAddCLI(_CatalogCommon):
         config = cls.cli(argv=argv, data=kwargs)
         path = _catalog_path(config)
         data = _load_raw(path)
+        if config.external_api_base or config.external_model or config.external_api_key_env:
+            return cls._add_external(config, path, data)
         if config.name:
             name = config.name
             # The guard moved below, after the entry exists to compare against.
@@ -720,7 +742,7 @@ class EndpointAddCLI(_CatalogCommon):
             name = _next_indexed_name(
                 data['endpoints'], _slug_alias(config.model)
             )
-        entry: dict[str, Any] = {'engine': config.engine}
+        entry: dict[str, Any] = {'engine': config.engine or 'vllm'}
         if config.model:
             entry['model'] = config.model
         if config.host:
@@ -764,6 +786,51 @@ class EndpointAddCLI(_CatalogCommon):
         if not config.dry_run:
             model_note = f' -> {config.model}' if config.model else ''
             print(f"added endpoint '{name}'{model_note}")
+        return 0
+
+
+    @classmethod
+    def _add_external(cls, config, path, data) -> int:
+        """``endpoint add NAME --external-api-base URL --external-model M``."""
+        from ..leasing.endpoints import external_errors
+
+        if not config.name:
+            raise SystemExit('endpoint add: an external endpoint needs a NAME '
+                             '(the alias clients will request)')
+        managed = {
+            '--engine': config.engine, '--model': config.model, '--host': config.host,
+            '--public-name': config.public_name, '--reclaim': config.reclaim,
+            '--min-vram-gib': config.min_vram_gib, '--gpu': config.gpu or None,
+            '--max-model-len': config.max_model_len, '--gpu-mem': config.gpu_mem,
+            '--tensor-parallel': config.tensor_parallel,
+            '--extra-args': config.extra_args, '--runtime': config.runtime or None,
+        }
+        given = [flag for flag, value in managed.items() if value is not None]
+        if given:
+            raise SystemExit(
+                f'endpoint add: {", ".join(given)} '
+                f'{"describe" if len(given) > 1 else "describes"} a runtime '
+                'infer-stack runs; an external endpoint (--external-*) runs nothing')
+        ext: dict[str, Any] = {'api_base': config.external_api_base,
+                               'model': config.external_model}
+        if config.external_api_key_env:
+            ext['api_key_env'] = config.external_api_key_env
+        entry: dict[str, Any] = {'external': ext}
+        if config.protocol:
+            entry['protocol'] = config.protocol
+        problems = external_errors(config.name, entry, ext)
+        if problems:
+            raise SystemExit('endpoint add: ' + '; '.join(problems))
+        action = _exists_guard(data, 'endpoints', config.name, config.force, entry)
+        if action == 'unchanged':
+            if not config.dry_run:
+                print(f"endpoint '{config.name}' already up to date")
+            return 0
+        data['endpoints'][config.name] = entry
+        _save_raw(path, data, dry_run=config.dry_run)
+        if not config.dry_run:
+            print(f"added external endpoint '{config.name}' -> "
+                  f"{config.external_model} at {config.external_api_base}")
         return 0
 
 

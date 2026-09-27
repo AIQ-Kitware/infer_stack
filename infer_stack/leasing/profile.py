@@ -153,8 +153,11 @@ class CatalogUnion:
         return [self.resolve_endpoint(n) for n in self.expand(names)]
 
     def resolve_requests(self, names: list[str], *, sharing: str | None = None):
-        return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
-                for n in self.expand(names)]
+        try:
+            return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
+                    for n in self.expand(names)]
+        except ValueError as ex:        # an external member: no lease request
+            raise CatalogError(str(ex)) from ex
 
     resolve_names = resolve_requests
 

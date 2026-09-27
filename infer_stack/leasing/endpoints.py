@@ -38,6 +38,59 @@ class ManagedTarget:
     kind = 'managed'
 
 
+#: Variables infer-stack itself keeps in the gateway's .env. An external
+#: target may not name one as its key: the gateway would send infer-stack's
+#: own credential to a server the catalog names.
+RESERVED_KEY_ENVS = frozenset({
+    'LITELLM_MASTER_KEY', 'LITELLM_SALT_KEY', 'LITELLM_DB_PASSWORD',
+    'WEBUI_SECRET_KEY', 'HF_TOKEN',
+})
+
+#: Endpoint keys that describe a runtime infer-stack realizes, so they mean
+#: nothing beside ``external:``.
+MANAGED_ONLY_KEYS = ('engine', 'model', 'host', 'runtime', 'placement', 'sharing',
+                     'reclaim', 'served_name', 'public_name')
+
+
+def external_errors(name: str, raw: dict[str, Any], external: Any) -> list[str]:
+    """What is wrong with endpoint ``name`` whose ``external:`` is ``external``
+    (``raw`` is the endpoint's whole mapping).
+
+    >>> external_errors('q', {'external': {}, 'runtime': {}}, {'api_base': 'box', 'model': ''})
+    ["endpoint 'q' is external: 'runtime' describes a runtime infer-stack runs and does not apply", "endpoint 'q': external.api_base must be an http(s) URL, not 'box'", "endpoint 'q': external.model is required (the name the upstream server expects)"]
+    >>> external_errors('q', {}, {'api_base': 'http://b/v1', 'model': 'm', 'api_key_env': 'HF_TOKEN'})
+    ["endpoint 'q': external.api_key_env may not be HF_TOKEN, one of infer-stack's own secrets"]
+    """
+    import re
+
+    errors = [f"endpoint {name!r} is external: {key!r} describes a runtime "
+              'infer-stack runs and does not apply'
+              for key in MANAGED_ONLY_KEYS if key in raw]
+    if not isinstance(external, dict):
+        return errors + [f"endpoint {name!r}: 'external' must be a mapping "
+                         '(api_base, model, optional api_key_env)']
+    unknown = sorted(set(external) - {'api_base', 'model', 'api_key_env'})
+    if unknown:
+        errors.append(f"endpoint {name!r}: unknown external key(s) {unknown} "
+                      '(api_base, model, api_key_env)')
+    base = external.get('api_base')
+    if not isinstance(base, str) or not re.match(r'https?://[^/\s]+', base):
+        errors.append(f"endpoint {name!r}: external.api_base must be an http(s) URL, "
+                      f'not {base!r}')
+    if not external.get('model') or not isinstance(external.get('model'), str):
+        errors.append(f"endpoint {name!r}: external.model is required (the name the "
+                      'upstream server expects)')
+    key_env = external.get('api_key_env')
+    if key_env is not None:
+        if not isinstance(key_env, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key_env):
+            errors.append(f"endpoint {name!r}: external.api_key_env must be an "
+                          f'environment variable name, not {key_env!r}')
+        elif key_env in RESERVED_KEY_ENVS:
+            errors.append(f"endpoint {name!r}: external.api_key_env may not be "
+                          f"{key_env}, one of infer-stack's own secrets")
+    return errors
+
+
 @dataclass(frozen=True)
 class ExternalTarget:
     """An OpenAI-compatible server infer-stack does not run.
@@ -76,7 +129,7 @@ class ResolvedEndpoint:
         >>> remote.to_request()
         Traceback (most recent call last):
         ...
-        ValueError: 'qwen' is externally provided; it has no lease request
+        ValueError: 'qwen' is externally provided and does not require a lease; use `infer-stack access qwen` or `infer-stack run ...`
     """
 
     alias: str
@@ -91,7 +144,9 @@ class ResolvedEndpoint:
         """The ledger request for a managed target (``--dedicated`` overrides
         the catalog's sharing); an external target has none."""
         if not isinstance(self.target, ManagedTarget):
-            raise ValueError(f'{self.alias!r} is externally provided; it has no lease request')
+            raise ValueError(
+                f'{self.alias!r} is externally provided and does not require a lease; '
+                f'use `infer-stack access {self.alias}` or `infer-stack run ...`')
         request = self.target.request
         if sharing_override and sharing_override != request.sharing:
             request = dataclasses.replace(request, sharing=sharing_override)

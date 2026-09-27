@@ -1123,12 +1123,19 @@ as its alias). `CatalogUnion` compares semantic keys and no longer imports
 still answers the `EndpointRequest` fields: eval_audit reads them off
 `resolve_endpoint` (its test failures are the same with and without this).
 
-### 30. [ ] The external target in the catalog and its CLI
+### 30. [x] The external target in the catalog and its CLI
 YAML `external:` block, validation of illegal mixtures, round-trip.
 `catalog endpoint add` gains mutually exclusive external options (e.g.
 `--external-api-base`, `--external-model`, `--external-api-key-env`), never
 an `--engine` choice; reject `--engine vllm` + external, `--gpu`/`--reclaim`
 + external. `catalog show` makes ownership obvious.
+
+*Done 2026-09-27:* `EndpointSpec.external`; `endpoints.external_errors`
+(managed-only keys, URL, model, env-name syntax, reserved names);
+`catalog endpoint add --external-*`; `resolve_requests` on an external
+member raises "... does not require a lease; use `infer-stack access
+NAME`". `catalog show` prints the `external:` block. Tests 1-2 and the CLI in
+`tests/test_external_endpoints.py`.
 
 ### 31. [ ] One terminology
 Endpoint alias (what users request through the front door), upstream model
