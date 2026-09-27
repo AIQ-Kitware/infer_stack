@@ -105,8 +105,9 @@ For crash-safe recovery, leasing still persists a frozen render snapshot. The
 controller advances it automatically on acquire under the publication lock:
 
 - **Quiescent stack.** With no active lease and no managed deployment
-  container, the next acquire adopts the current user settings and catalog
-  wholesale.
+  container, the next acquire adopts the current user settings. The catalog
+  is merged, never replaced: published endpoint definitions stay until
+  `routes prune` (an external endpoint has no lease to keep it).
 - **Compatible catalog additions while live.** New endpoint/bundle/route
   definitions can be merged into the active snapshot without changing any
   definition already frozen for resident workloads. This is the normal

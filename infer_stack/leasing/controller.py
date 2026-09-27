@@ -1080,18 +1080,21 @@ class Controller:
         User configuration remains authoritative; the persisted profile is an
         internal crash-recovery snapshot, not a third configuration surface.
 
-        * Quiescent stack: adopt the invocation profile wholesale.
-        * Live epoch: retain frozen global render settings, but append compatible
-          catalog snapshots so newly suggested/added endpoints can be acquired
-          side by side.  Semantic conflicts fail closed.
+        * Settings (backend, ports, images, gateway placement): adopted from
+          the invocation when the stack is quiescent, frozen while workloads
+          are resident.
+        * Catalogs, the published endpoint definitions: always merged
+          (:func:`~infer_stack.leasing.profile.adopt_catalog_sources`): the
+          invocation's definitions replace published ones nothing runs; one a
+          resident workload runs refuses; unrelated published definitions,
+          external endpoints included, stay. Quiescence does not unpublish.
         """
         from .._log import logger
         from .profile import (
             CatalogConflict,
             ProfileMismatch,
-            merge_catalog_sources,
+            adopt_catalog_sources,
             profile_drift,
-            prune_catalog_sources,
         )
 
         stored = self.ledger.profile()
@@ -1110,33 +1113,25 @@ class Controller:
         # because the stack happens to be quiescent.
         if not drift:
             return None
-        if self._profile_quiescent(residency):
-            return invocation
-
-        candidate = dict(stored)
+        quiescent = self._profile_quiescent(residency)
+        candidate = dict(invocation) if quiescent else dict(stored)
+        # Only definitions a resident workload is actually running have to stay
+        # frozen; redefining anything else (the normal case while iterating with
+        # `catalog endpoint add --force`) replaces it. Nothing else unpublishes.
+        pinned = set() if quiescent else self._pinned_endpoints(residency)
         try:
-            candidate['catalogs'] = merge_catalog_sources(
-                stored.get('catalogs') or [], invocation.get('catalogs') or []
-            )
-        except CatalogConflict:
-            # Only definitions a resident workload is actually running have to
-            # stay frozen. Redefining anything else -- the normal case while
-            # iterating with `catalog endpoint add --force` -- drops the stale
-            # definition instead of refusing every acquire on the host.
-            pinned = self._pinned_endpoints(residency)
-            try:
-                candidate['catalogs'] = merge_catalog_sources(
-                    prune_catalog_sources(stored.get('catalogs') or [], pinned),
-                    invocation.get('catalogs') or [],
-                )
-            except CatalogConflict as pinned_ex:
-                blocked = sorted(set(pinned_ex.names) & pinned) or sorted(pinned_ex.names)
-                raise ProfileMismatch(
-                    f'the current catalog redefines {", ".join(repr(b) for b in blocked)}, '
-                    'which a resident deployment is running. Release or evict it '
-                    f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
-                    'nothing is running are updated automatically'
-                ) from pinned_ex
+            candidate['catalogs'] = adopt_catalog_sources(
+                stored.get('catalogs') or [], invocation.get('catalogs') or [], pinned)
+        except CatalogConflict as pinned_ex:
+            blocked = sorted(set(pinned_ex.names) & pinned) or sorted(pinned_ex.names)
+            raise ProfileMismatch(
+                f'the current catalog redefines {", ".join(repr(b) for b in blocked)}, '
+                'which a resident deployment is running. Release or evict it '
+                f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
+                'nothing is running are updated automatically'
+            ) from pinned_ex
+        if quiescent:
+            return candidate if candidate != stored else None
 
         deferred = [
             key for key in drift if key != 'catalogs'

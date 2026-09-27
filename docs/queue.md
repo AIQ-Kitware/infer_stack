@@ -1151,6 +1151,13 @@ unchanged. New code (endpoints, routes, access) uses alias / upstream model /
 deployment id.
 
 ### 32. [ ] One semantic `GatewayRoute`
+
+*Step 1 done 2026-09-27 (decision 1):* `adopt_catalog_sources` merges the
+invocation's catalogs into the published union on every acquire: a changed
+definition replaces an unpinned published one, a pinned one refuses,
+everything else stays; quiescence adopts settings only. The live-epoch path
+used to drop every unpinned definition on any conflict; it now drops only the
+conflicting names. ADR 0001, known-limitations and `profile.py` updated.
 Alias, upstream adapter (OpenAI-compatible / Ollama), upstream model,
 api_base, optional credential-env name, optional managed dynamic route id.
 Produced by Compose (managed service name), KubeAI (cluster gateway),

@@ -37,10 +37,17 @@ On acquire, under the publication lock:
 1. Resolve the requested endpoint from the user's current catalog.
 2. Compare current user settings/catalog with the recovery snapshot.
 3. If the stack is quiescent (no active lease and no managed deployment
-   container), replace the snapshot wholesale with current user config.
+   container), adopt the current user settings.
 4. If workloads are resident, keep global render settings frozen for that
-   leasing epoch, but merge compatible catalog additions into the snapshot.
-   Existing endpoint/bundle/route definitions may not be redefined live.
+   leasing epoch.
+   In both cases merge the current catalog into the snapshot's published
+   endpoint definitions: a definition it changes replaces the published one
+   unless a resident workload runs it (then the acquire refuses); every other
+   published definition stays. *Amended 2026-09-27
+   ([external-endpoints](../planning/external-endpoints.md), decision 1):
+   quiescence used to replace the catalogs wholesale too, but an external
+   endpoint has no lease to keep it published, so only an explicit
+   `routes prune` unpublishes.*
 5. Preview/admit/render using that exact candidate snapshot, then persist the
    snapshot before committing the acquire's desired-state mutation.
 
@@ -80,8 +87,8 @@ published definitions are retained and incoming definitions are appended only
 if the semantic `CatalogUnion` has no conflicts. Thus an unrelated catalog edit
 cannot silently change an existing deployment's recovery render.
 
-A wholesale snapshot replacement is allowed only at the same quiescence
-boundary used by explicit publication. This preserves the original motivation
+Replacing the settings is allowed only at the same quiescence boundary used
+by explicit publication; `config publish` still replaces the whole snapshot. This preserves the original motivation
 for the frozen profile while removing it from the normal UX.
 
 ## Consequences

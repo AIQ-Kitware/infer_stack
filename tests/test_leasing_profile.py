@@ -86,7 +86,9 @@ def test_drift_is_warned_once(tmp_path):
     assert len(warnings) == 1 and 'ui' in warnings[0]
 
 
-def test_acquire_auto_adopts_current_catalog_when_quiescent(tmp_path):
+def test_a_quiescent_acquire_publishes_its_catalog_beside_the_others(tmp_path):
+    """Quiescence lets settings change; it does not unpublish endpoints
+    (campaign 2 decision 1: an external endpoint has no lease to keep it)."""
     a = Catalog.from_dict(cat('alpha'))
     b = Catalog.from_dict(cat('beta'))
     ledger, ctl = controller(tmp_path, catalog=a)
@@ -94,7 +96,7 @@ def test_acquire_auto_adopts_current_catalog_when_quiescent(tmp_path):
     _, ctl2 = controller(tmp_path, catalog=b)
     out = ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
     assert out.lease.endpoints == ['beta']
-    assert set(ctl2.backend.catalog.endpoints) == {'beta'}
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
     assert ledger.publication_pending() is None
 
 
@@ -636,3 +638,44 @@ def test_catalogs_naming_one_model_differently_agree_on_its_endpoint():
     assert list(union.endpoints) == ['qwen']
     a, b = (Catalog.from_dict(cat(k)).resolve_endpoint('qwen') for k in ('alias-a', 'alias-b'))
     assert a.semantic_key() == b.semantic_key()
+
+
+# -- the published endpoint union (campaign 2, decision 1) ---------------------------
+
+
+def test_quiescence_adopts_new_settings_but_keeps_published_endpoints(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    b = Catalog.from_dict(cat('beta'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.gc()                                              # freezes ui=True, {alpha}
+    _, ctl2 = controller(tmp_path, catalog=b, ui=False)
+    ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
+    assert ledger.profile()['ui'] is False               # settings: the invocation's
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
+
+
+def test_a_live_redefinition_drops_only_the_redefined_name(tmp_path):
+    """A conflict used to drop every unpinned published definition; an
+    external endpoint published by another runbook would have gone with it."""
+    def beta(**runtime):
+        return {'engine': 'vllm', 'model': 'm', 'reclaim': 'stop',
+                **({'runtime': runtime} if runtime else {})}
+
+    other = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/beta'}},
+        'endpoints': {'beta': beta(),
+                      'remote': {'external': {'api_base': 'http://box/v1', 'model': 'q'}}},
+    })
+    edited = Catalog.from_dict({'models': {'m': {'source': 'hf://org/beta'}},
+                                'endpoints': {'beta': beta(max_model_len=1024)}})
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.acquire('a', a.resolve_names(['alpha']), wait=False)       # alpha live, pinned
+    _, ctl2 = controller(tmp_path, catalog=other)
+    lease = ctl2.acquire('b', other.resolve_names(['beta']), wait=False).lease
+    ctl2.release(lease.id)                                          # beta stopped: unpinned
+    _, ctl3 = controller(tmp_path, catalog=edited)
+    ctl3.acquire('c', edited.resolve_names(['beta']), wait=False)   # redefines beta
+    published = ctl3.backend.catalog
+    assert {'alpha', 'beta', 'remote'} <= set(published.endpoints)
+    assert published.resolve_endpoint('beta').to_request().capacity == {'max_model_len': 1024}

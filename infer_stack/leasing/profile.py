@@ -9,9 +9,9 @@ re-renders, and could then recreate unrelated services.
 The first controller mutation against a ledger with no profile freezes that
 invocation's resolved settings. Later operations render from the stored copy.
 For the ordinary ``config init -> catalog suggest --apply -> acquire`` workflow,
-acquire advances this snapshot automatically: compatible catalog additions are
-merged into a live epoch, and a quiescent stack adopts the current invocation
-profile wholesale. ``infer-stack config publish`` remains an advanced explicit
+acquire advances this snapshot automatically: the invocation's catalogs are
+merged into the published endpoint definitions (:func:`adopt_catalog_sources`),
+and a quiescent stack adopts the invocation's settings. ``infer-stack config publish`` remains an advanced explicit
 pre-seed/preview operation; it is not a required third configuration step.
 
 Not in the profile:
@@ -229,10 +229,10 @@ def merge_catalog_sources(
     resolves differently, :class:`CatalogConflict` is raised before anything is
     written.
 
-    The snapshots are intentionally retained rather than replacing the old
-    source while workloads are resident.  Once the stack is quiescent the next
-    acquire replaces the profile wholesale with the current user configuration,
-    compacting this history back to the authoritative source(s).
+    The snapshots are the published endpoint definitions (see
+    :func:`adopt_catalog_sources` for how an acquire updates them); an
+    external endpoint has no lease to pin it, so they are never dropped merely
+    because the stack is quiescent.
     """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -245,6 +245,81 @@ def merge_catalog_sources(
     # Validate the semantic union now, before a controller persists it.
     CatalogUnion.from_sources(out)
     return out
+
+
+def drop_catalog_names(
+    sources: list[dict[str, Any]], names: set[str]
+) -> list[dict[str, Any]]:
+    """``sources`` without the endpoints and bundles named ``names``; a source
+    left with neither goes."""
+    out: list[dict[str, Any]] = []
+    for source in sources or []:
+        endpoints = {n: s for n, s in (source.get('endpoints') or {}).items()
+                     if n not in names}
+        bundles = {n: m for n, m in (source.get('bundles') or {}).items()
+                   if n not in names}
+        if not endpoints and not bundles:
+            continue
+        kept = dict(source)
+        kept['endpoints'] = endpoints
+        kept['bundles'] = bundles
+        out.append(kept)
+    return out
+
+
+def adopt_catalog_sources(
+    published: list[dict[str, Any]], incoming: list[dict[str, Any]],
+    pinned: set[str],
+) -> list[dict[str, Any]]:
+    """The published endpoint definitions after an acquire or access.
+
+    The published union is where endpoint definitions live between runs
+    (docs/planning/external-endpoints.md, decision 1). ``incoming`` (the
+    invocation's catalogs) is merged in: a definition it redefines replaces the
+    published one, unless a resident workload runs it (``pinned``: then
+    :class:`CatalogConflict`); every other published definition stays, however
+    unrelated. A published snapshot also sheds definitions ``incoming`` repeats,
+    so editing a catalog over time does not pile up copies.
+
+    Example:
+        >>> ep = lambda src: {'engine': 'vllm', 'model': 'm'}
+        >>> cat = lambda **eps: {'models': {'m': {'source': 'hf://o/m'}}, 'endpoints': eps}
+        >>> old = cat(a={'engine': 'vllm', 'model': 'm'},
+        ...           x={'external': {'api_base': 'http://h/v1', 'model': 'q'}})
+        >>> new = cat(a={'engine': 'vllm', 'model': 'm', 'runtime': {'max_model_len': 8}})
+        >>> out = adopt_catalog_sources([old], [new], pinned=set())
+        >>> sorted(CatalogUnion.from_sources(out).endpoints)      # x survives
+        ['a', 'x']
+        >>> adopt_catalog_sources([old], [new], pinned={'a'})
+        Traceback (most recent call last):
+        ...
+        infer_stack.leasing.profile.CatalogConflict: endpoint 'a' is defined differently in two published catalogs
+    """
+    base = list(published or [])
+    want = [dict(s or {}) for s in incoming or []]
+    mine = CatalogUnion.from_sources(want) if want else None
+    if mine is not None:
+        # Definitions the invocation repeats identically live in its snapshot.
+        same = set()
+        for source in base:
+            for name in (source.get('endpoints') or {}):
+                if name in mine.endpoints:
+                    try:
+                        other = Catalog.from_dict(source).resolve_endpoint(name)
+                        if other.semantic_key() == mine.resolve_endpoint(name).semantic_key():
+                            same.add(name)
+                    except CatalogError:
+                        pass
+        base = drop_catalog_names(base, same)
+    for _ in range(64):             # each round drops at least one name
+        try:
+            return merge_catalog_sources(base, want)
+        except CatalogConflict as ex:
+            names: set[str] = {str(n) for n in ex.names}
+            if not names or names & pinned:
+                raise
+            base = drop_catalog_names(base, names)
+    raise CatalogConflict('catalog union did not settle', [])
 
 
 def prune_catalog_sources(
