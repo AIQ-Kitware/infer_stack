@@ -12,6 +12,7 @@ import json
 import pytest
 import yaml
 
+from infer_stack.env_utils import write_env_file
 from infer_stack.leasing import Catalog
 from infer_stack.leasing.catalog import CatalogError
 from infer_stack.leasing.endpoints import ExternalTarget
@@ -605,3 +606,55 @@ def test_moving_a_bundled_endpoint_to_external_keeps_the_union_valid():
     union = CatalogUnion.from_sources(sources)
     assert not union.resolve_endpoint('local').managed
     assert union.bundles['pair'] == ['local', 'remote']
+
+
+# -- item 43: access readiness includes route publication -----------------------------
+
+
+class _LiteLLM:
+    """A healthy LiteLLM (it accepts its key) whose admin API can refuse adds."""
+
+    def __init__(self):
+        from test_leasing_dynamic_routing import RecordingGateway
+
+        self.admin = RecordingGateway()
+        self.refuse = True
+
+    def get(self, url, **kw):
+        from test_leasing_dynamic_routing import FakeResp
+
+        if url.endswith('/v1/models'):
+            return FakeResp(200, {'data': []})
+        return self.admin.get(url, **kw)
+
+    def post(self, url, **kw):
+        from test_leasing_dynamic_routing import FakeResp
+
+        if self.refuse and url.endswith('/model/new'):
+            return FakeResp(500, {'detail': 'db unavailable'})
+        return self.admin.post(url, **kw)
+
+
+def test_external_access_is_not_ready_until_its_route_is_published(tmp_path):
+    from test_leasing_dynamic_routing import FakeTime, _timed_backend
+
+    from infer_stack.leasing import Controller, Ledger, SqliteStore
+
+    time, http = FakeTime(), _LiteLLM()
+    be = _timed_backend(tmp_path / 'state', http, time)
+    be.catalog = Catalog.from_dict(catalog(remote=REMOTE))
+    write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')))
+    ctl = Controller(ledger, be, clock=time.clock, sleep=time.sleep)
+    result = ctl.access('me', be.catalog.resolve(['remote']))
+    assert result.ready is False and not result.published
+    assert ledger.publication_pending() is not None            # stays pending
+    http.refuse = False                                         # the DB is back
+    again = ctl.access('me', be.catalog.resolve(['remote']))
+    assert again.ready is True and ledger.publication_pending() is None
+
+
+def test_unchecked_access_is_not_called_ready(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    _, ctl = _keyed(tmp_path, cat)
+    assert ctl.access('me', cat.resolve(['remote']), wait=False).ready is None

@@ -127,9 +127,12 @@ class AccessResult:
     the base URL and credential (``None`` on an in-process backend); ``lease``:
     the one real lease over the managed members, or ``None`` when every member
     is external (the lease never lists an external name); ``acquire``: that
-    lease's outcome (readiness, placement). ``front_door_ready`` is ``False``
-    when an external member's front door never accepted its key in time; the
-    lease this access took is then already released.
+    lease's outcome (readiness, placement). ``published`` is whether the
+    publication (the gateway's routes included) completed; ``False`` leaves it
+    pending for the next apply. ``front_door_ready`` is ``False`` when an
+    external member's front door never accepted its key in time; the lease
+    this access took is then already released. ``waited`` is whether
+    readiness was checked at all.
     """
 
     endpoints: list[str]
@@ -139,22 +142,27 @@ class AccessResult:
     lease: Lease | None = None
     acquire: AcquireOutcome | None = None
     front_door_ready: bool | None = None
+    published: bool = True
+    waited: bool = True
 
     @property
     def deployments(self) -> list[Deployment]:
         return list(self.acquire.deployments) if self.acquire is not None else []
 
     @property
-    def ready(self) -> bool:
-        """Every member can be asked now (managed ones generated through the
-        front door; external ones reachable through it)."""
-        if self.front_door_ready is False:
+    def ready(self) -> bool | None:
+        """``True``: verified that every member can be asked now (infer-stack's
+        routes for them are published, managed members generate through the
+        front door, and the front door accepts its key; the external server
+        itself is not asked). ``False``: verified not. ``None``: not checked
+        (``wait=False``)."""
+        if not self.published or self.front_door_ready is False:
             return False
-        if self.acquire is None:
-            return True
-        if self.acquire.released_on_timeout:
+        if self.acquire is not None and (
+                self.acquire.released_on_timeout
+                or (self.acquire.wait is not None and not self.acquire.wait.ready)):
             return False
-        return self.acquire.wait is None or bool(self.acquire.wait.ready)
+        return True if self.waited else None
 
 
 @dataclass
@@ -1741,14 +1749,19 @@ class Controller:
             outcome = self.acquire(
                 owner, managed, ttl_seconds=ttl_seconds, wait=wait, timeout=timeout,
                 interval=interval, wait_for_placement=wait_for_placement)
+            rec = outcome.reconcile
         else:
-            self.publish_endpoints()
+            rec = self.publish_endpoints()
         result = AccessResult(
             endpoints=aliases, external=[e.alias for e in external],
             request_names=self.backend.request_names(aliases),
             connection=self.backend.connection_info(),
-            lease=outcome.lease if outcome is not None else None, acquire=outcome)
-        if front is not None and wait and not (outcome and outcome.released_on_timeout):
+            lease=outcome.lease if outcome is not None else None, acquire=outcome,
+            # An external member is reached only through the routes this
+            # publication installs: gateway liveness alone does not prove them.
+            published=not (external and rec.publication_pending), waited=wait)
+        if (front is not None and wait and result.published
+                and not (outcome and outcome.released_on_timeout)):
             accepted = front.gateway_accepts(
                 front.master_key(), wait=min(timeout, self.FRONT_DOOR_WAIT_S))
             result.front_door_ready = accepted is True

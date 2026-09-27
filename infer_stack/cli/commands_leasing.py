@@ -747,12 +747,17 @@ def _emit_access(config, controller, result) -> int:
             'external': result.external,
             'descriptor': _public_descriptor(descriptor),
             'ready': result.ready,
+            'published': result.published,
             'front_door_ready': result.front_door_ready,
             'pending': [] if outcome is None or outcome.wait is None else outcome.wait.pending,
             'failures': [] if outcome is None or outcome.wait is None else outcome.wait.failures,
             'released': released,
         }, indent=2))
-        return 0 if result.ready else 2
+        return 2 if result.ready is False else 0
+    if not result.published:
+        print('the gateway\'s routes for this access were not published; the '
+              'publication stays pending and `infer-stack apply` retries it')
+        return 2
     if result.front_door_ready is False:
         print('the front door did not accept its key in time'
               + (f'; lease {result.lease.id} released' if result.lease else ''))
@@ -765,14 +770,15 @@ def _emit_access(config, controller, result) -> int:
     for endpoint, model in descriptor['endpoints'].items():
         tag = '  (external)' if endpoint in result.external else ''
         print(f'  endpoint {endpoint} -> {model}{tag}')
-    print(f'  ready: {result.ready}')
+    print('  ready: ' + ('not checked (--no-wait)' if result.ready is None
+                         else str(result.ready)))
     if outcome is not None and outcome.wait is not None:
         for gid, endpoint in outcome.wait.pending:
             print(f'    pending: {endpoint} ({gid})')
     _print_front_door(result.connection)
     if config.env_file:
         print(f'  env-file: {config.env_file}')
-    return 0 if result.ready else 2
+    return 2 if result.ready is False else 0
 
 
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
@@ -2073,8 +2079,12 @@ class RunCLI(_LeasingCommonMixin):
             raise SystemExit(
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )
-        if result.front_door_ready is False:
-            raise SystemExit('run: the front door did not accept its key in time')
+        if not result.published or result.front_door_ready is False:
+            if result.lease is not None and result.front_door_ready is not False:
+                controller.release(result.lease.id)
+            raise SystemExit('run: the gateway\'s routes were not published'
+                             if not result.published else
+                             'run: the front door did not accept its key in time')
         descriptor = _descriptor_for(
             controller, result.lease, result.deployments, config,
             endpoints=result.endpoints,

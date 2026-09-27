@@ -1378,7 +1378,12 @@ declined (no profile, marker, route); crash before the commit; fresh managed
 acquire declined (no lease, no profile); first access commits profile and
 marker together; `gc` on a fresh ledger publishes no endpoint.
 
-### 43. [ ] Access readiness includes route publication
+### 43. [x] Access readiness includes route publication
+*Done 2026-09-27.* `AccessResult.published` (the publication's result; a
+pending one is not ready, exit 2, and `apply` retries it) and a tri-state
+`ready` (`None` with `--no-wait`); the front-door key check runs only after
+a completed publication. Test: route adds refused, the gateway healthy ->
+not ready and pending; the retry succeeds -> ready.
 External-only `access` returns ready when LiteLLM answers the master key,
 even if the route reconcile failed (`routes=False`, publication pending).
 Carry the publication result into `AccessResult`; ready requires it
