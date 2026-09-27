@@ -726,3 +726,31 @@ def test_status_reports_serving_not_residency_for_replicas(tmp_path):
     assert health() == ['restarting']
     assert _condition(stack, gid) == 'restarting'
     assert stack.backend.residency().is_resident(gid)  # still resident, as it should be
+
+
+def test_a_profile_with_its_own_scheduler_evicts_nothing(tmp_path):
+    """Re-review 3: a resource profile's `scheduler_name` hands the pod to a
+    scheduler whose filters infer-stack does not model, so it cannot tell
+    that stopping an idle Model would help, even on a capacity complaint."""
+    from infer_stack.config import resource_profiles_to_kubeai_values
+
+    values = resource_profiles_to_kubeai_values(
+        {'batch': {'scheduler_name': 'volcano', 'node_selector': {'gpu': 'a100'}}})
+    profile = values['resourceProfiles']['batch']
+    spec = {'schedulerName': profile['schedulerName'],
+            'nodeSelector': profile['nodeSelector']}
+    stack, ids = _two_idle_models(tmp_path)
+    _wait_blocked(stack, '0/2 nodes are available: 1 Insufficient nvidia.com/gpu, '
+                  "1 node(s) didn't match Pod's node affinity/selector.", spec)
+    assert _idle(stack, ids) == {'warm-a', 'warm-b'}
+
+
+def test_required_pod_anti_affinity_evicts_nothing(tmp_path):
+    stack, ids = _two_idle_models(tmp_path)
+    spec = {'nodeSelector': {'gpu': 'a100'}, 'affinity': {'podAntiAffinity': {
+        'requiredDuringSchedulingIgnoredDuringExecution': [
+            {'topologyKey': 'kubernetes.io/hostname',
+             'labelSelector': {'matchLabels': {'app': 'model'}}}]}}}
+    _wait_blocked(stack, '0/2 nodes are available: 1 Insufficient nvidia.com/gpu, '
+                  "1 node(s) didn't match Pod's node affinity/selector.", spec)
+    assert _idle(stack, ids) == {'warm-a', 'warm-b'}

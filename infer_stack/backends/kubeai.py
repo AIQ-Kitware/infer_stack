@@ -437,9 +437,13 @@ def eligible_nodes(pod_spec: dict, nodes: list[dict]) -> set[str] | None:
     """Nodes a pod could run on if they had room, or ``None`` if not known.
 
     A node qualifies when it is schedulable, carries every label of the
-    pod's ``nodeSelector``, and every blocking taint is tolerated. Required
-    node affinity is not evaluated here: ``None`` then, and the caller frees
-    nothing on a guess.
+    pod's ``nodeSelector``, and every blocking taint is tolerated: the
+    default scheduler's filters for those fields. Anything that filters
+    differently makes the answer unknown (``None``), and the caller frees
+    nothing on a guess: another scheduler (``schedulerName``, which a
+    resource profile's ``scheduler_name`` sets), required node affinity,
+    required pod affinity or anti-affinity, and a topology spread
+    constraint that forbids scheduling.
 
     >>> spec = {'nodeSelector': {'gpu': 'a100'}, 'tolerations': []}
     >>> nodes = [{'metadata': {'name': 'a', 'labels': {'gpu': 'a100'}}, 'spec': {}},
@@ -448,10 +452,21 @@ def eligible_nodes(pod_spec: dict, nodes: list[dict]) -> set[str] | None:
     ...           'spec': {'taints': [{'key': 'x', 'effect': 'NoSchedule'}]}}]
     >>> eligible_nodes(spec, nodes)
     {'a'}
+    >>> eligible_nodes({**spec, 'schedulerName': 'volcano'}, nodes) is None
+    True
+    >>> eligible_nodes({**spec, 'affinity': {'podAntiAffinity': {
+    ...     'requiredDuringSchedulingIgnoredDuringExecution': [{}]}}}, nodes) is None
+    True
     """
-    required = (((pod_spec.get('affinity') or {}).get('nodeAffinity') or {})
-                .get('requiredDuringSchedulingIgnoredDuringExecution'))
-    if required:
+    if pod_spec.get('schedulerName') not in (None, '', 'default-scheduler'):
+        return None                     # its filters are not these
+    affinity = pod_spec.get('affinity') or {}
+    hard = 'requiredDuringSchedulingIgnoredDuringExecution'
+    if any((affinity.get(kind) or {}).get(hard)
+           for kind in ('nodeAffinity', 'podAffinity', 'podAntiAffinity')):
+        return None
+    if any(c.get('whenUnsatisfiable', 'DoNotSchedule') == 'DoNotSchedule'
+           for c in pod_spec.get('topologySpreadConstraints') or []):
         return None
     selector = pod_spec.get('nodeSelector') or {}
     tolerations = pod_spec.get('tolerations') or []
