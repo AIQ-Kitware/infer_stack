@@ -1042,11 +1042,11 @@ def test_routes_seed_and_prune_publish_through_the_controller(tmp_path, monkeypa
     calls = []
     real = Controller.publish_change
 
-    def spy(self, change):
+    def spy(self, change, **kw):
         calls.append(self._flock_depth)
         # The registry must not be written before the controller runs the change.
         before = (state / 'litellm_registry.json').exists()
-        result = real(self, change)
+        result = real(self, change, **kw)
         calls.append(before)
         return result
 
