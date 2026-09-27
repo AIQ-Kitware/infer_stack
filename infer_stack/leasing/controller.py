@@ -1103,15 +1103,68 @@ class Controller:
         while its container is actually resident, which is the same rule
         placement uses. Anything else is free to be redefined.
         """
+        return set(self._pinned_deployments(residency))
+
+    def _pinned_deployments(self, residency=None) -> dict[str, list[Deployment]]:
+        """``{alias: [resident deployments serving it]}`` (see
+        :meth:`_pinned_endpoints`)."""
         _, deployments = self.ledger.status(virtual_expiry=True)
-        pinned: set[str] = set()
+        pinned: dict[str, list[Deployment]] = {}
         for deployment in deployments:
-            if deployment.state == DeploymentState.LIVE:
-                pinned.update(deployment.served)
-            elif deployment.state == DeploymentState.IDLE and residency is not None:
-                if residency.is_resident(deployment.id):
-                    pinned.update(deployment.served)
+            resident = deployment.state == DeploymentState.LIVE or (
+                deployment.state == DeploymentState.IDLE and residency is not None
+                and residency.is_resident(deployment.id))
+            if resident:
+                for alias in deployment.served:
+                    pinned.setdefault(alias, []).append(deployment)
         return pinned
+
+    def _pinned_changes(self, before: list[dict], after: list[dict],
+                        residency=None) -> list[str]:
+        """Resident aliases whose meaning ``after`` (catalog sources) changes
+        to one their running deployment does not have.
+
+        Pinning is an endpoint rule, not a catalog-conflict case (queue item
+        45): an ad-hoc deployment serving ``qwen`` pins ``qwen`` although no
+        catalog defines it, so publishing ``qwen -> external`` must refuse
+        like redefining a catalog one. A definition that matches what runs
+        (same engine and structure) is not a change of meaning.
+        """
+        from .catalog import CatalogError
+        from .profile import CatalogUnion
+
+        pinned = self._pinned_deployments(residency)
+        if not pinned:
+            return []
+        old = CatalogUnion.from_sources(before) if before else None
+        new = CatalogUnion.from_sources(after) if after else None
+        blocked = []
+        for alias in sorted(pinned):
+            if new is None or alias not in new.endpoints:
+                continue
+            try:
+                meaning = new.resolve_endpoint(alias)
+                if (old is not None and alias in old.endpoints
+                        and old.resolve_endpoint(alias).semantic_key()
+                        == meaning.semantic_key()):
+                    continue
+                if meaning.managed and meaning.to_request().compat_key in {
+                        d.compat_key for d in pinned[alias]}:
+                    continue
+            except CatalogError:
+                pass
+            blocked.append(alias)
+        return blocked
+
+    @staticmethod
+    def _pinned_refusal(blocked: list[str], what: str) -> Exception:
+        from .profile import ProfileMismatch
+
+        return ProfileMismatch(
+            f'{what} redefines {", ".join(repr(b) for b in blocked)}, which a '
+            'resident deployment is running. Release or evict it '
+            f'(`infer-stack evict {blocked[0]}`), then retry; definitions nothing '
+            'is running are updated automatically')
 
     def _profile_quiescent(self, residency=None) -> bool:
         """Whether it is safe to replace the recovery snapshot wholesale.
@@ -1192,6 +1245,10 @@ class Controller:
                 f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
                 'nothing is running are updated automatically'
             ) from pinned_ex
+        blocked = self._pinned_changes(
+            stored.get('catalogs') or [], candidate['catalogs'], residency)
+        if blocked:
+            raise self._pinned_refusal(blocked, 'the current catalog')
         if quiescent:
             return candidate if candidate != stored else None
 
@@ -2154,6 +2211,19 @@ class Controller:
 
             self._require_keys(gateway, CatalogUnion.from_sources(plan.sources)
                                if plan.sources else None)
+            # A resident alias keeps its meaning, wherever that meaning lived
+            # (a catalog, a registry row, a dynamic route): refused before the
+            # marker, with or without --replace.
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            published = self._published_sources()
+            blocked = self._pinned_changes(
+                published, adopt_catalog_sources(published, plan.sources, set()),
+                residency)
+            if blocked:
+                raise self._pinned_refusal(blocked, 'routes seed')
 
         def change():
             now = plan_seed(self._published_meanings(), plan.incoming)

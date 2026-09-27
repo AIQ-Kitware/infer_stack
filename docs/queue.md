@@ -1407,7 +1407,15 @@ without a key a published route needs. Validate the full desired route set
 at the render (both gateways), before any mutation; a typed front-door
 operation, not callers reading the gateway's `.env` path.
 
-### 45. [ ] Pinning protects every resident alias, not only catalog ones
+### 45. [x] Pinning protects every resident alias, not only catalog ones
+*Done 2026-09-27.* `Controller._pinned_changes`: a resident alias (LIVE, or
+IDLE and resident) may take a new published meaning only if it matches the
+deployment running it (same compat key); checked for acquire/access
+candidates and in `routes seed`'s preflight (before the marker, with or
+without `--replace`). Tests: a resident ad-hoc `qwen` (no catalog), dynamic
+routing, `seed --replace` qwen -> external refuses with profile, registry
+and marker unchanged; an access publishing one refuses; a catalog matching
+the running deployment is accepted. Both refusal tests fail on the old code.
 `routes seed --replace` (and an acquire's catalog adoption) can publish a
 new meaning for an alias a resident ad-hoc deployment serves (no catalog
 definition, registry-only or dynamic route). Pinning is an endpoint rule:

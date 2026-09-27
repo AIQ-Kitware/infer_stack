@@ -164,11 +164,11 @@ def test_kubeai_routes_an_external_endpoint_directly_not_through_the_cluster(tmp
 # -- publication: routes seed publishes, routes prune unpublishes -------------------
 
 
-def _ctl(tmp_path, cat, docker=None, *, key=True):
+def _ctl(tmp_path, cat, docker=None, *, key=True, **kw):
     """A controller on a compose stack; ``key`` writes the remote's key."""
     from test_leasing_profile import controller
 
-    ledger, ctl = controller(tmp_path, catalog=cat, docker=docker)
+    ledger, ctl = controller(tmp_path, catalog=cat, docker=docker, **kw)
     if key:
         write_env_file(ctl.backend.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
     return ledger, ctl
@@ -721,3 +721,58 @@ def test_the_cluster_gateway_refuses_a_route_whose_key_has_no_value(tmp_path):
     with pytest.raises(MissingRouteKey):
         gw.converge()
     assert not gw.manifests_file.exists()
+
+
+# -- item 45: pinning protects every resident alias ------------------------------------
+
+
+def _ad_hoc(tmp_path, **kw):
+    """A LIVE deployment serving `qwen` that no catalog defines (an ad-hoc
+    acquire through a catalog-less controller)."""
+    from test_leasing_compose import FakeDocker
+
+    docker = FakeDocker()
+    ledger, ctl = _ctl(tmp_path, None, docker, **kw)
+    managed = catalog()
+    managed['endpoints'] = {'qwen': managed['endpoints']['local']}
+    request = Catalog.from_dict(managed).resolve_requests(['qwen'])
+    ctl.acquire('me', request, wait=False, apply=False)
+    return ledger, ctl, docker
+
+
+def test_seed_replace_cannot_redefine_a_resident_ad_hoc_alias(tmp_path):
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, ctl, _ = _ad_hoc(tmp_path, dynamic_routing=True)
+    front = ctl.backend.front_door()
+    profile, registry = ledger.profile(), front.route_entries()
+    marker = ledger.publication_pending()
+    moved = Catalog.from_dict({'endpoints': {'qwen': REMOTE}})
+    plan = ctl.plan_route_seed([moved])
+    with pytest.raises(ProfileMismatch, match="redefines 'qwen'.*resident"):
+        ctl.commit_route_seed(plan, replace=True)
+    assert ledger.profile() == profile and front.route_entries() == registry
+    assert ledger.publication_pending() == marker        # nothing new marked
+
+
+def test_an_acquire_cannot_publish_a_new_meaning_for_a_resident_ad_hoc_alias(tmp_path):
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, _, docker = _ad_hoc(tmp_path)
+    moved = catalog(remote=REMOTE)
+    moved['endpoints']['qwen'] = REMOTE
+    cat = Catalog.from_dict(moved)
+    _, other = _ctl(tmp_path, cat, docker)
+    with pytest.raises(ProfileMismatch, match="redefines 'qwen'"):
+        other.access('me', cat.resolve(['remote']))
+    assert 'qwen' not in _published(ledger)
+
+
+def test_a_catalog_matching_the_resident_deployment_is_not_a_redefinition(tmp_path):
+    ledger, _, docker = _ad_hoc(tmp_path)
+    same = catalog()
+    same['endpoints']['qwen'] = dict(same['endpoints']['local'])
+    cat = Catalog.from_dict(same)
+    _, other = _ctl(tmp_path, cat, docker)
+    other.acquire('me', cat.resolve_requests(['local']), wait=False, apply=False)
+    assert 'qwen' in _published(ledger)

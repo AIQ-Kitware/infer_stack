@@ -31,6 +31,10 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   with no value.
 - A runbook whose catalog is already published no longer warns that its
   catalogs differ from the recovery snapshot.
+- An alias a resident deployment serves keeps its meaning even when no
+  catalog defines it (an ad-hoc acquire): `routes seed --replace`, `access`
+  and `acquire` refuse to publish a different definition until it is
+  released or evicted.
 - A published external endpoint whose key has no value refuses every
   publication (acquire, apply, config publish, ...) before anything changes,
   with the `infer-stack env NAME=...` to fix it; no command recreates the
