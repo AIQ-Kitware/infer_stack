@@ -118,6 +118,19 @@ class ExternalTarget:
     kind = 'external'
 
 
+def external_endpoints(catalog: Any) -> list[tuple[str, ExternalTarget]]:
+    """``[(alias, target), ...]`` for every external endpoint of ``catalog``."""
+    out = []
+    for alias in sorted(getattr(catalog, 'endpoints', None) or {}):
+        try:
+            target = catalog.resolve_endpoint(alias).target
+        except Exception:  # noqa: BLE001 - an invalid endpoint is not listed
+            continue
+        if isinstance(target, ExternalTarget):
+            out.append((alias, target))
+    return out
+
+
 def key_references(catalog: Any) -> dict[str, list[str]]:
     """``{variable: [endpoint alias, ...]}`` for every external endpoint of
     ``catalog`` that names a key.

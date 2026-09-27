@@ -556,3 +556,23 @@ def test_run_works_external_only_and_mixed(cli, names):
     leases, _ = Ledger(SqliteStore(cli.base[1])).status()
     assert all(le.state == 'released' for le in leases)         # run released its lease
     assert len(leases) == (1 if names == 'pair' else 0)
+
+
+# -- item 37: views --------------------------------------------------------------------
+
+
+def test_status_lists_published_external_endpoints_apart_from_deployments(tmp_path, monkeypatch):
+    from infer_stack.cli import commands_runtime as rt
+    from infer_stack.leasing import Ledger, SqliteStore
+    from infer_stack.leasing.profile import catalog_sources
+
+    db = tmp_path / 'ledger.db'
+    ledger = Ledger(SqliteStore(str(db)))
+    ledger.set_profile({'backend': 'compose', 'catalogs': catalog_sources(
+        Catalog.from_dict(catalog(remote=REMOTE)))})
+    import infer_stack.leasing as leasing
+    monkeypatch.setattr(leasing, 'default_ledger_path', lambda: db)
+    status = rt._leasing_status()
+    assert status['external'] == [('remote', 'Qwen/Qwen3-32B', 'http://box:8000/v1')]
+    assert status['deployments'] == []                  # no pseudo-deployment
+    assert 'remote' in '\n'.join(rt._external_lines(status['external']))

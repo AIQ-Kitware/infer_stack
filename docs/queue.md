@@ -1267,7 +1267,13 @@ through access. `release` of external-only access has nothing to release.
 Access is a typed capability, not a `getattr(backend, 'access')` hook
 (cleanup D).
 
-### 37. [ ] Views: `external`
+### 37. [x] Views: `external`
+*Done 2026-09-27.* `status` lists published external endpoints in their own
+section (alias, upstream model, server; "no lease"); `leases` is unchanged;
+`routes list` shows origin `external`; the TUI's catalog shows engine
+`external` with the upstream model, and its endpoint editor refuses an
+external endpoint (saving would have turned it into a vLLM one). `catalog
+show` prints the `external:` block as written.
 Status, TUI and catalog views show external targets as `external`.
 *Review:* no pseudo-deployment rows: `leases` stays leases and
 deployments. Show external endpoints in an endpoint/routing section

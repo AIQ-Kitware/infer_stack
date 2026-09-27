@@ -1549,6 +1549,12 @@ class InferStackTUI(App):
         self._endpoint_names = []
         for name in sorted(self.catalog.endpoints):
             ep = self.catalog.endpoints[name]
+            external = getattr(ep, 'external', None)
+            if external is not None:
+                # A server that runs elsewhere: no model entry, GPU or reclaim.
+                eps.add_row(name, external.model, 'external', '-', '-')
+                self._endpoint_names.append(name)
+                continue
             indices = (getattr(ep, 'placement', {}) or {}).get('gpu_indices')
             gpu = ','.join(str(i) for i in indices) if indices else 'auto'
             eps.add_row(
@@ -2931,6 +2937,12 @@ class InferStackTUI(App):
             return
         from .cli.commands_catalog import _load_raw
         entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
+        if 'external' in (entry or {}):
+            # The editor describes a runtime infer-stack runs; saving would
+            # turn the external endpoint into one.
+            self._refuse(f'{name} is external — edit it with `infer-stack catalog '
+                         'endpoint add --force --external-...` or `catalog edit`')
+            return
         self._status(f'inspecting GPUs for {name} editor…')
         self._prepare_endpoint_editor(name, entry)
 

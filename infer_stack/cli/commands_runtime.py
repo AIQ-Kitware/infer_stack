@@ -144,6 +144,31 @@ def _leasing_status() -> dict[str, Any]:
     ]
     out['summary'] = (active, len(leases), live, len(deployments))
     out['live_deployments'] = [d for d in deployments if d.state == DeploymentState.LIVE]
+    out['external'] = _published_external(ledger)
+    return out
+
+
+def _published_external(ledger) -> list[tuple[str, str, str]]:
+    """``(alias, upstream model, api_base)`` for each published external
+    endpoint: routed by the front door, held by no lease."""
+    from ..leasing.endpoints import external_endpoints
+    from ..leasing.profile import CatalogUnion
+
+    try:
+        sources = (ledger.profile() or {}).get('catalogs') or []
+        union = CatalogUnion.from_sources(sources) if sources else None
+    except Exception:  # noqa: BLE001 - status never fails on this
+        return []
+    return [(alias, t.model, t.api_base) for alias, t in external_endpoints(union)]
+
+
+def _external_lines(rows) -> list[str]:
+    """Plain-text 'external endpoints' block; empty when there are none."""
+    if not rows:
+        return []
+    width = max(8, *(len(r[0]) for r in rows))
+    out = ['', 'external endpoints (through the front door; no lease)']
+    out += [f'  {alias.ljust(width)}  {model} @ {base}' for alias, model, base in rows]
     return out
 
 
@@ -285,6 +310,8 @@ def _print_status_plain(d: dict[str, Any]) -> None:
               f'{live} live / {total_d} deployment(s)  (infer-stack leases)')
     for line in _served_lines(lz.get('served') or []):
         print(line)
+    for line in _external_lines(lz.get('external') or []):
+        print(line)
     if not d['configured']:
         print()
         for cmd, comment in _GETTING_STARTED:
@@ -361,6 +388,19 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
             console.print(Text(
                 '  STALE = recorded live but nothing is running for it; '
                 '`infer-stack apply` or `gc`', style='dim'))
+
+    external = lz.get('external') or []
+    if external:
+        ext_table = Table(box=None, pad_edge=False, padding=(0, 2, 0, 0))
+        ext_table.add_column('endpoint', style='bold cyan', no_wrap=True)
+        ext_table.add_column('upstream model', overflow='fold')
+        ext_table.add_column('server', style='dim', overflow='fold')
+        for alias, model, base in external:
+            ext_table.add_row(alias, model, base)
+        console.print()
+        console.print(Text('external endpoints (through the front door; no lease)',
+                           style='bold'))
+        console.print(ext_table)
 
     console.print()
     if d['configured']:
