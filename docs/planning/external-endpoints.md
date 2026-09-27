@@ -1,8 +1,35 @@
 # External endpoints, and access above leasing (design)
 
-**Status:** design (queue item 28), 2026-09-27. Implementation: queue items
-29-41 in [../queue.md](../queue.md). Parent: the backend-parity campaign
-([backend-parity-roadmap.md](backend-parity-roadmap.md)).
+**Status:** implemented, 2026-09-27 (queue items 28-41 in
+[../queue.md](../queue.md); decision 2 revised during implementation, see
+there). Parent: the backend-parity campaign
+([backend-parity-roadmap.md](backend-parity-roadmap.md)). Verified by
+`tests/test_external_endpoints.py` and `dev/external_e2e.sh` (real LiteLLM,
+static and dynamic routing).
+
+## The workflow
+
+```yaml
+endpoints:
+  qwen:
+    external:
+      api_base: http://gpu-box:8000/v1
+      model: Qwen/Qwen3-32B
+      api_key_env: REMOTE_QWEN_KEY
+```
+
+```bash
+infer-stack env REMOTE_QWEN_KEY=sk-...       # the key, by name; never in the catalog
+infer-stack access qwen --env-file qwen.env  # publish the route; no lease
+source qwen.env && my-eval --model "$INFER_STACK_ENDPOINT_QWEN"
+```
+
+Switching `qwen` back to a managed runtime (`engine: vllm`, `model: ...`)
+changes neither the alias nor these commands: `access` then takes a lease and
+waits for the model, and the env-file gains `INFER_STACK_LEASE_ID`. A bundle
+may mix both; it takes one lease, for its managed members. `run --endpoint
+qwen -- CMD` does the same around a command. `acquire` stays the lease
+operation and points an external endpoint at `access`.
 
 An endpoint is the public name a workflow asks for (`qwen`). Today every
 endpoint is a model infer-stack runs, so asking for one means taking a

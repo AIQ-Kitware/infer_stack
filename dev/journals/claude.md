@@ -3446,3 +3446,32 @@ always publishes.
 **Mistake.** A nested heredoc (`<<EOF` inside `<<'EOF'`) ended my edit
 early and ran the rest as shell; nothing was written, but edit scripts with
 heredocs inside now go through the Write tool.
+
+## 2026-09-27 — campaign 2 closed: the alternatives, and why not
+
+Recorded here because the design doc lists them in one line each; these are
+the arguments that decided them.
+
+- **A fake lease for an external endpoint** would have kept `acquire` the
+  only verb and every descriptor shaped as today. It puts demand, TTL and
+  reclaim state in the ledger for something with no runtime, and `release`
+  of it would have to mean something. Access above leasing costs one verb
+  (`access`) and one optional field (no `INFER_STACK_LEASE_ID`), and the
+  ledger keeps describing only what infer-stack runs.
+- **`engine: external`** reads naturally in YAML but mixes how a runtime is
+  realized with who owns it: every engine-keyed code path (placement,
+  render, readiness, measure) would have needed an "except external" branch.
+  A target (`ManagedTarget` / `ExternalTarget`) says who fulfils the
+  endpoint; engines stay a managed-runtime detail.
+- **External endpoints authored as route rows** (`routes add`) would have
+  been the smallest diff: the registry already fed the renderer. It makes
+  the registry a second catalog outside the conflict and pinning rules that
+  protect endpoint meaning. Deriving routes from the published union removed
+  catalog rows from the registry instead of adding a kind to it; the
+  registry kept one owner, ad-hoc deployments, because dropping those caused
+  a gateway blip on release (the first full test run showed it).
+- **Direct access to an external server** (the env-file points at its URL)
+  saves a hop. It gives external-only requests a second access mode where
+  the alias stops being the model name and the key is the provider's, so a
+  workflow changes when an endpoint moves. Through the front door, moving
+  `qwen` between managed and external changed nothing in the e2e's phase 8.

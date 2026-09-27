@@ -56,6 +56,16 @@ Schema (all sections optional except as referenced)::
         engine: ollama
         host: local-ollama
         model: qwen3.5:4b
+      # An OpenAI-compatible server that already runs elsewhere: no model
+      # entry, no lease; the LiteLLM front door routes the alias to it, sending
+      # the key held in the named variable (`infer-stack env NAME=...`).
+      # Reached with `infer-stack access` or `run`, not `acquire`.
+      qwen-remote:
+        external:
+          api_base: http://gpu-box:8000/v1
+          model: Qwen/Qwen3-32B      # what that server expects as `model`
+          api_key_env: REMOTE_QWEN_KEY
+        protocol: chat
 
     runtime_hosts:          # Ollama daemons (one daemon, many tags)
       local-ollama:

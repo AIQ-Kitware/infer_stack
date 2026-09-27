@@ -86,6 +86,7 @@ infer-stack config init               # data dir + default backend -> settings.y
 infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
 infer-stack catalog show              # what can be acquired
 infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
+infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
 infer-stack test <endpoint>           # one generation through the gateway
 infer-stack leases                    # desired vs running, per deployment
 infer-stack status                    # paths, backend and a lease summary
@@ -162,6 +163,21 @@ sections:
 * `runtime_hosts`: Ollama daemons, each with its GPUs and daemon settings;
 * `bundles`: named lists of endpoints to acquire together.
 
+An endpoint can instead name a server that already runs elsewhere, with
+`external: {api_base, model, api_key_env}` in place of `engine`/`model`.
+It has no lease: `infer-stack access` (or `run`) publishes its route on the
+LiteLLM front door, and the client asks for the alias through the same base
+URL as any other endpoint. Moving an alias between a managed runtime and an
+external server changes neither the alias nor the workflow:
+
+```bash
+infer-stack env REMOTE_QWEN_KEY=sk-...          # the upstream's key, by name
+infer-stack access qwen-remote --env-file qwen.env
+source qwen.env                                 # OPENAI_BASE_URL, OPENAI_API_KEY, ...
+```
+
+See [docs/planning/external-endpoints.md](docs/planning/external-endpoints.md).
+
 ```yaml
 models:
   smol135:
@@ -195,6 +211,7 @@ Shapes the stack renders:
 
 ```text
 Open WebUI -> LiteLLM -> vLLM / Ollama     # the default
+                     \-> an external OpenAI-compatible server (external:)
 Open WebUI -> vLLM / Ollama                # config set litellm false
 ```
 

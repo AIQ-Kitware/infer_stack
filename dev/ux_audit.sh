@@ -88,6 +88,7 @@ COLUMNS=250 infer-stack help tree 2>/dev/null | sed -E 's/^[│ ├└─]+//' \
 
 echo '== mistakes: each names its cause, none is a traceback'
 run acquire nope --yes
+run access nope --yes
 run release lease-nope --yes
 run wait nope --timeout 5
 run logs nope
@@ -104,3 +105,5 @@ for cmd in leases status ps env "env OPENAI_BASE_URL" doctor clean gc \
   run $cmd
 done
 run release --env-file "$WORK/lease.env" --yes
+run access "$ENDPOINT" --yes --timeout 600 --env-file "$WORK/access.env"
+run release --env-file "$WORK/access.env" --yes
