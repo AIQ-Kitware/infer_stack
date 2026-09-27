@@ -63,6 +63,8 @@ def test_a_target_resolves_by_alias_deployment_name_or_id():
 class _Backend:
     """A backend as the day-2 verbs see it."""
 
+    runs_engines = True
+
     def __init__(self, instances, *, residency=None):
         self._instances = instances
         self._residency = residency
@@ -181,7 +183,8 @@ def test_stack_compose_targets_the_compose_project_on_this_host(monkeypatch, tmp
     compose_file.write_text('services: {}\n')
     assert rt._compose_argv(SimpleNamespace()) == ['docker', 'compose', '-p', 'gw']
 
-    monkeypatch.setattr(rt, '_day2_backend', lambda config: SimpleNamespace())
+    monkeypatch.setattr(rt, '_day2_backend',
+                        lambda config: SimpleNamespace(compose_project=lambda: None))
     with pytest.raises(SystemExit, match='no Compose project on this host'):
         rt._compose_argv(SimpleNamespace())
 

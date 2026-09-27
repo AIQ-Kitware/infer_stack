@@ -412,7 +412,7 @@ def _requests_catalog(controller, config):
     """
     from ..leasing.profile import CatalogUnion
 
-    published = getattr(controller.backend, 'catalog', None)
+    published = controller.backend.catalog
     explicit = (
         getattr(config, 'catalog', None)
         or os.environ.get('INFER_STACK_CATALOG', '').strip()
@@ -601,8 +601,8 @@ def _oom_hints(controller, outcome) -> list[str]:
     from ..leasing.vram import looks_like_cuda_oom
 
     backend = controller.backend
-    logs_fn = getattr(backend, 'deployment_logs', None)
-    if logs_fn is None or outcome.wait is None or outcome.wait.ready:
+    logs_fn = backend.deployment_logs
+    if outcome.wait is None or outcome.wait.ready:
         return []
     by_id = {g.id: g for g in outcome.deployments}
     try:
@@ -612,7 +612,7 @@ def _oom_hints(controller, outcome) -> list[str]:
         }
     except Exception:
         memory = {}
-    assignments = dict(getattr(backend, 'last_assignments', {}) or {})
+    assignments = dict(backend.last_assignments or {})
     hints: list[str] = []
     for gid, endpoint in outcome.wait.pending:
         deployment = by_id.get(gid)
@@ -1783,8 +1783,8 @@ class MeasureCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
         backend = controller.backend
-        logs_fn = getattr(backend, 'deployment_logs', None)
-        if logs_fn is None:
+        logs_fn = backend.deployment_logs
+        if not backend.runs_engines:
             raise SystemExit(
                 'measure reads the engine\'s log, and this backend runs no engine '
                 '(set `--backend compose` or `kubeai`).'
@@ -1858,7 +1858,7 @@ class MeasureCLI(_LeasingCommonMixin):
             )
             recorded_to = None
             if config.record:
-                store = getattr(backend, 'measurements', None)
+                store = backend.measurements
                 if store is None:
                     raise SystemExit(
                         '--record: this backend keeps no measurements overlay.'
@@ -3019,7 +3019,8 @@ class ConfigPublishCLI(_ApprovalMixin):
         try:
             if profile.get('catalogs'):
                 CatalogUnion.from_sources(profile['catalogs'])   # conflicts
-            pull = getattr(controller.backend, 'pull_images', None)
+            host = controller.backend.host_runtime
+            pull = host.pull_images if host is not None else None
             if config.pull and pull is not None and profile.get('backend') == 'compose':
                 # Outside the lock, before anything is published: a steady-state
                 # apply must never wait on a registry, and a missing image must
@@ -3072,7 +3073,7 @@ class NetworkMigrateCLI(_ApprovalMixin):
         if not config.subnet:
             raise SystemExit('network migrate: --subnet is required')
         controller = _open_controller(config, interactive=True)
-        if not hasattr(controller.backend, 'network'):
+        if controller.backend.host_runtime is None:
             raise SystemExit('network migrate gives compose containers stable '
                              'addresses; this backend runs none (n/a on kubeai)')
         try:
@@ -3103,10 +3104,10 @@ class NetworkCheckCLI(_LeasingCommonMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config)
-        check = getattr(controller.backend, 'upstream_check', None)
-        if check is None:
+        host = controller.backend.host_runtime
+        if host is None:
             raise SystemExit('network check needs the compose backend')
-        result = check()
+        result = host.upstream_check()
         if config.json:
             print(json.dumps(result, indent=2))
         else:
@@ -3179,8 +3180,8 @@ class SecretsRotateCLI(_ApprovalMixin):
                              'rejects the OLD key')
         else:
             print('  gateway: new key accepted, old key rejected')
-        front = getattr(backend, 'compose_project', lambda: None)()
-        if getattr(front, 'ui', False):
+        front = backend.compose_project()
+        if front is not None and front.ui:
             print('  Open WebUI may keep the old key in its own settings: '
                   'update it under Admin > Settings > Connections')
         return 0

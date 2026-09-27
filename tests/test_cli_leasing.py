@@ -1252,3 +1252,38 @@ def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, 
         controller.commit_route_seed(plan)
     assert controller.ledger.publication_pending() is None
     assert gateway.route_entries() == {'alpha': {'engine': 'vllm', 'served': 'elsewhere'}}
+
+
+def test_replace_is_compare_and_swap_against_what_was_shown(tmp_path, monkeypatch):
+    """`routes seed --replace` replaces exactly the meaning it showed: if
+    another process redefined the alias between the plan and the commit,
+    nothing is written and no publication is left pending."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.routes import RouteConflict
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
+    controller = cl._open_controller(config, interactive=False)
+    gateway = controller.backend.front_door().gateway
+    gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'shown'}})
+    plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    assert list(plan.conflicted) == ['alpha']               # shown: 'shown' -> alpha
+    real_lock = controller._global_lock
+
+    def racing_lock():
+        gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'moved'}})
+        return real_lock()
+
+    controller._global_lock = racing_lock
+    with pytest.raises(RouteConflict, match='changed since the redefinition was shown'):
+        controller.commit_route_seed(plan, replace=True)
+    assert controller.ledger.publication_pending() is None
+    assert gateway.route_entries() == {'alpha': {'engine': 'vllm', 'served': 'moved'}}
+    controller._global_lock = real_lock                      # unchanged: it replaces
+    fresh = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    controller.commit_route_seed(fresh, replace=True)
+    assert 'alpha' not in gateway.route_entries()            # the published definition won

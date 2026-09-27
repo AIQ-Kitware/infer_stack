@@ -2076,7 +2076,9 @@ class Controller:
         workload runs. Rechecked under the lock: a conflict that appeared
         since the plan refuses too
         (:class:`~infer_stack.leasing.routes.RouteConflict`) and nothing is
-        written."""
+        written. ``replace`` is compare-and-swap: each redefinition replaces
+        exactly the meaning the plan showed; one another process changed
+        meanwhile refuses (``RouteConflict(changed=True)``)."""
         from .profile import CatalogConflict, ProfileMismatch, adopt_catalog_sources
         from .residency import ResidencyUnknown
         from .routes import RouteConflict, plan_seed
@@ -2092,6 +2094,13 @@ class Controller:
             now = plan_seed(self._published_meanings(), plan.incoming)
             if now.conflicted and not replace:
                 raise RouteConflict(sorted(now.conflicted))
+            if replace:
+                # Compare-and-swap: replace only what was shown and confirmed.
+                shown = {n: old for n, (old, _) in plan.conflicted.items()}
+                moved = sorted(n for n, (old, _) in now.conflicted.items()
+                               if n not in shown or not (shown[n] == old))
+                if moved:
+                    raise RouteConflict(moved, changed=True)
 
         def change():
             now = plan_seed(self._published_meanings(), plan.incoming)

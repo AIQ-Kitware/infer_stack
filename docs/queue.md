@@ -951,16 +951,19 @@ campaign 2. None blocks campaign 2.
 - [ ] **In-cluster gateway: deferred features (P5).** Dynamic routing and
   Open WebUI with `kubeai_gateway cluster` (they need Postgres and a UI in the
   cluster), and an Ingress (`kubeai_gateway_url` accepts one; none tested).
-- [ ] **`routes seed --replace` compare-and-swap.** Deferred; see
-  `known-limitations.md`. Carry the expected old row in the plan and ask
-  again on a mismatch under the lock.
-- [ ] **CLI capability probes that decide behaviour.** The controller has no
-  optional-hook `getattr` left, but the CLI still branches on
-  `getattr(backend, ...)` for `down`, `doctor`, `compose_project`,
-  `rendered_file`/`compose_file`, `deployment_logs` and `access` (the last is
-  campaign 2's cleanup D). By the re-review's rule a `getattr` default may
-  serve display, never a decision: make the deciding ones protocol members
-  or typed capabilities.
+- [x] **`routes seed --replace` compare-and-swap.** *Done 2026-09-27:* the
+  plan carries each alias's shown meaning; under the lock a changed one
+  refuses (`RouteConflict(changed=True)`), writes nothing, leaves no marker.
+- [x] **CLI capability probes that decide behaviour.** *Done 2026-09-27:*
+  `compose_project()`, `down()`, `doctor()`, `deployment_logs()` and
+  `runs_engines` are `ServingBackend` members (in-process defaults on
+  `SimpleAdmission`); `pull_images()` and `upstream_check()` are
+  `HostRuntime` members, and `network migrate` / `network check` / `config
+  publish --pull` ask `backend.host_runtime`; `access` became
+  `connection_info()` / `request_names()` (campaign 2). The `getattr`s left
+  in the CLI serve display only (file paths in JSON, the GPU inventory in an
+  OOM hint, the cache path in `measure`'s narration). `catalog` and
+  `measurements` are protocol attributes (`None` in-process).
 - [ ] **TUI catalog-reload flake.** The fix counts only catalog refusals; the
   cause (a background worker refusing meanwhile) was inferred, not
   reproduced. Reopen if it recurs.

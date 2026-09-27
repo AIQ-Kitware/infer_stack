@@ -183,6 +183,14 @@ class HostRuntime(Protocol):
         """Remove these containers now (orphans the operator agreed to remove)."""
         ...
 
+    def pull_images(self, images: Any) -> list[str]:
+        """Pull these images now; return the ones that failed."""
+        ...
+
+    def upstream_check(self) -> dict[str, dict[str, Any]]:
+        """Probe each model upstream by name from inside the gateway's network."""
+        ...
+
 
 class FrontDoorControl(Protocol):
     """The LiteLLM gateway as the controller and the CLI address it.
@@ -371,6 +379,33 @@ class ServingBackend(Protocol):
     def connection_info(self) -> ConnectionInfo | None:
         """Where a client reaches this backend's endpoints, or ``None``
         (an in-process backend serves nothing)."""
+        ...
+
+    #: Whether this backend runs engine processes (containers, pods) whose
+    #: logs can be read; ``False`` for the in-process backends.
+    runs_engines: bool
+    #: The catalog it renders from (the published union once a profile is in
+    #: use), or ``None``.
+    catalog: Any
+    #: Recorded VRAM measurements (``measure --record``), or ``None`` where
+    #: nothing is measured.
+    measurements: Any
+
+    def compose_project(self) -> Any | None:
+        """The Compose project on this host (the stack itself, or KubeAI's
+        gateway), or ``None`` where there is none."""
+        ...
+
+    def down(self) -> None:
+        """Take down everything this backend runs (``stack down``)."""
+        ...
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        """Preflight checks: ``(check, ok, detail)``; empty when there are none."""
+        ...
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        """The tail of a deployment's engine log; ``''`` when there is none."""
         ...
 
     def request_names(self, endpoints: list[str]) -> dict[str, str]:
@@ -615,6 +650,23 @@ class SimpleAdmission:
 
     def request_names(self, endpoints: list[str]) -> dict[str, str]:
         return {}
+
+    #: In-process: nothing runs, so nothing to log, check, measure or bring down.
+    runs_engines = False
+    catalog: Any = None
+    measurements: Any = None
+
+    def compose_project(self) -> Any | None:
+        return None
+
+    def down(self) -> None:
+        return None
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        return []
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        return ''
 
     def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
         return []

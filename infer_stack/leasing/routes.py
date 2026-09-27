@@ -96,13 +96,24 @@ def route_table(*layers: Iterable[GatewayRoute]) -> list[GatewayRoute]:
 
 
 class RouteConflict(ValueError):
-    """A seed would redefine existing aliases; ``names`` are the conflicts."""
+    """A seed would redefine existing aliases; ``names`` are the conflicts.
 
-    def __init__(self, names: list[str]):
+    ``changed``: a ``--replace`` whose confirmed redefinitions no longer hold,
+    because another process changed those aliases after the plan was shown.
+    """
+
+    def __init__(self, names: list[str], *, changed: bool = False):
         self.names = list(names)
-        super().__init__(
-            f'routes seed would redefine {len(self.names)} existing route(s): '
-            f'{", ".join(self.names)}; pass --replace to redefine them')
+        self.changed = changed
+        if changed:
+            message = (f'{", ".join(self.names)} changed since the redefinition was '
+                       'shown; nothing was written, run `routes seed` again to see '
+                       'what is there now')
+        else:
+            message = (f'routes seed would redefine {len(self.names)} existing '
+                       f'route(s): {", ".join(self.names)}; pass --replace to '
+                       'redefine them')
+        super().__init__(message)
 
 
 @dataclass(frozen=True, eq=False)

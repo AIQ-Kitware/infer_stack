@@ -72,7 +72,7 @@ def _compose_argv(config) -> list[str]:
     kubeai backend. Exits when there is none, or nothing is rendered yet.
     """
     backend = _day2_backend(config)
-    project = getattr(backend, 'compose_project', lambda: None)()
+    project = backend.compose_project()
     if project is None:
         raise SystemExit(
             f'the {_backend_name(backend)} backend has no Compose project on this '
@@ -831,11 +831,10 @@ class StackDownCLI(_PathOverridesMixin):
             cmd = _compose_argv(config) + ['down', '--remove-orphans', '--volumes']
             return int(subprocess.run(cmd, env=_docker_env()).returncode)
         backend = _day2_backend(config)
-        down = getattr(backend, 'down', None)
-        if down is None:
+        if not backend.runs_engines:
             print(f'the {_backend_name(backend)} backend runs nothing to bring down')
             return 0
-        down()
+        backend.down()
         return 0
 
 
@@ -910,15 +909,13 @@ class DoctorCLI(_PathOverridesMixin):
         from .commands_leasing import _make_backend
 
         backend = _make_backend(config)
-        doctor = getattr(backend, 'doctor', None)
         name = type(backend).__name__
-        if doctor is None:
+        checks = list(backend.doctor())
+        if not checks:
             print(f'{name}: no preflight checks defined — nothing to verify.')
             if not (config['gpu'] or config['sudo']):
                 return 0
-            doctor = list  # GPU checks still apply; the backend just has none
         failed = 0
-        checks = list(doctor())
         if config['gpu'] or config['sudo']:
             from ..gpu_doctor import gpu_checks
             checks += list(gpu_checks(use_sudo=bool(config['sudo'])))

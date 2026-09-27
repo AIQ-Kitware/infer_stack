@@ -1184,6 +1184,9 @@ class ComposeBackend(ConvergeScaffold):
     #: The file a render writes, whatever the backend (``status`` shows it).
     rendered_file = compose_file
 
+    #: Its engines are containers on this host.
+    runs_engines = True
+
     def compose_project(self):
         """The Compose project on this host: this one."""
         return self

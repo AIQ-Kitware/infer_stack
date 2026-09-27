@@ -41,6 +41,9 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Hardening from a review of the backend-parity work
 
+- `routes seed --replace` replaces exactly what it showed: an alias another
+  process redefined meanwhile refuses, and nothing is written.
+
 - A KubeAI Model with several replicas (`min_replicas`) is resident like one
   pod: releasing its last keep-warm lease no longer prunes it, `leases` shows
   it running, and it fails fast when every replica crash-loops.

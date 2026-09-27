@@ -566,6 +566,9 @@ class KubeaiBackend(ConvergeScaffold):
     #: The file a render writes, whatever the backend (``status`` shows it).
     rendered_file = models_file
 
+    #: Its engines are pods in the cluster.
+    runs_engines = True
+
     def compose_project(self):
         """The Compose project on this host: the gateway's, or ``None``
         (no gateway, or the gateway runs in the cluster)."""
