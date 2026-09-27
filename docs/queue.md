@@ -863,7 +863,10 @@ Each with a test that fails on the code before it:
 
 ## Final closure pass (2026-09-26)
 
-A third review found one cross-feature blocker and three small items.
+A third review found one cross-feature blocker and three small items. All
+done; verified by the suite, `ty`, flake8, both UX audits and the full k3s
+e2e (which also exposed, and 5337815 fixed, a race in `secrets rotate`'s
+old-key check behind an in-cluster rollout).
 
 ### 24. [x] `secrets rotate` under a running dynamic-routing gateway
 
