@@ -338,7 +338,25 @@ if [ "${GATEWAY:-1}" = 1 ] && [ "${E2E_DYNAMIC:-1}" = 1 ]; then
   else
     echo "!! no generation for $ALIAS under dynamic routing" >&2; exit 1
   fi
+  # Rotation while this host's dynamic-routing gateway is the front door:
+  # the apply first retires routes on the gateway still running the OLD key,
+  # then recreates it with the new one (queue item 24).
   run_is release --env-file "$WORK/dyn1.env" --yes
+  run_is secrets rotate --force > "$WORK/dyn-rotate.log" 2>&1 \
+    || { cat "$WORK/dyn-rotate.log" >&2; echo '!! rotation under dynamic routing failed' >&2; exit 1; }
+  grep -q 'new key accepted, old key rejected' "$WORK/dyn-rotate.log" \
+    || { cat "$WORK/dyn-rotate.log" >&2; exit 1; }
+  new_key=$(run_is env LITELLM_MASTER_KEY)
+  [ "$new_key" != "$OPENAI_API_KEY" ] || { echo '!! the key did not change' >&2; exit 1; }
+  if curl -sS --fail-with-body "$OPENAI_BASE_URL/chat/completions" \
+      -H "Authorization: Bearer $new_key" -H 'Content-Type: application/json' \
+      -d "{\"model\": \"$ALIAS\", \"max_tokens\": 4,
+           \"messages\": [{\"role\": \"user\", \"content\": \"say ok\"}]}" \
+    | grep -q 'choices'; then
+    echo '   secrets rotate under dynamic routing: the alias answers with the new key'
+  else
+    echo "!! no generation for $ALIAS with the rotated key" >&2; exit 1
+  fi
   run_is release --env-file "$WORK/dyn2.env" --yes
 fi
 

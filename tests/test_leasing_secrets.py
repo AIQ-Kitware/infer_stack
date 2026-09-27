@@ -242,3 +242,106 @@ def test_an_apply_that_cleanly_misses_the_runtime_keeps_the_old_key(tmp_path):
         ctl.rotate_gateway_key()
     assert env(ctl)[API_KEY_ENV] == old
     assert ctl.backend.gateway_accepts(env(ctl)[API_KEY_ENV])   # what clients get works
+
+
+# -- rotation under dynamic routing (queue item 24) ---------------------------------
+
+
+class AdminGateway(StartedGateway):
+    """A dynamic-routing LiteLLM: the admin API, answering only the key its
+    container started with (read from the container's environment)."""
+
+    def __init__(self, env_path, docker):
+        super().__init__(env_path, docker)
+        self.routes: dict[str, dict] = {}
+
+    def _started_key(self):
+        current = next((c for c in self.docker.containers.values()
+                        if c['service'] == 'litellm'), None)
+        return (current or {}).get('env', {}).get(API_KEY_ENV)
+
+    def _authorized(self, headers):
+        return bool(headers) and headers.get('Authorization') == f'Bearer {self._started_key()}'
+
+    def get(self, url, headers=None, **kw):
+        if url.endswith('/v1/model/info'):
+            if not self._authorized(headers):
+                return FakeResp(400, {'error': 'Authentication Error'})
+            return FakeResp(200, {'data': list(self.routes.values())})
+        if headers and headers.get('Authorization') == f'Bearer {self._started_key()}':
+            return FakeResp(200, {'data': []})
+        return FakeResp(400, {'error': 'Authentication Error'})
+
+    def post(self, url, headers=None, **kw):
+        if not self._authorized(headers):
+            return FakeResp(400, {'error': 'Authentication Error'})
+        body = kw.get('json') or {}
+        if url.endswith('/model/new'):
+            self.routes[body['model_info']['id']] = body
+        elif url.endswith('/model/delete'):
+            self.routes.pop(body['id'], None)
+        return FakeResp(200, {})
+
+
+def test_rotation_completes_under_a_running_dynamic_routing_gateway(tmp_path):
+    """The running gateway holds K0; rotation writes K1 first. The apply's
+    route-retirement phase must still talk to the gateway with K0, the
+    recreated gateway then runs K1, and the routes verify with K1."""
+    state = tmp_path / 'state'
+    clock = Clock()
+    docker = FakeDocker()
+    backend = ComposeBackend(
+        state_dir=state, inventory=simulate_inventory('2x80'), run=docker,
+        http=None, images={**IMAGES, 'postgres': 'pg:test'}, ports=PORTS, state=STATE,
+        catalog=CAT, litellm=True, ui=False, dynamic_routing=True,
+        sleep=clock.sleep, clock=clock,
+    )
+    backend.http = backend.gateway.http = AdminGateway(backend.gateway._env_path, docker)
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=clock)
+    ctl = Controller(ledger, backend, clock=clock, sleep=clock.sleep)
+    ctl.release(acquire(ctl, 'one').lease.id)       # a keep-warm model, routed
+    old = env(ctl)[API_KEY_ENV]
+    assert backend.gateway_accepts(old) and backend.http.routes
+
+    rec = ctl.rotate_gateway_key()
+
+    new = env(ctl)[API_KEY_ENV]
+    assert new != old and not rec.publication_pending
+    assert backend.gateway_accepts(new) and not backend.gateway_accepts(old)
+    assert backend.http.routes                      # verified with the new key
+    assert ledger.publication_pending() is None
+
+
+def test_rotation_completes_behind_kubeai_with_a_dynamic_host_gateway(tmp_path):
+    """The same interaction on KubeAI: its host gateway is the same Compose
+    machinery, so route retirement must use the running gateway's key."""
+    from infer_stack.backends.kubeai import KubeaiBackend
+    from test_leasing_kubeai import FakeKubectl
+
+    clock = Clock()
+    docker = FakeDocker()
+    gateway = ComposeBackend(
+        state_dir=tmp_path / 'gateway', inventory={'gpu_count': 0, 'gpus': []},
+        run=docker, http=None, project='infer-stack-gateway',
+        images={**IMAGES, 'postgres': 'pg:test'}, ports=PORTS, state=STATE,
+        litellm=True, ui=False, dynamic_routing=True, sleep=clock.sleep, clock=clock,
+    )
+    gateway.http = gateway.gateway.http = AdminGateway(gateway.gateway._env_path, docker)
+    backend = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=FakeKubectl(),
+                            http=gateway.http, gateway=gateway,
+                            gateway_upstream='http://10.43.0.9/openai/v1',
+                            default_resource_profile='gpu')
+    backend.catalog = CAT
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=clock)
+    ctl = Controller(ledger, backend, clock=clock, sleep=clock.sleep)
+    ctl.release(acquire(ctl, 'one').lease.id)
+    env_path = gateway.gateway._env_path
+    old = parse_env_file(env_path)[API_KEY_ENV]
+    assert gateway.gateway_accepts(old)
+
+    ctl.rotate_gateway_key()
+
+    new = parse_env_file(env_path)[API_KEY_ENV]
+    assert new != old
+    assert gateway.gateway_accepts(new) and not gateway.gateway_accepts(old)
+    assert ledger.publication_pending() is None

@@ -53,6 +53,7 @@ from ..probe import openai_ready
 from ..profile_runtime import simulator_args, vllm_args
 from .backend import ApplyResult, ConvergeScaffold, Readiness
 from .gateway import (
+    API_KEY_ENV,
     LITELLM_CONFIG_FILENAME,
     LITELLM_SERVICE,
     NGINX_CONFIG_FILENAME,
@@ -1985,12 +1986,28 @@ class ComposeBackend(ConvergeScaffold):
 
         if not (self.litellm and self.dynamic_routing):
             return True
-        running = any(c.service == 'litellm' and c.warm
-                      for c in self.residency().all_containers())
+        running = [c for c in self.residency().all_containers()
+                   if c.service == 'litellm' and c.warm]
         if not running:
             return True
-        return self.gateway._reconcile_routes(
-            deadline_s=ROUTE_RECONCILE_STEADY_S, retire_only=True)
+        # This phase talks to the gateway as it runs NOW, which is not yet
+        # recreated: after a rotation it holds the old key, not the .env's.
+        with self.gateway.live_credential(self._container_env(running[0], API_KEY_ENV)):
+            return self.gateway._reconcile_routes(
+                deadline_s=ROUTE_RECONCILE_STEADY_S, retire_only=True)
+
+    def _container_env(self, container, name: str) -> str | None:
+        """One variable of a running container's environment, as Docker
+        started it; ``None`` when it cannot be read."""
+        try:
+            info = json.loads(self.run(['docker', 'inspect', container.container_id]) or '[]')
+        except Exception:  # noqa: BLE001 - unknown: the caller keeps the managed value
+            return None
+        prefix = f'{name}='
+        for item in ((info[0] if info else {}).get('Config') or {}).get('Env') or []:
+            if str(item).startswith(prefix):
+                return str(item)[len(prefix):]
+        return None
 
     def _wait_until(self, predicate, *, deadline_s: float, what: str, interval: float = 1.0):
         """Poll strict residency until ``predicate(snapshot)``; abort at the deadline."""

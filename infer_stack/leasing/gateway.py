@@ -1317,8 +1317,32 @@ class Gateway(ConvergeScaffold):
             base = where()
         return base.rstrip('/')
 
+    #: The key the RUNNING gateway holds, while it differs from the managed
+    #: one (see :meth:`live_credential`); ``None``: the managed key.
+    _live_key: str | None = None
+
+    def live_credential(self, key: str | None):
+        """While active, admin calls authenticate with ``key``.
+
+        A rotation writes the new key to the ``.env`` before the gateway is
+        recreated with it, and an apply's first phase (retiring routes) talks
+        to the gateway still running on the old one. ``None`` (the running
+        key is unknown) keeps the managed key.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            previous, self._live_key = self._live_key, key
+            try:
+                yield
+            finally:
+                self._live_key = previous
+
+        return scope()
+
     def _auth_headers(self) -> dict[str, str]:
-        return {'Authorization': f'Bearer {self.master_key()}'}
+        return {'Authorization': f'Bearer {self._live_key or self.master_key()}'}
 
     def _desired_routes(self) -> list[dict[str, Any]]:
         """The rendered desired route set (litellm_routes.json), or empty."""
