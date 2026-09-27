@@ -859,3 +859,41 @@ Each with a test that fails on the code before it:
   ...)` remains in the controller; `ty` checks `FrontDoor` and
   `RecoveryProfile` conformance, and removing Compose's `allocates_gpus`
   fails it.
+
+## Final closure pass (2026-09-26)
+
+A third review found one cross-feature blocker and three small items.
+
+### 24. [ ] `secrets rotate` under a running dynamic-routing gateway
+
+*Why added:* rotation writes K1 to `.env` before publishing; the dynamic
+apply first retires routes on the still-running gateway, whose admin API
+accepts only K0, but authenticates with `.env`'s K1. Retirement cannot
+list routes, the apply returns `runtime=False`, and rotation restores K0
+and refuses: with dynamic routing on (Compose, or KubeAI's host gateway)
+rotation can never complete. The e2e rotated only after switching dynamic
+routing off, and the unit fake ran without it.
+
+**Do:** before the gateway is recreated, admin calls use the credential the
+running gateway holds; after, the desired one. Keep route retirement.
+**Done when:** with dynamic routing and a gateway started on K0, rotation
+succeeds: `.env` is K1, the gateway accepts K1 and rejects K0, routes
+verify, no marker; on Compose and KubeAI's host gateway; and the e2e rotates
+once while the host dynamic gateway is the front door.
+
+### 25. [ ] `SimpleAdmission` keeps `last_planned_digest`; the guard fails closed
+
+*Why added:* the in-process backends never set `last_planned_digest`, and
+the approval guard skips when it is empty, so an approved digest was not
+checked there. **Done when:** converge sets it from the same digest as
+preview, and an approved digest with no rendered digest refuses.
+
+### 26. [ ] Say what `leases` health reports
+
+*Why added:* `observe_state` takes only `restarting` from
+`deployment_health`, while the docs say the summary "feeds" it. **Done
+when:** code and docs agree.
+
+### 27. [ ] Record the `routes seed --replace` confirmation race as deferred
+
+**Done when:** it is in `known-limitations.md`.

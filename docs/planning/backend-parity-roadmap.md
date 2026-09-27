@@ -1,7 +1,7 @@
 # Backend parity roadmap: KubeAI as a superset of Compose
 
 **Status:** proposed 2026-09-25 · **P0 done** 2026-09-24 on
-`dev/backend-unification` · **features complete; review hardening and re-review done (queue 11-23)**:
+`dev/backend-unification` · **features complete; review hardening done except queue 24-27 (final closure pass)**:
 phases P1-P6 landed 2026-09-26 (P4 and P5 end in a handover run on real
 hardware, `dev/handover/`); a two-part outside review the same day found
 replica residency, the backend protocol, scheduler reclaim, publication
