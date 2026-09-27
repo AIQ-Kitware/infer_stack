@@ -919,3 +919,197 @@ there, and `status` shows `starting`. The docstrings of `observe_state` and
 **Done when:** it is in `known-limitations.md`.
 
 *Done 2026-09-26:* recorded there as current, deferred.
+
+---
+
+# Campaign 2: external endpoints, and access above leasing
+
+**Start only after items 11-27 are committed, green (suite, `ty`, flake8,
+full k3s e2e, UX audits) and the docs coherent. Do not interleave.** A
+separately reviewable campaign, requested 2026-09-26.
+
+**Goal.** First-class catalog endpoints whose model server already exists
+outside infer-stack, used as the occasion to remove conceptual duplication
+in endpoint -> lease -> route -> access. User stories: (1) a workflow asks
+for `qwen`; today infer-stack leases a local vLLM for it, tomorrow `qwen`
+points at a running OpenAI-compatible server, and the workflow does not
+change; (2) register a hardcoded OpenAI-compatible server as an endpoint
+without a fake lease.
+
+**Target data flow** (fewer transformations than today):
+catalog definition -> resolved endpoint meaning -> (managed:
+`EndpointRequest` -> ledger) / (external: target) -> semantic gateway
+route(s) -> gateway publication -> access descriptor.
+
+**Stop rule.** If the diff ends with more conceptual branches than today,
+stop and reconsider the abstraction. Do not bolt `external` onto every
+`if engine == ...`. If the code contradicts a conclusion below, stop and
+document it instead of forcing it.
+
+## Conclusions to preserve
+
+- **Endpoint identity is not lease identity.** An external endpoint creates
+  no `Lease`, `Deployment`, demand, GPU allocation, TTL or reclaim state.
+  The ledger holds only what infer-stack owns.
+- **"External" is not an engine.** No `engine: external`. Ownership is its
+  own axis: `Endpoint(alias, protocol, target: ManagedTarget(vllm|ollama) |
+  ExternalOpenAITarget(api_base, upstream model, api_key_env?))`. Existing
+  managed YAML is unchanged. Additive YAML:
+  `endpoints: {qwen-remote: {external: {api_base: ..., model: ...,
+  api_key_env: ...}, protocol: chat}}`. An external endpoint rejects
+  `runtime`, `placement`, `sharing`, `reclaim`, `host` (unless one proves a
+  meaning) and needs no `models:` entry.
+- **The catalog is the authoring authority.** Routes are derived
+  publication state; `routes seed` stays for multi-runbook pre-seeding, but
+  registering an external endpoint is a catalog operation, protected by the
+  profile/catalog conflict machinery: identical definitions coexist,
+  different ones conflict, a pinned managed endpoint cannot be silently
+  turned external, and once it is unpinned the change is allowed.
+- **Access through the front door only (first version).** One base URL,
+  the alias as model name, mixed bundles work, upstream credentials stay
+  behind the gateway. No implicit direct-to-external fallback. An external
+  endpoint without a LiteLLM front door fails clearly ("external catalog
+  targets currently require the front door").
+- **Externally owned means not controlled.** No startup, restart,
+  keep-warm, reclaim, placement for external targets. Publishing the route
+  is enough for `access` (no generation probe); an optional reachability
+  probe may report, never own. Views say `external`, not stopped / idle /
+  unplaced.
+
+## Work items (in order, small commits)
+
+### 28. [ ] Read, then write the design down first
+Read catalog, profile, gateway, controller and access code together. Write
+the data flow and invariants into a planning doc, and name the concepts
+that become unnecessary (e.g. `UPSTREAM_ROUTE`, unreachable
+`render_front_door` branches, lease-bound descriptors, route-derived
+catalog equality). Gate for the rest.
+
+### 29. [ ] `ResolvedEndpoint`: endpoint meaning, not a lease request
+One normalized object (alias, protocol, target) with a canonical semantic
+key used for catalog-union conflicts, profile drift, and "did this endpoint
+change". A managed target derives an `EndpointRequest`; an external one has
+none. `CatalogUnion` / profile code stop importing gateway or Compose route
+conversion (cleanup A). Transitional names may stay for compatibility.
+
+### 30. [ ] The external target in the catalog and its CLI
+YAML `external:` block, validation of illegal mixtures, round-trip.
+`catalog endpoint add` gains mutually exclusive external options (e.g.
+`--external-api-base`, `--external-model`, `--external-api-key-env`), never
+an `--engine` choice; reject `--engine vllm` + external, `--gpu`/`--reclaim`
++ external. `catalog show` makes ownership obvious.
+
+### 31. [ ] One terminology
+Endpoint alias (what users request through the front door), upstream model
+(what the target server expects as `model`), deployment id (one managed
+realization). Stop calling `served_model_name` a "public name"; keep old
+YAML spellings as compatibility aliases; all new code uses the three terms.
+
+### 32. [ ] One semantic `GatewayRoute`
+Alias, upstream adapter (OpenAI-compatible / Ollama), upstream model,
+api_base, optional credential-env name, optional managed dynamic route id.
+Produced by Compose (managed service name), KubeAI (cluster gateway),
+external targets (fixed URL), Ollama (its adapter); one renderer to
+LiteLLM's model entry; `routes list` uses the same object. Remove
+`UPSTREAM_ROUTE` if unneeded; persist a versioned serialization of the
+route in the registry if it removes branches. Same route type, different
+publication mechanisms (static registry vs dynamic reconciliation), not one
+storage for everything. Delete `render_front_door` branches that only tests
+reach (cleanup B), never a supported mode.
+
+### 33. [ ] External routes in static and dynamic routing
+Dynamic mode: an external route is standing desired state with a
+deterministic managed id from endpoint identity plus non-secret target
+semantics (independent of any deployment). It survives zero leases,
+releases, other acquires, gc, a dedicated deployment going away. Route
+retirement (item 17) stays intact; infer-stack never tears down an external
+upstream, only its route.
+
+### 34. [ ] External credentials by env reference
+`api_key_env` only; never a literal key in the catalog, registry, rendered
+route or logs. Render as a LiteLLM env reference; the gateway container
+receives the variable from the managed `.env` (`infer-stack env KEY=...`).
+Fail before apply if a declared key has no value; never generate provider
+keys. Dynamic routing: LiteLLM redacts credentials when listing, so do not
+read keys back; the route identity/fingerprint includes the env NAME (a
+changed reference forces replacement), never the value; a changed value
+triggers what the gateway needs to see it, without leaking it.
+
+### 35. [ ] Publication without a ledger mutation
+External-only access may change nothing in the ledger but still needs:
+check/incorporate the invocation catalog/profile, render gateway state,
+persist routes, apply under the publication lock with the pending /
+approved-render machinery. Factor it so managed acquire and external-only
+access reach the same publication coordinator; no second ad-hoc gateway
+apply path; no private gateway writes from the CLI.
+
+### 36. [ ] Access above leasing
+An access result: requested endpoints, base URL, credential info,
+alias -> request-model mapping, optional real lease, optional GPU
+reservation metadata (external-only: `lease=None`; mixed: one real lease
+for the managed subset; the lease never lists external names). The env
+format omits `INFER_STACK_LEASE_ID` when there is no lease (no sentinel);
+managed-only descriptors stay byte-identical where practical. A high-level
+`prepare_access`/`acquire_access` partitions managed/external, leases only
+managed, ensures publication, waits for managed runtime as today, returns
+one result. `infer-stack access ... [--env-file]` for workflows without
+`run`; `run` uses it. `acquire` stays lease-only: for external-only it
+says "'qwen' is externally provided and does not require a lease; use
+`infer-stack access qwen` or `infer-stack run ...`"; mixed bundles go
+through access. `release` of external-only access has nothing to release.
+Access is a typed capability, not a `getattr(backend, 'access')` hook
+(cleanup D).
+
+### 37. [ ] Views: `external`
+Status, TUI and catalog views show external targets as `external`.
+
+### 38. [ ] `FrontDoor` naming collision (cleanup C)
+If both the controller capability and the rendered artifact are still
+called `FrontDoor`, rename (e.g. `FrontDoorControl`, `RenderedFrontDoor`).
+
+### 39. [ ] Tests (not only parser tests)
+1 external parses and round-trips semantically; 2 invalid mixtures fail
+clearly; 3 no lease/deployment for external; 4 external-only access
+publishes a route with zero ledger demand; 5 mixed bundle creates only
+managed demand; 6 `run` works external-only and mixed; 7 managed-only `run`
+unchanged; 8 external needs a usable front door; 9 static routing keeps
+external routes across unrelated acquire/release/gc; 10 same for dynamic;
+11 two catalogs, same alias and target, union cleanly; 12 same alias,
+different target, conflict; 13 an active managed `qwen` cannot be silently
+redefined external; 14 once unpinned the same edit succeeds; 15 external ->
+managed likewise; 16 upstream key referenced by name, never serialized as
+value; 17 missing required key fails before apply; 18 a changed key
+reference forces route reconciliation; 19 external-only descriptor has no
+fake lease id; 20 releasing a mixed access result affects only its real
+lease; 21 `routes list` renders the same target as the gateway renderer;
+22 external routes recover after a process restart from durable state.
+Parity: Compose and KubeAI-with-gateway; on KubeAI an external route must
+not be rewritten to point at the cluster gateway.
+Mixed bundle acceptance (`access pair` / `run --endpoint pair`, pair =
+managed `local-model` + external `remote-model`): one real lease for
+`local-model`, none for `remote-model`, wait for the local one, external
+route published, one base URL, both aliases in the descriptor, only the
+managed lease released at the end.
+
+### 40. [ ] Real e2e with a local fake OpenAI server
+No internet provider. Phases: external only; managed only; mixed bundle;
+managed alias -> external after release; external under dynamic routing if
+practical. Run from a frozen copy.
+
+### 41. [ ] Docs, journal, verification
+Design doc: Endpoint (public contract) / Fulfillment (managed runtime or
+external upstream) / Lease (only when infer-stack owns runtime), with the
+workflow (`external:` in the catalog; `infer-stack access qwen --env-file
+./qwen.env`; `infer-stack env REMOTE_QWEN_API_KEY=...`) and that switching
+back to managed changes neither alias nor workflow. Update architecture
+docs, not only CLI help. Journal: fake lease vs access above leasing;
+`engine: external` vs target ownership; registry as authoring vs derived
+state; direct remote vs stable front door. Full suite, `ty`, flake8, UX
+audits, the relevant real e2e.
+
+## Non-goals
+Arbitrary providers; Anthropic/Bedrock/Azure schemas; direct multi-base-URL
+descriptors; health ownership or lifecycle of external services; fake
+leases; a service mesh; rewriting existing catalog entries. The first
+external target is an already-running OpenAI-compatible upstream; the
+target union allows more later.
