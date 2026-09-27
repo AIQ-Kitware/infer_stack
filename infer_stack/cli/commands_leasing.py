@@ -427,7 +427,7 @@ def _requests_catalog(controller, config):
 
 def _resolve(catalog, names, *, sharing=None):
     try:
-        return catalog.resolve_names(names, sharing=sharing)
+        return catalog.resolve_requests(names, sharing=sharing)
     except CatalogError as ex:
         raise SystemExit(str(ex))
 
@@ -1656,7 +1656,7 @@ class MeasureCLI(_LeasingCommonMixin):
             )
         catalog = _requests_catalog(controller, config)
         name = config.endpoint
-        request = catalog.resolve_names([name])[0]
+        request = catalog.resolve_requests([name])[0]
         if request.engine != 'vllm':
             raise SystemExit(
                 f'measure supports vllm endpoints only '

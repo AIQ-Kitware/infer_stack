@@ -162,7 +162,7 @@ def _litellm_model_list_from_catalog(catalog: Any) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for name in sorted(getattr(catalog, 'endpoints', {})):
         try:
-            req = catalog.resolve_endpoint(name)
+            req = catalog.resolve_endpoint(name).to_request()
         except Exception:  # noqa: BLE001 - a bad endpoint must not break the gateway
             continue
         if req.engine == 'vllm':
@@ -201,7 +201,7 @@ def _registry_incoming_from_catalog(catalog: Any) -> dict[str, dict[str, Any]]:
     incoming: dict[str, dict[str, Any]] = {}
     for name in sorted(getattr(catalog, 'endpoints', {})):
         try:
-            req = catalog.resolve_endpoint(name)
+            req = catalog.resolve_endpoint(name).to_request()
         except Exception:  # noqa: BLE001 - a bad endpoint must not break the gateway
             continue
         if req.engine == 'vllm':

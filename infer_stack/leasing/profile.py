@@ -76,18 +76,20 @@ def canonical_digest(data: Any) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def _request_key(catalog: Catalog, name: str, sharing: str | None = None) -> Any:
+def _endpoint_key(catalog: Catalog, name: str) -> str:
+    """What ``name`` means in ``catalog`` (its semantic key), or why it cannot."""
     try:
-        return dataclasses.asdict(catalog.resolve_endpoint(name, sharing=sharing))
+        return catalog.resolve_endpoint(name).semantic_key()
     except CatalogError as ex:
-        return {'unresolvable': str(ex)}
+        return f'unresolvable: {ex}'
 
 
 class CatalogUnion:
     """Several catalogs presented as one, for resolution and route rendering.
 
     Implements the part of :class:`Catalog` the leasing paths use:
-    ``endpoints``, ``bundles``, ``resolve_endpoint`` and ``resolve_names``.
+    ``endpoints``, ``bundles``, ``resolve_endpoint``, ``resolve`` and
+    ``resolve_requests``.
     """
 
     def __init__(self, sources: list[dict[str, Any]], catalogs: list[Catalog]):
@@ -96,13 +98,11 @@ class CatalogUnion:
         self._owner: dict[str, Catalog] = {}
         self.endpoints: dict[str, Any] = {}
         self.bundles: dict[str, list[str]] = {}
-        from .compose import _registry_incoming_from_catalog
-
-        routes: dict[str, Any] = {}
+        # Conflicts are endpoint meaning only: routes are derived from it.
         for cat in catalogs:
             for name, spec in cat.endpoints.items():
                 if name in self._owner:
-                    if _request_key(self._owner[name], name) != _request_key(cat, name):
+                    if _endpoint_key(self._owner[name], name) != _endpoint_key(cat, name):
                         raise CatalogConflict(
                             f'endpoint {name!r} is defined differently in two '
                             'published catalogs', [name]
@@ -117,13 +117,6 @@ class CatalogUnion:
                         [name]
                     )
                 self.bundles[name] = list(members)
-            for alias, row in _registry_incoming_from_catalog(cat).items():
-                if alias in routes and routes[alias] != row:
-                    raise CatalogConflict(
-                        f'route {alias!r} is defined differently in two published catalogs',
-                        [alias]
-                    )
-                routes[alias] = row
         clash = sorted(set(self.bundles) & set(self.endpoints))
         if clash:
             raise CatalogConflict(
@@ -148,20 +141,34 @@ class CatalogUnion:
             raise CatalogError(f"unknown endpoint '{name}'")
         return self._owner[name].resolve_endpoint(name, sharing=sharing)
 
-    def resolve_names(self, names: list[str], *, sharing: str | None = None):
+    def expand(self, names: list[str]) -> list[str]:
         ordered: list[str] = []
         for name in names:
             for member in self.bundles.get(name, [name]):
                 if member not in ordered:
                     ordered.append(member)
-        return [self.resolve_endpoint(n, sharing=sharing) for n in ordered]
+        return ordered
+
+    def resolve(self, names: list[str]):
+        return [self.resolve_endpoint(n) for n in self.expand(names)]
+
+    def resolve_requests(self, names: list[str], *, sharing: str | None = None):
+        return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
+                for n in self.expand(names)]
+
+    resolve_names = resolve_requests
 
     def request_matches(self, request) -> bool:
         """Whether ``request`` is exactly what this union resolves its name to."""
         cat = self._owner.get(request.endpoint)
         if cat is None:
             return False
-        return _request_key(cat, request.endpoint, request.sharing) == dataclasses.asdict(request)
+        try:
+            mine = cat.resolve_endpoint(request.endpoint).to_request(
+                sharing_override=request.sharing)
+        except (CatalogError, ValueError):
+            return False
+        return dataclasses.asdict(mine) == dataclasses.asdict(request)
 
     def _merged_view(self) -> Catalog:
         view = Catalog()

@@ -77,6 +77,7 @@ from typing import Any
 import yaml
 
 from .launch import launch_identity, translate_legacy
+from .endpoints import ManagedTarget, ResolvedEndpoint
 from .models import (
     EndpointRequest,
     Sharing,
@@ -496,40 +497,51 @@ class Catalog:
 
     def resolve_endpoint(
         self, name: str, *, sharing: str | None = None
-    ) -> EndpointRequest:
-        """Resolve one endpoint name into a ledger :class:`EndpointRequest`.
+    ) -> ResolvedEndpoint:
+        """What endpoint ``name`` means: a :class:`ResolvedEndpoint`.
 
-        ``sharing`` overrides the catalog's declared policy (e.g. the CLI
-        ``--dedicated`` flag) when given.
+        A managed target carries the catalog's request; ``to_request`` gives
+        the ledger's. ``sharing`` (from before ``to_request`` took the
+        override) is applied to that request when given.
         """
         if name not in self.endpoints:
             raise self._unknown_endpoint_error(name)
         ep = self.endpoints[name]
         share = sharing or ep.sharing
         if ep.engine == VLLM:
-            return self._resolve_vllm(ep, share)
-        if ep.engine == OLLAMA:
-            return self._resolve_ollama(ep, share)
-        raise CatalogError(
-            f"endpoint '{name}' has unknown engine '{ep.engine}'"
-        )
+            request = self._resolve_vllm(ep, share)
+        elif ep.engine == OLLAMA:
+            request = self._resolve_ollama(ep, share)
+        else:
+            raise CatalogError(
+                f"endpoint '{name}' has unknown engine '{ep.engine}'"
+            )
+        return ResolvedEndpoint(ep.name, ep.protocol, ManagedTarget(request))
 
-    def resolve_names(
-        self, names: list[str], *, sharing: str | None = None
-    ) -> list[EndpointRequest]:
-        """Expand a mix of endpoint and bundle names into requests.
-
-        Bundles expand to their member endpoints; duplicates (e.g. an endpoint
-        named directly and also via a bundle) are de-duplicated, preserving
-        order.
-        """
+    def expand(self, names: list[str]) -> list[str]:
+        """Endpoint names for a mix of endpoint and bundle names: bundles
+        expand to their members, duplicates go, order stays."""
         ordered: list[str] = []
         for name in names:
-            members = self.bundles.get(name, [name])
-            for member in members:
+            for member in self.bundles.get(name, [name]):
                 if member not in ordered:
                     ordered.append(member)
-        return [self.resolve_endpoint(n, sharing=sharing) for n in ordered]
+        return ordered
+
+    def resolve(self, names: list[str]) -> list[ResolvedEndpoint]:
+        """The meanings of a mix of endpoint and bundle names."""
+        return [self.resolve_endpoint(n) for n in self.expand(names)]
+
+    def resolve_requests(
+        self, names: list[str], *, sharing: str | None = None
+    ) -> list[EndpointRequest]:
+        """Ledger requests for a mix of endpoint and bundle names
+        (``sharing`` overrides the catalog's, e.g. ``--dedicated``)."""
+        return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
+                for n in self.expand(names)]
+
+    #: The name from before :meth:`resolve_requests`; kept for its callers.
+    resolve_names = resolve_requests
 
     def _resolve_vllm(
         self, ep: EndpointSpec, sharing: str

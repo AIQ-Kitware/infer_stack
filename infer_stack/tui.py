@@ -3439,7 +3439,7 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_acquire(self, name: str) -> None:
         try:
-            requests = self.catalog.resolve_names([name])
+            requests = self.catalog.resolve_requests([name])
             outcome = self.controller.acquire(
                 'manual', requests, ttl_seconds=None, wait=False, apply=True
             )

@@ -1096,7 +1096,7 @@ transaction with a possibly empty managed set; credentials by reference
 with `env` saying when an apply is needed; external route id =
 `('external', alias)`; access waits for the front door's key.
 
-### 29. [ ] `ResolvedEndpoint`: endpoint meaning, not a lease request
+### 29. [x] `ResolvedEndpoint`: endpoint meaning, not a lease request
 One normalized object (alias, protocol, target) with a canonical semantic
 key used for catalog-union conflicts, profile drift, and "did this endpoint
 change". A managed target derives an `EndpointRequest`; an external one has
@@ -1112,6 +1112,16 @@ request-time `--dedicated` is not part of the key. API: make
 `Catalog.resolve_endpoint(name)` return the `ResolvedEndpoint`, with
 `resolved.to_request(sharing_override=...)` (or `resolve_requests`) for the
 ledger; no parallel `resolve_endpoint_meaning` / `resolve_access_endpoint`.
+
+*Done 2026-09-27:* `leasing/endpoints.py`: `ResolvedEndpoint(alias,
+protocol, target)`, `ManagedTarget(request)`, `ExternalTarget(api_base,
+model, api_key_env)`, `semantic_key()` from the resolved request.
+`Catalog.resolve_endpoint` returns it; `resolve(names)` gives meanings,
+`resolve_requests(names, sharing=)` ledger requests (`resolve_names` kept
+as its alias). `CatalogUnion` compares semantic keys and no longer imports
+`_registry_incoming_from_catalog` (cleanup A). A managed `ResolvedEndpoint`
+still answers the `EndpointRequest` fields: eval_audit reads them off
+`resolve_endpoint` (its test failures are the same with and without this).
 
 ### 30. [ ] The external target in the catalog and its CLI
 YAML `external:` block, validation of illegal mixtures, round-trip.

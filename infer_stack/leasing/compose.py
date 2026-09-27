@@ -152,7 +152,7 @@ def profile_images(profile: dict[str, Any]) -> list[str]:
     union = CatalogUnion.from_sources(sources)
     for name in union.endpoints:
         try:
-            req = union.resolve_endpoint(name)
+            req = union.resolve_endpoint(name).to_request()
         except Exception:  # noqa: BLE001 - an unresolvable endpoint serves nothing
             continue
         if req.engine == 'vllm':      # same sources the render uses

@@ -621,3 +621,18 @@ def test_an_idle_but_resident_keep_warm_definition_stays_frozen(tmp_path):
     _, ctl3 = controller(tmp_path, catalog=changed, docker=docker)
     ctl3.acquire('z', changed.resolve_names(['alpha']), wait=False)
     assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+
+
+def test_catalogs_naming_one_model_differently_agree_on_its_endpoint():
+    """Endpoint meaning is the resolved request, not the catalog's model key
+    (campaign 2, item 29): `alias-a` and `alias-b` for one source agree."""
+    from infer_stack.leasing.profile import CatalogUnion
+
+    def cat(model_key):
+        return {'models': {model_key: {'source': 'hf://org/m'}},
+                'endpoints': {'qwen': {'engine': 'vllm', 'model': model_key}}}
+
+    union = CatalogUnion.from_sources([cat('alias-a'), cat('alias-b')])
+    assert list(union.endpoints) == ['qwen']
+    a, b = (Catalog.from_dict(cat(k)).resolve_endpoint('qwen') for k in ('alias-a', 'alias-b'))
+    assert a.semantic_key() == b.semantic_key()
