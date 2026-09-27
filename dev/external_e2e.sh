@@ -28,11 +28,15 @@
 #   E2E_MODES   routing modes to run (default "static dynamic")
 #   E2E_PORT    the mock's port (default 18911)
 #   E2E_SIM     the simulator image (default ghcr.io/llm-d/llm-d-inference-sim:v0.9.0)
+#   E2E_BACKEND compose (default) or kubeai: the external route through
+#               KubeAI's host gateway (phases 1-5; 6-8 need the simulator,
+#               which runs on Compose only). Needs KUBECONFIG and the chart.
 set -euo pipefail
 
 MODES="${E2E_MODES:-static dynamic}"
 PORT="${E2E_PORT:-18911}"
 SIM="${E2E_SIM:-ghcr.io/llm-d/llm-d-inference-sim:v0.9.0}"
+BACKEND="${E2E_BACKEND:-compose}"
 HOST_IP="$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)"
 [ -n "$HOST_IP" ] || { echo 'no docker0 address' >&2; exit 1; }
 
@@ -119,7 +123,7 @@ run_mode() {
     run_is() { env $IS_ENV infer-stack "$@"; }
     echo "== [$mode] work dir: $WORK"
     mkdir -p "$WORK/config"
-    run_is config set backend compose >/dev/null
+    run_is config set backend "$BACKEND" >/dev/null
     if [ "$mode" = dynamic ]; then run_is config set dynamic_routing true >/dev/null; fi
     # The runbook's own catalog: nothing external.
     cat > "$WORK/config/catalog.yaml" <<EOF
@@ -147,7 +151,7 @@ EOF
     run_is routes seed "$WORK/external.yaml" --yes
     run_is routes list
     run_is routes list --json | grep -q '"origin": "external"' || fail 'not listed as external'
-    if grep -rq 'key-one' "$WORK/data/leasing/compose/docker-compose.yml"; then
+    if grep -rq --include=docker-compose.yml 'key-one' "$WORK/data"; then
         fail 'the key value is in the compose file'
     fi
     chat_until remote 200
@@ -167,6 +171,18 @@ EOF
     if run_is routes list --json | grep -q '"remote"'; then fail 'still listed after prune'; fi
     chat_until remote 400
 
+    if [ "$BACKEND" != compose ]; then
+        echo "== [$mode] 5. access an external endpoint: no lease"
+        cp "$WORK/external.yaml" "$WORK/config/catalog.yaml"
+        run_is access remote --yes --env-file "$WORK/remote.env"
+        if grep -q INFER_STACK_LEASE_ID "$WORK/remote.env"; then fail 'a lease id without a lease'; fi
+        [ "$(chat_env "$WORK/remote.env" remote)" = 200 ] || fail "remote: $(cat "$WORK/chat.json")"
+        run_is stack down >/dev/null 2>&1 || true
+        stop_mock
+        rm_work "$WORK"
+        echo "== [$mode/$BACKEND] PASS (phases 1-5)"
+        return 0
+    fi
     # The runbook's catalog now names a managed endpoint, the external one,
     # and a bundle of both.
     cat > "$WORK/config/catalog.yaml" <<EOF

@@ -1323,7 +1323,9 @@ key refusal, publish, key rotation, prune, external-only access, managed
 access, mixed bundle, managed alias moved to external. Passes, from a
 frozen copy. It found three bugs the unit tests missed (catalog drift
 warnings, orphaned bundles on a redefinition, lowercase `authorization`).
-Not run: the same on KubeAI (unit-tested only).
+On KubeAI (`E2E_BACKEND=kubeai`, the host gateway in front of the dev
+k3s cluster): phases 1-5, static and dynamic, pass; 6-8 need the simulator,
+which runs on Compose only.
 No internet provider. Phases: external only; managed only; mixed bundle;
 managed alias -> external after release; external under dynamic routing if
 practical. Run from a frozen copy.
@@ -1333,8 +1335,8 @@ practical. Run from a frozen copy.
 managed; README (catalog model, main commands, shapes); the catalog schema
 docstring; routing doc. Journal: the four alternatives and why not. Suite
 (1094), ty, flake8, `dev/ux_audit.sh compose` (0 flags, now covering
-`access`), `dev/external_e2e.sh` (both routing modes). Not run here:
-`ux_audit.sh kubeai` and a KubeAI external e2e.
+`access`), `dev/external_e2e.sh` (both routing modes, Compose and KubeAI),
+`ux_audit.sh kubeai` (0 flags, `access` included).
 Design doc: Endpoint (public contract) / Fulfillment (managed runtime or
 external upstream) / Lease (only when infer-stack owns runtime), with the
 workflow (`external:` in the catalog; `infer-stack access qwen --env-file
