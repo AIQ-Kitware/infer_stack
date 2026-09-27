@@ -1029,7 +1029,7 @@ document it instead of forcing it.
 
 ## Work items (in order, small commits)
 
-### 28. [ ] Read, then write the design down first
+### 28. [x] Read, then write the design down first
 Read catalog, profile, gateway, controller and access code together. Write
 the data flow and invariants into a planning doc, and name the concepts
 that become unnecessary (e.g. `UPSTREAM_ROUTE`, unreachable
@@ -1086,6 +1086,15 @@ doc before item 29.*
    that dies after publication leaves the route (a committed lease follows
    normal TTL/recovery; no access handle); removing an external endpoint
    from the catalog unpublishes it by the rule decided in 1.
+
+*Done 2026-09-27:* [planning/external-endpoints.md](planning/external-endpoints.md)
+decides all seven. The chosen rules: the profile's `catalogs` is the durable
+published union (merged on every acquire/access; quiescence replaces
+settings, not catalogs; `routes prune` unpublishes); routes are derived at
+render, the registry becomes read-only legacy input; access is the acquire
+transaction with a possibly empty managed set; credentials by reference
+with `env` saying when an apply is needed; external route id =
+`('external', alias)`; access waits for the front door's key.
 
 ### 29. [ ] `ResolvedEndpoint`: endpoint meaning, not a lease request
 One normalized object (alias, protocol, target) with a canonical semantic
