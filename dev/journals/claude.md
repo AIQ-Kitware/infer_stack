@@ -3475,3 +3475,35 @@ the arguments that decided them.
   the alias stops being the model name and the key is the provider's, so a
   workflow changes when an endpoint moves. Through the front door, moving
   `qwen` between managed and external changed nothing in the e2e's phase 8.
+
+## 2026-09-27 — campaign 2 review: the publication boundary caught up
+
+**Intent.** A review of campaign 2 found that the profile/publication
+transaction model had not caught up with `profile.catalogs` being the
+published endpoint set (items 42-50). Model: Claude Opus 5.5
+(claude-opus-5-5), Claude Code.
+
+**Did.** (42) Nothing writes catalogs outside a publication's commit: the
+first profile rides the first marker, an acquire's candidate rides its lease
+transaction, access and a first `apply` go through `publish_profile`; `gc`
+no longer publishes on a fresh ledger. (43) Access readiness includes the
+publication's result, tri-state. (44) A route key with no value refuses at
+the render, for every command. (45) Pinning compares a resident alias's new
+meaning with the deployment running it, whatever source held the old one.
+(46) `FrontDoorControl` is the whole interface. (48-50) desired-state
+labelling, strict `api_base`, and an explicit no-migration decision.
+
+**Wider than reported.** Item 42 was reported for a fresh ledger; the same
+gap existed on every acquire with a catalog change (profile, marker and
+lease were three transactions). Fixed together.
+
+**Kept deliberately.** `apply` on a fresh ledger still publishes the
+invocation's endpoints (through the approved single commit): the parity test
+`test_catalog_routes_exist_before_models_run_and_do_not_churn` pins the
+no-blip property of `stack up` then `acquire`, and `gc` / `release` /
+`evict` are the non-endpoint operations the review meant.
+
+**Evidence.** Each poison test fails on the old code (item 45's two ran the
+full 180 s dynamic reconcile budget there, because the unfixed seed went on
+to publish). Suite 1114, ty, flake8, `external_e2e.sh` on Compose (8 phases,
+both routing modes) and on KubeAI (1-5, both).

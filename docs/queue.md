@@ -1354,6 +1354,8 @@ audits, the relevant real e2e.
 The architecture stands; these are places where the publication/profile
 transaction model had not caught up with published catalogs being real
 desired state. Items 42-45 must be fixed before campaign 2 is closed.
+*2026-09-27: 42-46 and 48-50 done; 47 recorded as a design candidate.
+Verified: suite, ty, flake8, `dev/external_e2e.sh` on Compose and KubeAI.*
 
 ### 42. [x] The first profile, and a profile candidate, commit with publication intent
 *Done 2026-09-27.* `_sync_profile` never writes; a fresh ledger renders from
