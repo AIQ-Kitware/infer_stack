@@ -1137,11 +1137,18 @@ member raises "... does not require a lease; use `infer-stack access
 NAME`". `catalog show` prints the `external:` block. Tests 1-2 and the CLI in
 `tests/test_external_endpoints.py`.
 
-### 31. [ ] One terminology
+### 31. [x] One terminology
 Endpoint alias (what users request through the front door), upstream model
 (what the target server expects as `model`), deployment id (one managed
 realization). Stop calling `served_model_name` a "public name"; keep old
 YAML spellings as compatibility aliases; all new code uses the three terms.
+
+*Done 2026-09-27:* the three terms are defined once, in
+`leasing/endpoints.py`'s docstring (the naming module and
+`EndpointSpec.served_name` point at it); `--public-name`'s help no longer
+calls the upstream model the public name. YAML `public_name`/`served_name`
+unchanged. New code (endpoints, routes, access) uses alias / upstream model /
+deployment id.
 
 ### 32. [ ] One semantic `GatewayRoute`
 Alias, upstream adapter (OpenAI-compatible / Ollama), upstream model,

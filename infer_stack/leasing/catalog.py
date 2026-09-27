@@ -174,6 +174,9 @@ class EndpointSpec:
     runtime: dict[str, Any] = field(default_factory=dict)
     sharing: str = Sharing.SHARED
     reclaim: str = DEFAULT_RECLAIM
+    #: The upstream model name the engine serves (``--served-model-name``);
+    #: YAML ``served_name`` or its older spelling ``public_name``. Defaults to
+    #: the endpoint alias, which is the public name.
     served_name: str | None = None
     # OpenAI surface the readiness probe (and clients) should use: 'chat' hits
     # /chat/completions, 'completions' hits /completions. A completions-only

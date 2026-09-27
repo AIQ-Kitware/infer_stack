@@ -1,9 +1,11 @@
 """The names infer-stack gives the things it runs, in one place.
 
 A compose service, a Kubernetes object, and the upstream host a gateway
-route points at are all derived from the served model name (or an Ollama
-host). The engine side and the gateway side must agree on these exactly, so
-both import them from here.
+route points at are all derived from the upstream model name (the served
+model name; or an Ollama host). The engine side and the gateway side must
+agree on these exactly, so both import them from here. The terms (endpoint
+alias, upstream model, deployment id) are defined in
+:mod:`infer_stack.leasing.endpoints`.
 """
 
 from __future__ import annotations

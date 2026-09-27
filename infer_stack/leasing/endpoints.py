@@ -14,6 +14,18 @@ compare its :meth:`~ResolvedEndpoint.semantic_key`, which is built from the
 resolved request (model source, revision, runtime knobs...), never from the
 catalog's own model keys, so two catalogs that name one model differently
 still agree. It knows nothing of leases, routes or backends.
+
+Three names, and only these (new code uses them; older spellings stay
+readable):
+
+* **endpoint alias** -- what a client requests through the front door, the
+  catalog's endpoint name (``ResolvedEndpoint.alias``). It is the public name.
+* **upstream model** -- what the serving process expects as ``model``: a
+  managed vLLM's ``--served-model-name`` (catalog ``served_name``, also spelled
+  ``public_name``; defaults to the alias), an Ollama tag, or
+  ``ExternalTarget.model``. Not public: clients never send it.
+* **deployment id** -- one managed realization of an endpoint, when there is
+  one (external targets have none).
 """
 
 from __future__ import annotations

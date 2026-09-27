@@ -679,7 +679,11 @@ class EndpointAddCLI(_CatalogCommon):
     model = kw.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
     host = kw.Value(None, type=str, help='Runtime host (ollama).')
     public_name = kw.Value(
-        None, type=str, help='Served/public name (for coalescing aliases).'
+        None, type=str,
+        help='Upstream model name the engine serves (--served-model-name; '
+             'default: the alias). Endpoints with the same upstream name and '
+             'model coalesce onto one deployment. Not the public name: clients '
+             'request the alias.',
     )
     reclaim = kw.Value(
         None, type=str, choices=['keep-warm', 'stop', 'scale-to-zero'],
