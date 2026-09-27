@@ -1285,7 +1285,10 @@ deployments. Show external endpoints in an endpoint/routing section
 If both the controller capability and the rendered artifact are still
 called `FrontDoor`, rename (e.g. `FrontDoorControl`, `RenderedFrontDoor`).
 
-### 39. [ ] Tests (not only parser tests)
+### 39. [x] Tests (not only parser tests)
+*Done 2026-09-27:* all 22 in `tests/test_external_endpoints.py` (plus the
+existing managed `run` tests for 7), KubeAI parity for routes, and the mixed
+bundle through the CLI (`access pair`, `run --endpoint pair`).
 1 external parses and round-trips semantically; 2 invalid mixtures fail
 clearly; 3 no lease/deployment for external; 4 external-only access
 publishes a route with zero ledger demand; 5 mixed bundle creates only
@@ -1309,7 +1312,15 @@ managed `local-model` + external `remote-model`): one real lease for
 route published, one base URL, both aliases in the descriptor, only the
 managed lease released at the end.
 
-### 40. [ ] Real e2e with a local fake OpenAI server
+### 40. [x] Real e2e with a local fake OpenAI server
+*Done 2026-09-27:* `dev/external_e2e.sh`, on the guest with no GPU: real
+LiteLLM, the mock OpenAI server as the external upstream (accepts one key),
+llm-d-inference-sim as the managed endpoint. Static and dynamic routing:
+key refusal, publish, key rotation, prune, external-only access, managed
+access, mixed bundle, managed alias moved to external. Passes, from a
+frozen copy. It found three bugs the unit tests missed (catalog drift
+warnings, orphaned bundles on a redefinition, lowercase `authorization`).
+Not run: the same on KubeAI (unit-tested only).
 No internet provider. Phases: external only; managed only; mixed bundle;
 managed alias -> external after release; external under dynamic routing if
 practical. Run from a frozen copy.

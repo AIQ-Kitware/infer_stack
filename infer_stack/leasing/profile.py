@@ -286,13 +286,24 @@ def drop_catalog_names(
     sources: list[dict[str, Any]], names: set[str]
 ) -> list[dict[str, Any]]:
     """``sources`` without the endpoints and bundles named ``names``; a source
-    left with neither goes."""
+    left with neither goes.
+
+    A bundle goes too when a member it names is dropped: a catalog's bundles
+    name its own endpoints, and a source must stay a valid catalog. (The
+    catalog that redefined the member publishes its own bundles.)
+
+    Example:
+        >>> src = {'endpoints': {'a': {}, 'b': {}}, 'bundles': {'ab': ['a', 'b']}}
+        >>> drop_catalog_names([src], {'a'})
+        [{'endpoints': {'b': {}}, 'bundles': {}}]
+    """
     out: list[dict[str, Any]] = []
     for source in sources or []:
         endpoints = {n: s for n, s in (source.get('endpoints') or {}).items()
                      if n not in names}
+        dropped = set(source.get('endpoints') or {}) - set(endpoints)
         bundles = {n: m for n, m in (source.get('bundles') or {}).items()
-                   if n not in names}
+                   if n not in names and not set(m or []) & dropped}
         if not endpoints and not bundles:
             continue
         kept = dict(source)

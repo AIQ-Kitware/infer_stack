@@ -576,3 +576,30 @@ def test_status_lists_published_external_endpoints_apart_from_deployments(tmp_pa
     assert status['external'] == [('remote', 'Qwen/Qwen3-32B', 'http://box:8000/v1')]
     assert status['deployments'] == []                  # no pseudo-deployment
     assert 'remote' in '\n'.join(rt._external_lines(status['external']))
+
+
+def test_two_catalogs_agree_on_an_external_alias_or_conflict():
+    from infer_stack.leasing.profile import CatalogConflict, CatalogUnion
+
+    a = {'endpoints': {'remote': REMOTE}}
+    b = {'models': {'x': {'source': 'hf://o/x'}}, 'endpoints': {'remote': REMOTE}}
+    union = CatalogUnion.from_sources([a, b])          # same alias, same target
+    assert list(union.endpoints) == ['remote']
+    other = {'endpoints': {'remote': {**REMOTE, 'external': {
+        **REMOTE['external'], 'model': 'Other/Model'}}}}
+    with pytest.raises(CatalogConflict, match="'remote'"):
+        CatalogUnion.from_sources([a, other])
+
+
+def test_moving_a_bundled_endpoint_to_external_keeps_the_union_valid():
+    """Found by dev/external_e2e.sh phase 8: redefining a bundle member left the
+    published copy of the bundle naming an endpoint its source no longer had."""
+    from infer_stack.leasing.profile import CatalogUnion, adopt_catalog_sources
+
+    before = catalog(remote=REMOTE)                          # pair = local + remote
+    after = catalog(remote=REMOTE)
+    after['endpoints']['local'] = {'external': dict(REMOTE['external'])}
+    sources = adopt_catalog_sources([before], [after], pinned=set())
+    union = CatalogUnion.from_sources(sources)
+    assert not union.resolve_endpoint('local').managed
+    assert union.bundles['pair'] == ['local', 'remote']

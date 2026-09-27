@@ -2166,12 +2166,8 @@ class Controller:
                 kept = {k: v for k, v in legacy.items() if k not in drop}
                 if kept != legacy:
                     gateway.replace_route_entries(kept)
-                sources = self._published_sources()
                 # A bundle naming an unpublished endpoint goes with it.
-                bundles = {b for src in sources
-                           for b, members in (src.get('bundles') or {}).items()
-                           if set(members or []) & set(drop)}
-                self._store_catalogs(drop_catalog_names(sources, set(drop) | bundles))
+                self._store_catalogs(drop_catalog_names(self._published_sources(), set(drop)))
             return drop
 
         return self.publish_change(change)

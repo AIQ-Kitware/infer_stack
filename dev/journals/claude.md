@@ -3425,3 +3425,24 @@ and merging rewrites the union's sources. It now compares endpoint meaning.
 Also: LiteLLM's upstream request lowercases `authorization`, and Postgres
 leaves its data dir owned by its own uid (the script removes it through a
 container).
+
+## 2026-09-27 — items 35-40: access above leasing, and the e2e that checked it
+
+**Did.** `Controller.access` over `acquire` (managed members, one lease) and
+`publish_endpoints` (external-only: the same preview, approved marker and
+publication, no ledger mutation); typed `ConnectionInfo` /
+`request_names()` replace the `access` dict hook; `infer-stack access`,
+`run` on top; lease-less env-files; `status` and TUI views; the
+`FrontDoorControl` / `RenderedFrontDoor` names. `dev/external_e2e.sh`
+covers eight phases in both routing modes on the guest.
+
+**Found by the e2e.** Redefining a bundle member (managed -> external) left
+the published copy of the bundle naming an endpoint its own source had
+dropped; every source must validate alone, so `drop_catalog_names` now
+drops such bundles. The first external-only access on a fresh ledger
+published nothing: freezing the snapshot consumed the candidate. Access now
+always publishes.
+
+**Mistake.** A nested heredoc (`<<EOF` inside `<<'EOF'`) ended my edit
+early and ran the rest as shell; nothing was written, but edit scripts with
+heredocs inside now go through the Write tool.
