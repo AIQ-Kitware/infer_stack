@@ -1029,12 +1029,73 @@ that become unnecessary (e.g. `UPSTREAM_ROUTE`, unreachable
 `render_front_door` branches, lease-bound descriptors, route-derived
 catalog equality). Gate for the rest.
 
+*Added by the campaign-2 design review (2026-09-27): decide these in the
+doc before item 29.*
+
+1. **Published endpoint lifetime.** What keeps an external endpoint
+   registered with zero leases; how it is explicitly removed; an unrelated
+   runbook or a global-setting change must not silently unregister it.
+   Today the recovery profile replaces its catalog set wholesale when
+   quiescent, and the route registry is append-only: two authorities that
+   external endpoints would make visibly disagree. Proposed: separate the
+   published catalog set's lifetime from the recovery settings' (may stay in
+   one persisted profile); quiescence permits changing frozen settings but
+   does not prune unrelated published definitions; an explicit
+   prune/unpublish removes them.
+2. **Route ownership.** Catalog-derived routes (exactly from the published
+   catalogs), manual/seeded routes (if still needed, owned explicitly), and
+   dynamic deployment routes (runtime-derived) are three owners, not one
+   alias -> row map. Decide whether catalog rows stay in the persistent
+   registry at all; if the registry carries nothing the published catalogs
+   do not, remove the duplicate instead of teaching it external targets.
+   `routes seed FILE...` may become "merge these catalogs into the
+   published union". `CatalogUnion` importing
+   `_registry_incoming_from_catalog` is the symptom.
+3. **One access transaction.** Mixed managed + external access is one
+   plan, one preview, one approval digest, one commit (profile/catalog,
+   lease, marker), one render/apply; not "acquire, then publish routes".
+   `acquire()` stays the lease-specific public operation over the same
+   transaction machinery.
+4. **Credential lifecycle.** Host Compose gateway: the LiteLLM service's
+   environment names each referenced variable (`KEY: ${KEY}`), so the
+   existing fingerprint recreates it on a value change without the value in
+   any route. In-cluster gateway: referenced variables go into its Secret
+   (`envFrom`), the pod-template hash covers their values, never in a
+   manifest or diff. `infer-stack env KEY=new`: choose publish-on-write or
+   stage-and-say-so ("gateway uses it after `infer-stack apply`"), never
+   silent. Reject reserved names (`LITELLM_MASTER_KEY`, salt, DB password,
+   Open WebUI secret, `HF_TOKEN`) and invalid variable syntax as
+   `api_key_env`.
+5. **Stable route identity.** An external route's id is its logical owner
+   (e.g. `external-route:<alias>`); api_base / model / credential name are
+   its content, compared by the semantic route to decide replacement.
+   Managed dedicated routes keep `deployment id + alias`.
+6. **Front-door readiness.** External upstream readiness is not
+   infer-stack's; its own gateway's is. `access` returns only after the
+   front door answers with the expected master key (no generation to the
+   upstream). Poison test: LiteLLM starts slowly.
+7. **Failure semantics.** A managed member of a mixed bundle that fails and
+   rolls back leaves the external definition and route published; a process
+   that dies after publication leaves the route (a committed lease follows
+   normal TTL/recovery; no access handle); removing an external endpoint
+   from the catalog unpublishes it by the rule decided in 1.
+
 ### 29. [ ] `ResolvedEndpoint`: endpoint meaning, not a lease request
 One normalized object (alias, protocol, target) with a canonical semantic
 key used for catalog-union conflicts, profile drift, and "did this endpoint
 change". A managed target derives an `EndpointRequest`; an external one has
 none. `CatalogUnion` / profile code stop importing gateway or Compose route
 conversion (cleanup A). Transitional names may stay for compatibility.
+
+*Review:* the managed target's key must cover everything behaviourally
+relevant, resolved (model source/revision, quantization/dtype, engine,
+upstream served name, launch/runtime structural knobs, capacity, meaningful
+placement, default sharing, reclaim policy, protocol), never the raw
+`models:` key: two catalogs naming one source differently stay equal. A
+request-time `--dedicated` is not part of the key. API: make
+`Catalog.resolve_endpoint(name)` return the `ResolvedEndpoint`, with
+`resolved.to_request(sharing_override=...)` (or `resolve_requests`) for the
+ledger; no parallel `resolve_endpoint_meaning` / `resolve_access_endpoint`.
 
 ### 30. [ ] The external target in the catalog and its CLI
 YAML `external:` block, validation of illegal mixtures, round-trip.
@@ -1062,9 +1123,9 @@ storage for everything. Delete `render_front_door` branches that only tests
 reach (cleanup B), never a supported mode.
 
 ### 33. [ ] External routes in static and dynamic routing
-Dynamic mode: an external route is standing desired state with a
-deterministic managed id from endpoint identity plus non-secret target
-semantics (independent of any deployment). It survives zero leases,
+Dynamic mode: an external route is standing desired state with a stable
+managed id from its logical owner, the endpoint alias (decision 28.5), not
+from target semantics; the semantic route decides whether it is replaced. It survives zero leases,
 releases, other acquires, gc, a dedicated deployment going away. Route
 retirement (item 17) stays intact; infer-stack never tears down an external
 upstream, only its route.
@@ -1074,12 +1135,17 @@ upstream, only its route.
 route or logs. Render as a LiteLLM env reference; the gateway container
 receives the variable from the managed `.env` (`infer-stack env KEY=...`).
 Fail before apply if a declared key has no value; never generate provider
-keys. Dynamic routing: LiteLLM redacts credentials when listing, so do not
+keys. Per decision 28.4: host Compose service environment and fingerprint;
+in-cluster gateway Secret and pod-template hash; the chosen `env KEY=new`
+semantics; reserved-name validation. Real test against the pinned LiteLLM:
+add a model through the admin API with `api_key = os.environ/TEST_KEY`,
+request, change `TEST_KEY`, recreate/roll as designed, request again. Test
+both gateway placements. Dynamic routing: LiteLLM redacts credentials when listing, so do not
 read keys back; the route identity/fingerprint includes the env NAME (a
 changed reference forces replacement), never the value; a changed value
 triggers what the gateway needs to see it, without leaking it.
 
-### 35. [ ] Publication without a ledger mutation
+### 35. [ ] Publication without a ledger mutation (one transaction, 28.3)
 External-only access may change nothing in the ledger but still needs:
 check/incorporate the invocation catalog/profile, render gateway state,
 persist routes, apply under the publication lock with the pending /
@@ -1088,6 +1154,14 @@ access reach the same publication coordinator; no second ad-hoc gateway
 apply path; no private gateway writes from the CLI.
 
 ### 36. [ ] Access above leasing
+*Review:* split the front door's part from the endpoints': a typed
+`FrontDoorControl.connection_info()` (base URL, front-door credential,
+optional UI URL), plus the resolved endpoints / routes (with LiteLLM the
+request name is the alias), make an `AccessResult`; the untyped
+`backend.access(endpoints) -> dict` goes (renamed, not a second "access").
+Mixed access is one transaction (28.3); `access` waits for front-door
+readiness (28.6); failure semantics per 28.7.
+
 An access result: requested endpoints, base URL, credential info,
 alias -> request-model mapping, optional real lease, optional GPU
 reservation metadata (external-only: `lease=None`; mixed: one real lease
@@ -1106,6 +1180,9 @@ Access is a typed capability, not a `getattr(backend, 'access')` hook
 
 ### 37. [ ] Views: `external`
 Status, TUI and catalog views show external targets as `external`.
+*Review:* no pseudo-deployment rows: `leases` stays leases and
+deployments. Show external endpoints in an endpoint/routing section
+(`status`, the TUI's catalog or routes view, `catalog show`).
 
 ### 38. [ ] `FrontDoor` naming collision (cleanup C)
 If both the controller capability and the rendered artifact are still
@@ -1152,6 +1229,8 @@ state; direct remote vs stable front door. Full suite, `ty`, flake8, UX
 audits, the relevant real e2e.
 
 ## Non-goals
+Direct external access (a second access mode where the alias stops being
+the model name) is a possible later optimization, not campaign 2.
 Arbitrary providers; Anthropic/Bedrock/Azure schemas; direct multi-base-URL
 descriptors; health ownership or lifecycle of external services; fake
 leases; a service mesh; rewriting existing catalog entries. The first
