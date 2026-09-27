@@ -48,8 +48,16 @@ On acquire, under the publication lock:
    quiescence used to replace the catalogs wholesale too, but an external
    endpoint has no lease to keep it published, so only an explicit
    `routes prune` unpublishes.*
-5. Preview/admit/render using that exact candidate snapshot, then persist the
-   snapshot before committing the acquire's desired-state mutation.
+5. Preview/admit/render using that exact candidate snapshot, then commit the
+   snapshot in the same transaction as the lease and the publication marker.
+   *Amended 2026-09-27 (queue item 42):* the snapshot's catalogs are the
+   published endpoint set, so writing them is publishing. It used to be
+   written before the lease, and a ledger's first snapshot on its first
+   mutation of any kind; now a crash or a declined approval before the commit
+   publishes nothing. A first non-endpoint mutation (gc, release, evict)
+   commits settings with no catalogs, with its marker; `access` and a first
+   `apply` / `stack up` publish the invocation's endpoints through the same
+   approved single commit.
 
 Compatible catalog additions therefore support the common pattern of adding a
 new model while another model is already serving. A conflicting edit is a real

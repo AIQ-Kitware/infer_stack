@@ -183,16 +183,18 @@ def test_seed_publishes_an_external_endpoint_and_prune_unpublishes_it(tmp_path):
     plan = ctl.plan_route_seed([other])
     assert list(plan.added) == ['remote']
     ctl.commit_route_seed(plan)
-    assert _published(ledger) == ['local', 'remote']
+    # The seed publishes what it names; the invocation's own catalog is
+    # published by the operations that publish it (acquire, access, apply).
+    assert _published(ledger) == ['remote']
     view = {r.alias: r.origin for r in ctl.route_view()}
-    assert view == {'local': 'catalog', 'remote': 'external'}
+    assert view['remote'] == 'external'
 
     plan = ctl.plan_route_prune()                 # the invocation knows only 'local'
     assert plan.dropped == ['remote']
     dropped, _ = ctl.commit_route_prune(plan)
     assert dropped == ['remote']
-    assert _published(ledger) == ['local']
-    assert [r.alias for r in ctl.route_view()] == ['local']
+    assert _published(ledger) == []
+    assert 'remote' not in [r.alias for r in ctl.route_view()]
 
 
 def test_prune_keeps_what_a_live_deployment_serves(tmp_path):

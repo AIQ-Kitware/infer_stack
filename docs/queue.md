@@ -1355,7 +1355,15 @@ The architecture stands; these are places where the publication/profile
 transaction model had not caught up with published catalogs being real
 desired state. Items 42-45 must be fixed before campaign 2 is closed.
 
-### 42. [ ] The first profile, and a profile candidate, commit with publication intent
+### 42. [x] The first profile, and a profile candidate, commit with publication intent
+*Done 2026-09-27.* `_sync_profile` never writes; a fresh ledger renders from
+settings with no catalogs, committed by the first marker
+(`mark_publication_pending(profile=...)`) or network migration; an acquire
+commits its candidate inside `ledger.acquire` with the lease; access (and a
+first `apply` / `stack up`) through `publish_profile` after an approved
+preview. `gc`, `release`, `evict` never publish endpoints; `routes seed`
+publishes only what it names. Poison tests:
+`tests/test_publication_transaction.py` (8). ADR 0001 amended.
 `_sync_profile(create=True)` persists an absent profile at once, before
 preview, approval or marker. Since `profile.catalogs` is the published
 endpoint set, that publishes the invocation's endpoints outside the

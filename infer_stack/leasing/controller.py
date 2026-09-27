@@ -233,6 +233,9 @@ class Controller:
         # Recovery snapshot (see leasing/profile.py): this process's own
         # resolved settings, captured before the backend is switched to the
         # resolved copy, and the snapshot the backend currently renders from.
+        #: The first snapshot, rendered from but not yet written (see
+        #: :meth:`_sync_profile`).
+        self._fresh_profile: dict | None = None
         self._invocation_profile: dict | None = None
         self._applied_profile: dict | None = None
         self._profile_drift_warned = False
@@ -706,6 +709,7 @@ class Controller:
             self.ledger.migrate_network(
                 subnet=subnet, reset_addresses=reset,
                 approved_digest=self.backend.last_preview_digest,
+                profile=self._take_fresh_profile(),
             )
             return self._publish()
 
@@ -1139,7 +1143,11 @@ class Controller:
 
         stored = self.ledger.profile()
         invocation = self._invocation_profile
-        if stored is None or invocation is None or stored == invocation:
+        if invocation is None:
+            return None
+        if stored is None:
+            return dict(invocation)     # the first publication: all of it
+        if stored == invocation:
             return None
         if stored.get('backend') != invocation.get('backend'):
             raise ProfileMismatch(
@@ -1205,6 +1213,7 @@ class Controller:
         self._applied_profile = profile
 
     def _restore_stored_profile(self, stored: dict | None) -> None:
+        stored = stored if stored is not None else self._fresh_profile
         if stored is None:
             return
         self._use_profile_candidate(stored)
@@ -1214,9 +1223,13 @@ class Controller:
         """Make the backend render from the active recovery snapshot.
 
         With ``create`` (every mutation, under the lock), a ledger without a
-        snapshot gets this invocation's resolved settings frozen as the initial
-        one. Drift is reported once; acquire decides under the same lock whether
-        current user config can advance the snapshot. Backends without a render
+        snapshot renders from this invocation's settings with no published
+        endpoints (:attr:`_fresh_profile`). That is not written here: it
+        commits with the first publication marker (:meth:`_mark_pending`), and
+        an acquire or access commits the invocation's catalogs with its own
+        transaction, because writing ``catalogs`` is publishing them. Drift is
+        reported once; acquire decides under the same lock whether current
+        user config can advance the snapshot. Backends without a render
         profile (null, test fakes) are left alone.
         """
         from .._log import logger
@@ -1234,13 +1247,9 @@ class Controller:
         if self._invocation_profile is None:
             self._invocation_profile = render()
         if stored is None:
-            stored = self._invocation_profile
-            self.ledger.set_profile(stored)
-            logger.info(
-                'Froze the initial recovery snapshot ({} backend, {} catalog(s)); '
-                'normal acquire advances it automatically from current user config',
-                stored.get('backend'), len(stored.get('catalogs') or []),
-            )
+            # Settings only: endpoints are published by the operations that
+            # publish them, in their own transaction.
+            stored = self._fresh_profile = {**self._invocation_profile, 'catalogs': []}
         elif not self._profile_drift_warned:
             drift = profile_drift(stored, self._invocation_profile)
             if drift:
@@ -1275,7 +1284,20 @@ class Controller:
         current = self.ledger.publication_pending()
         if current and current.get('placement_context'):
             self.ledger.clear_placement_context()
-        return self.ledger.mark_publication_pending(apply_requested=apply)
+        return self.ledger.mark_publication_pending(
+            apply_requested=apply, profile=self._take_fresh_profile())
+
+    def _take_fresh_profile(self) -> dict | None:
+        """The first snapshot to commit with the next marker, or ``None``
+        when the ledger already has one."""
+        from .._log import logger
+
+        fresh, self._fresh_profile = self._fresh_profile, None
+        if fresh is None or self.ledger.profile() is not None:
+            return None
+        logger.info('Froze the initial recovery snapshot ({} backend); acquire and '
+                    'access publish endpoints into it', fresh.get('backend'))
+        return fresh
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
         """Apply the last render if the marker requests it; clear on success.
@@ -1422,9 +1444,18 @@ class Controller:
         Heals drift (re-ups a container that died out-of-band) and publishes
         anything pending, including leases staged with ``--no-apply``. It is
         also the explicit approval that clears an approved-digest mismatch.
+
+        On a ledger with no profile yet (``stack up`` on a fresh stack) it
+        publishes the invocation's endpoints first, through the same preview,
+        approval and single commit as ``access`` (:meth:`publish_endpoints`), so
+        catalog routes exist before any model runs and the first acquire does
+        not recreate the gateway. Other mutations (gc, release, evict) never
+        publish endpoints.
         """
         self._explicit_apply = True
         try:
+            if self.backend.recovery_profile is not None and self.ledger.profile() is None:
+                return self.publish_endpoints()
             return self.reconcile(apply=True)
         finally:
             self._explicit_apply = False
@@ -1758,8 +1789,14 @@ class Controller:
             except BaseException:
                 self._restore_stored_profile(stored)
                 raise
-            self.ledger.publish_profile(
-                candidate, approved_digest=self.backend.last_preview_digest)
+            try:
+                # Profile (the published endpoints) and approved marker at once.
+                self.ledger.publish_profile(
+                    candidate, approved_digest=self.backend.last_preview_digest)
+            except BaseException:
+                self._restore_stored_profile(stored)
+                raise
+            self._fresh_profile = None
             self._profile_error = None
             self._applied_profile = candidate
             return self._publish()
@@ -1816,8 +1853,6 @@ class Controller:
                         self._restore_stored_profile(stored_profile)
                     raise
                 if not reasons:
-                    if candidate_profile is not None:
-                        self._commit_profile_candidate(candidate_profile)
                     # Allocations are committed with the lease, so no placement
                     # scope needs recording for recovery.
                     self._mark_pending(apply=apply)
@@ -1828,9 +1863,18 @@ class Controller:
                             # Nothing is applied for --no-apply, so there is no
                             # approval to guard; staged state stays discardable.
                             approved_digest=self._admission_digest if apply else None,
+                            # The published endpoints commit with the lease.
+                            profile=candidate_profile,
                         )
                     except AdmissionConflict:
                         continue            # the ledger moved; preview again
+                    except BaseException:
+                        if candidate_profile is not None:
+                            self._restore_stored_profile(self.ledger.profile())
+                        raise
+                    if candidate_profile is not None:
+                        self._profile_error = None
+                        self._applied_profile = candidate_profile
                     try:
                         rec = self._render()
                     except ConvergeAborted:
@@ -1993,10 +2037,9 @@ class Controller:
         return self.backend.routes(desired, inputs)
 
     def _published_sources(self) -> list[dict]:
-        """The published catalog union's sources (the stored profile's, else
-        the ones this invocation would freeze)."""
-        profile = self.ledger.profile() or self.invocation_profile() or {}
-        return list(profile.get('catalogs') or [])
+        """The published catalog union's sources: the stored profile's, and
+        none before the first publication."""
+        return list((self.ledger.profile() or {}).get('catalogs') or [])
 
     def _meanings(self, union) -> dict:
         """``{alias: Meaning}`` for every endpoint of ``union``."""

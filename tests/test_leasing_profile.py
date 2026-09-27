@@ -92,7 +92,7 @@ def test_a_quiescent_acquire_publishes_its_catalog_beside_the_others(tmp_path):
     a = Catalog.from_dict(cat('alpha'))
     b = Catalog.from_dict(cat('beta'))
     ledger, ctl = controller(tmp_path, catalog=a)
-    ctl.gc()                                              # freezes {alpha}
+    ctl.apply_now()                                       # publishes {alpha}
     _, ctl2 = controller(tmp_path, catalog=b)
     out = ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
     assert out.lease.endpoints == ['beta']
@@ -137,7 +137,7 @@ def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path)
 def test_union_of_catalogs_serves_either_runbook(tmp_path):
     union = CatalogUnion.from_sources([cat('alpha'), cat('beta')])
     ledger, ctl = controller(tmp_path, catalog=union)
-    ctl.gc()
+    ctl.apply_now()
     # A runbook that only knows `beta` passes its own catalog: no drift, accepted.
     b = Catalog.from_dict(cat('beta'))
     _, ctl2 = controller(tmp_path, catalog=b)
@@ -647,7 +647,7 @@ def test_quiescence_adopts_new_settings_but_keeps_published_endpoints(tmp_path):
     a = Catalog.from_dict(cat('alpha'))
     b = Catalog.from_dict(cat('beta'))
     ledger, ctl = controller(tmp_path, catalog=a, ui=True)
-    ctl.gc()                                              # freezes ui=True, {alpha}
+    ctl.apply_now()                                       # freezes ui=True, {alpha}
     _, ctl2 = controller(tmp_path, catalog=b, ui=False)
     ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
     assert ledger.profile()['ui'] is False               # settings: the invocation's

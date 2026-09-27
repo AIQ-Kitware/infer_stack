@@ -31,6 +31,11 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   with no value.
 - A runbook whose catalog is already published no longer warns that its
   catalogs differ from the recovery snapshot.
+- Publishing endpoints is transactional: an acquire commits its catalogs
+  with its lease and publication marker, and a fresh ledger's first snapshot
+  is written with its first marker, never before. `gc`, `release` and
+  `evict` publish no endpoints on a fresh ledger; `acquire`, `access` and a
+  first `apply` / `stack up` do.
 - `infer-stack access NAME...` makes endpoints reachable whoever runs them:
   it leases the managed ones (as `acquire`), publishes external ones with no
   lease, waits for the front door, and writes the same env-file (with no

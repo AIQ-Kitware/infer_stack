@@ -238,10 +238,11 @@ class Ledger:
         self.store.publish_profile(profile, approved_digest=approved_digest)
 
     def migrate_network(self, *, subnet: str, reset_addresses: bool,
-                        approved_digest: str | None) -> None:
-        """Switch the stable-address subnet and mark it pending, at once."""
+                        approved_digest: str | None, profile: dict | None = None) -> None:
+        """Switch the stable-address subnet and mark it pending, at once
+        (with a first ``profile``, if there is none yet)."""
         self.store.migrate_network(subnet=subnet, reset_addresses=reset_addresses,
-                                   approved_digest=approved_digest)
+                                   approved_digest=approved_digest, profile=profile)
 
     def acquire(
         self,
@@ -252,6 +253,7 @@ class Ledger:
         overlay: AcquireOverlay | None = None,
         allocations: dict[str, list[int]] | None = None,
         approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> AcquireResult:
         """Create a lease and coalesce its endpoints onto deployment deployments.
 
@@ -262,6 +264,11 @@ class Ledger:
         committed as they are, together with ``allocations`` (deployment id ->
         GPUs), in one transaction. If the admission state changed since the
         preview, :class:`AdmissionConflict` is raised and nothing is written.
+
+        ``profile`` (the acquire's recovery-profile candidate, whose catalogs
+        are the published endpoint set) commits in the same transaction: the
+        endpoints it publishes are never durable without the lease and the
+        publication intent that go with them.
         """
         lease_id = self.id_factory('lease')
         deployment_ids: list[str] = []
@@ -290,6 +297,8 @@ class Ledger:
                 self.store.update_deployment_served(gid, served, now)
             for gid, gpus in (allocations or {}).items():
                 self.store.set_deployment_allocation(gid, gpus)
+            if profile is not None:
+                self.store._write_profile(profile)
             if approved_digest is not None:
                 # In the same transaction as the lease: the digest can never
                 # describe a candidate that was not committed.
@@ -509,11 +518,13 @@ class Ledger:
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
         placement_context: dict | None = None, approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> dict:
         """See :meth:`SqliteStore.mark_publication_pending`."""
         return self.store.mark_publication_pending(
             apply_requested=apply_requested, interrupted=interrupted,
             placement_context=placement_context, approved_digest=approved_digest,
+            profile=profile,
         )
 
     def clear_placement_context(self) -> None:

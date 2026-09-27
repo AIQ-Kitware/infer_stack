@@ -385,17 +385,25 @@ class SqliteStore:
 
     def set_profile(self, profile: dict) -> None:
         with self.transaction():
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                (json.dumps(profile, sort_keys=True),),
-            )
+            self._write_profile(profile)
+
+    def _write_profile(self, profile: dict) -> None:
+        """The profile upsert; the caller holds a :meth:`transaction`."""
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            (json.dumps(profile, sort_keys=True),),
+        )
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
         placement_context: dict | None = None, approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> dict:
         """Record that desired state is changing; return the marker written.
+
+        ``profile``, when given, is written in the same transaction (a first
+        recovery profile commits with the publication intent it belongs to).
 
         Both flags only ever turn on until the marker is cleared.
         ``interrupted`` records that an apply was killed mid-flight, so the
@@ -404,6 +412,8 @@ class SqliteStore:
         ``allowed_gpus``) replaces any stored one; ``None`` keeps it.
         """
         with self.transaction():
+            if profile is not None:
+                self._write_profile(profile)
             return self._write_marker(
                 apply_requested=apply_requested, interrupted=interrupted,
                 placement_context=placement_context, approved_digest=approved_digest,
@@ -455,15 +465,11 @@ class SqliteStore:
         in one transaction, so a crash cannot leave a published profile whose
         approval nothing records."""
         with self.transaction():
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                (json.dumps(profile, sort_keys=True),),
-            )
+            self._write_profile(profile)
             self._write_marker(apply_requested=True, approved_digest=approved_digest)
 
     def migrate_network(self, *, subnet: str, reset_addresses: bool,
-                        approved_digest: str | None) -> None:
+                        approved_digest: str | None, profile: dict | None = None) -> None:
         """Switch subnet, reset addresses and mark the change pending, atomically.
 
         A crash leaves either the old subnet with its address table, or the new
@@ -471,6 +477,8 @@ class SqliteStore:
         which could hand a service's address to another service.
         """
         with self.transaction():
+            if profile is not None:
+                self._write_profile(profile)
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('network_config', ?) "
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
