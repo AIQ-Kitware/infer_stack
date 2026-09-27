@@ -40,6 +40,7 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_mock import MockModalCLI
 from .commands_leasing import (
+    AccessCLI,
     AcquireCLI,
     ApplyCLI,
     CleanCLI,
@@ -129,6 +130,7 @@ class ManageCLI(kw.ModalCLI):
 
     # Leasing model (acquire/release/run + status)
     acquire = AcquireCLI  # stand up endpoints: lease + up + wait (--ttl for soft TTL)
+    access = AccessCLI  # reach endpoints, managed or external: lease only what runs here
     release = ReleaseCLI
     evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
     gc = GcCLI  # reclaim TTL-expired (leaked) leases + free their GPUs

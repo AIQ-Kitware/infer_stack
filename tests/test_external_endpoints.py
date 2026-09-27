@@ -7,6 +7,8 @@ or model entry, and it is reached through the front door like any other.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import yaml
 
@@ -377,3 +379,180 @@ def test_env_says_when_a_published_key_takes_effect(tmp_path, monkeypatch, capsy
     assert "remote send(s) $REMOTE_QWEN_KEY" in out and 'infer-stack apply' in out
     assert cl.EnvCLI.main(argv=['UNRELATED=1']) == 0
     assert 'apply' not in capsys.readouterr().out
+
+
+# -- items 35-36: access above leasing ------------------------------------------------
+
+
+def _keyed(tmp_path, cat, docker=None):
+    """A controller on a compose stack whose managed .env holds the remote key."""
+    from infer_stack.env_utils import write_env_file
+
+    ledger, ctl = _ctl(tmp_path, cat, docker)
+    write_env_file(ctl.backend.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+    return ledger, ctl
+
+
+def _demand(ledger):
+    leases, deployments = ledger.status()
+    return leases, deployments
+
+
+def test_external_only_access_publishes_a_route_and_takes_no_lease(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    ledger, ctl = _keyed(tmp_path, cat)
+    result = ctl.access('me', cat.resolve(['remote']))
+    assert result.lease is None and result.external == ['remote']
+    assert result.ready and result.front_door_ready is True
+    assert result.request_names == {'remote': 'remote'}
+    assert _demand(ledger) == ([], [])                        # zero ledger demand
+    assert ledger.publication_pending() is None
+    config = yaml.safe_load((ctl.backend.state_dir / 'litellm_config.yaml').read_text())
+    assert 'remote' in [e['model_name'] for e in config['model_list']]
+
+
+def test_a_mixed_bundle_leases_only_its_managed_member(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))       # bundle 'pair' = local + remote
+    ledger, ctl = _keyed(tmp_path, cat)
+    result = ctl.access('me', cat.resolve(['pair']))
+    assert result.endpoints == ['local', 'remote'] and result.external == ['remote']
+    assert result.lease is not None and result.lease.endpoints == ['local']
+    leases, deployments = _demand(ledger)
+    assert len(leases) == 1 and [sorted(d.served) for d in deployments] == [['local']]
+    ctl.release(result.lease.id)                          # releases only the real lease
+    assert {r.alias: r.origin for r in ctl.route_view()}['remote'] == 'external'
+
+
+def test_access_to_an_external_endpoint_needs_the_front_door_and_its_key(tmp_path):
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    _, ctl = _ctl(tmp_path, cat)
+    with pytest.raises(ProfileMismatch, match='infer-stack env REMOTE_QWEN_KEY='):
+        ctl.access('me', cat.resolve(['remote']))
+    _, lean = _ctl(tmp_path / 'lean', cat)
+    lean.backend.litellm = False
+    with pytest.raises(ProfileMismatch, match='LiteLLM front door'):
+        lean.access('me', cat.resolve(['remote']))
+
+
+def test_a_front_door_that_never_answers_releases_the_lease_access_took(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    ledger, ctl = _keyed(tmp_path, cat)
+    ctl.FRONT_DOOR_WAIT_S = 0.0
+    ctl.backend.gateway_accepts = lambda key, wait=0.0: None
+    result = ctl.access('me', cat.resolve(['pair']))
+    assert result.front_door_ready is False and not result.ready
+    leases, _ = ledger.status()
+    assert [le.state for le in leases] == ['released']
+
+
+def test_a_live_managed_endpoint_is_not_silently_redefined_external(tmp_path):
+    from infer_stack.leasing.profile import ProfileMismatch
+    from test_leasing_compose import FakeDocker
+
+    docker = FakeDocker()
+    managed = Catalog.from_dict(catalog())
+    ledger, ctl = _ctl(tmp_path, managed, docker)
+    held = ctl.acquire('me', managed.resolve_requests(['local']), wait=False)
+    moved = Catalog.from_dict({'endpoints': {'local': REMOTE}})
+    _, other = _keyed(tmp_path, moved, docker)
+    with pytest.raises(ProfileMismatch, match="'local'"):
+        other.access('me', moved.resolve(['local']))
+    ctl.release(held.lease.id)
+    ctl.evict()                                                  # the keep-warm one too
+    result = other.access('me', moved.resolve(['local']))       # unpinned: it moves
+    assert result.external == ['local'] and result.lease is None
+    back = Catalog.from_dict(catalog())                          # and back to managed
+    _, again = _ctl(tmp_path, back, docker)
+    out = again.access('me', back.resolve(['local']))
+    assert out.lease is not None and out.external == []
+
+
+def test_external_routes_come_back_from_durable_state(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    _, ctl = _keyed(tmp_path, cat)
+    ctl.access('me', cat.resolve(['remote']))
+    _, fresh = _ctl(tmp_path, None)                  # a new process, no catalog
+    routes = {r.alias: r for r in fresh.route_view()}
+    assert routes['remote'].api_base == 'http://box:8000/v1'
+
+
+def test_routes_list_shows_what_the_gateway_renders(tmp_path):
+    cat = Catalog.from_dict(catalog(remote=REMOTE))
+    _, ctl = _keyed(tmp_path, cat)
+    ctl.access('me', cat.resolve(['remote']))
+    config = yaml.safe_load((ctl.backend.state_dir / 'litellm_config.yaml').read_text())
+    assert [r.entry() for r in ctl.route_view()] == config['model_list']
+
+
+# -- the CLI: access, run, acquire ------------------------------------------------------
+
+
+@pytest.fixture
+def cli(tmp_path, monkeypatch):
+    """The CLI on a compose stack (fake docker, shared between commands)."""
+    from types import SimpleNamespace
+
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.env_utils import write_env_file
+    from test_leasing_compose import FakeDocker
+    from test_leasing_profile import backend
+
+    docker = FakeDocker()
+    cat_path = tmp_path / 'catalog.yaml'
+    cat_path.write_text(yaml.safe_dump(catalog(remote=REMOTE)))
+    state = tmp_path / 'state'
+
+    def make(config, *, interactive=False):
+        be = backend(state, catalog=Catalog.load(cat_path), docker=docker)
+        write_env_file(be.gateway._env_path, {'REMOTE_QWEN_KEY': 'sk-remote'})
+        return be
+
+    monkeypatch.setattr(cl, '_make_backend', make)
+    base = ['--ledger', str(tmp_path / 'ledger.db'), '--catalog', str(cat_path)]
+    return SimpleNamespace(cl=cl, base=base, tmp=tmp_path)
+
+
+def test_access_cli_writes_a_descriptor_without_a_fake_lease_id(cli, capsys):
+    envf = cli.tmp / 'remote.env'
+    assert cli.cl.AccessCLI.main(argv=['remote', *cli.base, '--env-file', str(envf)]) == 0
+    out = capsys.readouterr().out
+    assert 'no lease: every endpoint is external' in out
+    text = envf.read_text()
+    assert 'INFER_STACK_LEASE_ID' not in text
+    assert 'INFER_STACK_ENDPOINT_REMOTE=remote' in text and 'OPENAI_BASE_URL=' in text
+    with pytest.raises(SystemExit) as info:                     # nothing to release
+        cli.cl.ReleaseCLI.main(argv=[*cli.base[:2], '--env-file', str(envf)])
+    assert info.value.code == 0
+
+
+def test_access_cli_mixed_bundle_and_release_by_env_file(cli, capsys):
+    envf = cli.tmp / 'pair.env'
+    assert cli.cl.AccessCLI.main(argv=['pair', *cli.base, '--env-file', str(envf),
+                                       '--json']) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data['lease_id'] and data['external'] == ['remote']
+    assert set(data['descriptor']['endpoints']) == {'local', 'remote'}
+    assert f"INFER_STACK_LEASE_ID={data['lease_id']}" in envf.read_text()
+    cli.cl.ReleaseCLI.main(argv=[*cli.base[:2], '--env-file', str(envf)])
+
+
+def test_acquire_points_an_external_endpoint_at_access(cli):
+    with pytest.raises(SystemExit, match=r'does not require a lease; use `infer-stack access remote`'):
+        cli.cl.AcquireCLI.main(argv=['remote', *cli.base])
+
+
+@pytest.mark.parametrize('names', ['remote', 'pair'])
+def test_run_works_external_only_and_mixed(cli, names):
+    import sys
+
+    probe = ('import os,sys; sys.exit(0 if os.environ.get("INFER_STACK_ENDPOINT_REMOTE")'
+             ' == "remote" and os.environ.get("OPENAI_BASE_URL") else 3)')
+    rc = cli.cl.RunCLI.main(argv=[*cli.base, '--endpoint', names, '--', sys.executable, '-c', probe])
+    assert rc == 0
+    from infer_stack.leasing import Ledger, SqliteStore
+
+    leases, _ = Ledger(SqliteStore(cli.base[1])).status()
+    assert all(le.state == 'released' for le in leases)         # run released its lease
+    assert len(leases) == (1 if names == 'pair' else 0)

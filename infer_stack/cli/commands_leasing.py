@@ -452,12 +452,21 @@ def _resolve_lease(config, verb: str) -> str | None:
                 'what is held)')
         sid = read_lease_id(path)
         if not sid:
+            if verb == 'release':
+                # An access to external endpoints only holds nothing.
+                print(f'release: {path} names no lease (an access to external '
+                      'endpoints only); nothing to release')
+                raise SystemExit(0)
             raise SystemExit(f'{verb}: {path} names no lease ({LEASE_ENV})')
     return sid
 
 
-def _descriptor_for(controller, lease, deployments, config, *, assignments=None):
-    """Build the descriptor, preferring backend-supplied access (real base_url).
+def _descriptor_for(controller, lease, deployments, config, *, assignments=None,
+                    endpoints=None):
+    """Build the descriptor, preferring the backend's connection (real base_url).
+
+    ``endpoints`` (an access's aliases, external ones included) default to the
+    lease's; ``lease`` is ``None`` for an access to external endpoints only.
 
     For a GPU *reservation* the env-file's only useful payload is the reserved
     GPU index(es): fold the placement assignment into ``cuda_visible_devices`` so
@@ -467,14 +476,12 @@ def _descriptor_for(controller, lease, deployments, config, *, assignments=None)
     base_url = config.base_url
     api_key_env = config.api_key_env
     api_key = None
-    request_names = None
-    access = getattr(controller.backend, 'access', None)
-    info = access(list(lease.endpoints)) if access else None
-    if info:
-        base_url = info.get('base_url', base_url)
-        api_key_env = info.get('api_key_env', api_key_env)
-        api_key = info.get('api_key')
-        request_names = info.get('request_names')
+    wanted = list(endpoints if endpoints is not None else lease.endpoints)
+    info = controller.backend.connection_info()
+    if info is not None and info.base_url is not None:
+        # Otherwise (Open WebUI alone, or nothing) keep the configured defaults.
+        base_url, api_key_env, api_key = info.base_url, info.api_key_env, info.api_key
+    request_names = controller.backend.request_names(wanted) or None
     cuda_visible_devices = None
     if assignments:
         reserved_gpus: list[int] = []
@@ -491,6 +498,7 @@ def _descriptor_for(controller, lease, deployments, config, *, assignments=None)
         api_key=api_key,
         request_names=request_names,
         cuda_visible_devices=cuda_visible_devices,
+        endpoints=wanted,
     )
 
 
@@ -699,15 +707,72 @@ def _emit_acquire(config, controller, outcome) -> int:
                 print(f'    pending: {endpoint} ({gid})')
             for hint in _oom_hints(controller, outcome):
                 print(f'    {hint}')
-        access = getattr(controller.backend, 'access', None)
-        info = access(list(outcome.lease.endpoints)) if access else None
-        if info and info.get('ui_url'):
-            print(f'  open webui: {info["ui_url"]}')
-        if info and info.get('proxy_url'):
-            print(f'  front door: {info["proxy_url"]}  (UI: /   API: /v1)')
+        _print_front_door(controller.backend.connection_info())
         if config.env_file:
             print(f'  env-file: {config.env_file}')
     return 2 if not_ready else 0
+
+
+def _print_front_door(info) -> None:
+    """The UI and reverse-proxy lines of an acquire's or access's summary."""
+    if info is not None and info.ui_url:
+        print(f'  open webui: {info.ui_url}')
+    if info is not None and info.proxy_url:
+        print(f'  front door: {info.proxy_url}  (UI: /   API: /v1)')
+
+
+def _resolve_endpoints(catalog, names):
+    """``catalog.resolve(names)``: endpoint meanings, bundles expanded."""
+    try:
+        return catalog.resolve(names)
+    except CatalogError as ex:
+        raise SystemExit(str(ex))
+
+
+def _emit_access(config, controller, result) -> int:
+    """Output for ``access``: the descriptor, and what is held."""
+    outcome = result.acquire
+    released = (outcome is not None and outcome.released_on_timeout) or (
+        result.front_door_ready is False and result.lease is not None)
+    descriptor = _descriptor_for(
+        controller, result.lease, result.deployments, config,
+        endpoints=result.endpoints,
+        assignments=outcome.reconcile.assignments if outcome is not None else None)
+    if config.env_file and not released:
+        Path(config.env_file).expanduser().write_text(render_env_file(descriptor))
+    if config.json:
+        print(json.dumps({
+            'lease_id': result.lease.id if result.lease is not None else None,
+            'endpoints': result.endpoints,
+            'external': result.external,
+            'descriptor': _public_descriptor(descriptor),
+            'ready': result.ready,
+            'front_door_ready': result.front_door_ready,
+            'pending': [] if outcome is None or outcome.wait is None else outcome.wait.pending,
+            'failures': [] if outcome is None or outcome.wait is None else outcome.wait.failures,
+            'released': released,
+        }, indent=2))
+        return 0 if result.ready else 2
+    if result.front_door_ready is False:
+        print('the front door did not accept its key in time'
+              + (f'; lease {result.lease.id} released' if result.lease else ''))
+        return 2
+    if outcome is not None and outcome.released_on_timeout:
+        return _emit_acquire(config, controller, outcome)
+    held = (f'lease {result.lease.id} (owner={result.lease.owner})'
+            if result.lease is not None else 'no lease: every endpoint is external')
+    print(f'access {", ".join(result.endpoints)}: {held}')
+    for endpoint, model in descriptor['endpoints'].items():
+        tag = '  (external)' if endpoint in result.external else ''
+        print(f'  endpoint {endpoint} -> {model}{tag}')
+    print(f'  ready: {result.ready}')
+    if outcome is not None and outcome.wait is not None:
+        for gid, endpoint in outcome.wait.pending:
+            print(f'    pending: {endpoint} ({gid})')
+    _print_front_door(result.connection)
+    if config.env_file:
+        print(f'  env-file: {config.env_file}')
+    return 0 if result.ready else 2
 
 
 def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
@@ -994,6 +1059,76 @@ class AcquireCLI(_AcquireFlagsMixin):
             owner=config.owner or _default_owner(),
             ttl_seconds=_parse_duration(config.ttl),
         )
+
+
+class AccessCLI(_AcquireFlagsMixin):
+    """Make endpoints reachable and write how to reach them.
+
+    ``access NAME…`` is ``acquire`` for a workflow that does not care who
+    runs its models. A managed endpoint (a model infer-stack runs) is leased
+    and brought up exactly as ``acquire`` does; an external one (``external:``
+    in the catalog, a server that already runs elsewhere) is published on the
+    LiteLLM front door and needs no lease. Either way the client gets one base
+    URL and asks for the alias, so moving an endpoint between the two changes
+    neither. Mixed bundles take one lease, for the managed members only.
+
+    Write the descriptor with ``--env-file``; ``release --env-file`` releases
+    the lease, if there is one. (``run`` does all of this around a command.)
+    """
+
+    __command__ = 'access'
+    __epilog__ = """
+    Examples:
+        # an external endpoint: publish its route, no lease
+        infer-stack env REMOTE_QWEN_KEY=sk-...
+        infer-stack access remote-qwen --env-file qwen.env
+
+        # a bundle of a managed and an external endpoint: one lease
+        infer-stack access pair --env-file pair.env
+        infer-stack release --env-file pair.env
+    """
+
+    names = kw.Value(
+        [], nargs='*', position=1, type=str, help='Endpoint or bundle names.'
+    )
+    ttl = kw.Value(
+        None, type=str, help='Soft TTL of the lease, if one is taken (e.g. 2h).'
+    )
+    owner = kw.Value(None, type=str, help='Lease owner (default: $USER).')
+    dedicated = kw.Value(
+        False, isflag=True,
+        help='Force dedicated deployments for the managed members.',
+    )
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..leasing.backend import ConvergeAborted, PlacementError
+        from ..leasing.profile import ProfileMismatch
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not config.apply:
+            raise SystemExit('access: --no-apply stages a lease; use `acquire --no-apply`')
+        controller = _open_controller(config)
+        catalog = _requests_catalog(controller, config)
+        names = _collect_names(config.names)
+        if not names:
+            raise SystemExit('give at least one endpoint or bundle name')
+        endpoints = _resolve_endpoints(catalog, names)
+        try:
+            result = controller.access(
+                config.owner or _default_owner(), endpoints,
+                sharing=Sharing.DEDICATED if config.dedicated else None,
+                ttl_seconds=_parse_duration(config.ttl), wait=bool(config.wait),
+                timeout=float(config.timeout), interval=float(config.interval),
+                wait_for_placement=bool(config.queue))
+        except ConvergeAborted:
+            raise SystemExit('aborted: changes not applied (no lease kept)')
+        except ProfileMismatch as ex:
+            raise SystemExit(f'access: {ex}')
+        except PlacementError as ex:
+            raise SystemExit('could not place every requested endpoint (no lease '
+                             'kept):\n' + '\n'.join(f'  {r}' for r in ex.reasons))
+        return _emit_access(config, controller, result)
 
 
 class RenderCLI(_LeasingCommonMixin):
@@ -1866,10 +2001,12 @@ class RenewCLI(_LeasingCommonMixin):
 
 
 class RunCLI(_LeasingCommonMixin):
-    """Acquire endpoints, run a command with the endpoint env, then release.
+    """Access endpoints, run a command with the endpoint env, then release.
 
-    Everything after ``--`` is the command. The lease is always released on
-    exit; the TTL is the backstop if the process is hard-killed.
+    Everything after ``--`` is the command. Managed endpoints are leased
+    (``access``), external ones only published; the lease, if any, is always
+    released on exit, and the TTL is the backstop if the process is
+    hard-killed.
     """
 
     __command__ = 'run'
@@ -1910,11 +2047,11 @@ class RunCLI(_LeasingCommonMixin):
             raise SystemExit('run: --endpoint is required')
         if not command:
             raise SystemExit('run: give a command after --')
-        requests = _resolve(catalog, names)
+        endpoints = _resolve_endpoints(catalog, names)
         try:
-            outcome = controller.acquire(
+            result = controller.access(
                 config.owner or _default_owner(),
-                requests,
+                endpoints,
                 ttl_seconds=_parse_duration(config.ttl),
                 wait=True,
                 timeout=float(config.timeout),
@@ -1923,7 +2060,8 @@ class RunCLI(_LeasingCommonMixin):
             )
         except ProfileMismatch as ex:
             raise SystemExit(f'run: {ex}')
-        if outcome.wait is not None and not outcome.wait.ready:
+        outcome = result.acquire
+        if outcome is not None and outcome.wait is not None and not outcome.wait.ready:
             # The controller already released the lease on timeout
             # (released_on_timeout); just surface why we're not running.
             if outcome.wait.failures:
@@ -1935,8 +2073,11 @@ class RunCLI(_LeasingCommonMixin):
             raise SystemExit(
                 f'run: endpoints not ready: {outcome.wait.pending}'
             )
+        if result.front_door_ready is False:
+            raise SystemExit('run: the front door did not accept its key in time')
         descriptor = _descriptor_for(
-            controller, outcome.lease, outcome.deployments, config
+            controller, result.lease, result.deployments, config,
+            endpoints=result.endpoints,
         )
         env = dict(os.environ)
         env.update(descriptor_env(descriptor))
@@ -1944,7 +2085,8 @@ class RunCLI(_LeasingCommonMixin):
             proc = subprocess.run(command, env=env)
             return int(proc.returncode)
         finally:
-            controller.release(outcome.lease.id)
+            if result.lease is not None:
+                controller.release(result.lease.id)
 
 
 def _lease_ttl(le, now: float | None = None) -> str:

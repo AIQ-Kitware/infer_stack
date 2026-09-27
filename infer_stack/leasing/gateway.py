@@ -23,7 +23,7 @@ import yaml
 from ..config import PINNED_IMAGES
 from ..config import DEFAULT_PORTS
 from ..env_utils import ensure_secret, parse_env_file, write_env_file
-from .backend import ConvergeScaffold
+from .backend import ConnectionInfo, ConvergeScaffold
 from .endpoints import ExternalTarget
 from .models import Deployment, served_name
 from .naming import (
@@ -664,7 +664,7 @@ def set_master_key(env_path: Path, key: str) -> None:
 
 
 @dataclass
-class FrontDoor:
+class RenderedFrontDoor:
     """The rendered front door: its Compose services and config files."""
 
     services: dict[str, Any]
@@ -693,7 +693,7 @@ def render_front_door(
     dynamic_routing: bool,
     dynamic_routes: list[GatewayRoute] | None = None,
     ui_run_as: str | None = None,
-) -> FrontDoor:
+) -> RenderedFrontDoor:
     """Render the gateway, its database, Open WebUI and the reverse proxy.
 
     ``routes`` is the static route table (one per alias,
@@ -815,7 +815,7 @@ def render_front_door(
                 ).hexdigest()[:12],
             )
 
-    return FrontDoor(services=services, litellm_config=litellm_config,
+    return RenderedFrontDoor(services=services, litellm_config=litellm_config,
                      nginx_config=nginx_config, litellm_routes=litellm_routes)
 
 
@@ -1372,29 +1372,22 @@ class Gateway(ConvergeScaffold):
             return False
         return True
 
-    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
-        """Where a client reaches these endpoints, for the env-file descriptor.
+    def connection_info(self) -> ConnectionInfo | None:
+        """Where a client reaches the front door.
 
-        With the LiteLLM front door, that is one ``base_url`` and the request
-        model name is the endpoint alias itself. With LiteLLM off there is no
-        single base URL, but a managed Open WebUI (if on) is still a useful
-        access point, so report just its URL rather than ``None``.
+        With LiteLLM, one ``base_url``, the master key and its variable's
+        name. With LiteLLM off there is no single base URL, but a managed Open
+        WebUI (if on) is still a useful access point, so report just its URL
+        rather than ``None``.
         """
         base_url, ui_url = self.urls()
+        proxy_url = (f'http://127.0.0.1:{self.reverse_proxy_port}'
+                     if self.reverse_proxy and base_url is not None else None)
         if base_url is None:
-            return {'ui_url': ui_url} if ui_url else None
-        info: dict[str, Any] = {
-            'base_url': base_url,
-            'api_key_env': API_KEY_ENV,
-            'api_key': self.master_key(),
-            'request_names': {ep: ep for ep in endpoints},
-        }
-        if ui_url:
-            info['ui_url'] = ui_url
-        if self.reverse_proxy:
-            # The unified front door: one origin, UI at / and the API at /v1.
-            info['proxy_url'] = f'http://127.0.0.1:{self.reverse_proxy_port}'
-        return info
+            return ConnectionInfo(None, ui_url=ui_url) if ui_url else None
+        return ConnectionInfo(base_url, api_key_env=API_KEY_ENV,
+                              api_key=self.master_key(), ui_url=ui_url,
+                              proxy_url=proxy_url)
 
 
 def front_door_urls(backend) -> tuple[str | None, str | None]:

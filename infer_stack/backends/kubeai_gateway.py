@@ -154,8 +154,8 @@ class ClusterGateway(ConvergeScaffold):
     def gateway_accepts(self, key: str, *, wait: float = 0.0):
         return self.gateway.gateway_accepts(key, wait=wait)
 
-    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
-        return self.gateway.access(endpoints)
+    def connection_info(self):
+        return self.gateway.connection_info()
 
     def catalog_routes(self, catalog) -> list[GatewayRoute]:
         return []              # the kubeai backend supplies its own routes

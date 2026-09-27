@@ -7,6 +7,8 @@ on a k3s host (docs/kubeai-backend.md).
 
 from __future__ import annotations
 
+from test_leasing_compose import access_info
+
 import json
 from pathlib import Path
 
@@ -345,7 +347,7 @@ def test_probe_ready_completions_protocol(tmp_path):
 def test_access_maps_endpoints_to_model_names(tmp_path):
     be, _ = make_backend(tmp_path, base_url='http://10.0.0.5:8000/openai/v1/')
     be.converge([vllm('grp-a', served='qwen-32b')])
-    info = be.access(['grp-a'])
+    info = access_info(be, ['grp-a'])
     assert info['base_url'] == 'http://10.0.0.5:8000/openai/v1'
     assert info['api_key'] == 'EMPTY'          # unauthenticated gateway
     assert info['api_key_env'] is None
@@ -486,7 +488,7 @@ def test_corrupt_sidecar_degrades_gracefully(tmp_path):
     be, _ = make_backend(tmp_path)
     be.converge([vllm('grp-a', served='qwen')])
     be._state_file.write_text('{not json')
-    info = be.access(['grp-a'])
+    info = access_info(be, ['grp-a'])
     # falls back to the slug-of-endpoint guess rather than crashing
     assert info['request_names'] == {'grp-a': 'grp-a'}
     be.apply()  # and apply still works (prunes against an empty wanted-set...
@@ -641,7 +643,7 @@ def test_with_a_gateway_clients_use_the_alias_and_the_managed_key(tmp_path):
     dep = vllm('grp-a', served='Qwen/Qwen2.5-0.5B')
     dep.served = {'tiny': {'served_model_name': 'Qwen/Qwen2.5-0.5B', 'protocol': 'chat'}}
     be.converge([dep])
-    info = be.access(['tiny'])
+    info = access_info(be, ['tiny'])
     assert info['request_names'] == {'tiny': 'tiny'}        # the alias, as on compose
     assert info['base_url'].startswith('http://127.0.0.1:')
     assert info['api_key'] == be.gateway.master_key()
@@ -653,7 +655,7 @@ def test_without_a_gateway_clients_still_see_kubeai_directly(tmp_path):
     be, _ = make_backend(tmp_path)
     be.converge([vllm('grp-a', served='qwen-32b')])
     assert be.litellm is False
-    assert be.access(['grp-a'])['request_names'] == {'grp-a': 'qwen-32b'}
+    assert access_info(be, ['grp-a'])['request_names'] == {'grp-a': 'qwen-32b'}
 
 
 def test_rotating_the_key_recreates_the_gateway_in_front_of_the_cluster(tmp_path):
@@ -1063,7 +1065,7 @@ def test_the_in_cluster_gateway_routes_by_cluster_dns(tmp_path):
         'http://kubeai.kubeai.svc.cluster.local/openai/v1'
     assert kubectl.gateway_objects['Service']['spec']['type'] == 'NodePort'
     assert kubectl.rollouts == 1
-    assert be.access(['tiny'])['base_url'] == 'http://10.0.0.7:30442/v1'
+    assert access_info(be, ['tiny'])['base_url'] == 'http://10.0.0.7:30442/v1'
     assert be.compose_project() is None and be.front_door() is be.gateway
 
 

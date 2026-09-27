@@ -31,6 +31,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   with no value.
 - A runbook whose catalog is already published no longer warns that its
   catalogs differ from the recovery snapshot.
+- `infer-stack access NAME...` makes endpoints reachable whoever runs them:
+  it leases the managed ones (as `acquire`), publishes external ones with no
+  lease, waits for the front door, and writes the same env-file (with no
+  `INFER_STACK_LEASE_ID` when nothing is leased). `run` uses it, so a mixed
+  bundle takes one lease for its managed members. `acquire` of an external
+  endpoint points at `access`; `release --env-file` of a lease-less env-file
+  has nothing to release.
 
 ### Hardening from a review of the backend-parity work
 

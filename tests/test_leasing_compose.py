@@ -39,6 +39,19 @@ IMAGES = {
 PORTS = {'ollama': 11434}
 
 
+
+def access_info(be, endpoints):
+    """What a client is handed for ``endpoints`` (the descriptor's inputs), as
+    a dict: the backend's connection info and its request names."""
+    info = be.connection_info()
+    if info is None:
+        return None
+    out = {k: v for k, v in vars(info).items()
+           if v is not None or (k == 'api_key_env' and info.base_url is not None)}
+    if info.base_url is not None:
+        out['request_names'] = be.request_names(list(endpoints))
+    return out
+
 def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm',
          protocol='chat', t=0.0):
     # endpoint (public alias) is the deployment id; served_model_name is the upstream
@@ -637,7 +650,7 @@ def test_converge_writes_nginx_conf_and_access_reports_proxy(tmp_path):
     be.converge([vllm('a', served='aa')])
     assert (tmp_path / 'nginx.conf').exists()
     assert 'reverse-proxy' in yaml.safe_load(be.compose_file.read_text())['services']
-    info = be.access(['aa'])
+    info = access_info(be, ['aa'])
     assert info['proxy_url'] == 'http://127.0.0.1:8080'
 
 
@@ -1059,9 +1072,9 @@ def test_litellm_router_settings_present(tmp_path):
 
 def test_access_includes_ui_url_when_ui_on(tmp_path):
     be = make_backend(tmp_path, ui=True)
-    assert be.access(['a'])['ui_url'] == 'http://127.0.0.1:13000'
+    assert access_info(be, ['a'])['ui_url'] == 'http://127.0.0.1:13000'
     be_noui = make_backend(tmp_path, ui=False)
-    assert 'ui_url' not in be_noui.access(['a'])
+    assert 'ui_url' not in access_info(be_noui, ['a'])
 
 
 def test_converge_diff_decline_aborts(tmp_path, monkeypatch):
@@ -1196,7 +1209,7 @@ def test_controller_acquire_render_only_stages(tmp_path):
 
 def test_access_reports_litellm_base_url(tmp_path):
     be = make_backend(tmp_path)
-    info = be.access(['qwen-coder', 'reranker'])
+    info = access_info(be, ['qwen-coder', 'reranker'])
     assert info['base_url'] == 'http://127.0.0.1:14042/v1'
     assert info['api_key_env'] == 'LITELLM_MASTER_KEY'
     assert info['api_key'].startswith('sk-')      # infer-stack manages the key
@@ -1238,7 +1251,7 @@ def test_envfile_carries_managed_api_key(tmp_path):
     from infer_stack.leasing.models import Lease
 
     be = make_backend(tmp_path)
-    info = be.access(['qwen-coder'])
+    info = access_info(be, ['qwen-coder'])
     lease = Lease('sess-x', 'me', 'active', 0.0, None, None, 0.0,
                   endpoints=['qwen-coder'])
     g = Deployment('g', 'ck', 'vllm', 'shared-compatible', {}, {},
@@ -1255,13 +1268,13 @@ def test_envfile_carries_managed_api_key(tmp_path):
 def test_access_none_without_litellm(tmp_path):
     # No gateway and no UI -> no single access point.
     be = make_backend(tmp_path, litellm=False, ui=False)
-    assert be.access(['x']) is None
+    assert access_info(be, ['x']) is None
 
 
 def test_access_reports_ui_url_without_litellm(tmp_path):
     # No gateway but a managed UI -> the UI is still a useful access point.
     be = make_backend(tmp_path, litellm=False, ui=True)
-    info = be.access(['x'])
+    info = access_info(be, ['x'])
     assert info == {'ui_url': 'http://127.0.0.1:13000'}
 
 

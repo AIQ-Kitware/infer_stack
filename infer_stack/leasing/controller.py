@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
-from .backend import ApplyResult, HostRuntime, ServingBackend
+from .backend import ApplyResult, ConnectionInfo, HostRuntime, ServingBackend
 from .routes import RoutePlan
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
@@ -115,6 +115,46 @@ class AcquireOutcome:
     # True when the readiness wait timed out and the controller rolled the lease
     # back (released + reconciled) so a never-ready acquire doesn't pin a GPU.
     released_on_timeout: bool = False
+
+
+@dataclass
+class AccessResult:
+    """What a workload needs to reach its endpoints, and what it holds.
+
+    ``endpoints``: the aliases asked for, bundles expanded, in order;
+    ``external``: those an external server fulfils (no lease, no deployment);
+    ``request_names``: the ``model`` a client sends for each; ``connection``:
+    the base URL and credential (``None`` on an in-process backend); ``lease``:
+    the one real lease over the managed members, or ``None`` when every member
+    is external (the lease never lists an external name); ``acquire``: that
+    lease's outcome (readiness, placement). ``front_door_ready`` is ``False``
+    when an external member's front door never accepted its key in time; the
+    lease this access took is then already released.
+    """
+
+    endpoints: list[str]
+    external: list[str]
+    request_names: dict[str, str]
+    connection: ConnectionInfo | None
+    lease: Lease | None = None
+    acquire: AcquireOutcome | None = None
+    front_door_ready: bool | None = None
+
+    @property
+    def deployments(self) -> list[Deployment]:
+        return list(self.acquire.deployments) if self.acquire is not None else []
+
+    @property
+    def ready(self) -> bool:
+        """Every member can be asked now (managed ones generated through the
+        front door; external ones reachable through it)."""
+        if self.front_door_ready is False:
+            return False
+        if self.acquire is None:
+            return True
+        if self.acquire.released_on_timeout:
+            return False
+        return self.acquire.wait is None or bool(self.acquire.wait.ready)
 
 
 @dataclass
@@ -1613,6 +1653,116 @@ class Controller:
         )
         return self._finish_acquire(result, rec, apply=apply, wait=wait,
                                     timeout=timeout, interval=interval)
+
+    #: Seconds ``access`` waits for the front door to accept its key, when an
+    #: external member has nothing else to wait for.
+    FRONT_DOOR_WAIT_S = 120.0
+
+    def access(
+        self,
+        owner: str,
+        endpoints: list,
+        *,
+        sharing: str | None = None,
+        ttl_seconds: float | None = None,
+        wait: bool = True,
+        timeout: float = 300.0,
+        interval: float = 2.0,
+        wait_for_placement: bool = False,
+    ) -> AccessResult:
+        """Make ``endpoints`` reachable: lease the managed ones, publish all.
+
+        ``endpoints`` are :class:`~infer_stack.leasing.endpoints.
+        ResolvedEndpoint` s (``catalog.resolve(names)``). The managed members
+        take one lease through :meth:`acquire`, whose transaction also
+        publishes the invocation's catalogs, external definitions included
+        (docs/planning/external-endpoints.md, decision 3). With no managed
+        member there is no ledger mutation: :meth:`publish_endpoints` runs the
+        same preview, approval and publication without one. External members
+        need the LiteLLM front door, a value for their key, and a front door
+        that accepts its key (decision 6); nothing is sent to the external
+        server. If the front door never answers, the lease this call took is
+        released and ``front_door_ready`` is ``False``.
+        """
+        from .endpoints import ExternalTarget
+        from .profile import ProfileMismatch
+
+        aliases = [e.alias for e in endpoints]
+        external = [e for e in endpoints if not e.managed]
+        front = self.backend.front_door() if external else None
+        if external:
+            if front is None or not front.litellm:
+                raise ProfileMismatch(
+                    f'{", ".join(repr(e.alias) for e in external)} '
+                    f'{"is" if len(external) == 1 else "are"} served by an external '
+                    'server, reached only through the LiteLLM front door; this '
+                    'backend has none (turn `litellm` on)')
+            missing = front.gateway.missing_keys(sorted({
+                e.target.api_key_env for e in external
+                if isinstance(e.target, ExternalTarget) and e.target.api_key_env}))
+            if missing:
+                raise ProfileMismatch(
+                    f'${missing[0]} has no value in {front.gateway._env_path}; set it '
+                    f'first: `infer-stack env {missing[0]}=...`')
+        managed = [e.to_request(sharing_override=sharing) for e in endpoints if e.managed]
+        outcome = None
+        if managed:
+            outcome = self.acquire(
+                owner, managed, ttl_seconds=ttl_seconds, wait=wait, timeout=timeout,
+                interval=interval, wait_for_placement=wait_for_placement)
+        else:
+            self.publish_endpoints()
+        result = AccessResult(
+            endpoints=aliases, external=[e.alias for e in external],
+            request_names=self.backend.request_names(aliases),
+            connection=self.backend.connection_info(),
+            lease=outcome.lease if outcome is not None else None, acquire=outcome)
+        if front is not None and wait and not (outcome and outcome.released_on_timeout):
+            accepted = front.gateway_accepts(
+                front.master_key(), wait=min(timeout, self.FRONT_DOOR_WAIT_S))
+            result.front_door_ready = accepted is True
+            if not result.front_door_ready and outcome is not None:
+                self.release(outcome.lease.id)
+        return result
+
+    def publish_endpoints(self) -> ReconcileResult:
+        """Publish the invocation's endpoint definitions with no lease.
+
+        The same transaction an acquire runs, minus the ledger mutation:
+        under the lock, derive the profile candidate (the invocation's
+        catalogs merged into the published union), preview its render with
+        approval, then store it with the approved digest and publish. When the
+        union already has them it still publishes: the front door may be down
+        (a fresh stack, or after ``stack down``), and an unchanged render
+        applies as a no-op.
+        """
+        from .residency import ResidencyUnknown
+
+        recovery = self.backend.recovery_profile
+        with self._global_lock():
+            self._sync_profile(create=True)
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            candidate = self._acquire_profile_candidate(residency=residency)
+            if candidate is None or recovery is None:
+                self._mark_pending(apply=True)
+                return self._publish()
+            stored = self.ledger.profile()
+            self._use_profile_candidate(candidate)
+            try:
+                self._prepare_network(self.backend.host_runtime)
+                desired, inputs = self._admission_view(residency, virtual_expiry=True)
+                self.backend.preview(desired, inputs, approve=True)
+            except BaseException:
+                self._restore_stored_profile(stored)
+                raise
+            self.ledger.publish_profile(
+                candidate, approved_digest=self.backend.last_preview_digest)
+            self._profile_error = None
+            self._applied_profile = candidate
+            return self._publish()
 
     def _acquire_by_admission(
         self, owner, requests, *, ttl_seconds, apply, wait_for_placement,

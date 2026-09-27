@@ -10,6 +10,8 @@ backend's own tests.
 
 from __future__ import annotations
 
+from test_leasing_compose import access_info
+
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -223,7 +225,7 @@ def make_stack(request, tmp_path):
 def test_one_base_url_the_managed_key_and_the_alias(make_stack):
     stack = make_stack()
     stack.acquire('one')
-    info = stack.backend.access(['one'])
+    info = access_info(stack.backend, ['one'])
     assert info['base_url'].startswith('http://127.0.0.1:')
     assert info['api_key'] == stack.front.master_key()
     assert info['request_names'] == {'one': 'one'}

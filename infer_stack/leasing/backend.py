@@ -184,7 +184,7 @@ class HostRuntime(Protocol):
         ...
 
 
-class FrontDoor(Protocol):
+class FrontDoorControl(Protocol):
     """The LiteLLM gateway as the controller and the CLI address it.
 
     ``backend.front_door()`` returns one, or ``None`` for a backend without a
@@ -210,6 +210,29 @@ class FrontDoor(Protocol):
 
     def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
         ...
+
+    def connection_info(self) -> ConnectionInfo | None:
+        """Where a client reaches this front door; ``None`` when nothing does."""
+        ...
+
+
+@dataclass(frozen=True)
+class ConnectionInfo:
+    """Where a client reaches the endpoints: a base URL and its credential.
+
+    Through the LiteLLM front door, one ``base_url`` for every alias and the
+    managed master key (``api_key``, read from ``api_key_env``); without one,
+    whatever the backend's own server offers (KubeAI's, keyless:
+    ``api_key='EMPTY'``). ``ui_url`` / ``proxy_url`` are Open WebUI and the
+    single-port reverse proxy, when on. The request name per endpoint is the
+    backend's (:meth:`ServingBackend.request_names`), not the front door's.
+    """
+
+    base_url: str | None
+    api_key_env: str | None = None
+    api_key: str | None = None
+    ui_url: str | None = None
+    proxy_url: str | None = None
 
 
 class RecoveryProfile(Protocol):
@@ -335,7 +358,7 @@ class ServingBackend(Protocol):
         residents that yielded their GPUs). Empty where nothing is placed."""
         ...
 
-    def front_door(self) -> FrontDoor | None:
+    def front_door(self) -> FrontDoorControl | None:
         """What holds the LiteLLM gateway (its keys and routes), or
         ``None`` for a backend without one."""
         ...
@@ -343,6 +366,18 @@ class ServingBackend(Protocol):
     def routes(self, desired: list[Deployment], placement: Any = None
                ) -> list[GatewayRoute]:
         """The gateway routes a render of ``desired`` produces."""
+        ...
+
+    def connection_info(self) -> ConnectionInfo | None:
+        """Where a client reaches this backend's endpoints, or ``None``
+        (an in-process backend serves nothing)."""
+        ...
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        """The ``model`` a client sends for each of ``endpoints``, for those
+        this backend decides (the alias itself behind a LiteLLM front door; a
+        KubeAI Model's name without one). Others fall back to the deployment's
+        served name."""
         ...
 
     def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
@@ -568,12 +603,18 @@ class SimpleAdmission:
         """One scheduling domain in-process: any idle deployment frees room."""
         return [g.id for g in idle]
 
-    def front_door(self) -> FrontDoor | None:
+    def front_door(self) -> FrontDoorControl | None:
         return None                     # no gateway in-process
 
     def routes(self, desired: list[Deployment], placement: Any = None
                ) -> list[GatewayRoute]:
         return []
+
+    def connection_info(self) -> ConnectionInfo | None:
+        return None
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        return {}
 
     def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
         return []
@@ -784,10 +825,10 @@ def _conforms() -> None:  # pragma: no cover - read by the type checker only
     def host(backend: ComposeBackend) -> HostRuntime:
         return backend
 
-    def compose_front(backend: ComposeBackend) -> FrontDoor:
+    def compose_front(backend: ComposeBackend) -> FrontDoorControl:
         return backend
 
-    def cluster_front(backend: ClusterGateway) -> FrontDoor:
+    def cluster_front(backend: ClusterGateway) -> FrontDoorControl:
         return backend
 
     def compose_profile(backend: ComposeBackend) -> RecoveryProfile:

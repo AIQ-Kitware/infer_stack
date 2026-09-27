@@ -1301,9 +1301,13 @@ class ComposeBackend(ConvergeScaffold):
     def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
         return self.gateway.gateway_accepts(key, wait=wait)
 
-    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
+    def connection_info(self):
         """Where a client reaches these endpoints: the front door."""
-        return self.gateway.access(endpoints)
+        return self.gateway.connection_info()
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        """Behind LiteLLM a client sends the alias; without it, the served name."""
+        return {ep: ep for ep in endpoints} if self.litellm else {}
 
     @property
     def _state_file(self) -> Path:

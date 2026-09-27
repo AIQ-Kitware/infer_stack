@@ -1217,26 +1217,23 @@ class KubeaiBackend(ConvergeScaffold):
         return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason,
                          needs_room=bool(self._capacity_shortage(deployment)))
 
-    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
-        """Where a client reaches these endpoints (env-file descriptor).
+    def connection_info(self):
+        """Where a client reaches these endpoints: the gateway's front door, or
+        without one KubeAI's own OpenAI server, which is unauthenticated (the
+        api key is the literal ``EMPTY`` placeholder, and no key variable)."""
+        from ..leasing.backend import ConnectionInfo
 
-        One gateway ``base_url`` for everything; the request name is the Model
-        CR name (from the render sidecar), not the endpoint alias — KubeAI has
-        no alias layer. The gateway is unauthenticated, so the api key is the
-        literal ``EMPTY`` placeholder and no key env var is advertised.
-        """
         if self.gateway is not None:
-            return self.gateway.access(endpoints)
+            return self.gateway.connection_info()
+        return ConnectionInfo(self.base_url, api_key_env=None, api_key='EMPTY')
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        """The alias behind the gateway; without it the Model CR name (from the
+        render sidecar): KubeAI has no alias layer."""
+        if self.gateway is not None:
+            return {ep: ep for ep in endpoints}
         request_names = self._load_sidecar().get('request_names') or {}
-        return {
-            'base_url': self.base_url,
-            'api_key_env': None,
-            'api_key': 'EMPTY',
-            'request_names': {
-                ep: request_names.get(ep, model_name_for(ep))
-                for ep in endpoints
-            },
-        }
+        return {ep: request_names.get(ep, model_name_for(ep)) for ep in endpoints}
 
     #: No containers of this host to manage: the cluster owns network and pods.
     host_runtime = None

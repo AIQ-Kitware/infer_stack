@@ -1220,7 +1220,12 @@ read keys back; the route identity/fingerprint includes the env NAME (a
 changed reference forces replacement), never the value; a changed value
 triggers what the gateway needs to see it, without leaking it.
 
-### 35. [ ] Publication without a ledger mutation (one transaction, 28.3)
+### 35. [x] Publication without a ledger mutation (one transaction, 28.3)
+*Done 2026-09-27.* `Controller.publish_endpoints`: under the lock, the
+profile candidate (invocation catalogs merged into the union), a preview
+with approval, `ledger.publish_profile` (profile + approved marker at once),
+`_publish`. Mixed access is `acquire`, whose transaction already carries the
+candidate. No CLI writes gateway state.
 External-only access may change nothing in the ledger but still needs:
 check/incorporate the invocation catalog/profile, render gateway state,
 persist routes, apply under the publication lock with the pending /
@@ -1228,7 +1233,16 @@ approved-render machinery. Factor it so managed acquire and external-only
 access reach the same publication coordinator; no second ad-hoc gateway
 apply path; no private gateway writes from the CLI.
 
-### 36. [ ] Access above leasing
+### 36. [x] Access above leasing
+*Done 2026-09-27.* `ConnectionInfo` + `backend.connection_info()` /
+`request_names()` (typed, in the protocol) replace the `access` hook;
+`Controller.access` -> `AccessResult` (endpoints, external, request names,
+connection, lease or `None`, the acquire's outcome, front-door readiness);
+a front door that never accepts its key releases the lease the call took.
+`infer-stack access NAMES [--env-file]`; `run` uses it; the descriptor
+omits `INFER_STACK_LEASE_ID` without a lease; `release --env-file` of such
+a file says there is nothing to release (exit 0); `acquire` of an external
+endpoint points at `access`.
 *Review:* split the front door's part from the endpoints': a typed
 `FrontDoorControl.connection_info()` (base URL, front-door credential,
 optional UI URL), plus the resolved endpoints / routes (with LiteLLM the
@@ -1259,7 +1273,9 @@ Status, TUI and catalog views show external targets as `external`.
 deployments. Show external endpoints in an endpoint/routing section
 (`status`, the TUI's catalog or routes view, `catalog show`).
 
-### 38. [ ] `FrontDoor` naming collision (cleanup C)
+### 38. [x] `FrontDoor` naming collision (cleanup C)
+*Done 2026-09-27:* `FrontDoorControl` (the capability, now with
+`connection_info`) and `RenderedFrontDoor` (the render).
 If both the controller capability and the rendered artifact are still
 called `FrontDoor`, rename (e.g. `FrontDoorControl`, `RenderedFrontDoor`).
 

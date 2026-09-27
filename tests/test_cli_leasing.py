@@ -820,13 +820,12 @@ def test_acquire_json_redacts_api_key(env, capsys, monkeypatch):
     from infer_stack.cli import commands_leasing as cl
     from infer_stack.leasing import MemoryBackend
 
+    from infer_stack.leasing.backend import ConnectionInfo
+
     class KeyedBackend(MemoryBackend):
-        def access(self, endpoints):
-            return {
-                'base_url': 'http://x:1/v1',
-                'api_key_env': 'LITELLM_MASTER_KEY',
-                'api_key': 'sk-secret123',
-            }
+        def connection_info(self):
+            return ConnectionInfo('http://x:1/v1', api_key_env='LITELLM_MASTER_KEY',
+                                  api_key='sk-secret123')
 
     monkeypatch.setattr(
         cl, '_make_backend',
@@ -1176,9 +1175,14 @@ def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
         ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
     with pytest.raises(SystemExit, match='renew: no env-file at'):
         RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
+    # An env-file with no lease (an access to external endpoints only): there
+    # is nothing to release, and that is not an error.
     (tmp_path / 'lease.env').write_text('export OPENAI_BASE_URL=x\n')
-    with pytest.raises(SystemExit, match='names no lease'):
+    with pytest.raises(SystemExit) as info:
         ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+    assert info.value.code == 0
+    with pytest.raises(SystemExit, match='names no lease'):
+        RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
 
 
 def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monkeypatch, capsys):
