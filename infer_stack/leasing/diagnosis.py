@@ -9,7 +9,7 @@ error path behave the same on every backend.
 
 from __future__ import annotations
 
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 #: Restarts after which the runtime's own bookkeeping says an engine is
 #: looping, not loading. Two is already conclusive: a model that loads does not exit.
@@ -108,8 +108,30 @@ def _crashed(instance) -> bool:
     return exited_for_good or instance.restart_count >= 1
 
 
+def _unit_verdict(instance, logs: str, replicas: int = 1) -> str | None:
+    """Why this one unit can never start, from its own log, or ``None``."""
+    exited_for_good = (instance.state in {'exited', 'dead'}
+                       and (instance.exit_code or 0) != 0)
+    verdict = classify_engine_log(logs)
+    if verdict == 'transient' and instance.will_be_restarted:
+        return None                      # a retry is coming, and may work
+    if verdict == 'transient':
+        return (f'engine is not starting (exited with code '
+                f'{instance.exit_code} and will not be restarted)'
+                f'{_engine_error_summary(logs)}')
+    looping = instance.restart_count >= CRASH_LOOP_RESTARTS
+    if verdict != 'fatal' and not (exited_for_good or looping):
+        return None                      # unrecognised: keep the restart budget
+    why = (f'restarted {instance.restart_count} time(s)' if instance.restart_count
+           else f'exited with code {instance.exit_code}')
+    if replicas > 1:
+        why += f', all {replicas} replicas'
+    return f'engine is not starting ({why}){_engine_error_summary(logs)}'
+
+
 def diagnose_startup(instances: Sequence, read_logs: Callable[[], str], *,
-                     replicated: bool = False) -> str | None:
+                     replicated: bool = False,
+                     unit_logs: Callable[[Any], str] | None = None) -> str | None:
     """Diagnose an engine that cannot start, or ``None`` if it may still load.
 
     A restart policy makes an engine that exits immediately restart forever,
@@ -129,43 +151,43 @@ def diagnose_startup(instances: Sequence, read_logs: Callable[[], str], *,
     ``instances`` are the deployment's units. Without ``replicated`` (Docker)
     there must be exactly one: none is "not created yet", several are a
     conflict, and both say nothing. With it (a Kubernetes Model's replicas,
-    :attr:`Residency.replicated`) the set is diagnosed as one: fatal only
-    when every unit has crashed, since one unit still up or loading may
-    serve; the budget is the least-restarted unit's. The returned string
-    carries the engine's last words, because the cause is in its log and
-    nowhere else.
+    :attr:`Residency.replicated`) the set is fatal only when EVERY replica is,
+    each judged from its own log (``unit_logs``): one still up, loading, or
+    failing transiently with a retry to come may yet serve. Without per-unit
+    logs a replica set is never declared fatal, since a combined log cannot
+    tell whose error is whose. The returned string carries the engine's last
+    words, because the cause is in its log and nowhere else.
 
     >>> from infer_stack.leasing.residency import Container
-    >>> crash = 'error: unrecognized arguments: --nope'
-    >>> bad = Container('p1', 'grp', 'restarting', restart_count=1, exit_code=1)
-    >>> up = Container('p2', 'grp', 'running')
-    >>> diagnose_startup([bad, bad], lambda: crash, replicated=True)[:25]
+    >>> fatal = 'error: unrecognized arguments: --nope'
+    >>> hub = 'requests.exceptions.ConnectionError: Max retries exceeded'
+    >>> a = Container('p1', 'grp', 'restarting', restart_count=1, exit_code=1,
+    ...               restart_policy='always')
+    >>> b = Container('p2', 'grp', 'restarting', restart_count=1, exit_code=1,
+    ...               restart_policy='always')
+    >>> up = Container('p3', 'grp', 'running')
+    >>> logs = {'p1': fatal, 'p2': fatal, 'p3': ''}
+    >>> diagnose_startup([a, b], lambda: '', replicated=True,
+    ...                  unit_logs=lambda u: logs[u.container_id])[:25]
     'engine is not starting (r'
-    >>> diagnose_startup([bad, up], lambda: crash, replicated=True) is None
+    >>> logs['p2'] = hub                     # one replica may still recover
+    >>> diagnose_startup([a, b], lambda: '', replicated=True,
+    ...                  unit_logs=lambda u: logs[u.container_id]) is None
     True
-    >>> diagnose_startup([bad, bad], lambda: crash) is None     # a Docker conflict
+    >>> diagnose_startup([a, up], lambda: fatal, replicated=True) is None
+    True
+    >>> diagnose_startup([a, b], lambda: fatal) is None     # a Docker conflict
     True
     """
     if not instances or (len(instances) > 1 and not replicated):
         return None                      # not created yet, or conflicting units
     if not all(_crashed(i) for i in instances):
         return None                      # something is created, starting, or healthy
-    instance = min(instances, key=lambda i: i.restart_count)
-    exited_for_good = (instance.state in {'exited', 'dead'}
-                       and (instance.exit_code or 0) != 0)
-    logs = read_logs()
-    verdict = classify_engine_log(logs)
-    if verdict == 'transient' and any(i.will_be_restarted for i in instances):
-        return None                      # a retry is coming, and may work
-    if verdict == 'transient':
-        return (f'engine is not starting (exited with code '
-                f'{instance.exit_code} and will not be restarted)'
-                f'{_engine_error_summary(logs)}')
-    looping = instance.restart_count >= CRASH_LOOP_RESTARTS
-    if verdict != 'fatal' and not (exited_for_good or looping):
-        return None                      # unrecognised: keep the restart budget
-    why = (f'restarted {instance.restart_count} time(s)' if instance.restart_count
-           else f'exited with code {instance.exit_code}')
-    if len(instances) > 1:
-        why += f', all {len(instances)} replicas'
-    return f'engine is not starting ({why}){_engine_error_summary(logs)}'
+    if len(instances) == 1:
+        return _unit_verdict(instances[0], read_logs())
+    if unit_logs is None:
+        return None                      # whose error is whose cannot be told
+    verdicts = [_unit_verdict(i, unit_logs(i), len(instances)) for i in instances]
+    if not all(verdicts):
+        return None                      # some replica may still come up
+    return verdicts[0]

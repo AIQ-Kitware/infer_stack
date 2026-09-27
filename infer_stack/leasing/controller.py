@@ -735,10 +735,13 @@ class Controller:
         * ``unresolved``: LIVE from before allocations, with no unique container;
         * ``reclaimed``: idle under ``stop``, and its container is gone, as
           intended (see :meth:`keeps_up`);
-        * ``running`` / ``not-running``: whether its single container serves.
+        * ``restarting``: resident, but every unit is crash-looping;
+        * ``running`` / ``not-running``: whether it is resident (any replica
+          warm), from :func:`~infer_stack.leasing.residency.deployment_health`
+          for whether it serves.
         """
         from .profile import profile_drift
-        from .residency import ResidencyUnknown
+        from .residency import ResidencyUnknown, deployment_health
 
         leases, deployments = self.ledger.status(virtual_expiry=True)
         try:
@@ -770,7 +773,9 @@ class Controller:
                   and residency.unique_unit(g.id) is None):
                 condition = 'unresolved'
             elif residency is not None and residency.is_resident(g.id):
-                condition = 'running'
+                condition = ('restarting'
+                             if deployment_health(residency, g.id) == 'restarting'
+                             else 'running')
             elif residency is not None:
                 condition = 'not-running' if self.keeps_up(g) else 'reclaimed'
             else:

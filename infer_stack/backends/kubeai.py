@@ -1042,15 +1042,18 @@ class KubeaiBackend(ConvergeScaffold):
             pods = self.residency().units(deployment.id)
         except ResidencyUnknown:
             return ''
+        return '\n'.join(t for t in (self._pod_logs(pod, tail) for pod in pods) if t)
+
+    def _pod_logs(self, pod, tail: int = 400) -> str:
+        """One pod's log: its current run, then its previous one (fail-open)."""
         parts: list[str] = []
-        for pod in pods:
-            runs = [[]] + ([['--previous']] if pod.restart_count else [])
-            for extra in runs:
-                try:
-                    parts.append(self._kubectl(['logs', pod.container_id, '--tail',
-                                                str(tail), *extra]))
-                except Exception:  # noqa: BLE001 - gone, or no previous run
-                    pass
+        runs = [[]] + ([['--previous']] if pod.restart_count else [])
+        for extra in runs:
+            try:
+                parts.append(self._kubectl(['logs', pod.container_id, '--tail',
+                                            str(tail), *extra]))
+            except Exception:  # noqa: BLE001 - gone, or no previous run
+                pass
         return '\n'.join(p for p in parts if p)
 
     def startup_failure(self, deployment: Deployment) -> str | None:
@@ -1064,7 +1067,8 @@ class KubeaiBackend(ConvergeScaffold):
             return None                      # cannot read the cluster: say nothing
         return diagnose_startup(residency.units(deployment.id),
                                 lambda: self.deployment_logs(deployment, tail=200),
-                                replicated=residency.replicated)
+                                replicated=residency.replicated,
+                                unit_logs=lambda pod: self._pod_logs(pod, 200))
 
     def _capacity_shortage(self, deployment: Deployment) -> set[str]:
         """Resources the scheduler says this Model's pending pods lack."""

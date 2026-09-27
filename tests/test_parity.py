@@ -573,10 +573,15 @@ def test_two_compose_containers_for_one_deployment_still_fail_closed(tmp_path):
 def test_every_replica_crash_looping_fails_fast_and_one_healthy_does_not(tmp_path):
     stack, out, gid = _replicated(tmp_path)
     deployment = stack.ctl.ledger.get_deployment(gid)
-    stack.backend.deployment_logs = lambda deployment, tail=400: CRASH_LOG
+    logs = {}
+    stack.backend._pod_logs = lambda pod, tail=400: logs.get(pod.container_id, '')
     stack.runtime.crash_one.add(gid)                   # one replica still serves
+    logs['model-pair-0'] = CRASH_LOG
     assert stack.backend.startup_failure(deployment) is None
-    stack.runtime.crash[gid] = CRASH_LOG               # now every replica loops
+    stack.runtime.crash[gid] = CRASH_LOG               # now every replica loops...
+    logs['model-pair-1'] = 'ConnectionError: Max retries exceeded'   # ...one transiently
+    assert stack.backend.startup_failure(deployment) is None
+    logs['model-pair-1'] = CRASH_LOG                   # both fatal: fail fast
     why = stack.backend.startup_failure(deployment)
     assert why and 'all 2 replicas' in why and 'trust_remote_code' in why
 
@@ -702,3 +707,22 @@ def test_kubeai_settles_its_host_gateway_after_an_interrupted_apply(tmp_path):
     stack.front.settle_snapshot = lambda: (('c1', 'running'),)   # settled
     stack.ctl.apply_now()
     assert stack.ctl.ledger.publication_pending() is None
+
+
+def test_status_reports_serving_not_residency_for_replicas(tmp_path):
+    """Re-review 6: crash-looping units are resident (they hold resources) but
+    do not serve. Status must say so, and `leases` health must flag it."""
+    from infer_stack.cli.commands_runtime import _served_models
+
+    stack, out, gid = _replicated(tmp_path)
+
+    def health():
+        _, deployments = stack.ctl.ledger.status()
+        return [row[3] for row in _served_models(deployments, stack.backend)]
+
+    stack.runtime.crash_one.add(gid)                   # one healthy replica
+    assert health() == ['up']
+    stack.runtime.crash[gid] = CRASH_LOG               # every replica looping
+    assert health() == ['restarting']
+    assert _condition(stack, gid) == 'restarting'
+    assert stack.backend.residency().is_resident(gid)  # still resident, as it should be

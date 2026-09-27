@@ -2189,6 +2189,7 @@ def _print_health(health: dict) -> None:
         lines.append(f'residency UNKNOWN: {health["residency_error"]}')
     for row in health.get('deployments') or []:
         if row['condition'] in {'unknown', 'ambiguous', 'degraded', 'displaced',
+                                'restarting',
                                 'unresolved', 'not-running'}:
             lines.append(f'{row["condition"].upper()}: {row["id"]} ({row["state"]})')
     for orphan in health.get('orphans') or []:

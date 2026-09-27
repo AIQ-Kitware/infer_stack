@@ -250,6 +250,52 @@ class Residency:
         )
 
 
+def deployment_health(residency: Residency, deployment_id: str) -> str | None:
+    """Whether a deployment serves, as opposed to whether it is resident.
+
+    Residency is physical: a crash-looping unit is warm (it holds, and will
+    reclaim, its resources). Serving is not: a deployment is ``up`` only when
+    some unit runs and has not failed or not yet passed its health check. A
+    Docker container with no healthcheck reports an empty health, which is
+    up when running; a Kubernetes pod reports ``healthy`` when Ready.
+
+    * ``up``: some unit running, not ``starting`` or ``unhealthy``;
+    * ``starting``: none up, some running but not ready yet, or created;
+    * ``restarting``: every warm unit crash-looping (restarting);
+    * ``conflicted``: units that may not coexist (see :meth:`Residency.is_conflicted`);
+    * otherwise the units' states (``exited``, ``removing`` ...), or ``None``
+      when the deployment has no unit.
+
+    >>> def unit(name, state='running', health=''):
+    ...     return Container(name, 'grp', state, health=health)
+    >>> def health(*units):
+    ...     return deployment_health(Residency({'grp': units}, replicated=True), 'grp')
+    >>> health(unit('a', 'restarting'), unit('b', 'restarting'))
+    'restarting'
+    >>> health(unit('a', health='healthy'), unit('b', 'restarting'))
+    'up'
+    >>> health(unit('a', health='starting'), unit('b', 'restarting'))
+    'starting'
+    >>> health(unit('c'))                    # Docker, no healthcheck, running
+    'up'
+    """
+    units = residency.units(deployment_id)
+    if not units:
+        return None
+    if residency.is_conflicted(deployment_id):
+        return 'conflicted'
+    if any(u.state == 'running' and u.health not in ('starting', 'unhealthy')
+           for u in units):
+        return 'up'
+    if any(u.state == 'created' or (u.state == 'running' and u.health == 'starting')
+           for u in units):
+        return 'starting'
+    warm = residency.warm_units(deployment_id)
+    if warm and all(u.state == 'restarting' for u in warm):
+        return 'restarting'
+    return '/'.join(sorted({u.state for u in units}))
+
+
 def _gpus_from_device_requests(requests: Any) -> tuple[tuple[int, ...], bool]:
     """Map Docker ``HostConfig.DeviceRequests`` to ``(indices, all_gpus)``.
 
