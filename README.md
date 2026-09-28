@@ -85,6 +85,7 @@ Two backends run this: **Compose** (single host; vLLM and Ollama) and
 infer-stack config init               # data dir + default backend -> settings.yaml
 infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
 infer-stack catalog show              # what can be acquired
+infer-stack kube setup               # inspect/plan Kubernetes integration (read-only)
 infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
 infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
 infer-stack test <endpoint>           # one generation through the gateway
@@ -549,97 +550,103 @@ the managed key and the endpoint alias on either backend.
 The short version:
 
 ```bash
-./scripts/bootstrap_k3s.sh                         # a one-host cluster (k3s + helm)
-./scripts/install_kubeai.sh kubeai-values.yaml     # the chart, with your resourceProfiles
-kubectl -n kubeai port-forward svc/kubeai 8000:80 &
+# New cluster convenience path (omit --version to use the K3s install channel):
+infer-stack kube k3s bootstrap --version=<exact-k3s-version>
+
+# Read-only first: inspect the current cluster and the changes infer-stack owns.
+infer-stack kube setup
+infer-stack kube setup --apply
+infer-stack kube nodes
+
 infer-stack config set backend kubeai
-infer-stack doctor                                 # cluster -> CRD -> namespace -> KubeAI's API
+infer-stack config set kubeai_gateway cluster
+infer-stack doctor
 infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
 ```
 
-### KubeAI prerequisites
+### KubeAI cluster setup
 
-You need a Kubernetes cluster, `kubectl` and Helm. `scripts/bootstrap_k3s.sh`
-installs k3s and helm on one host; the steps it runs, by hand:
+`infer-stack kube` owns the integration knowledge, not Kubernetes itself. An
+existing kubeadm/RKE2/EKS/etc. cluster is first-class: point `kubectl` at it
+and start with `infer-stack kube setup`. K3s is only the convenient local
+bootstrap path.
 
-```bash
-curl -sfL https://get.k3s.io | sh -
-# or pin
-curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION='v1.34.3+k3s1' sh -
-```
-
-Make `kubectl` usable without `sudo`:
-
-```bash
-sudo mkdir -p /etc/rancher/k3s/config.yaml.d
-printf 'write-kubeconfig-mode: "0644"\n' | \
-  sudo tee /etc/rancher/k3s/config.yaml.d/10-kubeconfig-mode.yaml >/dev/null
-sudo systemctl restart k3s
-kubectl get nodes
-```
-
-Install Helm:
+`kube setup` is a plan/apply command. The default is read-only and checks the
+cluster, Ready nodes, NVIDIA scheduling/discovery capabilities, Helm, KubeAI,
+and the resource profiles infer-stack can derive from GPU labels. It accepts
+working externally-managed GPU/KubeAI integrations instead of replacing them.
 
 ```bash
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/83a46119086589a593a62ca544982977a60318ca/scripts/get-helm-4
-chmod 700 get_helm.sh
-./get_helm.sh
-helm version
+infer-stack kube setup
+# [ok] / [WARN] / [NEED] / [FAIL] checklist + proposed managed changes
+
+infer-stack kube setup --apply
 ```
 
-### NVIDIA GPU support
+The apply side is deliberately narrow: it can reconcile the NVIDIA device
+plugin + GPU Feature Discovery when an `nvidia` RuntimeClass shows that the
+node runtime is already configured, install/reconcile KubeAI, and add missing
+discovered GPU `resourceProfiles`. It does **not** install NVIDIA drivers or
+the NVIDIA container runtime. On K3s, install those before the first start (or
+restart K3s afterward), then rerun `kube setup`.
 
-Install the NVIDIA device plugin and GPU Feature Discovery so Kubernetes can expose GPU resources and labels:
+For a fresh K3s server, `kube k3s bootstrap` installs/starts K3s, keeps K3s's
+own kubeconfig as the authority (readable by the local user), waits for Ready,
+and installs Helm if needed. On a clean account it symlinks `~/.kube/config`
+to that authoritative file; an existing kubeconfig is never overwritten, and the
+CLI tells you to select/merge the K3s context before continuing:
 
 ```bash
-helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
-helm repo update
-helm upgrade -i nvdp nvdp/nvidia-device-plugin \
-  --version 0.17.1 \
-  --namespace nvidia-device-plugin \
-  --create-namespace \
-  --set gfd.enabled=true \
-  --set runtimeClassName=nvidia
+infer-stack kube k3s bootstrap --version=<exact-k3s-version>
+infer-stack kube setup
+infer-stack kube setup --apply
 ```
 
-Check that GPU support is working:
+An exact K3s version is recommended once the cluster is real infrastructure.
+If K3s is already active and the requested version differs, infer-stack refuses
+to perform an implicit cluster upgrade.
+
+`kube setup` generates its reconciled KubeAI values under the infer-stack data
+root (`generated/kube/kubeai-values.yaml`). Existing named resource profiles
+win over generated profiles, so hand-tuned scheduling rules are not silently
+rewritten. An optional operator values file participates in the same merge:
 
 ```bash
-kubectl -n nvidia-device-plugin get pods
-kubectl get node "$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')" \
-  -o jsonpath='{.status.allocatable.nvidia\.com/gpu}{"\n"}'
-kubectl get nodes --show-labels | tr ',' '\n' | grep 'nvidia.com/' || true
+infer-stack kube setup --values ./kubeai-values.local.yaml
+infer-stack kube setup --apply --values ./kubeai-values.local.yaml
 ```
 
-You want a non-empty `nvidia.com/gpu` count and `nvidia.com/*` labels such as product and memory.
+On an existing KubeAI Helm release, `--apply` preserves the installed chart
+version unless `--kubeai-version=...` explicitly requests another one. On a
+fresh install, use that option when you want a fixed chart version. `HF_TOKEN`,
+when set, is passed through a short-lived mode-0600 values file rather than on
+the Helm command line.
 
-### Resource profiles
-
-A `resourceProfile` is what one "GPU unit" means on your cluster; the
-catalog's `runtime.resource_profile` (or the `kubeai_resource_profile`
-setting) names one, and infer-stack appends the GPU count. Include GPU
-`requests`, GPU `limits` and `runtimeClassName: nvidia`: without them the
-pod can land on the GPU node and still start without `libcuda.so.1`.
+`infer-stack kube nodes` is the compact inventory used by the setup logic:
 
 ```bash
-PRODUCT="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.nvidia\.com/gpu\.product}')"
-
-cat > kubeai-values.yaml <<EOF
-resourceProfiles:
-  nvidia-gpu:
-    runtimeClassName: nvidia
-    requests:
-      nvidia.com/gpu: "1"
-    limits:
-      nvidia.com/gpu: "1"
-    nodeSelector:
-      nvidia.com/gpu.product: "${PRODUCT}"
-EOF
-./scripts/install_kubeai.sh kubeai-values.yaml kubeai
+infer-stack kube nodes
+infer-stack kube nodes --json
 ```
 
-If a `kubeai` release already exists, reuse its namespace
-(`helm list -A | grep kubeai`) and set `kubeai_namespace` to match.
+The important GPU facts are allocatable `nvidia.com/gpu` plus GPU Feature
+Discovery's `nvidia.com/gpu.product` and `nvidia.com/gpu.memory` labels. These
+are also the authority used to derive one KubeAI resource profile per GPU
+product. If a managed cluster already supplies those capabilities but has no
+`nvidia` RuntimeClass, infer-stack accepts it and omits `runtimeClassName` from
+its generated profiles.
+
+For CPU-only development, skip NVIDIA checks explicitly:
+
+```bash
+infer-stack kube setup --gpu=none
+```
+
+The older `scripts/bootstrap_k3s.sh` and `scripts/join_agent.sh` entry points
+remain compatibility wrappers around the CLI. `scripts/install_kubeai.sh` is
+retained as a low-level/manual Helm escape hatch; normal setup should use
+`infer-stack kube setup [--apply]` so checks, profile discovery, and install
+behavior share one authority.
 
 ### Debugging checks
 

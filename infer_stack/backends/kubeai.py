@@ -23,7 +23,7 @@ simultaneously desired deployments are reported loudly (``last_unplaced`` /
 ``last_errors``), never silently overwritten.
 
 Cluster prerequisites (once per cluster, not per acquire): a reachable
-kubeconfig, the KubeAI helm chart installed (``scripts/install_kubeai.sh``)
+kubeconfig, KubeAI installed (normally via ``infer-stack kube setup --apply``)
 with ``resourceProfiles`` matching the ``resource_profile`` names your catalog
 uses, and a route to the gateway (the default ``base_url`` assumes
 ``kubectl port-forward svc/kubeai 8000:80``). See ``docs/kubeai-backend.md``.
@@ -191,6 +191,33 @@ def node_gpus(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             'labels': labels,
         }
     return out
+
+
+def resource_profiles_for_nodes(
+    nodes: list[dict[str, Any]], *, runtime_class_name: str | None = 'nvidia',
+) -> dict[str, Any]:
+    """One KubeAI resource profile per discovered NVIDIA GPU product.
+
+    This is shared by ``catalog suggest`` and ``kube setup`` so there is one
+    authority for the generated profile names and scheduling shape. Existing
+    operator profiles are merged/preserved by the setup layer.
+    """
+    profiles: dict[str, Any] = {}
+    gpu_nodes = [f for f in node_gpus(nodes).values()
+                 if f.get('count') and f.get('product')]
+    for facts in sorted(gpu_nodes,
+                        key=lambda f: (f.get('memory_gib') or 0, f.get('product') or '')):
+        product = str(facts['product'])
+        profile = {
+            'imageName': 'nvidia-gpu',
+            'requests': {GPU_RESOURCE: '1'},
+            'limits': {GPU_RESOURCE: '1'},
+            'nodeSelector': {GPU_PRODUCT_LABEL: product},
+        }
+        if runtime_class_name:
+            profile['runtimeClassName'] = runtime_class_name
+        profiles[f'nvidia-{dns_slug(product)}'] = profile
+    return profiles
 
 
 def sized_profiles(profiles: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> dict[str, float]:
@@ -768,16 +795,11 @@ class KubeaiBackend(ConvergeScaffold):
                  'memory_gib': best['memory_gib'],
                  'memory_mib': int(best['memory_gib'] * 1024),
                  'display_active': False} for i in range(best['count'])]
-        profiles = {}
-        for f in sorted(gpu_nodes, key=lambda f: f['memory_gib']):
-            product = f['product'] or 'gpu'
-            profiles[f'nvidia-{dns_slug(product)}'] = {
-                'imageName': 'nvidia-gpu',
-                'runtimeClassName': 'nvidia',
-                'requests': {GPU_RESOURCE: '1'},
-                'limits': {GPU_RESOURCE: '1'},
-                'nodeSelector': {GPU_PRODUCT_LABEL: product},
-            }
+        profiles = resource_profiles_for_nodes([
+            {'metadata': {'name': name, 'labels': facts['labels']},
+             'status': {'allocatable': {GPU_RESOURCE: str(facts['count'])}}}
+            for name, facts in facts.items()
+        ])
         return {'gpu_count': len(gpus), 'gpus': gpus}, profiles
 
     def _enrich_min_vram(self, desired) -> None:
@@ -997,7 +1019,7 @@ class KubeaiBackend(ConvergeScaffold):
                 raise RuntimeError(
                     f'kubectl apply failed: {ex}\n'
                     'Is the KubeAI chart installed and the kubeconfig '
-                    'reachable? See scripts/install_kubeai.sh and '
+                    'reachable? See `infer-stack kube setup` and '
                     'docs/kubeai-backend.md.'
                 ) from ex
         # Prune: managed Models on the cluster that the render dropped. Their
@@ -1276,13 +1298,13 @@ class KubeaiBackend(ConvergeScaffold):
         if not _run_check(
             'cluster reachable',
             ['version', '--client=false', '-o', 'json'],
-            'is the kubeconfig set up? (scripts/bootstrap_k3s.sh)',
+            'is the kubeconfig set up? (`infer-stack kube setup`; for new K3s: `infer-stack kube k3s bootstrap`)',
         ):
             return checks
         if not _run_check(
             'KubeAI Model CRD installed',
             ['get', 'crd', 'models.kubeai.org', '-o', 'name'],
-            'install the chart: scripts/install_kubeai.sh',
+            'run `infer-stack kube setup` to inspect, then `infer-stack kube setup --apply`',
         ):
             return checks
         _run_check(

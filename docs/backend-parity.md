@@ -23,7 +23,7 @@ cluster setup is [kubeai-backend.md](kubeai-backend.md).
 
 | | Compose | KubeAI adds |
 |---|---|---|
-| tools | Docker with the NVIDIA runtime | a cluster (`scripts/bootstrap_k3s.sh` for one host, `scripts/join_agent.sh` for another), `kubectl`, `helm`, the KubeAI chart (`scripts/install_kubeai.sh`), the NVIDIA device plugin on GPU nodes |
+| tools | Docker with the NVIDIA runtime | a Kubernetes cluster (`infer-stack kube k3s bootstrap/join` is the K3s convenience path), `kubectl`, `helm`, KubeAI, and GPU scheduling/discovery capabilities (`infer-stack kube setup [--apply]`) |
 | information | none: GPUs are discovered with `nvidia-smi` | `resourceProfiles` in the chart values (what one GPU unit requests, and on which nodes; `catalog suggest --backend kubeai` proposes them from the nodes' GPU labels), and per endpoint `runtime.resource_profile`, a `min_vram_gib` that picks one by size, or a default `kubeai_resource_profile` |
 | settings | `backend compose` | `backend kubeai`; `kubeai_gateway cluster` for more than one workstation; `kubeai_namespace`, `kubeai_base_url`, `kubeai_gateway_upstream` when the defaults (namespace `kubeai`, a port-forward on 8000, the Service's cluster IP) do not hold |
 | preflight | none needed | `infer-stack doctor`: cluster → CRD → namespace → KubeAI's API |

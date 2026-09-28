@@ -386,8 +386,8 @@ class CatalogSuggestCLI(
             )
             _print_yaml(text)
             if values:
-                print('# helm values for the KubeAI chart (merge, then '
-                      '`scripts/install_kubeai.sh <values>`):\n' + values,
+                print('# discovered KubeAI resourceProfiles (the same shape reconciled by '
+                      '`infer-stack kube setup`; shown here for inspection/manual Helm use):\n' + values,
                       file=sys.stderr)
             return 0
 
@@ -416,8 +416,8 @@ class CatalogSuggestCLI(
                 f'{", ".join(skipped)}'
             )
         if values:
-            print('resource profiles for the KubeAI chart (merge into your helm '
-                  'values, then `scripts/install_kubeai.sh <values>`):')
+            print('discovered KubeAI resource profiles (normally reconciled by '
+                  '`infer-stack kube setup --apply`; shown here for inspection/manual Helm use):')
             print(values, end='')
         return 0
 

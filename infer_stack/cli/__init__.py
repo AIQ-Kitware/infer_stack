@@ -15,6 +15,7 @@ The layers are:
 * ``compose``  — compose + LiteLLM helpers.
 * ``options``  — shared ``DataConfig`` mixins for override flags.
 * ``commands_catalog`` — catalog editor (models/endpoints/hosts/bundles).
+* ``commands_kube``    — Kubernetes integration inspection/setup.
 * ``commands_leasing`` — acquire/release/run/leases/test + reconcile.
 * ``commands_runtime`` — ``status`` + ``stack`` day-2 compose wrappers.
 * ``commands_meta``    — version/help/config introspection.
@@ -30,6 +31,7 @@ from .. import __version__
 # so tests can patch seams where they are actually looked up.
 from . import (  # noqa: F401
     commands_catalog,
+    commands_kube,
     commands_leasing,
     commands_meta,
     commands_mock,
@@ -38,7 +40,7 @@ from . import (  # noqa: F401
     options,
 )
 from .commands_catalog import CatalogModalCLI
-from .commands_mock import MockModalCLI
+from .commands_kube import KubeModalCLI
 from .commands_leasing import (
     AccessCLI,
     AcquireCLI,
@@ -60,6 +62,7 @@ from .commands_leasing import (
 )
 from .commands_leasing import EnvCLI as LeasingEnvCLI
 from .commands_leasing import RenderCLI as LeasingRenderCLI
+from .commands_mock import MockModalCLI
 from .commands_meta import (
     ConfigModalCLI,
     ConfigPathsCLI,
@@ -121,6 +124,7 @@ class ManageCLI(kw.ModalCLI):
     paths = ConfigPathsCLI  # top-level alias for `config paths`
     status = StatusCLI
     doctor = DoctorCLI  # preflight the configured backend's prerequisites
+    kube = KubeModalCLI  # inspect/setup the Kubernetes integration infer-stack needs
 
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI

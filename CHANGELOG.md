@@ -2,6 +2,28 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Kubernetes integration setup moves into `infer-stack kube`
+
+- Added `infer-stack kube nodes` and capability-driven `infer-stack kube setup`;
+  setup is read-only by default and `--apply` reconciles only infer-stack's
+  Kubernetes integration requirements. Existing GPU Operator / managed-cluster
+  NVIDIA resources and externally managed KubeAI installations are accepted
+  rather than replaced.
+- `kube setup --apply` can reconcile the pinned NVIDIA device plugin with GPU
+  Feature Discovery, install/reconcile KubeAI, and merge discovered GPU
+  resource profiles without overwriting operator-owned profiles. Existing
+  KubeAI Helm versions and optional operator values are preserved unless an
+  explicit override is requested. Existing/operator `secrets.*` values are
+  carried only through a temporary mode-0600 Helm values file, never copied
+  into infer-stack's persistent generated YAML.
+- Added explicit K3s convenience commands, `infer-stack kube k3s bootstrap`
+  and `infer-stack kube k3s join`; the old bootstrap/join scripts are now
+  compatibility wrappers so cluster lifecycle knowledge has one implementation.
+  Host NVIDIA driver/container-runtime installation remains outside infer-stack.
+- KubeAI diagnostics and catalog guidance now point at the shared Kubernetes
+  setup surface instead of requiring users to compose README recipes and shell
+  scripts by hand.
+
 ### External endpoints; gateway routes derived from the published catalogs
 
 - A catalog endpoint can name an OpenAI-compatible server infer-stack does

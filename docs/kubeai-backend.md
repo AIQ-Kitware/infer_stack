@@ -37,34 +37,43 @@ Where the two backends match and where they still differ, row by row:
 
 ## One-time cluster setup
 
+The normal setup path is now capability-driven and lives in the CLI:
+
 ```bash
-# 1. A cluster. For a single GPU host, k3s works out of the box:
-./scripts/bootstrap_k3s.sh
+# Existing cluster: just point kubectl at it. For a new local K3s server:
+infer-stack kube k3s bootstrap --version=<exact-k3s-version>
 
-# 2. Resource profiles: name -> the requests/limits/nodeSelector that one
-#    "GPU unit" means on your cluster. These names are what the catalog's
-#    `runtime.resource_profile` refers to. Without the GPU request and
-#    runtimeClassName the pod can land on a GPU node and still start without
-#    libcuda.so.1. `infer-stack catalog suggest --backend kubeai` proposes
-#    one per GPU product once the device plugin runs.
-cat > kubeai-values.yaml <<'EOF'
-resourceProfiles:
-  nvidia-gpu-rtx-4090:
-    runtimeClassName: nvidia
-    requests:
-      nvidia.com/gpu: "1"
-    limits:
-      nvidia.com/gpu: "1"
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
-EOF
-
-# 3. Install the chart (HF_TOKEN, if exported, is passed to the chart secret):
-./scripts/install_kubeai.sh kubeai-values.yaml kubeai
-
-# 4. A route to the gateway. The default base_url assumes a port-forward:
-kubectl -n kubeai port-forward svc/kubeai 8000:80 &
+# Planning is read-only; apply only after reviewing it.
+infer-stack kube setup
+infer-stack kube setup --apply
+infer-stack kube nodes
 ```
+
+`kube setup` checks the Kubernetes API, Ready nodes, GPU scheduling/discovery
+facts, Helm, the KubeAI CRD/service, and discovered GPU resource profiles. It
+is capability-based: an existing GPU Operator or externally-managed KubeAI is
+accepted when it already supplies what infer-stack needs. It does not replace
+working external components merely because they were installed differently.
+
+The managed NVIDIA path begins only after Kubernetes exposes an `nvidia`
+RuntimeClass. Installing NVIDIA drivers/container-runtime packages is host
+administration and remains outside infer-stack. With that runtime present,
+`kube setup --apply` may install/reconcile the pinned NVIDIA device plugin +
+GPU Feature Discovery and then derive profiles from `nvidia.com/gpu.product`
+and `nvidia.com/gpu.memory`.
+
+KubeAI values are written to `<data>/generated/kube/kubeai-values.yaml`. Named
+profiles already supplied by the operator win over generated profiles. Use an
+operator values file for other chart customization:
+
+```bash
+infer-stack kube setup --values ./kubeai-values.local.yaml
+infer-stack kube setup --apply --values ./kubeai-values.local.yaml
+```
+
+For an existing Helm-managed KubeAI release, apply preserves its installed
+chart version by default; use `--kubeai-version=...` for an explicit change.
+`scripts/install_kubeai.sh` remains only as a manual Helm escape hatch.
 
 ## Point infer-stack at it
 
@@ -105,12 +114,9 @@ Discovery) of the nodes its `nodeSelector` selects; a profile without a
 `nodeSelector`, like the chart's generic ones, has no size and is never
 picked this way. With none large enough, the `kubeai_resource_profile`
 default is used, or the acquire is refused with the sizes it found.
-`infer-stack catalog suggest` proposes one sized profile per GPU product in
-the cluster, ready for the helm values:
-
-```bash
-infer-stack catalog suggest --backend kubeai   # catalog on stdout, profiles on stderr
-```
+`infer-stack kube setup` is the setup authority for these profiles;
+`catalog suggest --backend kubeai` consumes the same profile-generation shape
+while suggesting model/catalog entries.
 
 Verify the setup before the first acquire — `doctor` checks the chain in
 dependency order (cluster reachable → CRD installed → namespace → KubeAI's API):
@@ -151,37 +157,37 @@ routes only: dynamic routing and Open WebUI need the host placement.
 
 ## Add a workstation
 
-The cluster's first node is the one `scripts/bootstrap_k3s.sh` set up. To add
-a GPU workstation as a second node:
+On the server node, copy the K3s token into a protected file on the new host
+through whatever secure channel you normally use, and record the server's K3s
+version. Then on the new workstation (after NVIDIA driver/container-runtime
+setup when it is a GPU node):
 
-1. On the first node, collect the join facts:
-   ```bash
-   sudo cat /var/lib/rancher/k3s/server/node-token   # the token
-   k3s --version                                     # join with the same version
-   ```
-2. On the new workstation (NVIDIA driver and container toolkit installed),
-   join with the server's version:
-   ```bash
-   INSTALL_K3S_VERSION='v1.36.4+k3s1' \
-     scripts/join_agent.sh https://<first-node-ip>:6443 <token> <name>
-   ```
-   Between the nodes, open 6443/tcp (to the first node), 8472/udp (flannel)
-   and 10250/tcp; for clients, the NodePort (30442/tcp).
-3. Back on the first node: the NVIDIA device plugin is a DaemonSet, so it
-   starts on the new node by itself. Check the new node reports its GPUs and
-   labels, then add a sized profile for its GPU product:
-   ```bash
-   kubectl get node <name> -o jsonpath='{.status.allocatable.nvidia\.com/gpu}{"\n"}'
-   infer-stack catalog suggest --backend kubeai     # profiles per GPU product (stderr)
-   ```
-   Merge the proposed `resourceProfiles` into your helm values and rerun
-   `scripts/install_kubeai.sh <values>`. An endpoint that names that profile,
-   or declares a `min_vram_gib` only that GPU meets, lands on the new node.
-4. With the gateway in the cluster (above), a card on either workstation uses
-   the env file as it is: the NodePort answers on every node.
+```bash
+infer-stack kube k3s join \
+  --server=https://<first-node-ip>:6443 \
+  --token-file=~/.private/k3s-token \
+  --node-name=<name> \
+  --version=<same-k3s-version>
+```
 
-`dev/k3s_agent_container.sh` makes a second node out of a container on one
-host, for development; `dev/handover/p5_two_hosts.sh` checks a real one.
+The token is read from a file so it does not land in shell history or the
+installer argv. Between K3s nodes, allow the K3s-required cluster traffic
+(6443/tcp to the server, the configured Flannel/backend traffic, and kubelet
+traffic as appropriate for your network); expose the infer-stack NodePort only
+on the trusted LAN/VPN.
+
+Back on the control node, inspect and reconcile the newly visible hardware:
+
+```bash
+infer-stack kube nodes
+infer-stack kube setup
+infer-stack kube setup --apply
+```
+
+A new GPU product becomes a new discovered KubeAI resource profile without
+rewriting any same-named operator profile. `dev/k3s_agent_container.sh` still
+provides a synthetic second K3s node for development;
+`dev/handover/p5_two_hosts.sh` is the real two-host evidence path.
 
 ## Semantics + limitations
 
