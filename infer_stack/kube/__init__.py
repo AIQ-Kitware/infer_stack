@@ -8,6 +8,6 @@ This package is not a kubectl replacement: arbitrary cluster administration
 stays with Kubernetes-native tools.
 """
 
-from .manage import KubeManager, SetupPlan
+from .manage import KubeManager, NodeLifecyclePlan, SetupPlan
 
-__all__ = ['KubeManager', 'SetupPlan']
+__all__ = ['KubeManager', 'NodeLifecyclePlan', 'SetupPlan']

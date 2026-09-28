@@ -31,6 +31,7 @@ from ..paths import data_root
 NVIDIA_DEVICE_PLUGIN_VERSION = '0.17.1'
 NVIDIA_DEVICE_PLUGIN_REPO = 'https://nvidia.github.io/k8s-device-plugin'
 KUBEAI_REPO = 'https://www.kubeai.org'
+COMPOSE_DETACH_ANNOTATION = 'infer-stack.io/compose-detached'
 
 RunFunc = Callable[..., str]
 
@@ -84,6 +85,35 @@ class SetupPlan:
         return any(not c.ok and c.level == 'required' for c in self.checks)
 
 
+@dataclass
+class NodeLifecyclePlan:
+    """Read-only view of a node before a temporary Compose/Kube swap."""
+
+    name: str
+    ready: bool
+    schedulable: bool
+    detach_state: str | None
+    control_plane: bool
+    workload_pods: list[str] = field(default_factory=list)
+    retained_pods: list[str] = field(default_factory=list)
+    unmanaged_pods: list[str] = field(default_factory=list)
+
+    @property
+    def can_detach(self) -> bool:
+        """Whether ``kubectl drain`` can proceed without ``--force``."""
+        return not self.unmanaged_pods
+
+    @property
+    def detach_owned(self) -> bool:
+        """Whether infer-stack owns this cordon/detach transition."""
+        return self.detach_state in {'requested', 'true'}
+
+    @property
+    def detached_for_compose(self) -> bool:
+        """Whether the drain completed and the host is ready for Compose."""
+        return self.detach_state == 'true'
+
+
 class KubeManager:
     """Inspect/reconcile the small slice of Kubernetes infer-stack depends on."""
 
@@ -100,6 +130,164 @@ class KubeManager:
         result = self.kubectl_json(['get', 'nodes', '-o', 'json'])
         return list(result.get('items') or [])
 
+    def node(self, name: str) -> dict[str, Any]:
+        try:
+            return self.kubectl_json(['get', 'node', name, '-o', 'json'])
+        except Exception as ex:
+            raise RuntimeError(
+                f'could not inspect Kubernetes node {name!r}: {ex}'
+            ) from ex
+
+    def pods_on_node(self, name: str) -> list[dict[str, Any]]:
+        result = self.kubectl_json([
+            'get', 'pods', '-A', '--field-selector', f'spec.nodeName={name}',
+            '-o', 'json',
+        ])
+        return list(result.get('items') or [])
+
+    @staticmethod
+    def _node_ready(node: dict[str, Any]) -> bool:
+        conditions = (node.get('status') or {}).get('conditions') or []
+        return any(
+            c.get('type') == 'Ready' and c.get('status') == 'True'
+            for c in conditions
+        )
+
+    @staticmethod
+    def _node_control_plane(node: dict[str, Any]) -> bool:
+        labels = (node.get('metadata') or {}).get('labels') or {}
+        return any(
+            key in labels
+            for key in (
+                'node-role.kubernetes.io/control-plane',
+                'node-role.kubernetes.io/master',
+            )
+        )
+
+    @staticmethod
+    def _pod_name(pod: dict[str, Any]) -> str:
+        meta = pod.get('metadata') or {}
+        namespace = str(meta.get('namespace') or 'default')
+        name = str(meta.get('name') or '?')
+        return f'{namespace}/{name}'
+
+    @staticmethod
+    def _pod_retained_by_drain(pod: dict[str, Any]) -> bool:
+        """Mirror/static and DaemonSet pods are intentionally left by drain."""
+        meta = pod.get('metadata') or {}
+        annotations = meta.get('annotations') or {}
+        if 'kubernetes.io/config.mirror' in annotations:
+            return True
+        owners = meta.get('ownerReferences') or []
+        return any(owner.get('kind') == 'DaemonSet' for owner in owners)
+
+    @staticmethod
+    def _pod_unmanaged(pod: dict[str, Any]) -> bool:
+        """Bare pods make ``kubectl drain`` refuse unless ``--force`` is used."""
+        meta = pod.get('metadata') or {}
+        annotations = meta.get('annotations') or {}
+        if 'kubernetes.io/config.mirror' in annotations:
+            return False
+        return not bool(meta.get('ownerReferences'))
+
+    def node_lifecycle_plan(self, name: str) -> NodeLifecyclePlan:
+        """Inspect a node for reversible Kubernetes <-> Compose use.
+
+        ``detach`` intentionally means *scheduling detach*, not cluster leave:
+        the kubelet / distribution agent keeps running and the node identity is
+        preserved.  This is what makes a later attach a cheap uncordon rather
+        than a reinstall/rejoin operation.
+        """
+        node = self.node(name)
+        meta = node.get('metadata') or {}
+        spec = node.get('spec') or {}
+        annotations = meta.get('annotations') or {}
+        pods = self.pods_on_node(name)
+        retained = [p for p in pods if self._pod_retained_by_drain(p)]
+        workload = [p for p in pods if not self._pod_retained_by_drain(p)]
+        unmanaged = [p for p in workload if self._pod_unmanaged(p)]
+        return NodeLifecyclePlan(
+            name=name,
+            ready=self._node_ready(node),
+            schedulable=not bool(spec.get('unschedulable')),
+            detach_state=annotations.get(COMPOSE_DETACH_ANNOTATION),
+            control_plane=self._node_control_plane(node),
+            workload_pods=sorted(self._pod_name(p) for p in workload),
+            retained_pods=sorted(self._pod_name(p) for p in retained),
+            unmanaged_pods=sorted(self._pod_name(p) for p in unmanaged),
+        )
+
+    def detach_node_for_compose(
+        self, name: str, *, timeout_seconds: int = 300,
+    ) -> NodeLifecyclePlan:
+        """Cordon/drain a node while preserving its cluster membership.
+
+        We deliberately do not stop kubelet/K3s/etc.  Keeping the distribution
+        agent alive retains identity, networking and control-plane services;
+        the cordon is the ownership boundary that prevents new scheduled GPU
+        work while Compose uses the host directly.
+        """
+        plan = self.node_lifecycle_plan(name)
+        if (
+            plan.detached_for_compose
+            and not plan.schedulable
+            and not plan.workload_pods
+        ):
+            return plan
+        if not plan.schedulable and not plan.detach_owned:
+            raise RuntimeError(
+                f'node {name!r} is already cordoned by another operator. '
+                'Refusing to adopt an unrelated maintenance cordon as a '
+                'temporary Compose detach.'
+            )
+        if not plan.can_detach:
+            names = ', '.join(plan.unmanaged_pods)
+            raise RuntimeError(
+                f'node {name!r} has unmanaged pod(s) that kubectl drain would '
+                f'refuse without --force: {names}. Move/remove them explicitly; '
+                'infer-stack will not force-delete unrelated bare pods.'
+            )
+        self.run([
+            'kubectl', 'annotate', 'node', name,
+            f'{COMPOSE_DETACH_ANNOTATION}=requested', '--overwrite',
+        ])
+        self.run(['kubectl', 'cordon', name])
+        self.run([
+            'kubectl', 'drain', name,
+            '--ignore-daemonsets',
+            '--delete-emptydir-data',
+            f'--timeout={int(timeout_seconds)}s',
+        ])
+        self.run([
+            'kubectl', 'annotate', 'node', name,
+            f'{COMPOSE_DETACH_ANNOTATION}=true', '--overwrite',
+        ])
+        return self.node_lifecycle_plan(name)
+
+    def attach_node_from_compose(
+        self, name: str, *, timeout_seconds: int = 180,
+    ) -> NodeLifecyclePlan:
+        """Make a previously detached node schedulable again."""
+        plan = self.node_lifecycle_plan(name)
+        if plan.schedulable and not plan.detach_owned:
+            return plan
+        if not plan.detach_owned:
+            raise RuntimeError(
+                f'node {name!r} is cordoned, but infer-stack did not mark it as '
+                'temporarily detached for Compose. Refusing to undo an '
+                'operator-owned maintenance cordon.'
+            )
+        self.run([
+            'kubectl', 'wait', '--for=condition=Ready', f'node/{name}',
+            f'--timeout={int(timeout_seconds)}s',
+        ])
+        self.run(['kubectl', 'uncordon', name])
+        self.run([
+            'kubectl', 'annotate', 'node', name,
+            f'{COMPOSE_DETACH_ANNOTATION}-',
+        ])
+        return self.node_lifecycle_plan(name)
+
     @staticmethod
     def node_rows(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Compact node inventory for people and JSON output."""
@@ -107,17 +295,20 @@ class KubeManager:
         rows = []
         for node in nodes:
             meta = node.get('metadata') or {}
-            status = node.get('status') or {}
-            conditions = status.get('conditions') or []
-            ready = any(
-                c.get('type') == 'Ready' and c.get('status') == 'True'
-                for c in conditions
-            )
+            ready = KubeManager._node_ready(node)
             name = str(meta.get('name') or '')
             facts = gpu.get(name, {})
+            spec = node.get('spec') or {}
+            annotations = meta.get('annotations') or {}
             rows.append({
                 'name': name,
                 'ready': ready,
+                'schedulable': not bool(spec.get('unschedulable')),
+                'detached_for_compose': (
+                    annotations.get(COMPOSE_DETACH_ANNOTATION) == 'true'
+                ),
+                'detach_state': annotations.get(COMPOSE_DETACH_ANNOTATION),
+                'control_plane': KubeManager._node_control_plane(node),
                 'gpu_count': facts.get('count', 0),
                 'gpu_product': facts.get('product'),
                 'gpu_memory_gib': facts.get('memory_gib'),

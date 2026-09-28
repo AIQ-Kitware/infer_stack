@@ -53,6 +53,13 @@ infer-stack kube setup --apply
 infer-stack kube nodes
 ```
 
+For temporary testing on workstations that already have Compose state you want
+to preserve, do not point KubeAI at the existing Compose ledger. The
+[cluster setup guide](cluster-setup.md#temporarily-swap-compose-configured-workstations-into-a-cluster)
+uses a separate KubeAI data root and `kube node detach/attach` so the same
+physical machines can move back to local Compose use without uninstalling or
+rejoining Kubernetes.
+
 `kube setup` checks the Kubernetes API, Ready nodes, GPU scheduling/discovery
 facts, Helm, the KubeAI CRD/service, and discovered GPU resource profiles. It
 is capability-based: an existing GPU Operator or externally-managed KubeAI is
@@ -81,6 +88,8 @@ chart version by default; use `--kubeai-version=...` for an explicit change.
 
 ## Point infer-stack at it
 
+For a Kubernetes-only control host:
+
 ```bash
 infer-stack config set backend kubeai
 # optional overrides (defaults shown):
@@ -92,6 +101,17 @@ infer-stack config set kubeai_resource_profile nvidia-gpu-rtx-4090
 # reachable from a cluster node; set an ingress URL when this host is not one):
 infer-stack config set kubeai_gateway_upstream http://kubeai.example/openai/v1
 ```
+
+On a host whose persisted default remains Compose, use a separate KubeAI
+authority/data root instead:
+
+```bash
+export INFER_STACK_BACKEND=kubeai
+export INFER_STACK_DATA_DIR="$HOME/.local/share/infer_stack-kubeai"
+```
+
+Unset those variables to return to that host's existing Compose authority after
+the Kubernetes node has been detached as described in the cluster setup guide.
 
 Catalog endpoints opt into a specific profile per endpoint; the GPU count is
 appended automatically from `tensor_parallel_size × pipeline_parallel_size ×

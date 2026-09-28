@@ -2,6 +2,25 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Reversible Kubernetes / Compose workstation handoff
+
+- Added `infer-stack kube node status|detach|attach`. `detach` is a preview by
+  default; `--yes` marks an infer-stack-owned maintenance cordon, drains
+  controller-managed workloads, and leaves the Kubernetes agent/control plane
+  running so the host can temporarily use its GPU through the local Compose
+  backend. `attach --yes` waits for the same node identity to be Ready and
+  uncordons it after the operator has stopped local Compose GPU workloads.
+- The lifecycle refuses bare/unmanaged pods rather than force-deleting them and
+  refuses to attach/detach through a cordon owned by unrelated cluster
+  maintenance. Interrupted detaches are marked so they can be retried or
+  reversed safely.
+- `kube nodes` now exposes schedulability and reports an infer-stack-detached
+  node as `SCHED=compose`.
+- Documented the practical two-workstation test workflow: preserve existing
+  Compose config/ledger, run KubeAI from a separate data root with
+  `INFER_STACK_BACKEND=kubeai`, and switch physical nodes between Kubernetes
+  scheduling and direct Compose use without uninstalling/rejoining Kubernetes.
+
 ### Kubernetes integration setup moves into `infer-stack kube`
 
 - Kept the generic Kubernetes manager/backend distribution-neutral: generic

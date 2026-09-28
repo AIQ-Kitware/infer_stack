@@ -13,22 +13,40 @@ GPU_MEMORY = 'nvidia.com/gpu.memory'
 GPU_RESOURCE = 'nvidia.com/gpu'
 
 
-def node(name='gpu-a', *, product='RTX-TEST', memory='24576', count='1'):
+def node(
+    name='gpu-a', *, product='RTX-TEST', memory='24576', count='1',
+    schedulable=True, detached=False, control_plane=False,
+):
     labels = {}
     if product is not None:
         labels[GPU_PRODUCT] = product
     if memory is not None:
         labels[GPU_MEMORY] = memory
+    if control_plane:
+        labels['node-role.kubernetes.io/control-plane'] = 'true'
     allocatable = {}
     if count is not None:
         allocatable[GPU_RESOURCE] = count
+    annotations = {}
+    if detached:
+        annotations['infer-stack.io/compose-detached'] = 'true'
     return {
-        'metadata': {'name': name, 'labels': labels},
+        'metadata': {'name': name, 'labels': labels, 'annotations': annotations},
+        'spec': {'unschedulable': not schedulable},
         'status': {
             'conditions': [{'type': 'Ready', 'status': 'True'}],
             'allocatable': allocatable,
         },
     }
+
+
+def pod(name, *, namespace='default', owner='ReplicaSet', mirror=False):
+    meta = {'name': name, 'namespace': namespace, 'annotations': {}}
+    if owner is not None:
+        meta['ownerReferences'] = [{'kind': owner, 'name': f'{name}-owner'}]
+    if mirror:
+        meta['annotations']['kubernetes.io/config.mirror'] = 'mirror-hash'
+    return {'metadata': meta}
 
 
 class FakeCluster:
@@ -42,8 +60,10 @@ class FakeCluster:
         service=True,
         releases=None,
         values=None,
+        pods=None,
     ):
         self.nodes = nodes if nodes is not None else [node()]
+        self.pods = pods if pods is not None else {}
         self.runtime_class = runtime_class
         self.crd = crd
         self.namespace = namespace
@@ -61,6 +81,57 @@ class FakeCluster:
             return '{}'
         if args == ['kubectl', 'get', 'nodes', '-o', 'json']:
             return json.dumps({'items': self.nodes})
+        if len(args) == 6 and args[:3] == ['kubectl', 'get', 'node'] and args[4:] == ['-o', 'json']:
+            wanted = args[3]
+            for item in self.nodes:
+                if item.get('metadata', {}).get('name') == wanted:
+                    return json.dumps(item)
+            raise RuntimeError('not found')
+        if (
+            len(args) == 8
+            and args[:4] == ['kubectl', 'get', 'pods', '-A']
+            and args[4] == '--field-selector'
+            and args[6:] == ['-o', 'json']
+        ):
+            wanted = args[5].split('=', 1)[1]
+            return json.dumps({'items': self.pods.get(wanted, [])})
+        if args[:3] == ['kubectl', 'annotate', 'node']:
+            wanted = args[3]
+            annotation = args[4]
+            for item in self.nodes:
+                if item.get('metadata', {}).get('name') != wanted:
+                    continue
+                annotations = item.setdefault('metadata', {}).setdefault('annotations', {})
+                if annotation.endswith('-'):
+                    annotations.pop(annotation[:-1], None)
+                else:
+                    key, value = annotation.split('=', 1)
+                    annotations[key] = value
+                return f'node/{wanted} annotated\n'
+            raise RuntimeError('not found')
+        if args[:2] == ['kubectl', 'cordon']:
+            wanted = args[2]
+            for item in self.nodes:
+                if item.get('metadata', {}).get('name') == wanted:
+                    item.setdefault('spec', {})['unschedulable'] = True
+                    return f'node/{wanted} cordoned\n'
+            raise RuntimeError('not found')
+        if args[:2] == ['kubectl', 'drain']:
+            wanted = args[2]
+            self.pods[wanted] = [
+                item for item in self.pods.get(wanted, [])
+                if KubeManager._pod_retained_by_drain(item)
+            ]
+            return f'node/{wanted} drained\n'
+        if args[:3] == ['kubectl', 'wait', '--for=condition=Ready']:
+            return 'condition met\n'
+        if args[:2] == ['kubectl', 'uncordon']:
+            wanted = args[2]
+            for item in self.nodes:
+                if item.get('metadata', {}).get('name') == wanted:
+                    item.setdefault('spec', {})['unschedulable'] = False
+                    return f'node/{wanted} uncordoned\n'
+            raise RuntimeError('not found')
         if args[:4] == ['kubectl', 'get', 'runtimeclass', 'nvidia']:
             if not self.runtime_class:
                 raise RuntimeError('not found')
@@ -385,3 +456,113 @@ def test_generic_setup_runtime_hint_is_distribution_neutral():
     details = '\n'.join(check.detail for check in plan.checks)
     assert 'k3s' not in details.lower()
     assert 'cluster/distribution' in details
+
+
+def test_node_detach_is_reversible_and_keeps_daemonsets():
+    fake = FakeCluster(
+        nodes=[node('gpu-a', control_plane=True)],
+        pods={
+            'gpu-a': [
+                pod('model', namespace='kubeai'),
+                pod('nvidia-plugin', namespace='nvidia-device-plugin', owner='DaemonSet'),
+                pod('kube-apiserver', namespace='kube-system', mirror=True),
+            ],
+        },
+    )
+    manager = manager_for(fake)
+    before = manager.node_lifecycle_plan('gpu-a')
+    assert before.schedulable
+    assert before.control_plane
+    assert before.workload_pods == ['kubeai/model']
+    assert sorted(before.retained_pods) == [
+        'kube-system/kube-apiserver',
+        'nvidia-device-plugin/nvidia-plugin',
+    ]
+
+    detached = manager.detach_node_for_compose('gpu-a', timeout_seconds=42)
+    assert detached.detached_for_compose
+    assert not detached.schedulable
+    assert detached.workload_pods == []
+    assert any(
+        args == [
+            'kubectl', 'drain', 'gpu-a', '--ignore-daemonsets',
+            '--delete-emptydir-data', '--timeout=42s',
+        ]
+        for args, _ in fake.calls
+    )
+    assert not any(
+        args[:2] == ['systemctl', 'stop'] or args[:2] == ['sudo', 'systemctl']
+        for args, _ in fake.calls
+    )
+
+    attached = manager.attach_node_from_compose('gpu-a', timeout_seconds=19)
+    assert attached.schedulable
+    assert not attached.detached_for_compose
+    assert any(args == ['kubectl', 'uncordon', 'gpu-a'] for args, _ in fake.calls)
+
+
+def test_node_detach_refuses_unmanaged_pods_instead_of_force_deleting():
+    fake = FakeCluster(
+        nodes=[node('gpu-a')],
+        pods={'gpu-a': [pod('manual-debug', owner=None)]},
+    )
+    manager = manager_for(fake)
+    plan = manager.node_lifecycle_plan('gpu-a')
+    assert plan.unmanaged_pods == ['default/manual-debug']
+    assert not plan.can_detach
+    try:
+        manager.detach_node_for_compose('gpu-a')
+    except RuntimeError as ex:
+        assert 'without --force' in str(ex)
+    else:
+        raise AssertionError('expected unmanaged pod safety refusal')
+    assert not any(args[:2] == ['kubectl', 'drain'] for args, _ in fake.calls)
+
+
+def test_node_attach_refuses_to_undo_foreign_cordon():
+    fake = FakeCluster(nodes=[node('gpu-a', schedulable=False, detached=False)])
+    manager = manager_for(fake)
+    try:
+        manager.attach_node_from_compose('gpu-a')
+    except RuntimeError as ex:
+        assert 'operator-owned maintenance cordon' in str(ex)
+    else:
+        raise AssertionError('expected foreign cordon safety refusal')
+    assert not any(args[:2] == ['kubectl', 'uncordon'] for args, _ in fake.calls)
+
+
+def test_interrupted_detach_marker_can_be_retried():
+    interrupted = node('gpu-a', schedulable=False)
+    interrupted['metadata']['annotations']['infer-stack.io/compose-detached'] = 'requested'
+    fake = FakeCluster(
+        nodes=[interrupted],
+        pods={'gpu-a': [pod('model', namespace='kubeai')]},
+    )
+    manager = manager_for(fake)
+    before = manager.node_lifecycle_plan('gpu-a')
+    assert before.detach_owned
+    assert not before.detached_for_compose
+    assert before.workload_pods == ['kubeai/model']
+
+    after = manager.detach_node_for_compose('gpu-a')
+    assert after.detached_for_compose
+    assert after.workload_pods == []
+
+
+def test_node_rows_show_compose_detach_state():
+    rows = KubeManager.node_rows([
+        node('a'),
+        node('b', schedulable=False, detached=True),
+    ])
+    assert rows[0]['schedulable'] is True
+    assert rows[0]['detached_for_compose'] is False
+    assert rows[1]['schedulable'] is False
+    assert rows[1]['detached_for_compose'] is True
+
+
+def test_detach_marker_on_schedulable_node_is_detectable_conflict():
+    row = KubeManager.node_rows([
+        node('gpu-a', schedulable=True, detached=True),
+    ])[0]
+    assert row['schedulable'] is True
+    assert row['detached_for_compose'] is True

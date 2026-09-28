@@ -184,7 +184,8 @@ operator-owned profiles with the same names remain authoritative.
 
 ### 6. Verify the serving path
 
-After the cluster inventory is correct:
+After the cluster inventory is correct, a fresh Kubernetes-only control host
+can make KubeAI its durable default:
 
 ```bash
 infer-stack config set backend kubeai
@@ -192,8 +193,152 @@ infer-stack config set kubeai_gateway cluster
 infer-stack doctor
 ```
 
+If this machine already has a Compose deployment history that you want to keep
+and return to later, do **not** reuse that Compose ledger as the KubeAI ledger.
+Use the temporary-testing workflow below instead.
+
 Then exercise a real acquire/generation/release and the multi-host handoff
 checks described in [the KubeAI backend guide](kubeai-backend.md).
+
+## Temporarily swap Compose-configured workstations into a cluster
+
+It is common to start with workstations that already use infer-stack's Compose
+backend and temporarily pool them for KubeAI testing. There are two independent
+pieces of state to preserve:
+
+1. the workstation's existing Compose configuration/ledger; and
+2. the Kubernetes node's cluster identity.
+
+Neither needs to be destroyed. Use a separate KubeAI data root for the cluster
+authority, and temporarily **cordon + drain** a node when its physical GPU is
+being handed back to local Compose. The Kubernetes distribution agent keeps
+running throughout; `detach` does not uninstall, stop, or remove the node.
+
+### Keep the existing Compose authority intact
+
+Before using a Compose-configured machine as a Kubernetes GPU worker, quiesce
+its local Compose backend:
+
+```bash
+infer-stack release --all --evict
+infer-stack ps
+```
+
+On the one machine that will operate the KubeAI infer-stack authority, use an
+independent data root instead of changing the existing Compose default:
+
+```bash
+export INFER_STACK_BACKEND=kubeai
+export INFER_STACK_DATA_DIR="$HOME/.local/share/infer_stack-kubeai"
+
+# KubeAI-only settings can coexist with a persisted Compose default.
+infer-stack config set kubeai_gateway cluster
+infer-stack doctor
+```
+
+`INFER_STACK_BACKEND` overrides the persisted `backend: compose` only for the
+current shell. `INFER_STACK_DATA_DIR` gives KubeAI its own ledger and rendered
+state, which is important because recovery snapshots intentionally do not
+change backend kind inside one ledger. The normal catalog/config root remains
+shared, so the same endpoint definitions can be exercised on both backends.
+
+Workstation B does not need a local KubeAI infer-stack authority merely because
+it is a Kubernetes worker. Its existing Compose configuration can remain
+untouched while the authority on workstation A schedules KubeAI pods onto it.
+
+### Hand one node back to Compose
+
+If you are ending the KubeAI test entirely rather than removing only one
+worker, first quiesce the KubeAI authority while its temporary environment is
+still active:
+
+```bash
+infer-stack release --all --evict
+infer-stack ps
+```
+
+For a single-node handoff, detach can instead evict that node's workload pods;
+their controllers may reschedule them onto other attached workers.
+
+Run the node lifecycle command from any shell whose `kubectl` context has
+permission to drain the target node. The first invocation is a read-only
+preview:
+
+```bash
+infer-stack kube node detach <node-name>
+infer-stack kube node detach <node-name> --yes
+```
+
+Detach:
+
+- records that infer-stack owns this temporary cordon;
+- cordons the node so Kubernetes cannot schedule new ordinary workloads there;
+- drains controller-managed workload pods;
+- keeps DaemonSet/static pods and the Kubernetes agent/control plane running;
+- refuses unmanaged/bare pods instead of using `kubectl drain --force`.
+
+`infer-stack kube nodes` reports such a node with `SCHED=compose`. A K3s server
+that is also the sole control-plane node may be detached this way: the control
+plane remains running because detach does not stop the K3s service. Cluster
+workloads can of course become Pending if every worker is cordoned.
+
+After detach succeeds, use the target workstation's original Compose setup.
+If the current shell was the KubeAI authority shell, return to the persisted
+Compose default by dropping the temporary overrides:
+
+```bash
+unset INFER_STACK_BACKEND INFER_STACK_DATA_DIR
+infer-stack doctor
+```
+
+### Hand the node back to Kubernetes
+
+First stop/release every local Compose GPU workload on the target workstation:
+
+```bash
+infer-stack release --all --evict
+infer-stack ps
+```
+
+Then, from a cluster-admin shell, preview and explicitly re-enable scheduling:
+
+```bash
+infer-stack kube node attach <node-name>
+infer-stack kube node attach <node-name> --yes
+```
+
+`attach --yes` is the operator's assertion that local Compose no longer owns
+the GPU. It waits for the existing node to be Ready, uncordons it, and removes
+the infer-stack detach marker. It refuses to uncordon a node that was cordoned
+by someone else, so temporary backend switching cannot silently undo unrelated
+cluster maintenance.
+
+To operate KubeAI again on the authority machine:
+
+```bash
+export INFER_STACK_BACKEND=kubeai
+export INFER_STACK_DATA_DIR="$HOME/.local/share/infer_stack-kubeai"
+infer-stack doctor
+```
+
+There is no second `kube k3s join`: attach reuses the node identity and agent
+configuration that were preserved during detach.
+
+For two Compose-configured machines A and B, a complete test cycle is therefore:
+
+```text
+Compose A + Compose B
+  -> quiesce both Compose stacks
+  -> create/join Kubernetes once
+  -> use a separate KubeAI data root on A
+  -> test KubeAI on A+B
+  -> release KubeAI workloads
+  -> kube node detach A/B
+  -> use Compose A/B again
+  -> quiesce Compose A/B
+  -> kube node attach A/B
+  -> resume the same KubeAI authority/data root
+```
 
 ## Use an existing cluster
 
@@ -220,6 +365,9 @@ administrator:
 
 - `kube setup` owns only the integration components/capabilities infer-stack
   needs.
+- `kube node detach/attach` owns only a temporary scheduling cordon used to
+  hand a host's GPU between Kubernetes and local Compose; it does not remove
+  cluster membership.
 - Distribution-specific provisioning stays in scoped subcommands such as
   `kube k3s`.
 - Arbitrary cluster administration remains `kubectl`, Helm, and the chosen

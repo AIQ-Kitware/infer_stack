@@ -86,6 +86,7 @@ infer-stack config init               # data dir + default backend -> settings.y
 infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
 infer-stack catalog show              # what can be acquired
 infer-stack kube setup               # inspect/plan Kubernetes integration (read-only)
+infer-stack kube node detach NODE     # preview handing a cluster GPU host to Compose
 infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
 infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
 infer-stack test <endpoint>           # one generation through the gateway
@@ -566,6 +567,14 @@ infer-stack config set kubeai_gateway cluster
 infer-stack doctor
 infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
 ```
+
+If the workstation already has a Compose ledger/configuration that you plan to
+return to, keep that authority intact rather than switching backend kinds in
+the same ledger. The cluster setup guide documents the temporary test pattern:
+use `INFER_STACK_BACKEND=kubeai` with a separate KubeAI data root, and use
+`infer-stack kube node detach/attach` to hand each physical GPU host between
+Kubernetes scheduling and direct Compose use without uninstalling or rejoining
+the node. See [docs/cluster-setup.md](docs/cluster-setup.md).
 
 ### Kubernetes cluster setup and KubeAI integration
 
