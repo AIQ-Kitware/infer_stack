@@ -358,3 +358,30 @@ def test_k3s_bootstrap_existing_server_does_not_fetch_installer(monkeypatch):
         args[:3] == ['kubectl', '--kubeconfig', str(k3s.K3S_KUBECONFIG)]
         for args, _ in calls
     )
+
+
+def test_generic_setup_missing_kubectl_hint_is_distribution_neutral():
+    manager = KubeManager(run=lambda args, **kwargs: '')
+    manager.command_exists = lambda name: False
+    plan = manager.plan_setup()
+    assert plan.failed
+    details = '\n'.join(check.detail for check in plan.checks)
+    assert 'k3s' not in details.lower()
+    assert 'distribution-specific' in details
+
+
+def test_generic_setup_runtime_hint_is_distribution_neutral():
+    fake = FakeCluster(
+        nodes=[node(product=None, memory=None, count=None)],
+        runtime_class=False,
+        crd=True,
+        namespace=True,
+        service=True,
+        releases=[],
+    )
+    manager = manager_for(fake)
+    plan = manager.plan_setup(gpu='nvidia')
+    assert plan.failed
+    details = '\n'.join(check.detail for check in plan.checks)
+    assert 'k3s' not in details.lower()
+    assert 'cluster/distribution' in details

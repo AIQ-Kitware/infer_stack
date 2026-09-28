@@ -1,8 +1,11 @@
-"""Kubernetes integration helpers used by ``infer-stack kube``.
+"""Distribution-neutral Kubernetes integration helpers.
 
-This package deliberately manages only the Kubernetes capabilities infer-stack
-needs.  It is not a kubectl replacement: arbitrary cluster administration stays
-with Kubernetes-native tools.
+The generic layer models only capabilities visible through Kubernetes APIs and
+Helm.  Distribution provisioning is deliberately kept in leaf modules such as
+:mod:`infer_stack.kube.k3s`; generic setup must not depend on one distribution.
+
+This package is not a kubectl replacement: arbitrary cluster administration
+stays with Kubernetes-native tools.
 """
 
 from .manage import KubeManager, SetupPlan

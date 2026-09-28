@@ -4,6 +4,12 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Kubernetes integration setup moves into `infer-stack kube`
 
+- Kept the generic Kubernetes manager/backend distribution-neutral: generic
+  diagnostics now describe Kubernetes capabilities rather than K3s remediation,
+  while K3s provisioning remains isolated under `infer-stack kube k3s`. Added a
+  dedicated cluster setup runbook that documents the control-plane/worker model,
+  K3s as the first provisioning target, and the contract future distro-specific
+  integrations must preserve.
 - Added `infer-stack kube nodes` and capability-driven `infer-stack kube setup`;
   setup is read-only by default and `--apply` reconciles only infer-stack's
   Kubernetes integration requirements. Existing GPU Operator / managed-cluster

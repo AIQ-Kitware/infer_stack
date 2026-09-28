@@ -530,6 +530,7 @@ def test_doctor_stops_at_first_missing_dependency(tmp_path):
     checks = be.doctor()
     assert checks[0][1] is False
     assert 'kubeconfig' in checks[0][2]
+    assert 'k3s' not in checks[0][2].lower()
     assert len(checks) == 1               # later checks would only cascade
 
 

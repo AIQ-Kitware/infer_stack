@@ -1,7 +1,9 @@
 """Kubernetes integration commands.
 
-``kube`` intentionally exposes only infer-stack's integration surface.  Use
-``kubectl``/``helm`` for arbitrary cluster administration.
+The top-level ``kube`` surface is distribution-neutral and exposes only the
+capabilities infer-stack needs.  Provisioning integrations live in explicitly
+scoped subcommands such as ``kube k3s``.  Use ``kubectl``/``helm`` for arbitrary
+cluster administration.
 """
 
 from __future__ import annotations
@@ -169,7 +171,7 @@ class K3sBootstrapCLI(kw.Config):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        from ..kube.k3s import bootstrap
+        from ..kube.k3s import K3S_NODE_TOKEN, bootstrap
 
         try:
             default_kubeconfig_ready = bootstrap(version=config.version)
@@ -183,7 +185,9 @@ class K3sBootstrapCLI(kw.Config):
                 'current context selects this K3s cluster (or set KUBECONFIG) '
                 'before running setup.'
             )
-        print('Next: infer-stack kube setup')
+        print(f'K3s join token: sudo cat {K3S_NODE_TOKEN}')
+        print('Join workers with: infer-stack kube k3s join --server=... --token-file=...')
+        print('Then: infer-stack kube setup')
         return 0
 
 
@@ -218,7 +222,11 @@ class K3sJoinCLI(kw.Config):
 
 
 class K3sModalCLI(kw.ModalCLI):
-    """Create/join K3s clusters; not required for existing Kubernetes clusters."""
+    """First supported provisioning target: create/join K3s clusters.
+
+    This namespace is intentionally distribution-specific.  Existing clusters
+    and future provisioning integrations use the same generic ``kube setup``.
+    """
 
     __command__ = 'k3s'
     bootstrap = K3sBootstrapCLI
@@ -226,7 +234,7 @@ class K3sModalCLI(kw.ModalCLI):
 
 
 class KubeModalCLI(kw.ModalCLI):
-    """Inspect/setup the Kubernetes capabilities used by infer-stack."""
+    """Inspect/setup infer-stack capabilities on any Kubernetes distribution."""
 
     __command__ = 'kube'
     nodes = KubeNodesCLI

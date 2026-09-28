@@ -37,7 +37,11 @@ Where the two backends match and where they still differ, row by row:
 
 ## One-time cluster setup
 
-The normal setup path is now capability-driven and lives in the CLI:
+For the control-plane/worker mental model and the full create/join runbook, see
+[cluster-setup.md](cluster-setup.md). The generic integration is
+distribution-neutral; K3s is only the first scoped provisioning target.
+
+The normal setup path is capability-driven and lives in the CLI:
 
 ```bash
 # Existing cluster: just point kubectl at it. For a new local K3s server:
@@ -155,7 +159,7 @@ needed. `secrets rotate` updates its Secret and rolls it; `doctor` checks it;
 `kubeai_gateway_url` (an ingress URL clients should use instead). Static
 routes only: dynamic routing and Open WebUI need the host placement.
 
-## Add a workstation
+## Add a workstation with the K3s provisioning integration
 
 On the server node, copy the K3s token into a protected file on the new host
 through whatever secure channel you normally use, and record the server's K3s

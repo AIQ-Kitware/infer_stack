@@ -155,3 +155,39 @@ K3s remains an explicit convenience implementation underneath Kubernetes rather 
 I also factored KubeAI resource-profile generation into a shared backend helper so `catalog suggest` and cluster setup use the same mapping, updated KubeAI doctor/catalog remediation text, and rewrote the README/KubeAI backend/parity docs around the new plan/apply authority. A late review caught two important edge cases: Helm may be absent only when every needed GPU/KubeAI capability is already externally managed; if the plan has any reconciliation action, missing Helm is a required blocker. Also, preserving existing Helm values must not copy `secrets.*` (including a prior Hugging Face token) into generated YAML; those values are now split into the ephemeral secret file and preserved across upgrades without being persisted by infer-stack. The explicit K3s subcommands inherit `kw.Config`, matching the rest of the kwconf command surface.
 
 Validation in this extracted/offline checkout: `python -m compileall -q infer_stack tests`, `bash -n` on the compatibility wrappers, and `git diff --check` pass. `tests/test_cli_kube.py` plus four focused existing KubeAI sizing/measurement tests pass (14 passed, 60 deselected). Running the complete two relevant test files reaches 67 passing tests; the remaining seven tests fail at collection/import only because `kwconf` is not installed in this container. A minimal temporary kwconf/ubelt shape stub outside the repository successfully imports the complete CLI tree and verifies the nested `ManageCLI.kube -> KubeModalCLI.k3s -> bootstrap/join` registration. Package-index DNS is unavailable, so I could not execute the real kwconf parser/help tree or the full project suite; those should be run in the normal development environment before merge.
+
+## 2026-09-28 13:52:00 -0400
+
+Summary of user intent: keep the new Kubernetes integration from acquiring K3s
+as an architectural dependency while retaining K3s as infer-stack's first
+well-supported workstation-cluster provisioning path.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I tightened the distribution boundary rather than inventing a provider
+abstraction before a second provisioning integration exists. The generic
+`KubeManager` and KubeAI backend diagnostics no longer mention K3s-specific
+remediation; they report missing Kubernetes/container-runtime capabilities in
+distribution-neutral terms. K3s knowledge remains in the explicit
+`infer_stack.kube.k3s` leaf module and `infer-stack kube k3s` CLI namespace.
+Package/CLI docstrings now state that separation explicitly.
+
+I added `docs/cluster-setup.md` as the operator runbook. It distinguishes the
+Kubernetes control plane from infer-stack authority, shows the initial K3s
+server + agent topology (with the server also usable as a GPU worker), gives the
+create/join/reconcile sequence, and gives an existing-cluster path that starts
+directly at `kube nodes` / `kube setup`. README and the KubeAI backend guide
+link to this runbook and identify K3s as the first provisioning target rather
+than the generic backend. Focused tests assert that generic missing-kubectl and
+missing-NVIDIA-runtime diagnostics remain distribution-neutral.
+
+Validation: with the same minimal offline ubelt/kwconf stubs used for the prior
+overlay, `tests/test_cli_kube.py` passes 12/12. The Kubernetes CLI suite plus
+the non-parser KubeAI sizing/doctor checks pass 16/16. Running both complete
+relevant files reaches 71 passed / 5 failed; every failure is a CLI-entry test
+that reaches the intentional `kwconf.Config.cli` stub, so the real kwconf parser
+remains the only unavailable test dependency in this environment. `compileall`,
+`bash -n` on both compatibility wrappers, and `git diff --check` pass. A
+cumulative archive was applied to a pristine extraction of the supplied source;
+all overlay files compared byte-identical, executable modes were preserved, and
+the 16-test focused verification passed there as well.

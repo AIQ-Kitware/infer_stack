@@ -275,8 +275,8 @@ class KubeManager:
         if not self.command_exists('kubectl'):
             plan.checks.append(Check(
                 'kubectl available', False,
-                'install kubectl or use `infer-stack kube k3s bootstrap` '
-                'on a new K3s server',
+                'install kubectl and select a Kubernetes context; cluster '
+                'provisioning is distribution-specific',
             ))
             return plan
         plan.checks.append(Check('kubectl available', True))
@@ -338,8 +338,9 @@ class KubeManager:
                 plan.checks.append(Check(
                     'RuntimeClass nvidia', runtime_ok,
                     '' if runtime_ok else (
-                        'Kubernetes has no nvidia RuntimeClass; on K3s install '
-                        'nvidia-container-runtime before starting/restarting K3s'
+                        'Kubernetes has no nvidia RuntimeClass; configure the '
+                        'NVIDIA container runtime for this cluster/distribution '
+                        'before rerunning setup'
                     ),
                 ))
                 level = 'action' if runtime_ok else 'required'

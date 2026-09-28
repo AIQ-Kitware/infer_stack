@@ -542,7 +542,10 @@ services and the cluster scheduler in place of the local GPU planner. The
 LiteLLM gateway still fronts everything, so a card sees one `OPENAI_BASE_URL`,
 the managed key and the endpoint alias on either backend.
 
-* Setup, settings and semantics: [docs/kubeai-backend.md](docs/kubeai-backend.md).
+* Creating/joining a cluster and the distribution boundary:
+  [docs/cluster-setup.md](docs/cluster-setup.md).
+* KubeAI setup, settings and semantics:
+  [docs/kubeai-backend.md](docs/kubeai-backend.md).
 * What matches Compose, what does not yet, and what is deliberate:
   [docs/backend-parity.md](docs/backend-parity.md); the plan to close the
   rest: [docs/planning/backend-parity-roadmap.md](docs/planning/backend-parity-roadmap.md).
@@ -564,12 +567,15 @@ infer-stack doctor
 infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
 ```
 
-### KubeAI cluster setup
+### Kubernetes cluster setup and KubeAI integration
 
-`infer-stack kube` owns the integration knowledge, not Kubernetes itself. An
-existing kubeadm/RKE2/EKS/etc. cluster is first-class: point `kubectl` at it
-and start with `infer-stack kube setup`. K3s is only the convenient local
-bootstrap path.
+See [docs/cluster-setup.md](docs/cluster-setup.md) for the server/worker mental
+model and the complete first-cluster runbook. `infer-stack kube` owns the
+integration knowledge, not Kubernetes itself. Its generic commands are
+distribution-neutral: an existing kubeadm/RKE2/k0s/EKS/etc. cluster is
+first-class once `kubectl` selects it. K3s is the first explicitly supported
+**provisioning** integration and therefore lives under `infer-stack kube k3s`,
+not in the generic manager/backend.
 
 `kube setup` is a plan/apply command. The default is read-only and checks the
 cluster, Ready nodes, NVIDIA scheduling/discovery capabilities, Helm, KubeAI,

@@ -1298,7 +1298,7 @@ class KubeaiBackend(ConvergeScaffold):
         if not _run_check(
             'cluster reachable',
             ['version', '--client=false', '-o', 'json'],
-            'is the kubeconfig set up? (`infer-stack kube setup`; for new K3s: `infer-stack kube k3s bootstrap`)',
+            'select a reachable Kubernetes kubeconfig/context, then run `infer-stack kube setup`',
         ):
             return checks
         if not _run_check(

@@ -1,4 +1,8 @@
-"""Explicit K3s convenience path for creating/joining infer-stack clusters."""
+"""K3s-specific cluster provisioning convenience.
+
+This is a leaf integration beneath the distribution-neutral ``infer_stack.kube``
+capability layer.  Generic setup/backends must not depend on this module.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ def _active(run: RunFunc, service: str) -> bool:
 
 
 K3S_KUBECONFIG = Path('/etc/rancher/k3s/k3s.yaml')
+K3S_NODE_TOKEN = Path('/var/lib/rancher/k3s/server/node-token')
 
 
 def _ensure_default_kubeconfig_link() -> bool:
