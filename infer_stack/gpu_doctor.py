@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 __all__ = ['GpuSample', 'Holder', 'gpu_checks']
 
@@ -210,10 +210,12 @@ def gpu_checks(use_sudo: bool = False, *, _sample=None, _apps=None,
 
     holders = _holders() if _holders else device_holders(use_sudo)
     if holders is None:
-        yield ('device holders', True,
+        yield ('device holders', False,
                'not checked — needs root, and unprivileged this can only see '
                'your own processes, which would read as a false all-clear. '
-               'Re-run with --sudo.')
+               + ('Sudo was requested but non-interactive elevation or the scan failed. '
+                'Run sudo -v, then retry with --sudo.' if use_sudo else
+                'Re-run with --sudo.'))
         return
 
     unexpected = [h for h in holders if not h.expected]

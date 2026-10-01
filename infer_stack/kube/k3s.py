@@ -49,6 +49,8 @@ def _ensure_default_kubeconfig_link() -> bool:
 
     Existing kubeconfig state is operator authority and is never replaced.
     """
+    if os.environ.get('KUBECONFIG'):
+        return os.environ['KUBECONFIG'] == str(K3S_KUBECONFIG)
     target = Path.home() / '.kube' / 'config'
     if target.exists() or target.is_symlink():
         if target.is_symlink():
@@ -66,7 +68,7 @@ def _ensure_helm(run: RunFunc) -> None:
     if shutil.which('helm') is not None:
         return
     installer = run(['curl', '-fsSL', HELM_INSTALL_URL])
-    run(['bash', '-s', '--'], input_text=installer)
+    run(['sudo', '-n', 'bash', '-s', '--'], input_text=installer)
 
 
 def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool:
@@ -74,10 +76,12 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
 
     NVIDIA drivers/container runtime are intentionally not installed here.
     K3s detects an already-installed NVIDIA container runtime when it starts;
-    ``infer-stack kube setup`` reports the resulting RuntimeClass/capabilities.
+    ``infer-stack kube doctor`` reports the resulting RuntimeClass/capabilities.
     """
     run = run or default_run
     _require_local_tool('sudo')
+    if _active(run, 'k3s-agent'):
+        raise RuntimeError('This host is a K3s agent; refusing to replace it with a server')
     already_active = _active(run, 'k3s')
     if already_active and version:
         installed = run(['k3s', '--version']).splitlines()[0]
@@ -94,16 +98,20 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
         file.write('write-kubeconfig-mode: "0644"\n')
         source = file.name
     try:
-        run(['sudo', 'mkdir', '-p', '/etc/rancher/k3s/config.yaml.d'])
+        run(['sudo', '-n', 'mkdir', '-p', '/etc/rancher/k3s/config.yaml.d'])
         run([
-            'sudo', 'install', '-m', '0644', source,
+            'sudo', '-n', 'install', '-m', '0644', source,
             '/etc/rancher/k3s/config.yaml.d/10-infer-stack-kubeconfig-mode.yaml',
         ])
     finally:
         Path(source).unlink(missing_ok=True)
 
     if already_active:
-        run(['sudo', 'systemctl', 'restart', 'k3s'])
+        # Updating the mode fragment does not require restarting a working
+        # control plane. Repair current access directly; next start uses it too.
+        run(['sudo', '-n', 'chmod', '0644', str(K3S_KUBECONFIG)])
+    elif shutil.which('k3s') is not None:
+        run(['sudo', '-n', 'systemctl', 'start', 'k3s'])
     else:
         installer = _fetch_installer(run)
         env = os.environ.copy()
@@ -111,7 +119,7 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
         if version:
             env['INSTALL_K3S_VERSION'] = version
             preserve.append('INSTALL_K3S_VERSION')
-        cmd = ['sudo']
+        cmd = ['sudo', '-n']
         if preserve:
             cmd.append('--preserve-env=' + ','.join(preserve))
         cmd.extend(['sh', '-'])

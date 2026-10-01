@@ -9,6 +9,7 @@ deployments), with pointers to dig deeper.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -123,13 +124,14 @@ def _leasing_status() -> dict[str, Any]:
 
     path = default_ledger_path()
     out: dict[str, Any] = {'path': str(path), 'exists': path.exists(),
-                           'leases': [], 'deployments': [], 'summary': None}
+                           'leases': [], 'deployments': [], 'summary': None, 'recovery_profile': None}
     if not path.exists():
         return out
     try:
         ledger = Ledger(SqliteStore(str(path)))
         leases, deployments = ledger.status(virtual_expiry=True)
         out['pending'] = ledger.publication_pending() is not None
+        out['recovery_profile'] = ledger.profile()
     except Exception:  # noqa: BLE001
         return out
     active = sum(1 for le in leases if le.state == LeaseState.ACTIVE)
@@ -224,13 +226,29 @@ def _gather_status(config) -> dict[str, Any]:
         backend = None
     rendered = getattr(backend, 'rendered_file', None)
     leasing = _leasing_status()
+    active_profile = leasing.get('recovery_profile')
+    configured_backend = os.environ.get('INFER_STACK_BACKEND', '').strip() or get_setting('backend') or 'null'
+    recovery_backend = (active_profile or {}).get('backend')
+    # Interpret old deployment rows using their frozen backend, never the new
+    # configured kind. Failure to inspect it remains unknown in the status view.
+    if active_profile:
+        from types import SimpleNamespace
+        try:
+            active_config = SimpleNamespace(**{**config.asdict(), 'backend': recovery_backend})
+            backend = _day2_backend(active_config)
+            backend.recovery_profile.use_profile(active_profile)
+            rendered = getattr(backend, 'rendered_file', None)
+        except (SystemExit, Exception):
+            backend = None
+            rendered = None
     if leasing.get('live_deployments'):
         leasing['served'] = _served_models(leasing.pop('live_deployments'), backend,
                                            pending=bool(leasing.get('pending')))
     else:
         leasing.pop('live_deployments', None)
     return {
-        'backend': str(get_setting('backend') or 'null'),
+        'backend': str(configured_backend),
+        'recovery_backend': recovery_backend,
         'data_dir': str(data_root()),
         'config_dir': str(config_root()),
         'configured': settings_path().exists(),
@@ -285,7 +303,10 @@ def _served_lines(served: list[tuple[str, str, str, str]]) -> list[str]:
 
 def _print_status_plain(d: dict[str, Any]) -> None:
     print('infer-stack status')
-    print(f'  backend:     {d["backend"]}')
+    print(f'  configured backend: {d["backend"]}')
+    print(f'  active recovery backend: {d["recovery_backend"] or "(none — no active snapshot)"}')
+    if d['recovery_backend'] and d['recovery_backend'] != d['backend']:
+        print('  transition required: quiesce the old backend, then infer-stack ledger rotate --yes')
     print(f'  data dir:    {d["data_dir"]}')
     print(f'  config dir:  {d["config_dir"]}')
     cat = d['catalog']
@@ -328,7 +349,10 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
     table.add_column(style='bold', justify='left', no_wrap=True)
     table.add_column(overflow='fold')
 
-    table.add_row('backend', Text(d['backend'], style='bold cyan'))
+    table.add_row('configured backend', Text(d['backend'], style='bold cyan'))
+    table.add_row('active recovery backend', Text(d['recovery_backend'] or '(none — no active snapshot)', style='cyan'))
+    if d['recovery_backend'] and d['recovery_backend'] != d['backend']:
+        table.add_row('transition required', 'Quiesce the old backend, then infer-stack ledger rotate --yes')
     table.add_row('data dir', Text(d['data_dir'], style='cyan'))
     table.add_row('config dir', Text(d['config_dir'], style='cyan'))
     cat = d['catalog']

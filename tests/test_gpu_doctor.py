@@ -50,7 +50,7 @@ def test_unprivileged_holder_check_is_unknown_not_clear():
     res = _checks(_sample=lambda: [GpuSample(0, 0, 2)], _apps=lambda: [],
                   _holders=lambda: None)
     ok, detail = res['device holders']
-    assert ok is True                      # not a failure, but...
+    assert ok is False                     # incomplete diagnostic must not pass
     assert 'not checked' in detail         # ...explicitly not an all-clear
     assert '--sudo' in detail
 
@@ -111,3 +111,12 @@ def test_sampling_takes_the_minimum_so_one_spike_is_not_load():
 def test_no_gpus_is_a_failure_not_a_pass():
     res = _checks(_sample=lambda: [], _apps=lambda: [], _holders=lambda: [])
     assert res['GPUs visible'][0] is False
+
+
+def test_requested_sudo_unavailable_has_actionable_hint():
+    res = _checks(use_sudo=True, _sample=lambda: [GpuSample(0, 0, 2)],
+                  _apps=lambda: [], _holders=lambda: None)
+    ok, detail = res['device holders']
+    assert not ok
+    assert 'sudo -v' in detail
+    assert 'Re-run with --sudo' not in detail

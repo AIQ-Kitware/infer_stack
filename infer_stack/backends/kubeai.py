@@ -23,7 +23,7 @@ simultaneously desired deployments are reported loudly (``last_unplaced`` /
 ``last_errors``), never silently overwritten.
 
 Cluster prerequisites (once per cluster, not per acquire): a reachable
-kubeconfig, KubeAI installed (normally via ``infer-stack kube setup --apply``)
+kubeconfig, KubeAI installed (normally via ``infer-stack kube install --apply``)
 with ``resourceProfiles`` matching the ``resource_profile`` names your catalog
 uses, and a route to the gateway (the default ``base_url`` assumes
 ``kubectl port-forward svc/kubeai 8000:80``). See ``docs/kubeai-backend.md``.
@@ -106,8 +106,9 @@ def _model_doc(
     ``spec.args`` reuses the exact arg pipeline the compose backend renders
     with (``_vllm_service_dict`` + ``vllm_args``), so every serving knob the
     compat key distinguishes (revision/quantization/dtype/pp/...) reaches the
-    engine here too. ``served_model_name`` is overridden to the CR name so the
-    gateway's request name and vLLM's served name agree.
+    engine here too. KubeAI injects the served name from the CR name before
+    spec.args (engine_vllm.go); emit only the remaining infer-stack flags.
+    Environment templates use that same CR identity.
     """
     name = name or model_name(deployment)
     svc = vllm_service_dict(deployment)
@@ -128,7 +129,7 @@ def _model_doc(
         'resourceProfile': profile,
         'minReplicas': min_replicas,
         'maxReplicas': max_replicas,
-        'args': vllm_args(svc),
+        'args': vllm_args(svc, include_served_name=False),
     }
     doc: dict[str, Any] = {
         'apiVersion': 'kubeai.org/v1',
@@ -756,7 +757,7 @@ class KubeaiBackend(ConvergeScaffold):
     def gpu_facts(self) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
         """``(each node's GPUs, each sized profile's GPU GiB)`` from the cluster.
 
-        Empty when the cluster cannot say (no GPU labels, no chart config):
+        Node facts survive missing chart config; installed sizing is empty then:
         sizing then falls back to the default profile, as before.
         """
         import time
@@ -765,17 +766,28 @@ class KubeaiBackend(ConvergeScaffold):
         if cached is not None and time.monotonic() - cached[0] < self.GPU_FACTS_TTL:
             return cached[1]
         try:
-            nodes = (json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
-                     .get('items') or [])
-            config = json.loads(self._kubectl(
-                ['get', 'configmap', self.CONFIG_MAP, '-o', 'json']) or '{}')
-            system = yaml.safe_load(((config.get('data') or {}).get('system.yaml')) or '') or {}
-            facts = node_gpus(nodes)
-            sized = sized_profiles(system.get('resourceProfiles') or {}, facts)
-        except Exception:  # noqa: BLE001 - sizing is best-effort, never fatal
-            facts, sized = {}, {}
+            facts = self.node_gpu_facts()
+        except Exception:  # node discovery is best-effort
+            facts = {}
+        try:
+            profiles = self.installed_resource_profiles()
+            sized = sized_profiles(profiles, facts)
+        except Exception:  # missing/malformed chart config must not erase nodes
+            sized = {}
         self._gpu_facts_cache = (time.monotonic(), (facts, sized))
         return facts, sized
+
+    def node_gpu_facts(self) -> dict[str, dict[str, Any]]:
+        """Discover Kubernetes GPUs independently of KubeAI installation."""
+        nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
+        return node_gpus(nodes.get('items') or [])
+
+    def installed_resource_profiles(self) -> dict[str, Any]:
+        """Read installed chart profiles; callers decide how to handle absence."""
+        config = json.loads(self._kubectl(
+            ['get', 'configmap', self.CONFIG_MAP, '-o', 'json']) or '{}')
+        system = yaml.safe_load((config.get('data') or {}).get('system.yaml', '')) or {}
+        return system.get('resourceProfiles') or {}
 
     def suggestion_inventory(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """``(inventory, resourceProfiles)`` for ``catalog suggest``.
@@ -964,7 +976,9 @@ class KubeaiBackend(ConvergeScaffold):
 
             raise ProfileMismatch(
                 f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
-                'tear down the old backend before switching backend kinds'
+                'quiesce the old backend (release leases and tear down workloads), then '
+                'start a new ledger/recovery epoch with `infer-stack ledger rotate --yes` '
+                'for the configured backend; stack down alone retains the old snapshot'
             )
         from ..leasing.profile import CatalogUnion
 
@@ -1019,7 +1033,7 @@ class KubeaiBackend(ConvergeScaffold):
                 raise RuntimeError(
                     f'kubectl apply failed: {ex}\n'
                     'Is the KubeAI chart installed and the kubeconfig '
-                    'reachable? See `infer-stack kube setup` and '
+                    'reachable? See `infer-stack kube doctor` and '
                     'docs/kubeai-backend.md.'
                 ) from ex
         # Prune: managed Models on the cluster that the render dropped. Their
@@ -1265,6 +1279,11 @@ class KubeaiBackend(ConvergeScaffold):
         """
         return self.gateway.settle_snapshot() if self.gateway is not None else None
 
+    def recovery_blockers(self) -> list[str]:
+        """Strict transition gate, including Models whose pods have not started."""
+        return ([f'Model/{name}' for name in self._cluster_models()]
+                + [i.name for i in self.instances()])
+
     def down(self) -> None:
         """Delete every infer-stack-managed Model (explicit stop), and the gateway."""
         for name in sorted(self._cluster_models()):
@@ -1298,21 +1317,21 @@ class KubeaiBackend(ConvergeScaffold):
         if not _run_check(
             'cluster reachable',
             ['version', '--client=false', '-o', 'json'],
-            'select a reachable Kubernetes kubeconfig/context, then run `infer-stack kube setup`',
+            'select a reachable Kubernetes kubeconfig/context, then run `infer-stack kube doctor`',
         ):
             return checks
         if not _run_check(
             'KubeAI Model CRD installed',
             ['get', 'crd', 'models.kubeai.org', '-o', 'name'],
-            'run `infer-stack kube setup` to inspect, then `infer-stack kube setup --apply`',
+            'run `infer-stack kube doctor` to inspect, then `infer-stack kube install --apply`',
         ):
             return checks
-        _run_check(
+        if not _run_check(
             f'namespace {self.namespace!r} exists',
             ['get', 'namespace', self.namespace, '-o', 'name'],
-            f'kubectl create namespace {self.namespace} (or install the '
-            'chart there)',
-        )
+            f'infer-stack kube install --namespace={self.namespace} --apply',
+        ):
+            return checks
         if getattr(self.gateway, 'in_cluster', False):
             # Clients use the gateway in the cluster; no port-forward needed.
             checks.append(self.gateway.doctor_check())
@@ -1327,9 +1346,8 @@ class KubeaiBackend(ConvergeScaffold):
         except Exception as ex:  # noqa: BLE001 - report, don't raise
             ok = False
             detail = (
-                f'{ex} — is the gateway routed? e.g. '
-                f'`kubectl -n {self.namespace} port-forward svc/kubeai '
-                '8000:80` (or set kubeai_base_url)'
+                f'{ex} — inspect `infer-stack kube status`, then '
+                'set a reachable API with `infer-stack config set kubeai_base_url <URL>`'
             )
         # KubeAI's own API (what the port-forward reaches), not infer-stack's
         # LiteLLM gateway, which starts with the first acquire.

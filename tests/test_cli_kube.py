@@ -412,6 +412,8 @@ def test_k3s_bootstrap_existing_server_does_not_fetch_installer(monkeypatch):
 
     def fake_run(args, **kwargs):
         calls.append((list(args), dict(kwargs)))
+        if args == ['systemctl', 'is-active', '--quiet', 'k3s-agent']:
+            raise RuntimeError('inactive')
         if args == ['systemctl', 'is-active', '--quiet', 'k3s']:
             return 'active\n'
         if args == ['k3s', '--version']:
@@ -424,7 +426,7 @@ def test_k3s_bootstrap_existing_server_does_not_fetch_installer(monkeypatch):
     ready = k3s.bootstrap(version='v1.34.3+k3s1', run=fake_run)
     assert ready is True
     assert not any(args and args[0] == 'curl' for args, _ in calls)
-    assert any(args[:3] == ['sudo', 'systemctl', 'restart'] for args, _ in calls)
+    assert not any('restart' in args for args, _ in calls)
     assert any(
         args[:3] == ['kubectl', '--kubeconfig', str(k3s.K3S_KUBECONFIG)]
         for args, _ in calls

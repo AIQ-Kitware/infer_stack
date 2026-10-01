@@ -234,6 +234,61 @@ class SqliteStore:
                 if 'duplicate column' not in str(ex).lower():
                     raise
 
+    def backup_to(self, path: Path) -> None:
+        """Publish a consistent SQLite archive, including committed WAL contents.
+
+        The caller holds the controller publication lock. A temporary file plus
+        atomic replace ensures an interrupted backup is never a valid archive.
+        """
+        import os
+        import tempfile
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.ledger-backup-', dir=path.parent)
+        os.close(fd)
+        try:
+            with self._lock, contextlib.closing(sqlite3.connect(temporary)) as destination:
+                self._conn._conn.backup(destination)
+            with open(temporary, 'rb') as file:
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def start_backend_epoch(self, profile: dict, archive: dict, *,
+                            expected_profile: dict, expected_version: int) -> None:
+        """Atomically replace archived history with a new backend snapshot.
+
+        Keep the same database inode: other processes may already hold SQLite
+        connections. Replacing/renaming the live DB would strand those writers
+        in the old epoch. The new profile rejects them at their next mutation.
+        """
+        from .profile import ProfileMismatch
+
+        with self.transaction() as conn:
+            if (self.profile() != expected_profile
+                    or self.admission_state_version() != expected_version):
+                raise ProfileMismatch('Ledger changed during rotation; review and retry')
+            archives = self.meta_json('ledger_archives', [])
+            conn.execute('DELETE FROM claims')
+            conn.execute('DELETE FROM leases')
+            conn.execute('DELETE FROM deployments')
+            conn.execute('DELETE FROM service_addresses')
+            conn.execute("DELETE FROM meta WHERE key NOT IN "
+                         "('schema_version', 'desired_gen', 'applied_gen', "
+                         "'admission_state_version', 'ledger_archives')")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('ledger_archives', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (_dumps([*archives, archive]),))
+            self._write_profile(profile)
+            self.bump_desired_generation()
+
     def close(self) -> None:
         """Close the owned sqlite connection. Safe to call more than once."""
         self._conn.close()

@@ -2377,7 +2377,9 @@ class ComposeBackend(ConvergeScaffold):
 
             raise ProfileMismatch(
                 f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
-                'tear down the old backend before switching backend kinds'
+                'quiesce the old backend (release leases and tear down workloads), then '
+                'start a new ledger/recovery epoch with `infer-stack ledger rotate --yes` '
+                'for the configured backend; stack down alone retains the old snapshot'
             )
         self.project = profile['project']
         self.litellm = profile['litellm']

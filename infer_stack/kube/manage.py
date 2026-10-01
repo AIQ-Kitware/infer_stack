@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -49,6 +47,7 @@ def default_run(
         env=env,
         text=True,
         capture_output=True,
+        timeout=360 if ('upgrade' in args or 'wait' in args) else 60,
         check=False,
     )
     if proc.returncode:
@@ -385,11 +384,6 @@ class KubeManager:
         """``(resource exposed, discovery labels complete, detail)``."""
         facts = node_gpus(nodes)
         gpu_nodes = {name: f for name, f in facts.items() if f.get('count')}
-        resource_ok = bool(gpu_nodes)
-        labels_ok = bool(gpu_nodes) and all(
-            f.get('product') and f.get('memory_gib')
-            for f in gpu_nodes.values()
-        )
         if not gpu_nodes:
             return False, False, 'no node exposes allocatable nvidia.com/gpu'
         total = sum(int(f.get('count') or 0) for f in gpu_nodes.values())
@@ -419,14 +413,16 @@ class KubeManager:
         found = self.kubeai_release(release)
         if found is None or str(found.get('namespace') or '') != namespace:
             return {}
-        try:
-            text = self.run([
-                'helm', 'get', 'values', release,
-                '-n', namespace, '-o', 'yaml',
-            ])
-        except Exception:
-            return {}
-        return yaml.safe_load(text or '') or {}
+        # An unreadable existing release is not an empty values mapping:
+        # silently treating it as one would discard operator configuration.
+        text = self.run([
+            'helm', 'get', 'values', release,
+            '-n', namespace, '-o', 'yaml',
+        ])
+        values = yaml.safe_load(text or '') or {}
+        if not isinstance(values, dict):
+            raise RuntimeError('Installed KubeAI Helm values must be a mapping')
+        return values
 
     @staticmethod
     def load_values_file(path: str | Path | None) -> dict[str, Any]:
@@ -715,55 +711,16 @@ class KubeManager:
         resource_profiles: dict[str, Any],
         version: str | None = None,
         operator_values: dict[str, Any] | None = None,
+        chart: str = 'kubeai/kubeai',
     ) -> Path:
-        self.run([
-            'helm', 'repo', 'add', 'kubeai', KUBEAI_REPO, '--force-update'
-        ])
-        self.run(['helm', 'repo', 'update'])
-        base_values = self._deep_merge(
-            self._existing_kubeai_values(release, namespace),
-            operator_values or {},
-        )
-        public_values, secret_values = self._split_secret_values(base_values)
-        values = self._merge_profiles(public_values, resource_profiles)
+        from ..kubeai_ops import install_chart
+
+        values = self._merge_profiles(self._deep_merge(
+            self._existing_kubeai_values(release, namespace), operator_values or {},
+        ), resource_profiles)
         values_path = data_root() / 'generated' / 'kube' / 'kubeai-values.yaml'
-        values_path.parent.mkdir(parents=True, exist_ok=True)
-        values_path.write_text(
-            yaml.safe_dump(values, sort_keys=False), encoding='utf-8'
-        )
-
-        cmd = [
-            'helm', 'upgrade', '--install', release, 'kubeai/kubeai',
-            '-n', namespace, '--create-namespace',
-            '-f', str(values_path), '--wait',
-        ]
-        if version:
-            cmd.extend(['--version', version])
-
-        # Keep chart secrets out of persistent generated YAML and process argv.
-        # Existing/operator secret values are preserved in-memory; HF_TOKEN, if
-        # exported, deliberately overrides only the Hugging Face token.
-        token = os.environ.get('HF_TOKEN', '').strip()
-        if token:
-            huggingface = secret_values.setdefault('secrets', {}).setdefault(
-                'huggingface', {}
-            )
-            huggingface['token'] = token
-        secret_path: str | None = None
-        try:
-            if secret_values:
-                with tempfile.NamedTemporaryFile(
-                    'w', prefix='infer-stack-kubeai-secret-',
-                    suffix='.yaml', delete=False,
-                ) as file:
-                    os.chmod(file.name, 0o600)
-                    yaml.safe_dump(secret_values, file, sort_keys=False)
-                    secret_path = file.name
-                cmd.extend(['-f', secret_path])
-            self.run(cmd)
-        finally:
-            if secret_path:
-                Path(secret_path).unlink(missing_ok=True)
+        install_chart(values=values, values_path=values_path, namespace=namespace,
+                      release=release, chart=chart, version=version, run=self.run)
         return values_path
 
     def apply_setup(

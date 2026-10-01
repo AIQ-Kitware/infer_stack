@@ -41,6 +41,7 @@ from . import (  # noqa: F401
 )
 from .commands_catalog import CatalogModalCLI
 from .commands_kube import KubeModalCLI
+from .commands_ledger import LedgerModalCLI
 from .commands_leasing import (
     AccessCLI,
     AcquireCLI,
@@ -146,6 +147,7 @@ class ManageCLI(kw.ModalCLI):
     apply = ApplyCLI  # bring the desired set up (the trigger for acquire --no-apply)
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
+    ledger = LedgerModalCLI
     routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
     network = NetworkModalCLI  # stable per-service addresses + upstream routing check
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])

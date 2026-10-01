@@ -1,6 +1,6 @@
 PYTHON ?= python
-# The KubeAI chart values: your resourceProfiles (see docs/kubeai-backend.md).
-VALUES ?= kubeai-values.yaml
+# Optional extra Helm values; the common case infers GPU profiles.
+VALUES ?=
 
 status:
 	$(PYTHON) manage.py status
@@ -9,10 +9,10 @@ render:
 	$(PYTHON) manage.py render
 
 bootstrap-k3s:
-	bash scripts/bootstrap_k3s.sh
+	$(PYTHON) manage.py kube bootstrap --provider=k3s --apply
 
 install-kubeai:
-	bash scripts/install_kubeai.sh $(VALUES) kubeai
+	$(PYTHON) manage.py kube install --apply $(if $(VALUES),--values "$(VALUES)",)
 
 port-forward-kubeai:
 	kubectl -n kubeai port-forward svc/kubeai 8000:80

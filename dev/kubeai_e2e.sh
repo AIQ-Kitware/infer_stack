@@ -2,11 +2,14 @@
 # End-to-end smoke test for the kubeai backend against a REAL cluster.
 #
 # Prereqs (once): a cluster + the KubeAI chart. On a single GPU host:
-#   ./scripts/bootstrap_k3s.sh
-#   printf 'resourceProfiles:\n  %s:\n    runtimeClassName: nvidia\n    requests: {nvidia.com/gpu: "1"}\n    limits: {nvidia.com/gpu: "1"}\n' \
-#       "${E2E_RESOURCE_PROFILE:-nvidia-gpu}" > /tmp/kubeai-values.yaml
-#   ./scripts/install_kubeai.sh /tmp/kubeai-values.yaml kubeai
-#   kubectl -n kubeai port-forward svc/kubeai 8000:80 &
+#   infer-stack kube inventory
+#   infer-stack kube bootstrap --provider=k3s
+#   sudo -v
+#   infer-stack kube bootstrap --provider=k3s --apply
+#   infer-stack kube install
+#   infer-stack kube install --apply
+#   infer-stack kube doctor
+# Set kubeai_base_url / E2E_BASE_URL to a reachable KubeAI OpenAI URL.
 #
 # Without a GPU (verified on k3s): install the chart with
 # dev/e2e_tests/kubeai-cpu-values.yaml, whose `cpu` profile runs real vLLM on

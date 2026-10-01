@@ -126,9 +126,10 @@ controller advances it automatically on acquire under the publication lock:
   away.
 
 `allowed_gpus` remains per caller rather than part of the recovery snapshot.
-Changing backend kind (Compose to KubeAI or back) still requires tearing down
-the old backend first; automatic snapshot advancement never crosses backend
-kinds.
+Changing backend kind (Compose to KubeAI or back) requires quiescing the old
+backend, then `infer-stack ledger rotate --yes` to archive its history and start
+a new recovery epoch. `stack down` alone retains the old snapshot. Automatic
+snapshot advancement never crosses backend kinds.
 
 
 ### A queued acquire holds nothing while it waits (current, by design)

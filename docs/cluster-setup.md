@@ -12,7 +12,7 @@ any Kubernetes distribution
         |
         | kubectl / Kubernetes API
         v
-infer-stack kube nodes / setup
+infer-stack kube inventory / doctor / install
         |
         v
 GPU scheduling + discovery, KubeAI, resource profiles
@@ -21,14 +21,14 @@ GPU scheduling + discovery, KubeAI, resource profiles
 Distribution-specific lifecycle commands live below that boundary:
 
 ```text
-infer-stack kube k3s bootstrap
+infer-stack kube bootstrap --provider=k3s
 infer-stack kube k3s join
 
 # A future integration could add, for example:
 # infer-stack kube k0s ...
 ```
 
-Nothing in `infer-stack kube setup`, model placement, the lease controller, or
+Nothing in `infer-stack kube inventory`, model placement, the lease controller, or
 the KubeAI backend requires K3s. An existing kubeadm, RKE2, k0s, EKS, or other
 Kubernetes cluster should start at [Use an existing cluster](#use-an-existing-cluster).
 
@@ -68,7 +68,7 @@ are different concepts.
 
 ## What generic setup expects
 
-Before `infer-stack kube setup --apply`, the generic integration cares about
+Before `infer-stack kube install --apply`, the generic integration cares about
 observable capabilities rather than how the cluster was installed:
 
 - `kubectl` selects the intended cluster context and can reach its API.
@@ -87,13 +87,13 @@ The read-only check is always the first command:
 
 ```bash
 infer-stack kube nodes
-infer-stack kube setup
+infer-stack kube inventory
 ```
 
 Only after reviewing the target context and plan:
 
 ```bash
-infer-stack kube setup --apply
+infer-stack kube install --apply
 ```
 
 Host NVIDIA driver/container-runtime installation stays outside infer-stack.
@@ -115,19 +115,22 @@ same version.
 On workstation A:
 
 ```bash
-infer-stack kube k3s bootstrap --version=<exact-k3s-version>
+infer-stack kube bootstrap --provider=k3s --version=<exact-k3s-version>
+sudo -v
+infer-stack kube bootstrap --provider=k3s --version=<exact-k3s-version> --apply
 ```
 
-This command is intentionally scoped under `kube k3s`: it installs/starts a
+This provider-specific bootstrap plans by default; `--apply` installs/starts a
 K3s server, waits for its node to become Ready, and makes the K3s kubeconfig
 usable without overwriting an existing `~/.kube/config`.
 
 Then inspect the generic Kubernetes integration:
 
 ```bash
-infer-stack kube nodes
-infer-stack kube setup
-infer-stack kube setup --apply
+infer-stack kube inventory
+infer-stack kube doctor
+infer-stack kube install
+infer-stack kube install --apply
 ```
 
 The setup commands above are not K3s-specific.
@@ -174,9 +177,10 @@ network.
 Back on the machine operating infer-stack:
 
 ```bash
-infer-stack kube nodes
-infer-stack kube setup
-infer-stack kube setup --apply
+infer-stack kube inventory
+infer-stack kube doctor
+infer-stack kube install
+infer-stack kube install --apply
 ```
 
 A newly joined GPU product may produce a new KubeAI resource profile. Existing
@@ -347,29 +351,29 @@ kubeconfig/context and begin at the generic layer:
 
 ```bash
 kubectl config current-context
-infer-stack kube nodes
-infer-stack kube setup
-infer-stack kube setup --apply
+infer-stack kube inventory
+infer-stack kube doctor
+infer-stack kube install
+infer-stack kube install --apply
 infer-stack doctor
 ```
 
 The generic setup path must not depend on K3s files, services, tokens, Flannel,
 or installer behavior. If a future Kubernetes distribution needs first-class
-provisioning convenience, add it under its own `infer-stack kube <distro>`
-namespace while preserving this generic contract.
+provisioning convenience, add a provider adapter for `infer-stack kube bootstrap --provider=<distro>` while preserving this generic contract.
 
 ## Ownership boundary
 
 `infer-stack kube` deliberately stops short of being a general Kubernetes
 administrator:
 
-- `kube setup` owns only the integration components/capabilities infer-stack
-  needs.
+- `kube inventory/doctor` inspect prerequisites and installation; `kube install`
+  reconciles the KubeAI chart and resource profiles.
 - `kube node detach/attach` owns only a temporary scheduling cordon used to
   hand a host's GPU between Kubernetes and local Compose; it does not remove
   cluster membership.
-- Distribution-specific provisioning stays in scoped subcommands such as
-  `kube k3s`.
+- Distribution provisioning uses `kube bootstrap --provider=k3s`; joining nodes
+  remains under `kube k3s join`.
 - Arbitrary cluster administration remains `kubectl`, Helm, and the chosen
   distribution's tooling.
 - Existing externally managed GPU/KubeAI capabilities are accepted instead of

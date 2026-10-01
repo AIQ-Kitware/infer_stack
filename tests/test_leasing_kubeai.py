@@ -156,7 +156,10 @@ def test_render_model_doc_shape():
     assert spec['minReplicas'] == 1 and spec['maxReplicas'] == 1
     assert '--tensor-parallel-size=2' in spec['args']
     # the gateway request name and vLLM's served name must agree
-    assert '--served-model-name=qwen' in spec['args']
+    assert not any(a.startswith('--served-model-name') for a in spec['args'])
+    # KubeAI prepends this argument from the Model name before spec.args.
+    effective = ['--served-model-name=' + doc['metadata']['name'], *spec['args']]
+    assert effective.count('--served-model-name=qwen') == 1
     assert rendered.models == {'qwen': 'grp-a'}
     assert rendered.request_names == {'grp-a': 'qwen'}
 
@@ -544,7 +547,7 @@ def test_doctor_reports_gateway_down(tmp_path):
     checks = be.doctor()
     gateway = [c for c in checks if c[0].startswith("KubeAI's API")][0]
     assert gateway[1] is False
-    assert 'port-forward' in gateway[2]
+    assert 'infer-stack kube status' in gateway[2]
 
 
 def test_doctor_cli_exit_codes(tmp_path, monkeypatch, capsys):
@@ -1158,3 +1161,33 @@ def test_the_host_gateways_unverified_routes_leave_the_apply_incomplete(tmp_path
     be.gateway.apply = lambda: ApplyResult(routes=False, detail='routes not verified')
     outcome = be.apply()
     assert outcome.runtime and not outcome.routes and not outcome.complete
+
+
+def test_kubeai_served_name_override_uses_model_identity_once():
+    # Catalog served_name changes Model identity; KubeAI uses that identity.
+    from infer_stack.leasing import Catalog
+    catalog = Catalog.from_dict({'models': {'m': {'source': 'hf://org/model'}},
+        'endpoints': {'alias': {'model': 'm', 'engine': 'vllm', 'served_name': 'Custom/Name',
+                               'runtime': {'resource_profile': 'gpu-single-default'}}}})
+    ledger = Ledger(SqliteStore(':memory:'))
+    result = ledger.acquire('test', catalog.resolve_requests(['alias']))
+    rendered = render_models(result.deployments, namespace='default', default_resource_profile=None)
+    (doc,) = rendered.docs
+    assert doc['metadata']['name'] == 'custom-name'
+    effective = ['--served-model-name=' + doc['metadata']['name'], *doc['spec']['args']]
+    assert effective.count('--served-model-name=custom-name') == 1
+    assert rendered.request_names['alias'] == 'custom-name'
+
+
+def test_kubeai_extra_args_preserve_nonidentity_repetitions():
+    dep = vllm('grp-a', extra_args=['--dtype=half', '--dtype=bfloat16'])
+    rendered = render_models([dep], namespace='default', default_resource_profile=None)
+    assert rendered.docs[0]['spec']['args'][-2:] == ['--dtype=half', '--dtype=bfloat16']
+
+
+def test_explicit_served_name_extra_argument_is_rejected():
+    from infer_stack.leasing import Catalog, CatalogError
+    with pytest.raises(CatalogError, match='repeats --served-model-name'):
+        Catalog.from_dict({'models': {'m': {'source': 'hf://org/model'}},
+            'endpoints': {'alias': {'engine': 'vllm', 'model': 'm', 'runtime': {
+                'extra_args': ['--served-model-name=incorrect']}}}})

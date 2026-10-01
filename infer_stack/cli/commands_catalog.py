@@ -387,7 +387,7 @@ class CatalogSuggestCLI(
             _print_yaml(text)
             if values:
                 print('# discovered KubeAI resourceProfiles (the same shape reconciled by '
-                      '`infer-stack kube setup`; shown here for inspection/manual Helm use):\n' + values,
+                      '`infer-stack kube install`; review with `infer-stack kube install`):\n' + values,
                       file=sys.stderr)
             return 0
 
@@ -417,7 +417,7 @@ class CatalogSuggestCLI(
             )
         if values:
             print('discovered KubeAI resource profiles (normally reconciled by '
-                  '`infer-stack kube setup --apply`; shown here for inspection/manual Helm use):')
+                  '`infer-stack kube install --apply`; review with `infer-stack kube install`):')
             print(values, end='')
         return 0
 

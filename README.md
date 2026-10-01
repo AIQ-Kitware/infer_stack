@@ -85,7 +85,8 @@ Two backends run this: **Compose** (single host; vLLM and Ollama) and
 infer-stack config init               # data dir + default backend -> settings.yaml
 infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
 infer-stack catalog show              # what can be acquired
-infer-stack kube setup               # inspect/plan Kubernetes integration (read-only)
+infer-stack kube inventory           # Kubernetes/GPU/KubeAI facts, before or after install
+infer-stack kube doctor              # detailed readiness + actionable fixes
 infer-stack kube node detach NODE     # preview handing a cluster GPU host to Compose
 infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
 infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
@@ -554,17 +555,20 @@ the managed key and the endpoint alias on either backend.
 The short version:
 
 ```bash
-# New cluster convenience path (omit --version to use the K3s install channel):
-infer-stack kube k3s bootstrap --version=<exact-k3s-version>
-
-# Read-only first: inspect the current cluster and the changes infer-stack owns.
-infer-stack kube setup
-infer-stack kube setup --apply
-infer-stack kube nodes
-
+infer-stack kube inventory
+infer-stack kube doctor
+# New local cluster / NVIDIA plugin + GFD prerequisites (review before applying):
+infer-stack kube bootstrap --provider=k3s
+sudo -v
+infer-stack kube bootstrap --provider=k3s --apply
+# Automatic profiles from Kubernetes node labels; no temporary values file needed:
+infer-stack kube install
+infer-stack kube install --apply
+infer-stack kube doctor
+infer-stack catalog suggest --backend kubeai
 infer-stack config set backend kubeai
 infer-stack config set kubeai_gateway cluster
-infer-stack doctor
+infer-stack doctor --backend kubeai
 infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
 ```
 
@@ -576,119 +580,73 @@ use `INFER_STACK_BACKEND=kubeai` with a separate KubeAI data root, and use
 Kubernetes scheduling and direct Compose use without uninstalling or rejoining
 the node. See [docs/cluster-setup.md](docs/cluster-setup.md).
 
+### Switching an existing recovery ledger to KubeAI
+
+Stopping the Compose realization retains its recovery backend and historical
+ledger. Backend kinds require separate recovery epochs. After releasing every
+old lease and stopping the old runtime:
+
+```bash
+infer-stack release --all --backend compose
+infer-stack stack down --backend compose
+infer-stack config set backend kubeai
+infer-stack status                     # configured kubeai / active recovery compose
+infer-stack ledger rotate              # verify quiescence and preview the archive
+infer-stack ledger rotate --yes        # archive old history; initialize KubeAI epoch
+infer-stack ledger archives            # archive paths + history inspection commands
+infer-stack acquire <endpoint> --yes
+```
+
+Rotation refuses active leases, remaining old runtime objects, and unknown
+runtime state. It does not change configuration/catalogs or silently tear down
+workloads. Old leases, deployments and the recovery profile remain in SQLite
+archives under `<ledger-directory>/archives/`. Rotation is transactional and
+safe to retry; a matching recovery backend makes the command a no-op. `gc`
+reports backend mismatches with transition instructions; `gc --forget` remains
+a history-only operation.
+
 ### Kubernetes cluster setup and KubeAI integration
 
-See [docs/cluster-setup.md](docs/cluster-setup.md) for the server/worker mental
-model and the complete first-cluster runbook. `infer-stack kube` owns the
-integration knowledge, not Kubernetes itself. Its generic commands are
-distribution-neutral: an existing kubeadm/RKE2/k0s/EKS/etc. cluster is
-first-class once `kubectl` selects it. K3s is the first explicitly supported
-**provisioning** integration and therefore lives under `infer-stack kube k3s`,
-not in the generic manager/backend.
+[docs/cluster-setup.md](docs/cluster-setup.md) describes server/worker setup.
+`kube inventory` and `kube status` report structured facts; `--json` includes
+probe errors without discarding other discoveries. Inventory and catalog
+suggestions work before the KubeAI chart or namespace exists.
 
-`kube setup` is a plan/apply command. The default is read-only and checks the
-cluster, Ready nodes, NVIDIA scheduling/discovery capabilities, Helm, KubeAI,
-and the resource profiles infer-stack can derive from GPU labels. It accepts
-working externally-managed GPU/KubeAI integrations instead of replacing them.
+`kube doctor` checks Kubernetes, NVIDIA scheduling/discovery, and KubeAI in
+dependency order. Top-level `doctor --backend kubeai` remains the operational
+preflight for acquiring work. If Helm installation succeeds but the configured
+KubeAI API URL is unavailable, doctor reports that remaining routing issue.
+Set `kubeai_base_url` to a reachable OpenAI URL for the installed service.
 
-```bash
-infer-stack kube setup
-# [ok] / [WARN] / [NEED] / [FAIL] checklist + proposed managed changes
+`kube bootstrap` defaults to a read-only plan; `--apply` (or `--yes`) authorizes
+host/cluster changes. K3s is the implemented provisioning provider; inventory,
+installation and the backend work with any Kubernetes distribution. Bootstrap
+preserves working clusters and existing kubeconfigs, installs Helm if missing,
+and reconciles NVIDIA device plugin **0.17.1** with GPU Feature Discovery.
+Install the host NVIDIA driver and container toolkit first. K3s discovers the
+installed runtime on startup; bootstrap restarts local K3s only when runtime
+discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels.
 
-infer-stack kube setup --apply
-```
+`kube install` shows inferred Helm values; `--apply` uses Helm upgrade/install
+and checks readiness afterward. `--dry-run`/`--plan` forces read-only behavior.
+`--namespace`, `--release`, `--chart`, `--version` and `--values` allow overrides.
+Existing named profiles and custom values are preserved; `HF_TOKEN` overrides
+the chart token using a temporary protected file. Generated public values live
+at `<data>/generated/kube/kubeai-values.yaml`.
 
-The apply side is deliberately narrow: it can reconcile the NVIDIA device
-plugin + GPU Feature Discovery when an `nvidia` RuntimeClass shows that the
-node runtime is already configured, install/reconcile KubeAI, and add missing
-discovered GPU `resourceProfiles`. It does **not** install NVIDIA drivers or
-the NVIDIA container runtime. On K3s, install those before the first start (or
-restart K3s afterward), then rerun `kube setup`.
+The older `kube setup` and `kube k3s` commands remain available for compatibility
+and node join operations. Setup scripts are compatibility wrappers around the
+package commands.
 
-For a fresh K3s server, `kube k3s bootstrap` installs/starts K3s, keeps K3s's
-own kubeconfig as the authority (readable by the local user), waits for Ready,
-and installs Helm if needed. On a clean account it symlinks `~/.kube/config`
-to that authoritative file; an existing kubeconfig is never overwritten, and the
-CLI tells you to select/merge the K3s context before continuing:
+### Debugging serving failures
 
-```bash
-infer-stack kube k3s bootstrap --version=<exact-k3s-version>
-infer-stack kube setup
-infer-stack kube setup --apply
-```
-
-An exact K3s version is recommended once the cluster is real infrastructure.
-If K3s is already active and the requested version differs, infer-stack refuses
-to perform an implicit cluster upgrade.
-
-`kube setup` generates its reconciled KubeAI values under the infer-stack data
-root (`generated/kube/kubeai-values.yaml`). Existing named resource profiles
-win over generated profiles, so hand-tuned scheduling rules are not silently
-rewritten. An optional operator values file participates in the same merge:
-
-```bash
-infer-stack kube setup --values ./kubeai-values.local.yaml
-infer-stack kube setup --apply --values ./kubeai-values.local.yaml
-```
-
-On an existing KubeAI Helm release, `--apply` preserves the installed chart
-version unless `--kubeai-version=...` explicitly requests another one. On a
-fresh install, use that option when you want a fixed chart version. `HF_TOKEN`,
-when set, is passed through a short-lived mode-0600 values file rather than on
-the Helm command line.
-
-`infer-stack kube nodes` is the compact inventory used by the setup logic:
-
-```bash
-infer-stack kube nodes
-infer-stack kube nodes --json
-```
-
-The important GPU facts are allocatable `nvidia.com/gpu` plus GPU Feature
-Discovery's `nvidia.com/gpu.product` and `nvidia.com/gpu.memory` labels. These
-are also the authority used to derive one KubeAI resource profile per GPU
-product. If a managed cluster already supplies those capabilities but has no
-`nvidia` RuntimeClass, infer-stack accepts it and omits `runtimeClassName` from
-its generated profiles.
-
-For CPU-only development, skip NVIDIA checks explicitly:
-
-```bash
-infer-stack kube setup --gpu=none
-```
-
-The older `scripts/bootstrap_k3s.sh` and `scripts/join_agent.sh` entry points
-remain compatibility wrappers around the CLI. `scripts/install_kubeai.sh` is
-retained as a low-level/manual Helm escape hatch; normal setup should use
-`infer-stack kube setup [--apply]` so checks, profile discovery, and install
-behavior share one authority.
-
-### Debugging checks
-
-`infer-stack acquire` reports pod-level failures itself (`ImagePullBackOff`,
-`Unschedulable`, a crash with the engine's error quoted). `infer-stack ps` lists
-the pods and `infer-stack logs -f <endpoint>` follows one, as on compose. For
-anything else, with `NS` the namespace and `MODEL` the Model's name
-(`kubectl -n $NS get models`):
-
-```bash
-kubectl -n "$NS" describe model "$MODEL"
-kubectl -n "$NS" get pods -l model="$MODEL"
-kubectl -n "$NS" logs -f -l model="$MODEL" -c server            # the engine
-kubectl -n "$NS" logs -l model="$MODEL" -c server --previous     # after a restart
-kubectl -n "$NS" logs deploy/kubeai --tail=200 -f                # the KubeAI controller
-kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 40
-```
-
-Common bad states:
-
-* `libcuda.so.1: cannot open shared object file`: the pod did not request a
-  GPU; fix the resource profile (requests, limits, `runtimeClassName`).
-* startup probe fails with `connection refused`: still pulling the image,
-  loading the model or warming up; the acquire's wait reports which.
-* `/models` works but completions 404: the request bypassed the gateway and
-  used the alias; through the gateway the alias is the model name, directly
-  against KubeAI the Model name is (`INFER_STACK_ENDPOINT_*` in the env file).
+`infer-stack kube status` summarizes live Kubernetes state. `infer-stack acquire`
+reports pod failures such as `ImagePullBackOff`, `Unschedulable`, and engine
+crashes. Use `infer-stack ps` and `infer-stack logs -f <endpoint>` to inspect
+model serving. If `/models` works but completions return 404, check that clients
+use the gateway alias; direct KubeAI requests use the Model name from the env
+file (`INFER_STACK_ENDPOINT_*`). Missing `libcuda.so.1` usually indicates that
+the model profile did not request GPUs or select the correct runtime.
 
 ---
 

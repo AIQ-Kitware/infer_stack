@@ -376,7 +376,7 @@ class K3sBootstrapCLI(kw.Config):
             )
         print(f'K3s join token: sudo cat {K3S_NODE_TOKEN}')
         print('Join workers with: infer-stack kube k3s join --server=... --token-file=...')
-        print('Then: infer-stack kube setup')
+        print('Then: infer-stack kube inventory; infer-stack kube bootstrap; infer-stack kube install')
         return 0
 
 
@@ -422,10 +422,221 @@ class K3sModalCLI(kw.ModalCLI):
     join = K3sJoinCLI
 
 
+def _inventory_for_config(config, manager):
+    from ..kube.inspect import inventory
+    from ..paths import get_setting
+
+    return inventory(manager, namespace=_namespace(config), release=config.release,
+                     base_url=config.base_url or get_setting('kubeai_base_url') or
+                     'http://127.0.0.1:8000/openai/v1')
+
+
+def _print_inventory(report):
+    import yaml
+
+    print('cluster')
+    for key, value in report['cluster'].items():
+        print(f'  {key}: {value}')
+    print(f"host GPUs: {report['host_gpus']}")
+    print('tools')
+    for key, value in report['tools'].items():
+        print(f'  {key}: {"available" if value else "missing"}')
+    for node in report['nodes']:
+        print(f"node {node['name']}")
+        for key in ('ready', 'nvidia_runtime_class', 'gpu_count', 'gpu_product',
+                    'gpu_memory_gib', 'gfd_labels'):
+            print(f'  {key}: {node[key]}')
+    plugins = report['device_plugin']
+    print('NVIDIA device plugin: ' + ('unknown' if plugins is None else 'missing' if not plugins else
+          ', '.join(f"{p['name']} ({p['ready']}/{p['desired']} ready)" for p in plugins)))
+    kubeai = report['kubeai']
+    print('KubeAI')
+    print(f"  Model CRD: {'installed' if kubeai['crd'] else 'missing' if kubeai['crd'] is False else 'unknown'}")
+    print(f"  namespace {kubeai['namespace']}: {'present' if kubeai['namespace_exists'] else 'missing' if kubeai['namespace_exists'] is False else 'unknown'}")
+    release = kubeai['release']
+    print(f"  Helm release: {release.get('chart')} ({release.get('status')})" if release else
+          '  Helm release: missing/unknown')
+    api = kubeai['api']
+    print(f"  API: {api['base_url']} — {'available' if api['reachable'] else 'unavailable'}")
+    if not api['reachable']:
+        print(f"    {api.get('error') or api.get('blocked') or api.get('status_code') or ''}")
+    for key in ('pods', 'services', 'models'):
+        items = kubeai[key]
+        print(f"  {key}: {len(items) if items is not None else 'unknown/blocked'}")
+        for item in items or []:
+            name = item.get('metadata', {}).get('name', '?')
+            status = item.get('status', {})
+            if key == 'pods':
+                containers = status.get('containerStatuses', [])
+                summary = f"{status.get('phase', '?')}; {sum(bool(c.get('ready')) for c in containers)}/{len(containers)} containers ready"
+            elif key == 'services':
+                spec = item.get('spec', {})
+                summary = f"{spec.get('type', '?')} {spec.get('clusterIP', '')}"
+            else:
+                summary = f"{status.get('readyReplicas', 0)} ready replicas"
+            print(f'    {name}: {summary}')
+    print('resource profiles proposed')
+    print(yaml.safe_dump(report['resource_profiles']['proposed'], sort_keys=False), end='')
+    print('resource profiles installed: ' + (', '.join(report['resource_profiles']['installed']) or 'none'))
+    for key, error in report['errors'].items():
+        print(f'  probe {key}: {error}')
+
+
+def _print_checks(checks):
+    for check in checks:
+        mark = {'ok': 'ok  ', 'fail': 'FAIL', 'blocked': 'SKIP'}[check['status']]
+        print(f"[{mark}] {check['name']} — {check['detail']}")
+        if check['fix']:
+            print(f"       fix: {check['fix']}")
+
+
+class KubeInventoryCLI(_PathOverridesMixin):
+    """Describe Kubernetes, GPU and KubeAI facts, including partial installations."""
+
+    __command__ = 'inventory'
+    namespace = kw.Value(None, type=str, help='Configured KubeAI namespace override.')
+    release = kw.Value('kubeai', type=str, help='KubeAI Helm release name.')
+    base_url = kw.Value(None, type=str, help='Configured KubeAI OpenAI API URL override.')
+    json = kw.Value(False, isflag=True, help='Emit structured facts and probe errors.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        report = _inventory_for_config(config, KubeManager())
+        if config.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            _print_inventory(report)
+        return 0
+
+
+class KubeStatusCLI(KubeInventoryCLI):
+    """Show cluster GPUs, KubeAI release, pods, services and managed Models."""
+
+    __command__ = 'status'
+
+
+class KubeDoctorCLI(KubeInventoryCLI):
+    """Check Kubernetes/GPU prerequisites and KubeAI readiness in dependency order."""
+
+    __command__ = 'doctor'
+    gpu = kw.Value('nvidia', type=str, choices=['nvidia', 'none'], help='Use none for explicitly configured CPU KubeAI.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..kube.inspect import failed, readiness
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        report = _inventory_for_config(config, KubeManager())
+        checks = readiness(report, gpu=config.gpu != 'none')
+        if config.json:
+            print(json.dumps({'inventory': report, 'checks': checks}, indent=2))
+        else:
+            _print_checks(checks)
+        return int(failed(checks))
+
+
+class KubeInstallCLI(KubeInventoryCLI):
+    """Plan KubeAI values; --apply installs/upgrades the chart and checks readiness."""
+
+    __command__ = 'install'
+    gpu = kw.Value('nvidia', type=str, choices=['nvidia', 'none'], help='Use none with explicit CPU resource profiles.')
+    apply = kw.Value(False, isflag=True, alias=['yes'], help='Apply the displayed Helm installation plan.')
+    dry_run = kw.Value(False, isflag=True, alias=['plan'], help='Only inspect values, even with --apply.')
+    values = kw.Value(None, type=str, help='Additional Helm values; custom named profiles take precedence.')
+    chart = kw.Value('kubeai/kubeai', type=str, help='KubeAI chart reference.')
+    version = kw.Value(None, type=str, help='Chart version; preserves installed version by default.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import yaml
+
+        from ..kube.inspect import failed, readiness
+        from ..kube.operations import install, install_plan
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        manager = KubeManager()
+        try:
+            operator = manager.load_values_file(config['values'])
+            report = _inventory_for_config(config, manager)
+            if config.gpu == 'none':
+                report['resource_profiles']['proposed'] = {}
+            values = install_plan(manager, report, operator_values=operator)
+            checks = readiness(report, installation=False, gpu=config.gpu != 'none')
+            if config.json:
+                if not config.apply or config.dry_run:
+                    print(json.dumps({'values': values, 'checks': checks}, indent=2))
+            else:
+                _print_checks(checks)
+                print(yaml.safe_dump(values, sort_keys=False), end='')
+            if not config.apply or config.dry_run:
+                if not config.json:
+                    print('No changes made. Run infer-stack kube install --apply to install/upgrade.')
+                return int(failed(checks))
+            install(manager, report, operator_values=operator, chart=config.chart, version=config.version, gpu=config.gpu != 'none')
+            checks = readiness(_inventory_for_config(config, manager), gpu=config.gpu != 'none')
+            if config.json:
+                print(json.dumps({'values': values, 'checks': checks}, indent=2))
+            else:
+                _print_checks(checks)
+            return int(failed(checks))
+        except RuntimeError as ex:
+            raise SystemExit(str(ex)) from ex
+
+
+class KubeBootstrapCLI(KubeInventoryCLI):
+    """Plan host/cluster GPU prerequisites; --apply converges them with K3s."""
+
+    __command__ = 'bootstrap'
+    provider = kw.Value('k3s', choices=['k3s'], type=str, help='Cluster provisioning provider.')
+    version = kw.Value(None, type=str, help='Optional exact K3s version; no implicit upgrades.')
+    apply = kw.Value(False, isflag=True, alias=['yes'], help='Authorize host/cluster bootstrap changes.')
+    dry_run = kw.Value(False, isflag=True, alias=['plan'], help='Only display the plan.')
+    timeout = kw.Value(180, type=int, help='Ready/GPU discovery wait timeout in seconds.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..kube.inspect import failed, readiness
+        from ..kube.operations import K3sProvider
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        manager = KubeManager()
+        provider = K3sProvider()
+        report = _inventory_for_config(config, manager)
+        actions = provider.plan(manager, report)
+        if not config.apply or config.dry_run:
+            if config.json:
+                print(json.dumps({'inventory': report, 'actions': actions}, indent=2))
+            else:
+                for action in actions:
+                    print(f'[plan] {action}')
+                print('No changes made. Authenticate with sudo -v if needed; then run infer-stack kube bootstrap --apply.')
+            return 0
+        try:
+            report = provider.apply(manager, report, version=config.version, timeout=config.timeout)
+        except RuntimeError as ex:
+            raise SystemExit(f'{ex}. If elevation failed, authenticate with sudo -v and retry.') from ex
+        checks = readiness(report, installation=False)
+        if config.json:
+            print(json.dumps({'inventory': report, 'checks': checks}, indent=2))
+        else:
+            _print_checks(checks)
+        return int(failed(checks))
+
+
 class KubeModalCLI(kw.ModalCLI):
     """Inspect/setup infer-stack capabilities on any Kubernetes distribution."""
 
     __command__ = 'kube'
+    inventory = KubeInventoryCLI
+    doctor = KubeDoctorCLI
+    bootstrap = KubeBootstrapCLI
+    install = KubeInstallCLI
+    status = KubeStatusCLI
     nodes = KubeNodesCLI
     node = KubeNodeModalCLI
     setup = KubeSetupCLI

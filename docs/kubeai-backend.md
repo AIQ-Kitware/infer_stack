@@ -41,50 +41,98 @@ For the control-plane/worker mental model and the full create/join runbook, see
 [cluster-setup.md](cluster-setup.md). The generic integration is
 distribution-neutral; K3s is only the first scoped provisioning target.
 
-The normal setup path is capability-driven and lives in the CLI:
+The normal setup path uses package commands:
 
 ```bash
-# Existing cluster: just point kubectl at it. For a new local K3s server:
-infer-stack kube k3s bootstrap --version=<exact-k3s-version>
-
-# Planning is read-only; apply only after reviewing it.
-infer-stack kube setup
-infer-stack kube setup --apply
-infer-stack kube nodes
+infer-stack kube inventory             # works before KubeAI exists
+infer-stack kube doctor                # detailed dependency-ordered readiness
+infer-stack kube bootstrap --provider=k3s  # plan a new host or prerequisite repair
+sudo -v
+infer-stack kube bootstrap --apply     # K3s/Helm/NVIDIA device plugin 0.17.1 + GFD
+infer-stack kube install               # inspect inferred resourceProfiles and values
+infer-stack kube install --apply       # Helm upgrade/install, wait, post-install doctor
+infer-stack kube status                # nodes, GPUs, plugin, pods/services/managed Models
 ```
 
-For temporary testing on workstations that already have Compose state you want
-to preserve, do not point KubeAI at the existing Compose ledger. The
-[cluster setup guide](cluster-setup.md#temporarily-swap-compose-configured-workstations-into-a-cluster)
-uses a separate KubeAI data root and `kube node detach/attach` so the same
-physical machines can move back to local Compose use without uninstalling or
-rejoining Kubernetes.
+Install host NVIDIA drivers/container toolkit before bootstrap. Inventory and
+install are distribution-neutral. Bootstrap preserves working clusters and
+existing kubeconfigs; it refuses to replace a selected unreachable context.
+Use `--version` to pin K3s; active clusters are never implicitly upgraded.
 
-`kube setup` checks the Kubernetes API, Ready nodes, GPU scheduling/discovery
-facts, Helm, the KubeAI CRD/service, and discovered GPU resource profiles. It
-is capability-based: an existing GPU Operator or externally-managed KubeAI is
-accepted when it already supplies what infer-stack needs. It does not replace
-working external components merely because they were installed differently.
+`inventory`, `doctor`, and `status` accept `--json`. Errors belong to individual
+probes, so a missing KubeAI ConfigMap cannot erase GPU node facts. A cluster with
+a leftover CRD but no namespace/chart can be diagnosed and repaired with these
+commands. Kubernetes GPU allocation and GFD readiness are separate from host
+GPU visibility.
 
-The managed NVIDIA path begins only after Kubernetes exposes an `nvidia`
-RuntimeClass. Installing NVIDIA drivers/container-runtime packages is host
-administration and remains outside infer-stack. With that runtime present,
-`kube setup --apply` may install/reconcile the pinned NVIDIA device plugin +
-GPU Feature Discovery and then derive profiles from `nvidia.com/gpu.product`
-and `nvidia.com/gpu.memory`.
-
-KubeAI values are written to `<data>/generated/kube/kubeai-values.yaml`. Named
-profiles already supplied by the operator win over generated profiles. Use an
-operator values file for other chart customization:
+Mutation requires `--apply` (alias `--yes`). Both mutating commands support
+`--dry-run` (alias `--plan`). Install derives one profile per GPU product with
+GPU requests/limits, a product selector and `runtimeClassName=nvidia` when that
+RuntimeClass exists. Kubernetes chooses placement; infer-stack assigns no host
+GPU indices. Models request multiple GPUs via the existing profile/count syntax.
 
 ```bash
-infer-stack kube setup --values ./kubeai-values.local.yaml
-infer-stack kube setup --apply --values ./kubeai-values.local.yaml
+infer-stack kube install --values ./kubeai-values.local.yaml --namespace kubeai
+infer-stack kube install --values ./kubeai-values.local.yaml --namespace kubeai --apply
 ```
 
-For an existing Helm-managed KubeAI release, apply preserves its installed
-chart version by default; use `--kubeai-version=...` for an explicit change.
-`scripts/install_kubeai.sh` remains only as a manual Helm escape hatch.
+Custom values extend the automatic common case. Existing/custom named profiles
+win over generated profiles. The installed chart version is preserved unless
+`--version` overrides it; `--chart` and `--release` select alternative settings.
+`HF_TOKEN` is preserved using a temporary mode-0600 Helm values file, never
+printed or written to the persistent generated public values. Inspect those
+values at `<data>/generated/kube/kubeai-values.yaml`.
+
+Installation waits for Helm readiness, then checks the configured
+`kubeai_base_url`. If that URL is unavailable, installation reports a routing
+failure even though the release is installed; set a reachable OpenAI URL with
+`infer-stack config set kubeai_base_url <URL>` and repeat doctor. No automatic
+background port-forward is created.
+
+For temporary Compose/KubeAI testing, preserve the Compose authority as described
+in [cluster setup](cluster-setup.md#temporarily-swap-compose-configured-workstations-into-a-cluster).
+`kube setup` remains a compatibility plan/apply workflow, and the setup scripts
+forward to the new commands.
+
+For explicit CPU development, preserve the existing CPU chart workflow:
+
+```bash
+infer-stack kube install --gpu=none --values dev/e2e_tests/kubeai-cpu-values.yaml
+infer-stack kube install --gpu=none --values dev/e2e_tests/kubeai-cpu-values.yaml --apply
+infer-stack kube doctor --gpu=none
+```
+
+## Migrate an existing Compose recovery ledger
+
+`stack down --backend compose` removes runtime objects but retains the Compose
+recovery snapshot. Changing `settings.yaml` alone cannot reinterpret historical
+Compose rows as Kubernetes Models. Use an explicit transition:
+
+```bash
+infer-stack release --all --backend compose
+infer-stack stack down --backend compose
+infer-stack config set backend kubeai
+infer-stack ledger rotate               # preview; strict old-runtime verification
+infer-stack ledger rotate --yes         # commit archived history and new epoch
+infer-stack ledger archives
+infer-stack acquire <endpoint> --yes
+```
+
+All active leases must be released and all old runtime objects removed first.
+An unreachable runtime blocks rotation, rather than being interpreted as empty.
+KubeAI transitions also check managed Model CRs whose pods may not yet exist.
+Stopped Compose containers must be removed with `stack down` as well, so restart
+policies cannot resurrect them after transition. Configuration/catalogs are
+untouched. SQLite backups under `<ledger-directory>/archives/` retain the old
+leases/deployments/profile, including committed WAL contents. The archive is
+published before a single transaction resets live rows and installs the new
+backend snapshot. Retrying after interruption is safe. The live DB stays at the
+same path/inode; already-open old-backend controllers refuse their next
+mutation against the new snapshot.
+
+`status` names the configured and active recovery backends separately. `gc`
+refuses backend mismatch cleanly with `ledger rotate` guidance. `gc --forget`
+only prunes terminal historical rows; it never adopts the configured backend.
 
 ## Point infer-stack at it
 
@@ -102,8 +150,8 @@ infer-stack config set kubeai_resource_profile nvidia-gpu-rtx-4090
 infer-stack config set kubeai_gateway_upstream http://kubeai.example/openai/v1
 ```
 
-On a host whose persisted default remains Compose, use a separate KubeAI
-authority/data root instead:
+For temporary testing while keeping an existing Compose recovery epoch, use a
+separate KubeAI authority/data root:
 
 ```bash
 export INFER_STACK_BACKEND=kubeai
@@ -138,7 +186,7 @@ Discovery) of the nodes its `nodeSelector` selects; a profile without a
 `nodeSelector`, like the chart's generic ones, has no size and is never
 picked this way. With none large enough, the `kubeai_resource_profile`
 default is used, or the acquire is refused with the sizes it found.
-`infer-stack kube setup` is the setup authority for these profiles;
+`infer-stack kube install` is the installation authority for these profiles;
 `catalog suggest --backend kubeai` consumes the same profile-generation shape
 while suggesting model/catalog entries.
 
@@ -203,9 +251,10 @@ on the trusted LAN/VPN.
 Back on the control node, inspect and reconcile the newly visible hardware:
 
 ```bash
-infer-stack kube nodes
-infer-stack kube setup
-infer-stack kube setup --apply
+infer-stack kube inventory
+infer-stack kube bootstrap --apply
+infer-stack kube install --apply
+infer-stack kube doctor
 ```
 
 A new GPU product becomes a new discovered KubeAI resource profile without

@@ -1479,6 +1479,7 @@ class GcCLI(_ApprovalMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..leasing.backend import ConvergeAborted
+        from ..leasing.profile import ProfileMismatch
 
         config = cls.cli(argv=argv, data=kwargs)
         controller = _open_controller(config, interactive=True)
@@ -1491,6 +1492,8 @@ class GcCLI(_ApprovalMixin):
                 print(f'gc --forget: forgot {n_leases} released/expired lease(s), '
                       f'{n_deployments} stopped deployment(s)')
             return 0
+        if controller._profile_error is not None:
+            raise SystemExit(f'gc: {controller._profile_error}')
         if config.orphans:
             # Unlabelled units in residency. The kubeai backend reads only the
             # pods carrying its label, so it never has any.
@@ -1511,6 +1514,8 @@ class GcCLI(_ApprovalMixin):
             return 0
         try:
             outcome = controller.gc(evict_idle=bool(config.evict))
+        except ProfileMismatch as ex:
+            raise SystemExit(f'gc: {ex}') from ex
         except ConvergeAborted:
             raise _declined_exit()
         if config.json:

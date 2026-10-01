@@ -131,3 +131,63 @@ Design takeaways:
 1. Once a file becomes canonical input, stale detection must treat it as input everywhere apply-style commands rely on freshness checks.
 2. A clean source-of-truth split is only complete when freshness logic follows the same split.
 3. Focused tests around stale detection are worth adding because timestamp-based bugs are easy to reintroduce during unrelated CLI cleanup.
+
+## 2026-10-01 19:28:25 -0400
+
+User intent: make Kubernetes inventory, detailed readiness, K3s bootstrap and
+KubeAI installation first-class kwconf commands, then fix the real-machine
+Compose-to-KubeAI migration failures (stack down left the old recovery identity,
+gc threw ProfileMismatch, status hid the active backend, sudo diagnostics implied
+an all-clear, and the vLLM pod received served-model-name twice). Validation is
+on this VM with fake runtimes; the maintainer will exercise the GPU machine.
+
+Model/configuration: GPT-6 (Codex), Default collaboration mode, standard session
+configuration; the exact reasoning-effort setting is not exposed to this agent.
+No sub-agents used. No real-host bootstrap/install mutations performed.
+
+I extended the existing kube ModalCLI and KubeManager rather than introducing
+another shell implementation. Independent probes retain their own errors; node
+GPU facts cannot depend on installed chart configuration because they determine
+that configuration. Inventory describes facts; readiness applies dependency
+policy. Bootstrap is a provider adapter with a read-only default and explicit
+apply; working clusters/kubeconfigs win over installation convenience. The local
+K3s restart gate verifies cluster identity, and unknown runtime state never means
+quiescent. NVIDIA driver/toolkit installation remains host-distribution work.
+Helm 0.17.1 NVIDIA plugin/GFD behavior is retained. KubeAI upgrades share
+kubeai_ops and protect tokens in temporary 0600 values files.
+
+The migration failure clarified that runtime teardown and recovery epoch
+ownership are separate operations. The chosen ledger rotate command previews
+and rechecks quiescence under the publication lock, archives SQLite using its
+backup API (including WAL), then atomically clears archived rows and publishes
+the new configured backend snapshot in the same database. Keeping the database
+inode avoids stranding already-open processes on a renamed old ledger. Archive
+publication precedes reset; interruption before reset retains old state and
+interruption after commit is a no-op on retry. Active leases and strict runtime
+objects block rotation. Catalog/settings files remain authority and untouched.
+GC reports a mismatch before mutation; status names both backend identities and
+reads old rows with their frozen backend. KubeAI's engine_vllm.go injects the CR
+served name before spec.args; an optional flag in the shared arg builder removes
+only infer-stack's own served-name emission for KubeAI, preserving Compose and
+arbitrary extra arguments.
+
+I am confident in the node/config separation and archive transaction design;
+remaining risk is integration behavior on a real K3s host, particularly runtime
+PATH discovery, chart rollout timing and configured API routing. Final combined
+focused validation passed 213 tests. The full suite passed 1098 tests with 7 skips
+and 8 existing cleanup/ResourceWarnings. `ty check ./infer_stack`, the CI flake8
+E9/F63/F7/F82 gate, scoped Ruff checks of changed implementation/new tests, and
+`git diff --check` passed. Actual entrypoint help tree, all five kube leaves,
+ledger rotate, status, gc and both GPU/sudo doctor forms were inspected. A
+standalone simulated integration using real Controllers/SQLite and fake runtime
+commands exercised acquire/refusal, clean GC refusal, preview/rotation/retry,
+archive inspection and subsequent KubeAI acquire successfully. Read-only probes
+on the VM's existing CPU K3s cluster retained both node facts and diagnosed the
+missing plugin, unready node and unavailable configured API. No setup mutation
+was performed. Remaining acceptance is the maintainer's GPU host: inventory and
+doctor, bootstrap/install preview then explicit apply where needed, followed by
+both detailed and operational doctor checks with the intended namespace/API URL.
+
+Reusable takeaways: prerequisite inventory must precede configuration that
+consumes it; teardown does not erase persistence ownership; SQLite history
+rotation should preserve live connections and change epochs transactionally.
