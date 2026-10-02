@@ -15,6 +15,7 @@ import kwconf as kw
 
 from ..kube import KubeManager
 from ..kube.manage import NVIDIA_DEVICE_PLUGIN_VERSION
+from .commands_kube_worker import K3sExportCLI, K3sOnboardCLI, KubeNodeTestCLI
 from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
 
@@ -274,6 +275,7 @@ class KubeNodeModalCLI(kw.ModalCLI):
 
     __command__ = 'node'
     status = KubeNodeStatusCLI
+    test = KubeNodeTestCLI
     detach = KubeNodeDetachCLI
     attach = KubeNodeAttachCLI
 
@@ -426,6 +428,8 @@ class K3sModalCLI(kw.ModalCLI):
     __command__ = 'k3s'
     bootstrap = K3sBootstrapCLI
     join = K3sJoinCLI
+    onboard = K3sOnboardCLI
+    export = K3sExportCLI
     status = K3sStatusCLI
 
 

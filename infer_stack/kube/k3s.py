@@ -271,3 +271,66 @@ def local_status(*, run: RunFunc | None = None) -> dict:
     except Exception:
         report['errors'].append('Cannot inspect active agent configuration; authenticate with sudo -v then retry')
     return report
+
+
+def export_join_info(*, server: str, directory: str | Path, run: RunFunc | None = None) -> dict:
+    """Export a private join bundle; refresh only a bundle owned by this cluster.
+
+    Token and rewritten admin kubeconfig never appear on stdout. The original
+    root/default configs are unchanged. The manifest is written first so an
+    interrupted export can safely complete on retry.
+    """
+    import hashlib
+
+    run = run or default_run
+    if not server.startswith('https://'):
+        raise RuntimeError('Join server must use https:// with a reachable LAN/VPN address')
+    if not _active(run, 'k3s'):
+        raise RuntimeError('Export must run on the local K3s server; an agent/selected remote context is not sufficient')
+    config = yaml.safe_load(run(['sudo', '-n', 'cat', str(K3S_KUBECONFIG)]))
+    if not isinstance(config, dict):
+        raise RuntimeError('Local K3s kubeconfig must contain a mapping')
+    token = run(['sudo', '-n', 'cat', str(K3S_NODE_TOKEN)]).strip()
+    if not token:
+        raise RuntimeError('Local K3s node token is empty')
+    contexts = {c['name']: c['context'] for c in config.get('contexts') or []}
+    selected = contexts.get(config.get('current-context'), {}).get('cluster')
+    clusters = [c for c in config.get('clusters') or [] if c.get('name') == selected]
+    if len(clusters) != 1 or not clusters[0].get('cluster', {}).get('certificate-authority-data'):
+        raise RuntimeError('Local K3s kubeconfig has no unique selected cluster with embedded CA data')
+    ca_data = clusters[0]['cluster']['certificate-authority-data']
+    if not isinstance(ca_data, str):
+        raise RuntimeError('Local K3s CA data must be a string')
+    fingerprint = hashlib.sha256(ca_data.encode()).hexdigest()
+    clusters[0]['cluster']['server'] = server.rstrip('/')
+    target = Path(directory).expanduser()
+    marker = target / 'manifest.json'
+    metadata = {'kind': 'infer-stack-k3s-join', 'cluster_ca_sha256': fingerprint, 'server': server.rstrip('/')}
+    if target.exists():
+        if target.is_symlink() or not target.is_dir() or target.stat().st_uid != os.getuid():
+            raise RuntimeError('Join export directory must be a directory owned by this user, not a symlink')
+        if target.stat().st_mode & 0o077:
+            raise RuntimeError(f'Join export directory must be private (chmod 700): {target}')
+        if any(target.iterdir()):
+            if not marker.is_file():
+                raise RuntimeError('Refusing to overwrite a nonempty directory without an infer-stack join manifest')
+            previous = json.loads(marker.read_text())
+            if previous.get('kind') != metadata['kind'] or previous.get('cluster_ca_sha256') != fingerprint:
+                raise RuntimeError('Join export belongs to a different cluster; choose a new directory')
+    else:
+        target.mkdir(parents=True, mode=0o700)
+    documents = {'manifest.json': json.dumps(metadata, indent=2) + '\n',
+                 'kubeconfig.yaml': yaml.safe_dump(config), 'token': token + '\n'}
+    for name, content in documents.items():
+        # NamedTemporaryFile creates mode 0600 before any secret is written.
+        with tempfile.NamedTemporaryFile('w', dir=target, prefix='.join-', delete=False) as temporary:
+            pending = Path(temporary.name)
+            try:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                os.replace(pending, target / name)
+            finally:
+                pending.unlink(missing_ok=True)
+    return {'server': metadata['server'], 'directory': str(target),
+            'kubeconfig': str(target / 'kubeconfig.yaml'), 'token_file': str(target / 'token')}

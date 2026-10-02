@@ -424,3 +424,47 @@ building a package-native, reviewed plan/apply path with isolated test resources
 exact placement checks, real generation and ownership-limited cleanup. Driver
 installation remains an explicit host prerequisite rather than an implicit OS
 migration. Real GPU acceptance will be run by the maintainer, not on this VM.
+
+The worker path is now `kube k3s export` on the server (private join bundle),
+`kube k3s onboard NAME` on the worker (plan/apply), and `kube node test NAME`
+for repeat acceptance from any admin host. Export writes 0700/0600 artifacts,
+rewrites only the copied server URL, identifies ownership by cluster CA, and
+writes its manifest first so interrupted export can resume. Onboard requires
+explicit matching admin access and existing host driver/toolkit, infers server
+version, reuses membership validation and the existing plugin/chart installers,
+then waits for this worker's exact expected resources. Stale EKS context does
+not define its target. I intentionally did not add an OS package/driver upgrade
+policy to a cluster join command.
+
+Acceptance reserves all expected GPUs briefly for a fresh NVML device query,
+then one GPU for a Model rendered through the existing backend. It asserts the
+actual node, request/limit/runtime, replica readiness, serving GPU identity and
+real generation response. The temporary Model is outside the lease managed
+selector, so no second ledger authority can prune production Models. Stable
+node profiles are added through the shared Helm helper with existing version
+and values preserved; profiles remain for reuse, while exact owned run resources
+are cleaned on failure/success. Interrupted runs have explicit ownership-checked
+cleanup, not namespace-wide deletion. Heterogeneous nodes report every UUID,
+product and memory; they do not claim generation on every product or GPU-index
+selection. Pod startup polling replaces a long opaque wait and emits changes.
+
+Focused CLI/backend/readiness/TUI validation initially passed 228 cases; worker
+acceptance/export tests now cover additional cases. The first full-suite run
+passed 1251 with 3 skips and 8 existing ResourceWarnings; final validation follows
+after the last export and preservation regressions. Manual root CLI simulations
+for namek, yardrat and aiq-gpu2 all passed, with real kwconf parsing/rendering and
+fake command/HTTP seams (`/tmp/infer-stack-worker-simulated.log`). A real VM
+loopback service forward returned /models HTTP 200 and was stopped on exit;
+no worker join, GPU workload, chart upgrade or credential export ran on the VM.
+
+Final validation: focused suites 233 passed; final full `pytest -q` 1256 passed,
+3 skipped, 8 pre-existing cleanup/ResourceWarnings (140.19 seconds), using
+`/tmp/infer-stack-venv/bin` (CPython 3.14.6). `ty check infer_stack`, CI flake8
+(E9/F63/F7/F82), scoped Ruff for all changed Python/new worker/TUI tests,
+compileall, shell syntax and diff whitespace checks passed. Real help tree and
+kube/node/test/k3s/onboard/export help were inspected. Export --plan created no
+files. A real read-only VM node-test JSON plan returned exit 1 and correctly
+reported Ready but zero allocatable GPUs/missing GFD, rather than using another
+node as evidence. The full worker hardware/generation acceptance remains for
+namek/aiq-gpu, with heterogeneous generation limited to one allocated GPU per
+run. No maintainer design decision is needed to try that documented workflow.
