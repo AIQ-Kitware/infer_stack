@@ -16,6 +16,10 @@
 # dev/e2e_tests/kubeai-cpu-values.yaml, whose `cpu` profile runs real vLLM on
 # CPU (needs AVX-512), and run with E2E_RESOURCE_PROFILE=cpu.
 #
+# For an individual joining GPU worker, prefer the scoped acceptance harness:
+#   infer-stack kube k3s onboard NODE --server=... --token-file=... --kubeconfig=... --namespace=default
+#   infer-stack kube node test NODE --expected-gpus=1 --namespace=default --apply
+# This broader lifecycle/gateway suite expects a quiescent test namespace.
 # Then:  ./dev/kubeai_e2e.sh
 #
 # Knobs (env):

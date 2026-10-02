@@ -180,6 +180,112 @@ to reach the K3s API on the server, and inter-node traffic required by the
 configured K3s networking backend must be allowed on the trusted cluster
 network.
 
+### Join and test a GPU worker in one reviewed operation
+
+On **aiq-gpu**, prepare the bundle without printing credentials:
+
+```bash
+infer-stack kube k3s export \
+    --server=https://<aiq-gpu-address>:6443 \
+    --directory=~/.private/namek-join
+sudo -v
+infer-stack kube k3s export \
+    --server=https://<aiq-gpu-address>:6443 \
+    --directory=~/.private/namek-join --apply
+```
+
+The directory is `0700`; `token`, `kubeconfig.yaml` and `manifest.json` are
+`0600`. Export rewrites the server URL in this copy, leaves original kubeconfigs
+unchanged, and can refresh an owned bundle after interruption/certificate
+rotation. It refuses unrelated directories or a bundle for another cluster.
+Securely transfer the directory to **namek** using your normal transport,
+retaining those permissions.
+
+On `namek`, with the NVIDIA driver and container toolkit already installed,
+use the private bundle files. The kubeconfig's selected server must be
+**the same URL** passed to `--server`, including the reachable LAN/VPN address
+instead of `127.0.0.1`. Do not overwrite an existing EKS/default kubeconfig.
+The onboarding command requires `kubectl` and Helm on the invoking machine.
+These credentials grant administrative access; keep the separate files private.
+
+Preview on `namek`:
+
+```bash
+infer-stack kube k3s onboard namek \
+    --server=https://<aiq-gpu-address>:6443 \
+    --token-file=~/.private/namek-join/token \
+    --kubeconfig=~/.private/namek-join/kubeconfig.yaml \
+    --namespace=default
+```
+
+Then run the same command with `--apply` after authenticating with `sudo -v`.
+It detects local GPU count/products/memory/UUIDs and infers the control plane's
+K3s version, verifies existing membership or installs the agent, checks local
+containerd NVIDIA discovery, waits for **namek itself** to become Ready with the
+expected GPU resources and GFD labels, and runs real GPU/model acceptance.
+It uses the existing NVIDIA/KubeAI installers if those components are absent.
+Host drivers/toolkit remain prerequisites: a missing toolkit fails before any
+agent changes. An existing agent on a different server is refused. Repeating
+onboarding rechecks membership and launches a fresh acceptance test.
+
+Acceptance briefly reserves **all GPUs on the named node** for a fresh runtime
+query, then uses **one GPU** for a small KubeAI Model and real generation.
+Allow those GPUs to become available first; the test does not evict workloads.
+It asserts actual pod placement on the requested node, exactly one GPU
+request/limit, NVIDIA runtime, nested KubeAI replica readiness, and an actual
+OpenAI generation response. The serving pod's device UUID/product are reported.
+Other cluster nodes cannot satisfy the test. The default model is the public
+`HuggingFaceTB/SmolLM2-135M-Instruct`; first image/model downloads may take
+minutes (`--timeout=900` by default). State changes are printed while waiting.
+No manually started port-forward or Docker gateway is needed: the test opens
+and closes a temporary, loopback-only KubeAI service forward.
+
+For an already joined worker, repeat acceptance from **aiq-gpu** or another
+administrative host, without distributing admin credentials to the worker:
+
+```bash
+infer-stack kube node test namek --expected-gpus=1 --namespace=default
+infer-stack kube node test namek --expected-gpus=1 --namespace=default --apply
+
+# The same acceptance surface handles later workers:
+infer-stack kube node test yardrat --expected-gpus=2 --namespace=default --apply
+infer-stack kube node test aiq-gpu2 --expected-gpus=4 --namespace=default --apply
+```
+
+`--kubeconfig=...` scopes all administrative commands to an explicit file;
+otherwise `node test` uses the selected context shown in its plan.
+`--resource-profile=<installed-one-GPU-profile>` retains custom image and
+resource settings and adds the node's hostname constraint. With no override,
+the normal NVIDIA model-server image profile is used. The test adds a stable
+node-specific KubeAI resource profile through the existing Helm upgrade helper,
+preserving installed chart version and values. That reusable profile remains
+installed and is printed for subsequent catalog use; it is not a host GPU index.
+The initial profile addition can roll KubeAI's controller, as the plan states.
+
+For heterogeneous `yardrat`, the device query reports both GPU products and
+memories independently. GFD selectors describe nodes, and Kubernetes' generic
+`nvidia.com/gpu` allocation does not select a particular physical product within
+a mixed node. The generation check verifies one allocated GPU and reports which
+one; it does **not** claim generation on every GPU/product or multi-GPU tensor
+parallelism. The other devices receive the fresh runtime/device query.
+
+Temporary Models and probe Pods have their own acceptance-run labels and are
+outside infer-stack's normal managed lease set. Catalog, recovery ledger,
+gateway and unrelated Models are preserved. Each run prints its cleanup command;
+normal success/failure deletes only that run's resources. After process/host
+interruption, use the printed ID (and the same namespace/kubeconfig):
+
+```bash
+infer-stack kube node test namek --namespace=default \
+    --run-id=<printed-id> --cleanup --apply
+```
+
+Cleanup verifies ownership before deletion and is safe to repeat. An occupied
+run ID is refused until explicit cleanup. Plans and results also support
+`--json`; progress goes to stderr. The broader `dev/kubeai_e2e.sh` remains the
+control-plane lifecycle/gateway suite and should run in a quiescent test namespace;
+use the targeted test above to accept individual joining workers.
+
 ### 5. Reconcile newly visible hardware
 
 Back on the machine operating infer-stack:

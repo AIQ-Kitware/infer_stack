@@ -87,6 +87,7 @@ infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
 infer-stack catalog show              # what can be acquired
 infer-stack kube inventory           # Kubernetes/GPU/KubeAI facts, before or after install
 infer-stack kube doctor              # detailed readiness + actionable fixes
+infer-stack kube node test NODE --expected-gpus=1  # plan worker GPU + real generation acceptance
 infer-stack kube node detach NODE     # preview handing a cluster GPU host to Compose
 infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
 infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
@@ -702,6 +703,23 @@ the timeout is only for a model that is loading. Reading Docker's own
 signals: `litellm exited with code 137` is a SIGKILL (an OOM kill or a forced
 replacement), whereas LiteLLM returning HTTP 500 with `Cannot connect to host
 vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
+
+### Join and accept GPU workers
+
+`infer-stack kube k3s onboard namek --server=... --token-file=... --kubeconfig=...`
+plans a local GPU worker join and node-specific acceptance; add `--apply` to
+execute it. Host NVIDIA drivers/toolkit are prerequisites. It infers the server
+version, verifies every locally detected device, then checks actual one-GPU
+KubeAI placement and generation on this worker. Admin credentials are explicit
+private files, separate from any selected EKS context.
+
+For an already joined worker, run `infer-stack kube node test namek
+--expected-gpus=1 --namespace=default --apply` from the control plane. The same
+surface accepts two-device `yardrat` and four-device `aiq-gpu2`; mixed products
+are reported separately. Tests preserve leases and unrelated Models, remove
+their temporary resources, and retain a reusable node profile. See the
+[worker onboarding instructions](docs/cluster-setup.md#join-and-test-a-gpu-worker-in-one-reviewed-operation)
+for plan/apply, credentials, interrupted cleanup and heterogeneous-node limits.
 
 ### Kubernetes dashboard
 

@@ -468,3 +468,11 @@ reported Ready but zero allocatable GPUs/missing GFD, rather than using another
 node as evidence. The full worker hardware/generation acceptance remains for
 namek/aiq-gpu, with heterogeneous generation limited to one allocated GPU per
 run. No maintainer design decision is needed to try that documented workflow.
+
+The documentation is committed separately from implementation: README links the
+worker recipe, cluster setup gives the exact private export -> secure transfer
+-> onboard plan/apply sequence plus repeat node tests and interrupted cleanup,
+and the broader dev e2e comments distinguish worker acceptance from its
+namespace-wide lifecycle assumptions. This preserves one Python installer
+implementation while making the operator's path concrete for all three planned
+worker shapes.
