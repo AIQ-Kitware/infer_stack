@@ -79,6 +79,12 @@ GPU requests/limits, a product selector and `runtimeClassName=nvidia` when that
 RuntimeClass exists. Kubernetes chooses placement; infer-stack assigns no host
 GPU indices. Models request multiple GPUs via the existing profile/count syntax.
 
+KubeAI Model names are limited to 40 characters. Short served names keep their
+DNS slug; longer names use a readable prefix plus a digest of the full name.
+Dynamic routes additionally reserve the deployment suffix, keeping dedicated
+deployments distinct. Gateway routes use the same canonical name; endpoint
+aliases and model source IDs remain unchanged.
+
 ```bash
 infer-stack kube install --values ./kubeai-values.local.yaml --namespace kubeai
 infer-stack kube install --values ./kubeai-values.local.yaml --namespace kubeai --apply

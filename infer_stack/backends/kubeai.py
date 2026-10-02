@@ -31,6 +31,7 @@ uses, and a route to the gateway (the default ``base_url`` assumes
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +48,8 @@ MODELS_FILENAME = 'models.yaml'
 STATE_FILENAME = 'leasing-kubeai-state.json'
 MANAGED_LABEL = 'infer-stack/managed'
 DEPLOYMENT_LABEL = 'infer-stack/deployment'
+# KubeAI's Model CRD is stricter than Kubernetes's usual DNS label limit.
+MODEL_NAME_MAX_LENGTH = 40
 DEFAULT_NAMESPACE = 'kubeai'
 # The standard local access path: `kubectl port-forward svc/kubeai 8000:80`.
 # An ingress-fronted cluster overrides this via the kubeai_base_url setting.
@@ -61,19 +64,26 @@ def model_name_for(served: str, deployment_id: str | None = None) -> str:
     name clients use through the KubeAI gateway never changes. With
     ``deployment_id`` (dynamic routing), the deployment's tail is appended, as
     for a compose service, so same-model ``--dedicated`` deployments are
-    separate Models; the gateway addresses each by name.
+    separate Models; the gateway addresses each by name. KubeAI limits Model
+    names to 40 characters. Overlong slugs retain a readable prefix plus a
+    digest of the full served name, budgeting separately for a deployment tail.
 
     >>> model_name_for('Qwen/Qwen3-8B')
     'qwen-qwen3-8b'
     >>> model_name_for('Qwen/Qwen3-8B', 'grp-0123456789ab')
     'qwen-qwen3-8b-01234567'
     """
-    if deployment_id is None:
-        return dns_slug(served)
     from ..leasing.naming import deployment_tail
 
-    tail = deployment_tail(deployment_id)
-    return f'{dns_slug(served)[:62 - len(tail)].rstrip("-")}-{tail}'
+    suffix = f'-{deployment_tail(deployment_id)}' if deployment_id is not None else ''
+    slug = dns_slug(served)
+    budget = MODEL_NAME_MAX_LENGTH - len(suffix)
+    if len(slug) > budget:
+        # Hash the whole identity, not the retained prefix. Static routes and
+        # dynamic deployment routes must derive exactly the same shortened CR.
+        digest = hashlib.sha256(served.encode()).hexdigest()[:8]
+        slug = f'{slug[:budget - len(digest) - 1].rstrip("-")}-{digest}'
+    return slug + suffix
 
 
 def model_name(deployment: Deployment, *, unique: bool = False) -> str:

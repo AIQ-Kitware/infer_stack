@@ -273,3 +273,30 @@ rows with no probe errors; screenshot /tmp/infer-stack-kubernetes-tui.svg.
 No real Apply/Down/node/bootstrap/install action was invoked. Maintainer
 validation remains the GPU hosts' credential refresh, actual agent membership,
 canary startup, and confirmed node handoff with real workloads.
+
+## 2026-10-01 20:55:21 -0400
+
+User intent: correct the reviewed KubeAI 40-character Model-name blocker,
+refresh runtime canaries on explicit apply, and make GPU-worker join verification
+explicit. Keep the long e2e identity and logical commits. Model/configuration:
+GPT-6 (Codex), Default collaboration mode, reasoning effort not exposed;
+user-requested attribution GPT-6.1-Sol. No sub-agents.
+
+The name budget belonged in model_name_for, shared by rendered Models and gateway
+routes. Kubernetes DNS validity alone did not imply CRD validity. Short names
+retain their existing identities; overlong names reserve an eight-character
+SHA-256 digest of the full served identity and the existing deployment tail.
+Simple truncation would merge distinct models sharing a prefix. This changes
+only names which the existing KubeAI CRD could not accept. The regression keeps
+HuggingFaceTB/SmolLM2-135M-Instruct and checks the two dedicated Model/route
+identities together. A first test unnecessarily invoked gateway apply with a
+fake HTTP implementation that never completed dynamic registration; interrupted
+after 73 preceding passes and restricted this rendering regression to its actual
+contract. No real workload was created by that test.
+
+Naming validation: tests/test_leasing_kubeai.py passed all 74 tests, including
+short/boundary names, static/dynamic long-prefix collisions, dedicated
+separation, and the exact long e2e Model with matching gateway routes. Type
+checks, scoped Ruff and whitespace checks passed. The script's long alias is
+unchanged. Read-only probes found an existing CPU KubeAI chart and no managed
+Models on this VM; its API needs a temporary port-forward before e2e.

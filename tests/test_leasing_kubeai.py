@@ -1191,3 +1191,45 @@ def test_explicit_served_name_extra_argument_is_rejected():
         Catalog.from_dict({'models': {'m': {'source': 'hf://org/model'}},
             'endpoints': {'alias': {'engine': 'vllm', 'model': 'm', 'runtime': {
                 'extra_args': ['--served-model-name=incorrect']}}}})
+
+
+@pytest.mark.parametrize('served,deployment_id,expected', [
+    ('short-name', None, 'short-name'),
+    ('Qwen/Qwen3-8B', 'grp-0123456789ab', 'qwen-qwen3-8b-01234567'),
+    ('x' * 40, None, 'x' * 40),
+    ('x' * 31, 'grp-0123456789ab', 'x' * 31 + '-01234567'),
+])
+def test_model_name_preserves_names_within_kubeai_limit(served, deployment_id, expected):
+    from infer_stack.backends.kubeai import model_name_for
+    assert model_name_for(served, deployment_id) == expected
+
+
+@pytest.mark.parametrize('deployment_id', [None, 'grp-0e0b4141abcd'])
+def test_long_model_names_are_bounded_stable_and_collision_resistant(deployment_id):
+    from infer_stack.backends.kubeai import model_name_for
+    prefix = 'very-long-served-model-name-' * 4
+    names = [model_name_for(prefix + ending, deployment_id) for ending in ('a', 'b')]
+    assert len(set(names)) == 2
+    assert all(len(name) <= 40 and not name.endswith('-') for name in names)
+    assert names[0] == model_name_for(prefix + 'a', deployment_id)
+    if deployment_id:
+        assert names[0].endswith('-0e0b4141')
+        assert names[0] != model_name_for(prefix + 'a', 'grp-abcdef123456')
+
+
+def test_e2e_long_dynamic_model_name_matches_render_and_gateway(tmp_path):
+    from infer_stack.backends.kubeai import model_name_for
+    served = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+    be, _ = make_front_door_backend(tmp_path, dynamic_routing=True)
+    deps = [vllm(gid, hf=served, served=served) for gid in
+            ('grp-0e0b4141abcd', 'grp-abcdef123456')]
+    for dep in deps:
+        dep.served = {served: {'served_model_name': served, 'protocol': 'chat'}}
+    be.converge(deps, apply=False)
+    docs = list(yaml.safe_load_all(be.models_file.read_text()))
+    expected = {model_name_for(served, dep.id) for dep in deps}
+    assert len(expected) == 2
+    assert all(len(name) <= 40 for name in expected)
+    assert {m['metadata']['name'] for m in docs} == expected
+    routes = json.loads((be.gateway.state_dir / 'litellm_routes.json').read_text())
+    assert {r['litellm_params']['model'] for r in routes} == {'openai/' + n for n in expected}
