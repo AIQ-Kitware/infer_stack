@@ -621,11 +621,17 @@ Set `kubeai_base_url` to a reachable OpenAI URL for the installed service.
 `kube bootstrap` defaults to a read-only plan; `--apply` (or `--yes`) authorizes
 host/cluster changes. K3s is the implemented provisioning provider; inventory,
 installation and the backend work with any Kubernetes distribution. Bootstrap
-preserves working clusters and existing kubeconfigs, installs Helm if missing,
+always provisions/reconciles the local K3s server, preserves unrelated selected
+contexts and kubeconfigs, installs Helm if missing,
 and reconciles NVIDIA device plugin **0.17.1** with GPU Feature Discovery.
 Install the host NVIDIA driver and container toolkit first. K3s discovers the
 installed runtime on startup; bootstrap restarts local K3s only when runtime
-discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels.
+discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels, and verifies unknown
+GPU-node runtime handlers with small node-specific canary pods. Root admin
+credentials stay `0600`; a private `0600` copy lives at
+`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Select the
+local server explicitly with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`
+before inventory/install; rerun bootstrap to refresh copied certificates.
 
 `kube install` shows inferred Helm values; `--apply` uses Helm upgrade/install
 and checks readiness afterward. `--dry-run`/`--plan` forces read-only behavior.
@@ -634,8 +640,10 @@ Existing named profiles and custom values are preserved; `HF_TOKEN` overrides
 the chart token using a temporary protected file. Generated public values live
 at `<data>/generated/kube/kubeai-values.yaml`.
 
-The older `kube setup` and `kube k3s` commands remain available for compatibility
-and node join operations. Setup scripts are compatibility wrappers around the
+`kube setup` is a deprecated alias of `kube install`; it no longer owns a
+separate prerequisite workflow. `kube k3s bootstrap` provisions only the local
+server, `join` verifies requested worker membership, and `status` reports local
+membership independently of any stale selected admin context. Setup scripts are compatibility wrappers around the
 package commands.
 
 ### Debugging serving failures

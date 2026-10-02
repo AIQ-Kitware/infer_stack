@@ -13,10 +13,7 @@ class K3sProvider:
 
     def plan(self, manager: KubeManager, report: dict) -> list[str]:
         actions = []
-        if not report['cluster']['reachable']:
-            actions.append('Install/start K3s only if no existing cluster/service; establish kubeconfig access')
-        else:
-            actions.append('Preserve the selected working cluster and kubeconfig')
+        actions.append('Provision the local K3s server; preserve unrelated selected context; use private local kubeconfig for all reconciliation')
         if not report['tools']['helm']:
             actions.append('Install Helm')
         if not report.get('gpu_count'):
@@ -27,15 +24,9 @@ class K3sProvider:
         return actions
 
     def apply(self, manager: KubeManager, report: dict, *, version=None, timeout=180) -> dict:
-        if not report['cluster']['reachable']:
-            # A configured but broken context is operator authority. Do not silently
-            # provision a second cluster beneath an unrelated kubeconfig.
-            if report['cluster']['context']:
-                raise RuntimeError('Selected context is unreachable; repair/select kubeconfig before bootstrap')
-            if not k3s.bootstrap(version=version, run=manager.run):
-                raise RuntimeError('Existing kubeconfig preserved. Select the K3s context, then retry bootstrap')
-        elif not report['tools']['helm']:
-            k3s._ensure_helm(manager.run)
+        # provider=k3s always targets this host's K3s, never the selected EKS/etc.
+        k3s.bootstrap(version=version, run=manager.run)
+        manager = self._local_manager(manager)
         fresh = inventory(manager)
         if not fresh.get('gpu_count') and (manager.command_exists('k3s')
                 or 'nvidia' not in (fresh['runtime_classes'] or [])):
@@ -68,7 +59,8 @@ class K3sProvider:
                 raise RuntimeError('K3s did not detect NVIDIA runtime; ensure nvidia-container-runtime is in the K3s service PATH')
         manager.run(['kubectl', 'wait', '--for=condition=Ready', 'node', '--all', f'--timeout={timeout}s'])
         plugin = fresh.get('device_plugin') or []
-        if (not plugin or not all(p['healthy'] for p in plugin)
+        if (not plugin or not any(p['desired'] > 0 for p in plugin)
+                or not all(p['healthy'] for p in plugin if p['desired'] > 0)
                 or not fresh.get('gpu_count')
                 or not all(r['gfd_labels'] for r in fresh['nodes'] if r['gpu_count'])):
             if 'nvidia' not in (fresh['runtime_classes'] or []):
@@ -77,11 +69,54 @@ class K3sProvider:
         deadline = time.monotonic() + timeout
         while True:
             fresh = inventory(manager)
+            if fresh.get('gpu_count') and 'nvidia' in (fresh['runtime_classes'] or []):
+                verify_node_runtimes(manager, fresh, timeout=timeout)
+                fresh = inventory(manager)
             if not failed(readiness(fresh, installation=False)):
                 return fresh
             if time.monotonic() >= deadline:
                 raise RuntimeError('GPU readiness timed out; run infer-stack kube doctor')
             time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _local_manager(manager):
+        def run(args, **kwargs):
+            if args[0] in {'kubectl', 'helm'}:
+                args = [args[0], '--kubeconfig', str(k3s.user_kubeconfig()), *args[1:]]
+            return manager.run(args, **kwargs)
+        local = KubeManager(run=run)
+        local.command_exists = manager.command_exists
+        return local
+
+
+def verify_node_runtimes(manager, report, *, timeout=180):
+    """Explicit bootstrap canaries test each GPU node's nvidia handler.
+
+    No GPU reservation: allocatable resources are independently checked. A
+    successful retained Pod supplies inspectable evidence for later inventory.
+    No hostRuntime claim is inferred from the RuntimeClass object alone.
+    """
+    import hashlib
+    import json
+    for node in report['nodes']:
+        if not node['gpu_count'] or node.get('nvidia_runtime_verified') is True:
+            continue
+        name = 'infer-stack-runtime-' + hashlib.sha256(node['name'].encode()).hexdigest()[:12]
+        existing = manager.kubectl_json(['-n', 'kube-system', 'get', 'pod', name, '--ignore-not-found', '-o', 'json'])
+        if existing and existing.get('metadata', {}).get('labels', {}).get('infer-stack/runtime-canary') != 'true':
+            raise RuntimeError(f'Refusing to replace unrelated pod kube-system/{name}')
+        manager.run(['kubectl', '-n', 'kube-system', 'delete', 'pod', name, '--ignore-not-found', '--wait=true'])
+        doc = {'apiVersion': 'v1', 'kind': 'Pod',
+               'metadata': {'name': name, 'namespace': 'kube-system',
+                            'labels': {'infer-stack/runtime-canary': 'true'}},
+               'spec': {'nodeName': node['name'], 'runtimeClassName': 'nvidia',
+                        'restartPolicy': 'Never', 'automountServiceAccountToken': False,
+                        'containers': [{'name': 'runtime', 'image': 'busybox:1.37.0', 'command': ['/bin/true']}],
+                        'tolerations': [{'operator': 'Exists'}]}}
+        manager.run(['kubectl', 'apply', '-f', '-'], input_text=json.dumps(doc))
+        manager.run(['kubectl', '-n', 'kube-system', 'wait', '--for=jsonpath={.status.phase}=Succeeded',
+                     f'pod/{name}', f'--timeout={timeout}s'])
+
 
 
 def install_plan(manager: KubeManager, report: dict, *, operator_values=None) -> dict:
@@ -98,9 +133,16 @@ def install(manager: KubeManager, report: dict, *, operator_values=None,
     checks = readiness(report, installation=False, gpu=gpu)
     if report['errors'].get('helm_releases'):
         raise RuntimeError('Cannot inspect existing Helm releases; repair Helm access before installation')
+    blockers = [c for c in checks if c['status'] == 'fail' and not c['name'].endswith('NVIDIA runtime verified')]
+    if blockers:
+        raise RuntimeError('KubeAI prerequisites failed: ' + ', '.join(c['name'] for c in blockers)
+                           + '. Run infer-stack kube doctor / kube bootstrap')
+    if gpu and 'nvidia' in (report['runtime_classes'] or []):
+        verify_node_runtimes(manager, report)
+        report = inventory(manager, namespace=report['kubeai']['namespace'], release=report['kubeai']['release_name'], base_url=report['kubeai']['api']['base_url'])
+    checks = readiness(report, installation=False, gpu=gpu)
     if failed(checks):
-        names = ', '.join(c['name'] for c in checks if c['status'] == 'fail')
-        raise RuntimeError(f'KubeAI prerequisites failed: {names}. Run infer-stack kube doctor / kube bootstrap')
+        raise RuntimeError('Node runtime verification incomplete; run infer-stack kube doctor')
     kubeai = report['kubeai']
     manager.install_kubeai(namespace=kubeai['namespace'], release=kubeai['release_name'],
                           resource_profiles=report['resource_profiles']['proposed'] if gpu else {},

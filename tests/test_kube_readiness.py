@@ -53,6 +53,10 @@ class Cluster:
             return '{}'
         if args[0] == 'kubectl' and 'nodes' in args and 'get' in args:
             return json.dumps({'items': self.nodes})
+        if args[:3] == ['kubectl', 'get', 'pods'] and '-A' in args:
+            return json.dumps({'items': [{'metadata': {'name': 'nvdp-' + n['metadata']['name'], 'namespace': 'nvidia-device-plugin'},
+                'spec': {'nodeName': n['metadata']['name'], 'runtimeClassName': 'nvidia'},
+                'status': {'containerStatuses': [{'state': {'running': {'startedAt': 'now'}}}]}} for n in self.nodes]})
         if args[:3] == ['kubectl', 'get', 'runtimeclasses']:
             return json.dumps({'items': [{'metadata': {'name': 'nvidia'}}]})
         if args[:3] == ['kubectl', 'get', 'daemonsets']:
@@ -231,18 +235,22 @@ def test_install_requires_prerequisites():
     assert not any('upgrade' in c for c in cluster.calls)
 
 
-def test_bootstrap_working_cluster_idempotent():
+def test_bootstrap_working_cluster_idempotent(monkeypatch):
     cluster = Cluster()
     m = manager(cluster)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: True)
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     provider = K3sProvider()
     for _ in range(2):
         provider.apply(m, inventory(m), timeout=0)
     assert not any(c[0] in ('sudo', 'curl', 'systemctl') or 'upgrade' in c for c in cluster.calls)
 
 
-def test_bootstrap_partial_state_resumes():
+def test_bootstrap_partial_state_resumes(monkeypatch):
     cluster = Cluster(nodes=[node(count=0, product=None)], plugin=False)
     m = manager(cluster)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: True)
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     provider = K3sProvider()
     provider.apply(m, inventory(m), timeout=0)
     provider.apply(m, inventory(m), timeout=0)
@@ -316,6 +324,8 @@ def test_bootstrap_installs_helm_only_if_missing(monkeypatch):
         assert run == cluster
         m.command_exists = lambda name: name in ('kubectl', 'helm')
     monkeypatch.setattr('infer_stack.kube.k3s._ensure_helm', ensure)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: ensure(kw['run']))
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     result = K3sProvider().apply(m, inventory(m), timeout=0)
     assert result['tools']['helm']
 
@@ -339,6 +349,7 @@ def test_k3s_fresh_then_interrupted_start_never_reinstalls(monkeypatch):
     monkeypatch.setattr(k3s.shutil, 'which', lambda name: '/usr/local/bin/k3s' if name == 'k3s' and installed else None)
     monkeypatch.setattr(k3s, '_ensure_default_kubeconfig_link', lambda: True)
     monkeypatch.setattr(k3s, '_ensure_helm', lambda run: None)
+    monkeypatch.setattr(k3s, '_provision_user_kubeconfig', lambda run: None)
     k3s.bootstrap(run=run)
     k3s.bootstrap(run=run)
     assert sum(c[0] == 'curl' for c in calls) == 1
@@ -370,6 +381,8 @@ def test_runtime_repair_refuses_unrelated_local_cluster(monkeypatch):
         return original(args, **kwargs)
     m.run = run
     monkeypatch.setattr('infer_stack.kube.k3s._active', lambda *args: True)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: True)
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     with pytest.raises(RuntimeError, match='differs from local K3s'):
         K3sProvider().apply(m, inventory(m), timeout=0)
     assert not any('restart' in c for c in cluster.calls)
@@ -379,6 +392,8 @@ def test_k3s_runtimeclass_alone_does_not_prove_runtime_configured(monkeypatch):
     cluster = Cluster(nodes=[node(count=0)], plugin=False)
     m = manager(cluster, tools=('kubectl', 'helm', 'k3s'))
     monkeypatch.setattr('infer_stack.kube.k3s._active', lambda *args: True)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: True)
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     with pytest.raises(RuntimeError, match='nvidia-container-toolkit'):
         K3sProvider().apply(m, inventory(m), timeout=0)
     assert not any('upgrade' in c for c in cluster.calls)
@@ -398,6 +413,8 @@ def test_k3s_configured_runtime_does_not_restart(monkeypatch):
         return original(args, **kwargs)
     m.run = run
     monkeypatch.setattr('infer_stack.kube.k3s._active', lambda *args: True)
+    monkeypatch.setattr('infer_stack.kube.k3s.bootstrap', lambda **kw: True)
+    monkeypatch.setattr(K3sProvider, '_local_manager', staticmethod(lambda manager: manager))
     result = K3sProvider().apply(m, inventory(m), timeout=0)
     assert result['gpu_count'] == 4
     assert not any('restart' in c for c in host_calls)

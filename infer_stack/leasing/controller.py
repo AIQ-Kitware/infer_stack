@@ -1220,7 +1220,8 @@ class Controller:
             raise ProfileMismatch(
                 f"the active recovery snapshot uses {stored.get('backend')!r}, "
                 f"but current config selects {invocation.get('backend')!r}; "
-                'tear down the old backend before switching'
+                'quiesce/tear down the old backend, then archive its history and '
+                'start a new recovery epoch with `infer-stack ledger rotate --yes`'
             )
         drift = profile_drift(stored, invocation)
         # A runbook whose catalog is already a subset of an explicitly seeded
@@ -1558,12 +1559,25 @@ class Controller:
         ]
         deadline = self.clock() + timeout
         last_room = float('-inf')
+        last_details = {}
         while True:
             pending = []
             failures = []
             blocked: dict[str, Deployment] = {}
             for (g, ep) in pairs:
                 probe = self.backend.probe_ready(g, ep)
+                detail = 'generation verified' if probe.ready else probe.detail
+                if detail and last_details.get((g.id, ep)) != detail:
+                    from .._log import logger
+                    message = f'{ep}: {detail}'
+                    logger.info('{}', message)
+                    progress = getattr(self.backend, 'progress', None)
+                    if progress is not None:
+                        try:
+                            progress(message)
+                        except Exception:
+                            pass  # presentation must not affect lease readiness
+                    last_details[(g.id, ep)] = detail
                 if probe.ready:
                     continue
                 pending.append((g, ep))

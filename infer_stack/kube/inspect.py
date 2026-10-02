@@ -29,7 +29,7 @@ def inventory(manager: KubeManager, *, namespace='kubeai', release='kubeai',
     report: dict[str, Any] = {
         'tools': {name: manager.command_exists(name) for name in ('kubectl', 'helm')},
         'cluster': {'context': '', 'reachable': False, 'distribution': None},
-        'host_gpus': None, 'gpu_count': 0, 'nodes': [], 'runtime_classes': None, 'device_plugin': None,
+        'local_membership': None, 'host_gpus': None, 'gpu_count': 0, 'nodes': [], 'runtime_classes': None, 'device_plugin': None,
         'kubeai': {'namespace': namespace, 'release_name': release, 'crd': None,
                    'namespace_exists': None, 'release': None, 'pods': None,
                    'services': None, 'models': None,
@@ -44,6 +44,9 @@ def inventory(manager: KubeManager, *, namespace='kubeai', release='kubeai',
             report['errors'][key] = str(ex)
             return default
 
+    if manager.command_exists('k3s'):
+        from .k3s import local_status
+        report['local_membership'] = probe('local_membership', lambda: local_status(run=manager.run))
     if manager.command_exists('nvidia-smi'):
         def host_gpus():
             text = manager.run(['nvidia-smi', '--query-gpu=index,name,memory.total',
@@ -78,8 +81,25 @@ def inventory(manager: KubeManager, *, namespace='kubeai', release='kubeai',
         report['runtime_classes'] = [i.get('metadata', {}).get('name')
                                      for i in runtime.get('items', [])]
     runtime_ok = 'nvidia' in (report['runtime_classes'] or [])
+    runtime_pods = probe('node_runtime', lambda: manager.kubectl_json(
+        ['get', 'pods', '-A', '-o', 'json'])) if runtime_ok else None
     for row in report['nodes']:
-        row['nvidia_runtime_class'] = runtime_ok
+        row['nvidia_runtime_verified'] = None
+        row['nvidia_runtime_evidence'] = 'No observed pod proves the node runtime handler'
+        for pod in (runtime_pods or {}).get('items', []):
+            spec, status = pod.get('spec', {}), pod.get('status', {})
+            if spec.get('nodeName') != row['name'] or spec.get('runtimeClassName') != 'nvidia':
+                continue
+            started = any(c.get('state', {}).get('running') or c.get('state', {}).get('terminated')
+                          for c in status.get('containerStatuses') or [])
+            if started:
+                row['nvidia_runtime_verified'] = True
+                row['nvidia_runtime_evidence'] = f"nvidia runtime pod {manager._pod_name(pod)} started"
+                break
+            messages = ' '.join(str(c.get('message', '')) for c in status.get('conditions') or [])
+            if 'runtime handler' in messages.lower():
+                row['nvidia_runtime_verified'] = False
+                row['nvidia_runtime_evidence'] = messages
     ds = probe('device_plugin', lambda: manager.kubectl_json(
         ['get', 'daemonsets', '-A', '-o', 'json']))
     if ds is not None:
@@ -91,7 +111,8 @@ def inventory(manager: KubeManager, *, namespace='kubeai', release='kubeai',
                 desired = status.get('desiredNumberScheduled', 0)
                 plugins.append({'name': manager._pod_name(item), 'desired': desired,
                                 'ready': status.get('numberReady', 0),
-                                'healthy': desired > 0 and status.get('numberReady', 0) == desired})
+                                'applicable': desired > 0,
+                                'healthy': (status.get('numberReady', 0) == desired) if desired > 0 else None})
         report['device_plugin'] = plugins
     report['resource_profiles']['proposed'] = manager.resource_profiles(
         nodes, runtime_class_name='nvidia' if runtime_ok else None)
@@ -161,8 +182,13 @@ def readiness(report: dict, *, installation=True, gpu=True) -> list[dict]:
         check('NVIDIA runtime', runtime_ok or bool(gpu_rows),
               'Install NVIDIA driver/container toolkit on GPU nodes; then infer-stack kube bootstrap',
               'RuntimeClass nvidia' if runtime_ok else 'No nvidia RuntimeClass; GPU allocation proves an external integration' if gpu_rows else '')
+        for row in gpu_rows if runtime_ok else []:
+            verified = row.get('nvidia_runtime_verified')
+            check(f"node {row['name']} NVIDIA runtime verified", verified is True,
+                  'infer-stack kube install --apply (verifies runtime handlers in the selected cluster)',
+                  row.get('nvidia_runtime_evidence', 'Runtime handler unknown'))
         plugin = report['device_plugin']
-        check('NVIDIA device plugin', bool(plugin) and all(p['healthy'] for p in plugin),
+        check('NVIDIA device plugin', bool(plugin) and any(p['desired'] > 0 for p in plugin) and all(p['healthy'] for p in plugin if p['desired'] > 0),
               'infer-stack kube bootstrap', report['errors'].get('device_plugin', ''))
         if check('nvidia.com/gpu allocatable', bool(gpu_rows), 'infer-stack kube bootstrap'):
             check('GFD product + memory labels', all(r['gfd_labels'] for r in gpu_rows),

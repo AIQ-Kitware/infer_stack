@@ -122,11 +122,19 @@ infer-stack kube bootstrap --provider=k3s --version=<exact-k3s-version> --apply
 
 This provider-specific bootstrap plans by default; `--apply` installs/starts a
 K3s server, waits for its node to become Ready, and makes the K3s kubeconfig
-usable without overwriting an existing `~/.kube/config`.
+private: the root admin file stays `0600`, and only the invoking user receives
+a `0600` copy at `~/.kube/infer-stack-k3s.yaml`. Existing default configs and
+`KUBECONFIG` are never replaced. `provider=k3s` always reconciles this local
+server through its explicit private kubeconfig, even when EKS or another cluster
+is selected. Use `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` for subsequent
+inventory/install. Repeating bootstrap refreshes the copied certificates when
+K3s rotates its admin credentials. The older `scripts/bootstrap_k3s.sh` calls
+`infer-stack kube k3s bootstrap`, which provisions only the local server.
 
-Then inspect the generic Kubernetes integration:
+Then explicitly select the local K3s server and inspect the generic integration:
 
 ```bash
+export KUBECONFIG=~/.kube/infer-stack-k3s.yaml
 infer-stack kube inventory
 infer-stack kube doctor
 infer-stack kube install
@@ -177,6 +185,7 @@ network.
 Back on the machine operating infer-stack:
 
 ```bash
+export KUBECONFIG=~/.kube/infer-stack-k3s.yaml
 infer-stack kube inventory
 infer-stack kube doctor
 infer-stack kube install
@@ -381,3 +390,21 @@ administrator:
 
 This keeps K3s easy to use today without making it part of infer-stack's
 backend or scheduling architecture.
+
+### Local worker membership and runtime evidence
+
+`infer-stack kube k3s status` reports local server/agent membership without
+consulting the selected admin context or exposing join tokens. After join,
+verify the worker on the control plane with `infer-stack kube node status <name>`.
+A stale EKS context on the worker does not mean local membership failed. Active
+agents must match requested server/name/version before join can return success.
+
+A RuntimeClass object is cluster-scoped and does not prove every node handler.
+Inventory reports per-node runtime evidence independently. Explicit bootstrap
+and install can run small node-specific runtime canaries on GPU nodes; they
+reserve no GPUs and retain completed pods in `kube-system`. Unknown handlers
+block detailed readiness until verified. Optional NVIDIA components scheduled
+onto zero nodes report N/A instead of causing a reinstall/readiness loop.
+
+`kube setup` is deprecated and delegates to `kube install`; use local K3s
+bootstrap for prerequisites and generic install for the selected cluster.

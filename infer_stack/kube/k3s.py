@@ -6,11 +6,15 @@ capability layer.  Generic setup/backends must not depend on this module.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import tempfile
 from pathlib import Path
 from typing import Callable
+
+import yaml
 
 from .manage import default_run
 
@@ -50,18 +54,44 @@ def _ensure_default_kubeconfig_link() -> bool:
     Existing kubeconfig state is operator authority and is never replaced.
     """
     if os.environ.get('KUBECONFIG'):
-        return os.environ['KUBECONFIG'] == str(K3S_KUBECONFIG)
+        return os.environ['KUBECONFIG'] == str(user_kubeconfig())
     target = Path.home() / '.kube' / 'config'
     if target.exists() or target.is_symlink():
         if target.is_symlink():
             try:
-                return target.resolve() == K3S_KUBECONFIG
+                return target.resolve() == user_kubeconfig()
             except OSError:
                 return False
         return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(K3S_KUBECONFIG)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.symlink_to(user_kubeconfig())
     return True
+
+
+def user_kubeconfig() -> Path:
+    return Path.home() / '.kube' / 'infer-stack-k3s.yaml'
+
+
+def _provision_user_kubeconfig(run: RunFunc) -> None:
+    """Refresh an explicitly owned 0600 admin copy; never expose root credentials.
+
+    K3s rotates its admin certificates. Rerunning bootstrap refreshes this copy.
+    An unrelated default or KUBECONFIG remains untouched.
+    """
+    target = user_kubeconfig()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    text = run(['sudo', '-n', 'cat', str(K3S_KUBECONFIG)])
+    if not text.strip():
+        raise RuntimeError('Local K3s kubeconfig is empty; cannot provision user access')
+    fd, source = tempfile.mkstemp(prefix='.infer-stack-k3s-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'w') as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(source, target)
+    finally:
+        Path(source).unlink(missing_ok=True)
 
 
 def _ensure_helm(run: RunFunc) -> None:
@@ -72,7 +102,7 @@ def _ensure_helm(run: RunFunc) -> None:
 
 
 def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool:
-    """Install/start a local K3s server and make its kubeconfig readable.
+    """Install/start a local K3s server and provision restricted user access.
 
     NVIDIA drivers/container runtime are intentionally not installed here.
     K3s detects an already-installed NVIDIA container runtime when it starts;
@@ -85,31 +115,31 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
     already_active = _active(run, 'k3s')
     if already_active and version:
         installed = run(['k3s', '--version']).splitlines()[0]
-        if version not in installed:
+        if installed.split()[2] != version:
             raise RuntimeError(
                 f'K3s is already active as {installed!r}; requested {version!r}. '
                 'Refusing an implicit cluster upgrade; upgrade K3s explicitly.'
             )
 
-    # Keep this as persistent K3s configuration rather than copying the
-    # root-owned kubeconfig into ~/.kube (which creates a second authority that
-    # can drift when K3s rotates credentials).
+    # The root admin authority stays 0600. Only this invoking user receives
+    # a private copy; bootstrap refreshes it when credentials rotate.
     with tempfile.NamedTemporaryFile('w', prefix='infer-stack-k3s-', delete=False) as file:
-        file.write('write-kubeconfig-mode: "0644"\n')
+        file.write('write-kubeconfig-mode: "0600"\n')
         source = file.name
     try:
         run(['sudo', '-n', 'mkdir', '-p', '/etc/rancher/k3s/config.yaml.d'])
         run([
             'sudo', '-n', 'install', '-m', '0644', source,
-            '/etc/rancher/k3s/config.yaml.d/10-infer-stack-kubeconfig-mode.yaml',
+            '/etc/rancher/k3s/config.yaml.d/zz-infer-stack-kubeconfig-mode.yaml',
         ])
     finally:
         Path(source).unlink(missing_ok=True)
 
+    run(['sudo', '-n', 'rm', '-f', '/etc/rancher/k3s/config.yaml.d/10-infer-stack-kubeconfig-mode.yaml'])
     if already_active:
         # Updating the mode fragment does not require restarting a working
         # control plane. Repair current access directly; next start uses it too.
-        run(['sudo', '-n', 'chmod', '0644', str(K3S_KUBECONFIG)])
+        run(['sudo', '-n', 'chmod', '0600', str(K3S_KUBECONFIG)])
     elif shutil.which('k3s') is not None:
         run(['sudo', '-n', 'systemctl', 'start', 'k3s'])
     else:
@@ -125,8 +155,10 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
         cmd.extend(['sh', '-'])
         run(cmd, input_text=installer, env=env)
 
+    run(['sudo', '-n', 'chmod', '0600', str(K3S_KUBECONFIG)])
+    _provision_user_kubeconfig(run)
     run([
-        'kubectl', '--kubeconfig', str(K3S_KUBECONFIG),
+        'kubectl', '--kubeconfig', str(user_kubeconfig()),
         'wait', '--for=condition=Ready', 'node', '--all', '--timeout=180s',
     ])
     default_kubeconfig_ready = _ensure_default_kubeconfig_link()
@@ -145,10 +177,19 @@ def join(
     """Join this host to an existing K3s server without putting its token on argv."""
     run = run or default_run
     _require_local_tool('sudo')
+    if _active(run, 'k3s'):
+        raise RuntimeError('This host runs a K3s server; refusing to replace it with an agent')
     if _active(run, 'k3s-agent'):
+        membership = local_status(run=run)
+        if membership['errors']:
+            raise RuntimeError('Cannot verify active K3s membership: ' + '; '.join(membership['errors']))
+        if membership['server'].rstrip('/') != server.rstrip('/'):
+            raise RuntimeError(f"Active K3s agent server {membership['server']!r} differs from requested {server!r}; stop/reconfigure membership explicitly")
+        if node_name and membership['node_name'] != node_name:
+            raise RuntimeError(f"Active K3s agent node name {membership['node_name']!r} differs from requested {node_name!r}")
         if version:
             installed = run(['k3s', '--version']).splitlines()[0]
-            if version not in installed:
+            if installed.split()[2] != version:
                 raise RuntimeError(
                     f'K3s agent is already active as {installed!r}; requested '
                     f'{version!r}. Refusing an implicit agent upgrade.'
@@ -174,8 +215,59 @@ def join(
         env['INSTALL_K3S_VERSION'] = version
         preserve.append('INSTALL_K3S_VERSION')
     run(
-        ['sudo', '--preserve-env=' + ','.join(preserve), 'sh', '-'],
+        ['sudo', '-n', '--preserve-env=' + ','.join(preserve), 'sh', '-'],
         input_text=installer,
         env=env,
     )
     run(['systemctl', 'is-active', '--quiet', 'k3s-agent'])
+
+
+def local_status(*, run: RunFunc | None = None) -> dict:
+    """Local membership independent of selected admin kubeconfig, without secrets.
+
+    Inspect the running agent's actual argv/environment, then K3s config with
+    its drop-ins. Unknown/unreadable configuration is reported and cannot make
+    a requested join look idempotent.
+    """
+    run = run or default_run
+    report = {'agent_active': _active(run, 'k3s-agent'),
+              'server_active': _active(run, 'k3s'), 'server': '',
+              'node_name': '', 'version': '', 'errors': []}
+    if not report['agent_active'] and not report['server_active']:
+        return report
+    try:
+        report['version'] = run(['k3s', '--version']).splitlines()[0]
+    except Exception:
+        report['errors'].append('Unable to read local K3s version')
+    if not report['agent_active']:
+        return report
+    try:
+        pid = run(['systemctl', 'show', 'k3s-agent', '--property=MainPID', '--value']).strip()
+        if not pid.isdigit() or int(pid) == 0:
+            raise ValueError('agent PID unavailable')
+        argv = run(['sudo', '-n', 'cat', f'/proc/{pid}/cmdline']).split('\0')
+        environ = run(['sudo', '-n', 'cat', f'/proc/{pid}/environ']).split('\0')
+        env = dict(v.split('=', 1) for v in environ if '=' in v)
+        flags = {}
+        for i, arg in enumerate(argv):
+            if arg.startswith('--'):
+                key, sep, value = arg[2:].partition('=')
+                flags[key] = value if sep else (argv[i + 1] if i + 1 < len(argv) else '')
+        config_path = flags.get('config') or env.get('K3S_CONFIG_FILE') or '/etc/rancher/k3s/config.yaml'
+        # Read only through the privilege seam. The command emits YAML only
+        # into memory; secrets never enter the status report or diagnostics.
+        files = json.loads(run(['sudo', '-n', 'python3', '-c',
+            'import glob,json,pathlib,sys; p=sys.argv[1]; '
+            'print(json.dumps([pathlib.Path(f).read_text() for f in ([p] if pathlib.Path(p).exists() else []) + sorted(glob.glob(p+".d/*.yaml"))]))',
+            config_path]))
+        config = {}
+        for text in files:
+            values = yaml.safe_load(text) or {}
+            config.update(values)
+        report['server'] = str(flags.get('server') or env.get('K3S_URL') or config.get('server') or '')
+        report['node_name'] = str(flags.get('node-name') or env.get('K3S_NODE_NAME') or config.get('node-name') or socket.gethostname().lower())
+        if not report['server']:
+            report['errors'].append('Active agent server is unknown')
+    except Exception:
+        report['errors'].append('Cannot inspect active agent configuration; authenticate with sudo -v then retry')
+    return report

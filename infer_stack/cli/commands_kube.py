@@ -279,13 +279,10 @@ class KubeNodeModalCLI(kw.ModalCLI):
 
 
 class KubeSetupCLI(_PathOverridesMixin):
-    """Inspect or reconcile the Kubernetes capabilities infer-stack needs.
+    """Deprecated compatibility alias of kube install.
 
-    The default is read-only.  ``--apply`` installs/reconciles only components
-    infer-stack owns: the NVIDIA device-plugin/GFD convenience path (when an
-    NVIDIA RuntimeClass says the host runtime is ready), and KubeAI with
-    discovered resource profiles.  Existing working GPU integrations and
-    operator-customized named profiles are preserved.
+    Use kube bootstrap for local K3s prerequisites. Setup delegates KubeAI
+    planning/apply to the install command and has no independent orchestration.
     """
 
     __command__ = 'setup'
@@ -313,39 +310,12 @@ class KubeSetupCLI(_PathOverridesMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        namespace = _namespace(config)
-        manager = KubeManager()
-        try:
-            operator_values = manager.load_values_file(config.values)
-        except RuntimeError as ex:
-            raise SystemExit(str(ex)) from ex
-        if not config.apply:
-            try:
-                plan = manager.plan_setup(
-                    namespace=namespace, release=config.release, gpu=config.gpu,
-                    operator_values=operator_values,
-                )
-            except RuntimeError as ex:
-                raise SystemExit(str(ex)) from ex
-            _print_plan(plan)
-            print('\nNo changes made. Re-run with --apply to reconcile managed components.')
-            return 1 if plan.failed else 0
-
-        try:
-            plan, values_path = manager.apply_setup(
-                namespace=namespace,
-                release=config.release,
-                gpu=config.gpu,
-                nvidia_plugin_version=config.nvidia_plugin_version,
-                kubeai_version=config.kubeai_version,
-                operator_values=operator_values,
-            )
-        except RuntimeError as ex:
-            raise SystemExit(str(ex)) from ex
-        _print_plan(plan)
-        if values_path is not None:
-            print(f'\nKubeAI values authority: {values_path}')
-        return 1 if plan.failed else 0
+        print('Deprecated: kube setup is an alias of kube install; use kube bootstrap for local K3s prerequisites.')
+        if config.nvidia_plugin_version != NVIDIA_DEVICE_PLUGIN_VERSION:
+            raise SystemExit('Use the pinned NVIDIA bootstrap path; setup no longer owns plugin installation')
+        return KubeInstallCLI.main(argv=False, namespace=_namespace(config), release=config.release,
+                                   gpu='none' if config.gpu == 'none' else 'nvidia',
+                                   apply=config.apply, values=config['values'], version=config.kubeai_version)
 
 
 class K3sBootstrapCLI(kw.Config):
@@ -360,19 +330,20 @@ class K3sBootstrapCLI(kw.Config):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        from ..kube.k3s import K3S_NODE_TOKEN, bootstrap
+        from ..kube.k3s import K3S_NODE_TOKEN, bootstrap, user_kubeconfig
 
         try:
             default_kubeconfig_ready = bootstrap(version=config.version)
         except RuntimeError as ex:
             raise SystemExit(str(ex)) from ex
         print('K3s server is active and all nodes are Ready.')
-        print('K3s kubeconfig: /etc/rancher/k3s/k3s.yaml')
+        print('Root admin kubeconfig: /etc/rancher/k3s/k3s.yaml (0600)')
+        print(f'Private user kubeconfig: {user_kubeconfig()} (0600); rerun bootstrap to refresh certificates')
         if not default_kubeconfig_ready:
             print(
                 'Existing ~/.kube/config was left unchanged. Make sure its '
-                'current context selects this K3s cluster (or set KUBECONFIG) '
-                'before running setup.'
+                'current context selects this K3s cluster before installation.'
+                f' Select it explicitly with: export KUBECONFIG={user_kubeconfig()}'
             )
         print(f'K3s join token: sudo cat {K3S_NODE_TOKEN}')
         print('Join workers with: infer-stack kube k3s join --server=... --token-file=...')
@@ -395,6 +366,8 @@ class K3sJoinCLI(kw.Config):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
+        import socket
+
         from ..kube.k3s import join
 
         try:
@@ -406,20 +379,42 @@ class K3sJoinCLI(kw.Config):
             )
         except RuntimeError as ex:
             raise SystemExit(str(ex)) from ex
-        print('K3s agent is active.')
+        print('K3s agent is active; this does not change the selected admin kubeconfig.')
+        print('Inspect local membership: infer-stack kube k3s status')
+        print(f'On the control plane: infer-stack kube node status {config.node_name or socket.gethostname().lower()}')
         return 0
+
+
+class K3sStatusCLI(kw.Config):
+    """Local K3s server/agent membership, independent of selected admin context."""
+    __command__ = 'status'
+    json = kw.Value(False, isflag=True, help='Emit membership facts without credentials.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from ..kube.k3s import local_status
+        config = cls.cli(argv=argv, data=kwargs)
+        report = local_status()
+        if config.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print('local Kubernetes membership (not selected admin context)')
+            for key, value in report.items():
+                print(f'  {key}: {value}')
+        return int(bool(report['errors']))
 
 
 class K3sModalCLI(kw.ModalCLI):
     """First supported provisioning target: create/join K3s clusters.
 
     This namespace is intentionally distribution-specific.  Existing clusters
-    and future provisioning integrations use the same generic ``kube setup``.
+    and future provisioning integrations use generic inventory/doctor/install.
     """
 
     __command__ = 'k3s'
     bootstrap = K3sBootstrapCLI
     join = K3sJoinCLI
+    status = K3sStatusCLI
 
 
 def _inventory_for_config(config, manager):
@@ -434,7 +429,12 @@ def _inventory_for_config(config, manager):
 def _print_inventory(report):
     import yaml
 
-    print('cluster')
+    if report.get('local_membership') is not None:
+        print('local Kubernetes membership')
+        for key, value in report['local_membership'].items():
+            print(f'  {key}: {value}')
+    print('selected admin cluster')
+    print('  RuntimeClass objects: ' + ', '.join(report['runtime_classes'] or []))
     for key, value in report['cluster'].items():
         print(f'  {key}: {value}')
     print(f"host GPUs: {report['host_gpus']}")
@@ -443,12 +443,12 @@ def _print_inventory(report):
         print(f'  {key}: {"available" if value else "missing"}')
     for node in report['nodes']:
         print(f"node {node['name']}")
-        for key in ('ready', 'nvidia_runtime_class', 'gpu_count', 'gpu_product',
+        for key in ('ready', 'nvidia_runtime_verified', 'nvidia_runtime_evidence', 'gpu_count', 'gpu_product',
                     'gpu_memory_gib', 'gfd_labels'):
             print(f'  {key}: {node[key]}')
     plugins = report['device_plugin']
     print('NVIDIA device plugin: ' + ('unknown' if plugins is None else 'missing' if not plugins else
-          ', '.join(f"{p['name']} ({p['ready']}/{p['desired']} ready)" for p in plugins)))
+          ', '.join(f"{p['name']} ({str(p['ready']) + '/' + str(p['desired']) + ' ready' if p['desired'] > 0 else 'N/A: zero scheduled'})" for p in plugins)))
     kubeai = report['kubeai']
     print('KubeAI')
     print(f"  Model CRD: {'installed' if kubeai['crd'] else 'missing' if kubeai['crd'] is False else 'unknown'}")
@@ -476,7 +476,10 @@ def _print_inventory(report):
                 summary = f"{status.get('readyReplicas', 0)} ready replicas"
             print(f'    {name}: {summary}')
     print('resource profiles proposed')
-    print(yaml.safe_dump(report['resource_profiles']['proposed'], sort_keys=False), end='')
+    if report['resource_profiles']['proposed']:
+        print(yaml.safe_dump(report['resource_profiles']['proposed'], sort_keys=False), end='')
+    else:
+        print('  none: discover allocatable GPUs with GFD product/memory labels through a reachable admin context')
     print('resource profiles installed: ' + (', '.join(report['resource_profiles']['installed']) or 'none'))
     for key, error in report['errors'].items():
         print(f'  probe {key}: {error}')
@@ -588,10 +591,10 @@ class KubeInstallCLI(KubeInventoryCLI):
 
 
 class KubeBootstrapCLI(KubeInventoryCLI):
-    """Plan host/cluster GPU prerequisites; --apply converges them with K3s."""
+    """Plan a local K3s server and GPU prerequisites; never targets unrelated selected contexts."""
 
     __command__ = 'bootstrap'
-    provider = kw.Value('k3s', choices=['k3s'], type=str, help='Cluster provisioning provider.')
+    provider = kw.Value('k3s', choices=['k3s'], type=str, help='Provision local K3s, regardless of selected admin context.')
     version = kw.Value(None, type=str, help='Optional exact K3s version; no implicit upgrades.')
     apply = kw.Value(False, isflag=True, alias=['yes'], help='Authorize host/cluster bootstrap changes.')
     dry_run = kw.Value(False, isflag=True, alias=['plan'], help='Only display the plan.')
@@ -621,6 +624,9 @@ class KubeBootstrapCLI(KubeInventoryCLI):
         except RuntimeError as ex:
             raise SystemExit(f'{ex}. If elevation failed, authenticate with sudo -v and retry.') from ex
         checks = readiness(report, installation=False)
+        if not config.json:
+            from ..kube.k3s import user_kubeconfig
+            print(f'Local K3s reconciled. For inventory/install: export KUBECONFIG={user_kubeconfig()}')
         if config.json:
             print(json.dumps({'inventory': report, 'checks': checks}, indent=2))
         else:

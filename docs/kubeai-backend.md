@@ -55,15 +55,23 @@ infer-stack kube status                # nodes, GPUs, plugin, pods/services/mana
 ```
 
 Install host NVIDIA drivers/container toolkit before bootstrap. Inventory and
-install are distribution-neutral. Bootstrap preserves working clusters and
-existing kubeconfigs; it refuses to replace a selected unreachable context.
+install are distribution-neutral. `bootstrap --provider=k3s` always targets
+the local K3s server, never an unrelated selected context (reachable or stale).
+Root admin credentials remain `0600`. Bootstrap refreshes a private user copy at
+`~/.kube/infer-stack-k3s.yaml`, preserving existing default configs. Explicitly
+select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` before inventory/install.
 Use `--version` to pin K3s; active clusters are never implicitly upgraded.
 
 `inventory`, `doctor`, and `status` accept `--json`. Errors belong to individual
 probes, so a missing KubeAI ConfigMap cannot erase GPU node facts. A cluster with
 a leftover CRD but no namespace/chart can be diagnosed and repaired with these
 commands. Kubernetes GPU allocation and GFD readiness are separate from host
-GPU visibility.
+GPU visibility. A cluster-scoped RuntimeClass is reported separately from node
+runtime evidence; missing handler evidence remains unknown, never an all-clear.
+Apply bootstrap/install verifies unknown handlers on GPU nodes with small
+`busybox:1.37.0` canaries using `runtimeClassName=nvidia`. These reserve no GPU
+and retain completed pods in `kube-system` as diagnostic evidence. Inactive
+0/0 NVIDIA DaemonSets are N/A, so an optional MPS component does not block readiness.
 
 Mutation requires `--apply` (alias `--yes`). Both mutating commands support
 `--dry-run` (alias `--plan`). Install derives one profile per GPU product with
@@ -91,8 +99,9 @@ background port-forward is created.
 
 For temporary Compose/KubeAI testing, preserve the Compose authority as described
 in [cluster setup](cluster-setup.md#temporarily-swap-compose-configured-workstations-into-a-cluster).
-`kube setup` remains a compatibility plan/apply workflow, and the setup scripts
-forward to the new commands.
+`kube setup` is deprecated and delegates to `kube install`; it no longer
+reconciles prerequisites independently. The bootstrap compatibility script
+invokes the unambiguous `kube k3s bootstrap` local-server command.
 
 For explicit CPU development, preserve the existing CPU chart workflow:
 
@@ -242,6 +251,12 @@ infer-stack kube k3s join \
   --version=<same-k3s-version>
 ```
 
+After join, use `infer-stack kube k3s status` on the worker for local membership.
+Joining does not change its admin kubeconfig or grant cluster-admin credentials;
+verify it from the control plane with `infer-stack kube node status <name>`.
+An already-running agent must match the requested server, node name and version
+or join refuses.
+
 The token is read from a file so it does not land in shell history or the
 installer argv. Between K3s nodes, allow the K3s-required cluster traffic
 (6443/tcp to the server, the configured Flannel/backend traffic, and kubelet
@@ -313,3 +328,7 @@ provides a synthetic second K3s node for development;
   deployment is its own Model (`<name>-<id tail>`), so `--dedicated` twice
   gives two Models behind one alias. The gateway's config changes are shown
   and approved with the acquire's, before its lease commits.
+
+Acquire/wait logs changed readiness states once: pending/scheduler reasons,
+scheduled node and image, container startup/model loading, replica readiness,
+and finally generation verification. It does not log every unchanged poll.

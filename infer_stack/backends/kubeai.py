@@ -217,7 +217,9 @@ def resource_profiles_for_nodes(
         }
         if runtime_class_name:
             profile['runtimeClassName'] = runtime_class_name
-        profiles[f'nvidia-{dns_slug(product)}'] = profile
+        slug = dns_slug(product)
+        name = slug if slug.startswith('nvidia-') else f'nvidia-{slug}'
+        profiles[name] = profile
     return profiles
 
 
@@ -521,6 +523,41 @@ def _requests(pod: dict) -> set[str]:
     return names
 
 
+def model_startup_progress(pods: list[dict]) -> str:
+    """Stable lifecycle text: location, startup reason/image, replica readiness.
+
+    Avoid unstable API error text in the poll loop. Readiness still requires a
+    generation; container/replica readiness only explains what we are awaiting.
+    """
+    if not pods:
+        return 'pending — waiting for KubeAI to create a pod'
+    details = []
+    for pod in pods:
+        spec, status = pod.get('spec', {}), pod.get('status', {})
+        node = spec.get('nodeName')
+        conditions = status.get('conditions') or []
+        scheduled = next((c for c in conditions if c.get('type') == 'PodScheduled'), {})
+        if not node:
+            why = scheduled.get('message') or scheduled.get('reason') or 'waiting for scheduler'
+            details.append(f'pending — {why}')
+            continue
+        containers = status.get('containerStatuses') or []
+        waiting = [c.get('state', {}).get('waiting', {}).get('reason') for c in containers]
+        waiting = [w for w in waiting if w]
+        images = ', '.join(c.get('image', '?') for c in spec.get('containers') or [])
+        if waiting:
+            details.append(f"scheduled on {node} — {', '.join(waiting)}; image {images}")
+        elif not containers:
+            details.append(f'scheduled on {node} — creating container / pulling image {images}')
+        elif all(c.get('ready') for c in containers):
+            details.append(f'scheduled on {node} — replica ready; verifying generation')
+        else:
+            details.append(f'scheduled on {node} — container started; model loading')
+    ready = sum(any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                    for c in p.get('status', {}).get('conditions') or []) for p in pods)
+    return f'{ready}/{len(pods)} replicas ready; ' + '; '.join(sorted(set(details)))
+
+
 class KubeaiBackend(ConvergeScaffold):
     """Cluster KubeAI backend (converge-style).
 
@@ -560,6 +597,7 @@ class KubeaiBackend(ConvergeScaffold):
             http = requests
         self.http = http
         self.assume_yes = assume_yes
+        self.progress: Callable[[str], None] | None = None
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()
         # KubeAI/k8s schedules; there are no host GPU indices to report.
@@ -1232,17 +1270,25 @@ class KubeaiBackend(ConvergeScaffold):
         )
         if ok:
             return Readiness(True, reason)
-        # A crash-looping engine keeps its pod "Running" between restarts, so
-        # check every not-ready probe, not only when the Model is missing.
-        failure = self.startup_failure(deployment)
-        if failure is not None:
-            return Readiness(False, failure, fatal=True)
-        waiting = self._waiting_reason(deployment)
-        # Room helps only when the scheduler says some node is short of a
-        # resource; a selector, taint or affinity no node satisfies stays
-        # unschedulable whatever is stopped (reclaim_candidates picks whom).
-        return Readiness(False, f'{reason} (pod: {waiting})' if waiting else reason,
-                         needs_room=bool(self._capacity_shortage(deployment)))
+        # One pod list supplies startup, scheduler and progress facts together.
+        from ..leasing.diagnosis import diagnose_startup
+        from ..leasing.residency import residency_from_pods
+        try:
+            raw = self._kubectl(['get', 'pods', '-l', f'{MANAGED_LABEL}=true', '-o', 'json'])
+            residency = residency_from_pods(raw)
+            units = residency.units(deployment.id)
+            failure = diagnose_startup(units,
+                lambda: self.deployment_logs(deployment, tail=200),
+                replicated=residency.replicated, unit_logs=lambda pod: self._pod_logs(pod, 200))
+            if failure is not None:
+                return Readiness(False, failure, fatal=True)
+            pods = [p for p in json.loads(raw).get('items', [])
+                    if p.get('metadata', {}).get('labels', {}).get(DEPLOYMENT_LABEL) == deployment.id]
+            short = any(p.reason == 'Unschedulable' and insufficient_resources(p.message) for p in units)
+            detail = model_startup_progress(pods)
+            return Readiness(False, detail, needs_room=short)
+        except Exception as ex:  # diagnostic failure is unknown, never an all-clear
+            return Readiness(False, f'Cannot inspect Model pods: {ex}; API: {reason}')
 
     def connection_info(self):
         """Where a client reaches these endpoints: the gateway's front door, or

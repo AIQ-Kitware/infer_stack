@@ -191,3 +191,40 @@ both detailed and operational doctor checks with the intended namespace/API URL.
 Reusable takeaways: prerequisite inventory must precede configuration that
 consumes it; teardown does not erase persistence ownership; SQLite history
 rotation should preserve live connections and change epochs transactionally.
+
+## 2026-10-01 20:12:00 -0400
+
+User intent: extend the TUI with efficient Kubernetes node/cluster reporting and
+controls, then prioritize the real-host review of the previous setup work before
+resuming that UI task. Model/configuration: GPT-6 (Codex), Default collaboration
+mode; reasoning effort not exposed. Commit attribution requested by the user is
+GPT-6.1-Sol. No sub-agents. TUI work was paused and stashed during this review.
+
+The review exposed three product boundary mistakes: admin credential access was
+made too broad, provider=k3s reused whatever admin context was selected, and an
+optional NVIDIA DaemonSet with no targets counted as unhealthy. Root K3s config
+now remains 0600; the invoking user gets a private, atomically refreshed 0600
+copy. This accepts certificate refresh maintenance in exchange for preserving
+other users' privileges and unrelated kubeconfigs. Explicit K3s provisioning
+always scopes reconciliation to that local copy. A worker's local membership is
+reported independently from its admin context, and an active agent must match
+requested server/name/version before join may return idempotently.
+
+RuntimeClass existence is a cluster fact, not evidence of node handlers. The
+inventory now reports observed nvidia-runtime pod startup separately per node;
+unknown handlers block detailed readiness rather than implying success. Explicit
+bootstrap/install can run tiny node-specific runtime canaries without reserving
+a GPU, retaining completed pods as diagnostic evidence. This avoids taking busy
+GPU capacity merely to test a handler. Successful startup proves the observed
+runtime invocation, not future driver health. Kube setup is deprecated and routes
+to the native install leaf so the shell-visible workflows share policy. Readiness
+waits report changed states and final generation verification; KubeAI includes
+node/image/replica detail with one pod list for nonfatal diagnosis.
+
+Review validation: 207 focused tests passed; the full suite before restoring
+the TUI passed 1194 tests with 3 skips and 8 cleanup/ResourceWarnings. An
+additional startup-detail regression passed in the review module (15 tests).
+Type checks, CI flake8, scoped Ruff, shell syntax and actual entrypoint help
+checks passed. Remaining real-host checks include private credential access/
+refresh, stale-EKS context isolation, active-worker config inspection, and runtime
+canaries on aiq-gpu/namek. No real cluster mutation is part of this work.

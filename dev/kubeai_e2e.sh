@@ -6,6 +6,7 @@
 #   infer-stack kube bootstrap --provider=k3s
 #   sudo -v
 #   infer-stack kube bootstrap --provider=k3s --apply
+#   export KUBECONFIG=~/.kube/infer-stack-k3s.yaml
 #   infer-stack kube install
 #   infer-stack kube install --apply
 #   infer-stack kube doctor

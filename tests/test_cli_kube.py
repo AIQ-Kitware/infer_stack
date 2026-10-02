@@ -290,7 +290,7 @@ def test_k3s_join_keeps_token_out_of_argv(tmp_path, monkeypatch):
             return '# installer\n'
         if args[:3] == ['systemctl', 'is-active', '--quiet']:
             active_checks += 1
-            if active_checks == 1:
+            if active_checks <= 2:
                 raise RuntimeError('inactive')
             return 'active\n'
         return ''
@@ -306,7 +306,7 @@ def test_k3s_join_keeps_token_out_of_argv(tmp_path, monkeypatch):
     assert all(token not in ' '.join(args) for args, _ in calls)
     install = [item for item in calls if item[0] and item[0][0] == 'sudo'][0]
     assert install[1]['env']['K3S_TOKEN'] == token
-    assert 'K3S_TOKEN' in install[0][1]
+    assert 'K3S_TOKEN' in install[0][2]
 
 
 def test_missing_helm_is_required_when_setup_has_managed_actions():
@@ -422,13 +422,14 @@ def test_k3s_bootstrap_existing_server_does_not_fetch_installer(monkeypatch):
 
     monkeypatch.setattr(k3s, '_require_local_tool', lambda name: None)
     monkeypatch.setattr(k3s, '_ensure_helm', lambda run: None)
+    monkeypatch.setattr(k3s, '_provision_user_kubeconfig', lambda run: None)
     monkeypatch.setattr(k3s, '_ensure_default_kubeconfig_link', lambda: True)
     ready = k3s.bootstrap(version='v1.34.3+k3s1', run=fake_run)
     assert ready is True
     assert not any(args and args[0] == 'curl' for args, _ in calls)
     assert not any('restart' in args for args, _ in calls)
     assert any(
-        args[:3] == ['kubectl', '--kubeconfig', str(k3s.K3S_KUBECONFIG)]
+        args[:3] == ['kubectl', '--kubeconfig', str(k3s.user_kubeconfig())]
         for args, _ in calls
     )
 
