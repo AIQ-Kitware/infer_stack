@@ -42,9 +42,21 @@ class Cluster:
         self.reachable = reachable
         self.calls = []
         self.documents = []
+        self.canaries = {}
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
+        if args[:3] == ['kubectl', '-n', 'kube-system'] and 'pod' in args:
+            name = args[args.index('pod') + 1]
+            if 'get' in args:
+                return json.dumps(self.canaries.get(name, {}))
+            if 'delete' in args:
+                self.canaries.pop(name, None)
+                return ''
+        if args == ['kubectl', 'apply', '-f', '-']:
+            doc = json.loads(kwargs['input_text'])
+            self.canaries[doc['metadata']['name']] = doc
+            return ''
         if args[:3] == ['kubectl', 'config', 'current-context']:
             return 'test-context'
         if args[:2] == ['kubectl', 'version']:
@@ -198,7 +210,7 @@ def test_install_values_token_upgrade_dryrun(tmp_path, monkeypatch, capsys):
     assert KubeInstallCLI.main(argv=['--dry-run', '--json']) == 0
     preview = json.loads(capsys.readouterr().out)
     assert len(preview['values']['resourceProfiles']) == 2
-    assert not any('upgrade' in c or 'add' in c for c in cluster.calls)
+    assert not any('upgrade' in c or 'add' in c or 'apply' in c or 'delete' in c for c in cluster.calls)
     assert not (tmp_path / 'generated').exists()
     assert KubeInstallCLI.main(argv=False, apply=True) == 0
     assert len(cluster.documents[-1][0]['resourceProfiles']) == 2
@@ -210,6 +222,7 @@ def test_install_values_token_upgrade_dryrun(tmp_path, monkeypatch, capsys):
     assert KubeInstallCLI.main(argv=False, apply=True) == 0
     upgrades = [c for c in cluster.calls if c[:3] == ['helm', 'upgrade', '--install']]
     assert len(upgrades) == 2
+    assert sum(c == ['kubectl', 'apply', '-f', '-'] for c in cluster.calls) == 4
     assert '--version' in upgrades[-1]
 
 
@@ -243,6 +256,7 @@ def test_bootstrap_working_cluster_idempotent(monkeypatch):
     provider = K3sProvider()
     for _ in range(2):
         provider.apply(m, inventory(m), timeout=0)
+    assert sum(c == ['kubectl', 'apply', '-f', '-'] for c in cluster.calls) == 2
     assert not any(c[0] in ('sudo', 'curl', 'systemctl') or 'upgrade' in c for c in cluster.calls)
 
 

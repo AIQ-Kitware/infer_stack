@@ -396,13 +396,21 @@ backend or scheduling architecture.
 `infer-stack kube k3s status` reports local server/agent membership without
 consulting the selected admin context or exposing join tokens. After join,
 verify the worker on the control plane with `infer-stack kube node status <name>`.
-A stale EKS context on the worker does not mean local membership failed. Active
+A stale EKS context on the worker does not mean local membership failed.
+Join establishes membership, not NVIDIA driver/toolkit readiness. If local GPUs
+are detected, join warns that control-plane verification is required. Check the
+specific worker, rather than relying on another GPU node to make the cluster
+look ready: for `namek`, expect Ready, one allocatable GPU, RTX 3090 GFD product,
+roughly 24 GiB GFD memory, and a fresh runtime canary from `kube install --apply`. Active
 agents must match requested server/name/version before join can return success.
 
 A RuntimeClass object is cluster-scoped and does not prove every node handler.
 Inventory reports per-node runtime evidence independently. Explicit bootstrap
-and install can run small node-specific runtime canaries on GPU nodes; they
-reserve no GPUs and retain completed pods in `kube-system`. Unknown handlers
+and install rerun small node-specific runtime canaries on every GPU node on
+each explicit apply, including nodes with prior successful evidence. They reserve
+no GPUs and retain completed pods in `kube-system`. Inventory labels terminated
+pod evidence as historical and includes its observed timestamp; it does not
+promise that the handler still works after reconfiguration. Unknown handlers
 block detailed readiness until verified. Optional NVIDIA components scheduled
 onto zero nodes report N/A instead of causing a reinstall/readiness loop.
 

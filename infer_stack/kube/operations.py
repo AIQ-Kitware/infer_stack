@@ -67,10 +67,14 @@ class K3sProvider:
                 raise RuntimeError('NVIDIA chart remediation requires RuntimeClass nvidia; configure node runtimes first')
             manager.install_nvidia_device_plugin()
         deadline = time.monotonic() + timeout
+        verified_nodes = set()
         while True:
             fresh = inventory(manager)
             if fresh.get('gpu_count') and 'nvidia' in (fresh['runtime_classes'] or []):
-                verify_node_runtimes(manager, fresh, timeout=timeout)
+                # Fresh per apply, once per node during this readiness loop.
+                pending = [n for n in fresh['nodes'] if n['gpu_count'] and n['name'] not in verified_nodes]
+                verify_node_runtimes(manager, {'nodes': pending}, timeout=timeout)
+                verified_nodes.update(n['name'] for n in pending)
                 fresh = inventory(manager)
             if not failed(readiness(fresh, installation=False)):
                 return fresh
@@ -93,13 +97,14 @@ def verify_node_runtimes(manager, report, *, timeout=180):
     """Explicit bootstrap canaries test each GPU node's nvidia handler.
 
     No GPU reservation: allocatable resources are independently checked. A
-    successful retained Pod supplies inspectable evidence for later inventory.
+    successful retained Pod supplies historical evidence for later inventory.
+    Always replace our own canary: prior startup cannot verify today's handler.
     No hostRuntime claim is inferred from the RuntimeClass object alone.
     """
     import hashlib
     import json
     for node in report['nodes']:
-        if not node['gpu_count'] or node.get('nvidia_runtime_verified') is True:
+        if not node['gpu_count']:
             continue
         name = 'infer-stack-runtime-' + hashlib.sha256(node['name'].encode()).hexdigest()[:12]
         existing = manager.kubectl_json(['-n', 'kube-system', 'get', 'pod', name, '--ignore-not-found', '-o', 'json'])

@@ -229,3 +229,77 @@ def test_startup_details_expose_node_image_and_replica_state():
     pod['status']['conditions'] = [{'type': 'Ready', 'status': 'True'}]
     assert '1/1 replicas ready' in model_startup_progress([pod])
     assert 'verifying generation' in model_startup_progress([pod])
+
+
+def test_retained_runtime_canary_is_historical_evidence(capsys):
+    cluster = Cluster()
+    m = manager(cluster)
+    def run(args, **kw):
+        if args[:3] == ['kubectl', 'get', 'pods']:
+            return json.dumps({'items': [{'metadata': {'name': 'old-canary', 'namespace': 'kube-system'},
+                'spec': {'nodeName': 'gpu-a', 'runtimeClassName': 'nvidia'},
+                'status': {'containerStatuses': [{'state': {'terminated': {
+                    'exitCode': 0, 'finishedAt': '2026-09-01T00:00:00Z'}}}]}}]})
+        return cluster(args, **kw)
+    m.run = run
+    report = inventory(m, http=HTTP)
+    row = report['nodes'][0]
+    assert row['nvidia_runtime_verified'] is True  # observed startup, not a new test
+    assert row['nvidia_runtime_evidence_state'] == 'historical'
+    assert row['nvidia_runtime_observed_at'] == '2026-09-01T00:00:00Z'
+    from infer_stack.cli.commands_kube import _print_inventory
+    _print_inventory(report)
+    assert 'historical startup, not a fresh verification' in capsys.readouterr().out
+
+
+def test_runtime_canary_refreshes_all_gpu_nodes_and_detects_new_failure():
+    documents, calls = [], []
+    def run(args, **kw):
+        calls.append(args)
+        if 'get' in args:
+            return json.dumps({'metadata': {'labels': {'infer-stack/runtime-canary': 'true'}}})
+        if 'apply' in args:
+            documents.append(json.loads(kw['input_text']))
+        if 'wait' in args and len(documents) > 2:
+            raise RuntimeError('runtime handler nvidia is no longer configured')
+        return ''
+    report = {'nodes': [
+        {'name': name, 'gpu_count': count, 'nvidia_runtime_verified': True}
+        for name, count in [('aiq-gpu', 4), ('namek', 1), ('cpu-node', 0)]]}
+    m = KubeManager(run=run)
+    verify_node_runtimes(m, report)
+    assert [d['spec']['nodeName'] for d in documents] == ['aiq-gpu', 'namek']
+    with pytest.raises(RuntimeError, match='no longer configured'):
+        verify_node_runtimes(m, report)
+    assert len(documents) == 3
+    assert sum('delete' in c for c in calls) == 3
+
+
+def test_runtime_canary_never_replaces_unrelated_pod():
+    calls = []
+    def run(args, **kw):
+        calls.append(args)
+        return json.dumps({'metadata': {'labels': {}}})
+    report = {'nodes': [{'name': 'namek', 'gpu_count': 1, 'nvidia_runtime_verified': True}]}
+    with pytest.raises(RuntimeError, match='unrelated pod'):
+        verify_node_runtimes(KubeManager(run=run), report)
+    assert len(calls) == 1 and 'get' in calls[0]
+
+
+@pytest.mark.parametrize('products', ['NVIDIA GeForce RTX 3090', ''])
+def test_join_reports_local_gpu_separately_from_cluster_availability(monkeypatch, capsys, products):
+    from infer_stack.cli.commands_kube import K3sJoinCLI
+    calls = []
+    monkeypatch.setattr(k3s, 'join', lambda **kw: calls.append(kw))
+    m = KubeManager(run=lambda args: products)
+    m.command_exists = lambda name: name == 'nvidia-smi'
+    monkeypatch.setattr('infer_stack.cli.commands_kube.KubeManager', lambda: m)
+    assert K3sJoinCLI.main(argv=False, server='https://server:6443', token_file='unused', node_name='namek') == 0
+    text = capsys.readouterr().out
+    assert 'infer-stack kube node status namek' in text
+    assert ('Local GPU detected' in text) == bool(products)
+    if products:
+        assert 'RTX 3090' in text
+        assert 'nvidia.com/gpu' in text and 'GFD product/memory' in text
+        assert 'fresh runtime canary' in text
+    assert len(calls) == 1

@@ -381,6 +381,18 @@ class K3sJoinCLI(kw.Config):
             raise SystemExit(str(ex)) from ex
         print('K3s agent is active; this does not change the selected admin kubeconfig.')
         print('Inspect local membership: infer-stack kube k3s status')
+        manager = KubeManager()
+        if manager.command_exists('nvidia-smi'):
+            try:
+                products = manager.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader']).strip()
+            except RuntimeError:
+                print('Local GPU inspection failed; verify driver/runtime preparation and cluster-side GPU availability from the control plane.')
+            else:
+                if products:
+                    print('Local GPUs: ' + ', '.join(products.splitlines()))
+                    print('Local GPU detected, but cluster-side GPU availability must be verified from the control plane.')
+                    print('Join does not install NVIDIA drivers/toolkit or prove GPU runtime readiness.')
+                    print('Verify this node is Ready, exposes nvidia.com/gpu, has GFD product/memory labels, and passes a fresh runtime canary via infer-stack kube install --apply.')
         print(f'On the control plane: infer-stack kube node status {config.node_name or socket.gethostname().lower()}')
         return 0
 
@@ -443,7 +455,8 @@ def _print_inventory(report):
         print(f'  {key}: {"available" if value else "missing"}')
     for node in report['nodes']:
         print(f"node {node['name']}")
-        for key in ('ready', 'nvidia_runtime_verified', 'nvidia_runtime_evidence', 'gpu_count', 'gpu_product',
+        for key in ('ready', 'nvidia_runtime_verified', 'nvidia_runtime_evidence_state', 'nvidia_runtime_observed_at',
+                    'nvidia_runtime_evidence', 'gpu_count', 'gpu_product',
                     'gpu_memory_gib', 'gfd_labels'):
             print(f'  {key}: {node[key]}')
     plugins = report['device_plugin']

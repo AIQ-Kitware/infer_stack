@@ -300,3 +300,51 @@ separation, and the exact long e2e Model with matching gateway routes. Type
 checks, scoped Ruff and whitespace checks passed. The script's long alias is
 unchanged. Read-only probes found an existing CPU KubeAI chart and no managed
 Models on this VM; its API needs a temporary port-forward before e2e.
+
+The second correction separates historical observation from explicit verification.
+Every bootstrap/install apply replaces infer-stack-owned canaries on all GPU
+nodes, even when old pods or currently running workloads supplied evidence.
+Bootstrap tracks nodes checked during that invocation to avoid recreating
+canaries on every readiness poll. Unrelated same-name pods remain protected;
+failed fresh waits abort installation. Inventory retains historical startup
+facts with evidence state/timestamp and explicit wording. A successful old
+container start is valuable diagnosis, but cannot establish today's handler.
+
+Worker join now detects local GPU products best-effort after membership is
+established and warns that drivers/toolkit and control-plane readiness are
+separate. It directs the operator to check the specific worker's allocatable
+GPUs, GFD product/memory and fresh runtime canary, so aiq-gpu's four GPUs cannot
+mask namek exposing zero. This is an explicit warning, not automated driver
+installation or a claim that worker-side admin credentials exist.
+
+Focused runtime/CLI tests: 72 passed. This includes repeated bootstrap/install
+canaries, historical timestamps, later runtime breakage, unrelated pod refusal,
+dry-run nonmutation and RTX 3090 join output. Type checks, CI flake8, scoped
+Ruff, compileall, shell syntax and diff whitespace checks passed. Actual kwconf
+join help and read-only inventory were inspected. Real e2e runs from a frozen
+source snapshot with the unchanged script, E2E_MODEL=HuggingFaceTB/SmolLM2-135M-Instruct,
+E2E_RESOURCE_PROFILE=cpu, E2E_BASE_URL=http://127.0.0.1:18000/openai/v1,
+and all default dynamic/replica/gateway phases enabled. The optional sized,
+make-room and remote-node phases remain disabled by their normal defaults;
+this VM has no GPU and its old container worker is NotReady. A temporary local
+port-forward supplies the installed chart's API. Initial real generation
+already passed; the full result is pending.
+
+Full unit validation: pytest -q passed 1218 tests, 3 skipped, 8 existing cleanup/
+ResourceWarnings (133.24s). Extended Ruff on tests/test_leasing_kubeai.py reports
+three import-order findings; checking the parent commit via stdin reproduces
+the identical three findings. They predate this correction and are left alone.
+CI flake8/type checks and scoped Ruff on changed production/readiness files
+remain green. The real CRD has accepted the shortened dynamic long-name Model,
+and the gateway has registered its route; generation is still in progress.
+
+Real e2e completed with exit zero and PASS: kubeai backend end-to-end lifecycle.
+The unchanged long identity passed static generation, two keep-warm replicas,
+two dynamic dedicated deployments and independent route teardown, dynamic key
+rotation, in-cluster NodePort generation/doctor, Secret rotation and gateway
+teardown. Log: /tmp/infer-stack-review-e2e.log. Post-run probes confirm zero
+managed Models, no infer-stack-gateway Deployment, and no gateway Docker
+containers. The temporary port-forward was stopped. The script's cleanup left
+root/container-owned temporary PostgreSQL data with a permission warning;
+no running database/workload remains. GPU canary freshness and a real RTX 3090
+worker's join/placement/generation still require aiq-gpu/namek validation.

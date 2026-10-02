@@ -85,20 +85,29 @@ def inventory(manager: KubeManager, *, namespace='kubeai', release='kubeai',
         ['get', 'pods', '-A', '-o', 'json'])) if runtime_ok else None
     for row in report['nodes']:
         row['nvidia_runtime_verified'] = None
+        row['nvidia_runtime_evidence_state'] = 'unknown'
+        row['nvidia_runtime_observed_at'] = None
         row['nvidia_runtime_evidence'] = 'No observed pod proves the node runtime handler'
         for pod in (runtime_pods or {}).get('items', []):
             spec, status = pod.get('spec', {}), pod.get('status', {})
             if spec.get('nodeName') != row['name'] or spec.get('runtimeClassName') != 'nvidia':
                 continue
-            started = any(c.get('state', {}).get('running') or c.get('state', {}).get('terminated')
-                          for c in status.get('containerStatuses') or [])
-            if started:
+            states = [c.get('state', {}) for c in status.get('containerStatuses') or []]
+            running = next((s['running'] for s in states if s.get('running')), None)
+            terminated = next((s['terminated'] for s in states if s.get('terminated')), None)
+            if running or terminated:
                 row['nvidia_runtime_verified'] = True
-                row['nvidia_runtime_evidence'] = f"nvidia runtime pod {manager._pod_name(pod)} started"
+                row['nvidia_runtime_evidence_state'] = 'running' if running else 'historical'
+                state = running or terminated or {}
+                row['nvidia_runtime_observed_at'] = state.get('finishedAt') or state.get('startedAt')
+                row['nvidia_runtime_evidence'] = (
+                    f"last observed nvidia runtime pod {manager._pod_name(pod)} "
+                    + ('running' if running else 'terminated; historical startup, not a fresh verification'))
                 break
             messages = ' '.join(str(c.get('message', '')) for c in status.get('conditions') or [])
             if 'runtime handler' in messages.lower():
                 row['nvidia_runtime_verified'] = False
+                row['nvidia_runtime_evidence_state'] = 'failed'
                 row['nvidia_runtime_evidence'] = messages
     ds = probe('device_plugin', lambda: manager.kubectl_json(
         ['get', 'daemonsets', '-A', '-o', 'json']))
