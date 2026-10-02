@@ -205,46 +205,53 @@ configuration search.
 
 ## What is established versus still unknown
 
-Established:
+Established after the completed round-3 run
+`qwen38-rtx8000-round3-20260924T150901`:
 
-- The RTX 8000 has enough VRAM for Qwen3.8-27B W4A16 at `max_model_len=262144`
-  with FP16/auto KV.
-- `TRITON_ATTN` is a working attention backend in the pinned image on sm75.
-- Short decode is approximately 33-35 tok/s on the viable configurations.
-- Cold 32K prefill is approximately 230 seconds.
-- 4096/8192 prefill chunks are effectively tied; 16384 is worse.
-- The `-fast` target improves short decode by about 3% without improving cold
-  prefill.
-- FP8 KV, the tested int4 KV path, and the tested KVarN path are not useful
-  candidates on this card with the pinned stack.
+- The RTX 8000 has enough VRAM for Qwen3.8-27B W4A16 at
+  `max_model_len=262144` with ordinary FP16/auto KV. Low-bit KV is unnecessary
+  for one full-context request.
+- `TRITON_ATTN` is the working attention backend in the pinned image on sm75.
+- `max_num_batched_tokens=4096` and `8192` are effectively tied at short/32K
+  contexts; 8192 is the measured operating point and 16384 is worse.
+- HyperQwen's prepared `-fast` target remains the best measured performance
+  candidate. It improves short decode by about 3% in round 2 and is a small,
+  consistent decode-at-depth win in round 3 without changing cold prefill.
+- Prefix caching materially changes the persistent-agent workload. Cold 64K
+  prefill took about 875 seconds and cold 128K about 3340 seconds, while exact
+  cached repeats took about 10 and 18 seconds respectively. Appending a small
+  new turn over those cached prefixes took about 13 and 20 seconds.
+- Decode throughput falls with context depth even when the long prefix is
+  cached: the `-fast` target measured about 24.8 tok/s at 8K, 16.4 tok/s at
+  32K, 11.5 tok/s at 64K, and 4.84 tok/s at 128K.
+- FP8 KV, the tested int4 KV path, activation-int8 variants, and the tested
+  KVarN path are not useful candidates on this card with the pinned stack.
 - The first near-full LiteLLM result was a gateway timeout, not proof of a vLLM
   context-capacity failure.
 
-Not yet established:
+Still not established:
 
-- cold prefill time at 64K, 128K, 196K, or 240K;
-- how much of a long prompt vLLM's hybrid prefix cache actually reuses on this
-  model/card;
-- latency of an appended coding-agent turn after a large prefix is cached;
-- decode throughput at 32K/64K/128K/240K context depth;
-- quality parity of the normal and `-fast` prepared targets;
+- cold prefill time at 196K or 240K; the completed round-3 run used
+  `RUN_DEEP=0`;
+- decode-at-depth beyond 128K;
+- quality parity of the standard and prepared `-fast` checkpoints;
 - whether a modified Flex page geometry would improve sm75 prefill;
 - whether HyperQwen's speculative kernels can be ported profitably to FP16/sm75.
 
-Do not extrapolate the 32K cold-prefill time to 262K as a claimed measurement.
-The observed scaling is strongly nonlinear, so a naive fit can suggest hours,
-but no near-full direct-vLLM cold run has completed yet.
+Do not extrapolate the 128K cold-prefill time to 262K as a claimed measurement.
+The model has sufficient KV capacity for the full configured window, but the
+completed benchmark did not ingest a 196K/240K prompt.
 
 ## Round 3: prefix-cache and context-depth experiment
 
 Script: `dev/profile_qwen38_rtx8000_round3.sh`
 
-Round 3 intentionally narrows the matrix to two endpoints:
+Round 3 narrowed the matrix to two endpoints:
 
 - standard W4A16 target;
 - HyperQwen `-fast` target.
 
-Both use:
+Both used:
 
 - `TRITON_ATTN`;
 - `max_num_batched_tokens=8192`;
@@ -255,50 +262,49 @@ Both use:
 - one sequence;
 - no speculative decoding.
 
-At each context depth the script performs four direct-vLLM requests:
+At each context depth the script performed four direct-vLLM requests: a cold
+base prompt, an exact cached repeat, a small appended turn over the cached
+prefix, and a 256-token decode from the fully cached appended prompt.
 
-1. a cold base prompt with one generated token;
-2. the exact base prompt again, measuring cached-token reuse and warm wall time;
-3. the same long prefix plus a small appended turn, again measuring cached
-   tokens and wall time;
-4. the appended prompt again with 256 generated tokens, measuring decode speed
-   when the long prompt is fully cached.
+The completed ordinary run produced:
 
-Default context targets are 8K, 32K, 64K, and 128K. The expensive 196K and
-240K cold probes are opt-in with `RUN_DEEP=1`. If a cold request times out, the
-script records the failure and by default stops trying deeper contexts for that
-endpoint instead of wasting additional hours.
+| Target | standard cold | fast cold | standard append | fast append | standard decode | fast decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | 22.12 s | 22.49 s | 1.37 s | 1.40 s | 24.56 tok/s | **24.84 tok/s** |
+| 32K | 229.00 s | 229.97 s | 2.01 s | 2.03 s | 16.09 tok/s | **16.35 tok/s** |
+| 64K | 874.46 s | 876.15 s | 12.93 s | **12.88 s** | 11.40 tok/s | **11.54 tok/s** |
+| 128K | 3343.78 s | **3340.80 s** | **19.90 s** | 20.18 s | 4.836 tok/s | **4.837 tok/s** |
 
-Run the default experiment with:
+The standard target exposed a 426,478-token KV cache (1.63x nominal concurrency
+at 262K); the prepared `-fast` target exposed 436,774 tokens (1.67x). Exact
+cached repeats reused essentially the entire reusable prefix: for example the
+128K probe reported 130,800 cached tokens of a 131,131-token cold prompt.
 
-```bash
-cd ~/code/infer_stack
-BASE_URL=0.0.0.0:14042 ./dev/profile_qwen38_rtx8000_round3.sh
-```
+The fast target therefore wins only modestly, but it wins without sacrificing
+capacity or cold-prefill behavior. That is enough to make it the preferred
+performance prefab while retaining the standard checkpoint as the conservative
+comparison until quality parity is established separately.
 
-After the ordinary run establishes whether warm-prefix behavior remains useful
-through 128K, request the deep proof with:
-
-```bash
-cd ~/code/infer_stack
-BASE_URL=0.0.0.0:14042 RUN_DEEP=1 ./dev/profile_qwen38_rtx8000_round3.sh
-```
-
-Results are written under
-`dev/benchmark-results/qwen38-rtx8000-round3-<timestamp>/`, including
-`summary.tsv`, `summary.csv`, per-endpoint request/response files, container
-logs, and the exact rendered endpoint catalog entries.
+The historical script can reproduce the exact experiment. The newer
+`dev/profile_qwen38_hyperqwen.sh` generalizes the same workload by GPU compute
+capability and VRAM so the Blackwell/high-VRAM path can be tuned without baking
+product names into the benchmark.
 
 ## Current endpoint guidance
 
-For a conservative manually selected endpoint, use the standard W4A16 target
-with Triton, FP16/auto KV, 8192 batched tokens, prefix caching, and full 262K
-model length. For a performance candidate, use the otherwise identical `-fast`
-target; it has the best measured short decode so far, but its quality parity
-should be checked independently.
+For a high-VRAM Turing card (sm75-sm79, at least 48 GiB), the best measured
+performance configuration is:
 
-Do not choose low-bit KV merely to obtain full context on this 48-GiB card: the
-working FP16/auto-KV path already has substantially more KV capacity than one
-262K request needs. The next decision should be based on round-3 warm-prefix
-latency and decode-at-depth, because those measurements directly represent the
-persistent coding-agent workload.
+- prepared `Qwen3.8-27B-W4A16-AutoRound-fast` target;
+- full `max_model_len=262144`;
+- FP16/auto KV;
+- `TRITON_ATTN`;
+- `max_num_batched_tokens=8192`;
+- prefix caching enabled;
+- one sequence;
+- no speculative decoding.
+
+Keep an otherwise identical standard-checkpoint endpoint available as the
+conservative comparison. Do not choose low-bit KV merely to obtain full context
+on this class: the working FP16/auto-KV path already has substantially more KV
+capacity than one 262K request needs.

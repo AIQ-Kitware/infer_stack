@@ -131,7 +131,7 @@ class _SimulateHardwareMixin(kw.Config):
     simulate_hardware = kw.Value(
         None,
         type=str,
-        help='Simulate GPUs: comma-separated NxM or M entries (e.g. 4x96, 2x80, "48,16" for a heterogeneous host). Useful for planning on smaller machines.',
+        help='Simulate GPUs: comma-separated NxM[@CC] or M[@CC] entries (e.g. 4x96@12.0, 2x80@9.0, "48@7.5,16"). Useful for planning on smaller machines and capability classes.',
     )
 
 

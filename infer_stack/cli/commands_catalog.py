@@ -267,7 +267,8 @@ class CatalogSuggestCLI(
     catalog (additive: existing entries are kept unless ``--force``).
 
     Pure + offline: ``--simulate-hardware 2x80`` suggests for hardware you do not
-    have in front of you.
+    have in front of you; append ``@CC`` (for example ``48@7.5`` or
+    ``4x96@12.0``) when a capability-gated profile matters.
 
     On the kubeai backend the hardware is the cluster's: GPU Feature
     Discovery's node labels (``nvidia.com/gpu.product`` / ``.memory``) and each
@@ -277,6 +278,7 @@ class CatalogSuggestCLI(
 
         infer-stack catalog suggest                      # render only (no write)
         infer-stack catalog suggest --simulate-hardware 4x48
+        infer-stack catalog suggest --simulate-hardware 4x96@12.0
         infer-stack catalog suggest --apply              # merge into the catalog
     """
 

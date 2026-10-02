@@ -105,18 +105,23 @@ vllm_models:
       gpu_memory_utilization: 0.4
       enable_prefix_caching: true
 
-  # -- Qwen3.8-27B: measured single-3090 HyperQwen profiles ---------------
-  # Qwen/Qwen3.8-27B is a 27.78B-parameter hybrid model with a 262K context
-  # window, but its bf16 weights do not fit a 24-GiB card. HyperQwen's measured
-  # 3090 path starts from dbirks' ~19.5-GB W4A16 AutoRound body, requantizes the
-  # large bf16 heads/MTP module once, adds its fast variant + DFlash2 drafter,
-  # and serves through a patched vLLM image. Tuned on RTX 3090 (sm86); also
-  # measured unchanged on an RTX PRO 6000 Blackwell (sm120): ~300 tok/s single
-  # stream, 4 concurrent batched without queueing, 23 GiB used of 96 because the
-  # launcher pins the KV pool. Needs Ampere or newer (the image is CUDA 13).
-  # Keep the unsuffixed `qwen3.8-27b` name free for the official
-  # Qwen/Qwen3.8-27B checkpoint. This entry is the dbirks W4A16 derivative
-  # plus HyperQwen's serving stack, so its catalog identity says so.
+  # -- Qwen3.8-27B / HyperQwen -------------------------------------------
+  # Qwen/Qwen3.8-27B has a 262K native window.  This entry starts from
+  # dbirks' ~19.5-GB W4A16 AutoRound derivative and delegates preparation / the
+  # patched vLLM launch path to HyperQwen.  Suggestion profiles are gated by
+  # capability + VRAM classes first; exact GPU-name gates are reserved for real
+  # model-specific evidence.
+  #
+  # Evidence currently carried in-tree:
+  #   * 24-GiB Ampere-class: HyperQwen's reference fast/long/huge profiles.
+  #   * 48-GiB Turing (sm75, Quadro RTX 8000): full 262144 context boots with
+  #     FP16/auto KV, TRITON_ATTN, prefix caching and one sequence.  Round 3
+  #     measured the prepared -fast target as a small but consistent decode win.
+  #   * 96-GiB Blackwell: the reference 64K fast endpoint has been measured at
+  #     high speed, but full-context tuning is not yet benchmarked.  The generic
+  #     >=48-GiB Ampere+ full-context batch profile below is deliberately
+  #     conservative/provisional so the model's full window is available while
+  #     dev/profile_qwen38_hyperqwen.sh searches for a faster class profile.
   qwen3.8-27b-dbirks-hyperqwen:
     hf_model_id: dbirks/Qwen3.8-27B-W4A16-AutoRound
     served_model_name: qwen3.8-27b-dbirks-hyperqwen
@@ -126,21 +131,16 @@ vllm_models:
     min_vram_gib_per_replica: 24
     preferred_gpu_count: 1
     context_window: 262144
-    requires_ampere: true
+    # The ordinary speed-first single-user launcher uses BF16 speculative paths.
+    # Keep that *endpoint* Ampere+ without excluding the model source from the
+    # measured high-VRAM Turing batch variants below.
+    default_hardware:
+      min_compute_cap: 8.0
     defaults:
-      # HyperQwen's speed-first single-user profile. Its launcher pins the
-      # actual KV pool and uses DFlash2; 64K is the measured default, not the
-      # model's absolute context ceiling.
       max_model_len: 65536
       gpu_memory_utilization: 0.93
       enable_prefix_caching: true
       image: ghcr.io/syv-ai/hyperqwen:sha-684e927
-      # The image's own launcher, not `vllm serve`: its `single` mode reads
-      # the settings below from the environment. Keep CTX explicit so the
-      # generated catalog describes the whole launch rather than relying on an
-      # image-internal default. SPEC=mtp with CTX=long (and a larger
-      # max_model_len) is its long-context one. EXTRA_ARGS go last on its
-      # vLLM command line, which keeps the served name infer-stack routes to.
       command: [single]
       env:
         PORT: '{port}'
@@ -150,32 +150,110 @@ vllm_models:
         MAX_LEN: '{max_model_len}'
         GPU_UTIL: '{gpu_memory_utilization}'
         EXTRA_ARGS: '--served-model-name={served_model_name}'
-      # Prepared weights (~20 GB, requantized once) and its compile caches.
       mounts:
         /app/models: hyperqwen/qwen3.8-27b/models
         /cache: hyperqwen/qwen3.8-27b/cache
-    # HyperQwen's other context-oriented single-user profiles are useful
-    # choices on its reference 24-GiB RTX 3090. These are suggestion variants,
-    # not runtime recipes: catalog suggest emits ordinary endpoints referencing
-    # this same model, and pins them to the detected 3090 that justified the
-    # hardware-specific suggestion. The live catalog stays explicit thereafter.
     endpoint_variants:
+      # The compressed long-context profiles are most useful on memory-tight
+      # 24-32 GiB Ampere-or-newer cards.  Gate by class rather than RTX 3090
+      # product name so nearby variants can benefit without pretending they were
+      # individually benchmarked.
       long:
-        gpu_name_hints: [rtx 3090]
+        min_compute_cap: 8.0
+        max_vram_gib_per_replica: 32
         runtime:
           max_model_len: 150000
           env:
             SPEC: mtp
             CTX: long
       huge:
-        gpu_name_hints: [rtx 3090]
+        min_compute_cap: 8.0
+        max_vram_gib_per_replica: 32
         runtime:
-          # HyperQwen's README calls this the ~240K profile; the launcher's
-          # measured ceiling with the default 7-token DFlash2 block is 245760.
           max_model_len: 245760
           env:
             SPEC: dflash2
             CTX: huge
+
+      # Conservative full-context profile for roomy Ampere/Ada/Hopper/Blackwell
+      # cards.  This avoids the 24-GiB-specific compressed KV modes and uses the
+      # same batch + ordinary KV shape proven on the RTX 8000, but keeps BF16 on
+      # modern hardware and selects HyperQwen's prepared -fast target.  This is
+      # a provisional portability profile, not a claim that batch is optimal on
+      # every >=48-GiB card; benchmark it with profile_qwen38_hyperqwen.sh.
+      full:
+        min_compute_cap: 8.0
+        min_vram_gib_per_replica: 48
+        runtime_replace_keys: [command, env]
+        runtime:
+          max_model_len: 262144
+          gpu_memory_utilization: 0.90
+          max_num_seqs: 1
+          command: [batch]
+          env:
+            PORT: '{port}'
+            VERIFY: 0
+            MODEL: /app/models/Qwen3.8-27B-W4A16-AutoRound-fast
+            KV: fp8
+            PREFIX_CACHE: 1
+            MAX_LEN: '{max_model_len}'
+            MAX_SEQS: 1
+            GPU_UTIL: '{gpu_memory_utilization}'
+            INT8_ACT: ''
+            INT8_LAYERS: ''
+            EXTRA_ARGS: '--served-model-name={served_model_name} --dtype=bfloat16 --kv-cache-dtype=auto --max-num-batched-tokens=8192'
+
+      # RTX 8000 results generalize conservatively by architecture + capacity: sm75
+      # with >=48 GiB has enough room for ordinary FP16 KV at 262K, while BF16
+      # launchers are inappropriate.  Suggest both the slightly faster prepared
+      # target and the conservative standard target; keep the fast one warm when
+      # this model is the largest available suggestion.
+      turing-fast-full:
+        min_compute_cap: 7.5
+        max_compute_cap: 7.9
+        min_vram_gib_per_replica: 48
+        preferred: true
+        runtime_replace_keys: [command, env]
+        runtime:
+          max_model_len: 262144
+          gpu_memory_utilization: 0.90
+          max_num_seqs: 1
+          command: [batch]
+          env:
+            PORT: '{port}'
+            VERIFY: 0
+            MODEL: /app/models/Qwen3.8-27B-W4A16-AutoRound-fast
+            KV: fp8
+            PREFIX_CACHE: 1
+            MAX_LEN: '{max_model_len}'
+            MAX_SEQS: 1
+            GPU_UTIL: '{gpu_memory_utilization}'
+            INT8_ACT: ''
+            INT8_LAYERS: ''
+            EXTRA_ARGS: '--served-model-name={served_model_name} --dtype=half --kv-cache-dtype=auto --attention-backend=TRITON_ATTN --max-num-batched-tokens=8192'
+      turing-full:
+        min_compute_cap: 7.5
+        max_compute_cap: 7.9
+        min_vram_gib_per_replica: 48
+        runtime_replace_keys: [command, env]
+        runtime:
+          max_model_len: 262144
+          gpu_memory_utilization: 0.90
+          max_num_seqs: 1
+          command: [batch]
+          env:
+            PORT: '{port}'
+            VERIFY: 0
+            MODEL: /app/models/Qwen3.8-27B-W4A16-AutoRound
+            KV: fp8
+            PREFIX_CACHE: 1
+            MAX_LEN: '{max_model_len}'
+            MAX_SEQS: 1
+            GPU_UTIL: '{gpu_memory_utilization}'
+            INT8_ACT: ''
+            INT8_LAYERS: ''
+            EXTRA_ARGS: '--served-model-name={served_model_name} --dtype=half --kv-cache-dtype=auto --attention-backend=TRITON_ATTN --max-num-batched-tokens=8192'
+
   qwen2.5-7b:
     hf_model_id: Qwen/Qwen2.5-7B-Instruct
     served_model_name: qwen2.5-7b

@@ -36,22 +36,21 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 ## Related work
 
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
-  and serving stack for running Qwen3.8-27B efficiently on 24-GiB consumer GPUs,
-  with its published tuning and measurements centered on the RTX 3090.
-  infer-stack's suggestion for it delegates the requantization, patched-vLLM
-  launcher, speculative decoding, and GPU-level tuning to HyperQwen's image,
-  described entirely in catalog data (see "Images with their own launcher"
-  below); infer-stack adds hardware discovery, catalog suggestions,
-  exact GPU affinity, lease lifecycle, and routing around that serving stack.
-  `catalog suggest` offers its fast endpoint on any Ampere-or-newer GPU with
-  24 GiB; on a detected RTX 3090 it also offers explicit `-long` (150K) and
-  `-huge` (245,760) endpoint variants from HyperQwen's measured single-user
-  profiles. It has also been measured unchanged on an RTX PRO 6000 Blackwell.
-  The base suggestion is
-  named `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
+  and serving stack for Qwen3.8-27B. infer-stack delegates requantization,
+  patched-vLLM launchers, speculative decoding, and GPU-level tuning to its
+  image, while hardware discovery and suggestion choose explicit catalog
+  profiles by GPU *class* (compute capability + VRAM) rather than product-name
+  strings. Memory-tight 24-32 GiB Ampere-or-newer cards get the reference
+  fast/long/huge choices. High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
+  measured full-262K FP16/Triton profiles, with the prepared `-fast` checkpoint
+  preferred. Roomy Ampere-or-newer cards (>=48 GiB) get the fast baseline plus
+  a conservative/provisional full-262K ordinary-KV prefab; use
+  `dev/profile_qwen38_hyperqwen.sh` to refine that class on new hardware such as
+  Blackwell. Exact GPU-name gates remain available for future exceptions backed
+  by model-specific measurements. The model identity is
+  `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
   `dbirks/Qwen3.8-27B-W4A16-AutoRound` derivative; the unsuffixed
-  `qwen3.8-27b` identity is left available for the official
-  `Qwen/Qwen3.8-27B` checkpoint.
+  `qwen3.8-27b` identity is left available for the official checkpoint.
 
 ## Supported platform
 
@@ -481,10 +480,11 @@ runtime:
 
 Changing the launcher's mode is a data edit, in the catalog or the TUI's
 endpoint editor. The HyperQwen suggestion (see "Related work") is a worked
-example: on an RTX 3090, `catalog suggest` emits its measured context
-profiles as separate `-long` and `-huge` endpoints. The hardware check
-happens only while suggesting; the resulting catalog holds ordinary explicit
-runtime data, so `apply`/`acquire` never retunes an endpoint after the fact.
+example: `catalog suggest` uses compute capability and VRAM to emit the serving
+profiles appropriate to the detected hardware class (and exact name gates only
+for measured exceptions). The hardware check happens only while suggesting;
+the resulting catalog holds ordinary explicit runtime data, so `apply`/`acquire`
+never retunes an endpoint after the fact.
 
 - `{max_model_len}`, `{gpu_memory_utilization}`, `{served_model_name}` and
   `{port}` are filled in from the endpoint, so a launcher that takes them

@@ -13,8 +13,11 @@ from infer_stack.leasing.suggest import (
 )
 
 
-def _gpu(index, mem, name='GPU', display=False):
-    return {'index': index, 'name': name, 'memory_gib': mem, 'display_active': display}
+def _gpu(index, mem, name='GPU', display=False, compute_cap=None):
+    gpu = {'index': index, 'name': name, 'memory_gib': mem, 'display_active': display}
+    if compute_cap is not None:
+        gpu['compute_cap'] = compute_cap
+    return gpu
 
 
 def test_builtin_pool_is_nonempty_and_real():
@@ -35,13 +38,16 @@ def test_builtin_pool_is_nonempty_and_real():
     assert qwen38.min_vram_gib_per_replica == 24
     assert qwen38.context_window == 262144
     assert qwen38.gpu_name_hints == []
-    assert qwen38.requires_ampere is True
+    assert qwen38.requires_ampere is False
+    assert qwen38.default_hardware == {'min_compute_cap': 8.0}
     assert qwen38.defaults['max_model_len'] == 65536
     assert qwen38.defaults['gpu_memory_utilization'] == 0.93
     assert qwen38.defaults['env']['CTX'] == 'fast'
     assert 'serve_recipe' not in qwen38.defaults       # generic fields only
     assert qwen38.defaults['command'] == ['single']
-    assert set(qwen38.endpoint_variants) == {'long', 'huge'}
+    assert set(qwen38.endpoint_variants) == {
+        'long', 'huge', 'full', 'turing-fast-full', 'turing-full'
+    }
     assert qwen38.endpoint_variants['long']['runtime']['max_model_len'] == 150000
     assert qwen38.endpoint_variants['huge']['runtime']['max_model_len'] == 245760
     assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
@@ -67,7 +73,7 @@ def test_derive_runtime_never_sizes_below_pool_default():
 def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     # A single 24 GiB RTX 3090: the current-gen models that fit a 24 GiB card
     # should be suggested; the ones needing a bigger/second GPU should not.
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6)]}
     models = suggest_catalog(inv)['models']
     fits = {'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-0.8b', 'qwen3.5-2b',
             'qwen3.5-4b', 'qwen3.5-9b',
@@ -80,7 +86,7 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
 
 
 def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090')]}
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6)]}
     out = suggest_catalog(inv)
     base = 'qwen3.8-27b-dbirks-hyperqwen'
     assert {base, f'{base}-long', f'{base}-huge'} <= set(out['endpoints'])
@@ -98,29 +104,40 @@ def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
         150000, 'mtp', 'long')
     assert (huge['max_model_len'], huge['env']['SPEC'], huge['env']['CTX']) == (
         245760, 'dflash2', 'huge')
-    # The variant inherits the generic launcher contract rather than repeating a
-    # model-specific recipe in Python. The hardware gate becomes an exact pin so
-    # a later best-fit placement cannot silently move the measured profile.
+    # The variants inherit the generic launcher contract rather than repeating
+    # a model-specific recipe in Python.  A homogeneous host needs no arbitrary
+    # exact pin: the min-VRAM placement is sufficient for this capability class.
     for name in (f'{base}-long', f'{base}-huge'):
         ep = out['endpoints'][name]
         assert ep['runtime']['command'] == ['single']
         assert ep['runtime']['env']['MAX_LEN'] == '{max_model_len}'
         assert ep['runtime']['mounts']['/cache'] == 'hyperqwen/qwen3.8-27b/cache'
-        assert ep['placement']['gpu_indices'] == [0]
+        assert ep['placement'] == {'min_vram_gib': 24}
         assert ep['reclaim']['policy'] == 'stop'
 
 
-def test_hyperqwen_context_variants_are_not_injected_on_other_ampere_cards():
-    # The base HyperQwen endpoint is portable to other supported >=24 GiB Ampere
-    # cards, but the extra long/huge suggestions are intentionally tied to the
-    # reference card whose profiles were measured. A user can still author the
-    # same generic runtime data explicitly elsewhere.
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 48, name='NVIDIA A40')]}
-    endpoints = suggest_catalog(inv)['endpoints']
+def test_hyperqwen_variants_follow_capability_and_vram_classes():
     base = 'qwen3.8-27b-dbirks-hyperqwen'
-    assert base in endpoints
-    assert f'{base}-long' not in endpoints
-    assert f'{base}-huge' not in endpoints
+
+    # A non-3090 24 GiB Ampere card gets the same memory-tight context choices:
+    # the class is what matters, not an exact product string.
+    small = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 24, name='NVIDIA RTX A5000', compute_cap=8.6),
+    ]}
+    small_eps = suggest_catalog(small)['endpoints']
+    assert {base, f'{base}-long', f'{base}-huge'} <= set(small_eps)
+    assert f'{base}-full' not in small_eps
+
+    # A roomy Ampere card keeps the speed-first baseline and gains an ordinary-
+    # KV full-context profile; the compressed 24-GiB long/huge profiles are not
+    # cluttering this class.
+    roomy = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 48, name='NVIDIA A40', compute_cap=8.6),
+    ]}
+    roomy_eps = suggest_catalog(roomy)['endpoints']
+    assert {base, f'{base}-full'} <= set(roomy_eps)
+    assert f'{base}-long' not in roomy_eps
+    assert f'{base}-huge' not in roomy_eps
 
 
 def test_fits_on_respects_vram_and_gpu_count():
@@ -150,8 +167,8 @@ def test_fit_filter_tracks_gpu_size():
 
 def test_qwen38_27b_suggestion_uses_the_hyperqwen_profile_on_any_card_that_fits():
     inv = {'gpu_count': 2, 'gpus': [
-        _gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell Workstation Edition'),
-        _gpu(3, 24, name='NVIDIA GeForce RTX 3090'),
+        _gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell Workstation Edition', compute_cap=12.0),
+        _gpu(3, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6),
     ]}
     out = suggest_catalog(inv)
     assert out['models']['qwen3.8-27b-dbirks-hyperqwen']['source'] == (
@@ -175,15 +192,82 @@ def test_qwen38_27b_suggestion_uses_the_hyperqwen_profile_on_any_card_that_fits(
     }
 
 
+def test_roomy_blackwell_gets_provisional_full_context_prefab():
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    inv = {'gpu_count': 4, 'gpus': [
+        _gpu(i, 96, name='NVIDIA RTX PRO 6000 Blackwell', compute_cap=12.0)
+        for i in range(4)
+    ]}
+    ep = suggest_catalog(inv)['endpoints'][f'{base}-full']
+    # All four GPUs are the same eligible class, so class gating need not turn
+    # into an arbitrary exact GPU pin.
+    assert ep['placement'] == {'min_vram_gib': 48}
+    rt = ep['runtime']
+    assert rt['max_model_len'] == 262144
+    assert rt['command'] == ['batch']
+    assert rt['max_num_seqs'] == 1
+    assert rt['env']['MODEL'].endswith('AutoRound-fast')
+    assert '--dtype=bfloat16' in rt['env']['EXTRA_ARGS']
+    assert '--kv-cache-dtype=auto' in rt['env']['EXTRA_ARGS']
+    assert 'SPEC' not in rt['env']
+    assert 'CTX' not in rt['env']
+
+
+def test_class_gated_profile_pins_only_on_heterogeneous_host():
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    inv = {'gpu_count': 2, 'gpus': [
+        _gpu(0, 48, name='Quadro RTX 8000', compute_cap=7.5),
+        _gpu(1, 96, name='NVIDIA RTX PRO 6000 Blackwell', compute_cap=12.0),
+    ]}
+    out = suggest_catalog(inv)['endpoints']
+    # min_vram alone cannot express either compute-capability class here, so the
+    # generated catalog preserves the suggestion-time class choice exactly.
+    assert out[base]['placement']['gpu_indices'] == [1]
+    assert out[f'{base}-full']['placement']['gpu_indices'] == [1]
+    assert out[f'{base}-turing-fast-full']['placement']['gpu_indices'] == [0]
+
+
 def test_qwen38_27b_profile_is_suggested_wherever_it_fits():
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell')]}
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 96, name='NVIDIA RTX PRO 6000 Blackwell', compute_cap=12.0)]}
     assert 'qwen3.8-27b-dbirks-hyperqwen' in suggest_catalog(inv)['models']
 
 
-def test_qwen38_27b_profile_is_not_suggested_before_ampere():
-    # 48 GiB is plenty, but a Turing card cannot run the recipe's image.
-    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 48, name='Quadro RTX 8000')]}
-    assert 'qwen3.8-27b-dbirks-hyperqwen' not in suggest_catalog(inv)['models']
+def test_qwen38_high_vram_turing_gets_measured_full_context_profiles_only():
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    inv = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 48, name='Quadro RTX 8000', compute_cap=7.5),
+    ]}
+    out = suggest_catalog(inv)
+    assert base in out['models']
+    assert base not in out['endpoints']  # speculative default is Ampere+
+    assert {f'{base}-turing-fast-full', f'{base}-turing-full'} <= set(out['endpoints'])
+    fast = out['endpoints'][f'{base}-turing-fast-full']
+    assert fast['runtime']['max_model_len'] == 262144
+    assert fast['runtime']['command'] == ['batch']
+    assert fast['runtime']['env']['MODEL'].endswith('AutoRound-fast')
+    assert '--dtype=half' in fast['runtime']['env']['EXTRA_ARGS']
+    assert '--attention-backend=TRITON_ATTN' in fast['runtime']['env']['EXTRA_ARGS']
+    assert fast['reclaim']['policy'] in {'keep-warm', 'stop'}
+
+    # Turing with only 24 GiB has neither the Ampere speculative path nor enough
+    # room for the measured ordinary-KV full-context recipe.
+    small = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 24, name='Quadro RTX 6000', compute_cap=7.5),
+    ]}
+    assert base not in suggest_catalog(small)['models']
+
+    # Older nvidia-smi builds may omit compute_cap.  The name fallback is
+    # deliberately narrow enough to distinguish measured Turing from Pascal.
+    turing_without_cap = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 48, name='Quadro RTX 8000'),
+    ]}
+    assert f'{base}-turing-fast-full' in suggest_catalog(
+        turing_without_cap
+    )['endpoints']
+    pascal_without_cap = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 48, name='Tesla P40'),
+    ]}
+    assert base not in suggest_catalog(pascal_without_cap)['models']
 
 
 def test_old_dbirks_qwen38_suggestion_name_migrates_without_touching_official():

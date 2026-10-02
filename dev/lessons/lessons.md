@@ -179,3 +179,16 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Applies when:** inspecting process/fd state under live `/proc`, especially
     privileged diagnostics that must distinguish incomplete observation from
     authentication failure.
+
+- **Lesson:** Once ordinary KV on a high-VRAM GPU already exceeds a model's
+  native context window, treat context capacity and long-session performance as
+  separate problems. Prefer the ordinary-KV full-context path first, then
+  benchmark cold prefill, prefix reuse, and decode-at-depth before introducing
+  lower-bit/compressed KV solely for capacity.
+  - **Evidence / MWE:** `dev/qwen38_rtx8000_findings.md`, especially completed
+    round 3 (`qwen38-rtx8000-round3-20260924T150901`): 48-GiB sm75 exposed
+    426K-437K FP16 KV tokens for a 262K model window; cached 128K follow-up turns
+    completed in ~18-20 s while cold 128K prefill took ~3341-3344 s.
+  - **Applies when:** serving a model whose ordinary KV cache already covers its
+    advertised maximum context on the target GPU class, especially persistent
+    agent/chat workloads with reusable prefixes.
