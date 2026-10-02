@@ -168,9 +168,9 @@ def readiness(report: dict, *, installation=True, gpu=True) -> list[dict]:
     """Policy over inventory; stop dependent chains at their first blocker."""
     checks = []
 
-    def check(name, ok, fix='', detail='', blocked=False):
+    def check(name, ok, fix='', detail='', blocked=False, warning=False):
         checks.append({'name': name, 'ok': bool(ok), 'status': 'blocked' if blocked else
-                       ('ok' if ok else 'fail'), 'detail': detail, 'fix': fix if not ok else ''})
+                       ('warn' if warning else 'ok' if ok else 'fail'), 'detail': detail, 'fix': fix if not ok or warning else ''})
         return ok
 
     if not check('kubectl available', report['tools']['kubectl'],
@@ -193,9 +193,10 @@ def readiness(report: dict, *, installation=True, gpu=True) -> list[dict]:
               'RuntimeClass nvidia' if runtime_ok else 'No nvidia RuntimeClass; GPU allocation proves an external integration' if gpu_rows else '')
         for row in gpu_rows if runtime_ok else []:
             verified = row.get('nvidia_runtime_verified')
-            check(f"node {row['name']} NVIDIA runtime verified", verified is True,
+            check(f"node {row['name']} NVIDIA runtime evidence", verified is True,
                   'infer-stack kube install --apply (verifies runtime handlers in the selected cluster)',
-                  row.get('nvidia_runtime_evidence', 'Runtime handler unknown'))
+                  row.get('nvidia_runtime_evidence', 'Runtime handler unknown'),
+                  warning=verified is True and row.get('nvidia_runtime_evidence_state') == 'historical')
         plugin = report['device_plugin']
         check('NVIDIA device plugin', bool(plugin) and any(p['desired'] > 0 for p in plugin) and all(p['healthy'] for p in plugin if p['desired'] > 0),
               'infer-stack kube bootstrap', report['errors'].get('device_plugin', ''))

@@ -56,6 +56,23 @@ DEFAULT_NAMESPACE = 'kubeai'
 DEFAULT_BASE_URL = 'http://127.0.0.1:8000/openai/v1'
 
 
+def model_replica_counts(model: dict) -> tuple[int | None, int | None]:
+    """Observed (all, ready) replicas; missing counts stay unknown.
+
+    KubeAI uses status.replicas.{all,ready}; tolerate older flat counters.
+    """
+    status = model.get('status') or {}
+    replicas = status.get('replicas')
+    def count(value):
+        try:
+            return max(0, int(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(replicas, dict):
+        return count(replicas.get('all')), count(replicas.get('ready', status.get('readyReplicas')))
+    return count(replicas), count(status.get('readyReplicas'))
+
+
 def model_name_for(served: str, deployment_id: str | None = None) -> str:
     """Deterministic Model CR name for a served model name: ``<dns-slug>``.
 

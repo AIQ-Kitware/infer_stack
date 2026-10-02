@@ -348,3 +348,44 @@ containers. The temporary port-forward was stopped. The script's cleanup left
 root/container-owned temporary PostgreSQL data with a permission warning;
 no running database/workload remains. GPU canary freshness and a real RTX 3090
 worker's join/placement/generation still require aiq-gpu/namek validation.
+
+## 2026-10-01 22:29:42 -0400
+
+User intent: correct the TUI/status review on top of the already committed name
+and canary fixes; secondary review also asks for CLI replica counts and truthful
+historical-runtime doctor warnings. Keep efficient monitoring, kwconf and Compose
+semantics, and make logical commits. Model/configuration: GPT-6 (Codex), Default
+collaboration mode; reasoning effort not exposed. Requested commit attribution:
+GPT-6.1-Sol. No sub-agents.
+
+I kept Model declaration as observation rather than changing the backend's
+ownership contract. A shared replica helper understands the actual nested
+KubeAI CR status and older flat counters, retaining unknown counts. Model/pod
+samples derive declared/scheduled/container-running/replica-ready stages. The
+API picker requires positive ready-replica evidence and labels generation as
+unverified until an explicit successful request. Last-generation proof belongs
+to an endpoint/pool; it does not prove every dedicated deployment or replica
+served a request. Proof is scoped to observed Model/pod incarnations and removed
+when replacement/restarts, readiness loss or failures invalidate it. No passive
+generation probes are introduced.
+
+The global observation still costs one Model list at the existing cadence; it
+previously spent that request on observe() and threw the status away. Fresh
+Cluster samples are reused, and its three list reads remain visible-only. Tests
+that injected slow observe() now inject the actual Model query seam, with count
+budgets for the independent global and Cluster workers. Historical runtime
+startup becomes WARN/evidence rather than an ok claim of fresh verification;
+unknown/failing handlers still fail and explicit apply still creates new canaries.
+
+Combined correction validation: 149 backend/CLI/readiness focused tests passed;
+97 existing/new TUI tests passed before the three extra editor-refusal cases,
+and those four editor cases passed separately. The final full suite passed
+1231 tests, 3 skipped, 8 existing cleanup/ResourceWarnings (137.18s). Type check,
+CI flake8, scoped Ruff, compileall, shell syntax and whitespace checks passed.
+The previously confirmed three import-order Ruff findings in the pre-existing
+KubeAI test module remain untouched. Actual kwconf inventory/doctor help and a
+read-only headless TUI against the VM cluster passed (two nodes, four pods, no
+probe errors). No workload or host mutations occurred in this correction.
+The earlier unchanged long-model CPU e2e passed; GPU placement/generation and
+fresh worker/runtime tests still need aiq-gpu/namek. Readiness and editor changes
+are committed separately so operator-evidence policy is reviewable on its own.

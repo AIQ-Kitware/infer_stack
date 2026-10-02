@@ -138,7 +138,7 @@ def install(manager: KubeManager, report: dict, *, operator_values=None,
     checks = readiness(report, installation=False, gpu=gpu)
     if report['errors'].get('helm_releases'):
         raise RuntimeError('Cannot inspect existing Helm releases; repair Helm access before installation')
-    blockers = [c for c in checks if c['status'] == 'fail' and not c['name'].endswith('NVIDIA runtime verified')]
+    blockers = [c for c in checks if c['status'] == 'fail' and not c['name'].endswith('NVIDIA runtime evidence')]
     if blockers:
         raise RuntimeError('KubeAI prerequisites failed: ' + ', '.join(c['name'] for c in blockers)
                            + '. Run infer-stack kube doctor / kube bootstrap')

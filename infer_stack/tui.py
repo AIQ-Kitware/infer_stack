@@ -1010,6 +1010,12 @@ class InferStackTUI(App):
         # Must match the Collapsible widgets' initial state, or the gate in
         # _collect polls for a pane that is shut until the first sync.
         self._collapsed = {'docker': True, 'system': True}
+        self._kube_states: dict[str, dict] = {}
+        self._kube_model_error = ''
+        self._kube_tokens: dict[str, tuple] = {}
+        self._kube_verified: dict[str, tuple[tuple, str]] = {}
+        self._api_select_signature = None
+        self._api_readiness_text = None
         self._ready_endpoints: list[str] = []
         # served endpoint name -> OpenAI surface ('chat' | 'completions'), read
         # from the live deployment payload so the API tab probes the surface a
@@ -1188,6 +1194,8 @@ class InferStackTUI(App):
                 'clipboard.', classes='desc',
             )
             yield Static('', id='api-urls', markup=False)
+            if self._is_kube:
+                yield Static('', id='api-readiness', markup=False)
             with Horizontal(id='api-controls'):
                 yield Select([], prompt='model…', id='api-model')
                 yield Button('Send', id='btn-api-send', variant='primary')
@@ -1290,7 +1298,7 @@ class InferStackTUI(App):
         deployments_tbl = self.query_one('#deployments', DataTable)
         deployments_tbl.add_column('', width=2, key='sel')  # multi-select marker
         deployments_tbl.add_columns(
-            'id', 'engine', 'state', 'running', 'gpus', 'served',
+            'id', 'engine', 'state', 'lifecycle' if self._is_kube else 'running', 'gpus', 'served',
             'leases', 'held by'
         )
         self.query_one('#ps', DataTable).add_columns(
@@ -1664,21 +1672,52 @@ class InferStackTUI(App):
             return '-'
 
     def _sync_api_models(self, names: list[str]) -> None:
-        """Point the API model selector at the currently-ready endpoints only."""
+        """Select running Compose / replica-ready KubeAI endpoints; label proof."""
         self._api_models_wanted = names
-        if names == self._ready_endpoints:
+        if self._is_kube:
+            self._update_kube_api_readiness(names)
+        signature = (tuple(names), tuple(n in self._kube_verified for n in names) if self._is_kube else ())
+        if signature == self._api_select_signature:
             return
         try:
             select = self.query_one('#api-model', Select)
         except NoMatches:
             return          # the API tab is not built yet; filled when it is
         self._ready_endpoints = names
+        self._api_select_signature = signature
         current = None if _select_is_blank(select.value) else select.value
-        select.set_options([(n, n) for n in names])
+        select.set_options([((n + (' (generation verified)' if n in self._kube_verified else
+                                    ' (replica ready; generation unverified)')) if self._is_kube else n, n)
+                            for n in names])
         if current in names:
             select.value = current
         elif names:
             select.value = names[0]
+
+    def _update_kube_api_readiness(self, names):
+        text = ('Only replica-ready endpoints are offered. Send/Test all verifies generation on demand; '
+                'passive monitoring makes no generation requests.')
+        if self._kube_verified:
+            text += '\nLast successful generation: ' + ', '.join(
+                f'{ep} at {proof[1]}' for ep, proof in sorted(self._kube_verified.items()))
+        if self._kube_model_error:
+            text += '\nModel readiness unknown: ' + self._kube_model_error
+        if text == self._api_readiness_text:
+            return
+        try:
+            self.query_one('#api-readiness', Static).update(text)
+            self._api_readiness_text = text
+        except NoMatches:
+            pass
+
+    def _record_kube_generation(self, model, token, success):
+        if not self._is_kube:
+            return
+        if success and token and self._kube_tokens.get(model) == token:
+            self._kube_verified[model] = (token, time.strftime('%H:%M:%S'))
+        else:
+            self._kube_verified.pop(model, None)
+        self._sync_api_models(list(self._api_models_wanted))
 
     def _update_catalog_help(self) -> None:
         help_ = self.query_one('#catalog-help', Static)
@@ -1745,11 +1784,18 @@ class InferStackTUI(App):
             now = time.monotonic()
             if (self._observed_at is None
                     or (now - self._observed_at) >= self.observe_interval):
-                if (self._is_kube and self._cluster_snapshot is not None
-                        and self._cluster_snapshot['models'] is not None
-                        and self._cluster_at is not None and now - self._cluster_at < self.observe_interval):
-                    self._observed = {m.get('metadata', {}).get('labels', {}).get('infer-stack/deployment')
-                                      for m in self._cluster_snapshot['models']} - {None, ''}
+                if self._is_kube:
+                    from .kube.monitor import model_states, snapshot
+                    report = self._cluster_snapshot
+                    if (report is None or report['models'] is None or self._cluster_at is None
+                            or now - self._cluster_at >= self.observe_interval):
+                        # The global ledger/API observation costs one Model list;
+                        # full node/pod monitoring remains gated by the Cluster tab.
+                        report = snapshot(self._cluster_manager(), namespace=self.controller.backend.namespace,
+                                          resources=('models',))
+                    self._kube_states = model_states(report)
+                    self._kube_model_error = report['errors'].get('models', '')
+                    self._observed = set(self._kube_states)
                     self._assignments = {}
                 else:
                     self._observed, self._assignments = _placement_view(self.controller)
@@ -1788,17 +1834,26 @@ class InferStackTUI(App):
         if 'gpus' in data:
             self._fill_gpus(data['gpus'])
             self.query_one('#sysinfo', Static).update(data.get('sysinfo', ''))
-        # Ready = endpoints served by a deployment that is actually running.
+        # Compose observes running services. KubeAI eligibility instead needs
+        # replica evidence; a declared Model is not a ready endpoint.
         ready: set[str] = set()
         protocols: dict[str, str] = {}
         for g in data['deployments']:
-            if g.id in data['observed']:
+            if (self._kube_states.get(g.id, {}).get('replica_ready') if self._is_kube
+                    else g.id in data['observed']):
                 ready.update(g.served)
                 for name, payload in g.served.items():
                     proto = payload.get('protocol') if isinstance(payload, dict) \
                         else None
                     if proto:
                         protocols[name] = proto
+        if self._is_kube:
+            self._kube_tokens = {ep: tuple(sorted(
+                (g.id, self._kube_states[g.id]['identity']) for g in data['deployments']
+                if ep in g.served and self._kube_states.get(g.id, {}).get('replica_ready')))
+                for ep in ready}
+            self._kube_verified = {ep: proof for ep, proof in self._kube_verified.items()
+                                   if self._kube_tokens.get(ep) == proof[0]}
         self._ready_protocols = protocols
         self._sync_api_models(sorted(ready))
         self._update_summary(data['leases'], data['deployments'], data['observed'])
@@ -1913,7 +1968,7 @@ class InferStackTUI(App):
         # paint is ledger-only), the running counts would read as a confident
         # "0 running" — say we're still observing instead of silently lying.
         observing = self._observed_at is None
-        running_label = 'observing…' if observing else f'{running} running'
+        running_label = 'observing…' if observing else f'{running} declared' if self._is_kube else f'{running} running'
         # Assign only on change: Textual repaints a pane whenever its border
         # title is set, even to the same text, and these two panes hold the
         # lease and deployment tables -- most of the screen, every tick
@@ -2013,7 +2068,8 @@ class InferStackTUI(App):
             (
                 SELECT_MARK if g.id in self._dep_sel else '',
                 g.id, g.engine, str(g.state),
-                _running_label(g.id, observed),
+                (self._kube_states.get(g.id, {}).get('stage', 'unknown' if self._kube_model_error else 'absent')
+                 if self._is_kube else _running_label(g.id, observed)),
                 _gpu_label(g.id, observed, assignments),
                 ','.join(sorted(g.served)) or '-',
                 str(g.demand), ','.join(owners.get(g.id, [])) or '-',
@@ -2965,10 +3021,18 @@ class InferStackTUI(App):
     def _receive_cluster(self, report):
         self._cluster_snapshot = report
         self._cluster_at = time.monotonic()
+        if report['models'] is not None:
+            from .kube.monitor import model_states
+            self._kube_states = model_states(report)
+            self._kube_model_error = ''
+            self._observed = set(self._kube_states)
+            self._observed_at = self._cluster_at
         self._render_cluster(report)
+        if len(self.screen_stack) == 1:
+            self._refresh_now()
 
     def _render_cluster(self, report):
-        from .kube.monitor import node_rows, pod_rows
+        from .kube.monitor import model_states, node_rows, pod_rows
         nodes = node_rows(report)
         self._node_names = [r[0] for r in nodes]
         self._diff_fill(self.screen_stack[0].query_one('#cluster-nodes', DataTable),
@@ -2978,10 +3042,12 @@ class InferStackTUI(App):
         self._diff_fill(self.screen_stack[0].query_one('#cluster-pods', DataTable),
                         pods or [('(unavailable)' if report['pods'] is None else '(no pods)',) + ('-',) * 5],
                         '_cluster_pods_cache', id_index=0)
-        models = report['models']
-        model_text = 'unknown' if models is None else ', '.join(
-            f"{m.get('metadata', {}).get('name')}: {m.get('status', {}).get('readyReplicas', 0)} ready"
-            for m in models) or 'none'
+        states = model_states(report)
+        def replica_text(value):
+            return str(value) if value is not None else '?'
+        model_text = 'unknown' if report['models'] is None else ', '.join(
+            f"{r['name']}: {replica_text(r['ready_replicas'])}/{replica_text(r['all_replicas'])} ready; {r['stage']}"
+            for r in states.values()) or 'none'
         age = max(0, int(time.monotonic() - report['sampled_at']))
         summary = (f'Namespace: {report["namespace"]} · sample {age}s ago · refresh ≥15s, only while visible\n'
                    'GPU requests are scheduled resources across all namespaces, not utilization.\n'
@@ -3562,7 +3628,10 @@ class InferStackTUI(App):
         resp = self._http_client().post(
             url, json=body, headers=headers, timeout=120)
         self._raise_for_body(resp)
-        return self._completion_text(resp.json())
+        data = resp.json()
+        if self._is_kube and not data.get('choices'):
+            raise RuntimeError('generation response has no choices')
+        return self._completion_text(data)
 
     def _curl_for(self, model: str, prompt: str, *, reveal_key: bool = False) -> str:
         """The equivalent ``curl`` for a chat- or text-completion, matching the
@@ -3637,7 +3706,8 @@ class InferStackTUI(App):
     def action_api_send(self) -> None:
         model = self._selected_api_model()
         if not model:
-            self._refuse('no ready models to query (acquire one first)')
+            self._refuse('no replica-ready endpoints to query (acquire and wait for a ready replica)' if self._is_kube
+                         else 'no ready models to query (acquire one first)')
             return
         prompt = (self.query_one('#api-prompt', Input).value.strip()
                   or 'Say hello in one short sentence.')
@@ -3648,9 +3718,10 @@ class InferStackTUI(App):
     def action_api_test_all(self) -> None:
         models = list(self._ready_endpoints)
         if not models:
-            self._refuse('no ready models to test (acquire one first)')
+            self._refuse('no replica-ready endpoints to test (acquire and wait for a ready replica)' if self._is_kube
+                         else 'no ready models to test (acquire one first)')
             return
-        self._api_log(f'— testing {len(models)} ready model(s) —')
+        self._api_log(f'— testing {len(models)} ' + ('replica-ready endpoint(s)' if self._is_kube else 'ready model(s)') + ' —')
         self._cli(*(cli.command('test', model) for model in models))
         self._do_api_test_all(models)
 
@@ -3684,11 +3755,14 @@ class InferStackTUI(App):
 
     @work(thread=True, group='api')
     def _do_api_send(self, model: str, prompt: str) -> None:
+        token = self._kube_tokens.get(model)
         try:
             out = self._api_chat(model, prompt)
             self.call_from_thread(self._api_log, f'  [{model}] {out}')
+            self.call_from_thread(self._record_kube_generation, model, token, True)
         except Exception as ex:  # noqa: BLE001
             self.call_from_thread(self._api_log, f'  [{model}] ERROR: {ex}')
+            self.call_from_thread(self._record_kube_generation, model, token, False)
 
     @work(thread=True, group='api')
     def _do_api_list(self) -> None:
@@ -3712,13 +3786,16 @@ class InferStackTUI(App):
         import time
 
         for model in models:
+            token = self._kube_tokens.get(model)
             start = time.perf_counter()
             try:
                 self._api_chat(model, 'Reply with the single word: ok')
                 dt = time.perf_counter() - start
                 self.call_from_thread(self._api_log, f'  ✓ {model}  ({dt:.1f}s)')
+                self.call_from_thread(self._record_kube_generation, model, token, True)
             except Exception as ex:  # noqa: BLE001
                 self.call_from_thread(self._api_log, f'  ✗ {model}  {ex}')
+                self.call_from_thread(self._record_kube_generation, model, token, False)
         self.call_from_thread(self._api_log, '— done —')
 
     # Mutations converge the backend (docker up/down, possibly slow) off the UI

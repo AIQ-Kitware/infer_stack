@@ -486,7 +486,9 @@ def _print_inventory(report):
                 spec = item.get('spec', {})
                 summary = f"{spec.get('type', '?')} {spec.get('clusterIP', '')}"
             else:
-                summary = f"{status.get('readyReplicas', 0)} ready replicas"
+                from ..backends.kubeai import model_replica_counts
+                total, ready = model_replica_counts(item)
+                summary = f"{ready if ready is not None else '?'}/{total if total is not None else '?'} ready replicas"
             print(f'    {name}: {summary}')
     print('resource profiles proposed')
     if report['resource_profiles']['proposed']:
@@ -500,7 +502,7 @@ def _print_inventory(report):
 
 def _print_checks(checks):
     for check in checks:
-        mark = {'ok': 'ok  ', 'fail': 'FAIL', 'blocked': 'SKIP'}[check['status']]
+        mark = {'ok': 'ok  ', 'warn': 'WARN', 'fail': 'FAIL', 'blocked': 'SKIP'}[check['status']]
         print(f"[{mark}] {check['name']} — {check['detail']}")
         if check['fix']:
             print(f"       fix: {check['fix']}")

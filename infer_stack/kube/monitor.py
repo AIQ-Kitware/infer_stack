@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 
+from ..backends.kubeai import model_replica_counts
 from .manage import KubeManager
 
 
@@ -32,7 +33,7 @@ def gpu_request(pod: dict) -> int:
     return max(steady + sidecars, peak) + int((spec.get('overhead') or {}).get('nvidia.com/gpu', 0))
 
 
-def snapshot(manager: KubeManager, *, namespace: str) -> dict:
+def snapshot(manager: KubeManager, *, namespace: str, resources=('nodes', 'pods', 'models')) -> dict:
     report = {'nodes': None, 'pods': None, 'models': None, 'errors': {},
               'sampled_at': time.monotonic(), 'namespace': namespace}
     for key, args in (
@@ -41,6 +42,8 @@ def snapshot(manager: KubeManager, *, namespace: str) -> dict:
         ('models', ['-n', namespace, 'get', 'models.kubeai.org',
                     '-l', 'infer-stack/managed=true', '-o', 'json']),
     ):
+        if key not in resources:
+            continue
         try:
             result = manager.kubectl_json(args)
             if not isinstance(result.get('items'), list):
@@ -94,3 +97,39 @@ def pod_rows(report: dict) -> list[tuple]:
                      f"{sum(bool(c.get('ready')) for c in containers)}/{len(pod.get('spec', {}).get('containers') or [])}",
                      str(sum(c.get('restartCount', 0) for c in containers)), str(gpu_request(pod))))
     return sorted(rows)
+
+
+def model_states(report: dict) -> dict[str, dict]:
+    """Lifecycle evidence from one sample; declaring a CR proves no readiness."""
+    states = {}
+    for model in report['models'] or []:
+        meta = model.get('metadata') or {}
+        gid = (meta.get('labels') or {}).get('infer-stack/deployment')
+        if not gid:
+            continue
+        pods = [p for p in report['pods'] or []
+                if p.get('metadata', {}).get('namespace') == report['namespace']
+                and p.get('metadata', {}).get('labels', {}).get('infer-stack/deployment') == gid
+                and not p.get('metadata', {}).get('deletionTimestamp')
+                and p.get('status', {}).get('phase') not in {'Succeeded', 'Failed'}]
+        scheduled = any(p.get('spec', {}).get('nodeName') for p in pods)
+        running = any(c.get('state', {}).get('running')
+                      for p in pods for c in p.get('status', {}).get('containerStatuses') or [])
+        ready_pods = any(any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                            for c in p.get('status', {}).get('conditions') or []) for p in pods)
+        total, ready = model_replica_counts(model)
+        replica_ready = bool(ready and (report['pods'] is None or ready_pods))
+        stage = 'replica ready' if replica_ready else 'pod running' if running else 'scheduled' if scheduled else 'declared'
+        if meta.get('deletionTimestamp'):
+            stage, replica_ready = 'deleting', False
+        # Proof is scoped to this incarnation; replacement/restarts invalidate
+        # an earlier successful API request. A Model-only sample has no pod proof.
+        identity = (meta.get('uid'), meta.get('generation'), tuple(sorted(
+            (p.get('metadata', {}).get('uid', ''), tuple(
+                (c.get('containerID', ''), c.get('restartCount', 0))
+                for c in p.get('status', {}).get('containerStatuses') or [])) for p in pods))
+                    if report['pods'] is not None else None)
+        states[gid] = {'name': meta.get('name'), 'stage': stage,
+                       'replica_ready': replica_ready, 'all_replicas': total,
+                       'ready_replicas': ready, 'identity': identity}
+    return states

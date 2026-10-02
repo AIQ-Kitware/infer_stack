@@ -362,3 +362,20 @@ through the controller even without a local gateway render; Down confirms
 managed Model/gateway teardown and retains leases. Existing Acquire, Release,
 Evict and pod log controls remain available. Endpoint editing exposes
 `runtime.resource_profile` instead of physical host GPU indices.
+
+
+Kubernetes readiness has separate stages: declared Model, scheduled pod,
+running container, ready replica, and generation verified by an explicit API
+request. CLI inventory and the Cluster summary read KubeAI's
+`status.replicas.all/ready`, with fallback for legacy flat counters; missing
+counts remain unknown. A CR alone never makes an endpoint eligible for the API
+picker. Replica-ready candidates are labeled generation-unverified until
+**Send** or **Test all** succeeds. Verification is last-request evidence for the
+endpoint, not proof that every replica answered. Replacement, observed restarts,
+readiness loss or a failed request invalidates that evidence.
+
+The global ledger/API observation uses one cached Model-list read, reusing a
+fresh Cluster sample when available. Full node/pod monitoring remains limited
+to the visible Cluster tab. Passive refresh performs no generation requests.
+Doctor reports retained terminated runtime evidence as a non-failing **WARN**,
+with `kube install --apply` as the fresh-verification step.

@@ -90,14 +90,14 @@ def test_cluster_visible_only_cache_manual_refresh_and_partial_data(tmp_path):
         app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None, kube_manager=m)
         async with app.run_test(size=(180, 55)) as pilot:
             await pilot.pause()
-            assert not cluster.calls  # no kube inventory at mount/hidden pane
+            assert len(cluster.calls) == 1 and 'models.kubeai.org' in cluster.calls[0]  # one global readiness read; no node/pod inventory
             app.query_one('#docker', Collapsible).collapsed = False
             app.query_one('#docker-tabs', TabbedContent).active = 'tab-cluster'
             await pilot.pause()
             await app.workers.wait_for_complete()
             assert app.query_one('#cluster-nodes', DataTable).row_count == 1
             count = len(cluster.calls)
-            assert count == 3
+            assert count == 4  # one global Model read plus three Cluster reads
             app.action_refresh()
             await app.workers.wait_for_complete()
             assert len(cluster.calls) == count
@@ -144,10 +144,10 @@ def test_slow_cluster_probe_never_overlaps_or_blocks_ui(tmp_path):
             await pilot.press('2')
             await pilot.pause()
             assert app.query_one('#top', TabbedContent).active == 'tab-api'
-            assert len(calls) == 1
+            assert len(calls) == 2  # one global Model read and one slow Cluster read
             gate.set()
             await app.workers.wait_for_complete()
-            assert len(calls) == 3
+            assert len(calls) == 4
     try:
         asyncio.run(scenario())
     finally:
@@ -272,11 +272,11 @@ def test_refresh_does_not_spawn_duplicate_slow_observation(tmp_path):
     controller, catalog = context(tmp_path)
     gate = threading.Event()
     calls = []
-    def observe():
-        calls.append('observe')
+    def observe(args, **kw):
+        calls.append(args)
         gate.wait(5)
-        return set()
-    controller.backend.observe = observe
+        return '{"items": []}'
+    controller.backend.run = observe
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
@@ -325,4 +325,118 @@ def test_log_followers_pause_while_cluster_or_other_top_tab_is_visible(tmp_path)
             app.query_one('#top', TabbedContent).active = 'tab-api'
             await pilot.pause()
             assert calls == ['stop']
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('status,expected', [
+    ({'replicas': {'all': 2, 'ready': 1}}, (2, 1)),
+    ({'replicas': {'all': 2, 'ready': 0}, 'readyReplicas': 2}, (2, 0)),
+    ({'replicas': 2, 'readyReplicas': 1}, (2, 1)),
+    ({'readyReplicas': 1}, (None, 1)),
+    ({}, (None, None)),
+])
+def test_actual_kubeai_replica_counts_and_compatibility(status, expected):
+    from infer_stack.backends.kubeai import model_replica_counts
+    assert model_replica_counts({'status': status}) == expected
+
+
+def lifecycle_report(gid='grp-q'):
+    return {'nodes': [], 'pods': [], 'namespace': 'default', 'errors': {},
+            'sampled_at': time.monotonic(), 'models': [{
+                'metadata': {'name': 'qwen-coder', 'uid': 'model-1', 'generation': 1,
+                             'labels': {'infer-stack/deployment': gid}},
+                'status': {'replicas': {'all': 2, 'ready': 0}}}]}
+
+
+def test_kubeai_lifecycle_evidence_and_namespace_scope():
+    from infer_stack.kube.monitor import model_states
+    r = lifecycle_report()
+    assert model_states(r)['grp-q']['stage'] == 'declared'
+    pod = {'metadata': {'name': 'vllm', 'namespace': 'default', 'uid': 'pod-1',
+                       'labels': {'infer-stack/deployment': 'grp-q'}},
+           'spec': {'nodeName': 'namek'}, 'status': {'phase': 'Pending'}}
+    r['pods'] = [pod]
+    assert model_states(r)['grp-q']['stage'] == 'scheduled'
+    pod['status'] = {'phase': 'Running', 'containerStatuses': [
+        {'containerID': 'container-1', 'state': {'running': {'startedAt': 'now'}}}]}
+    assert model_states(r)['grp-q']['stage'] == 'pod running'
+    r['models'][0]['status']['replicas']['ready'] = 1
+    assert not model_states(r)['grp-q']['replica_ready']  # stale CR counter cannot override unready pods
+    pod['status']['conditions'] = [{'type': 'Ready', 'status': 'True'}]
+    assert model_states(r)['grp-q']['stage'] == 'replica ready'
+    before = model_states(r)['grp-q']['identity']
+    pod['status']['containerStatuses'][0]['restartCount'] = 1
+    assert model_states(r)['grp-q']['identity'] != before
+    pod['metadata']['namespace'] = 'unrelated'
+    assert not model_states(r)['grp-q']['replica_ready']
+    r['pods'] = None  # Model-only polling uses the CR replica count, not guessed pod facts
+    assert model_states(r)['grp-q']['replica_ready']
+    r['models'][0]['metadata']['deletionTimestamp'] = 'now'
+    assert not model_states(r)['grp-q']['replica_ready']
+
+
+def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(tmp_path):
+    from test_leasing_kubeai import vllm
+    controller, catalog = context(tmp_path)
+    deployment = vllm('grp-q', served='qwen-coder')
+    deployment.served = {'qwen-coder': {'served_model_name': 'qwen-coder', 'protocol': 'chat'}}
+    controller.ledger.store.insert_deployment(deployment)
+    requests = []
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {'choices': [{'message': {'content': 'ok'}}]}
+    class HTTP:
+        def post(self, *args, **kw):
+            requests.append((args, kw))
+            return Response()
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None,
+                            kube_manager=manager(Cluster()), http=HTTP())
+        app._litellm = lambda: ('http://gateway/v1', 'key')
+        async with app.run_test(size=(180, 55)) as pilot:
+            await pilot.pause()
+            r = lifecycle_report()
+            app._receive_cluster(r)
+            assert app._api_models_wanted == []
+            assert app._kube_states['grp-q']['stage'] == 'declared'
+            assert '0/2 ready' in str(app.query_one('#cluster-summary', Static).render())
+            app.query_one('#top', TabbedContent).active = 'tab-api'
+            await pilot.pause()
+            assert app._ready_endpoints == []
+            r['pods'] = None
+            r['models'][0]['status']['replicas']['ready'] = 1
+            app._receive_cluster(r)
+            assert app._ready_endpoints == ['qwen-coder']
+            assert app._kube_verified == {}
+            assert '1/2 ready' in str(app.query_one('#cluster-summary', Static).render())
+            assert 'generation unverified' in str(app.query_one('#api-model', Select)._options)
+            assert requests == []  # no generation during passive refresh
+            app.action_api_send()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert 'qwen-coder' in app._kube_verified
+            assert 'Last successful generation' in str(app.query_one('#api-readiness', Static).render())
+            assert len(requests) == 1
+            old_post = app._http_client().post
+            def fail(*args, **kwargs):
+                raise RuntimeError('upstream loading')
+            app._http_client().post = fail
+            app.action_api_test_all()
+            await app.workers.wait_for_complete()
+            assert not app._kube_verified
+            app._http_client().post = old_post
+            app.action_api_test_all()
+            await app.workers.wait_for_complete()
+            assert 'qwen-coder' in app._kube_verified
+            old_token = app._kube_tokens['qwen-coder']
+            r['models'][0]['metadata']['uid'] = 'replacement-model'
+            app._receive_cluster(r)
+            assert not app._kube_verified
+            app._record_kube_generation('qwen-coder', old_token, True)
+            assert not app._kube_verified  # late response cannot verify a replacement
+            r['models'][0]['status']['replicas']['ready'] = 0
+            app._receive_cluster(r)
+            assert app._ready_endpoints == []
     asyncio.run(scenario())

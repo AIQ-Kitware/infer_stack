@@ -303,3 +303,34 @@ def test_join_reports_local_gpu_separately_from_cluster_availability(monkeypatch
         assert 'nvidia.com/gpu' in text and 'GFD product/memory' in text
         assert 'fresh runtime canary' in text
     assert len(calls) == 1
+
+
+def test_cli_inventory_uses_actual_kubeai_replica_shape_and_unknown_counts(capsys):
+    from infer_stack.cli.commands_kube import _print_inventory
+    report = inventory(manager(Cluster(installed=True)), http=HTTP)
+    report['kubeai']['models'] = [
+        {'metadata': {'name': 'q'}, 'status': {'replicas': {'all': 2, 'ready': 1}}},
+        {'metadata': {'name': 'old'}, 'status': {'replicas': 3, 'readyReplicas': 2}},
+        {'metadata': {'name': 'unknown'}}]
+    _print_inventory(report)
+    text = capsys.readouterr().out
+    assert 'q: 1/2 ready replicas' in text
+    assert 'old: 2/3 ready replicas' in text
+    assert 'unknown: ?/? ready replicas' in text
+
+
+def test_doctor_historical_runtime_is_nonfailing_warning_with_fresh_fix(capsys):
+    from infer_stack.cli.commands_kube import _print_checks
+    report = inventory(manager(Cluster(installed=True)), http=HTTP)
+    row = report['nodes'][0]
+    row['nvidia_runtime_evidence_state'] = 'historical'
+    row['nvidia_runtime_evidence'] = 'previously observed; not a fresh verification'
+    checks = readiness(report)
+    check = next(c for c in checks if c['name'].endswith('NVIDIA runtime evidence'))
+    assert check['status'] == 'warn'
+    assert 'infer-stack kube install --apply' in check['fix']
+    assert not failed(checks)
+    _print_checks(checks)
+    text = capsys.readouterr().out
+    assert '[WARN] node gpu-a NVIDIA runtime evidence' in text
+    assert 'previously observed' in text
