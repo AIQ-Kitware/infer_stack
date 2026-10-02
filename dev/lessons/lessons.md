@@ -166,3 +166,16 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   until killed; removing the inner lock made it finish in 4 s.
 - **Applies when:** adding a gateway/backend helper that writes state under
   the state dir and may be reached from a render or converge.
+
+- **Lesson:** A traversal of live `/proc` can return useful stdout and exit 1
+  because a PID or fd disappears between directory enumeration and `stat`.
+  Treating any nonzero `find /proc` status as total scan failure discards valid
+  observations and can be misreported as a sudo/authentication problem. Check
+  privilege separately, tolerate only the expected `/proc/...: No such file or
+  directory` race, and fail closed on other errors.
+  - **Evidence / MWE:** `tests/test_gpu_doctor.py::test_proc_find_race_keeps_valid_holder_results`;
+    live aiq-gpu reproduction on 2026-10-02 produced 52 valid NVIDIA-device
+    holder records while one vanished fd made GNU find exit 1.
+  - **Applies when:** inspecting process/fd state under live `/proc`, especially
+    privileged diagnostics that must distinguish incomplete observation from
+    authentication failure.
