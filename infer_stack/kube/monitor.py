@@ -99,7 +99,7 @@ def pod_rows(report: dict) -> list[tuple]:
     return sorted(rows)
 
 
-def model_states(report: dict) -> dict[str, dict]:
+def model_states(report: dict, previous: dict | None = None) -> dict[str, dict]:
     """Lifecycle evidence from one sample; declaring a CR proves no readiness."""
     states = {}
     for model in report['models'] or []:
@@ -123,12 +123,16 @@ def model_states(report: dict) -> dict[str, dict]:
         if meta.get('deletionTimestamp'):
             stage, replica_ready = 'deleting', False
         # Proof is scoped to this incarnation; replacement/restarts invalidate
-        # an earlier successful API request. A Model-only sample has no pod proof.
+        # an earlier successful API request. Less detailed observations retain
+        # known pod identity only while the Model incarnation is unchanged.
         identity = (meta.get('uid'), meta.get('generation'), tuple(sorted(
             (p.get('metadata', {}).get('uid', ''), tuple(
                 (c.get('containerID', ''), c.get('restartCount', 0))
                 for c in p.get('status', {}).get('containerStatuses') or [])) for p in pods))
                     if report['pods'] is not None else None)
+        old_identity = (previous or {}).get(gid, {}).get('identity')
+        if report['pods'] is None and old_identity and identity[:2] == old_identity[:2]:
+            identity = (*identity[:2], old_identity[2])
         states[gid] = {'name': meta.get('name'), 'stage': stage,
                        'replica_ready': replica_ready, 'all_replicas': total,
                        'ready_replicas': ready, 'identity': identity}

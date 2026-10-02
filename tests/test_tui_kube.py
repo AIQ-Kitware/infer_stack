@@ -421,12 +421,26 @@ def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(t
             assert '1/2 ready' in str(app.query_one('#cluster-summary', Static).render())
             assert 'generation unverified' in str(app.query_one('#api-model', Select)._options)
             assert requests == []  # no generation during passive refresh
+            r['pods'] = [{'metadata': {'namespace': 'default', 'uid': 'pod-1',
+                                       'labels': {'infer-stack/deployment': 'grp-q'}},
+                          'spec': {'nodeName': 'namek'},
+                          'status': {'conditions': [{'type': 'Ready', 'status': 'True'}],
+                                     'containerStatuses': [{'containerID': 'container-1', 'restartCount': 0}]}}]
+            app._receive_cluster(r)
             app.action_api_send()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert 'qwen-coder' in app._kube_verified
             assert 'Last successful generation' in str(app.query_one('#api-readiness', Static).render())
             assert len(requests) == 1
+            proof = app._kube_verified['qwen-coder']
+            full_pods = r['pods']
+            r['pods'] = None
+            app._receive_cluster(r)
+            assert app._kube_verified['qwen-coder'] == proof
+            r['pods'] = full_pods
+            app._receive_cluster(r)
+            assert app._kube_verified['qwen-coder'] == proof
             old_post = app._http_client().post
             def fail(*args, **kwargs):
                 raise RuntimeError('upstream loading')
@@ -444,6 +458,10 @@ def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(t
             assert not app._kube_verified
             app._record_kube_generation('qwen-coder', old_token, True)
             assert not app._kube_verified  # late response cannot verify a replacement
+            app._record_kube_generation('qwen-coder', app._kube_tokens['qwen-coder'], True)
+            current_proof = app._kube_verified['qwen-coder']
+            app._record_kube_generation('qwen-coder', old_token, False)
+            assert app._kube_verified['qwen-coder'] == current_proof  # late failure cannot erase newer proof
             r['models'][0]['status']['replicas']['ready'] = 0
             app._receive_cluster(r)
             assert app._ready_endpoints == []
@@ -452,7 +470,7 @@ def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(t
 
 @pytest.mark.parametrize('launch', [
     {'image': 'my-vllm:foo'}, {'command': ['custom-server']},
-    {'serve_recipe': 'hyperqwen-3090-single'},
+    {'serve_recipe': 'hyperqwen-3090-single'}, {'mounts': ['/host:/container']},
 ])
 def test_kubeai_editor_refuses_existing_unsupported_launch(tmp_path, launch):
     controller, catalog = context(tmp_path)
@@ -469,5 +487,5 @@ def test_kubeai_editor_refuses_existing_unsupported_launch(tmp_path, launch):
             await pilot.pause()
             assert app.screen is screen
             assert results == []
-            assert 'does not support runtime.image/command' in errors[0]
+            assert 'does not support runtime.' in errors[0]
     asyncio.run(scenario())

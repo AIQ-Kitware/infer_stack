@@ -661,9 +661,10 @@ class _AddEndpointScreen(ModalScreen):
                 if not self._kubeai:
                     result.update(image=self._v('e-image').strip(), command=self._v('e-command'))
                 else:
-                    from .leasing.launch import translate_legacy
-                    if any(translate_legacy(self._entry.get('runtime') or {}).get(k) for k in ('image', 'command')):
-                        raise ValueError('KubeAI does not support runtime.image/command overrides; remove them in the catalog or use Compose.')
+                    from .backends.kubeai import unsupported_runtime_fields
+                    unsupported = unsupported_runtime_fields(self._entry.get('runtime') or {})
+                    if unsupported:
+                        raise ValueError(f'KubeAI does not support runtime.{unsupported[0]}; remove it in the catalog or use Compose.')
             else:
                 result.update({
                     'host': self._v('e-host'),
@@ -1727,8 +1728,10 @@ class InferStackTUI(App):
             return
         if success and token and self._kube_tokens.get(model) == token:
             self._kube_verified[model] = (token, time.strftime('%H:%M:%S'))
-        else:
-            self._kube_verified.pop(model, None)
+        elif not success:
+            existing = self._kube_verified.get(model)
+            if existing and existing[0] == token:
+                self._kube_verified.pop(model, None)
         self._sync_api_models(list(self._api_models_wanted))
 
     def _update_catalog_help(self) -> None:
@@ -1805,7 +1808,7 @@ class InferStackTUI(App):
                         # full node/pod monitoring remains gated by the Cluster tab.
                         report = snapshot(self._cluster_manager(), namespace=self.controller.backend.namespace,
                                           resources=('models',))
-                    self._kube_states = model_states(report)
+                    self._kube_states = model_states(report, self._kube_states)
                     self._kube_model_error = report['errors'].get('models', '')
                     self._observed = set(self._kube_states)
                     self._assignments = {}
@@ -3035,7 +3038,7 @@ class InferStackTUI(App):
         self._cluster_at = time.monotonic()
         if report['models'] is not None:
             from .kube.monitor import model_states
-            self._kube_states = model_states(report)
+            self._kube_states = model_states(report, self._kube_states)
             self._kube_model_error = ''
             self._observed = set(self._kube_states)
             self._observed_at = self._cluster_at

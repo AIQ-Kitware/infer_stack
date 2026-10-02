@@ -50,10 +50,19 @@ MANAGED_LABEL = 'infer-stack/managed'
 DEPLOYMENT_LABEL = 'infer-stack/deployment'
 # KubeAI's Model CRD is stricter than Kubernetes's usual DNS label limit.
 MODEL_NAME_MAX_LENGTH = 40
+UNSUPPORTED_RUNTIME_FIELDS = ('image', 'command', 'mounts')
 DEFAULT_NAMESPACE = 'kubeai'
 # The standard local access path: `kubectl port-forward svc/kubeai 8000:80`.
 # An ingress-fronted cluster overrides this via the kubeai_base_url setting.
 DEFAULT_BASE_URL = 'http://127.0.0.1:8000/openai/v1'
+
+
+def unsupported_runtime_fields(runtime: dict) -> tuple[str, ...]:
+    """Shared stock KubeAI launch policy, including legacy launch recipes."""
+    from ..leasing.launch import translate_legacy
+
+    translated = translate_legacy(runtime)
+    return tuple(key for key in UNSUPPORTED_RUNTIME_FIELDS if translated.get(key))
 
 
 def model_replica_counts(model: dict) -> tuple[int | None, int | None]:
@@ -360,7 +369,7 @@ def render_models(
         from ..leasing.launch import translate_legacy
 
         runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
-        custom = [k for k in ('image', 'command', 'mounts') if runtime.get(k)]
+        custom = unsupported_runtime_fields(runtime)
         if custom:
             # A KubeAI Model runs stock vLLM: it has no place for a container
             # image override, command or host mounts (env maps onto spec.env). Fail closed,

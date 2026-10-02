@@ -396,3 +396,31 @@ probe errors). No workload or host mutations occurred in this correction.
 The earlier unchanged long-model CPU e2e passed; GPU placement/generation and
 fresh worker/runtime tests still need aiq-gpu/namek. Readiness and editor changes
 are committed separately so operator-evidence policy is reviewable on its own.
+
+## 2026-10-01 23:13:37 -0400
+
+The user wants easier worker onboarding and GPU acceptance for namek (one
+3090), then yardrat (two heterogeneous GPUs) and aiq-gpu2 (four smaller GPUs),
+while correcting three focused TUI review findings. Model/configuration: GPT-6
+Codex, Default collaboration mode; reasoning effort is not exposed. Commits
+retain the requested GPT-6.1-Sol co-author attribution.
+
+I separated evidence identity from sampling detail: a Model-only observation
+retains known pod incarnation only when Model UID/generation agrees, while
+fresh pod observations and readiness loss remain authoritative contradictions.
+Old asynchronous failures now invalidate only their own incarnation's proof;
+late success likewise cannot alter a replacement. The editor and renderer now
+share the stock KubeAI launch capability policy, including mounts and legacy
+recipes. This protects evidence from UI tab changes without pretending stale
+pod observations are current pod facts. Focused TUI/backend validation: 97
+passed; scoped Ruff passed. A temporary missing local render variable during
+refactoring was caught by focused tests and corrected before commit.
+
+The onboarding design should separate local agent membership from explicit
+administrative access and test the named worker rather than total cluster
+capacity. Mixed-product nodes need actual device observations: a product label
+on a node cannot promise which physical GPU Kubernetes will allocate. I am
+building a package-native, reviewed plan/apply path with isolated test resources,
+exact placement checks, real generation and ownership-limited cleanup. Driver
+installation remains an explicit host prerequisite rather than an implicit OS
+migration. Real GPU acceptance will be run by the maintainer, not on this VM.
