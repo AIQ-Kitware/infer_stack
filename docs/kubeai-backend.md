@@ -332,3 +332,27 @@ provides a synthetic second K3s node for development;
 Acquire/wait logs changed readiness states once: pending/scheduler reasons,
 scheduled node and image, container startup/model loading, replica readiness,
 and finally generation verification. It does not log every unchanged poll.
+
+## TUI cluster monitoring and control
+
+Open `infer-stack tui`, expand runtime (`c`), and select **Cluster**. The cached
+node table includes Ready, scheduling, GPU allocation/requests, product/memory,
+GFD and observed runtime startup evidence. The pod table includes KubeAI and
+NVIDIA components, their nodes, startup reasons, readiness, restarts and GPU
+requests. **Refresh cluster** requests a new sample; **Doctor** runs the same
+inventory/readiness policy as the CLI once, with actionable fixes.
+
+Three batched list requests supply the cluster view. Automatic sampling occurs
+at most every 15 seconds (or the longer configured observation interval), stops
+when hidden, and never overlaps a previous sample. Ledger refreshes remain
+independent. Partial RBAC/network failures retain other facts and show unknown
+values rather than an empty healthy cluster. Scheduled GPU requests count all
+namespaces and exclude completed pods; no remote GPU utilization is inferred.
+
+Node detach/attach previews and confirmation reuse the CLI's ownership-aware
+lifecycle operations. Detach warns about eviction and emptyDir loss; attach
+requires the operator to stop local Compose GPU work first. Apply reconciles
+through the controller even without a local gateway render; Down confirms
+managed Model/gateway teardown and retains leases. Existing Acquire, Release,
+Evict and pod log controls remain available. Endpoint editing exposes
+`runtime.resource_profile` instead of physical host GPU indices.

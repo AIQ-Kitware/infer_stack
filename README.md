@@ -702,3 +702,25 @@ the timeout is only for a model that is loading. Reading Docker's own
 signals: `litellm exited with code 137` is a SIGKILL (an OOM kill or a forced
 replacement), whereas LiteLLM returning HTTP 500 with `Cannot connect to host
 vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
+
+### Kubernetes dashboard
+
+`infer-stack tui` provides a **Cluster** tab in the expanded runtime pane on the
+KubeAI backend. It shows Ready/scheduling state, GPU allocation and scheduled
+requests across namespaces, GFD labels, runtime evidence, managed Models and
+KubeAI/NVIDIA pod startup/restart state. GPU requests are scheduling facts, not
+live GPU utilization; the system pane explicitly describes the local host.
+
+Cluster monitoring uses three batched API reads, cached for at least 15 seconds
+and polled only while the tab is visible. Slow probes cannot overlap or block
+keyboard input; **Refresh cluster** forces a sample, and **Doctor** runs the
+shared detailed checks on demand. Pod samples also feed the Instances view.
+
+Select a node for **Detach node** or **Attach node**. Each previews its workload
+and scheduling state and requires confirmation; detach drains workloads and
+emptyDir data, while attach confirms local Compose workloads have stopped.
+These reuse `kube node detach/attach` and preserve cluster membership. The
+Control tab provides **Apply** through the leasing controller and confirmed
+**Down** for managed Models and the gateway. Leases remain after Down. The
+KubeAI endpoint editor selects resource profiles; Kubernetes chooses node/GPU
+placement.

@@ -47,7 +47,7 @@ def default_run(
         env=env,
         text=True,
         capture_output=True,
-        timeout=360 if ('upgrade' in args or 'wait' in args) else 60,
+        timeout=360 if ('upgrade' in args or 'wait' in args or 'drain' in args) else 60,
         check=False,
     )
     if proc.returncode:

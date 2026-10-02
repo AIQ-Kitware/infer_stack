@@ -228,3 +228,48 @@ Type checks, CI flake8, scoped Ruff, shell syntax and actual entrypoint help
 checks passed. Remaining real-host checks include private credential access/
 refresh, stale-EKS context isolation, active-worker config inspection, and runtime
 canaries on aiq-gpu/namek. No real cluster mutation is part of this work.
+
+## 2026-10-01 20:29:02 -0400
+
+User intent: resume the Kubernetes TUI work after the bootstrap review and
+make logical commits. Model/configuration: GPT-6 (Codex), Default collaboration
+mode; reasoning effort not exposed. User-requested commit attribution:
+GPT-6.1-Sol. No sub-agents.
+
+I separated the review corrections from the TUI changes. The dashboard needs
+live scheduling facts cheaply; running full inventory/Helm/API diagnosis every
+ledger tick would create avoidable latency and subprocess load. kube.monitor
+instead gathers three batched lists, retains independent errors, and computes
+scheduled GPU requests across namespaces. It explicitly does not call those
+requests utilization. Runtime evidence remains observed pod startup, never a
+claim inferred from a cluster RuntimeClass. The cached Cluster tab samples at
+least 15 seconds apart only while visible; ledger/instance observation has its
+own cadence, and non-overlap guards prevent canceled Textual workers from
+leaving duplicate subprocesses behind. Existing node GPU parsing and residency
+parsing supply tables and cached Instances data. Doctor is deliberate/on-demand. Log followers pause while their tab is hidden;
+returning retains backend action output captured in the meantime. Textual
+Expanded/Collapsed messages need their own handlers for immediate gating;
+relying on the base Toggled message delayed the update until a timer tick.
+
+Control reuses the existing lifecycle manager: node actions preview affected
+workloads, warn about emptyDir loss or Compose ownership handback, confirm, then
+recheck before mutation. Apply stays with the controller; Down works for Model
+renders without a local gateway file, confirms Model/gateway teardown, retains
+leases, and holds the publication lock. Mutations invalidate caches. The endpoint
+editor exposes resource_profile rather than physical GPU indices on KubeAI.
+Compose behavior and host metrics remain available; local metrics are explicitly
+labeled as local on the cluster backend. The tradeoff is bounded polling rather
+than persistent Kubernetes watches: this avoids adding a second client/session
+lifecycle, and count-based tests pin the request budget. Small retained runtime
+canaries prove an observed invocation, not permanent future handler health.
+
+Validation: 79 existing TUI tests and 11 new Kubernetes TUI tests passed (90 total),
+including hidden log streams and captured action output. The
+final combined full suite passed 1206 tests with 3 skips and 8 cleanup/ResourceWarnings.
+A final N/A representation check passed 49 review/readiness tests. Type checks,
+CI flake8, scoped Ruff and diff whitespace checks passed. A read-only headless
+TUI run against this VM's actual K3s cluster showed two node rows and four pod
+rows with no probe errors; screenshot /tmp/infer-stack-kubernetes-tui.svg.
+No real Apply/Down/node/bootstrap/install action was invoked. Maintainer
+validation remains the GPU hosts' credential refresh, actual agent membership,
+canary startup, and confirmed node handoff with real workloads.

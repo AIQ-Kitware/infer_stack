@@ -34,16 +34,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from rich.markup import escape as escape_markup
 from textual import events, work
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
-from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
 from textual.css.query import NoMatches
 from textual.lazy import Lazy
-from textual.widget import Widget
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Collapsible,
@@ -60,6 +61,7 @@ from textual.widgets import (
 )
 
 from . import __version__
+from . import cli_equivalent as cli
 from .cli.commands_leasing import (
     _gpu_label,
     _lease_ttl,
@@ -67,9 +69,6 @@ from .cli.commands_leasing import (
     _running_label,
 )
 from .leasing import DeploymentState, LeaseState
-from rich.markup import escape as escape_markup
-
-from . import cli_equivalent as cli
 from .log_filter import compact_litellm_tracebacks
 
 ALL_SERVICES = ''  # the Select value meaning "every service"
@@ -122,6 +121,9 @@ ACTIVITY_VERBS = {
     '_do_cleanup': 'cleaning up the ledger',
     '_do_apply': 'applying',
     '_do_compose': 'docker compose',
+    '_do_kube_doctor': 'checking Kubernetes readiness',
+    '_prepare_node_action': 'inspecting node',
+    '_do_node_action': 'updating node',
     '_save_endpoint': 'saving endpoint',
     '_do_suggest': 'inspecting GPUs for a suggestion',
     '_prepare_endpoint_editor': 'inspecting GPUs',
@@ -370,11 +372,13 @@ class _AddEndpointScreen(ModalScreen):
         name: str | None = None,
         entry: dict | None = None,
         inventory: dict[str, Any] | None = None,
+        kubeai: bool = False,
     ):
         super().__init__()
         self._models = models
         self._edit_name = name
         self._entry = entry or {}
+        self._kubeai = kubeai
         self._gpus = sorted(
             (inventory or {}).get('gpus', []),
             key=lambda g: int(g.get('index', 0)),
@@ -453,7 +457,7 @@ class _AddEndpointScreen(ModalScreen):
                     yield Input(value=cur_model or '', placeholder='model name',
                                 id='e-model-text')
                 yield Label('engine')
-                yield Select([('vllm', 'vllm'), ('ollama', 'ollama')],
+                yield Select([('vllm', 'vllm')] if self._kubeai else [('vllm', 'vllm'), ('ollama', 'ollama')],
                              value=cur_engine, allow_blank=False, id='e-engine')
                 with Vertical(id='vllm-opts'):
                     yield Label('tensor-parallel size  (GPUs per replica)')
@@ -468,10 +472,17 @@ class _AddEndpointScreen(ModalScreen):
                     yield Label('GPU memory utilization  (0-1, per GPU)')
                     yield Input(value=self._rt('gpu_memory_utilization'),
                                 placeholder='float, e.g. 0.9', id='e-gpu')
-                    yield Label('GPU placement  (auto or exact physical indices)')
-                    yield Static(self._gpu_hint(), classes='hint')
-                    yield Input(value=self._gpu_pin_value(),
-                                placeholder='auto, 1, or 0,2', id='e-gpu-pin')
+                    if self._kubeai:
+                        yield Label('KubeAI resource profile')
+                        yield Static('Kubernetes chooses nodes/GPUs. Use an installed profile name '
+                                     '(with optional :GPU-count), or leave blank for configured default.', classes='hint')
+                        yield Input(value=self._rt('resource_profile'),
+                                    placeholder='e.g. gpu-single-default:1', id='e-resource-profile')
+                    else:
+                        yield Label('GPU placement  (auto or exact physical indices)')
+                        yield Static(self._gpu_hint(), classes='hint')
+                        yield Input(value=self._gpu_pin_value(),
+                                    placeholder='auto, 1, or 0,2', id='e-gpu-pin')
                     yield Label('max concurrent sequences')
                     yield Input(value=self._rt('max_num_seqs'),
                                 placeholder='int, optional', id='e-seqs')
@@ -607,7 +618,7 @@ class _AddEndpointScreen(ModalScreen):
                     dict(self._entry.get('placement') or {})
                     if self._entry.get('engine', 'vllm') == 'vllm' else {}
                 )
-                indices = self._parse_gpu_indices(self._v('e-gpu-pin'))
+                indices = None if self._kubeai else self._parse_gpu_indices(self._v('e-gpu-pin'))
                 required = self._required_gpu_count(tensor_parallel, data_parallel)
                 if indices is not None and len(indices) != required:
                     raise ValueError(
@@ -625,6 +636,8 @@ class _AddEndpointScreen(ModalScreen):
                     placement.pop('gpu_indices', None)
                 else:
                     placement['gpu_indices'] = indices
+                if self._kubeai:
+                    result['resource_profile'] = self._v('e-resource-profile').strip()
                 result.update({
                     'tensor_parallel': tensor_parallel,
                     'data_parallel': data_parallel,
@@ -682,16 +695,17 @@ class _ConfirmScreen(ModalScreen):
     #dialog Button { margin: 0 0 0 2; }
     """
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, *, confirm_label: str = 'Remove'):
         super().__init__()
         self._message = message
+        self._confirm_label = confirm_label
 
     def compose(self) -> ComposeResult:
         with Vertical(id='dialog'):
             yield Label(self._message)
             with Horizontal():
                 yield Button('Cancel', id='cancel')
-                yield Button('Remove', variant='error', id='ok')
+                yield Button(self._confirm_label, variant='error', id='ok')
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == 'ok')
@@ -776,6 +790,9 @@ class InferStackTUI(App):
     }
     #api { padding: 1 2; }
 
+    .cluster-actions { height: auto; }
+    #cluster-nodes { height: 8; min-height: 4; }
+    #cluster-pods { height: 10; min-height: 4; }
     #endpoints, #models, #leases-pane, #deployments-pane, #docker, #system, #api {
         border: round $surface;
         background: $boost;
@@ -884,6 +901,7 @@ class InferStackTUI(App):
         catalog_path: str | Path | None = None,
         http: Any = None,
         exit_after_paint: bool = False,
+        kube_manager: Any = None,
     ) -> None:
         super().__init__()
         #: Quit once the first frame is drawn (``tui --exit_after_paint``).
@@ -893,6 +911,21 @@ class InferStackTUI(App):
         self.controller = controller
         self.catalog = catalog
         self.interval = interval
+        from .backends.kubeai import KubeaiBackend
+        self._is_kube = isinstance(controller.backend, KubeaiBackend)
+        self._kube_manager = kube_manager
+        self._cluster_visible = False
+        self._dashboard_visible = True
+        self._logs_visible = False
+        self._cluster_at: float | None = None
+        self._cluster_snapshot: dict | None = None
+        self._cluster_inflight = False
+        self._node_names: list[str] = []
+        self._node_rows_cache: list[tuple] = []
+        self._cluster_pods_cache: list[tuple] = []
+        self._instances_at: float | None = None
+        self._instances_cache: list | None = None
+        self._instance_warning = ''
         # Two cadences (see the TUI settings tab): the ledger is cheap in-memory state, so
         # it drives the visible refresh; ``observe()``/``plan()`` shell out to
         # docker, so they run on a slower beat and their result is cached between
@@ -1111,6 +1144,21 @@ class InferStackTUI(App):
                         with TabPane('Instances', id='tab-containers'):
                             yield DataTable(id='ps', cursor_type='row',
                                             zebra_stripes=True)
+                        if self._is_kube:
+                            with TabPane('Cluster', id='tab-cluster'):
+                                with VerticalScroll():
+                                    yield Static('Open this tab to inspect Kubernetes.', id='cluster-summary')
+                                    with Horizontal(classes='cluster-actions'):
+                                        yield Button('Refresh cluster', id='btn-cluster-refresh')
+                                        yield Button('Doctor', id='btn-kube-doctor')
+                                    yield DataTable(id='cluster-nodes', cursor_type='row', zebra_stripes=True)
+                                    with Horizontal(classes='cluster-actions'):
+                                        yield Button('Detach node', id='btn-node-detach')
+                                        yield Button('Attach node', id='btn-node-attach')
+                                    yield Static('Detach drains workloads and temporary data; attach restores scheduling. '
+                                                 'Both preview and confirm. Cluster agents keep running.', classes='hint')
+                                    yield DataTable(id='cluster-pods', cursor_type='row', zebra_stripes=True)
+                                    yield Static('', id='cluster-doctor')
                         with TabPane('Control', id='tab-control'):
                             yield Static(
                                 'Apply brings up what the ledger says should run. '
@@ -1269,6 +1317,16 @@ class InferStackTUI(App):
         self.query_one('#compose-path', Static).update(
             f'rendered: {rendered or "(this backend renders no file)"}'
         )
+        if self._is_kube:
+            self.query_one('#cluster-nodes', DataTable).add_columns(
+                'node', 'Ready', 'scheduling', 'GPUs allocatable', 'GPUs requested', 'product', 'GiB', 'GFD', 'runtime evidence')
+            self.query_one('#cluster-pods', DataTable).add_columns(
+                'pod', 'node', 'phase / reason', 'Ready', 'restarts', 'GPUs requested')
+            self.query_one('#compose-path', Static).update(
+                f'Backend: kubeai · recovery snapshot: {(self.controller.ledger.profile() or {}).get("backend", "none")} · '
+                f'namespace: {self.controller.backend.namespace} · '
+                f'API: {self.controller.backend.base_url} · Kubernetes schedules Models')
+            self.query_one('#system', Collapsible).title = 'local host (not cluster metrics)'
         # Capture docker's own chatter (up/down progress on stderr) into the
         # logs pane instead of letting it bleed onto the full-screen terminal.
         self._install_quiet_docker()
@@ -1687,15 +1745,25 @@ class InferStackTUI(App):
             now = time.monotonic()
             if (self._observed_at is None
                     or (now - self._observed_at) >= self.observe_interval):
-                self._observed, self._assignments = _placement_view(self.controller)
+                if (self._is_kube and self._cluster_snapshot is not None
+                        and self._cluster_snapshot['models'] is not None
+                        and self._cluster_at is not None and now - self._cluster_at < self.observe_interval):
+                    self._observed = {m.get('metadata', {}).get('labels', {}).get('infer-stack/deployment')
+                                      for m in self._cluster_snapshot['models']} - {None, ''}
+                    self._assignments = {}
+                else:
+                    self._observed, self._assignments = _placement_view(self.controller)
                 self._observed_at = now
             data: dict[str, Any] = {
                 'leases': leases, 'deployments': deployments,
                 'observed': self._observed, 'assignments': self._assignments,
             }
-            if not self._collapsed['docker']:
-                data['instances'] = self._instance_list()
-            if not self._collapsed['system']:
+            if self._dashboard_visible and not self._collapsed['docker']:
+                if self._instances_at is None or now - self._instances_at >= self.observe_interval:
+                    self._instances_cache = self._instance_list()
+                    self._instances_at = now
+                data['instances'] = self._instances_cache
+            if self._dashboard_visible and not self._collapsed['system']:
                 data['gpus'] = self._gpu_rows()
                 data['sysinfo'] = self._system_line()
             return data
@@ -1741,17 +1809,21 @@ class InferStackTUI(App):
         in ``_collect`` reflects reality — Collapsible.Toggled doesn't fire on
         every path, so don't depend on it alone."""
         try:
-            was_collapsed = self._collapsed['docker']
+            was_logs_visible = self._logs_visible
             self._collapsed['docker'] = \
                 self.query_one('#docker', Collapsible).collapsed
             self._collapsed['system'] = \
                 self.query_one('#system', Collapsible).collapsed
             self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
+            dashboard = len(self.screen_stack) == 1 and self.query_one('#top', TabbedContent).active == 'tab-dashboard'
+            self._dashboard_visible = dashboard
+            self._cluster_visible = (self._is_kube and dashboard and
+                                     not self._collapsed['docker'] and self._active_tab == 'tab-cluster')
             # Follow logs only while somebody can see them.
-            if was_collapsed and not self._collapsed['docker']:
-                if self._log_proc is None:
-                    self._restart_logs(self._log_service)
-            elif not was_collapsed and self._collapsed['docker']:
+            self._logs_visible = dashboard and not self._collapsed['docker'] and self._active_tab == 'tab-logs'
+            if self._logs_visible and not was_logs_visible:
+                self._resume_visible_logs()
+            elif was_logs_visible and not self._logs_visible:
                 self._terminate_logs()
         except Exception:  # noqa: BLE001
             pass
@@ -1821,12 +1893,18 @@ class InferStackTUI(App):
         rereads the catalog, edited or not."""
         self._cli(cli.command('status'))
         self._reload_catalog()
+        self._observed_at = self._instances_at = self._cluster_at = None
         self.action_refresh()
 
     def action_refresh(self) -> None:
         self._sync_pane_state()   # capture pane state on the UI thread first
         self._reload_catalog_if_changed()
-        self._refresh_bg()
+        # Textual exclusive workers cancel delivery, not an in-flight subprocess.
+        # Never spawn overlapping refreshes when Kubernetes is slow/unreachable.
+        if not any(w.group == 'refresh' and not w.is_finished for w in self.workers):
+            self._refresh_bg()
+        if self._cluster_visible:
+            self._request_cluster_refresh()
 
     def _update_summary(self, leases, deployments, observed) -> None:
         active = sum(1 for le in leases if str(le.state) == 'active')
@@ -2058,7 +2136,28 @@ class InferStackTUI(App):
     def _instance_list(self):
         """What the backend runs (worker thread), or ``None`` if unreadable."""
         try:
-            return list(self.controller.backend.instances())
+            backend = self.controller.backend
+            report = self._cluster_snapshot
+            self._instance_warning = ''
+            if (self._is_kube and report is not None and report['pods'] is not None
+                    and self._cluster_at is not None
+                    and time.monotonic() - self._cluster_at < max(15, self.observe_interval)):
+                import json
+
+                from .leasing.instances import KUBERNETES, from_residency
+                from .leasing.residency import residency_from_pods
+                pods = [p for p in report['pods']
+                        if p.get('metadata', {}).get('namespace') == backend.namespace
+                        and p.get('metadata', {}).get('labels', {}).get('infer-stack/managed') == 'true']
+                instances = from_residency(residency_from_pods(json.dumps({'items': pods})),
+                                           runtime=KUBERNETES, namespace=backend.namespace)
+                if backend.gateway is not None:
+                    try:
+                        instances += list(backend.gateway.instances())
+                    except Exception as ex:
+                        self._instance_warning = f'Gateway instances unavailable: {ex}'
+                return instances
+            return list(backend.instances())
         except Exception:  # noqa: BLE001 - a monitor must never crash
             return None
 
@@ -2118,7 +2217,8 @@ class InferStackTUI(App):
         # begun with an engine that has since left would miss its successor.
         # The selection did not change, so no Select.Changed will restart it.
         if (self._log_service == ENGINE_SERVICES
-                and not self._collapsed['docker']):
+                and not self._collapsed['docker']
+                and self._dashboard_visible and self._active_tab == 'tab-logs'):
             self._restart_logs(ENGINE_SERVICES)
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -2173,6 +2273,16 @@ class InferStackTUI(App):
             return
         log.write(f'— following logs: {label} —')
         self._stream_logs(target, generation)
+
+    def _resume_visible_logs(self):
+        # A source change deliberately clears the pane; reopening the same
+        # pane retains backend action output captured while its stream paused.
+        previous = list(self._log_lines[-LOG_PANE_LINES:])
+        self._restart_logs(self._log_service)
+        if previous:
+            self.query_one('#logs', RichLog).write('— earlier runtime output —')
+            self._write_log_lines(previous)
+            self.query_one('#logs', RichLog).write('— live stream resumed —')
 
     def _resolve_log_target(self, service: str):
         """(what to hand `docker compose logs`, what to show the user).
@@ -2429,6 +2539,9 @@ class InferStackTUI(App):
     ) -> None:
         # Only the docker sub-tabs gate polling; the top-level Dashboard/Settings
         # tabs fire this too — ignore those.
+        if getattr(event.tabbed_content, 'id', None) == 'top':
+            self.action_refresh()
+            return
         if getattr(event.tabbed_content, 'id', None) != 'docker-tabs':
             return
         self._active_tab = self.query_one('#docker-tabs', TabbedContent).active
@@ -2436,11 +2549,13 @@ class InferStackTUI(App):
 
     def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
         self._sync_pane_state()
-        if self._collapsed['docker']:
-            self._terminate_logs()
-        elif self._log_proc is None:
-            self._restart_logs(self._log_service)
         self.action_refresh()
+
+    def on_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
+        self.on_collapsible_toggled(event)
+
+    def on_collapsible_collapsed(self, event: Collapsible.Collapsed) -> None:
+        self.on_collapsible_toggled(event)
 
     # -- helpers + actions -------------------------------------------------
 
@@ -2706,6 +2821,10 @@ class InferStackTUI(App):
             'btn-apply-ui-settings': self._on_apply_ui_settings,
             'btn-compose-up': self.action_compose_up,
             'btn-compose-down': self.action_compose_down,
+            'btn-cluster-refresh': self.action_cluster_refresh,
+            'btn-kube-doctor': self.action_kube_doctor,
+            'btn-node-detach': lambda: self.action_node_control('detach'),
+            'btn-node-attach': lambda: self.action_node_control('attach'),
         }
         button = event.button.id or 'button'
         handler = handlers.get(button)
@@ -2805,6 +2924,142 @@ class InferStackTUI(App):
         self._cli(cli.command('gc', '--forget'))
         self._do_cleanup()
 
+    # -- Kubernetes dashboard ---------------------------------------------
+
+    def _cluster_manager(self):
+        if self._kube_manager is None:
+            from .backends.kubeai import _default_kubectl_run
+            from .kube.manage import KubeManager, default_run
+            backend = self.controller.backend
+            # Default dashboard reads have a short bounded deadline. Tests and
+            # embedding applications retain the backend's injectable runner.
+            if backend.run is _default_kubectl_run:
+                def run(args, **kw):
+                    if args[0] == 'kubectl':
+                        args = [args[0], '--request-timeout=5s', *args[1:]]
+                    return default_run(args, **kw)
+            else:
+                run = backend.run
+            self._kube_manager = KubeManager(run=run)
+        return self._kube_manager
+
+    def _request_cluster_refresh(self, *, force=False):
+        if not self._is_kube or self._cluster_inflight or any(w.group == 'kube-doctor' and not w.is_finished for w in self.workers):
+            return
+        if not force and self._cluster_at is not None and time.monotonic() - self._cluster_at < max(15, self.observe_interval):
+            if self._cluster_snapshot is not None:
+                self._render_cluster(self._cluster_snapshot)
+            return
+        self._cluster_inflight = True
+        self._collect_cluster()
+
+    @work(thread=True, group='cluster', exit_on_error=False)
+    def _collect_cluster(self):
+        from .kube.monitor import snapshot
+        try:
+            report = snapshot(self._cluster_manager(), namespace=self.controller.backend.namespace)
+            self.call_from_thread(self._receive_cluster, report)
+        finally:
+            self._cluster_inflight = False
+
+    def _receive_cluster(self, report):
+        self._cluster_snapshot = report
+        self._cluster_at = time.monotonic()
+        self._render_cluster(report)
+
+    def _render_cluster(self, report):
+        from .kube.monitor import node_rows, pod_rows
+        nodes = node_rows(report)
+        self._node_names = [r[0] for r in nodes]
+        self._diff_fill(self.screen_stack[0].query_one('#cluster-nodes', DataTable),
+                        nodes or [('(unavailable)' if report['nodes'] is None else '(no nodes)',) + ('-',) * 8],
+                        '_node_rows_cache', id_index=0)
+        pods = pod_rows(report)
+        self._diff_fill(self.screen_stack[0].query_one('#cluster-pods', DataTable),
+                        pods or [('(unavailable)' if report['pods'] is None else '(no pods)',) + ('-',) * 5],
+                        '_cluster_pods_cache', id_index=0)
+        models = report['models']
+        model_text = 'unknown' if models is None else ', '.join(
+            f"{m.get('metadata', {}).get('name')}: {m.get('status', {}).get('readyReplicas', 0)} ready"
+            for m in models) or 'none'
+        age = max(0, int(time.monotonic() - report['sampled_at']))
+        summary = (f'Namespace: {report["namespace"]} · sample {age}s ago · refresh ≥15s, only while visible\n'
+                   'GPU requests are scheduled resources across all namespaces, not utilization.\n'
+                   f'Managed Models: {model_text}\nAPI: {self.controller.backend.base_url}')
+        if report['errors']:
+            summary += '\n' + '\n'.join(f'{key}: {value}' for key, value in report['errors'].items())
+        if self._instance_warning:
+            summary += '\n' + self._instance_warning
+        self.screen_stack[0].query_one('#cluster-summary', Static).update(escape_markup(summary))
+
+    def action_cluster_refresh(self):
+        self._status('refreshing Kubernetes cluster…')
+        self._cli(cli.command('kube', 'status'))
+        self._request_cluster_refresh(force=True)
+
+    def action_kube_doctor(self):
+        if not self._is_kube:
+            return
+        if any(w.group == 'kube-doctor' and not w.is_finished for w in self.workers):
+            return
+        self._cli(cli.command('kube', 'doctor', f'--namespace={self.controller.backend.namespace}'))
+        self._do_kube_doctor()
+
+    @work(thread=True, group='kube-doctor', exit_on_error=False)
+    def _do_kube_doctor(self):
+        from .kube.inspect import inventory, readiness
+        backend = self.controller.backend
+        report = inventory(self._cluster_manager(), namespace=backend.namespace,
+                           base_url=backend.base_url, http=backend.http)
+        checks = readiness(report)
+        text = '\n'.join(f"[{c['status']}] {c['name']} {c['detail']}"
+                         + (f"\n  fix: {c['fix']}" if c['fix'] else '') for c in checks)
+        self.call_from_thread(self._show_cluster_doctor, text)
+        self.call_from_thread(self.app_log, escape_markup(text))
+
+    def _show_cluster_doctor(self, text):
+        self.screen_stack[0].query_one('#cluster-doctor', Static).update(escape_markup(text))
+
+    def action_node_control(self, verb):
+        name = self._selected('cluster-nodes', self._node_names)
+        if not name:
+            self._refuse('select a cluster node first')
+            return
+        self._prepare_node_action(name, verb)
+
+    @work(thread=True, exclusive=True, group='node-plan', exit_on_error=False)
+    def _prepare_node_action(self, name, verb):
+        plan = self._cluster_manager().node_lifecycle_plan(name)
+        message = (f'{verb.title()} node {name}? Ready: {plan.ready}; '
+                   f'schedulable: {plan.schedulable}; control plane: {plan.control_plane}.\n'
+                   f'Workload pods: {", ".join(plan.workload_pods) or "none"}.\n')
+        if verb == 'detach':
+            message += 'Drain evicts workloads and deletes emptyDir data; DaemonSets/static pods remain. '
+        else:
+            message += 'Stop Compose GPU workloads on that host before restoring scheduling. '
+        message += 'The cluster agent remains running. State is rechecked before applying.'
+        self.call_from_thread(self._confirm_node_action, name, verb, message)
+
+    def _confirm_node_action(self, name, verb, message):
+        self.push_screen(_ConfirmScreen(message, confirm_label=verb.title()),
+                         lambda confirmed: self._start_node_action(name, verb) if confirmed else None)
+
+    def _start_node_action(self, name, verb):
+        if any(w.group == 'mutate' and not w.is_finished for w in self.workers):
+            self._refuse('another runtime action is still running; retry node control when it finishes')
+            return
+        self._do_node_action(name, verb)
+
+    @work(thread=True, exclusive=True, group='mutate', exit_on_error=False)
+    def _do_node_action(self, name, verb):
+        self.call_from_thread(self._cli, cli.command('kube', 'node', verb, name, '--yes'))
+        manager = self._cluster_manager()
+        if verb == 'detach':
+            manager.detach_node_for_compose(name)
+        else:
+            manager.attach_node_from_compose(name)
+        self._after_mutation(f'node {name}: {verb} done')
+
     # -- docker compose control -------------------------------------------
 
     def _compose_target(self):
@@ -2813,7 +3068,7 @@ class InferStackTUI(App):
         return rendered if rendered is not None and Path(rendered).exists() else None
 
     def action_compose_up(self) -> None:
-        if self._compose_target() is None:
+        if not self._is_kube and self._compose_target() is None:
             self._refuse('nothing rendered yet — acquire a model first')
             return
         self._status('apply… (output in the Logs tab)')
@@ -2834,17 +3089,33 @@ class InferStackTUI(App):
         self._after_mutation(msg)
 
     def action_compose_down(self) -> None:
-        if self._compose_target() is None:
+        if any(w.group == 'mutate' and not w.is_finished for w in self.workers):
+            self._refuse('another runtime action is still running; retry Down when it finishes')
+            return
+        if not self._is_kube and self._compose_target() is None:
             self._refuse('nothing rendered yet — nothing to bring down')
             return
         self._status('down (bypasses leases; releases nothing)…')
         self._cli(cli.command('stack', 'down'))
+        if self._is_kube:
+            self.push_screen(_ConfirmScreen(
+                f'Delete all managed KubeAI Models in {self.controller.backend.namespace} '
+                'and stop the gateway? Leases remain; Apply brings them back.', confirm_label='Down'),
+                lambda confirmed: self._confirmed_down() if confirmed else None)
+        else:
+            self._do_down()
+
+    def _confirmed_down(self):
+        if any(w.group == 'mutate' and not w.is_finished for w in self.workers):
+            self._refuse('another runtime action is still running; retry Down when it finishes')
+            return
         self._do_down()
 
     @work(thread=True, exclusive=True, group='mutate')
     def _do_down(self) -> None:
         try:
-            self.controller.backend.down()
+            with self.controller.publication_lock():
+                self.controller.backend.down()
             msg = 'down done'
         except Exception as ex:  # noqa: BLE001
             msg = f'down failed: {_why(ex)}'
@@ -2950,7 +3221,7 @@ class InferStackTUI(App):
     def _prepare_endpoint_editor(self, name: str | None, entry: dict) -> None:
         try:
             from .hardware import detect_inventory
-            inventory = detect_inventory()
+            inventory = {'gpus': []} if self._is_kube else detect_inventory()
         except Exception:  # noqa: BLE001 - editor remains usable with numeric pins
             inventory = {'gpu_count': 0, 'gpus': []}
         try:
@@ -2970,6 +3241,7 @@ class InferStackTUI(App):
                 name=name,
                 entry=entry,
                 inventory=inventory,
+                kubeai=self._is_kube,
             ),
             self._on_add_endpoint,
         )
@@ -3017,6 +3289,10 @@ class InferStackTUI(App):
             for rk, ck in keymap.items():
                 if result.get(rk) is not None:
                     runtime[ck] = result[rk]
+            if 'resource_profile' in result:
+                runtime.pop('resource_profile', None)
+                if result['resource_profile']:
+                    runtime['resource_profile'] = result['resource_profile']
             if result.get('gpu_mem') is not None:
                 runtime['gpu_memory_utilization'] = result['gpu_mem']
             if result.get('prefix_caching') in ('on', 'off'):
@@ -3531,6 +3807,7 @@ class InferStackTUI(App):
 
     def _after_mutation(self, message: str) -> None:
         self.call_from_thread(self._status, message)
+        self._observed_at = self._instances_at = self._cluster_at = None
         self.call_from_thread(self.action_refresh)
 
 
