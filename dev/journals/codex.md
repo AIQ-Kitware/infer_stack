@@ -377,6 +377,13 @@ budgets for the independent global and Cluster workers. Historical runtime
 startup becomes WARN/evidence rather than an ok claim of fresh verification;
 unknown/failing handlers still fail and explicit apply still creates new canaries.
 
+The KubeAI editor hides image/command and retains environment. Existing custom
+launches are refused during edit instead of silently erased, and rendering now
+rejects image overrides as well as command/mounts. vLLM data parallelism is
+explicitly distinguished from independent KubeAI pod replicas. Compose keeps
+its image/command controls. I prefer rejection to inventing unsupported CR fields
+or pretending an ignored image override changed the realization.
+
 Combined correction validation: 149 backend/CLI/readiness focused tests passed;
 97 existing/new TUI tests passed before the three extra editor-refusal cases,
 and those four editor cases passed separately. The final full suite passed

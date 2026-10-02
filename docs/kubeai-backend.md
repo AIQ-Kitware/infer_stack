@@ -379,3 +379,15 @@ fresh Cluster sample when available. Full node/pod monitoring remains limited
 to the visible Cluster tab. Passive refresh performs no generation requests.
 Doctor reports retained terminated runtime evidence as a non-failing **WARN**,
 with `kube install --apply` as the fresh-verification step.
+
+
+The KubeAI endpoint editor exposes environment and resource profiles, with no
+arbitrary container image/command controls. Custom images belong in installed
+KubeAI resource/model-server profiles. `runtime.image` overrides are rejected
+by rendering instead of ignored; command/mount overrides remain unsupported.
+Editing an existing unsupported launch reports an error rather than dropping
+those settings. Compose retains its image and command controls.
+
+The editor's vLLM data-parallel size consumes GPUs inside one serving deployment;
+it does not create independent Kubernetes replicas. KubeAI pod replication uses
+`runtime.min_replicas` / `runtime.max_replicas`.

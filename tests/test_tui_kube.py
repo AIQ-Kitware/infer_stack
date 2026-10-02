@@ -16,6 +16,7 @@ from textual.widgets import (
     Collapsible,
     DataTable,
     Input,
+    Label,
     Select,
     Static,
     TabbedContent,
@@ -226,6 +227,11 @@ def test_kube_endpoint_editor_uses_resource_profiles(tmp_path):
             app.push_screen(screen, results.append)
             await pilot.pause()
             assert not list(screen.query('#e-gpu-pin'))
+            assert not list(screen.query('#e-image'))
+            assert not list(screen.query('#e-command'))
+            assert any('within one serving deployment' in str(label.render()) for label in screen.query(Label))
+            assert any('runtime.min_replicas' in str(label.render()) for label in screen.query(Static))
+            screen.query_one('#e-env', Input).value = 'MODE=fast'
             assert screen.query_one('#e-engine', Select).value == 'vllm'
             screen.query_one('#e-resource-profile', Input).value = 'nvidia-rtx-3090:2'
             screen.on_button_pressed(Button.Pressed(Button(id='ok')))
@@ -233,6 +239,8 @@ def test_kube_endpoint_editor_uses_resource_profiles(tmp_path):
     asyncio.run(scenario())
     entry = InferStackTUI._endpoint_entry(results[0])
     assert entry['runtime']['resource_profile'] == 'nvidia-rtx-3090:2'
+    assert entry['runtime']['env'] == {'MODE': 'fast'}
+    assert 'image' not in entry['runtime'] and 'command' not in entry['runtime']
     assert 'placement' not in entry
 
 
@@ -439,4 +447,27 @@ def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(t
             r['models'][0]['status']['replicas']['ready'] = 0
             app._receive_cluster(r)
             assert app._ready_endpoints == []
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('launch', [
+    {'image': 'my-vllm:foo'}, {'command': ['custom-server']},
+    {'serve_recipe': 'hyperqwen-3090-single'},
+])
+def test_kubeai_editor_refuses_existing_unsupported_launch(tmp_path, launch):
+    controller, catalog = context(tmp_path)
+    results, errors = [], []
+    async def scenario():
+        app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            screen = _AddEndpointScreen(['qc'], kubeai=True, name='q',
+                                        entry={'engine': 'vllm', 'model': 'qc', 'runtime': launch})
+            screen._error = errors.append
+            app.push_screen(screen, results.append)
+            await pilot.pause()
+            screen.on_button_pressed(Button.Pressed(Button(id='ok')))
+            await pilot.pause()
+            assert app.screen is screen
+            assert results == []
+            assert 'does not support runtime.image/command' in errors[0]
     asyncio.run(scenario())

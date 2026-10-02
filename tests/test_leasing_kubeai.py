@@ -195,6 +195,7 @@ def test_render_attention_backend_reaches_cr_env():
 @pytest.mark.parametrize('launch', [
     {'serve_recipe': 'hyperqwen-3090-single'},       # a legacy entry, translated
     {'command': ['single']},
+    {'image': 'my-vllm:foo'},
     {'mounts': {'/cache': 'x/cache'}},
 ])
 def test_render_refuses_a_custom_container_launch(launch):

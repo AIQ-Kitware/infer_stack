@@ -360,10 +360,10 @@ def render_models(
         from ..leasing.launch import translate_legacy
 
         runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
-        custom = [k for k in ('command', 'mounts') if runtime.get(k)]
+        custom = [k for k in ('image', 'command', 'mounts') if runtime.get(k)]
         if custom:
             # A KubeAI Model runs stock vLLM: it has no place for a container
-            # command or host mounts (env maps onto spec.env). Fail closed,
+            # image override, command or host mounts (env maps onto spec.env). Fail closed,
             # never silently serve the stock engine instead.
             out.unrenderable.add(deployment.id)
             out.errors.append(

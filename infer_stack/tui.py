@@ -463,7 +463,11 @@ class _AddEndpointScreen(ModalScreen):
                     yield Label('tensor-parallel size  (GPUs per replica)')
                     yield Input(value=self._rt('tensor_parallel_size'),
                                 placeholder='int, e.g. 2', id='e-tp')
-                    yield Label('data-parallel size  (replicas across GPUs)')
+                    yield Label('vLLM data-parallel size  (within one serving deployment)' if self._kubeai
+                                else 'data-parallel size  (replicas across GPUs)')
+                    if self._kubeai:
+                        yield Static('This consumes GPUs within a vLLM deployment; independent KubeAI pod replicas '
+                                     'use runtime.min_replicas / max_replicas.', classes='hint')
                     yield Input(value=self._rt('data_parallel_size'),
                                 placeholder='int, e.g. 2', id='e-dp')
                     yield Label('max model len  (context window, tokens)')
@@ -493,14 +497,18 @@ class _AddEndpointScreen(ModalScreen):
                     yield Input(value=extra_str,
                                 placeholder='--dtype=half --enforce-eager',
                                 id='e-extra')
-                    yield Label('container image  (blank = the default vLLM image)')
-                    yield Input(value=str(rt.get('image') or ''),
-                                placeholder='e.g. vllm/vllm-openai:v0.25.1', id='e-image')
-                    yield Label('container command  (replaces `vllm serve MODEL …`; '
-                                'blank = stock)')
-                    yield Input(value=command_str,
-                                placeholder="for an image with its own launcher, e.g. single",
-                                id='e-command')
+                    if not self._kubeai:
+                        yield Label('container image  (blank = the default vLLM image)')
+                        yield Input(value=str(rt.get('image') or ''),
+                                    placeholder='e.g. vllm/vllm-openai:v0.25.1', id='e-image')
+                        yield Label('container command  (replaces `vllm serve MODEL …`; '
+                                    'blank = stock)')
+                        yield Input(value=command_str,
+                                    placeholder="for an image with its own launcher, e.g. single",
+                                    id='e-command')
+                    else:
+                        yield Static('Container image/launch are configured by KubeAI server/resource profiles, '
+                                     'not arbitrary endpoint image/command overrides.', classes='hint')
                     yield Label('container environment  (KEY=VALUE, space-separated)')
                     yield Static(
                         '{max_model_len} {gpu_memory_utilization} '
@@ -647,11 +655,15 @@ class _AddEndpointScreen(ModalScreen):
                     'prefix_caching': str(
                         self.query_one('#e-prefix', Select).value or ''),
                     'extra_args': self._v('e-extra'),
-                    'image': self._v('e-image').strip(),
-                    'command': self._v('e-command'),
                     'env': self._parse_env(self._v('e-env')),
                     'placement': placement,
                 })
+                if not self._kubeai:
+                    result.update(image=self._v('e-image').strip(), command=self._v('e-command'))
+                else:
+                    from .leasing.launch import translate_legacy
+                    if any(translate_legacy(self._entry.get('runtime') or {}).get(k) for k in ('image', 'command')):
+                        raise ValueError('KubeAI does not support runtime.image/command overrides; remove them in the catalog or use Compose.')
             else:
                 result.update({
                     'host': self._v('e-host'),
