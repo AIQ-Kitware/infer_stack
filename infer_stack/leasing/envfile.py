@@ -38,36 +38,53 @@ def _endpoint_var(endpoint: str) -> str:
 
 
 def build_descriptor(
-    lease: Lease,
+    lease: Lease | None,
     deployments: list[Deployment],
     *,
-    base_url: str,
-    api_key_env: str = 'LITELLM_MASTER_KEY',
+    base_url: str | None,
+    api_key_env: str | None = 'LITELLM_MASTER_KEY',
     api_key: str | None = None,
     request_names: dict[str, str] | None = None,
     cuda_visible_devices: str | None = None,
+    endpoints: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build the endpoint descriptor for one lease.
+    """Build the endpoint descriptor for one lease, or for an access.
 
-    Only the endpoints this lease actually requested are included (a coalesced
-    deployment may serve more). ``request_names`` overrides the model name a client
-    must request per endpoint — e.g. behind a LiteLLM front door the client asks
-    for the endpoint *alias*, not the upstream served name.
+    ``endpoints`` are the aliases to describe, in order (default: the
+    lease's). An endpoint a deployment serves gets its request name from
+    ``request_names`` (behind a LiteLLM front door the client asks for the
+    endpoint *alias*, not the upstream served name), else from the
+    deployment; one no deployment serves (an external endpoint, reached
+    through the front door) only from ``request_names``. Only the endpoints
+    asked for are included (a coalesced deployment may serve more). With no
+    lease -- an access to external endpoints only -- ``lease_id`` is
+    ``None``, and the env-file carries no lease id.
+
+    Example:
+        >>> d = build_descriptor(None, [], base_url='http://h:1/v1',
+        ...                      endpoints=['remote'], request_names={'remote': 'remote'})
+        >>> d['lease_id'], d['endpoints']
+        (None, {'remote': 'remote'})
     """
-    endpoints: dict[str, str] = {}
+    wanted = list(lease.endpoints) if endpoints is None and lease is not None \
+        else list(endpoints or [])
+    names: dict[str, str] = {}
     for deployment in deployments:
         for endpoint, payload in deployment.served.items():
-            if endpoint in lease.endpoints:
+            if endpoint in wanted:
                 if request_names and endpoint in request_names:
-                    endpoints[endpoint] = request_names[endpoint]
+                    names[endpoint] = request_names[endpoint]
                 else:
-                    endpoints[endpoint] = _request_model_name(payload, endpoint)
-    # preserve the lease's requested order where possible
-    ordered = {ep: endpoints[ep] for ep in lease.endpoints if ep in endpoints}
+                    names[endpoint] = _request_model_name(payload, endpoint)
+    for endpoint in wanted:
+        if endpoint not in names and request_names and endpoint in request_names:
+            names[endpoint] = request_names[endpoint]
+    # preserve the requested order
+    ordered = {ep: names[ep] for ep in wanted if ep in names}
     descriptor: dict[str, Any] = {
         'schema_version': 1,
         'kind': 'infer-stack-endpoint',
-        'lease_id': lease.id,
+        'lease_id': lease.id if lease is not None else None,
         'base_url': base_url,
         'api_key_env': api_key_env,
         'protocol': 'openai',
@@ -83,7 +100,11 @@ def build_descriptor(
 
 def descriptor_env(descriptor: dict[str, Any]) -> dict[str, str]:
     """Flatten a descriptor into the env vars a job should see."""
-    env: dict[str, str] = {LEASE_ENV: descriptor['lease_id']}
+    env: dict[str, str] = {}
+    if descriptor.get('lease_id'):
+        # No sentinel without a lease: `release --env-file` then has nothing
+        # to find, which is the truth.
+        env[LEASE_ENV] = descriptor['lease_id']
     if descriptor.get('base_url'):
         env['OPENAI_BASE_URL'] = descriptor['base_url']
     if descriptor.get('api_key'):

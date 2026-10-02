@@ -9,7 +9,14 @@ kubeai) and the CLI verbs are built on top of this in later phases.
 
 from __future__ import annotations
 
-from .backend import Backend, MemoryBackend, NullBackend, Readiness
+from .backend import (
+    Backend,
+    HostRuntime,
+    MemoryBackend,
+    NullBackend,
+    Readiness,
+    ServingBackend,
+)
 from .catalog import (
     Catalog,
     CatalogError,
@@ -61,6 +68,7 @@ __all__ = [
     'AcquireOutcome',
     'AcquireResult',
     'Backend',
+    'HostRuntime',
     'Catalog',
     'CatalogError',
     'ComposeBackend',
@@ -77,6 +85,7 @@ __all__ = [
     'MemoryBackend',
     'ModelSpec',
     'NullBackend',
+    'ServingBackend',
     'RESERVED_ENDPOINT',
     'RESERVED_ENGINE',
     'Readiness',

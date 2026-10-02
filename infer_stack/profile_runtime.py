@@ -111,9 +111,11 @@ def simulator_args(service: dict[str, Any]) -> list[str]:
     return args
 
 
-def vllm_args(service: dict[str, Any]) -> list[str]:
-    args = [
-        f'--served-model-name={service["served_model_name"]}',
+def vllm_args(service: dict[str, Any], *, include_served_name: bool = True) -> list[str]:
+    """Engine flags; KubeAI owns the served name through its Model identity."""
+    args = ([f'--served-model-name={service["served_model_name"]}']
+            if include_served_name else [])
+    args += [
         f'--tensor-parallel-size={service["tensor_parallel_size"]}',
         # .get: older KubeAI lock data predates these keys.
         f'--pipeline-parallel-size={service.get("pipeline_parallel_size", 1)}',

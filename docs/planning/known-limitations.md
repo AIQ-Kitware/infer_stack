@@ -105,8 +105,9 @@ For crash-safe recovery, leasing still persists a frozen render snapshot. The
 controller advances it automatically on acquire under the publication lock:
 
 - **Quiescent stack.** With no active lease and no managed deployment
-  container, the next acquire adopts the current user settings and catalog
-  wholesale.
+  container, the next acquire adopts the current user settings. The catalog
+  is merged, never replaced: published endpoint definitions stay until
+  `routes prune` (an external endpoint has no lease to keep it).
 - **Compatible catalog additions while live.** New endpoint/bundle/route
   definitions can be merged into the active snapshot without changing any
   definition already frozen for resident workloads. This is the normal
@@ -125,20 +126,20 @@ controller advances it automatically on acquire under the publication lock:
   away.
 
 `allowed_gpus` remains per caller rather than part of the recovery snapshot.
-Changing backend kind (Compose to KubeAI or back) still requires tearing down
-the old backend first; automatic snapshot advancement never crosses backend
-kinds.
+Changing backend kind (Compose to KubeAI or back) requires quiescing the old
+backend, then `infer-stack ledger rotate --yes` to archive its history and start
+a new recovery epoch. `stack down` alone retains the old snapshot. Automatic
+snapshot advancement never crosses backend kinds.
 
 
 ### A queued acquire holds nothing while it waits (current, by design)
 
-With the Compose backend an acquire is admitted atomically: its lease and its
-GPU allocations are committed together, or nothing is. A queued (`--queue`)
-acquire that has not been admitted yet has written nothing, so it holds no GPU
-and has no place in line (see "Admission is first-come" below).
-
-Backends without strict residency (KubeAI, the null backend) keep the earlier
-behaviour: the lease is committed first and placed by the render.
+On every backend an acquire is admitted atomically: its lease and its
+allocations are committed together, or nothing is (on KubeAI, where the
+cluster schedules, the allocation is empty and admission decides only
+renderability). A queued (`--queue`) acquire that has not been admitted yet
+has written nothing, so it holds no GPU and has no place in line (see
+"Admission is first-come" below).
 
 ### Admission is first-come, not fair (design boundary)
 
@@ -166,8 +167,33 @@ asks for it.
 
 ### Multi-node placement (current)
 
-Placement is per host. Spanning one deployment across machines, or scheduling
-across several hosts, is not supported.
+The compose backend places on one host. The kubeai backend schedules across
+the cluster's nodes (verified with a second node in a container; a run
+across two real machines is `dev/handover/p5_two_hosts.sh`). One deployment
+spanning machines (tensor parallel across nodes) is supported on neither.
+
+### State from before the route registry is not migrated (design boundary)
+
+A state directory whose gateway predates `litellm_registry.json` (it has a
+rendered `litellm_config.yaml` and no registry) is no longer seeded from
+that config. Decided 2026-09-27 (queue item 50): seeding it again would make
+every rendered route permanent registry state, the duplicate authority the
+published catalogs replaced, and what it could recover has another source:
+catalog endpoints are republished by their runbooks' next acquire (or at
+once, `infer-stack routes seed CATALOG...`), and an ad-hoc deployment's
+route by its next acquire. What is lost is an ad-hoc route whose deployment
+is gone and whose runbook never runs again, whose upstream was already
+gone. Such state directories also predate the recovery profile (2026-09-16;
+the registry is from 2026-07-13), so they could not be resumed anyway.
+
+### The in-cluster gateway routes only (current, deferred)
+
+With `kubeai_gateway cluster` the LiteLLM gateway is a Deployment and a
+NodePort Service with static routes. Dynamic routing and Open WebUI need
+the host placement (`kubeai_gateway host`): in the cluster they would need
+Postgres and a UI there, which P5 deferred. `kubeai_gateway_url` accepts an
+Ingress URL, but no Ingress has been tested. External endpoints work in both
+placements (their keys go into the gateway's Secret).
 
 ### Forged ownership labels are outside the threat model (design boundary)
 
@@ -283,11 +309,12 @@ starved new leases.
   has no single running container (for example a GPU reservation, which runs
   nothing), it stays *unresolved*: it keeps working, but no new GPU is
   allocated to anyone until its lease is released.
-- **Other backends.** On backends without strict residency (KubeAI, null),
-  idle keep-warm deployments stay in the desired set, as before. A failed
-  acquire whose rollback cannot read residency can then leave a leaseless idle
-  candidate that the next apply starts (workaround: `infer-stack evict
-  <deployment>`).
+- **Other backends.** KubeAI reads strict residency from pods: an idle
+  keep-warm Model stays in the desired set while it is resident (any of its
+  replicas warm), and on a scheduling failure the wait evicts only an idle
+  Model that could free the capacity that is short (see
+  [../backend-parity.md](../backend-parity.md)). The null backend reports
+  nothing running.
 
 ### Known fault: the gateway can route a model's traffic to another container (until `network migrate`)
 
@@ -310,3 +337,11 @@ migrated keep Docker's dynamic addresses.
 - after a misroute, stop traffic for about five minutes before retrying;
 - setting `AIOHTTP_TTL_DNS_CACHE` low on the gateway narrows the window but does
   not close it.
+
+### `routes seed --replace` is compare-and-swap (fixed 2026-09-27)
+
+`routes seed --replace` shows each redefinition (`A0 -> A1`) and asks, then
+commits under the publication lock only if every alias still means what was
+shown. If another process changed one to `A2` in between, nothing is
+written, no publication is left pending, and the refusal says to run the
+seed again to see `A2`.

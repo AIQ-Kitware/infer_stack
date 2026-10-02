@@ -30,9 +30,10 @@ through: that turns the *mode* off and leaves the *daemon* holding its handles.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 __all__ = ['GpuSample', 'Holder', 'gpu_checks']
 
@@ -41,8 +42,16 @@ _BUSY_UTIL = 50
 #: More than this allocated means somebody's memory is on the card, so high
 #: utilization is explained and there is nothing to report.
 _IDLE_MEM_MIB = 512
-#: Holders that are expected on a healthy machine, matched against argv[0].
-_EXPECTED_HOLDERS = ('nvidia-persistenced',)
+#: Passive/system holders that are expected on a healthy workstation.  These
+#: processes may keep NVIDIA character devices open, and therefore can block a
+#: low-level GPU reset, but they do not by themselves reserve GPU memory or make
+#: the device unavailable to Compose/vLLM workloads.
+_EXPECTED_HOLDERS = (
+    'nvidia-persistenced',
+    'nvidia-device-plugin',
+    'gpu-feature-discovery',
+    'nvtop',
+)
 
 
 @dataclass
@@ -66,8 +75,16 @@ class Holder:
     cgroup: str = ''
 
     @property
+    def process_name(self) -> str:
+        """Basename of argv[0], or a placeholder after a /proc race."""
+        words = self.cmdline.split()
+        if not words:
+            return '<exited>'
+        return words[0].rsplit('/', 1)[-1]
+
+    @property
     def expected(self) -> bool:
-        return any(name in self.cmdline for name in _EXPECTED_HOLDERS)
+        return self.process_name in _EXPECTED_HOLDERS
 
     @property
     def where(self) -> str:
@@ -155,11 +172,52 @@ def device_holders(use_sudo: bool):
     """
     if not use_sudo:
         return None
-    text = _run(['sudo', '-n', 'find', '/proc', '-maxdepth', '3',
-                 '-path', '*/fd/*', '-lname', '/dev/nvidia*',
-                 '-printf', '%h %l\n'], timeout=30)
-    if text is None:
+
+    # Check elevation separately so a racy /proc traversal cannot be
+    # misreported as "sudo is unavailable".  ``find /proc`` legitimately
+    # returns 1 if a process/fd disappears between readdir and stat; stdout
+    # from the rest of the traversal is still valid and must not be discarded.
+    try:
+        sudo_check = subprocess.run(
+            ['sudo', '-n', 'true'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
+    if sudo_check.returncode != 0:
+        return None
+
+    try:
+        out = subprocess.run(
+            ['sudo', '-n', 'find', '/proc', '-maxdepth', '3',
+             '-path', '*/fd/*', '-lname', '/dev/nvidia*',
+             '-printf', '%h %l\n'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env={**os.environ, 'LC_ALL': 'C'},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if out.returncode != 0:
+        errors = [
+            line.strip()
+            for line in out.stderr.splitlines()
+            if line.strip()
+        ]
+        benign_proc_race = bool(errors) and all(
+            '/proc/' in line and 'No such file or directory' in line
+            for line in errors
+        )
+        if not benign_proc_race:
+            return None
+
+    text = out.stdout
     holders: dict[int, Holder] = {}
     for line in text.strip().splitlines():
         parts = line.split()
@@ -171,9 +229,14 @@ def device_holders(use_sudo: bool):
         pid = int(m.group(1))
         if pid in holders:
             continue
-        holders[pid] = Holder(pid, parts[1],
-                              _proc_text(pid, 'cmdline').replace('\0', ' ').strip(),
-                              _proc_text(pid, 'cgroup').strip())
+        cmdline = _proc_text(pid, 'cmdline').replace('\0', ' ').strip()
+        cgroup = _proc_text(pid, 'cgroup').strip()
+        # The pid can disappear after find observed its fd.  At that point the
+        # holder itself is gone too, so do not turn a stale observation into a
+        # current conflict (or crash later while formatting an empty argv).
+        if not cmdline and not cgroup:
+            continue
+        holders[pid] = Holder(pid, parts[1], cmdline, cgroup)
     return sorted(holders.values(), key=lambda h: h.pid)
 
 
@@ -210,30 +273,33 @@ def gpu_checks(use_sudo: bool = False, *, _sample=None, _apps=None,
 
     holders = _holders() if _holders else device_holders(use_sudo)
     if holders is None:
-        yield ('device holders', True,
+        yield ('device holders', False,
                'not checked — needs root, and unprivileged this can only see '
                'your own processes, which would read as a false all-clear. '
-               'Re-run with --sudo.')
+               + ('Sudo was requested but non-interactive elevation or the scan failed. '
+                'Run sudo -v, then retry with --sudo.' if use_sudo else
+                'Re-run with --sudo.'))
         return
 
     unexpected = [h for h in holders if not h.expected]
     expected = [h for h in holders if h.expected]
     if not unexpected:
-        detail = 'only expected holders'
+        detail = 'only passive/system holders'
         if expected:
-            detail += f" ({', '.join(sorted({h.cmdline.split()[0].split('/')[-1] for h in expected}))})"
+            names = ', '.join(sorted({h.process_name for h in expected}))
+            detail += f' ({names})'
         yield ('device holders', True, detail)
     else:
         lines = []
         for h in unexpected:
             where = f' in {h.where}' if h.where else ''
-            lines.append(f'pid {h.pid} {h.cmdline.split()[0][:40]}{where}')
+            lines.append(f'pid {h.pid} {h.process_name[:40]}{where}')
         yield ('device holders', False,
                '; '.join(lines) + ' — these hold a device, so `nvidia-smi -r` '
                'will refuse. Stop the owning container or pod rather than '
                'resetting.')
 
-    if expected:
+    if any(h.process_name == 'nvidia-persistenced' for h in expected):
         yield ('reset would be blocked', True,
                'nvidia-persistenced holds every device by design. `nvidia-smi '
                '-pm 0` turns the mode off but leaves the daemon holding its '

@@ -23,7 +23,7 @@ simultaneously desired deployments are reported loudly (``last_unplaced`` /
 ``last_errors``), never silently overwritten.
 
 Cluster prerequisites (once per cluster, not per acquire): a reachable
-kubeconfig, the KubeAI helm chart installed (``scripts/install_kubeai.sh``)
+kubeconfig, KubeAI installed (normally via ``infer-stack kube install --apply``)
 with ``resourceProfiles`` matching the ``resource_profile`` names your catalog
 uses, and a route to the gateway (the default ``base_url`` assumes
 ``kubectl port-forward svc/kubeai 8000:80``). See ``docs/kubeai-backend.md``.
@@ -31,13 +31,14 @@ uses, and a route to the gateway (the default ``base_url`` assumes
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
-from ..leasing.backend import ConvergeScaffold, Readiness
+from ..leasing.backend import ApplyResult, ConvergeScaffold, Readiness
 from ..leasing.compose import dns_slug, vllm_service_dict
 from ..leasing.models import Deployment
 from ..probe import openai_ready
@@ -47,34 +48,86 @@ MODELS_FILENAME = 'models.yaml'
 STATE_FILENAME = 'leasing-kubeai-state.json'
 MANAGED_LABEL = 'infer-stack/managed'
 DEPLOYMENT_LABEL = 'infer-stack/deployment'
+# KubeAI's Model CRD is stricter than Kubernetes's usual DNS label limit.
+MODEL_NAME_MAX_LENGTH = 40
+UNSUPPORTED_RUNTIME_FIELDS = ('image', 'command', 'mounts')
 DEFAULT_NAMESPACE = 'kubeai'
 # The standard local access path: `kubectl port-forward svc/kubeai 8000:80`.
 # An ingress-fronted cluster overrides this via the kubeai_base_url setting.
 DEFAULT_BASE_URL = 'http://127.0.0.1:8000/openai/v1'
 
 
-def model_name_for(served: str) -> str:
+def unsupported_runtime_fields(runtime: dict) -> tuple[str, ...]:
+    """Shared stock KubeAI launch policy, including legacy launch recipes."""
+    from ..leasing.launch import translate_legacy
+
+    translated = translate_legacy(runtime)
+    return tuple(key for key in UNSUPPORTED_RUNTIME_FIELDS if translated.get(key))
+
+
+def model_replica_counts(model: dict) -> tuple[int | None, int | None]:
+    """Observed (all, ready) replicas; missing counts stay unknown.
+
+    KubeAI uses status.replicas.{all,ready}; tolerate older flat counters.
+    """
+    status = model.get('status') or {}
+    replicas = status.get('replicas')
+    def count(value):
+        try:
+            return max(0, int(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(replicas, dict):
+        return count(replicas.get('all')), count(replicas.get('ready', status.get('readyReplicas')))
+    return count(replicas), count(status.get('readyReplicas'))
+
+
+def model_name_for(served: str, deployment_id: str | None = None) -> str:
     """Deterministic Model CR name for a served model name: ``<dns-slug>``.
 
     Derived purely from the served name (like the compose service name), so it
     is identical across releases/re-acquires of the same endpoint — the request
-    name clients use through the KubeAI gateway never changes.
+    name clients use through the KubeAI gateway never changes. With
+    ``deployment_id`` (dynamic routing), the deployment's tail is appended, as
+    for a compose service, so same-model ``--dedicated`` deployments are
+    separate Models; the gateway addresses each by name. KubeAI limits Model
+    names to 40 characters. Overlong slugs retain a readable prefix plus a
+    digest of the full served name, budgeting separately for a deployment tail.
+
+    >>> model_name_for('Qwen/Qwen3-8B')
+    'qwen-qwen3-8b'
+    >>> model_name_for('Qwen/Qwen3-8B', 'grp-0123456789ab')
+    'qwen-qwen3-8b-01234567'
     """
-    return dns_slug(served)
+    from ..leasing.naming import deployment_tail
+
+    suffix = f'-{deployment_tail(deployment_id)}' if deployment_id is not None else ''
+    slug = dns_slug(served)
+    budget = MODEL_NAME_MAX_LENGTH - len(suffix)
+    if len(slug) > budget:
+        # Hash the whole identity, not the retained prefix. Static routes and
+        # dynamic deployment routes must derive exactly the same shortened CR.
+        digest = hashlib.sha256(served.encode()).hexdigest()[:8]
+        slug = f'{slug[:budget - len(digest) - 1].rstrip("-")}-{digest}'
+    return slug + suffix
+
+
+def model_name(deployment: Deployment, *, unique: bool = False) -> str:
+    """The Model CR name for ``deployment``: the one place it is derived."""
+    return model_name_for(_served_name(deployment), deployment.id if unique else None)
 
 
 def _served_name(deployment: Deployment) -> str:
-    return deployment.spec.get('served_model_name') or (
-        sorted(deployment.served)[0] if deployment.served else deployment.id
-    )
+    from ..leasing.models import served_name
+
+    return served_name(deployment)
 
 
 def _gpu_count(deployment: Deployment) -> int:
-    runtime = deployment.spec.get('runtime', {}) or {}
-    tp = int(runtime.get('tensor_parallel_size', 1) or 1)
-    pp = int(runtime.get('pipeline_parallel_size', 1) or 1)
-    dp = int(runtime.get('data_parallel_size', 1) or 1)
-    return max(1, tp * pp * dp)
+    """Resource-profile units for a Model: the planner's GPU count, at least 1."""
+    from ..leasing.placement import required_gpu_count
+
+    return max(1, required_gpu_count(deployment))
 
 
 def _model_doc(
@@ -82,16 +135,18 @@ def _model_doc(
     *,
     namespace: str,
     resource_profile: str,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Build one KubeAI ``Model`` CR for a vLLM deployment.
 
     ``spec.args`` reuses the exact arg pipeline the compose backend renders
     with (``_vllm_service_dict`` + ``vllm_args``), so every serving knob the
     compat key distinguishes (revision/quantization/dtype/pp/...) reaches the
-    engine here too. ``served_model_name`` is overridden to the CR name so the
-    gateway's request name and vLLM's served name agree.
+    engine here too. KubeAI injects the served name from the CR name before
+    spec.args (engine_vllm.go); emit only the remaining infer-stack flags.
+    Environment templates use that same CR identity.
     """
-    name = model_name_for(_served_name(deployment))
+    name = name or model_name(deployment)
     svc = vllm_service_dict(deployment)
     svc['served_model_name'] = name
     profile = resource_profile
@@ -110,7 +165,7 @@ def _model_doc(
         'resourceProfile': profile,
         'minReplicas': min_replicas,
         'maxReplicas': max_replicas,
-        'args': vllm_args(svc),
+        'args': vllm_args(svc, include_served_name=False),
     }
     doc: dict[str, Any] = {
         'apiVersion': 'kubeai.org/v1',
@@ -125,11 +180,143 @@ def _model_doc(
         },
         'spec': spec,
     }
-    # Attention backend is a vLLM env var, not a CLI arg (see compose._vllm_service);
-    # forward it through the KubeAI Model's env map for parity across backends.
+    # Container environment through the Model's env map, as compose renders
+    # it: runtime.env (templates filled, values as strings), plus the attention
+    # backend, which is a vLLM env var rather than a flag.
+    from ..leasing.launch import env_string, fill
+
+    env = {str(k): fill(env_string(v), svc) for k, v in svc['env'].items()}
     if svc.get('attention_backend'):
-        spec['env'] = {'VLLM_ATTENTION_BACKEND': str(svc['attention_backend'])}
+        env['VLLM_ATTENTION_BACKEND'] = str(svc['attention_backend'])
+    if env:
+        spec['env'] = env
     return doc
+
+
+#: GPU Feature Discovery's node labels: the GPU model, and per-GPU memory (MiB).
+GPU_PRODUCT_LABEL = 'nvidia.com/gpu.product'
+GPU_MEMORY_LABEL = 'nvidia.com/gpu.memory'
+GPU_RESOURCE = 'nvidia.com/gpu'
+
+
+def node_gpus(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each node's GPUs, from its labels and allocatable: ``{node: facts}``.
+
+    ``facts`` is ``{'product', 'memory_gib', 'count', 'labels'}``; a node with
+    no memory label has ``memory_gib`` None.
+
+    >>> n = {'metadata': {'name': 'a', 'labels': {GPU_PRODUCT_LABEL: 'L4',
+    ...                                            GPU_MEMORY_LABEL: '23034'}},
+    ...      'status': {'allocatable': {GPU_RESOURCE: '2'}}}
+    >>> node_gpus([n])['a']['memory_gib'], node_gpus([n])['a']['count']
+    (22.49, 2)
+    """
+    out = {}
+    for node in nodes:
+        meta = node.get('metadata') or {}
+        labels = dict(meta.get('labels') or {})
+        memory = labels.get(GPU_MEMORY_LABEL)
+        try:
+            memory_gib = round(int(memory) / 1024, 2) if memory else None
+        except ValueError:
+            memory_gib = None
+        count = str(((node.get('status') or {}).get('allocatable') or {}).get(GPU_RESOURCE) or '')
+        out[str(meta.get('name'))] = {
+            'product': labels.get(GPU_PRODUCT_LABEL),
+            'memory_gib': memory_gib,
+            'count': int(count) if count.isdigit() else 0,
+            'labels': labels,
+        }
+    return out
+
+
+def resource_profiles_for_nodes(
+    nodes: list[dict[str, Any]], *, runtime_class_name: str | None = 'nvidia',
+) -> dict[str, Any]:
+    """One KubeAI resource profile per discovered NVIDIA GPU product.
+
+    This is shared by ``catalog suggest`` and ``kube setup`` so there is one
+    authority for the generated profile names and scheduling shape. Existing
+    operator profiles are merged/preserved by the setup layer.
+    """
+    profiles: dict[str, Any] = {}
+    gpu_nodes = [f for f in node_gpus(nodes).values()
+                 if f.get('count') and f.get('product')]
+    for facts in sorted(gpu_nodes,
+                        key=lambda f: (f.get('memory_gib') or 0, f.get('product') or '')):
+        product = str(facts['product'])
+        profile = {
+            'imageName': 'nvidia-gpu',
+            'requests': {GPU_RESOURCE: '1'},
+            'limits': {GPU_RESOURCE: '1'},
+            'nodeSelector': {GPU_PRODUCT_LABEL: product},
+        }
+        if runtime_class_name:
+            profile['runtimeClassName'] = runtime_class_name
+        slug = dns_slug(product)
+        name = slug if slug.startswith('nvidia-') else f'nvidia-{slug}'
+        profiles[name] = profile
+    return profiles
+
+
+def sized_profiles(profiles: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> dict[str, float]:
+    """Per-GPU memory (GiB) of each resource profile that says where it runs.
+
+    A profile's size is the smallest ``nvidia.com/gpu.memory`` among the nodes
+    its ``nodeSelector`` selects. A profile without a ``nodeSelector`` (the
+    chart's generic ones) could land anywhere, so it has no size and is never
+    picked by size.
+
+    >>> nodes = {'a': {'memory_gib': 24.0, 'labels': {'gpu': 'small'}},
+    ...          'b': {'memory_gib': 80.0, 'labels': {'gpu': 'big'}}}
+    >>> sized_profiles({'small': {'nodeSelector': {'gpu': 'small'}},
+    ...                 'big': {'nodeSelector': {'gpu': 'big'}},
+    ...                 'anywhere': {}}, nodes)
+    {'big': 80.0, 'small': 24.0}
+    """
+    sizes = {}
+    for name, profile in sorted((profiles or {}).items()):
+        selector = (profile or {}).get('nodeSelector') or {}
+        if not selector:
+            continue
+        found = [facts['memory_gib'] for facts in nodes.values()
+                 if facts.get('memory_gib')
+                 and all(facts['labels'].get(k) == str(v) for k, v in selector.items())]
+        if found:
+            sizes[name] = min(found)
+    return sizes
+
+
+def pick_profile(explicit: str | None, min_vram_gib: float | None,
+                 sized: dict[str, float], default: str | None) -> tuple[str | None, str]:
+    """``(profile, why)`` for one deployment.
+
+    An endpoint's own ``resource_profile`` wins. Else, with ``min_vram_gib``,
+    the smallest sized profile whose GPUs have that much memory. Else the
+    ``kubeai_resource_profile`` default. ``why`` says which rule chose, or
+    why nothing could.
+
+    >>> sized = {'small': 24.0, 'big': 80.0}
+    >>> pick_profile(None, 40, sized, 'cpu')
+    ('big', 'min_vram_gib 40 GiB -> big (80 GiB GPUs)')
+    >>> pick_profile(None, 10, sized, None)[0], pick_profile('mine', 40, sized, None)[0]
+    ('small', 'mine')
+    >>> pick_profile(None, 100, sized, None)
+    (None, 'min_vram_gib 100 GiB: no resource profile has GPUs that large (big 80 GiB, small 24 GiB)')
+    """
+    if explicit:
+        return explicit, 'runtime.resource_profile'
+    if min_vram_gib:
+        fitting = sorted((size, name) for name, size in sized.items()
+                         if size >= float(min_vram_gib))
+        if fitting:
+            size, name = fitting[0]
+            return name, f'min_vram_gib {min_vram_gib:g} GiB -> {name} ({size:g} GiB GPUs)'
+        if not default:
+            known = ', '.join(f'{n} {g:g} GiB' for n, g in sorted(sized.items())) or 'none sized'
+            return None, (f'min_vram_gib {min_vram_gib:g} GiB: no resource profile has '
+                          f'GPUs that large ({known})')
+    return default, 'kubeai_resource_profile'
 
 
 class RenderedModels:
@@ -141,6 +328,8 @@ class RenderedModels:
         self.request_names: dict[str, str] = {}  # endpoint -> CR name
         self.unrenderable: set[str] = set()
         self.errors: list[str] = []
+        #: deployment id -> which rule chose its resource profile.
+        self.profile_reasons: dict[str, str] = {}
 
     @property
     def text(self) -> str:
@@ -154,6 +343,8 @@ def render_models(
     *,
     namespace: str,
     default_resource_profile: str | None,
+    unique_names: bool = False,
+    sized: dict[str, float] | None = None,
 ) -> RenderedModels:
     """Render the desired set into KubeAI ``Model`` docs (pure, no I/O).
 
@@ -178,11 +369,11 @@ def render_models(
         from ..leasing.launch import translate_legacy
 
         runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
-        custom = [k for k in ('command', 'env', 'mounts') if runtime.get(k)]
+        custom = unsupported_runtime_fields(runtime)
         if custom:
-            # A KubeAI Model runs stock vLLM; it has no place for a container
-            # command, environment or host mounts. Fail closed, never silently
-            # serve the stock engine instead.
+            # A KubeAI Model runs stock vLLM: it has no place for a container
+            # image override, command or host mounts (env maps onto spec.env). Fail closed,
+            # never silently serve the stock engine instead.
             out.unrenderable.add(deployment.id)
             out.errors.append(
                 f"{deployment.id}: runtime.{custom[0]} describes a custom container "
@@ -190,10 +381,10 @@ def render_models(
                 'VLLM Model does not. Use --backend compose for this endpoint.'
             )
             continue
-        profile = (
-            runtime.get('resource_profile') or default_resource_profile or ''
-        )
-        if not str(profile).strip():
+        min_vram = (deployment.spec.get('placement') or {}).get('min_vram_gib')
+        profile, why = pick_profile(runtime.get('resource_profile'), min_vram,
+                                    sized or {}, default_resource_profile)
+        if not str(profile or '').strip():
             out.unrenderable.add(deployment.id)
             out.errors.append(
                 f'{deployment.id}: no resource profile — set '
@@ -201,9 +392,11 @@ def render_models(
                 'resourceProfiles key from your KubeAI helm values, e.g. '
                 "'nvidia-gpu-rtx-4090') or `config set "
                 'kubeai_resource_profile <name>` as the default.'
+                + (f' ({why})' if min_vram else '')
             )
             continue
-        name = model_name_for(_served_name(deployment))
+        out.profile_reasons[deployment.id] = why
+        name = model_name(deployment, unique=unique_names)
         if name in out.models:
             out.unrenderable.add(deployment.id)
             out.errors.append(
@@ -217,6 +410,7 @@ def render_models(
                 deployment,
                 namespace=namespace,
                 resource_profile=str(profile),
+                name=name,
             )
         )
         out.models[name] = deployment.id
@@ -238,11 +432,166 @@ def _default_kubectl_run(args: list[str]) -> str:
         args, capture_output=True, text=True, timeout=120,
     )
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or '').strip()
+        detail = kubectl_complaint(proc.stderr or proc.stdout or '')
         raise RuntimeError(
             f'{" ".join(args)} failed ({proc.returncode}): {detail[:500]}'
         )
     return proc.stdout
+
+
+def kubectl_complaint(stderr: str) -> str:
+    r"""kubectl's own complaint, without the client library's log lines.
+
+    kubectl prefixes its retries with klog lines (``E0926 14:05:52 ...
+    memcache.go:265] "Unhandled Error" err="..."``) and ends with the sentence
+    that says what is wrong; that sentence is the complaint.
+
+    >>> kubectl_complaint('E0926 14:05:52.449219  841241 memcache.go:265] "Unhandled '
+    ...                   'Error" err="couldn\'t get current server API group list"\n'
+    ...                   'The connection to the server localhost:8080 was refused - '
+    ...                   'did you specify the right host or port?\n')
+    'The connection to the server localhost:8080 was refused - did you specify the right host or port?'
+    """
+    import re
+
+    lines = [ln.strip() for ln in str(stderr).splitlines() if ln.strip()]
+    plain = [ln for ln in lines if not re.match(r'^[EWIF]\d{4} \d\d:\d\d:\d\d', ln)]
+    if plain:
+        return plain[-1]
+    return lines[-1] if lines else ''
+
+
+
+
+def insufficient_resources(message: str) -> set[str]:
+    """The resources a scheduler message says some node is short of.
+
+    ``Unschedulable`` covers a node selector nothing matches, a taint the pod
+    does not tolerate, affinity, and plain capacity alike. Only capacity can
+    be relieved by stopping another Model, and the message says which it is,
+    node by node.
+
+    >>> sorted(insufficient_resources(
+    ...     '0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 1 Insufficient '
+    ...     "memory, 1 node(s) didn't match Pod's node affinity/selector."))
+    ['memory', 'nvidia.com/gpu']
+    >>> insufficient_resources("0/2 nodes are available: 2 node(s) had untolerated "
+    ...                        "taint {gpu: reserved}.")
+    set()
+    """
+    import re
+
+    return set(re.findall(r'Insufficient ([A-Za-z0-9./_-]+?)[,.]?(?:\s|$)', message or ''))
+
+
+def _tolerates(tolerations: list[dict], taint: dict) -> bool:
+    """Whether a pod's tolerations admit one node taint (Kubernetes' rule)."""
+    if taint.get('effect') not in ('NoSchedule', 'NoExecute'):
+        return True                                 # PreferNoSchedule never blocks
+    for t in tolerations:
+        if t.get('effect') and t.get('effect') != taint.get('effect'):
+            continue
+        if t.get('operator') == 'Exists':
+            if not t.get('key') or t.get('key') == taint.get('key'):
+                return True
+        elif t.get('key') == taint.get('key') and t.get('value') == taint.get('value'):
+            return True
+    return False
+
+
+def eligible_nodes(pod_spec: dict, nodes: list[dict]) -> set[str] | None:
+    """Nodes a pod could run on if they had room, or ``None`` if not known.
+
+    A node qualifies when it is schedulable, carries every label of the
+    pod's ``nodeSelector``, and every blocking taint is tolerated: the
+    default scheduler's filters for those fields. Anything that filters
+    differently makes the answer unknown (``None``), and the caller frees
+    nothing on a guess: another scheduler (``schedulerName``, which a
+    resource profile's ``scheduler_name`` sets), required node affinity,
+    required pod affinity or anti-affinity, and a topology spread
+    constraint that forbids scheduling.
+
+    >>> spec = {'nodeSelector': {'gpu': 'a100'}, 'tolerations': []}
+    >>> nodes = [{'metadata': {'name': 'a', 'labels': {'gpu': 'a100'}}, 'spec': {}},
+    ...          {'metadata': {'name': 'b', 'labels': {'gpu': 'l4'}}, 'spec': {}},
+    ...          {'metadata': {'name': 'c', 'labels': {'gpu': 'a100'}},
+    ...           'spec': {'taints': [{'key': 'x', 'effect': 'NoSchedule'}]}}]
+    >>> eligible_nodes(spec, nodes)
+    {'a'}
+    >>> eligible_nodes({**spec, 'schedulerName': 'volcano'}, nodes) is None
+    True
+    >>> eligible_nodes({**spec, 'affinity': {'podAntiAffinity': {
+    ...     'requiredDuringSchedulingIgnoredDuringExecution': [{}]}}}, nodes) is None
+    True
+    """
+    if pod_spec.get('schedulerName') not in (None, '', 'default-scheduler'):
+        return None                     # its filters are not these
+    affinity = pod_spec.get('affinity') or {}
+    hard = 'requiredDuringSchedulingIgnoredDuringExecution'
+    if any((affinity.get(kind) or {}).get(hard)
+           for kind in ('nodeAffinity', 'podAffinity', 'podAntiAffinity')):
+        return None
+    if any(c.get('whenUnsatisfiable', 'DoNotSchedule') == 'DoNotSchedule'
+           for c in pod_spec.get('topologySpreadConstraints') or []):
+        return None
+    selector = pod_spec.get('nodeSelector') or {}
+    tolerations = pod_spec.get('tolerations') or []
+    out = set()
+    for node in nodes:
+        meta, spec = node.get('metadata') or {}, node.get('spec') or {}
+        labels = meta.get('labels') or {}
+        if spec.get('unschedulable'):
+            continue
+        if any(labels.get(k) != v for k, v in selector.items()):
+            continue
+        if all(_tolerates(tolerations, t) for t in spec.get('taints') or []):
+            out.add(str(meta.get('name') or ''))
+    return out
+
+
+def _requests(pod: dict) -> set[str]:
+    """The resource names a pod's containers request or limit."""
+    names: set[str] = set()
+    for c in (pod.get('spec') or {}).get('containers') or []:
+        res = c.get('resources') or {}
+        names.update((res.get('requests') or {}).keys())
+        names.update((res.get('limits') or {}).keys())
+    return names
+
+
+def model_startup_progress(pods: list[dict]) -> str:
+    """Stable lifecycle text: location, startup reason/image, replica readiness.
+
+    Avoid unstable API error text in the poll loop. Readiness still requires a
+    generation; container/replica readiness only explains what we are awaiting.
+    """
+    if not pods:
+        return 'pending — waiting for KubeAI to create a pod'
+    details = []
+    for pod in pods:
+        spec, status = pod.get('spec', {}), pod.get('status', {})
+        node = spec.get('nodeName')
+        conditions = status.get('conditions') or []
+        scheduled = next((c for c in conditions if c.get('type') == 'PodScheduled'), {})
+        if not node:
+            why = scheduled.get('message') or scheduled.get('reason') or 'waiting for scheduler'
+            details.append(f'pending — {why}')
+            continue
+        containers = status.get('containerStatuses') or []
+        waiting = [c.get('state', {}).get('waiting', {}).get('reason') for c in containers]
+        waiting = [w for w in waiting if w]
+        images = ', '.join(c.get('image', '?') for c in spec.get('containers') or [])
+        if waiting:
+            details.append(f"scheduled on {node} — {', '.join(waiting)}; image {images}")
+        elif not containers:
+            details.append(f'scheduled on {node} — creating container / pulling image {images}')
+        elif all(c.get('ready') for c in containers):
+            details.append(f'scheduled on {node} — replica ready; verifying generation')
+        else:
+            details.append(f'scheduled on {node} — container started; model loading')
+    ready = sum(any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                    for c in p.get('status', {}).get('conditions') or []) for p in pods)
+    return f'{ready}/{len(pods)} replicas ready; ' + '; '.join(sorted(set(details)))
 
 
 class KubeaiBackend(ConvergeScaffold):
@@ -268,6 +617,9 @@ class KubeaiBackend(ConvergeScaffold):
         run: Callable[[list[str]], str] | None = None,
         http: Any = None,
         assume_yes: bool = True,
+        gateway: Any = None,
+        gateway_upstream: str | None = None,
+        gateway_factory: Callable[[str], Any] | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -281,16 +633,52 @@ class KubeaiBackend(ConvergeScaffold):
             http = requests
         self.http = http
         self.assume_yes = assume_yes
+        self.progress: Callable[[str], None] | None = None
         self.last_errors: list[str] = []
         self.last_unplaced: set[str] = set()
         # KubeAI/k8s schedules; there are no host GPU indices to report.
         self.last_assignments: dict[str, list[int]] = {}
+        # The LiteLLM gateway in front of the cluster: a gateway-only
+        # ComposeBackend. With it, clients use the same front door, key and
+        # request names (the endpoint aliases) as on the compose backend.
+        # Without it, clients talk to KubeAI directly under its Model names.
+        self.gateway = gateway
+        if gateway is not None:
+            gateway.fronts_elsewhere = True
+        # Builds the gateway for a placement ('host' or 'cluster'), so a
+        # recovery profile can say where it runs (see use_profile).
+        self.gateway_factory = gateway_factory
+        # How that gateway reaches KubeAI. Unset: the KubeAI Service's cluster
+        # IP, which containers on a cluster node can reach; a gateway off the
+        # cluster needs an ingress URL here.
+        self.gateway_upstream = gateway_upstream
+        # `infer-stack measure --record` writes here, as on compose; a
+        # measurement fills an endpoint's missing min_vram_gib, which picks
+        # its resource profile by size.
+        from ..leasing.vram import Measurements
+
+        self.measurements = Measurements(self.state_dir / 'measurements.json')
 
     # -- state-dir plumbing --------------------------------------------------
 
     @property
     def models_file(self) -> Path:
         return self.state_dir / MODELS_FILENAME
+
+    #: The file a render writes, whatever the backend (``status`` shows it).
+    rendered_file = models_file
+
+    #: Its engines are pods in the cluster.
+    runs_engines = True
+
+    def compose_project(self):
+        """The Compose project on this host: the gateway's, or ``None``
+        (no gateway, or the gateway runs in the cluster)."""
+        return self.gateway.compose_project() if self.gateway is not None else None
+
+    def front_door(self):
+        """What holds the gateway's keys and route registry: the gateway."""
+        return self.gateway
 
     @property
     def _state_file(self) -> Path:
@@ -327,10 +715,264 @@ class KubeaiBackend(ConvergeScaffold):
             models[name] = (meta.get('labels') or {}).get(DEPLOYMENT_LABEL)
         return models
 
+    # -- the gateway -----------------------------------------------------------
+
+    @property
+    def litellm(self) -> bool:
+        return self.gateway is not None
+
+    @property
+    def litellm_port(self) -> int | None:
+        return self.gateway.litellm_port if self.gateway is not None else None
+
+    def _upstream_url(self) -> str:
+        """Where the gateway sends requests for this cluster's Models."""
+        if not self.gateway_upstream and getattr(self.gateway, 'in_cluster', False):
+            # Inside the cluster: the Service's DNS name, stable across
+            # reinstalls, unlike its cluster IP.
+            return f'http://kubeai.{self.namespace}.svc.cluster.local/openai/v1'
+        if not self.gateway_upstream:
+            ip = self._kubectl(['get', 'service', 'kubeai', '-o',
+                                'jsonpath={.spec.clusterIP}']).strip()
+            if not ip:
+                raise RuntimeError('the kubeai Service has no cluster IP; set '
+                                   '`config set kubeai_gateway_upstream <url>`')
+            self.gateway_upstream = f'http://{ip}/openai/v1'
+        return self.gateway_upstream.rstrip('/')
+
+    @property
+    def dynamic_routing(self) -> bool:
+        """The gateway manages routes live, so each deployment is its own Model."""
+        return bool(self.gateway is not None and getattr(self.gateway, 'dynamic_routing', False))
+
+    def catalog_routes(self, catalog) -> list:
+        """The routes every endpoint of ``catalog`` gets: each vLLM endpoint to
+        its Model through KubeAI, each external one to its own server.
+
+        The static superset, as on compose: the gateway's config then stays
+        byte-stable as models come and go, so it is never recreated for one.
+        """
+        from ..leasing.gateway import catalog_routes
+        from ..leasing.routes import GatewayRoute
+
+        if catalog is None or self.gateway is None:
+            return []
+        base = self._upstream_url()
+
+        def managed(alias, request):
+            if request.engine != 'vllm':
+                return None
+            served = request.served.get('served_model_name') or alias
+            return GatewayRoute(alias, 'openai', model_name_for(served), base)
+
+        return catalog_routes(catalog, managed)
+
+    def routes(self, desired: list[Deployment], placement=None) -> list:
+        """The routes a render of ``desired`` gives the gateway (``routes list``):
+        its whole table, the route registry included."""
+        if self.gateway is None:
+            return []
+        self._set_front_door(desired, self._render_documents(desired)[1])
+        if getattr(self.gateway, 'in_cluster', False):
+            return self.gateway.static_routes()
+        return self.gateway.routes([])
+
+    def _front_door_inputs(self, desired, rendered: RenderedModels):
+        """``(static routes, dynamic routes)`` the gateway adds, from a render.
+
+        Static routing: one route per alias, to the Model serving it, over the
+        catalog's. Dynamic routing: one route per (deployment, endpoint), each
+        to its own Model, so same-model ``--dedicated`` Models share the alias
+        and LiteLLM balances across them. External endpoints route to their
+        own servers either way, never through KubeAI.
+        """
+        from ..leasing.gateway import catalog_routes, upstream_route
+        from ..leasing.routes import GatewayRoute, route_table
+
+        if self.gateway is None:
+            return [], []
+        base = self._upstream_url()
+        if self.dynamic_routing:
+            by_id = {g.id: g for g in desired}
+            routes = [
+                upstream_route(gid, endpoint, name, base)
+                for name, gid in sorted(rendered.models.items())
+                for endpoint in sorted(by_id[gid].served)
+            ]
+            return [], routes + catalog_routes(self.catalog, dynamic=True)
+        catalog = self.catalog_routes(self.catalog)
+        defined = {r.alias for r in catalog}
+        # A Model serving a catalog alias is that endpoint's route; one serving
+        # an alias no catalog defines is the cluster's own (the gateway
+        # remembers those past release, as it does ad-hoc deployments).
+        models = [GatewayRoute(alias, 'openai', name, base,
+                               origin='catalog' if alias in defined else 'upstream')
+                  for alias, name in rendered.request_names.items()]
+        return route_table(catalog, models), []
+
+    def _set_front_door(self, desired, rendered: RenderedModels) -> None:
+        """Hand the gateway its inputs for the next render or preview."""
+        static, dynamic = self._front_door_inputs(desired, rendered)
+        self.gateway.extra_routes = static
+        self.gateway.extra_dynamic_routes = dynamic
+
     # -- converge-style surface ------------------------------------------------
 
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
-        """Render the desired Model set, then optionally apply it."""
+    #: The cluster schedules: no host GPU indices are allocated or recorded,
+    #: and admission commits an empty allocation for every deployment.
+    allocates_gpus = False
+
+    #: Seconds a read of the cluster's GPU facts is reused: resource profiles
+    #: and node labels change rarely, and a render reads them once.
+    GPU_FACTS_TTL = 60.0
+    #: The KubeAI chart's configuration, which holds its resourceProfiles.
+    CONFIG_MAP = 'kubeai-config'
+
+    def gpu_facts(self) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+        """``(each node's GPUs, each sized profile's GPU GiB)`` from the cluster.
+
+        Node facts survive missing chart config; installed sizing is empty then:
+        sizing then falls back to the default profile, as before.
+        """
+        import time
+
+        cached = getattr(self, '_gpu_facts_cache', None)
+        if cached is not None and time.monotonic() - cached[0] < self.GPU_FACTS_TTL:
+            return cached[1]
+        try:
+            facts = self.node_gpu_facts()
+        except Exception:  # node discovery is best-effort
+            facts = {}
+        try:
+            profiles = self.installed_resource_profiles()
+            sized = sized_profiles(profiles, facts)
+        except Exception:  # missing/malformed chart config must not erase nodes
+            sized = {}
+        self._gpu_facts_cache = (time.monotonic(), (facts, sized))
+        return facts, sized
+
+    def node_gpu_facts(self) -> dict[str, dict[str, Any]]:
+        """Discover Kubernetes GPUs independently of KubeAI installation."""
+        nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
+        return node_gpus(nodes.get('items') or [])
+
+    def installed_resource_profiles(self) -> dict[str, Any]:
+        """Read installed chart profiles; callers decide how to handle absence."""
+        config = json.loads(self._kubectl(
+            ['get', 'configmap', self.CONFIG_MAP, '-o', 'json']) or '{}')
+        system = yaml.safe_load((config.get('data') or {}).get('system.yaml', '')) or {}
+        return system.get('resourceProfiles') or {}
+
+    def suggestion_inventory(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """``(inventory, resourceProfiles)`` for ``catalog suggest``.
+
+        The inventory is the GPUs of the largest GPU node (a Model runs on one
+        node, so that is the biggest thing it can use), shaped like a host
+        inventory. The profiles are one per GPU product in the cluster, each
+        selecting that product's nodes: what the helm values need for
+        ``min_vram_gib`` to choose by size.
+        """
+        facts, _ = self.gpu_facts()
+        gpu_nodes = [f for f in facts.values() if f['count'] and f['memory_gib']]
+        if not gpu_nodes:
+            return {'gpu_count': 0, 'gpus': []}, {}
+        best = max(gpu_nodes, key=lambda f: (f['count'] * f['memory_gib'], f['memory_gib']))
+        gpus = [{'index': i, 'name': best['product'] or 'GPU',
+                 'memory_gib': best['memory_gib'],
+                 'memory_mib': int(best['memory_gib'] * 1024),
+                 'display_active': False} for i in range(best['count'])]
+        profiles = resource_profiles_for_nodes([
+            {'metadata': {'name': name, 'labels': facts['labels']},
+             'status': {'allocatable': {GPU_RESOURCE: str(facts['count'])}}}
+            for name, facts in facts.items()
+        ])
+        return {'gpu_count': len(gpus), 'gpus': gpus}, profiles
+
+    def _enrich_min_vram(self, desired) -> None:
+        """Fill a missing ``min_vram_gib`` from a recorded measurement (in memory).
+
+        The compose resolution order: a catalog-declared value wins, else the
+        measurements overlay. Never persisted.
+        """
+        from ..leasing.vram import measurement_key_for_spec
+
+        for g in desired:
+            placement = dict(g.spec.get('placement') or {})
+            if g.engine != 'vllm' or placement.get('min_vram_gib'):
+                continue
+            measured = self.measurements.get_min_vram_gib(measurement_key_for_spec(g.spec))
+            if measured:
+                placement.update(min_vram_gib=measured, min_vram_source='measured')
+                g.spec['placement'] = placement
+
+    def _needs_sizing(self, desired) -> bool:
+        """Whether any deployment asks for its profile by GPU memory."""
+        for g in desired:
+            runtime = g.spec.get('runtime') or {}
+            if (g.spec.get('placement') or {}).get('min_vram_gib') and not runtime.get(
+                    'resource_profile'):
+                return True
+        return False
+
+    def _render_documents(self, desired: list[Deployment]):
+        """``(plan, rendered, planned)`` in memory: the one KubeAI render.
+
+        The plan assigns every renderable deployment no GPUs; the
+        unrenderable ones are left out, with the render's reasons.
+        """
+        from ..leasing.placement import GpuPlan
+
+        desired = list(desired)
+        self._enrich_min_vram(desired)
+        rendered = render_models(
+            desired,
+            namespace=self.namespace,
+            default_resource_profile=self.default_resource_profile,
+            unique_names=self.dynamic_routing,
+            sized=self.gpu_facts()[1] if self._needs_sizing(desired) else None,
+        )
+        plan = GpuPlan(
+            assignments={g.id: [] for g in desired if g.id not in rendered.unrenderable},
+            errors=list(rendered.errors),
+        )
+        return plan, rendered, {self.models_file: rendered.text}
+
+    def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
+        """Render ``desired`` as :meth:`converge` would; write nothing.
+
+        ``placement`` is accepted for the admission interface and ignored:
+        the cluster places. Returns ``(plan, rendered)``.
+        """
+        plan, rendered, planned = self._render_documents(desired)
+        self._preview_approval(planned, approve=approve)
+        if self.gateway is not None:
+            # The gateway's changes are part of the same approval: shown now,
+            # before the lease commits, and not asked again at the render.
+            self._set_front_door(desired, rendered)
+            self.gateway.preview([], None, approve=approve)
+            self.last_preview_digest = self._combined_digest(
+                self.last_preview_digest, self.gateway.last_preview_digest)
+        return plan, rendered
+
+    def _combined_digest(self, models: str | None, gateway: str | None) -> str | None:
+        """One digest for the Models and the gateway's files together."""
+        if gateway is None:
+            return models
+        return self._planned_digest({'models': models or '', 'gateway': gateway})
+
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Whether ``desired`` could ever be served here: renderable or not.
+
+        Capacity is the cluster's to decide, so only a render failure is
+        permanent; that lets a queued acquire of one fail at once.
+        """
+        return self._render_documents(desired)[0]
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True, placement=None):
+        """Render the desired Model set, then optionally apply it.
+
+        ``placement`` (admission inputs) is ignored: the cluster places.
+        """
         from .._log import logger
 
         desired = list(desired)
@@ -341,29 +983,19 @@ class KubeaiBackend(ConvergeScaffold):
                 self.namespace,
                 ', '.join(sorted(g.id for g in desired)) or '(none)',
             )
-            for g in desired:
-                # Warn-and-ignore by decision (vram-aware-placement.md,
-                # Resolutions #3): k8s owns placement on this backend; the
-                # equivalent mechanism is the resourceProfile / resource
-                # requests, not our single-host planner.
-                if (g.spec.get('placement') or {}).get('min_vram_gib'):
-                    logger.warning(
-                        '  {}: placement.min_vram_gib is ignored on the '
-                        'kubeai backend (k8s owns placement — express the '
-                        'requirement via the resource profile instead)',
-                        g.id,
-                    )
-            rendered = render_models(
-                desired,
-                namespace=self.namespace,
-                default_resource_profile=self.default_resource_profile,
-            )
+            plan, rendered, planned = self._render_documents(desired)
+            for gid, why in sorted(rendered.profile_reasons.items()):
+                if why.startswith('min_vram_gib'):
+                    # The cluster places, within the profile chosen by size.
+                    logger.info('  {}: resource profile by {}', gid, why)
             self.last_errors = list(rendered.errors)
             self.last_unplaced = set(rendered.unrenderable)
-            self.last_assignments = {}
+            self.last_assignments = {}      # the cluster places
             for err in rendered.errors:
                 logger.warning('  render: {}', err)
-            self._approve_changes({self.models_file: rendered.text})
+            models_digest = self._planned_digest(planned)
+            self.last_planned_digest = models_digest
+            self._approve_changes(planned)
             self._atomic_write(self.models_file, rendered.text)
             self._save_sidecar(
                 {
@@ -371,13 +1003,18 @@ class KubeaiBackend(ConvergeScaffold):
                     'request_names': rendered.request_names,
                 }
             )
+            if self.gateway is not None:
+                # Gateway only: no engines on this host, so nothing to place.
+                # Its converge persists the merged route registry after its
+                # own approval (pre-approved by the preview when there was one).
+                self._set_front_door(desired, rendered)
+                self.gateway.converge([], apply=False)
+                self.last_planned_digest = self._combined_digest(
+                    models_digest, self.gateway.last_planned_digest)
             if not apply:
-                logger.info(
-                    'rendered {} Model(s) to {} (not applied; '
-                    '`infer-stack apply` to converge the cluster)',
-                    len(rendered.models),
-                    self.models_file,
-                )
+                # The caller applies next, or (--no-apply, render) says how.
+                logger.info('rendered {} Model(s) to {}',
+                            len(rendered.models), self.models_file)
                 return None
         self.apply()
         return None
@@ -395,6 +1032,10 @@ class KubeaiBackend(ConvergeScaffold):
             'namespace': self.namespace,
             'base_url': self.base_url,
             'resource_profile': self.default_resource_profile,
+            # The front door's own settings (UI, proxy, routing mode), in the
+            # gateway project's profile; None without a gateway.
+            'gateway': self.gateway.render_profile() if self.gateway is not None else None,
+            'gateway_upstream': self.gateway_upstream,
             'catalogs': catalog_sources(self.catalog),
         }
 
@@ -409,28 +1050,49 @@ class KubeaiBackend(ConvergeScaffold):
 
             raise ProfileMismatch(
                 f"the active recovery snapshot is for the {profile.get('backend')!r} backend; "
-                'tear down the old backend before switching backend kinds'
+                'quiesce the old backend (release leases and tear down workloads), then '
+                'start a new ledger/recovery epoch with `infer-stack ledger rotate --yes` '
+                'for the configured backend; stack down alone retains the old snapshot'
             )
         from ..leasing.profile import CatalogUnion
 
         self.namespace = profile['namespace']
         self.base_url = profile['base_url']
         self.default_resource_profile = profile['resource_profile']
+        self.gateway_upstream = profile.get('gateway_upstream') or self.gateway_upstream
         sources = profile.get('catalogs') or []
         self.catalog = CatalogUnion.from_sources(sources) if sources else None
+        front = profile.get('gateway')
+        # A profile from before the front door's settings were recorded holds
+        # only True/False here; it then keeps this process's settings.
+        if isinstance(front, dict) and self.gateway is not None:
+            wanted = 'cluster' if front.get('placement') == 'cluster' else 'host'
+            have = 'cluster' if getattr(self.gateway, 'in_cluster', False) else 'host'
+            if wanted != have:
+                # The snapshot decides where the gateway runs, as it decides
+                # everything else it renders.
+                if self.gateway_factory is None:
+                    from ..leasing.profile import ProfileMismatch
 
-    def apply(self) -> None:
-        """Converge the cluster to the last render: apply + prune.
+                    raise ProfileMismatch(
+                        f'the active recovery snapshot has the gateway on the {wanted}, '
+                        f'this process on the {have}')
+                self.gateway = self.gateway_factory(wanted)
+            self.gateway.use_profile(front)
+
+    def apply(self) -> ApplyResult:
+        """Converge the cluster to the last render: apply + prune, then the gateway.
 
         Reads the on-disk manifest last written by :meth:`converge` (render)
         and applies it — it does NOT re-render (compose parity: the controller
         coalesces applies under its own lock/generation). Then deletes any
         infer-stack-managed Model the render no longer contains. Idempotent.
+        The result includes the gateway's (its routes, with dynamic routing).
         """
         from .._log import logger
 
         if not self.models_file.exists():
-            return
+            return ApplyResult()
         text = self.models_file.read_text()
         wanted = set(self._load_sidecar().get('models') or {})
         if text.strip():
@@ -445,18 +1107,165 @@ class KubeaiBackend(ConvergeScaffold):
                 raise RuntimeError(
                     f'kubectl apply failed: {ex}\n'
                     'Is the KubeAI chart installed and the kubeconfig '
-                    'reachable? See scripts/install_kubeai.sh and '
+                    'reachable? See `infer-stack kube doctor` and '
                     'docs/kubeai-backend.md.'
                 ) from ex
-        # Prune: managed Models on the cluster that the render dropped.
+        # Prune: managed Models on the cluster that the render dropped. Their
+        # gateway routes go first, so none is left pointing at a deleted Model.
         stale = [
             name for name in self._cluster_models() if name not in wanted
         ]
+        if stale and self.gateway is not None and not self.gateway.retire_routes():
+            return ApplyResult(runtime=False, routes=False, detail=(
+                'routes to departing Models could not be removed; nothing was deleted'))
         for name in sorted(stale):
             logger.info('kubectl delete model {}', name)
             self._kubectl(
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
+        if self.gateway is not None:
+            return ApplyResult() & ApplyResult.of(self.gateway.apply())
+        return ApplyResult()
+
+    def residency(self):
+        """The managed Models' pods, strictly: raises rather than guess.
+
+        Unlike :meth:`observe`, a kubectl failure is never "nothing running";
+        see :mod:`infer_stack.leasing.residency`.
+        """
+        from ..leasing.residency import (
+            POD_MANAGED_LABEL,
+            ResidencyUnknown,
+            residency_from_pods,
+        )
+
+        try:
+            raw = self._kubectl(['get', 'pods', '-l', f'{POD_MANAGED_LABEL}=true',
+                                 '-o', 'json'])
+        except Exception as ex:  # noqa: BLE001 - any failure is "unknown"
+            raise ResidencyUnknown(f'kubectl get pods failed: {ex}') from ex
+        return residency_from_pods(raw)
+
+    def instances(self):
+        """The managed Models' pods, then the gateway's containers.
+
+        Raises :class:`~infer_stack.leasing.residency.ResidencyUnknown` when
+        the cluster cannot be read.
+        """
+        from ..leasing.instances import KUBERNETES, from_residency
+
+        pods = from_residency(self.residency(), runtime=KUBERNETES,
+                              namespace=self.namespace)
+        return pods + (self.gateway.instances() if self.gateway is not None else [])
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        """Recent engine logs: each pod's current run, then its previous one.
+
+        After a crash the kubelet has already restarted the container, so the
+        cause is in the previous run's log; it goes last, where the diagnosis
+        quotes from. Fail-open to ``''``.
+        """
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().units(deployment.id)
+        except ResidencyUnknown:
+            return ''
+        return '\n'.join(t for t in (self._pod_logs(pod, tail) for pod in pods) if t)
+
+    def _pod_logs(self, pod, tail: int = 400) -> str:
+        """One pod's log: its current run, then its previous one (fail-open)."""
+        parts: list[str] = []
+        runs = [[]] + ([['--previous']] if pod.restart_count else [])
+        for extra in runs:
+            try:
+                parts.append(self._kubectl(['logs', pod.container_id, '--tail',
+                                            str(tail), *extra]))
+            except Exception:  # noqa: BLE001 - gone, or no previous run
+                pass
+        return '\n'.join(p for p in parts if p)
+
+    def startup_failure(self, deployment: Deployment) -> str | None:
+        """Why this Model's engine cannot start, or ``None`` if it may still load."""
+        from ..leasing.diagnosis import diagnose_startup
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            residency = self.residency()
+        except ResidencyUnknown:
+            return None                      # cannot read the cluster: say nothing
+        return diagnose_startup(residency.units(deployment.id),
+                                lambda: self.deployment_logs(deployment, tail=200),
+                                replicated=residency.replicated,
+                                unit_logs=lambda pod: self._pod_logs(pod, 200))
+
+    def _capacity_shortage(self, deployment: Deployment) -> set[str]:
+        """Resources the scheduler says this Model's pending pods lack."""
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().units(deployment.id)
+        except ResidencyUnknown:
+            return set()
+        return {r for p in pods if p.reason == 'Unschedulable'
+                for r in insufficient_resources(p.message)}
+
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """Which idle Models could free room for ``blocked``, in ``idle``'s order.
+
+        One whose pod runs on a node ``blocked`` could be scheduled on, and
+        requests a resource the scheduler says is short. Nothing when the
+        blocked pod is not short of capacity, when its node constraints
+        cannot be evaluated, or when the cluster cannot be read: an eviction
+        that cannot help only loses a warm model.
+        """
+        try:
+            pods = json.loads(self._kubectl(
+                ['get', 'pods', '-l', f'{MANAGED_LABEL}=true', '-o', 'json']) or '{}')
+            nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
+        except Exception:  # noqa: BLE001 - unknown: evict nothing
+            return []
+        items = pods.get('items') or []
+
+        def gid(pod):
+            return ((pod.get('metadata') or {}).get('labels') or {}).get(DEPLOYMENT_LABEL)
+
+        short: set[str] = set()
+        where: set[str] | None = set()
+        for pod in items:
+            if gid(pod) != blocked.id:
+                continue
+            for cond in (pod.get('status') or {}).get('conditions') or []:
+                if cond.get('reason') == 'Unschedulable' and cond.get('status') == 'False':
+                    found = insufficient_resources(str(cond.get('message') or ''))
+                    if found:
+                        short |= found
+                        nodes_here = eligible_nodes(pod.get('spec') or {},
+                                                    nodes.get('items') or [])
+                        if nodes_here is None:
+                            where = None
+                        elif where is not None:
+                            where |= nodes_here
+        if not short or not where:
+            return []
+        wanted = {g.id for g in idle}
+        useful = {gid(pod) for pod in items
+                  if gid(pod) in wanted
+                  and (pod.get('spec') or {}).get('nodeName') in where
+                  and _requests(pod) & short}
+        return [g.id for g in idle if g.id in useful]
+
+    def _waiting_reason(self, deployment: Deployment) -> str:
+        """The pod's own reason for not running yet (``ImagePullBackOff``...)."""
+        from ..leasing.residency import ResidencyUnknown
+
+        try:
+            pods = self.residency().units(deployment.id)
+        except ResidencyUnknown:
+            return ''
+        reasons = sorted({p.reason for p in pods if p.reason and p.state != 'running'})
+        return ', '.join(reasons)
 
     def observe(self) -> set[str]:
         """Deployment ids with a managed Model CR on the cluster (best-effort)."""
@@ -475,59 +1284,96 @@ class KubeaiBackend(ConvergeScaffold):
         """
         if deployment.id not in self.observe():
             return Readiness(False, 'Model CR not on the cluster')
-        name = model_name_for(_served_name(deployment))
         served = deployment.served.get(endpoint) or {}
         protocol = served.get('protocol') or 'chat'
+        if self.gateway is not None:
+            # Ready means ready the way a client sees it: the alias, through
+            # the gateway, with its key.
+            front = self.gateway.gateway          # the runner's leasing.gateway.Gateway
+            base, model = f'{front._gateway_base()}/v1', endpoint
+            headers = front._auth_headers()
+        else:
+            base, model = self.base_url, model_name(deployment)
+            headers = None
         ok, reason = openai_ready(
-            base_url=self.base_url,
-            model=name,
+            base_url=base,
+            headers=headers,
+            model=model,
             protocol=protocol,
             require_listed=True,
             require_generation=True,
             http=self.http,
         )
-        return Readiness(ok, reason)
+        if ok:
+            return Readiness(True, reason)
+        # One pod list supplies startup, scheduler and progress facts together.
+        from ..leasing.diagnosis import diagnose_startup
+        from ..leasing.residency import residency_from_pods
+        try:
+            raw = self._kubectl(['get', 'pods', '-l', f'{MANAGED_LABEL}=true', '-o', 'json'])
+            residency = residency_from_pods(raw)
+            units = residency.units(deployment.id)
+            failure = diagnose_startup(units,
+                lambda: self.deployment_logs(deployment, tail=200),
+                replicated=residency.replicated, unit_logs=lambda pod: self._pod_logs(pod, 200))
+            if failure is not None:
+                return Readiness(False, failure, fatal=True)
+            pods = [p for p in json.loads(raw).get('items', [])
+                    if p.get('metadata', {}).get('labels', {}).get(DEPLOYMENT_LABEL) == deployment.id]
+            short = any(p.reason == 'Unschedulable' and insufficient_resources(p.message) for p in units)
+            detail = model_startup_progress(pods)
+            return Readiness(False, detail, needs_room=short)
+        except Exception as ex:  # diagnostic failure is unknown, never an all-clear
+            return Readiness(False, f'Cannot inspect Model pods: {ex}; API: {reason}')
 
-    def access(self, endpoints: list[str]) -> dict[str, Any] | None:
-        """Where a client reaches these endpoints (env-file descriptor).
+    def connection_info(self):
+        """Where a client reaches these endpoints: the gateway's front door, or
+        without one KubeAI's own OpenAI server, which is unauthenticated (the
+        api key is the literal ``EMPTY`` placeholder, and no key variable)."""
+        from ..leasing.backend import ConnectionInfo
 
-        One gateway ``base_url`` for everything; the request name is the Model
-        CR name (from the render sidecar), not the endpoint alias — KubeAI has
-        no alias layer. The gateway is unauthenticated, so the api key is the
-        literal ``EMPTY`` placeholder and no key env var is advertised.
-        """
+        if self.gateway is not None:
+            return self.gateway.connection_info()
+        return ConnectionInfo(self.base_url, api_key_env=None, api_key='EMPTY')
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        """The alias behind the gateway; without it the Model CR name (from the
+        render sidecar): KubeAI has no alias layer."""
+        if self.gateway is not None:
+            return {ep: ep for ep in endpoints}
         request_names = self._load_sidecar().get('request_names') or {}
-        return {
-            'base_url': self.base_url,
-            'api_key_env': None,
-            'api_key': 'EMPTY',
-            'request_names': {
-                ep: request_names.get(ep, model_name_for(ep))
-                for ep in endpoints
-            },
-        }
+        return {ep: request_names.get(ep, model_name_for(ep)) for ep in endpoints}
 
-    # -- realize/teardown (Protocol completeness; converge path supersedes) ---
+    #: No containers of this host to manage: the cluster owns network and pods.
+    host_runtime = None
 
-    def realize(self, deployment: Deployment) -> None:  # pragma: no cover
-        # The controller always drives converge-style backends through
-        # converge()/apply(); realize exists only so the Backend Protocol is
-        # satisfied. Deliberately NOT converge([deployment]) — a one-element
-        # desired set would prune every other managed Model.
-        pass
+    @property
+    def recovery_profile(self) -> KubeaiBackend:
+        """This backend is its own :class:`~infer_stack.leasing.backend.RecoveryProfile`."""
+        return self
 
-    def teardown(self, deployment: Deployment) -> None:
-        name = model_name_for(_served_name(deployment))
-        self._kubectl(
-            ['delete', 'models.kubeai.org', name, '--ignore-not-found']
-        )
+    def settle_snapshot(self):
+        """The host gateway's Compose containers, or ``None``.
+
+        ``kubectl apply`` is declarative server-side and leaves nothing half
+        done, but a gateway on this host is a Compose project whose Docker
+        work can outlive a killed client, exactly as on the compose backend.
+        """
+        return self.gateway.settle_snapshot() if self.gateway is not None else None
+
+    def recovery_blockers(self) -> list[str]:
+        """Strict transition gate, including Models whose pods have not started."""
+        return ([f'Model/{name}' for name in self._cluster_models()]
+                + [i.name for i in self.instances()])
 
     def down(self) -> None:
-        """Delete every infer-stack-managed Model (explicit stop)."""
+        """Delete every infer-stack-managed Model (explicit stop), and the gateway."""
         for name in sorted(self._cluster_models()):
             self._kubectl(
                 ['delete', 'models.kubeai.org', name, '--ignore-not-found']
             )
+        if self.gateway is not None:
+            self.gateway.down()
 
     # -- preflight -------------------------------------------------------------
 
@@ -537,7 +1383,7 @@ class KubeaiBackend(ConvergeScaffold):
         Everything ``acquire`` needs, checked cheaply and in dependency order,
         so a fresh setup fails as a checklist instead of a mid-acquire
         traceback: cluster reachable -> KubeAI CRD installed -> namespace
-        exists -> gateway answering at ``base_url``. Never raises.
+        exists -> KubeAI's API answering at ``base_url``. Never raises.
         """
         checks: list[tuple[str, bool, str]] = []
 
@@ -553,21 +1399,25 @@ class KubeaiBackend(ConvergeScaffold):
         if not _run_check(
             'cluster reachable',
             ['version', '--client=false', '-o', 'json'],
-            'is the kubeconfig set up? (scripts/bootstrap_k3s.sh)',
+            'select a reachable Kubernetes kubeconfig/context, then run `infer-stack kube doctor`',
         ):
             return checks
         if not _run_check(
             'KubeAI Model CRD installed',
             ['get', 'crd', 'models.kubeai.org', '-o', 'name'],
-            'install the chart: scripts/install_kubeai.sh',
+            'run `infer-stack kube doctor` to inspect, then `infer-stack kube install --apply`',
         ):
             return checks
-        _run_check(
+        if not _run_check(
             f'namespace {self.namespace!r} exists',
             ['get', 'namespace', self.namespace, '-o', 'name'],
-            f'kubectl create namespace {self.namespace} (or install the '
-            'chart there)',
-        )
+            f'infer-stack kube install --namespace={self.namespace} --apply',
+        ):
+            return checks
+        if getattr(self.gateway, 'in_cluster', False):
+            # Clients use the gateway in the cluster; no port-forward needed.
+            checks.append(self.gateway.doctor_check())
+            return checks
         try:
             resp = self.http.get(f'{self.base_url}/models', timeout=10)
             code = getattr(resp, 'status_code', 0)
@@ -578,9 +1428,15 @@ class KubeaiBackend(ConvergeScaffold):
         except Exception as ex:  # noqa: BLE001 - report, don't raise
             ok = False
             detail = (
-                f'{ex} — is the gateway routed? e.g. '
-                f'`kubectl -n {self.namespace} port-forward svc/kubeai '
-                '8000:80` (or set kubeai_base_url)'
+                f'{ex} — inspect `infer-stack kube status`, then '
+                'set a reachable API with `infer-stack config set kubeai_base_url <URL>`'
             )
-        checks.append((f'gateway at {self.base_url}', ok, detail))
+        # KubeAI's own API (what the port-forward reaches), not infer-stack's
+        # LiteLLM gateway, which starts with the first acquire.
+        checks.append((f"KubeAI's API at {self.base_url}", ok, detail))
+        if self.gateway is not None and hasattr(self.gateway, 'doctor'):
+            # The gateway on this host is a Compose project: Docker and its
+            # images are part of what an acquire needs.
+            checks.extend((f'gateway: {name}', good, why)
+                          for name, good, why in self.gateway.doctor())
         return checks

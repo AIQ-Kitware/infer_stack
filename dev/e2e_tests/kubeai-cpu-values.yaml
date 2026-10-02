@@ -1,0 +1,38 @@
+# KubeAI on a GPU-less machine, for exercising the kubeai backend for real.
+# The chart's `cpu` profile runs vLLM's CPU image (needs AVX-512). Sized for
+# a sub-1B model; raise the requests for anything larger.
+resourceProfiles:
+  cpu:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
+  # Half the guest's 120 cores: only one such Model fits at a time, which is
+  # how dev/kubeai_e2e.sh's make-room check forces a scheduling conflict.
+  cpu-half:
+    imageName: "cpu"
+    requests:
+      cpu: 64
+      memory: "16Gi"
+  # Two "GPU sizes" on CPU, for the sizing check (E2E_SIZED=1 in
+  # dev/kubeai_e2e.sh): each selects the nodes labelled with one fake GPU
+  # product, as a real profile selects nvidia.com/gpu.product. `sized-80g`
+  # tolerates dev/k3s_agent_container.sh's taint, so it lands on that node.
+  sized-24g:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
+    nodeSelector:
+      nvidia.com/gpu.product: "FAKE-24G"
+  sized-80g:
+    imageName: "cpu"
+    requests:
+      cpu: 8
+      memory: "16Gi"
+    nodeSelector:
+      nvidia.com/gpu.product: "FAKE-80G"
+    tolerations:
+    - key: infer-stack.test/simulated
+      operator: Exists
+      effect: NoSchedule

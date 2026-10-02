@@ -37,12 +37,27 @@ On acquire, under the publication lock:
 1. Resolve the requested endpoint from the user's current catalog.
 2. Compare current user settings/catalog with the recovery snapshot.
 3. If the stack is quiescent (no active lease and no managed deployment
-   container), replace the snapshot wholesale with current user config.
+   container), adopt the current user settings.
 4. If workloads are resident, keep global render settings frozen for that
-   leasing epoch, but merge compatible catalog additions into the snapshot.
-   Existing endpoint/bundle/route definitions may not be redefined live.
-5. Preview/admit/render using that exact candidate snapshot, then persist the
-   snapshot before committing the acquire's desired-state mutation.
+   leasing epoch.
+   In both cases merge the current catalog into the snapshot's published
+   endpoint definitions: a definition it changes replaces the published one
+   unless a resident workload runs it (then the acquire refuses); every other
+   published definition stays. *Amended 2026-09-27
+   ([external-endpoints](../planning/external-endpoints.md), decision 1):
+   quiescence used to replace the catalogs wholesale too, but an external
+   endpoint has no lease to keep it published, so only an explicit
+   `routes prune` unpublishes.*
+5. Preview/admit/render using that exact candidate snapshot, then commit the
+   snapshot in the same transaction as the lease and the publication marker.
+   *Amended 2026-09-27 (queue item 42):* the snapshot's catalogs are the
+   published endpoint set, so writing them is publishing. It used to be
+   written before the lease, and a ledger's first snapshot on its first
+   mutation of any kind; now a crash or a declined approval before the commit
+   publishes nothing. A first non-endpoint mutation (gc, release, evict)
+   commits settings with no catalogs, with its marker; `access` and a first
+   `apply` / `stack up` publish the invocation's endpoints through the same
+   approved single commit.
 
 Compatible catalog additions therefore support the common pattern of adding a
 new model while another model is already serving. A conflicting edit is a real
@@ -80,8 +95,8 @@ published definitions are retained and incoming definitions are appended only
 if the semantic `CatalogUnion` has no conflicts. Thus an unrelated catalog edit
 cannot silently change an existing deployment's recovery render.
 
-A wholesale snapshot replacement is allowed only at the same quiescence
-boundary used by explicit publication. This preserves the original motivation
+Replacing the settings is allowed only at the same quiescence boundary used
+by explicit publication; `config publish` still replaces the whole snapshot. This preserves the original motivation
 for the frozen profile while removing it from the normal UX.
 
 ## Consequences

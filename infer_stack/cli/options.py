@@ -2,17 +2,63 @@ from __future__ import annotations
 
 from ..paths import CONFIG_DIR_ENV
 from ..paths import DATA_DIR_ENV
-import scriptconfig as scfg
+import kwconf as kw
 
 # ---------------------------------------------------------------------------
 # DataConfig mixins for common override flags
 # ---------------------------------------------------------------------------
 
 
-class _PathOverridesMixin(scfg.DataConfig):
+#: Values a bare flag may carry (``--yes false``); anything else was a positional.
+_BOOL_WORDS = frozenset({'true', 'false', 'yes', 'no', 'on', 'off', '1', '0'})
+
+
+def reclaim_swallowed_positionals(config) -> None:
+    """Give back a positional argument that a preceding flag consumed.
+
+    kwconf flags take an optional value, so ``logs -f qwen`` parsed as
+    ``follow='qwen'`` and no names: the command then acted on everything.
+    Every infer-stack flag is a boolean, so a flag holding any other string
+    was handed a positional. It becomes ``True``, and the string goes back to
+    the front of the command's positional list (or its single positional,
+    when that is still empty).
+    """
+    defaults = type(config).__default__
+    positional = sorted((k for k, v in defaults.items() if getattr(v, 'position', None)),
+                        key=lambda k: defaults[k].position)
+    for key, value in defaults.items():
+        if not getattr(value, 'isflag', False) or value.isflag == 'counter':
+            continue
+        got = config[key]
+        if not isinstance(got, str) or got.strip().lower() in _BOOL_WORDS:
+            continue
+        config[key] = True
+        if not positional:
+            raise SystemExit(f'--{key} takes no value (got {got!r})')
+        target = positional[0]
+        many = defaults[target].parsekw.get('nargs') in ('*', '+')
+        if many:
+            config[target] = [got, *(config[target] or [])]
+        elif config[target] in (None, ''):
+            config[target] = got
+        else:
+            raise SystemExit(f'--{key} takes no value (got {got!r})')
+
+
+class _FlagSafeMixin(kw.Config):
+    """Parses ``--flag positional`` as a flag and a positional (see above)."""
+
+    @classmethod
+    def cli(cls, *args, **kwargs):
+        config = super().cli(*args, **kwargs)
+        reclaim_swallowed_positionals(config)
+        return config
+
+
+class _PathOverridesMixin(_FlagSafeMixin):
     """Adds global ``--config-dir`` / ``--data-dir`` to a subcommand."""
 
-    config_dir = scfg.Value(
+    config_dir = kw.Value(
         None,
         type=str,
         help=(
@@ -20,7 +66,7 @@ class _PathOverridesMixin(scfg.DataConfig):
             f'~/.config/infer_stack (XDG_CONFIG_HOME) or ${CONFIG_DIR_ENV} when set.'
         ),
     )
-    data_dir = scfg.Value(
+    data_dir = kw.Value(
         None,
         type=str,
         help=(
@@ -30,42 +76,42 @@ class _PathOverridesMixin(scfg.DataConfig):
     )
 
 
-class _BackendOverrideMixin(scfg.DataConfig):
-    backend = scfg.Value(
-        None, choices=['compose', 'kubeai'], help='Active backend override.'
+class _BackendOverrideMixin(kw.Config):
+    backend = kw.Value(
+        None, type=str, choices=['compose', 'kubeai'], help='Active backend override.'
     )
 
 
-class _ComposeOverrideMixin(scfg.DataConfig):
-    compose_cmd = scfg.Value(
+class _ComposeOverrideMixin(kw.Config):
+    compose_cmd = kw.Value(
         None,
         type=str,
         help="Docker compose command override (e.g. 'podman compose').",
     )
 
 
-class _ProfileOverrideMixin(scfg.DataConfig):
-    profile = scfg.Value(
+class _ProfileOverrideMixin(kw.Config):
+    profile = kw.Value(
         None,
         type=str,
         help='Active profile override (sets config.active_profile).',
     )
 
 
-class _PortOverridesMixin(scfg.DataConfig):
-    litellm_port = scfg.Value(None, type=int)
-    open_webui_port = scfg.Value(None, type=int)
-    postgres_port = scfg.Value(None, type=int)
+class _PortOverridesMixin(kw.Config):
+    litellm_port = kw.Value(None, type=int)
+    open_webui_port = kw.Value(None, type=int)
+    postgres_port = kw.Value(None, type=int)
 
 
-class _ClusterOverridesMixin(scfg.DataConfig):
-    namespace = scfg.Value(
+class _ClusterOverridesMixin(kw.Config):
+    namespace = kw.Value(
         None, type=str, help='Kubernetes namespace for kubeai deployments.'
     )
-    ingress_host = scfg.Value(
+    ingress_host = kw.Value(
         None, type=str, help='Ingress host (kubeai only).'
     )
-    ingress_enabled = scfg.Value(
+    ingress_enabled = kw.Value(
         None,
         isflag=True,
         alias=['ingress'],
@@ -73,24 +119,24 @@ class _ClusterOverridesMixin(scfg.DataConfig):
     )
 
 
-class _AllowUnsupportedMixin(scfg.DataConfig):
-    allow_unsupported = scfg.Value(
+class _AllowUnsupportedMixin(kw.Config):
+    allow_unsupported = kw.Value(
         False,
         isflag=True,
         help='Allow validation errors when planning/rendering.',
     )
 
 
-class _SimulateHardwareMixin(scfg.DataConfig):
-    simulate_hardware = scfg.Value(
+class _SimulateHardwareMixin(kw.Config):
+    simulate_hardware = kw.Value(
         None,
         type=str,
         help='Simulate GPUs: comma-separated NxM or M entries (e.g. 4x96, 2x80, "48,16" for a heterogeneous host). Useful for planning on smaller machines.',
     )
 
 
-class _AllowedGpusMixin(scfg.DataConfig):
-    allowed_gpus = scfg.Value(
+class _AllowedGpusMixin(kw.Config):
+    allowed_gpus = kw.Value(
         None,
         type=str,
         help=(
@@ -102,8 +148,8 @@ class _AllowedGpusMixin(scfg.DataConfig):
     )
 
 
-class _DisplayGpuMixin(scfg.DataConfig):
-    skip_display_gpus = scfg.Value(
+class _DisplayGpuMixin(kw.Config):
+    skip_display_gpus = kw.Value(
         None,
         isflag=True,
         alias=['skip-display-gpus'],

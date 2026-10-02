@@ -18,7 +18,7 @@ from ..paths import set_config_root, set_data_root
 def _as_mapping(args: Any) -> dict[str, Any]:
     """Coerce a CLI args object into a plain dict.
 
-    Works for ``None``, ``argparse.Namespace``, and ``scfg.DataConfig``
+    Works for ``None``, ``argparse.Namespace``, and ``kw.Config``
     instances. Used to side-step name clashes between user-declared fields and
     ``DataConfig`` builtins.
     """

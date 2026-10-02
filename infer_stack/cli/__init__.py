@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
-"""scriptconfig-based CLI for infer-stack.
+"""kwconf-based CLI for infer-stack.
 
-Each subcommand is a ``scfg.DataConfig`` subclass; ``ManageCLI`` composes
-them into a single ``scfg.ModalCLI`` exposed as the ``infer-stack`` entry
+Each subcommand is a ``kw.Config`` subclass; ``ManageCLI`` composes
+them into a single ``kw.ModalCLI`` exposed as the ``infer-stack`` entry
 point. Because every subcommand is a ``DataConfig``, the same class can
 be invoked from the shell (``infer-stack render --profile X``) or from
 Python (``RenderCLI.main(argv=False, profile='X')``).
@@ -15,6 +15,7 @@ The layers are:
 * ``compose``  — compose + LiteLLM helpers.
 * ``options``  — shared ``DataConfig`` mixins for override flags.
 * ``commands_catalog`` — catalog editor (models/endpoints/hosts/bundles).
+* ``commands_kube``    — Kubernetes integration inspection/setup.
 * ``commands_leasing`` — acquire/release/run/leases/test + reconcile.
 * ``commands_runtime`` — ``status`` + ``stack`` day-2 compose wrappers.
 * ``commands_meta``    — version/help/config introspection.
@@ -22,7 +23,7 @@ The layers are:
 
 from __future__ import annotations
 
-import scriptconfig as scfg
+import kwconf as kw
 
 from .. import __version__
 
@@ -30,6 +31,7 @@ from .. import __version__
 # so tests can patch seams where they are actually looked up.
 from . import (  # noqa: F401
     commands_catalog,
+    commands_kube,
     commands_leasing,
     commands_meta,
     commands_mock,
@@ -38,8 +40,10 @@ from . import (  # noqa: F401
     options,
 )
 from .commands_catalog import CatalogModalCLI
-from .commands_mock import MockModalCLI
+from .commands_kube import KubeModalCLI
+from .commands_ledger import LedgerModalCLI
 from .commands_leasing import (
+    AccessCLI,
     AcquireCLI,
     ApplyCLI,
     CleanCLI,
@@ -59,6 +63,7 @@ from .commands_leasing import (
 )
 from .commands_leasing import EnvCLI as LeasingEnvCLI
 from .commands_leasing import RenderCLI as LeasingRenderCLI
+from .commands_mock import MockModalCLI
 from .commands_meta import (
     ConfigModalCLI,
     ConfigPathsCLI,
@@ -78,7 +83,11 @@ from .commands_runtime import (
 # ---------------------------------------------------------------------------
 
 
-class ManageCLI(scfg.ModalCLI):
+class ManageCLI(kw.ModalCLI):
+    # The program name in usage and error messages (kwconf would use the class
+    # name, "ManageCLI").
+    __prog__ = 'infer-stack'
+
     description = (
         'Lease, acquire, and run LLM endpoints. Primary workflow: '
         'catalog -> acquire/run. See `infer-stack help tree`.'
@@ -104,7 +113,7 @@ class ManageCLI(scfg.ModalCLI):
         actual. Run `infer-stack help tree` for the whole command surface.
     """
 
-    # Backs the modal ``--version`` flag (scriptconfig reads ``__version__``).
+    # Backs the modal ``--version`` flag (kwconf reads ``__version__``).
     # The ``version`` *subcommand* is registered below under a non-colliding
     # attribute name; its CLI name comes from ``VersionCLI.__command__``.
     __version__ = __version__
@@ -116,6 +125,7 @@ class ManageCLI(scfg.ModalCLI):
     paths = ConfigPathsCLI  # top-level alias for `config paths`
     status = StatusCLI
     doctor = DoctorCLI  # preflight the configured backend's prerequisites
+    kube = KubeModalCLI  # inspect/setup the Kubernetes integration infer-stack needs
 
     # Catalog editor (models / endpoints / hosts / bundles — no raw YAML)
     catalog = CatalogModalCLI
@@ -125,6 +135,7 @@ class ManageCLI(scfg.ModalCLI):
 
     # Leasing model (acquire/release/run + status)
     acquire = AcquireCLI  # stand up endpoints: lease + up + wait (--ttl for soft TTL)
+    access = AccessCLI  # reach endpoints, managed or external: lease only what runs here
     release = ReleaseCLI
     evict = EvictCLI  # force-tear-down released (idle) models to free GPUs
     gc = GcCLI  # reclaim TTL-expired (leaked) leases + free their GPUs
@@ -136,6 +147,7 @@ class ManageCLI(scfg.ModalCLI):
     apply = ApplyCLI  # bring the desired set up (the trigger for acquire --no-apply)
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
+    ledger = LedgerModalCLI
     routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
     network = NetworkModalCLI  # stable per-service addresses + upstream routing check
     tui = TuiCLI  # live Textual monitor + controls (opt-in: infer-stack[tui])
@@ -161,14 +173,72 @@ def __getattr__(name: str):
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
+def runtime_failure(exc) -> str:
+    """A failed ``docker`` / ``kubectl`` command, for a person, not a traceback.
+
+    The command (without its long path arguments), the runtime's own last
+    words, and a hint for the failures with a known cause.
+
+    >>> import subprocess
+    >>> ex = subprocess.CalledProcessError(1, ['docker', 'compose', '-p', 'x', 'up', '-d'],
+    ...     stderr='Error: Bind for :::14042 failed: port is already allocated')
+    >>> print(runtime_failure(ex))
+    `docker compose up -d` failed:
+      Error: Bind for :::14042 failed: port is already allocated
+      port 14042 is in use by something else (`ss -ltnp | grep :14042` shows what); stop it, then `infer-stack apply`
+    >>> ex.stderr = 'failed to bind host port 0.0.0.0:13000/tcp: address already in use'
+    >>> runtime_failure(ex).splitlines()[-1].split(' (')[0]
+    '  port 13000 is in use by something else'
+    """
+    import re
+
+    cmd = [str(a) for a in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd])]
+    # Drop option values that are paths or project names: the verb is what reads.
+    shown, skip = [], False
+    for arg in cmd:
+        if skip:
+            skip = False
+            continue
+        if arg in ('-f', '-p', '--env-file', '-n', '--namespace'):
+            skip = True
+            continue
+        shown.append(arg)
+    text = '\n'.join(filter(None, [exc.stderr or '', exc.output or '']))
+    last = [ln.strip() for ln in str(text).splitlines() if ln.strip()][-3:]
+    lines = [f'`{" ".join(shown)}` failed:'] + [f'  {ln}' for ln in last]
+    port = re.search(r'Bind for \S*?:(\d+) failed: port is already allocated'
+                     r'|:(\d+)(?:/tcp)?: (?:bind: )?address already in use', str(text))
+    if port:
+        number = port.group(1) or port.group(2)
+        lines.append(f'  port {number} is in use by something else (`ss -ltnp | grep '
+                     f':{number}` shows what); stop it, then `infer-stack apply`')
+    elif shown and shown[0] in ('docker', 'kubectl'):
+        lines.append('  `infer-stack doctor` checks what this backend needs')
+    return '\n'.join(lines)
+
+
 def main(argv=None) -> int:
+    import subprocess
+
     from ..leasing import LeaseLockError
+    from ..leasing.backend import BackendTimeout
+    from ..leasing.gateway import MissingRouteKey
 
     try:
         rv = ManageCLI.main(argv=argv)
     except LeaseLockError as exc:
         # A mutating verb (acquire/release/gc/evict/apply) could not get the
         # cross-process lock; surface the actionable diagnosis, not a traceback.
+        raise SystemExit(str(exc))
+    except subprocess.CalledProcessError as exc:
+        # The runtime refused (a port in use, a daemon down): its words and a
+        # hint, not our stack. The controller already rolled back what it had
+        # committed, or left the change pending for `infer-stack apply`.
+        raise SystemExit(runtime_failure(exc))
+    except BackendTimeout as exc:
+        raise SystemExit(str(exc))
+    except MissingRouteKey as exc:
+        # Any publishing verb: the render refused before anything changed.
         raise SystemExit(str(exc))
     return int(rv) if rv is not None else 0
 
