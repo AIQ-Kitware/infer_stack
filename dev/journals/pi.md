@@ -124,20 +124,22 @@ What I did, in dependency order:
   and window-change drift, the remembered registry (new/legacy/junk rows),
   one deployment with two aliases, and the KubeAI static + dynamic paths.
 
-A consequence worth remembering: the window is now visible in the rendered
-gateway config, so the "config byte-stable as models come and go" property
-now holds *because the live deployment and its catalog endpoint agree on
-the window* — which is true for every catalog-derived acquisition (the
-deployment's runtime is the endpoint's runtime). Three old tests built
-hand-crafted deployments whose runtimes disagreed with the catalog they
-simulated; I aligned those fixtures (`_catalog_dict` in
-test_leasing_route_registry, the two/three-endpoint catalogs in
-test_leasing_compose, and the inline catalog in the kubeai test) so they
-model what a real acquisition carries. The one case where the bytes can
-still move is real and intended: a shared deployment that serves several
-catalog aliases declaring different windows advertises the launched
-(maximum) window while alive, and each alias reverts to its own declared
-window when the deployment is released.
+A consequence worth remembering: context is an endpoint contract, while
+`max_model_len` is also a deployment-capacity field. Capacity subsumption
+means a 65K catalog alias can legitimately share a compatible 262K process.
+The alias must still advertise 65K, both to keep its public contract stable
+and to preserve the static gateway's byte-stability across acquire/release.
+The catalog resolver therefore records `max_input_tokens` in each vLLM
+endpoint's `served` payload; route rendering uses that per-alias value, with a
+catalog fallback for deployments persisted before the field existed and the
+deployment runtime only as the ad-hoc fallback.
+
+LiteLLM can independently populate `max_input_tokens` from its bundled model
+metadata for an external route even when infer-stack did not set a window.
+Dynamic reconciliation must ignore such synthesized context when the desired
+route has no infer-stack-owned value; otherwise a known external model is
+deleted and re-added forever. When infer-stack does publish a window, drift
+remains strict and still forces replacement.
 
 Validation (CPU-only; this VM has no Docker, K8s, or a live LiteLLM):
 `pytest --xdoctest infer_stack tests` → 1184 passed, 8 skipped; flake8

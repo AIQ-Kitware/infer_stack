@@ -122,12 +122,12 @@ def effective_max_model_len(runtime: dict[str, Any] | None) -> int:
     The runtime's ``max_model_len`` when set (a legacy ``serve_recipe``
     translated first, exactly as the launch does; the translation is
     idempotent, so an already-translated runtime is fine), else the engine
-    default. This is the single source of truth for the effective window:
-    the same value launches the engine and is advertised to clients (the
-    LiteLLM route's ``model_info.max_input_tokens``), so what a client sees
-    can never drift from what the process was started with. Nothing is
-    coerced beyond the value itself: a window infer-stack would launch with
-    is the window it advertises.
+    default. This is the single derivation of an endpoint/runtime's effective
+    window: it launches a newly created deployment and seeds that endpoint's
+    LiteLLM ``model_info.max_input_tokens`` contract. Capacity subsumption may
+    later serve a smaller endpoint from a larger compatible deployment; in
+    that case the endpoint correctly keeps the smaller contract. Nothing is
+    coerced beyond the value itself.
 
     Example:
         >>> effective_max_model_len({'max_model_len': 262144})

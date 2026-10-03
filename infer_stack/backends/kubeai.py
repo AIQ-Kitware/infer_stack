@@ -790,10 +790,14 @@ class KubeaiBackend(ConvergeScaffold):
         to its own Model, so same-model ``--dedicated`` Models share the alias
         and LiteLLM balances across them. External endpoints route to their
         own servers either way, never through KubeAI. Every vLLM route
-        advertises the effective ``max_model_len`` its Model launches with.
+        advertises its endpoint context contract; when aliases coalesce, that
+        may be smaller than the shared Model's actual capacity.
         """
-        from ..leasing.gateway import catalog_routes, upstream_route
-        from ..leasing.launch import effective_max_model_len
+        from ..leasing.gateway import (
+            catalog_routes,
+            deployment_route_max_input_tokens,
+            upstream_route,
+        )
         from ..leasing.routes import GatewayRoute, route_table
 
         if self.gateway is None:
@@ -803,8 +807,8 @@ class KubeaiBackend(ConvergeScaffold):
             by_id = {g.id: g for g in desired}
             routes = [
                 upstream_route(gid, endpoint, name, base,
-                               max_input_tokens=effective_max_model_len(
-                                   by_id[gid].spec.get('runtime')))
+                               max_input_tokens=deployment_route_max_input_tokens(
+                                   by_id[gid], endpoint, catalog=self.catalog))
                 for name, gid in sorted(rendered.models.items())
                 for endpoint in sorted(by_id[gid].served)
             ]
@@ -815,7 +819,7 @@ class KubeaiBackend(ConvergeScaffold):
         # A Model serving a catalog alias is that endpoint's route; one serving
         # an alias no catalog defines is the cluster's own (the gateway
         # remembers those past release, as it does ad-hoc deployments). Each
-        # route advertises the window its Model launches with.
+        # route advertises the endpoint's own context contract.
         models = []
         for alias, name in rendered.request_names.items():
             deployment = by_id.get(rendered.models.get(name, ''))
@@ -823,7 +827,8 @@ class KubeaiBackend(ConvergeScaffold):
                 alias, 'openai', name, base,
                 origin='catalog' if alias in defined else 'upstream',
                 max_input_tokens=(
-                    effective_max_model_len(deployment.spec.get('runtime'))
+                    deployment_route_max_input_tokens(
+                        deployment, alias, catalog=self.catalog)
                     if deployment is not None else None)))
         return route_table(catalog, models), []
 

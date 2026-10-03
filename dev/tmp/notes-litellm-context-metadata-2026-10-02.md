@@ -1,11 +1,21 @@
 # Working notes — LiteLLM `model_info.max_input_tokens` from effective `max_model_len`
 
-Task: for every infer-stack-managed vLLM endpoint, advertise the same effective
-`max_model_len` to LiteLLM as the one used to launch vLLM:
+Task: for every infer-stack-managed vLLM endpoint, advertise that endpoint's
+effective configured context contract to LiteLLM:
 
 ```text
-effective vLLM max_model_len == LiteLLM model_info.max_input_tokens
+endpoint effective max_model_len == LiteLLM model_info.max_input_tokens
+endpoint effective max_model_len <= backing deployment max_model_len
 ```
+
+The inequality matters because infer-stack deliberately uses capacity
+subsumption: a 65K request can coalesce onto an already-running compatible
+262K deployment. The route must keep the 65K endpoint contract rather than
+inherit the larger process capacity. New requests persist the per-alias value
+in `Deployment.served`; legacy rows recover published alias values from the
+catalog. LiteLLM may also synthesize `max_input_tokens` from its own cost map
+for external routes; reconcile ignores that field when infer-stack did not set
+one, while remaining strict for infer-stack-managed values.
 
 ## Where things are today (verified in tree, branch dev/0.7.2)
 
@@ -78,14 +88,18 @@ effective vLLM max_model_len == LiteLLM model_info.max_input_tokens
   null, never under litellm_params, never max_output_tokens.
 - `gateway.py`:
   - `compose_catalog_route` vllm branch: `effective_max_model_len(request.spec['runtime'])`
-  - `deployment_routes` vllm branch: same from `deployment.spec['runtime']`
+  - `deployment_routes` vllm branch: per-alias `Deployment.served` contract,
+    catalog fallback for legacy rows, deployment runtime only as the final
+    ad-hoc fallback
   - `upstream_route` gains optional `max_input_tokens` kwarg
   - `remembered_rows`: vllm rows remember the value; upstream rows carry it
     when the route has it
   - `registry_route`: reads the remembered value (guarded: positive int or
     None; a legacy row without it reconstructs with no context — never
     invented)
-  - `_route_semantics`: add `model_info.max_input_tokens` (absent==absent)
+  - `_route_semantics`: add `model_info.max_input_tokens`; reconcile compares
+    it only when infer-stack supplied a desired value, so LiteLLM cost-map
+    metadata on external routes does not cause replacement churn
 - `backends/kubeai.py`: `catalog_routes().managed` and `_front_door_inputs`
   (both branches) feed the value through.
 - Tests A-I in `tests/test_leasing_context_metadata.py` (+ extend the

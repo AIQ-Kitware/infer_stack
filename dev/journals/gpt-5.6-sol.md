@@ -219,3 +219,32 @@ I kept the fix inside the GPU diagnostic rather than weakening backend admission
 The holder classification now distinguishes passive/system observers from unexpected holders. nvidia-persistenced, nvidia-device-plugin, gpu-feature-discovery, and nvtop are informational: they can hold NVIDIA character devices (and may block a low-level reset) but do not by themselves reserve GPU memory or make a Compose/vLLM placement unsafe. Unknown holders still fail the check and preserve the container/pod attribution. The reset-specific note is emitted only when nvidia-persistenced is actually present.
 
 Validation in this extracted checkout: python compileall passes. The normal pytest entrypoint cannot collect because ubelt is absent from the container, so I ran a dependency-light direct harness that reproduces the exact sudo=0/find=1+ENOENT+valid-stdout case and the observed three-process holder set; both pass. Focused pytest regressions were added for the transient /proc race, real find errors, and passive holder classification. The overlay is direct-overwrite and intentionally limited to the diagnostic, its tests, this journal, and the reusable /proc lesson.
+
+## 2026-10-03 — review of LiteLLM context metadata patch
+
+Reviewed commit `2ba288caad36` against the context-metadata requirements. The
+main propagation was sound, but two correctness gaps remained:
+
+1. `max_model_len` participates in capacity subsumption. A 65K endpoint can
+   coalesce onto an already-running compatible 262K deployment, so deriving
+   every route's `max_input_tokens` from the deployment runtime leaks the
+   larger process capacity into the smaller endpoint alias and makes static
+   gateway metadata change across acquire/release. The catalog resolver now
+   persists each vLLM endpoint's effective context contract in its per-alias
+   `served` payload. Route rendering uses that value, falls back to the current
+   catalog for legacy deployments, and only then falls back to deployment
+   capacity for ad-hoc aliases. Compose and KubeAI use the same helper.
+
+2. LiteLLM may synthesize `model_info.max_input_tokens` from its bundled model
+   metadata for an external route even when infer-stack never supplied that
+   field. Dynamic reconciliation previously compared it unconditionally, so a
+   known external model could be deleted and re-added every converge. Reconcile
+   now ignores observed context only when the desired route has no
+   infer-stack-owned context; managed values remain strict drift semantics.
+
+Focused CPU-only validation in the extracted source (with only a minimal
+`ubelt` import stub because the archive environment lacks project deps):
+`tests/test_leasing_context_metadata.py`, dynamic-routing, and route-registry
+suites pass; broader catalog/ledger/admission/routing coverage passes apart
+from two Compose tests that also fail on the unmodified base in this container
+and CLI tests blocked by missing `kwconf`. `compileall` is clean.

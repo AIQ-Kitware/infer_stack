@@ -1,11 +1,12 @@
 """The advertised context window.
 
-The invariant this change implements: for every managed vLLM endpoint, the
-effective ``max_model_len`` its process launches with equals the
-``model_info.max_input_tokens`` the front door advertises about it, on every
-route path (static compose, dynamic /model/new, KubeAI, upstream, and the
-remembered registry). Clients that read ``/v1/model/info`` (such as pi) then
-learn the real context window instead of guessing from the model family.
+Each managed vLLM endpoint advertises its effective configured context contract
+as ``model_info.max_input_tokens`` on every route path (static compose, dynamic
+``/model/new``, KubeAI, upstream, and the remembered registry). Usually that is
+also the backing process's ``max_model_len``. With capacity subsumption a small
+endpoint can share a larger process, and must keep its smaller public contract.
+Clients that read ``/v1/model/info`` (such as pi) therefore learn the endpoint
+limit infer-stack manages instead of guessing from the model family.
 """
 
 from __future__ import annotations
@@ -201,6 +202,23 @@ def test_route_semantics_include_the_window():
     assert Gateway._route_semantics(lo) == Gateway._route_semantics(lo)
 
 
+def test_litellm_synthesized_context_does_not_churn_external_route():
+    """A cost-map value is observable metadata, not infer-stack-owned drift."""
+    desired = Gateway._route_semantics(
+        GatewayRoute('known', 'openai', 'Qwen/Qwen3-1.7B', 'http://box/v1',
+                     route_id='isr-external').entry())
+    current = dict(desired, max_input_tokens=32768)
+    assert Gateway._route_semantics_match(desired, current)
+
+    # Managed capacity stays strict: once infer-stack publishes a value, a
+    # different observed value really is stale route state.
+    managed = Gateway._route_semantics(
+        GatewayRoute('known', 'openai', 'Qwen/Qwen3-1.7B', 'http://box/v1',
+                     route_id='isr-managed', max_input_tokens=65536).entry())
+    assert not Gateway._route_semantics_match(
+        managed, dict(managed, max_input_tokens=32768))
+
+
 # -- F/G. the remembered registry --------------------------------------------
 
 
@@ -267,6 +285,117 @@ def test_two_aliases_of_one_deployment_advertise_the_same_window():
         routes['shared-model'].entry()['model_info'] == {
             'max_input_tokens': 65536,
         }
+
+
+def test_coalesced_aliases_keep_their_own_catalog_context_contract():
+    """A smaller alias can share a larger process without becoming 'larger'."""
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.gateway import front_door_routes
+
+    catalog = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {
+            'small': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'tensor_parallel_size': 1,
+                            'max_model_len': 65536},
+            },
+            'full': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'tensor_parallel_size': 1,
+                            'max_model_len': 262144},
+            },
+        },
+    })
+    small = catalog.resolve_endpoint('small').to_request()
+    full = catalog.resolve_endpoint('full').to_request()
+    assert small.served['max_input_tokens'] == 65536
+    assert full.served['max_input_tokens'] == 262144
+    assert small.compat_key == full.compat_key
+
+    # Model the normal coalescing direction: the full deployment already
+    # exists and the smaller request is added to its served aliases.
+    deployment = Deployment(
+        'grp-shared', full.compat_key, 'vllm', 'shared-compatible',
+        dict(full.capacity), dict(full.spec),
+        {'full': dict(full.served), 'small': dict(small.served)},
+        DeploymentState.LIVE, 0.0, 0.0,
+    )
+    static, _ = front_door_routes(
+        [deployment], {'grp-shared': [0]}, catalog=catalog)
+    by_alias = {route.alias: route for route in static}
+    assert by_alias['small'].max_input_tokens == 65536
+    assert by_alias['full'].max_input_tokens == 262144
+
+    _, dynamic = front_door_routes(
+        [deployment], {'grp-shared': [0]}, catalog=catalog, dynamic=True)
+    by_alias = {route.alias: route for route in dynamic}
+    assert by_alias['small'].max_input_tokens == 65536
+    assert by_alias['full'].max_input_tokens == 262144
+
+    from infer_stack.leasing.gateway import remembered_rows
+    rows = remembered_rows(
+        [deployment], {'grp-shared': [0]}, defined=set())
+    assert rows['small']['max_input_tokens'] == 65536
+    assert rows['full']['max_input_tokens'] == 262144
+
+
+def test_ledger_coalescing_preserves_each_alias_context_payload():
+    from infer_stack.leasing import Catalog, Ledger, SqliteStore
+
+    catalog = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {
+            'small': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'max_model_len': 65536},
+            },
+            'full': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'max_model_len': 262144},
+            },
+        },
+    })
+    full = catalog.resolve_endpoint('full').to_request()
+    small = catalog.resolve_endpoint('small').to_request()
+    ledger = Ledger(SqliteStore(':memory:'))
+    big = ledger.acquire('big-user', [full])
+    little = ledger.acquire('small-user', [small])
+    assert big.deployments[0].id == little.deployments[0].id
+    deployment = ledger.get_deployment(big.deployments[0].id)
+    assert deployment.served['small']['max_input_tokens'] == 65536
+    assert deployment.served['full']['max_input_tokens'] == 262144
+
+
+def test_legacy_coalesced_deployment_recovers_alias_windows_from_catalog():
+    """Old ledger rows lack per-alias metadata; published aliases stay correct."""
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.gateway import front_door_routes
+
+    catalog = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/m'}},
+        'endpoints': {
+            'small': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'max_model_len': 65536},
+            },
+            'full': {
+                'engine': 'vllm', 'model': 'm', 'served_name': 'shared-model',
+                'runtime': {'max_model_len': 262144},
+            },
+        },
+    })
+    # This is how a deployment persisted before max_input_tokens was added to
+    # the per-endpoint served payload looks: both aliases only know the common
+    # process identity, whose actual capacity is 262K.
+    deployment = _vllm_dep('grp-old', served='shared-model', max_len=262144,
+                           extra_endpoints=['small', 'full'])
+    deployment.served.pop('shared-model')
+    static, _ = front_door_routes(
+        [deployment], {'grp-old': [0]}, catalog=catalog)
+    by_alias = {route.alias: route for route in static}
+    assert by_alias['small'].max_input_tokens == 65536
+    assert by_alias['full'].max_input_tokens == 262144
 
 
 def test_upstream_route_advertises_only_when_told():

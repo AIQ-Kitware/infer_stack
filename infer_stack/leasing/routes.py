@@ -41,9 +41,11 @@ class GatewayRoute:
     variable holding the upstream's key (never the key); without one an
     ``openai`` route sends ``EMPTY``. ``route_id`` is a dynamic route's
     managed id. ``origin`` says which owner produced it and is not part of
-    what it means. ``max_input_tokens`` is the context window the upstream
-    was launched with (the effective vLLM ``max_model_len``): it is
-    advertised in ``model_info`` so clients read the true window from
+    what it means. ``max_input_tokens`` is the public endpoint's context
+    contract: normally its effective vLLM ``max_model_len``. A
+    shared-compatible endpoint may be backed by a larger deployment, but its
+    advertised contract stays the endpoint's own configured window. It is
+    emitted in ``model_info`` so clients read the managed window from
     ``/model/info`` instead of guessing (absent when unknown, e.g. for
     servers infer-stack does not run).
 

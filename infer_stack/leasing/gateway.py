@@ -83,8 +83,8 @@ def compose_catalog_route(alias: str, request: Any) -> GatewayRoute | None:
     """Where a Compose front door sends a managed catalog endpoint: the
     engine service its served name determines (the same one every
     deployment of it gets without ``--dedicated``). A vLLM route advertises
-    the effective ``max_model_len`` the service runs with, so clients read
-    the true context window from the gateway rather than guessing."""
+    the endpoint's effective ``max_model_len`` contract, so clients read the
+    managed context window from the gateway rather than guessing."""
     if request.engine == 'vllm':
         served = request.served.get('served_model_name') or alias
         return GatewayRoute(alias, 'openai', served,
@@ -96,6 +96,34 @@ def compose_catalog_route(alias: str, request: Any) -> GatewayRoute | None:
         return GatewayRoute(alias, 'ollama', tag,
                             f'http://{ollama_service_name_for(host)}:{OLLAMA_CONTAINER_PORT}')
     return None
+
+
+def deployment_route_max_input_tokens(
+    deployment: Deployment, endpoint: str, *, catalog: Any = None,
+) -> int:
+    """Context window to advertise for one alias of ``deployment``.
+
+    ``max_model_len`` is a capacity field, so shared-compatible acquisition may
+    satisfy a smaller endpoint with a larger existing deployment.  The public
+    endpoint must keep its own contract in that case: a 65K alias coalesced onto
+    a 262K process still advertises 65K.  New catalog requests persist that
+    per-alias value in ``deployment.served``.  For deployments written by older
+    infer-stack versions, recover a published alias from the current catalog;
+    ad-hoc/unknown aliases fall back to the actual deployment window.
+    """
+    payload = deployment.served.get(endpoint)
+    if isinstance(payload, dict):
+        value = payload.get('max_input_tokens')
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    if catalog is not None and endpoint in (getattr(catalog, 'endpoints', None) or {}):
+        try:
+            request = catalog.resolve_endpoint(endpoint).to_request()
+            if request.engine == 'vllm':
+                return effective_max_model_len(request.spec.get('runtime'))
+        except Exception:  # noqa: BLE001 - route rendering must survive a bad catalog row
+            pass
+    return effective_max_model_len(deployment.spec.get('runtime'))
 
 
 def catalog_routes(
@@ -135,7 +163,7 @@ def catalog_routes(
 
 def deployment_routes(
     deployments: list[Deployment], assignments: dict[str, list[int]],
-    *, dynamic: bool = False,
+    *, dynamic: bool = False, catalog: Any = None,
 ) -> list[GatewayRoute]:
     """One route per (placed deployment, served endpoint alias).
 
@@ -153,13 +181,12 @@ def deployment_routes(
             continue
         if deployment.engine == 'vllm':
             served = served_name(deployment)
-            # The same effective window the launch runs with (one derivation
-            # in launch.py), advertised on every route of the deployment.
-            context = effective_max_model_len(deployment.spec.get('runtime'))
             service = (vllm_service_name(deployment, unique=True) if dynamic
                        else vllm_service_name_for(served))
             api_base = f'http://{service}:{VLLM_CONTAINER_PORT}/v1'
             for endpoint in sorted(deployment.served):
+                context = deployment_route_max_input_tokens(
+                    deployment, endpoint, catalog=catalog)
                 routes.append(GatewayRoute(
                     endpoint, 'openai', served, api_base, origin='deployment',
                     route_id=_route_id(deployment.id, endpoint) if dynamic else None,
@@ -216,12 +243,14 @@ def front_door_routes(
     """
     if dynamic:
         by_id: dict[str | None, GatewayRoute] = {}
-        for route in [*deployment_routes(deployments, assignments, dynamic=True),
+        for route in [*deployment_routes(
+                          deployments, assignments, dynamic=True, catalog=catalog),
                       *catalog_routes(catalog, dynamic=True), *extra_dynamic]:
             by_id[route.route_id] = route
         return [], list(by_id.values())
     return route_table(registry, catalog_routes(catalog),
-                       deployment_routes(deployments, assignments), extra), []
+                       deployment_routes(deployments, assignments, catalog=catalog),
+                       extra), []
 
 
 # -- Route registry --------------------------------------------------------
@@ -256,11 +285,11 @@ def remembered_rows(
             continue
         if deployment.engine == 'vllm':
             served = served_name(deployment)
-            # The window travels with the row: a row outlives its deployment
-            # (a release must not recreate the gateway), so the advertised
-            # context must be remembered, not re-derivable.
-            context = effective_max_model_len(deployment.spec.get('runtime'))
             for endpoint in sorted(deployment.served):
+                # The per-alias contract travels with the row: a row outlives
+                # its deployment, and a smaller alias may have been coalesced
+                # onto a larger shared-compatible process.
+                context = deployment_route_max_input_tokens(deployment, endpoint)
                 rows[endpoint] = {'engine': 'vllm', 'served': served,
                                   'max_input_tokens': context}
         elif deployment.engine == 'ollama':
@@ -1291,7 +1320,8 @@ class Gateway(ConvergeScaffold):
                 return False
             mismatched = [] if retire_only else sorted(
                 rid for rid in desired.keys() & current.keys()
-                if desired_semantics[rid] != current[rid]
+                if not self._route_semantics_match(
+                    desired_semantics[rid], current[rid])
             )
             to_add_ids = [] if retire_only else sorted(
                 (desired.keys() - current.keys()) | set(mismatched))
@@ -1345,10 +1375,12 @@ class Gateway(ConvergeScaffold):
         upstream base URL are the routing semantics infer-stack can both set and
         reliably observe; so is the name of an external route's key variable,
         kept in ``model_info`` because LiteLLM redacts the key itself.  So is the
-        advertised context window: a changed ``max_model_len`` is a different
-        route and is replaced under its id, while absent on both sides compares
-        equal, so legacy routes never churn.  A matching managed id with
-        different values here is drift and is replaced, not accepted as healthy.
+        advertised context window when infer-stack supplied one: a changed
+        managed window is a different route and is replaced under its id.
+        LiteLLM may synthesize a window for routes where infer-stack supplied
+        none; that extra metadata is deliberately ignored. A matching managed
+        id with different infer-stack-owned values here is drift and is
+        replaced, not accepted as healthy.
         """
         params = route.get('litellm_params') or {}
         info = route.get('model_info') or {}
@@ -1359,6 +1391,24 @@ class Gateway(ConvergeScaffold):
             'key_env': info.get('infer_stack_key_env'),
             'max_input_tokens': info.get('max_input_tokens'),
         }
+
+    @staticmethod
+    def _route_semantics_match(
+        desired: dict[str, Any], current: dict[str, Any],
+    ) -> bool:
+        """Whether observable LiteLLM route semantics satisfy ``desired``.
+
+        LiteLLM can populate ``model_info.max_input_tokens`` from its bundled
+        model metadata even when infer-stack did not set that field (notably for
+        external routes with published model names).  Such a synthesized value
+        is not infer-stack-owned state and must not trigger an endless
+        delete/re-add loop.  When infer-stack *does* advertise a context window,
+        it remains strict and any difference is semantic drift.
+        """
+        if desired.get('max_input_tokens') is None:
+            current = dict(current)
+            current['max_input_tokens'] = None
+        return desired == current
 
     def _list_managed_routes(
         self, *, deadline: float, delay: float

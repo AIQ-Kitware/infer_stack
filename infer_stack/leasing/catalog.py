@@ -86,7 +86,7 @@ from typing import Any
 
 import yaml
 
-from .launch import launch_identity, translate_legacy
+from .launch import effective_max_model_len, launch_identity, translate_legacy
 from .endpoints import ExternalTarget, ManagedTarget, ResolvedEndpoint, external_errors
 from .models import (
     EndpointRequest,
@@ -634,6 +634,11 @@ class Catalog:
             'served_model_name': served_name,
             'hf_model_id': model.hf_model_id,
             'protocol': ep.protocol,
+            # Per-endpoint contract, not deployment capacity. Shared-compatible
+            # acquisition may place this alias on a larger already-running
+            # deployment, so keep the requested/effective window with the
+            # alias instead of re-deriving it from the deployment later.
+            'max_input_tokens': effective_max_model_len(rt),
         }
         return EndpointRequest(
             endpoint=ep.name,

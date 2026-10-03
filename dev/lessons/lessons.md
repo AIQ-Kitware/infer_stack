@@ -192,3 +192,16 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Applies when:** serving a model whose ordinary KV cache already covers its
     advertised maximum context on the target GPU class, especially persistent
     agent/chat workloads with reusable prefixes.
+
+- **Lesson:** A serving deployment's capacity is not necessarily the public
+  contract of every alias routed to it. With subsumption/coalescing, a smaller
+  endpoint may ride a larger process; persist route metadata per alias and use
+  deployment capacity only as a fallback. Also distinguish metadata your
+  controller owns from fields a gateway synthesizes, or reconciliation can
+  churn forever on harmless enrichment.
+  - **Evidence / MWE:** `tests/test_leasing_context_metadata.py::test_coalesced_aliases_keep_their_own_catalog_context_contract`,
+    `test_legacy_coalesced_deployment_recovers_alias_windows_from_catalog`, and
+    `test_litellm_synthesized_context_does_not_churn_external_route`.
+  - **Applies when:** a controller advertises endpoint metadata through a proxy
+    while sharing/superset placement can map multiple endpoint contracts onto
+    one runtime, or the proxy enriches returned metadata independently.
