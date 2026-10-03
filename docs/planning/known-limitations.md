@@ -74,6 +74,12 @@ True multi-instance support therefore needs both resource namespacing and a
 shared hardware-allocation model; partial namespacing would give a misleading
 sense of safety.
 
+The proposed path beyond this limitation is documented in the
+[distributed control plane, remote server, and HA controller plan](distributed-control-plane-and-remote-server.md).
+That design keeps one logical authority while allowing multiple controller
+replicas, a PostgreSQL-backed server mode, and authenticated node agents for
+remote Compose hosts.
+
 ## Linux-only execution
 
 Linux is the only supported execution platform. The implementation relies on
