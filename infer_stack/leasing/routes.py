@@ -41,13 +41,20 @@ class GatewayRoute:
     variable holding the upstream's key (never the key); without one an
     ``openai`` route sends ``EMPTY``. ``route_id`` is a dynamic route's
     managed id. ``origin`` says which owner produced it and is not part of
-    what it means.
+    what it means. ``max_input_tokens`` is the context window the upstream
+    was launched with (the effective vLLM ``max_model_len``): it is
+    advertised in ``model_info`` so clients read the true window from
+    ``/model/info`` instead of guessing (absent when unknown, e.g. for
+    servers infer-stack does not run).
 
     Example:
         >>> GatewayRoute('qwen', 'openai', 'Qwen/Q', 'http://box/v1', key_env='BOX_KEY').entry()
         {'model_name': 'qwen', 'litellm_params': {'model': 'openai/Qwen/Q', 'api_base': 'http://box/v1', 'api_key': 'os.environ/BOX_KEY'}}
         >>> GatewayRoute('tiny', 'ollama', 'tinyllama', 'http://ollama:11434', route_id='isr-1').entry()
         {'model_name': 'tiny', 'litellm_params': {'model': 'ollama/tinyllama', 'api_base': 'http://ollama:11434'}, 'model_info': {'id': 'isr-1'}}
+        >>> GatewayRoute('big', 'openai', 'Big/B', 'http://b/v1', route_id='isr-9',
+        ...              max_input_tokens=262144).entry()
+        {'model_name': 'big', 'litellm_params': {'model': 'openai/Big/B', 'api_base': 'http://b/v1', 'api_key': 'EMPTY'}, 'model_info': {'id': 'isr-9', 'max_input_tokens': 262144}}
     """
 
     alias: str
@@ -57,21 +64,34 @@ class GatewayRoute:
     key_env: str | None = None
     route_id: str | None = None
     origin: str = field(default='catalog', compare=False)
+    max_input_tokens: int | None = None
 
     def entry(self) -> dict[str, Any]:
         """The LiteLLM entry: a static ``model_list`` item, or with a
-        ``route_id`` the body of an admin-API ``/model/new``."""
+        ``route_id`` the body of an admin-API ``/model/new``.
+
+        ``model_info`` carries the managed id and the advertised context
+        window. The window is ``max_input_tokens`` (the total sequence
+        budget the upstream was started with), never a ``litellm_params``
+        ``max_tokens`` (that would change request defaults) and never
+        ``max_output_tokens`` (a completion cap is prompt-dependent).
+        """
         params: dict[str, Any] = {'model': f'{self.kind}/{self.model}',
                                   'api_base': self.api_base}
         if self.kind == 'openai':
             params['api_key'] = f'os.environ/{self.key_env}' if self.key_env else 'EMPTY'
         entry: dict[str, Any] = {'model_name': self.alias, 'litellm_params': params}
+        model_info: dict[str, Any] = {}
         if self.route_id:
-            entry['model_info'] = {'id': self.route_id}
+            model_info['id'] = self.route_id
             if self.key_env:
                 # The key's name is part of what the route means, and LiteLLM
                 # redacts the key itself, so reconcile compares the name here.
-                entry['model_info']['infer_stack_key_env'] = self.key_env
+                model_info['infer_stack_key_env'] = self.key_env
+        if self.max_input_tokens is not None:
+            model_info['max_input_tokens'] = self.max_input_tokens
+        if model_info:
+            entry['model_info'] = model_info
         return entry
 
     def describe(self) -> str:

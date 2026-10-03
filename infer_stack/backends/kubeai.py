@@ -751,8 +751,11 @@ class KubeaiBackend(ConvergeScaffold):
 
         The static superset, as on compose: the gateway's config then stays
         byte-stable as models come and go, so it is never recreated for one.
+        Each vLLM route advertises the effective ``max_model_len`` its Model
+        launches with, so clients read the true context window.
         """
         from ..leasing.gateway import catalog_routes
+        from ..leasing.launch import effective_max_model_len
         from ..leasing.routes import GatewayRoute
 
         if catalog is None or self.gateway is None:
@@ -763,7 +766,9 @@ class KubeaiBackend(ConvergeScaffold):
             if request.engine != 'vllm':
                 return None
             served = request.served.get('served_model_name') or alias
-            return GatewayRoute(alias, 'openai', model_name_for(served), base)
+            return GatewayRoute(alias, 'openai', model_name_for(served), base,
+                                max_input_tokens=effective_max_model_len(
+                                    request.spec.get('runtime')))
 
         return catalog_routes(catalog, managed)
 
@@ -784,9 +789,11 @@ class KubeaiBackend(ConvergeScaffold):
         catalog's. Dynamic routing: one route per (deployment, endpoint), each
         to its own Model, so same-model ``--dedicated`` Models share the alias
         and LiteLLM balances across them. External endpoints route to their
-        own servers either way, never through KubeAI.
+        own servers either way, never through KubeAI. Every vLLM route
+        advertises the effective ``max_model_len`` its Model launches with.
         """
         from ..leasing.gateway import catalog_routes, upstream_route
+        from ..leasing.launch import effective_max_model_len
         from ..leasing.routes import GatewayRoute, route_table
 
         if self.gateway is None:
@@ -795,19 +802,29 @@ class KubeaiBackend(ConvergeScaffold):
         if self.dynamic_routing:
             by_id = {g.id: g for g in desired}
             routes = [
-                upstream_route(gid, endpoint, name, base)
+                upstream_route(gid, endpoint, name, base,
+                               max_input_tokens=effective_max_model_len(
+                                   by_id[gid].spec.get('runtime')))
                 for name, gid in sorted(rendered.models.items())
                 for endpoint in sorted(by_id[gid].served)
             ]
             return [], routes + catalog_routes(self.catalog, dynamic=True)
         catalog = self.catalog_routes(self.catalog)
         defined = {r.alias for r in catalog}
+        by_id = {g.id: g for g in desired}
         # A Model serving a catalog alias is that endpoint's route; one serving
         # an alias no catalog defines is the cluster's own (the gateway
-        # remembers those past release, as it does ad-hoc deployments).
-        models = [GatewayRoute(alias, 'openai', name, base,
-                               origin='catalog' if alias in defined else 'upstream')
-                  for alias, name in rendered.request_names.items()]
+        # remembers those past release, as it does ad-hoc deployments). Each
+        # route advertises the window its Model launches with.
+        models = []
+        for alias, name in rendered.request_names.items():
+            deployment = by_id.get(rendered.models.get(name, ''))
+            models.append(GatewayRoute(
+                alias, 'openai', name, base,
+                origin='catalog' if alias in defined else 'upstream',
+                max_input_tokens=(
+                    effective_max_model_len(deployment.spec.get('runtime'))
+                    if deployment is not None else None)))
         return route_table(catalog, models), []
 
     def _set_front_door(self, desired, rendered: RenderedModels) -> None:

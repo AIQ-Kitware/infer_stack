@@ -86,3 +86,82 @@ What I'm confident about: the endpoint math and the full manual procedure —
 this exact setup is running on the machine I'm executing on, so every
 claimed config shape was read, not inferred. The spec is a verified map, not
 a guess.
+
+## 2026-10-02 21:33:08 -0400
+
+Implemented the LiteLLM context-window metadata change (plan in
+`dev/tmp/notes-litellm-context-metadata-2026-10-02.md`). The goal: pi (and
+any client reading `/v1/model/info`) should learn the true context window
+instead of defaulting to 128k for custom model names like
+`qwen3.8-27b-dbirks-hyperqwen` whose vLLM process runs with
+`--max-model-len 262144`.
+
+What I did, in dependency order:
+
+- `leasing/launch.py` — moved `VLLM_DEFAULTS` here from `compose.py` and
+  added `effective_max_model_len(runtime)`: the one derivation of the
+  window a vLLM deployment launches with (runtime's `max_model_len` after
+  `translate_legacy`, else the default 8192; no coercion, so launch and
+  advertisement can never diverge).
+- `leasing/routes.py` — `GatewayRoute` gained a trailing
+  `max_input_tokens: int | None = None` (participates in `__eq__`);
+  `entry()` now builds `model_info` incrementally, adding
+  `max_input_tokens` whenever known, including routes without a `route_id`.
+- `leasing/gateway.py` — every route-producing path now advertises the
+  effective window: static compose (catalog + deployment routes), dynamic
+  `/model/new` (deployment routes carry it; `_route_semantics` includes it,
+  so a window change is drift and the route is replaced under its id),
+  `upstream_route` (KubeAI Models), and the remembered registry
+  (`remembered_rows` writes it for vLLM rows and known upstream rows;
+  `_remembered_context` guards hand-edited/legacy rows: positive whole
+  number only, else silently unknown — never a wrong number).
+- `backends/kubeai.py` — same propagation for the KubeAI frontend: catalog
+  routes, the dynamic per-(deployment, endpoint) upstream routes, and the
+  static per-alias model routes.
+- `tests/test_leasing_context_metadata.py` (new, 24 tests) — serialization,
+  static compose (superset + live), default consistency between
+  `vllm_service_dict` and the advertisement, dynamic `/model/new` bodies
+  and window-change drift, the remembered registry (new/legacy/junk rows),
+  one deployment with two aliases, and the KubeAI static + dynamic paths.
+
+A consequence worth remembering: the window is now visible in the rendered
+gateway config, so the "config byte-stable as models come and go" property
+now holds *because the live deployment and its catalog endpoint agree on
+the window* — which is true for every catalog-derived acquisition (the
+deployment's runtime is the endpoint's runtime). Three old tests built
+hand-crafted deployments whose runtimes disagreed with the catalog they
+simulated; I aligned those fixtures (`_catalog_dict` in
+test_leasing_route_registry, the two/three-endpoint catalogs in
+test_leasing_compose, and the inline catalog in the kubeai test) so they
+model what a real acquisition carries. The one case where the bytes can
+still move is real and intended: a shared deployment that serves several
+catalog aliases declaring different windows advertises the launched
+(maximum) window while alive, and each alias reverts to its own declared
+window when the deployment is released.
+
+Validation (CPU-only; this VM has no Docker, K8s, or a live LiteLLM):
+`pytest --xdoctest infer_stack tests` → 1184 passed, 8 skipped; flake8
+(E9,F63,F7,F82) clean; compileall clean. I also rendered a real config to
+confirm the shape: the `model_list` entry carries
+`model_info: {max_input_tokens: 262144}` and the dynamic `/model/new` body
+carries `model_info: {id: isr-…, max_input_tokens: …}`.
+
+What I could not test: that a live LiteLLM 1.82.3 actually returns
+`max_input_tokens` in its `/v1/model/info` response, and that pi picks it
+up as `contextWindow`. My reading of the LiteLLM source (v1.82.3: the
+config `model_info` is merged first and wins over the cost map, and
+`max_input_tokens` is a first-class `ModelInfo` field) says yes, but the
+live end-to-end check belongs to the next GPU-VM session. That is also the
+one operational wrinkle: the first converge after upgrading rewrites
+`litellm_config.yaml` (new `model_info` key), so the `config-hash` label
+changes and the gateway container is recreated once — expected, one-time.
+
+Confident: the derivation is centralized (launch.py), the invariant is
+enforced by construction on every path, and the guard on remembered rows
+fails closed. Uncertain: whether any client other than pi treats
+`max_input_tokens` differently from what the cost map would have supplied
+— worth a spot-check of the gateway's `/v1/model/info` after the live test.
+
+Also: `AGENTS.md` picked up aivm's commit-attribution rule (agent commits
+carry a `Co-authored-by:` trailer naming the model that produced them);
+infer_stack had no equivalent.

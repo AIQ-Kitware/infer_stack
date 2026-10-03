@@ -863,7 +863,11 @@ def test_catalog_endpoints_are_routed_before_they_run(tmp_path):
     be, _ = make_front_door_backend(tmp_path)
     be.catalog = Catalog.from_dict({
         'models': {'m': {'source': 'hf://org/m'}},
-        'endpoints': {'tiny': {'engine': 'vllm', 'model': 'm'}},
+        # Same runtime as the ``vllm`` fixture below, so the catalog route and
+        # the deployment serving it advertise the same window.
+        'endpoints': {'tiny': {'engine': 'vllm', 'model': 'm',
+                               'runtime': {'tensor_parallel_size': 1,
+                                           'max_model_len': 4096}}},
     })
     be.converge([], apply=False)
     before = (be.gateway.state_dir / 'litellm_config.yaml').read_text()

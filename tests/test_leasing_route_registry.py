@@ -80,6 +80,11 @@ def _catalog_dict(endpoint, *, model='m', served=None):
     spec = {'engine': 'vllm', 'model': model}
     if served:
         spec['served_name'] = served
+    # The same runtime as ``vllm_ep`` below: a live-acquired catalog endpoint
+    # carries the endpoint's own runtime, so its deployment and its catalog
+    # route agree on the window they advertise and the rendered bytes never
+    # move as the model comes and goes.
+    spec['runtime'] = {'tensor_parallel_size': 1, 'max_model_len': 32768}
     return {'models': {model: {'source': f'hf://org/{model}'}},
             'endpoints': {endpoint: spec}}
 

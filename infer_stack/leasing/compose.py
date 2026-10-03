@@ -65,7 +65,7 @@ from .gateway import (
     remembered_rows,
     render_front_door,
 )
-from .launch import env_string, fill, translate_legacy
+from .launch import VLLM_DEFAULTS, effective_max_model_len, env_string, fill, translate_legacy
 from .models import Deployment, is_reservation, served_name
 from .naming import (  # noqa: F401  (public names re-exported for callers)
     OLLAMA_CONTAINER_PORT,
@@ -94,15 +94,6 @@ LEASING_PROJECT = 'infer-stack'  # docker compose project name for leased stacks
 VLLM_HOST_PORT_BASE = 18000
 STATE_FILENAME = 'leasing-compose-state.json'
 COMPOSE_FILENAME = 'docker-compose.yml'
-
-VLLM_DEFAULTS = {
-    'gpu_memory_utilization': 0.9,
-    'max_model_len': 8192,
-    'max_num_batched_tokens': 8192,
-    'max_num_seqs': 256,
-}
-
-
 
 
 class ApplyAborted(RuntimeError):
@@ -354,7 +345,10 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'command': list(runtime.get('command') or []),
         'env': dict(runtime.get('env') or {}),
         'mounts': dict(runtime.get('mounts') or {}),
-        'max_model_len': runtime.get('max_model_len', VLLM_DEFAULTS['max_model_len']),
+        # The effective window: one source of truth (launch.py) shared with
+        # the LiteLLM route metadata, so the advertised context can never
+        # diverge from the one on the engine's command line.
+        'max_model_len': effective_max_model_len(runtime),
         'gpu_memory_utilization': runtime.get(
             'gpu_memory_utilization', VLLM_DEFAULTS['gpu_memory_utilization']
         ),

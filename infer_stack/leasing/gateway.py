@@ -25,6 +25,7 @@ from ..config import DEFAULT_PORTS
 from ..env_utils import ensure_secret, parse_env_file, write_env_file
 from .backend import ConnectionInfo, ConvergeScaffold
 from .endpoints import ExternalTarget
+from .launch import effective_max_model_len
 from .models import Deployment, served_name
 from .naming import (
     OLLAMA_CONTAINER_PORT,
@@ -81,11 +82,14 @@ ROUTE_RECONCILE_STEADY_S = 20.0
 def compose_catalog_route(alias: str, request: Any) -> GatewayRoute | None:
     """Where a Compose front door sends a managed catalog endpoint: the
     engine service its served name determines (the same one every
-    deployment of it gets without ``--dedicated``)."""
+    deployment of it gets without ``--dedicated``). A vLLM route advertises
+    the effective ``max_model_len`` the service runs with, so clients read
+    the true context window from the gateway rather than guessing."""
     if request.engine == 'vllm':
         served = request.served.get('served_model_name') or alias
         return GatewayRoute(alias, 'openai', served,
-                            f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1')
+                            f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1',
+                            max_input_tokens=effective_max_model_len(request.spec.get('runtime')))
     if request.engine == 'ollama':
         host = request.spec.get('host') or request.host
         tag = request.served.get('model') or alias
@@ -149,13 +153,17 @@ def deployment_routes(
             continue
         if deployment.engine == 'vllm':
             served = served_name(deployment)
+            # The same effective window the launch runs with (one derivation
+            # in launch.py), advertised on every route of the deployment.
+            context = effective_max_model_len(deployment.spec.get('runtime'))
             service = (vllm_service_name(deployment, unique=True) if dynamic
                        else vllm_service_name_for(served))
             api_base = f'http://{service}:{VLLM_CONTAINER_PORT}/v1'
             for endpoint in sorted(deployment.served):
                 routes.append(GatewayRoute(
                     endpoint, 'openai', served, api_base, origin='deployment',
-                    route_id=_route_id(deployment.id, endpoint) if dynamic else None))
+                    route_id=_route_id(deployment.id, endpoint) if dynamic else None,
+                    max_input_tokens=context))
         elif deployment.engine == 'ollama':
             host = deployment.spec.get('host') or deployment.id
             service = (ollama_service_name(deployment) if dynamic
@@ -236,9 +244,11 @@ def remembered_rows(
     route of a Model another backend runs, that ``defined`` (the published
     catalog aliases) does not cover.
 
-    A vLLM row carries ``served`` (the host is re-derived from it), an Ollama
-    row the tag and ``host``, an upstream row its ``api_base``: each renders
-    back (:func:`registry_route`) to the route the deployment has now.
+    A vLLM row carries ``served`` (the host is re-derived from it) and the
+    effective ``max_input_tokens`` its server ran with; an Ollama row the tag
+    and ``host``; an upstream row its ``api_base`` (and the window when
+    known): each renders back (:func:`registry_route`) to the route the
+    deployment has now.
     """
     rows: dict[str, dict[str, Any]] = {}
     for deployment in deployments:
@@ -246,8 +256,13 @@ def remembered_rows(
             continue
         if deployment.engine == 'vllm':
             served = served_name(deployment)
+            # The window travels with the row: a row outlives its deployment
+            # (a release must not recreate the gateway), so the advertised
+            # context must be remembered, not re-derivable.
+            context = effective_max_model_len(deployment.spec.get('runtime'))
             for endpoint in sorted(deployment.served):
-                rows[endpoint] = {'engine': 'vllm', 'served': served}
+                rows[endpoint] = {'engine': 'vllm', 'served': served,
+                                  'max_input_tokens': context}
         elif deployment.engine == 'ollama':
             host = deployment.spec.get('host') or deployment.id
             for endpoint, payload in sorted(deployment.served.items()):
@@ -255,9 +270,27 @@ def remembered_rows(
                                   'model': payload.get('model', endpoint), 'host': host}
     for route in extra:
         if route.origin == 'upstream' and route.kind == 'openai':
-            rows[route.alias] = {'engine': 'upstream', 'served': route.model,
-                                 'api_base': route.api_base}
+            row: dict[str, Any] = {'engine': 'upstream', 'served': route.model,
+                                   'api_base': route.api_base}
+            if route.max_input_tokens is not None:
+                row['max_input_tokens'] = route.max_input_tokens
+            rows[route.alias] = row
     return {alias: row for alias, row in rows.items() if alias not in defined}
+
+
+def _remembered_context(row: dict[str, Any]) -> int | None:
+    """The context a registry row remembers: a positive whole number, or None.
+
+    A row written by an older infer-stack carries no ``max_input_tokens`` and
+    a hand-edited one may carry junk: both render as "window unknown" (the
+    field is simply not advertised) rather than a wrong number.
+    """
+    value = row.get('max_input_tokens')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
 
 
 def registry_route(name: str, row: Any) -> GatewayRoute | None:
@@ -270,7 +303,8 @@ def registry_route(name: str, row: Any) -> GatewayRoute | None:
         return GatewayRoute(
             name, 'openai', served,
             f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1',
-            origin='registry')
+            origin='registry',
+            max_input_tokens=_remembered_context(row))
     if engine == 'ollama':
         host = row.get('host') or name
         return GatewayRoute(
@@ -280,7 +314,8 @@ def registry_route(name: str, row: Any) -> GatewayRoute | None:
     if engine == 'upstream' and row.get('api_base'):
         # A server this project does not run (a KubeAI cluster's gateway).
         return GatewayRoute(name, 'openai', row.get('served') or name,
-                            str(row['api_base']), origin='registry')
+                            str(row['api_base']), origin='registry',
+                            max_input_tokens=_remembered_context(row))
     return None
 
 
@@ -294,11 +329,18 @@ def registry_routes(registry: dict[str, Any] | None) -> list[GatewayRoute]:
 
 
 def upstream_route(deployment_id: str, endpoint: str, served: str,
-                   api_base: str) -> GatewayRoute:
+                   api_base: str,
+                   max_input_tokens: int | None = None) -> GatewayRoute:
     """A dynamic route to a server this project does not run (a KubeAI Model),
-    with the same deterministic id as a Compose engine's dynamic route."""
+    with the same deterministic id as a Compose engine's dynamic route.
+
+    ``max_input_tokens`` is the window that Model runs with (the effective
+    ``max_model_len`` of its rendered spec), advertised like any other route;
+    absent when the caller does not know it.
+    """
     return GatewayRoute(endpoint, 'openai', served, api_base, origin='upstream',
-                        route_id=_route_id(deployment_id, endpoint))
+                        route_id=_route_id(deployment_id, endpoint),
+                        max_input_tokens=max_input_tokens)
 
 
 def _dump_route_registry(registry: dict[str, Any]) -> str:
@@ -1302,15 +1344,20 @@ class Gateway(ConvergeScaffold):
         and may redact credentials.  The public alias, upstream model, and
         upstream base URL are the routing semantics infer-stack can both set and
         reliably observe; so is the name of an external route's key variable,
-        kept in ``model_info`` because LiteLLM redacts the key itself.  A matching managed id with different values here is
-        drift and is replaced, not accepted as healthy.
+        kept in ``model_info`` because LiteLLM redacts the key itself.  So is the
+        advertised context window: a changed ``max_model_len`` is a different
+        route and is replaced under its id, while absent on both sides compares
+        equal, so legacy routes never churn.  A matching managed id with
+        different values here is drift and is replaced, not accepted as healthy.
         """
         params = route.get('litellm_params') or {}
+        info = route.get('model_info') or {}
         return {
             'model_name': route.get('model_name'),
             'model': params.get('model'),
             'api_base': params.get('api_base'),
-            'key_env': (route.get('model_info') or {}).get('infer_stack_key_env'),
+            'key_env': info.get('infer_stack_key_env'),
+            'max_input_tokens': info.get('max_input_tokens'),
         }
 
     def _list_managed_routes(

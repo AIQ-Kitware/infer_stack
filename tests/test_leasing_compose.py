@@ -808,6 +808,11 @@ def test_render_litellm_front_door(tmp_path):
 def _two_endpoint_catalog():
     from infer_stack.leasing.catalog import Catalog
 
+    # Runtime matches the ``vllm`` fixture (tp 1, 32768): a live-acquired
+    # catalog endpoint carries the endpoint's own runtime, so its deployment
+    # and its catalog route agree on the advertised window and the gateway
+    # config never moves as models come and go.
+    runtime = {'tensor_parallel_size': 1, 'max_model_len': 32768}
     return Catalog.from_dict(
         {
             'models': {
@@ -815,8 +820,8 @@ def _two_endpoint_catalog():
                 'mb': {'source': 'hf://org/b'},
             },
             'endpoints': {
-                'alpha': {'engine': 'vllm', 'model': 'ma'},
-                'beta': {'engine': 'vllm', 'model': 'mb'},
+                'alpha': {'engine': 'vllm', 'model': 'ma', 'runtime': dict(runtime)},
+                'beta': {'engine': 'vllm', 'model': 'mb', 'runtime': dict(runtime)},
             },
         }
     )
@@ -870,6 +875,9 @@ def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
 def _three_endpoint_catalog():
     from infer_stack.leasing.catalog import Catalog
 
+    # Same runtime as the ``vllm`` fixture, for the same reason as in
+    # ``_two_endpoint_catalog``: live vs released must render identical bytes.
+    runtime = {'tensor_parallel_size': 1, 'max_model_len': 32768}
     return Catalog.from_dict(
         {
             'models': {
@@ -878,9 +886,9 @@ def _three_endpoint_catalog():
                 'mb': {'source': 'hf://org/b'},
             },
             'endpoints': {
-                'cee': {'engine': 'vllm', 'model': 'mc'},
-                'alpha': {'engine': 'vllm', 'model': 'ma'},
-                'beta': {'engine': 'vllm', 'model': 'mb'},
+                'cee': {'engine': 'vllm', 'model': 'mc', 'runtime': dict(runtime)},
+                'alpha': {'engine': 'vllm', 'model': 'ma', 'runtime': dict(runtime)},
+                'beta': {'engine': 'vllm', 'model': 'mb', 'runtime': dict(runtime)},
             },
         }
     )
