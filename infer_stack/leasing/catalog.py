@@ -29,6 +29,10 @@ Schema (all sections optional except as referenced)::
         # endpoint (GPU count is appended automatically from tp*pp*dp); falls
         # back to `config set kubeai_resource_profile <name>`.
         #   runtime: {resource_profile: nvidia-gpu-rtx-4090, ...}
+        # compose backend only: the container's /dev/shm (Docker's default is
+        # 64 MiB; vLLM's workers share memory when a model spans GPUs). Not
+        # set, nothing is rendered; KubeAI mounts a memory-backed /dev/shm.
+        #   runtime: {tensor_parallel_size: 4, shm_size: 16g}
         # An image with its own launcher (Compose only), described in data;
         # see infer_stack/leasing/launch.py for the fields and templates.
         #   runtime: {image: ..., command: [single],
@@ -52,6 +56,16 @@ Schema (all sections optional except as referenced)::
         engine: ollama
         host: local-ollama
         model: qwen3.5:4b
+      # An OpenAI-compatible server that already runs elsewhere: no model
+      # entry, no lease; the LiteLLM front door routes the alias to it, sending
+      # the key held in the named variable (`infer-stack env NAME=...`).
+      # Reached with `infer-stack access` or `run`, not `acquire`.
+      qwen-remote:
+        external:
+          api_base: http://gpu-box:8000/v1
+          model: Qwen/Qwen3-32B      # what that server expects as `model`
+          api_key_env: REMOTE_QWEN_KEY
+        protocol: chat
 
     runtime_hosts:          # Ollama daemons (one daemon, many tags)
       local-ollama:
@@ -72,7 +86,8 @@ from typing import Any
 
 import yaml
 
-from .launch import launch_identity, translate_legacy
+from .launch import effective_max_model_len, launch_identity, translate_legacy
+from .endpoints import ExternalTarget, ManagedTarget, ResolvedEndpoint, external_errors
 from .models import (
     EndpointRequest,
     Sharing,
@@ -169,6 +184,9 @@ class EndpointSpec:
     runtime: dict[str, Any] = field(default_factory=dict)
     sharing: str = Sharing.SHARED
     reclaim: str = DEFAULT_RECLAIM
+    #: The upstream model name the engine serves (``--served-model-name``);
+    #: YAML ``served_name`` or its older spelling ``public_name``. Defaults to
+    #: the endpoint alias, which is the public name.
     served_name: str | None = None
     # OpenAI surface the readiness probe (and clients) should use: 'chat' hits
     # /chat/completions, 'completions' hits /completions. A completions-only
@@ -178,6 +196,11 @@ class EndpointSpec:
     # errors()). ``min_vram_gib`` is the portable eligibility declaration;
     # ``gpu_indices`` is an optional exact local pin from the TUI/CLI.
     placement: dict[str, Any] = field(default_factory=dict)
+    #: An OpenAI-compatible server that already runs (``external:``), or
+    #: ``None`` for a runtime infer-stack realizes. Ownership, not an engine.
+    external: ExternalTarget | None = None
+    #: The endpoint's mapping as written, for validating an external one.
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 def _parse_sharing(value: Any) -> str:
@@ -284,10 +307,29 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
 
 
 def _runtime_errors(ep: EndpointSpec) -> list[str]:
-    """Validate the generic launch fields (see :mod:`.launch`)."""
+    """Validate the generic launch fields (see :mod:`.launch`) and ``shm_size``.
+
+    >>> ep = EndpointSpec(name='e', engine='vllm', model='m', runtime={'shm_size': '16g'})
+    >>> _runtime_errors(ep)
+    []
+    >>> ep.runtime['shm_size'] = 'lots'
+    >>> _runtime_errors(ep)[0].split(':')[0]
+    "endpoint 'e'"
+    """
+    import re
+
     from .launch import launch_errors
 
-    return launch_errors(ep.name, ep.engine, ep.runtime)
+    errors = launch_errors(ep.name, ep.engine, ep.runtime)
+    shm = (ep.runtime or {}).get('shm_size')
+    if shm is not None:
+        if ep.engine != VLLM:
+            errors.append(f"endpoint '{ep.name}': runtime.shm_size is for vllm "
+                          'endpoints')
+        elif not re.fullmatch(r'\d+(\.\d+)?\s*[kmg]?b?', str(shm), re.IGNORECASE):
+            errors.append(f"endpoint '{ep.name}': runtime.shm_size must be a size "
+                          f"such as 16g or 8gb, not {shm!r}")
+    return errors
 
 
 @dataclass
@@ -344,6 +386,19 @@ class Catalog:
         endpoints = {}
         for name, spec in (data.get('endpoints') or {}).items():
             spec = spec or {}
+            if 'external' in spec:
+                ext = spec.get('external')
+                endpoints[name] = EndpointSpec(
+                    name=name, engine='', model='',
+                    protocol=_parse_protocol(spec.get('protocol')),
+                    external=(ExternalTarget(
+                        api_base=str(ext.get('api_base') or ''),
+                        model=str(ext.get('model') or ''),
+                        api_key_env=ext.get('api_key_env'))
+                        if isinstance(ext, dict) else None),
+                    raw=dict(spec),
+                )
+                continue
             endpoints[name] = EndpointSpec(
                 name=name,
                 engine=spec.get('engine', VLLM),
@@ -388,6 +443,9 @@ class Catalog:
     def errors(self) -> list[str]:
         errors: list[str] = []
         for ep in self.endpoints.values():
+            if 'external' in ep.raw:
+                errors.extend(external_errors(ep.name, ep.raw, ep.raw.get('external')))
+                continue
             if ep.engine == VLLM:
                 if not ep.model:
                     errors.append(
@@ -473,40 +531,56 @@ class Catalog:
 
     def resolve_endpoint(
         self, name: str, *, sharing: str | None = None
-    ) -> EndpointRequest:
-        """Resolve one endpoint name into a ledger :class:`EndpointRequest`.
+    ) -> ResolvedEndpoint:
+        """What endpoint ``name`` means: a :class:`ResolvedEndpoint`.
 
-        ``sharing`` overrides the catalog's declared policy (e.g. the CLI
-        ``--dedicated`` flag) when given.
+        A managed target carries the catalog's request; ``to_request`` gives
+        the ledger's. ``sharing`` (from before ``to_request`` took the
+        override) is applied to that request when given.
         """
         if name not in self.endpoints:
             raise self._unknown_endpoint_error(name)
         ep = self.endpoints[name]
+        if ep.external is not None:
+            return ResolvedEndpoint(ep.name, ep.protocol, ep.external)
         share = sharing or ep.sharing
         if ep.engine == VLLM:
-            return self._resolve_vllm(ep, share)
-        if ep.engine == OLLAMA:
-            return self._resolve_ollama(ep, share)
-        raise CatalogError(
-            f"endpoint '{name}' has unknown engine '{ep.engine}'"
-        )
+            request = self._resolve_vllm(ep, share)
+        elif ep.engine == OLLAMA:
+            request = self._resolve_ollama(ep, share)
+        else:
+            raise CatalogError(
+                f"endpoint '{name}' has unknown engine '{ep.engine}'"
+            )
+        return ResolvedEndpoint(ep.name, ep.protocol, ManagedTarget(request))
 
-    def resolve_names(
-        self, names: list[str], *, sharing: str | None = None
-    ) -> list[EndpointRequest]:
-        """Expand a mix of endpoint and bundle names into requests.
-
-        Bundles expand to their member endpoints; duplicates (e.g. an endpoint
-        named directly and also via a bundle) are de-duplicated, preserving
-        order.
-        """
+    def expand(self, names: list[str]) -> list[str]:
+        """Endpoint names for a mix of endpoint and bundle names: bundles
+        expand to their members, duplicates go, order stays."""
         ordered: list[str] = []
         for name in names:
-            members = self.bundles.get(name, [name])
-            for member in members:
+            for member in self.bundles.get(name, [name]):
                 if member not in ordered:
                     ordered.append(member)
-        return [self.resolve_endpoint(n, sharing=sharing) for n in ordered]
+        return ordered
+
+    def resolve(self, names: list[str]) -> list[ResolvedEndpoint]:
+        """The meanings of a mix of endpoint and bundle names."""
+        return [self.resolve_endpoint(n) for n in self.expand(names)]
+
+    def resolve_requests(
+        self, names: list[str], *, sharing: str | None = None
+    ) -> list[EndpointRequest]:
+        """Ledger requests for a mix of endpoint and bundle names
+        (``sharing`` overrides the catalog's, e.g. ``--dedicated``)."""
+        try:
+            return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
+                    for n in self.expand(names)]
+        except ValueError as ex:        # an external member: no lease request
+            raise CatalogError(str(ex)) from ex
+
+    #: The name from before :meth:`resolve_requests`; kept for its callers.
+    resolve_names = resolve_requests
 
     def _resolve_vllm(
         self, ep: EndpointSpec, sharing: str
@@ -560,6 +634,11 @@ class Catalog:
             'served_model_name': served_name,
             'hf_model_id': model.hf_model_id,
             'protocol': ep.protocol,
+            # Per-endpoint contract, not deployment capacity. Shared-compatible
+            # acquisition may place this alias on a larger already-running
+            # deployment, so keep the requested/effective window with the
+            # alias instead of re-deriving it from the deployment later.
+            'max_input_tokens': effective_max_model_len(rt),
         }
         return EndpointRequest(
             endpoint=ep.name,

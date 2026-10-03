@@ -23,14 +23,19 @@ from fake_docker_state import ComposeFake
 
 from infer_stack.hardware import simulate_inventory
 from infer_stack.leasing import ComposeBackend, render_compose
-from infer_stack.leasing.compose import (
+from infer_stack.leasing.compose import vllm_service_name
+from infer_stack.leasing.gateway import (
     POSTGRES_SERVICE,
     ROUTE_ID_PREFIX,
-    _litellm_routes,
+    deployment_routes,
     _route_id,
-    vllm_service_name,
 )
 from infer_stack.leasing.models import Deployment, DeploymentState
+
+
+def _litellm_routes(deployments, assignments):
+    """The rendered dynamic route entries of the placed deployments."""
+    return [r.entry() for r in deployment_routes(deployments, assignments, dynamic=True)]
 
 STATE = {'hf_cache': '/cache/hf', 'ollama': '/cache/ollama'}
 IMAGES = {
@@ -238,7 +243,7 @@ def test_reconcile_replaces_same_id_route_with_wrong_semantics(tmp_path):
     # Simulate DB drift / an earlier endpoint definition with the same stable id.
     gw.models[rid]['litellm_params']['model'] = 'ollama/wrong-tag'
     before = len(gw.calls)
-    assert be._reconcile_routes() is True
+    assert be.gateway._reconcile_routes() is True
     assert gw.models[rid]['litellm_params']['model'] == 'openai/smol'
     assert gw.calls[before:] == [('delete', rid), ('new', rid)]
 
@@ -300,12 +305,12 @@ def test_reconcile_leaves_unmanaged_models_alone(tmp_path):
 
 def test_db_password_is_persisted_and_reused(tmp_path):
     be = make_backend(tmp_path, RecordingGateway())
-    pw1 = be.db_password()
+    pw1 = be.gateway.db_password()
     assert pw1
     # rewritten only if missing -> stable across calls and a fresh backend
-    assert be.db_password() == pw1
+    assert be.gateway.db_password() == pw1
     be2 = make_backend(tmp_path, RecordingGateway())
-    assert be2.db_password() == pw1
+    assert be2.gateway.db_password() == pw1
 
 
 # -- no blip on the UPSTREAMS too (the readiness-killing churn) -------------
@@ -380,9 +385,9 @@ def test_reconcile_delete_tolerates_already_gone(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _log.logger, 'warning', lambda *a, **k: warnings.append((a, k))
     )
-    be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x', ok_if_missing=True)
+    be.gateway._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x', ok_if_missing=True)
     assert warnings == []  # already gone -> no warning
-    be._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x')
+    be.gateway._post_route('/model/delete', {'id': 'isr-x'}, 'isr-x')
     assert warnings  # same response without the flag -> warns
 
 
@@ -431,9 +436,9 @@ def test_reconcile_reports_success_only_when_routes_verify(tmp_path):
     gw = RecordingGateway()
     be = make_backend(tmp_path, gw)
     be.converge([a], apply=False)
-    assert be._reconcile_routes() is True
+    assert be.gateway._reconcile_routes() is True
     assert _managed(gw) == {_route_id(a.id, 'smol')}
-    assert be._reconcile_routes() is True     # idempotent: nothing to change, still verified
+    assert be.gateway._reconcile_routes() is True     # idempotent: nothing to change, still verified
 
 
 def test_reconcile_against_unreachable_gateway_is_bounded_by_its_deadline(tmp_path):
@@ -443,7 +448,7 @@ def test_reconcile_against_unreachable_gateway_is_bounded_by_its_deadline(tmp_pa
     gw = UnreachableGateway(time)
     be = _timed_backend(tmp_path, gw, time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    assert be._reconcile_routes(deadline_s=25.0) is False
+    assert be.gateway._reconcile_routes(deadline_s=25.0) is False
     assert time.now <= 25.0
     assert gw.gets >= 2                        # it did retry within the budget
 
@@ -458,7 +463,7 @@ def test_reconcile_reports_failure_when_a_post_fails(tmp_path):
     time = FakeTime()
     be = _timed_backend(tmp_path, RejectingGateway(), time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    assert be._reconcile_routes(deadline_s=20.0) is False
+    assert be.gateway._reconcile_routes(deadline_s=20.0) is False
     assert time.now <= 20.0
 
 
@@ -477,7 +482,7 @@ def test_a_transient_post_failure_is_retried_within_the_deadline(tmp_path):
     be = _timed_backend(tmp_path, gw, time)
     a = dep('grp-aaaaaa', served='smol')
     be.converge([a], apply=False)
-    assert be._reconcile_routes(deadline_s=20.0) is True
+    assert be.gateway._reconcile_routes(deadline_s=20.0) is True
     assert _managed(gw) == {_route_id(a.id, 'smol')}
 
 
@@ -496,7 +501,7 @@ def test_post_timeout_is_capped_by_the_remaining_deadline(tmp_path):
 
     be = _timed_backend(tmp_path, SlowGateway(), time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    be._reconcile_routes(deadline_s=10.0)
+    be.gateway._reconcile_routes(deadline_s=10.0)
     assert seen and all(t <= 10.0 - 4.0 for t in seen)   # never the default 30 s
 
 
@@ -507,17 +512,17 @@ def test_apply_returns_false_when_routes_do_not_verify(tmp_path):
     time = FakeTime()
     be = _timed_backend(tmp_path, UnreachableGateway(time), time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    assert be.apply() is False
+    assert not be.apply().routes
 
 
 def test_apply_returns_true_once_routes_verify(tmp_path):
     be = make_backend(tmp_path, RecordingGateway())
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
-    assert be.apply() is True
+    assert be.apply().complete
 
 
 def test_apply_uses_the_short_deadline_when_the_gateway_was_already_up(tmp_path):
-    from infer_stack.leasing.compose import (
+    from infer_stack.leasing.gateway import (
         ROUTE_RECONCILE_BOOTSTRAP_S,
         ROUTE_RECONCILE_STEADY_S,
     )
@@ -526,11 +531,11 @@ def test_apply_uses_the_short_deadline_when_the_gateway_was_already_up(tmp_path)
     be = _timed_backend(tmp_path, UnreachableGateway(time), time)
     be.converge([dep('grp-aaaaaa', served='smol')], apply=False)
 
-    assert be.apply() is False                 # bootstrap: gateway was not running
+    assert not be.apply().routes                 # bootstrap: gateway was not running
     assert ROUTE_RECONCILE_STEADY_S < time.now <= ROUTE_RECONCILE_BOOTSTRAP_S
 
     time.now = 0.0
-    assert be.apply() is False                 # steady: the first up started it
+    assert not be.apply().routes                 # steady: the first up started it
     assert time.now <= ROUTE_RECONCILE_STEADY_S
 
 
@@ -538,4 +543,108 @@ def test_apply_returns_false_for_an_unreadable_render(tmp_path):
     be = make_backend(tmp_path, RecordingGateway())
     be.compose_file.parent.mkdir(parents=True, exist_ok=True)
     be.compose_file.write_text('services: [unclosed\n')
-    assert be.apply() is False
+    assert not be.apply().runtime              # unreadable: runtime not reached
+
+
+# -- a route never outlives its upstream (queue item 17) ------------------------
+
+
+class NoDeleteGateway(RecordingGateway):
+    """The admin API refuses to delete routes (a LiteLLM or DB failure)."""
+
+    refuse = True
+
+    def post(self, url, **kw):
+        if self.refuse and url.endswith('/model/delete'):
+            return FakeResp(500, {'error': 'db unavailable'})
+        return super().post(url, **kw)
+
+
+def test_a_departing_upstream_outlives_a_route_that_could_not_be_removed(tmp_path):
+    """Two dedicated deployments behind one alias; one is released while the
+    gateway cannot delete routes. Its engine must keep running until its route
+    is gone: an engine stopped under a live route fails some of the alias's
+    requests, and nothing but the next apply would repair it."""
+    time = FakeTime()
+    gw = NoDeleteGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a, b = dep('grp-aaaaaa', served='smol', t=0), dep('grp-bbbbbb', served='smol', t=1)
+    be.converge([a, b], apply=False)
+    assert be.apply().complete
+    b_service = vllm_service_name(b, unique=True)
+    assert b_service in be.run.running and len(_managed(gw)) == 2
+
+    be.converge([a], apply=False)                   # b released
+    outcome = be.apply()
+    assert not outcome.runtime and not outcome.complete
+    assert b_service in be.run.running              # not torn down under its route
+    assert _route_id(b.id, 'smol') in _managed(gw)
+
+    gw.refuse = False                               # the gateway recovers
+    assert be.apply().complete
+    assert b_service not in be.run.running
+    assert _managed(gw) == {_route_id(a.id, 'smol')}
+
+
+def test_kubeai_keeps_a_departing_model_while_its_route_stays(tmp_path):
+    """The same invariant behind KubeAI's host gateway: a stale Model is not
+    deleted while the gateway still routes to it."""
+    from infer_stack.backends.kubeai import KubeaiBackend
+    from test_leasing_kubeai import FakeKubectl
+
+    time = FakeTime()
+    gw = NoDeleteGateway()
+    kubectl = FakeKubectl()
+    gateway = ComposeBackend(
+        state_dir=tmp_path / 'gateway', inventory={'gpu_count': 0, 'gpus': []},
+        run=FakeDocker(), http=gw, project='infer-stack-gateway', images=IMAGES,
+        ports=PORTS, state=STATE, litellm=True, ui=False, dynamic_routing=True,
+        sleep=time.sleep, clock=time.clock,
+    )
+    be = KubeaiBackend(state_dir=tmp_path / 'kubeai', run=kubectl, http=gw,
+                       gateway=gateway, gateway_upstream='http://10.43.0.9/openai/v1',
+                       default_resource_profile='gpu')
+    a, b = dep('grp-aaaaaa', served='smol', t=0), dep('grp-bbbbbb', served='smol', t=1)
+    be.converge([a, b], apply=False)
+    assert be.apply().complete and len(kubectl.applied) == 2
+    managed_before = _managed(gw)
+    assert len(managed_before) == 2
+
+    be.converge([a], apply=False)                   # b released
+    assert not be.apply().complete
+    assert len(kubectl.applied) == 2                # b's Model is still there
+    assert _managed(gw) == managed_before
+
+    gw.refuse = False
+    assert be.apply().complete
+    assert len(kubectl.applied) == 1 and len(_managed(gw)) == 1
+
+
+def test_a_replacement_whose_add_fails_is_reported_as_a_gap(tmp_path, monkeypatch):
+    """A drifted route is replaced by delete-then-add; if the add fails, the
+    alias has no route until the next apply. That is not hidden: the result is
+    unverified and the gap is logged by route id."""
+    from infer_stack import _log
+
+    class NoAddGateway(RecordingGateway):
+        refuse_add = False
+
+        def post(self, url, **kw):
+            if self.refuse_add and url.endswith('/model/new'):
+                return FakeResp(500, {'error': 'db unavailable'})
+            return super().post(url, **kw)
+
+    time = FakeTime()
+    gw = NoAddGateway()
+    be = _timed_backend(tmp_path, gw, time)
+    a = dep('grp-aaaaaa', served='smol', t=0)
+    be.converge([a], apply=True)
+    rid = _route_id(a.id, 'smol')
+    gw.models[rid]['litellm_params']['model'] = 'ollama/wrong-tag'   # drift
+    gw.refuse_add = True
+    seen = []
+    monkeypatch.setattr(_log.logger, 'warning', lambda msg, *a, **k: seen.append(msg.format(*a)))
+
+    assert be.gateway._reconcile_routes(deadline_s=10.0) is False
+    assert rid not in gw.models                                      # the gap
+    assert any(rid in m and 'missing until the next apply' in m for m in seen)

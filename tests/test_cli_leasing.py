@@ -225,6 +225,22 @@ def test_release_evict_tears_down_immediately(env, capsys):
     assert _leases_json(env, capsys)['deployments'][0]['state'] == 'stopped'
 
 
+def test_gc_forget_drops_only_finished_rows(env, capsys):
+    """`gc --forget` is the TUI's Clean up: history goes, live rows stay."""
+    from infer_stack.cli.commands_leasing import GcCLI
+
+    AcquireCLI.main(argv=['qwen-coder', *_base(env), '--owner', 'a'])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all', '--evict'])
+    AcquireCLI.main(argv=['reranker', *_base(env), '--owner', 'b'])
+    capsys.readouterr()
+    assert GcCLI.main(argv=['--ledger', env.db, '--forget', '--json']) == 0
+    assert json.loads(capsys.readouterr().out) == {'leases': 1, 'deployments': 1}
+    data = _leases_json(env, capsys)
+    assert [le['owner'] for le in data['leases']] == ['b']
+    assert [g['state'] for g in data['deployments']] != ['stopped']
+    assert len(data['deployments']) == 1
+
+
 def test_acquire_without_ttl_is_standing_lease(env, capsys):
     # No --ttl -> an infinite (standing-service) lease owned by the caller.
     AcquireCLI.main(argv=['qwen-coder', *_base(env)])
@@ -793,7 +809,7 @@ def test_evict_json_stdout_is_pure_json(env, capsys):
     out, err = capsys.readouterr()
     data = json.loads(out)  # must parse: no human text mixed into stdout
     assert data == {'evicted': [], 'torn_down': [], 'missing': ['ghost']}
-    assert 'no idle deployment for: ghost' in err
+    assert 'evict: ghost is not a deployment or served endpoint' in err
     assert rc == 0
 
 
@@ -804,13 +820,12 @@ def test_acquire_json_redacts_api_key(env, capsys, monkeypatch):
     from infer_stack.cli import commands_leasing as cl
     from infer_stack.leasing import MemoryBackend
 
+    from infer_stack.leasing.backend import ConnectionInfo
+
     class KeyedBackend(MemoryBackend):
-        def access(self, endpoints):
-            return {
-                'base_url': 'http://x:1/v1',
-                'api_key_env': 'LITELLM_MASTER_KEY',
-                'api_key': 'sk-secret123',
-            }
+        def connection_info(self):
+            return ConnectionInfo('http://x:1/v1', api_key_env='LITELLM_MASTER_KEY',
+                                  api_key='sk-secret123')
 
     monkeypatch.setattr(
         cl, '_make_backend',
@@ -879,7 +894,7 @@ def _patch_backend(monkeypatch, state_dir, catalog=None):
 
 
 def test_routes_seed_then_list(tmp_path, monkeypatch, capsys):
-    """seed two sibling catalogs into the registry, then list shows both."""
+    """seed two sibling catalogs (publish them), then list shows both."""
     from infer_stack.cli.commands_leasing import RoutesListCLI, RoutesSeedCLI
 
     state = tmp_path / 'state'
@@ -902,9 +917,19 @@ def test_routes_seed_then_list(tmp_path, monkeypatch, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert sorted(r['name'] for r in out['routes']) == ['alpha', 'beta']
-    # Seeding then rendering left the gateway config listing both, unchanged on a
-    # re-list (no converge on list): the registry file is byte-stable.
-    assert (state / 'litellm_registry.json').exists()
+    assert {r['origin'] for r in out['routes']} == {'catalog'}
+    # Seeding published the catalogs; the registry stores none of their routes.
+    assert sorted(_published(db)) == ['alpha', 'beta']
+    assert not (state / 'litellm_registry.json').exists()
+
+
+def _published(db):
+    """The published catalog union's endpoints: ``{alias: spec}``."""
+    from infer_stack.leasing import Ledger, SqliteStore
+
+    profile = Ledger(SqliteStore(db)).profile() or {}
+    return {name: spec for source in profile.get('catalogs') or []
+            for name, spec in (source.get('endpoints') or {}).items()}
 
 
 def test_routes_seed_requires_compose_backend(tmp_path, capsys):
@@ -951,8 +976,7 @@ def test_routes_prune_drops_stale(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     rc = RoutesPruneCLI.main(argv=['--ledger', db, '--yes', '--json'])
     assert rc == 0
-    raw = capsys.readouterr().out  # `Write .env to ...` may precede the JSON
-    out = json.loads(raw[raw.index('{'):])
+    out = json.loads(capsys.readouterr().out)   # --json output is only the JSON
     assert out['dropped'] == ['beta']
     assert out['kept'] == ['alpha']
 
@@ -969,7 +993,7 @@ def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkey
     from infer_stack.leasing.backend import MemoryBackend
 
     class RoutesNeverVerify(MemoryBackend):
-        def converge(self, desired, *, apply=True):
+        def converge(self, desired, *, apply=True, placement=None):
             self.last_unplaced, self.last_errors, self.last_assignments = [], [], {}
 
         def apply(self):
@@ -1027,11 +1051,11 @@ def test_routes_seed_and_prune_publish_through_the_controller(tmp_path, monkeypa
     calls = []
     real = Controller.publish_change
 
-    def spy(self, change):
+    def spy(self, change, **kw):
         calls.append(self._flock_depth)
         # The registry must not be written before the controller runs the change.
         before = (state / 'litellm_registry.json').exists()
-        result = real(self, change)
+        result = real(self, change, **kw)
         calls.append(before)
         return result
 
@@ -1106,6 +1130,24 @@ def test_clean_force_releases_leases_and_evicts_keep_warm(env, capsys):
     assert all(d['state'] == 'stopped' for d in data['deployments'])
 
 
+
+def test_a_released_stop_deployment_is_neither_missing_nor_left_to_clean(env, capsys):
+    # UX audit pass 5, the README's first run: after `release --all` tore a
+    # `reclaim: stop` model down, `leases` warned NOT-RUNNING and `clean`
+    # offered to tear it down again. It is IDLE in the ledger by design.
+    from infer_stack.cli.commands_leasing import CleanCLI
+
+    catalog = yaml.safe_load(open(env.cat))
+    catalog['endpoints']['reranker']['reclaim'] = {'policy': 'stop'}
+    open(env.cat, 'w').write(yaml.safe_dump(catalog))
+    AcquireCLI.main(argv=['reranker', *_base(env)])
+    ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
+    capsys.readouterr()
+    LeasesCLI.main(argv=['--ledger', env.db])
+    assert 'NOT-RUNNING' not in capsys.readouterr().out
+    assert CleanCLI.main(argv=['--ledger', env.db]) == 0
+    assert 'already clean' in capsys.readouterr().out
+
 def test_clean_reports_an_already_clean_stack(env, capsys):
     from infer_stack.cli.commands_leasing import CleanCLI
 
@@ -1123,3 +1165,125 @@ def test_clean_json_dry_run_is_pure_json(env, capsys):
     assert data['dry_run'] is True
     assert [le['endpoints'] for le in data['leases']] == [['qwen-coder']]
     assert data['deployments'][0]['served'] == ['qwen-coder']
+
+
+def test_release_and_renew_name_a_missing_env_file(env, tmp_path):
+    # UX audit pass 6: a cleanup trap after a failed acquire ran
+    # `release --env-file lease.env` on a file never written: a traceback.
+    missing = str(tmp_path / 'lease.env')
+    with pytest.raises(SystemExit, match='release: no env-file at .*did not finish'):
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+    with pytest.raises(SystemExit, match='renew: no env-file at'):
+        RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
+    # An env-file with no lease (an access to external endpoints only): there
+    # is nothing to release, and that is not an error.
+    (tmp_path / 'lease.env').write_text('export OPENAI_BASE_URL=x\n')
+    with pytest.raises(SystemExit) as info:
+        ReleaseCLI.main(argv=['--ledger', env.db, '--env-file', missing])
+    assert info.value.code == 0
+    with pytest.raises(SystemExit, match='names no lease'):
+        RenewCLI.main(argv=['--ledger', env.db, '--env-file', missing, '--ttl', '1h'])
+
+
+def test_routes_seed_adds_but_refuses_to_redefine_without_replace(tmp_path, monkeypatch, capsys):
+    """Queue item 19: seeding a new alias is additive; seeding a different
+    definition of an existing alias redirects its clients, so it refuses by
+    default and leaves the published catalogs as they were."""
+    from infer_stack.cli.commands_leasing import RoutesSeedCLI
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    first = tmp_path / 'a.yaml'
+    first.write_text(yaml.safe_dump(_one_endpoint_catalog('alpha')))
+    other = _one_endpoint_catalog('alpha')
+    other['endpoints']['alpha']['served_name'] = 'alpha-v2'   # alpha, routed elsewhere
+    second = tmp_path / 'b.yaml'
+    second.write_text(yaml.safe_dump(other))
+
+    def seed(*args):
+        capsys.readouterr()
+        rc = RoutesSeedCLI.main(argv=['--ledger', db, *args, '--json', '--yes'])
+        return rc, json.loads(capsys.readouterr().out)
+
+    rc, out = seed(str(first))
+    assert rc == 0 and out['added'] == ['alpha']
+    published = _published(db)
+
+    rc, out = seed(str(first))                                  # identical: a no-op
+    assert out['added'] == [] and out['unchanged'] == ['alpha']
+    assert _published(db) == published
+
+    with pytest.raises(SystemExit, match='refused'):
+        RoutesSeedCLI.main(argv=['--ledger', db, str(second), '--yes'])
+    assert _published(db) == published                          # unchanged
+
+    rc, out = seed(str(second), '--replace')
+    assert rc == 0 and out['updated'] == ['alpha']
+    assert _published(db)['alpha']['served_name'] == 'alpha-v2'
+
+
+def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, monkeypatch):
+    """Re-review 7: another process redefines the alias between the plan and
+    the commit; the commit refuses, writes nothing, and leaves no pending
+    publication behind."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.routes import RouteConflict
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
+    controller = cl._open_controller(config, interactive=False)
+    plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    gateway = controller.backend.front_door().gateway
+    real_lock = controller._global_lock
+
+    def racing_lock():
+        # The other process wins the lock first and redefines alpha.
+        gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'elsewhere'}})
+        return real_lock()
+
+    controller._global_lock = racing_lock
+    with pytest.raises(RouteConflict):
+        controller.commit_route_seed(plan)
+    assert controller.ledger.publication_pending() is None
+    assert gateway.route_entries() == {'alpha': {'engine': 'vllm', 'served': 'elsewhere'}}
+
+
+def test_replace_is_compare_and_swap_against_what_was_shown(tmp_path, monkeypatch):
+    """`routes seed --replace` replaces exactly the meaning it showed: if
+    another process redefined the alias between the plan and the commit,
+    nothing is written and no publication is left pending."""
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.routes import RouteConflict
+
+    state = tmp_path / 'state'
+    state.mkdir()
+    db = str(tmp_path / 'ledger.db')
+    _patch_backend(monkeypatch, state)
+    config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
+    controller = cl._open_controller(config, interactive=False)
+    gateway = controller.backend.front_door().gateway
+    gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'shown'}})
+    plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    assert list(plan.conflicted) == ['alpha']               # shown: 'shown' -> alpha
+    real_lock = controller._global_lock
+
+    def racing_lock():
+        gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'moved'}})
+        return real_lock()
+
+    controller._global_lock = racing_lock
+    with pytest.raises(RouteConflict, match='changed since the redefinition was shown'):
+        controller.commit_route_seed(plan, replace=True)
+    assert controller.ledger.publication_pending() is None
+    assert gateway.route_entries() == {'alpha': {'engine': 'vllm', 'served': 'moved'}}
+    controller._global_lock = real_lock                      # unchanged: it replaces
+    fresh = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
+    controller.commit_route_seed(fresh, replace=True)
+    assert 'alpha' not in gateway.route_entries()            # the published definition won

@@ -9,7 +9,7 @@ from __future__ import annotations
 import shlex
 
 import pytest
-import scriptconfig as scfg
+import kwconf as kw
 
 from infer_stack import cli_equivalent as cli
 from infer_stack.cli import ManageCLI
@@ -20,7 +20,7 @@ def parse(text: str):
     words = shlex.split(text.split('   #', 1)[0])
     assert words[0] == 'infer-stack'
     node, rest = ManageCLI, words[1:]
-    while isinstance(node, type) and issubclass(node, scfg.ModalCLI):
+    while isinstance(node, type) and issubclass(node, kw.ModalCLI):
         node = getattr(node, rest[0].replace('-', '_'))
         rest = rest[1:]
     return node, node.cli(argv=rest, strict=True)

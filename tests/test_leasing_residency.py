@@ -59,7 +59,7 @@ def snap(*entries):
 @pytest.mark.parametrize('state', sorted(WARM_STATES))
 def test_warm_states_are_resident(state):
     res = snap(container('c1', 'grp-a', state=state))
-    assert res.resident('grp-a').container_id == 'c1'
+    assert res.unique_unit('grp-a').container_id == 'c1'
 
 
 @pytest.mark.parametrize('state', ['created', 'exited', 'removing', 'dead'])
@@ -67,7 +67,7 @@ def test_non_warm_states_are_not_resident_but_still_occupy_their_gpu(state):
     # Not warm cache -- but a created/exited container still carries a device
     # request that `up` could start, so nothing may be started on top of it.
     res = snap(container('c1', 'grp-a', state=state, device_ids=('3',)))
-    assert res.resident('grp-a') is None
+    assert res.unique_unit('grp-a') is None
     assert [c.container_id for c in res.occupants(3)] == ['c1']
 
 
@@ -76,14 +76,14 @@ def test_non_warm_states_are_not_resident_but_still_occupy_their_gpu(state):
 
 def test_gpus_come_from_device_request_indices():
     res = snap(container('c1', 'grp-a', device_ids=('2', '1')))
-    c = res.resident('grp-a')
+    c = res.unique_unit('grp-a')
     assert c.gpus == (1, 2) and c.all_gpus is False
     assert {g for g in range(4) if res.occupants(g)} == {1, 2}
 
 
 def test_container_without_a_gpu_reservation_occupies_nothing():
     res = snap(container('c1', 'grp-a', device_ids=()))   # DeviceRequests: None
-    assert res.resident('grp-a').gpus == ()
+    assert res.unique_unit('grp-a').gpus == ()
     assert all(res.occupants(g) == () for g in range(4))
 
 
@@ -95,7 +95,7 @@ def test_container_without_a_gpu_reservation_occupies_nothing():
 def test_unmappable_reservation_is_treated_as_every_gpu(requests):
     # Never guess which GPU a container holds: fail closed for every GPU.
     res = snap(container('c1', 'grp-a', requests=requests))
-    assert res.resident('grp-a').all_gpus is True
+    assert res.unique_unit('grp-a').all_gpus is True
     assert all(
         [c.container_id for c in res.occupants(g)] == ['c1'] for g in range(8)
     )
@@ -126,18 +126,18 @@ def test_duplicate_deployment_containers_are_kept_and_ambiguous():
         container('c2', 'grp-a', device_ids=('1',)),
         container('c1', 'grp-a', state='exited', device_ids=('0',)),
     )
-    assert res.ambiguous('grp-a') is True
-    assert res.resident('grp-a') is None
-    assert [c.container_id for c in res.containers('grp-a')] == ['c1', 'c2']
+    assert res.is_conflicted('grp-a') is True
+    assert res.unique_unit('grp-a') is None
+    assert [c.container_id for c in res.units('grp-a')] == ['c1', 'c2']
     assert [c.container_id for c in res.occupants(0)] == ['c1']
     assert [c.container_id for c in res.occupants(1)] == ['c2']
 
 
 def test_absent_deployment_is_not_resident_and_not_ambiguous():
     res = snap(container('c1', 'grp-a'))
-    assert res.resident('grp-b') is None
-    assert res.ambiguous('grp-b') is False
-    assert res.containers('grp-b') == ()
+    assert res.unique_unit('grp-b') is None
+    assert res.is_conflicted('grp-b') is False
+    assert res.units('grp-b') == ()
 
 
 @pytest.mark.parametrize('raw', ['not json', '{"Id": "c1"}', '[1, 2]',
@@ -189,7 +189,7 @@ def test_residency_lists_the_whole_project_in_every_state(tmp_path):
     assert ps[:4] == ['docker', 'ps', '-a', '--no-trunc']
     assert f'label={COMPOSE_PROJECT_LABEL}={PROJECT}' in ps
     assert docker.calls[1] == ['docker', 'inspect', 'c1']
-    assert res.resident('grp-a').gpus == (1,)
+    assert res.unique_unit('grp-a').gpus == (1,)
 
 
 def test_residency_with_no_containers_is_empty_and_skips_inspect(tmp_path):
@@ -259,10 +259,10 @@ def test_residency_against_real_docker_created_containers(tmp_path):
         be = ComposeBackend(state_dir=tmp_path, inventory=simulate_inventory('4x80'),
                             run=run, project=project)
         res = be.residency()
-        a, b = res.containers('grp-aaa'), res.containers('grp-bbb')
+        a, b = res.units('grp-aaa'), res.units('grp-bbb')
         assert len(a) == 1 and a[0].gpus == (1, 2) and a[0].state == 'created'
         assert len(b) == 1 and b[0].gpus == ()
-        assert res.resident('grp-aaa') is None           # created is not warm
+        assert res.unique_unit('grp-aaa') is None           # created is not warm
         assert [c.deployment_id for c in res.occupants(2)] == ['grp-aaa']
     finally:
         subprocess.run([*base, 'down'], capture_output=True, timeout=300)

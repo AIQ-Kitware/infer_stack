@@ -141,3 +141,156 @@ The failure is an ordering mismatch, not a HyperQwen or placement problem. Admis
 I kept the safety invariant intact and canonicalized only semantically unordered launch mappings at the Compose renderer boundary. Custom environment variables now render in sorted key order after infer-stack's owned `HF_TOKEN`; custom runtime mounts render in sorted container-target order. Command/argument lists remain ordered. This makes fresh-catalog and sqlite-reloaded deployments generate identical Compose bytes while preserving meaningful list order and the existing approval-digest check.
 
 Regression coverage mirrors the real boundary two ways. A render-level test takes a custom-launch deployment whose env/mount mappings are deliberately non-alphabetical, JSON round-trips its `spec`/`served` with `sort_keys=True` exactly as `SqliteStore` does, renders again, and asserts the complete Compose YAML is byte-identical. An admission-level test then acquires the same shape through `Controller`, verifying the lease remains ACTIVE and the publication marker clears after preview -> sqlite commit -> post-commit render. With a minimal temporary ubelt stub (the extracted checkout lacks project dependencies), the full Compose + admission suites pass: 115 passed, 4 skipped. `compileall` and `git diff --check` also pass. No HyperQwen-specific runtime logic was added.
+
+## 2026-09-28 13:07:17 -0400
+
+Summary of user intent: move from VM-only KubeAI testing toward practical real-cluster use, and consolidate the currently scattered K3s/NVIDIA/KubeAI setup knowledge into an ergonomic infer-stack surface without turning infer-stack into a general Kubernetes installer. The requested deliverable is an overlay implementing the design.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I added a deliberately narrow `infer-stack kube` modal. `kube nodes` inventories Ready state and GPU scheduling/discovery facts. `kube setup` is a read-only capability plan by default; `--apply` reconciles only the cluster integration infer-stack needs. The planner treats working externally managed GPU resources/labels or KubeAI components as satisfying the capability instead of taking them over. When infer-stack does need to manage NVIDIA support, it requires an already-functional `nvidia` RuntimeClass and then installs/reconciles the pinned NVIDIA device-plugin chart with GPU Feature Discovery; host drivers and the NVIDIA container runtime remain explicitly outside infer-stack's ownership. KubeAI setup merges discovered resource profiles into existing/operator Helm values without overwriting same-named hand-tuned profiles, preserves an installed chart version unless explicitly changed, supports an operator `--values` file, and keeps chart `secrets.*` out of both Helm argv and the persistent generated values file by carrying them only through a short-lived mode-0600 values file. An exported `HF_TOKEN` overrides the preserved Hugging Face token in that ephemeral layer.
+
+K3s remains an explicit convenience implementation underneath Kubernetes rather than being implied by the generic kube surface. `kube k3s bootstrap` owns the former bootstrap flow, configures K3s's persistent kubeconfig mode instead of copying a second kubeconfig authority, waits against `/etc/rancher/k3s/k3s.yaml` explicitly, symlinks a clean `~/.kube/config` to that authority but never overwrites an existing kubeconfig, and installs Helm when absent; an explicit version mismatch on an already-running server refuses an implicit upgrade. `kube setup` also prints the active Kubernetes context before its capability plan so an operator can see which cluster an apply would target. `kube k3s join` reads the cluster token from a file and passes it through the installer environment rather than argv. The old `scripts/bootstrap_k3s.sh` and `scripts/join_agent.sh` are compatibility wrappers around these commands, so they no longer duplicate lifecycle logic. `scripts/install_kubeai.sh` remains available as a low-level/manual escape hatch rather than becoming a second recommended workflow.
+
+I also factored KubeAI resource-profile generation into a shared backend helper so `catalog suggest` and cluster setup use the same mapping, updated KubeAI doctor/catalog remediation text, and rewrote the README/KubeAI backend/parity docs around the new plan/apply authority. A late review caught two important edge cases: Helm may be absent only when every needed GPU/KubeAI capability is already externally managed; if the plan has any reconciliation action, missing Helm is a required blocker. Also, preserving existing Helm values must not copy `secrets.*` (including a prior Hugging Face token) into generated YAML; those values are now split into the ephemeral secret file and preserved across upgrades without being persisted by infer-stack. The explicit K3s subcommands inherit `kw.Config`, matching the rest of the kwconf command surface.
+
+Validation in this extracted/offline checkout: `python -m compileall -q infer_stack tests`, `bash -n` on the compatibility wrappers, and `git diff --check` pass. `tests/test_cli_kube.py` plus four focused existing KubeAI sizing/measurement tests pass (14 passed, 60 deselected). Running the complete two relevant test files reaches 67 passing tests; the remaining seven tests fail at collection/import only because `kwconf` is not installed in this container. A minimal temporary kwconf/ubelt shape stub outside the repository successfully imports the complete CLI tree and verifies the nested `ManageCLI.kube -> KubeModalCLI.k3s -> bootstrap/join` registration. Package-index DNS is unavailable, so I could not execute the real kwconf parser/help tree or the full project suite; those should be run in the normal development environment before merge.
+
+## 2026-09-28 13:52:00 -0400
+
+Summary of user intent: keep the new Kubernetes integration from acquiring K3s
+as an architectural dependency while retaining K3s as infer-stack's first
+well-supported workstation-cluster provisioning path.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I tightened the distribution boundary rather than inventing a provider
+abstraction before a second provisioning integration exists. The generic
+`KubeManager` and KubeAI backend diagnostics no longer mention K3s-specific
+remediation; they report missing Kubernetes/container-runtime capabilities in
+distribution-neutral terms. K3s knowledge remains in the explicit
+`infer_stack.kube.k3s` leaf module and `infer-stack kube k3s` CLI namespace.
+Package/CLI docstrings now state that separation explicitly.
+
+I added `docs/cluster-setup.md` as the operator runbook. It distinguishes the
+Kubernetes control plane from infer-stack authority, shows the initial K3s
+server + agent topology (with the server also usable as a GPU worker), gives the
+create/join/reconcile sequence, and gives an existing-cluster path that starts
+directly at `kube nodes` / `kube setup`. README and the KubeAI backend guide
+link to this runbook and identify K3s as the first provisioning target rather
+than the generic backend. Focused tests assert that generic missing-kubectl and
+missing-NVIDIA-runtime diagnostics remain distribution-neutral.
+
+Validation: with the same minimal offline ubelt/kwconf stubs used for the prior
+overlay, `tests/test_cli_kube.py` passes 12/12. The Kubernetes CLI suite plus
+the non-parser KubeAI sizing/doctor checks pass 16/16. Running both complete
+relevant files reaches 71 passed / 5 failed; every failure is a CLI-entry test
+that reaches the intentional `kwconf.Config.cli` stub, so the real kwconf parser
+remains the only unavailable test dependency in this environment. `compileall`,
+`bash -n` on both compatibility wrappers, and `git diff --check` pass. A
+cumulative archive was applied to a pristine extraction of the supplied source;
+all overlay files compared byte-identical, executable modes were preserved, and
+the 16-test focused verification passed there as well.
+
+## 2026-09-28 14:42:27 -0400
+
+Summary of user intent: make two workstations that already have working Compose-backed infer-stack installations practical for real KubeAI testing without destroying their existing local state. The machines need to be pooled into Kubernetes, then temporarily handed back to direct Compose use, and later returned to the same cluster only when the operator explicitly requests it.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+The main design decision was to avoid treating temporary Compose use as Kubernetes leave/rejoin. A worker does not need its K3s/kubelet agent stopped merely to make its GPU safe for local Compose; doing so would create more lifecycle state, and stopping the sole K3s server would also take down the cluster control plane. Instead, the generic Kubernetes layer now models a reversible scheduling handoff. `infer-stack kube node detach NODE` is read-only by default; `--yes` marks an infer-stack-owned detach, cordons the node, and drains controller-managed workloads while leaving DaemonSet/static pods and the distribution agent/control plane running. `attach --yes` waits for that same node identity to be Ready, uncordons it, and removes the marker. This is distribution-neutral because it uses only Kubernetes APIs, so it does not weaken the earlier K3s boundary.
+
+The cordon has explicit ownership and crash recovery. Infer-stack refuses to adopt or undo an unrelated operator cordon. Detach writes a `requested` annotation before mutation and changes it to `true` only after a successful drain; an interrupted operation can therefore be retried or reversed instead of becoming an ambiguous foreign cordon. Bare/unmanaged pods are a hard stop rather than a reason to add `kubectl drain --force`. `kube nodes` now exposes schedulability, `compose` for a completed temporary detach, `pending` for an interrupted detach, and `CONFLICT` if someone externally makes a Compose-marked node schedulable.
+
+A second issue was backend recovery state. The existing leasing design intentionally refuses to change backend kind inside one recovery ledger, so switching a Compose-configured control workstation to `config set backend kubeai` and reusing its data root would make the physical-node workflow look easy while leaving a recovery-snapshot mismatch. I preserved that invariant rather than weakening it. The documented temporary-testing path keeps the persisted Compose default/ledger untouched and runs the one KubeAI authority with `INFER_STACK_BACKEND=kubeai` plus a separate `INFER_STACK_DATA_DIR=$HOME/.local/share/infer_stack-kubeai`. The normal config/catalog root remains shared. Unsetting those variables returns the control workstation to its original Compose authority; ordinary worker nodes never need a local KubeAI authority at all.
+
+The resulting two-machine loop is: quiesce local Compose on A/B, create/join Kubernetes once, run KubeAI from its separate authority/data root, release KubeAI workloads, detach A/B for Compose, use their old Compose installations, quiesce Compose, attach A/B, and resume the same KubeAI authority. There is no second `kube k3s join` because detach preserves membership and agent state. A K3s server that is also the sole control-plane node can be detached from workload scheduling without stopping the server; cluster workloads may become Pending when all workers are cordoned, but the control plane remains available to attach them again.
+
+Validation in this extracted/offline checkout: `tests/test_cli_kube.py` passes 18/18 with the same minimal ubelt stub used for the Kubernetes work; the tests cover reversible detach/attach, retained DaemonSet/static pods, refusal to force-delete unmanaged pods, refusal to undo foreign cordons, interrupted-detach retry, control-plane handling, and node inventory state. Four existing KubeAI doctor/sizing tests also pass. A minimal external kwconf/ubelt shape stub imports the full CLI tree and verifies `ManageCLI.kube -> KubeModalCLI.node -> status/detach/attach`. `python -m compileall -q infer_stack tests` passes. The container still lacks the real ubelt/kwconf and ruff packages, so the real parser/help path and repository lint suite should run in the normal development environment before merge.
+
+## 2026-10-02 11:19:47 -0400
+
+Summary of user intent: fix the Compose GPU doctor false-negative observed on aiq-gpu after handing the node back from Kubernetes. The live reproducer showed cached non-interactive sudo working, while GNU find over /proc returned status 1 because one fd disappeared during traversal even though it produced 52 valid NVIDIA-device holder records. Those holders were nvidia-persistenced, the Kubernetes NVIDIA device plugin, and nvtop; none represented a CUDA compute workload.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I kept the fix inside the GPU diagnostic rather than weakening backend admission. The privileged holder scan now verifies sudo independently, runs the /proc traversal with a stable C locale, and accepts a nonzero find exit only when every reported error is the expected live-/proc race (a /proc path vanished with ENOENT). Valid stdout is retained. Real permission/execution errors still fail closed. A second race was handled at the pid-detail stage: if the process disappears before cmdline/cgroup can be read, that stale holder is dropped rather than formatted as a current conflict.
+
+The holder classification now distinguishes passive/system observers from unexpected holders. nvidia-persistenced, nvidia-device-plugin, gpu-feature-discovery, and nvtop are informational: they can hold NVIDIA character devices (and may block a low-level reset) but do not by themselves reserve GPU memory or make a Compose/vLLM placement unsafe. Unknown holders still fail the check and preserve the container/pod attribution. The reset-specific note is emitted only when nvidia-persistenced is actually present.
+
+Validation in this extracted checkout: python compileall passes. The normal pytest entrypoint cannot collect because ubelt is absent from the container, so I ran a dependency-light direct harness that reproduces the exact sudo=0/find=1+ENOENT+valid-stdout case and the observed three-process holder set; both pass. Focused pytest regressions were added for the transient /proc race, real find errors, and passive holder classification. The overlay is direct-overwrite and intentionally limited to the diagnostic, its tests, this journal, and the reusable /proc lesson.
+
+## 2026-10-03 — review of LiteLLM context metadata patch
+
+Reviewed commit `2ba288caad36` against the context-metadata requirements. The
+main propagation was sound, but two correctness gaps remained:
+
+1. `max_model_len` participates in capacity subsumption. A 65K endpoint can
+   coalesce onto an already-running compatible 262K deployment, so deriving
+   every route's `max_input_tokens` from the deployment runtime leaks the
+   larger process capacity into the smaller endpoint alias and makes static
+   gateway metadata change across acquire/release. The catalog resolver now
+   persists each vLLM endpoint's effective context contract in its per-alias
+   `served` payload. Route rendering uses that value, falls back to the current
+   catalog for legacy deployments, and only then falls back to deployment
+   capacity for ad-hoc aliases. Compose and KubeAI use the same helper.
+
+2. LiteLLM may synthesize `model_info.max_input_tokens` from its bundled model
+   metadata for an external route even when infer-stack never supplied that
+   field. Dynamic reconciliation previously compared it unconditionally, so a
+   known external model could be deleted and re-added every converge. Reconcile
+   now ignores observed context only when the desired route has no
+   infer-stack-owned context; managed values remain strict drift semantics.
+
+Focused CPU-only validation in the extracted source (with only a minimal
+`ubelt` import stub because the archive environment lacks project deps):
+`tests/test_leasing_context_metadata.py`, dynamic-routing, and route-registry
+suites pass; broader catalog/ledger/admission/routing coverage passes apart
+from two Compose tests that also fail on the unmodified base in this container
+and CLI tests blocked by missing `kwconf`. `compileall` is clean.
+
+
+## 2026-10-03 13:18:00 -0400
+
+Summary of user intent: document a detailed future architecture for infer-stack
+that can be controlled remotely, can eventually run multiple redundant
+control-plane processes without creating competing authorities, and treats
+security of the remote control surface as a primary design constraint.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I wrote a planning document rather than changing runtime behavior. The central
+design decision is to distinguish one logical control plane from one physical
+control-plane machine: a managed backend domain should have one authoritative
+state, while one or more controller replicas may serve API traffic and
+reconciliation. Existing inference is deliberately a data-plane concern and
+should continue if every controller is temporarily unavailable; only mutations,
+reconciliation, TTL GC, and route changes should pause.
+
+The proposed evolution keeps SQLite for simple standalone mode and introduces
+PostgreSQL for remote/server/HA mode instead of attempting network-shared
+SQLite. The first HA shape is active-active API replicas plus one elected
+reconciler, with monotonically increasing leadership epochs and per-object
+desired generations so stale leaders cannot overwrite newer state. Remote
+Compose hosts are controlled through authenticated node agents rather than SSH
+or exposed Docker sockets; Kubernetes/KubeAI continues to use Kubernetes as its
+scheduler/agent substrate rather than adding a competing infer-stack scheduler.
+
+Security is intentionally part of the architecture rather than a later
+hardening pass. Remote listeners default to loopback, remote access requires
+TLS/authentication, normal users operate only on approved catalog endpoints,
+catalog mutation is a separate privilege, and the control API must not expose a
+generic exec surface or arbitrary images/commands/host mounts. The plan also
+defines durable operations/idempotency, audit records, failure semantics,
+backup/restore expectations, staged implementation phases, and a test strategy
+for leader failover, stale-generation fencing, node partitions, and data-plane
+independence.
+
+I also linked the current "one control plane per host or backend namespace"
+known limitation to this proposed successor architecture so the repository
+clearly distinguishes today's supported behavior from the future direction.
+This is documentation-only; no tests were required or run. The principal open
+questions left intentionally unresolved are API transport, agent transport,
+authentication provider, catalog authority, and whether infer-stack and LiteLLM
+share one physical PostgreSQL service or only colocate operationally while
+keeping separate schemas/credentials.

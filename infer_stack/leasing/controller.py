@@ -28,15 +28,25 @@ import warnings
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, TypeVar, cast
+from typing import Callable, Iterable, TypeVar
 
-from .backend import AdmissionBackend, Backend
+from .backend import (
+    ApplyResult,
+    ConnectionInfo,
+    FrontDoorControl,
+    HostRuntime,
+    ServingBackend,
+)
+from .routes import RoutePlan
 from .ledger import Ledger
 from .models import Deployment, DeploymentState, EndpointRequest, Lease, LeaseState
 
 _T = TypeVar('_T')
 
 KEEP_WARM = 'keep-warm'
+#: Between two evictions made to fit leased demand: long enough for the
+#: freed instance to terminate and the scheduler to retry.
+ROOM_COOLDOWN_S = 30.0
 
 #: After an interrupted apply, how long to wait for the runtime to stop changing
 #: before applying again, and how often to sample it. Held under the lock.
@@ -76,12 +86,16 @@ class ReconcileResult:
     placement_errors: list[str] = field(default_factory=list)
     # deployment id -> GPU indices it is on / slated for (placement backends only).
     assignments: dict[str, list[int]] = field(default_factory=dict)
-    # False when reconcile only rendered the on-disk state (no docker up/down).
+    # False when reconcile only rendered the on-disk state (nothing brought up or taken down).
     applied: bool = True
     # True when a publication marker is still set after this operation: the
     # desired state was staged (--no-apply, render) or its apply did not fully
     # succeed. The next applying operation, or `infer-stack apply`, publishes it.
     publication_pending: bool = False
+    # Whether the runtime reached the render (routes may still be unverified),
+    # and the apply's own words when it did not fully take effect.
+    runtime_applied: bool = False
+    apply_detail: str = ''
     # Admission mode: idle keep-warm residents that yielded their GPUs, and
     # LIVE deployments whose committed allocation is no longer valid.
     displaced: list[str] = field(default_factory=list)
@@ -107,6 +121,54 @@ class AcquireOutcome:
     # True when the readiness wait timed out and the controller rolled the lease
     # back (released + reconciled) so a never-ready acquire doesn't pin a GPU.
     released_on_timeout: bool = False
+
+
+@dataclass
+class AccessResult:
+    """What a workload needs to reach its endpoints, and what it holds.
+
+    ``endpoints``: the aliases asked for, bundles expanded, in order;
+    ``external``: those an external server fulfils (no lease, no deployment);
+    ``request_names``: the ``model`` a client sends for each; ``connection``:
+    the base URL and credential (``None`` on an in-process backend); ``lease``:
+    the one real lease over the managed members, or ``None`` when every member
+    is external (the lease never lists an external name); ``acquire``: that
+    lease's outcome (readiness, placement). ``published`` is whether the
+    publication (the gateway's routes included) completed; ``False`` leaves it
+    pending for the next apply. ``front_door_ready`` is ``False`` when an
+    external member's front door never accepted its key in time; the lease
+    this access took is then already released. ``waited`` is whether
+    readiness was checked at all.
+    """
+
+    endpoints: list[str]
+    external: list[str]
+    request_names: dict[str, str]
+    connection: ConnectionInfo | None
+    lease: Lease | None = None
+    acquire: AcquireOutcome | None = None
+    front_door_ready: bool | None = None
+    published: bool = True
+    waited: bool = True
+
+    @property
+    def deployments(self) -> list[Deployment]:
+        return list(self.acquire.deployments) if self.acquire is not None else []
+
+    @property
+    def ready(self) -> bool | None:
+        """``True``: verified that every member can be asked now (infer-stack's
+        routes for them are published, managed members generate through the
+        front door, and the front door accepts its key; the external server
+        itself is not asked). ``False``: verified not. ``None``: not checked
+        (``wait=False``)."""
+        if not self.published or self.front_door_ready is False:
+            return False
+        if self.acquire is not None and (
+                self.acquire.released_on_timeout
+                or (self.acquire.wait is not None and not self.acquire.wait.ready)):
+            return False
+        return True if self.waited else None
 
 
 @dataclass
@@ -165,7 +227,7 @@ class Controller:
     def __init__(
         self,
         ledger: Ledger,
-        backend: Backend,
+        backend: ServingBackend,
         *,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -185,6 +247,9 @@ class Controller:
         # Recovery snapshot (see leasing/profile.py): this process's own
         # resolved settings, captured before the backend is switched to the
         # resolved copy, and the snapshot the backend currently renders from.
+        #: The first snapshot, rendered from but not yet written (see
+        #: :meth:`_sync_profile`).
+        self._fresh_profile: dict | None = None
         self._invocation_profile: dict | None = None
         self._applied_profile: dict | None = None
         self._profile_drift_warned = False
@@ -195,7 +260,14 @@ class Controller:
         # Set only by apply_now(): the operator explicitly re-approves a render
         # that differs from an earlier approved digest.
         self._explicit_apply = False
+        # Set when an apply is invoked: whether a failed publication may have
+        # changed the runtime (secret rotation reads it; see rotate_gateway_key).
+        self._apply_began = False
         self._admission_digest: str | None = None
+        #: Whether the last refused admission was for lack of GPUs.
+        self._admission_capacity = False
+        #: Why residency could not be read, for the refusal that follows.
+        self._residency_error: str | None = None
         from .profile import ProfileMismatch
 
         try:
@@ -367,6 +439,18 @@ class Controller:
         except OSError as exc:
             return f'inspection failed: {exc}'
 
+    def publication_lock(self):
+        """Hold while changing state a render reads outside the ledger (the
+        managed ``.env``): the same host-wide lock every publication holds."""
+        return self._global_lock()
+
+    def invocation_profile(self) -> dict | None:
+        """The recovery profile this invocation resolves to (its settings and
+        catalogs), before any switch to a stored one; ``None`` without one."""
+        recovery = self.backend.recovery_profile
+        return self._invocation_profile or (
+            recovery.render_profile() if recovery is not None else None)
+
     @contextlib.contextmanager
     def _global_lock(self):
         """Serialize desired-state publication, single-writer.
@@ -416,31 +500,14 @@ class Controller:
 
     # -- reconcile ---------------------------------------------------------
 
-    def desired_deployments(self) -> list[Deployment]:
-        """Deployments that should currently be running."""
-        _, deployments = self.ledger.status()
-        desired: list[Deployment] = []
-        for deployment in deployments:
-            if deployment.state == DeploymentState.LIVE:
-                desired.append(deployment)
-            elif deployment.state == DeploymentState.IDLE:
-                policy = deployment.spec.get('reclaim', self.reclaim_default)
-                if policy == KEEP_WARM:
-                    desired.append(deployment)
-        return desired
-
     def _infeasible_alone(self, deployments, requested: set) -> dict:
         """Which of this lease's deployments cannot be placed even on an idle host.
 
         Returns ``{deployment_id: reason}``, empty when the whole set fits.
-        Backends without an idle-host planner (null, kubeai) return empty --
-        the check is an optimisation over waiting, never a new failure mode.
+        The check is an optimisation over waiting, never a new failure mode.
         """
-        plan_alone = getattr(self.backend, 'plan_on_idle_host', None)
-        if plan_alone is None:
-            return {}
         try:
-            plan = plan_alone(list(deployments))
+            plan = self.backend.plan_on_idle_host(list(deployments))
         except Exception as ex:  # noqa: BLE001 -- never fail an acquire on the check
             # Waiting (the old behavior) is still correct, so a broken check
             # must not break acquire. But it must not be silent either: a
@@ -466,76 +533,39 @@ class Controller:
     def _render(self) -> ReconcileResult:
         """Render the desired state to disk WITHOUT the slow apply.
 
-        The caller MUST hold :meth:`_global_lock`. For a converge-style backend
-        (Compose) this writes the compose project (placement + files) but does
-        not ``docker compose up`` -- that is :meth:`_apply_pending`, under the
-        same lock hold. A per-deployment ``realize``/``teardown`` backend has no
-        such split, so it realizes here; those backends expose no ``apply``.
+        The caller MUST hold :meth:`_global_lock`. This writes the backend's
+        rendered state (the compose project, the Model manifests) but does not
+        bring it up -- that is :meth:`_apply_pending`, under the same lock hold.
         """
         self.ledger.sweep()
-        placement = None
-        if self._admission_mode():
-            # Residency decides which idle keep-warm deployments are candidates
-            # at all; unknown residency fails the render (the change stays
-            # pending) rather than guessing which warm models exist.
-            residency = self._admitting.residency()
-            self._backfill_allocations(residency)
-            self._prepare_network()
-            desired, placement = self._admission_view(residency)
-            self._admitting.adopted = self._prune_adopted(residency)
-        else:
-            desired = self.desired_deployments()
-        # Bound once rather than probed with hasattr: the capability check is
-        # the same, and the bound method keeps its type instead of narrowing
-        # to `object` the way an attribute reached through hasattr does.
-        converge = getattr(self.backend, 'converge', None)
-        if converge is not None:
-            before = set(self.backend.observe())
-            try:
-                if placement is not None:
-                    converge(desired, apply=False, placement=placement)
-                else:
-                    converge(desired, apply=False)
-            except TypeError:
-                # Legacy converge(desired) with no apply kwarg renders+applies
-                # in one shot (no separate apply()); accept that here.
-                converge(desired)
-            after = set(self.backend.observe())
-            rec = ReconcileResult(
-                realized=sorted(after - before),
-                torn_down=sorted(before - after),
-                unplaced=sorted(
-                    getattr(self.backend, 'last_unplaced', ()) or ()
-                ),
-                placement_errors=list(
-                    getattr(self.backend, 'last_errors', ()) or ()
-                ),
-                assignments=dict(
-                    getattr(self.backend, 'last_assignments', {}) or {}
-                ),
-                applied=False,
-                displaced=list(getattr(self.backend, 'last_displaced', ()) or ()),
-                degraded=list(getattr(self.backend, 'last_degraded', ()) or ()),
-            )
-            if placement is not None:
-                self._adopt_existing(residency)
-            return rec
-        desired_ids = {g.id for g in desired}
-        actual = self.backend.observe()
-        result = ReconcileResult()
-        for deployment in desired:
-            if deployment.id not in actual:
-                self.backend.realize(deployment)
-                result.realized.append(deployment.id)
-        stale = actual - desired_ids
-        if stale:
-            by_id = {g.id: g for g in self.ledger.status()[1]}
-            for gid in stale:
-                deployment = by_id.get(gid)
-                if deployment is not None:
-                    self.backend.teardown(deployment)
-                    result.torn_down.append(gid)
-        return result
+        # Residency decides which idle keep-warm deployments are candidates at
+        # all; unknown residency fails the render (the change stays pending)
+        # rather than guessing which warm models exist.
+        residency = self.backend.residency()
+        self._backfill_allocations(residency)
+        host = self.backend.host_runtime
+        self._prepare_network(host)
+        desired, placement = self._admission_view(residency)
+        if host is not None:
+            host.set_adopted(self._prune_adopted(residency))
+        before = set(self.backend.observe())
+        self.backend.converge(desired, apply=False, placement=placement)
+        after = set(self.backend.observe())
+        notes = self.backend.placement_notes()
+        rec = ReconcileResult(
+            realized=sorted(after - before),
+            torn_down=sorted(before - after),
+            unplaced=sorted(self.backend.last_unplaced),
+            placement_errors=list(self.backend.last_errors),
+            assignments=dict(self.backend.last_assignments),
+            applied=False,
+            # The render's own record, the one authority for these facts.
+            displaced=list(notes.get('displaced') or ()),
+            degraded=list(notes.get('degraded') or ()),
+        )
+        if host is not None:
+            self._adopt_existing(residency, host)
+        return rec
 
     # -- serialised publication --------------------------------------------
     #
@@ -551,36 +581,36 @@ class Controller:
 
     # -- admission (plan steps P5, P6, P9) ------------------------------------
     #
-    # Backends with strict residency and an in-memory preview (Compose) get
-    # admission semantics:
+    # Every acquire, renew and publication goes through admission:
     #   * a LIVE deployment holds a committed allocation (assigned_gpus);
     #   * an IDLE keep-warm deployment is only an optional candidate, and only
     #     while it is uniquely resident; it yields its GPUs to demand and is
     #     never started;
     #   * an acquire is previewed in memory (placement AND render) and commits
     #     its lease together with its allocations, or commits nothing.
-    # Other backends (KubeAI, where the cluster schedules; test fakes) keep the
-    # previous behaviour.
+    # Where the cluster schedules (KubeAI, ``allocates_gpus`` false) every
+    # deployment commits an empty allocation: admission then decides only
+    # renderability, and a Pending pod is a wait reason, not an unplaced
+    # error. Backends that neither place nor inspect (dry-run, tests) get the
+    # same surface from SimpleAdmission.
+
+    def keeps_up(self, deployment: Deployment) -> bool:
+        """Whether the reconciler keeps ``deployment`` running.
+
+        LIVE always; IDLE only under ``keep-warm`` (the default policy). An
+        IDLE ``stop`` deployment is torn down by the release that idled it
+        and stays IDLE in the ledger, so a view that treats every IDLE row as
+        running reports a missing container that is exactly as intended.
+        """
+        if deployment.state == DeploymentState.LIVE:
+            return True
+        return (deployment.state == DeploymentState.IDLE
+                and deployment.spec.get('reclaim', self.reclaim_default) == KEEP_WARM)
 
     def _stored_state(self, lease_id: str):
         """A lease's state as stored (not virtually expired), or ``None``."""
         lease = self.ledger.get_lease(lease_id)
         return None if lease is None else lease.state
-
-    @property
-    def _admitting(self) -> AdmissionBackend:
-        """``self.backend`` as the admission surface.
-
-        Only for code that runs after :meth:`_admission_mode` (or an
-        equivalent capability check) said the backend has it.
-        """
-        return cast(AdmissionBackend, self.backend)
-
-    def _admission_mode(self) -> bool:
-        return all(
-            callable(getattr(self.backend, name, None))
-            for name in ('residency', 'preview', 'converge')
-        )
 
     def _admission_view(
         self, residency, *, overlay=None, virtual_expiry: bool = False
@@ -613,26 +643,35 @@ class Controller:
                 # unique container). Never freshly placed; it blocks new
                 # allocation until released (see _admit).
             elif deployment.state == DeploymentState.IDLE:
-                if deployment.spec.get('reclaim', self.reclaim_default) != KEEP_WARM:
+                if not self.keeps_up(deployment):
                     continue
-                resident = residency.resident(gid) if residency is not None else None
-                if resident is not None and not resident.all_gpus:
-                    hints[gid] = list(resident.gpus)
+                # Resident, with its GPUs known: every warm unit counts (a
+                # KubeAI Model's replicas), a conflict or an unmappable
+                # reservation does not. [] where the cluster places.
+                gpus = residency.resident_gpus(gid) if residency is not None else None
+                if gpus is not None:
+                    hints[gid] = gpus
                     optional.append(deployment)
         inputs = PlacementInputs(
             required_ids=set(required), hard=hard, optional_hints=hints,
         )
         return [*required.values(), *optional], inputs
 
-    def _prepare_network(self) -> None:
-        """Give the backend the stable-address table, once a network is migrated."""
+    def _prepare_network(self, host: HostRuntime | None) -> None:
+        """Give the host runtime the stable-address table, once a network is migrated.
+
+        Only a backend with containers on this host has a network to stamp
+        addresses on; for any other there is nothing to do.
+        """
+        if host is None:
+            return
         config = self.ledger.network_config()
         if config is None:
-            self._admitting.network = None
+            host.configure_network(None)
             return
-        self._admitting.network = {
-            'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()}
-        self._admitting.on_addresses = self.ledger.add_service_addresses
+        host.configure_network(
+            {'subnet': config['subnet'], 'addresses': self.ledger.service_addresses()},
+            on_addresses=self.ledger.add_service_addresses)
 
     def network_migrate(self, subnet: str, *, force: bool = False) -> ReconcileResult:
         """``infer-stack network migrate``: move the project to stable addresses.
@@ -644,10 +683,14 @@ class Controller:
         """
         import ipaddress
 
-        from .network import overlapping_subnets
         from .profile import ProfileMismatch
 
         subnet = str(ipaddress.ip_network(subnet))
+        host = self.backend.host_runtime
+        if host is None:
+            raise ProfileMismatch(
+                'network migrate moves containers on this host to fixed addresses; '
+                'this backend runs none (the compose backend does)')
         with self._global_lock():
             leases, _ = self.ledger.status(virtual_expiry=True)
             active = [le.id for le in leases if le.state == LeaseState.ACTIVE]
@@ -656,7 +699,7 @@ class Controller:
                     f'network migrate recreates every container; {len(active)} lease(s) '
                     'are active (release them, or pass --force)'
                 )
-            clash = overlapping_subnets(subnet, self._admitting.run)
+            clash = host.subnet_clashes(subnet)
             if clash:
                 raise ProfileMismatch(f'subnet {subnet} overlaps: {"; ".join(clash)}')
             current = self.ledger.network_config()
@@ -664,22 +707,23 @@ class Controller:
             # Preview the migrated render and take approval BEFORE any write:
             # a declined migration must leave the subnet and addresses as they were.
             self._sync_profile(create=True)
-            residency = self._admitting.residency()
-            saved = self._admitting.network
-            self._admitting.network = {
+            residency = self.backend.residency()
+            saved = host.network_table()
+            host.configure_network({
                 'subnet': subnet,
                 'addresses': {} if reset else self.ledger.service_addresses(),
-            }
+            })
             try:
                 desired, inputs = self._admission_view(
                     residency, virtual_expiry=True
                 )
-                self._admitting.preview(desired, inputs, approve=True)
+                self.backend.preview(desired, inputs, approve=True)
             finally:
-                self._admitting.network = saved
-            self.ledger.store.migrate_network(
+                host.configure_network(saved)
+            self.ledger.migrate_network(
                 subnet=subnet, reset_addresses=reset,
-                approved_digest=getattr(self.backend, 'last_preview_digest', None),
+                approved_digest=self.backend.last_preview_digest,
+                profile=self._take_fresh_profile(),
             )
             return self._publish()
 
@@ -689,14 +733,25 @@ class Controller:
         Refused while any lease is ACTIVE unless ``force``: its holder
         authenticates with the old key, and the gateway restarts. The new key
         is written, then published like any desired-state change, so the
-        gateway (and Open WebUI) are recreated with it. A declined apply puts
-        the old key back.
+        gateway (and Open WebUI) are recreated with it.
+
+        A running LiteLLM keeps the key it started with. So when the
+        publication fails before its apply began (declined, residency
+        unreadable, a render refused) nothing was recreated, and the old key
+        goes back into the managed ``.env``: otherwise clients would be handed
+        a key the gateway rejects. Once the apply began, the gateway may
+        already run the new key; the file keeps it, and the pending
+        publication converges the runtime to it on the next apply. An apply
+        that returns having not reached the runtime (``ApplyResult.runtime``
+        false: an unreadable render, routes that could not be retired) did
+        not recreate the gateway either, so the old key goes back too and the
+        rotation is refused with the apply's reason: the file must never
+        name a key the running gateway rejects.
         """
-        from .backend import ConvergeAborted
         from .profile import ProfileMismatch
 
-        rotate = getattr(self.backend, 'rotate_master_key', None)
-        if rotate is None or not getattr(self.backend, 'litellm', False):
+        front = self.backend.front_door()
+        if front is None or not front.litellm:
             raise ProfileMismatch('no LiteLLM gateway to rotate a key for')
         with self._global_lock():
             leases, _ = self.ledger.status(virtual_expiry=True)
@@ -707,12 +762,21 @@ class Controller:
                     '(release them, or pass --force)'
                 )
             self._mark_pending(apply=True)
-            replaced = rotate()
+            replaced = front.rotate_master_key()
+            self._apply_began = False
             try:
-                return self._publish()
-            except ConvergeAborted:
-                getattr(self.backend, 'restore_env')(replaced)
+                rec = self._publish()
+            except BaseException:
+                if not self._apply_began:
+                    front.restore_env(replaced)
                 raise
+            if rec.applied and not rec.runtime_applied:
+                front.restore_env(replaced)
+                raise ProfileMismatch(
+                    'the key was not changed: the gateway was not recreated ('
+                    + (rec.apply_detail or 'the runtime was not reached')
+                    + '); retry once `infer-stack apply` succeeds')
+            return rec
 
     def observe_state(self) -> dict:
         """A read-only health view for ``leases`` / ``status`` (plan step P10).
@@ -726,45 +790,54 @@ class Controller:
           neither started nor removed until its lease is released);
         * ``displaced``: an idle keep-warm model that yielded its GPUs;
         * ``unresolved``: LIVE from before allocations, with no unique container;
-        * ``running`` / ``not-running``: whether its single container serves.
+        * ``reclaimed``: idle under ``stop``, and its container is gone, as
+          intended (see :meth:`keeps_up`);
+        * ``restarting``: resident, but every unit is crash-looping (the one
+          serving state taken from
+          :func:`~infer_stack.leasing.residency.deployment_health`: it needs
+          an operator, and ``leases`` flags it);
+        * ``running`` / ``not-running``: whether it is resident (any replica
+          warm). A deployment still starting is ``running`` here, since
+          startup needs no one; ``status`` shows ``starting``.
         """
         from .profile import profile_drift
-        from .residency import ResidencyUnknown
+        from .residency import ResidencyUnknown, deployment_health
 
         leases, deployments = self.ledger.status(virtual_expiry=True)
-        sidecar = {}
-        loader = getattr(self.backend, '_load_sidecar', None)
-        if loader is not None:
-            try:
-                sidecar = loader() or {}
-            except Exception:  # noqa: BLE001 - a view must always render
-                sidecar = {}
+        try:
+            notes = self.backend.placement_notes() or {}
+        except Exception:  # noqa: BLE001 - a view must always render
+            notes = {}
         residency, residency_error = None, None
-        if callable(getattr(self.backend, 'residency', None)):
-            try:
-                residency = self._admitting.residency()
-            except ResidencyUnknown as ex:
-                residency_error = str(ex)
-        degraded = set(sidecar.get('degraded') or ())
-        displaced = set(sidecar.get('displaced') or ())
+        try:
+            residency = self.backend.residency()
+        except ResidencyUnknown as ex:
+            residency_error = str(ex)
+        degraded = set(notes.get('degraded') or ())
+        displaced = set(notes.get('displaced') or ())
         rows = []
         for g in deployments:
             if g.state not in (DeploymentState.LIVE, DeploymentState.IDLE):
                 continue
             if residency is None and residency_error is not None:
                 condition = 'unknown'
-            elif residency is not None and residency.ambiguous(g.id):
+            elif residency is not None and residency.is_conflicted(g.id):
                 condition = 'ambiguous'
             elif g.id in degraded and g.state == DeploymentState.LIVE:
                 condition = 'degraded'
             elif g.id in displaced and g.state == DeploymentState.IDLE:
                 condition = 'displaced'
             elif (g.state == DeploymentState.LIVE and g.assigned_gpus is None
-                  and self._admission_mode() and residency is not None
-                  and residency.resident(g.id) is None):
+                  and residency is not None
+                  and self._gpu_units(g) > 0
+                  and residency.unique_unit(g.id) is None):
                 condition = 'unresolved'
+            elif residency is not None and residency.is_resident(g.id):
+                condition = ('restarting'
+                             if deployment_health(residency, g.id) == 'restarting'
+                             else 'running')
             elif residency is not None:
-                condition = 'running' if residency.resident(g.id) else 'not-running'
+                condition = 'not-running' if self.keeps_up(g) else 'reclaimed'
             else:
                 condition = None
             rows.append({'id': g.id, 'state': g.state, 'condition': condition,
@@ -802,10 +875,10 @@ class Controller:
             self.ledger.set_adopted_containers(kept)
         return kept
 
-    def _adopt_existing(self, residency) -> None:
+    def _adopt_existing(self, residency, host: HostRuntime) -> None:
         """One-time migration: adopt project containers from before ownership labels.
 
-        Runs after the first admission-mode render on a ledger. A container
+        Runs after the first render on a ledger. A container
         without infer-stack's service and fingerprint labels is adopted, with
         the fingerprint of this render, if it is infrastructure the render
         still has, or a deployment container whose deployment is LIVE on the
@@ -816,8 +889,9 @@ class Controller:
         """
         if self.ledger.adopted_containers() is not None:
             return
-        fingerprints = self._admitting._load_sidecar().get('fingerprints') or {}
-        services = self._admitting._load_sidecar().get('services') or {}
+        rendered = host.rendered_services()
+        fingerprints = {name: fp for name, (fp, _) in rendered.items()}
+        services = {name: gid for name, (_, gid) in rendered.items()}
         _, deployments = self.ledger.status()
         by_id = {g.id: g for g in deployments}
         adopted = {}
@@ -831,13 +905,13 @@ class Controller:
                 live_here = (deployment.state == DeploymentState.LIVE
                              and list(c.gpus) == list(deployment.assigned_gpus or []))
                 resident = (deployment.state == DeploymentState.IDLE
-                            and residency.resident(c.deployment_id) is not None)
+                            and residency.is_resident(c.deployment_id))
                 if not (live_here or resident):
                     continue
             adopted[c.container_id] = {
                 'service': c.service, 'fingerprint': fingerprints[c.service]}
         self.ledger.set_adopted_containers(adopted)
-        self._admitting.adopted = adopted
+        host.set_adopted(adopted)
 
     def remove_orphans(self, confirm: Callable[[list], bool]) -> list:
         """``gc --orphans``: remove the project's unmanaged containers, with consent.
@@ -846,15 +920,25 @@ class Controller:
         neither labelled nor adopted, and removes exactly those if ``confirm``
         (shown the list) returns True. Returns the removed containers.
         """
+        host = self.backend.host_runtime
+        if host is None:
+            return []           # nothing of this host's to be an orphan
         with self._global_lock():
-            residency = self._admitting.residency()
+            residency = self.backend.residency()
             adopted = self.ledger.adopted_containers() or {}
             orphans = [c for c in residency.all_containers()
                        if not c.labelled and c.container_id not in adopted]
             if not orphans or not confirm(orphans):
                 return []
-            self._admitting.run(['docker', 'rm', '-f', *[c.container_id for c in orphans]])
+            host.remove_containers([c.container_id for c in orphans])
             return orphans
+
+    def _gpu_units(self, deployment) -> int:
+        """GPUs admission must account for: none where the cluster schedules."""
+        from .backend import allocates_gpus
+        from .placement import required_gpu_count
+
+        return required_gpu_count(deployment) if allocates_gpus(self.backend) else 0
 
     def _backfill_allocations(self, residency) -> list[str]:
         """Adopt allocations for LIVE deployments that predate them.
@@ -864,17 +948,16 @@ class Controller:
         GPUs stays unresolved: it keeps running where it is, but no new GPU is
         allocated to anyone until it is released. Returns the unresolved ids.
         """
-        from .placement import required_gpu_count
-
         unresolved = []
         _, deployments = self.ledger.status()
         for deployment in deployments:
             if deployment.state != DeploymentState.LIVE or deployment.assigned_gpus is not None:
                 continue
-            if required_gpu_count(deployment) == 0:
+            if self._gpu_units(deployment) == 0:
                 self.ledger.set_allocation(deployment.id, [])
                 continue
-            resident = residency.resident(deployment.id)
+            # One reservation to adopt: a unique unit, not a replica set.
+            resident = residency.unique_unit(deployment.id)
             if resident is not None and not resident.all_gpus and resident.gpus:
                 self.ledger.set_allocation(deployment.id, list(resident.gpus))
             else:
@@ -888,26 +971,28 @@ class Controller:
         commit for the candidate's new and revived deployments. Nothing is
         written here.
         """
-        from .placement import required_gpu_count
-
+        self._admission_capacity = False
         adopted: dict[str, list[int]] = {}
         need: list[str] = []
         for gid, deployment in overlay.deployments.items():
             fresh = gid in overlay.created or gid in overlay.revived
             if not fresh:
                 continue
-            if required_gpu_count(deployment) == 0:
+            if self._gpu_units(deployment) == 0:
                 continue
-            resident = residency.resident(gid) if (
+            resident = residency.unique_unit(gid) if (
                 residency is not None and gid in overlay.revived) else None
             if resident is not None and not resident.all_gpus and resident.gpus:
                 adopted[gid] = list(resident.gpus)      # IDLE->LIVE keeps its GPUs
             else:
                 need.append(gid)
-        if residency is None and (need or adopted):
+        if residency is None:
+            # The render after the commit needs residency too, so nothing can
+            # be admitted without it; refusing here commits nothing.
+            why = self._residency_error or 'the runtime did not answer'
             return {}, [
-                'Docker residency is unknown, so only requests that need no new '
-                'GPU are admitted; retry when `docker ps` works'
+                f'what is running cannot be read right now ({why}), so nothing is '
+                'admitted; `infer-stack doctor` checks the runtime'
             ]
         if need:
             unresolved = self._unresolved_allocations(exclude=set(overlay.deployments))
@@ -919,10 +1004,13 @@ class Controller:
                 ]
         for gid, gpus in adopted.items():
             overlay.deployments[gid].assigned_gpus = gpus
-        self._prepare_network()
+        self._prepare_network(self.backend.host_runtime)
         desired, inputs = self._admission_view(residency, overlay=overlay)
-        plan, rendered = self._admitting.preview(desired, inputs)
+        plan, rendered = self.backend.preview(desired, inputs)
+        from .backend import allocates_gpus
+
         reasons = []
+        capacity = False            # did any refusal come from GPU placement?
         unresolved = set(self._unresolved_allocations())
         # EVERY deployment the candidate claims must be placed and renderable,
         # including an existing one it only coalesces onto (whose served
@@ -936,9 +1024,12 @@ class Controller:
                 continue
             if gid in plan.degraded:
                 reasons.append(f'{gid}: its GPUs are no longer available')
+                capacity = True
             elif gid not in plan.assignments:
                 why = [e for e in plan.errors if e.startswith(gid)]
                 reasons.extend(why or [f'{gid}: could not be placed'])
+                # Where the cluster places, a plan without it is a refusal.
+                capacity = capacity or allocates_gpus(self.backend)
             elif gid in set(rendered.unrenderable):
                 why = [e for e in rendered.errors if gid in e] or [
                     f'{gid}: could not be rendered ({e})' for e in rendered.errors]
@@ -950,13 +1041,14 @@ class Controller:
             if holders:
                 reasons.append('GPUs held by admitted demand: ' + '; '.join(holders))
         self._admission_digest = None
+        self._admission_capacity = capacity
         if not reasons:
             # Approval happens now, before anything is committed; the render
             # after the commit produces the same files and does not ask again.
             # Its digest goes into the pending marker, so a recovery after a
             # crash (and perhaps an upgrade) cannot apply something else.
-            self._admitting.preview(desired, inputs, approve=True)
-            self._admission_digest = getattr(self.backend, 'last_preview_digest', None)
+            self.backend.preview(desired, inputs, approve=True)
+            self._admission_digest = self.backend.last_preview_digest
         for gid in adopted:
             overlay.deployments[gid].assigned_gpus = None   # committed with the lease
         return allocations, reasons
@@ -977,13 +1069,11 @@ class Controller:
         return out
 
     def _unresolved_allocations(self, *, exclude: AbstractSet[str] = frozenset()) -> list[str]:
-        from .placement import required_gpu_count
-
         _, deployments = self.ledger.status()
         return [
             g.id for g in deployments
             if g.state == DeploymentState.LIVE and g.assigned_gpus is None
-            and g.id not in exclude and required_gpu_count(g) > 0
+            and g.id not in exclude and self._gpu_units(g) > 0
         ]
 
     def set_invocation_catalog(self, catalog) -> None:
@@ -998,10 +1088,10 @@ class Controller:
         """
         from .profile import catalog_sources
 
-        render = getattr(self.backend, 'render_profile', None)
-        if render is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             return
-        base = dict(self._invocation_profile or render())
+        base = dict(self._invocation_profile or recovery.render_profile())
         base['catalogs'] = catalog_sources(catalog)
         self._invocation_profile = base
         self._profile_drift_warned = False
@@ -1013,15 +1103,68 @@ class Controller:
         while its container is actually resident, which is the same rule
         placement uses. Anything else is free to be redefined.
         """
+        return set(self._pinned_deployments(residency))
+
+    def _pinned_deployments(self, residency=None) -> dict[str, list[Deployment]]:
+        """``{alias: [resident deployments serving it]}`` (see
+        :meth:`_pinned_endpoints`)."""
         _, deployments = self.ledger.status(virtual_expiry=True)
-        pinned: set[str] = set()
+        pinned: dict[str, list[Deployment]] = {}
         for deployment in deployments:
-            if deployment.state == DeploymentState.LIVE:
-                pinned.update(deployment.served)
-            elif deployment.state == DeploymentState.IDLE and residency is not None:
-                if residency.resident(deployment.id) is not None:
-                    pinned.update(deployment.served)
+            resident = deployment.state == DeploymentState.LIVE or (
+                deployment.state == DeploymentState.IDLE and residency is not None
+                and residency.is_resident(deployment.id))
+            if resident:
+                for alias in deployment.served:
+                    pinned.setdefault(alias, []).append(deployment)
         return pinned
+
+    def _pinned_changes(self, before: list[dict], after: list[dict],
+                        residency=None) -> list[str]:
+        """Resident aliases whose meaning ``after`` (catalog sources) changes
+        to one their running deployment does not have.
+
+        Pinning is an endpoint rule, not a catalog-conflict case (queue item
+        45): an ad-hoc deployment serving ``qwen`` pins ``qwen`` although no
+        catalog defines it, so publishing ``qwen -> external`` must refuse
+        like redefining a catalog one. A definition that matches what runs
+        (same engine and structure) is not a change of meaning.
+        """
+        from .catalog import CatalogError
+        from .profile import CatalogUnion
+
+        pinned = self._pinned_deployments(residency)
+        if not pinned:
+            return []
+        old = CatalogUnion.from_sources(before) if before else None
+        new = CatalogUnion.from_sources(after) if after else None
+        blocked = []
+        for alias in sorted(pinned):
+            if new is None or alias not in new.endpoints:
+                continue
+            try:
+                meaning = new.resolve_endpoint(alias)
+                if (old is not None and alias in old.endpoints
+                        and old.resolve_endpoint(alias).semantic_key()
+                        == meaning.semantic_key()):
+                    continue
+                if meaning.managed and meaning.to_request().compat_key in {
+                        d.compat_key for d in pinned[alias]}:
+                    continue
+            except CatalogError:
+                pass
+            blocked.append(alias)
+        return blocked
+
+    @staticmethod
+    def _pinned_refusal(blocked: list[str], what: str) -> Exception:
+        from .profile import ProfileMismatch
+
+        return ProfileMismatch(
+            f'{what} redefines {", ".join(repr(b) for b in blocked)}, which a '
+            'resident deployment is running. Release or evict it '
+            f'(`infer-stack evict {blocked[0]}`), then retry; definitions nothing '
+            'is running are updated automatically')
 
     def _profile_quiescent(self, residency=None) -> bool:
         """Whether it is safe to replace the recovery snapshot wholesale.
@@ -1048,29 +1191,37 @@ class Controller:
         User configuration remains authoritative; the persisted profile is an
         internal crash-recovery snapshot, not a third configuration surface.
 
-        * Quiescent stack: adopt the invocation profile wholesale.
-        * Live epoch: retain frozen global render settings, but append compatible
-          catalog snapshots so newly suggested/added endpoints can be acquired
-          side by side.  Semantic conflicts fail closed.
+        * Settings (backend, ports, images, gateway placement): adopted from
+          the invocation when the stack is quiescent, frozen while workloads
+          are resident.
+        * Catalogs, the published endpoint definitions: always merged
+          (:func:`~infer_stack.leasing.profile.adopt_catalog_sources`): the
+          invocation's definitions replace published ones nothing runs; one a
+          resident workload runs refuses; unrelated published definitions,
+          external endpoints included, stay. Quiescence does not unpublish.
         """
         from .._log import logger
         from .profile import (
             CatalogConflict,
             ProfileMismatch,
-            merge_catalog_sources,
+            adopt_catalog_sources,
             profile_drift,
-            prune_catalog_sources,
         )
 
         stored = self.ledger.profile()
         invocation = self._invocation_profile
-        if stored is None or invocation is None or stored == invocation:
+        if invocation is None:
+            return None
+        if stored is None:
+            return dict(invocation)     # the first publication: all of it
+        if stored == invocation:
             return None
         if stored.get('backend') != invocation.get('backend'):
             raise ProfileMismatch(
                 f"the active recovery snapshot uses {stored.get('backend')!r}, "
                 f"but current config selects {invocation.get('backend')!r}; "
-                'tear down the old backend before switching'
+                'quiesce/tear down the old backend, then archive its history and '
+                'start a new recovery epoch with `infer-stack ledger rotate --yes`'
             )
         drift = profile_drift(stored, invocation)
         # A runbook whose catalog is already a subset of an explicitly seeded
@@ -1078,33 +1229,29 @@ class Controller:
         # because the stack happens to be quiescent.
         if not drift:
             return None
-        if self._profile_quiescent(residency):
-            return invocation
-
-        candidate = dict(stored)
+        quiescent = self._profile_quiescent(residency)
+        candidate = dict(invocation) if quiescent else dict(stored)
+        # Only definitions a resident workload is actually running have to stay
+        # frozen; redefining anything else (the normal case while iterating with
+        # `catalog endpoint add --force`) replaces it. Nothing else unpublishes.
+        pinned = set() if quiescent else self._pinned_endpoints(residency)
         try:
-            candidate['catalogs'] = merge_catalog_sources(
-                stored.get('catalogs') or [], invocation.get('catalogs') or []
-            )
-        except CatalogConflict as ex:
-            # Only definitions a resident workload is actually running have to
-            # stay frozen. Redefining anything else -- the normal case while
-            # iterating with `catalog endpoint add --force` -- drops the stale
-            # definition instead of refusing every acquire on the host.
-            pinned = self._pinned_endpoints(residency)
-            try:
-                candidate['catalogs'] = merge_catalog_sources(
-                    prune_catalog_sources(stored.get('catalogs') or [], pinned),
-                    invocation.get('catalogs') or [],
-                )
-            except CatalogConflict as pinned_ex:
-                blocked = sorted(set(pinned_ex.names) & pinned) or sorted(pinned_ex.names)
-                raise ProfileMismatch(
-                    f'the current catalog redefines {", ".join(repr(b) for b in blocked)}, '
-                    'which a resident deployment is running. Release or evict it '
-                    f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
-                    'nothing is running are updated automatically'
-                ) from pinned_ex
+            candidate['catalogs'] = adopt_catalog_sources(
+                stored.get('catalogs') or [], invocation.get('catalogs') or [], pinned)
+        except CatalogConflict as pinned_ex:
+            blocked = sorted(set(pinned_ex.names) & pinned) or sorted(pinned_ex.names)
+            raise ProfileMismatch(
+                f'the current catalog redefines {", ".join(repr(b) for b in blocked)}, '
+                'which a resident deployment is running. Release or evict it '
+                f'(`infer-stack evict {blocked[0]}`), then retry; definitions '
+                'nothing is running are updated automatically'
+            ) from pinned_ex
+        blocked = self._pinned_changes(
+            stored.get('catalogs') or [], candidate['catalogs'], residency)
+        if blocked:
+            raise self._pinned_refusal(blocked, 'the current catalog')
+        if quiescent:
+            return candidate if candidate != stored else None
 
         deferred = [
             key for key in drift if key != 'catalogs'
@@ -1121,9 +1268,9 @@ class Controller:
         return candidate if candidate != stored else None
 
     def _use_profile_candidate(self, profile: dict) -> None:
-        use = getattr(self.backend, 'use_profile', None)
-        if use is not None:
-            use(profile)
+        recovery = self.backend.recovery_profile
+        if recovery is not None:
+            recovery.use_profile(profile)
 
     def _commit_profile_candidate(self, profile: dict) -> None:
         """Persist an already-previewed acquire profile without publishing alone.
@@ -1138,6 +1285,7 @@ class Controller:
         self._applied_profile = profile
 
     def _restore_stored_profile(self, stored: dict | None) -> None:
+        stored = stored if stored is not None else self._fresh_profile
         if stored is None:
             return
         self._use_profile_candidate(stored)
@@ -1147,19 +1295,22 @@ class Controller:
         """Make the backend render from the active recovery snapshot.
 
         With ``create`` (every mutation, under the lock), a ledger without a
-        snapshot gets this invocation's resolved settings frozen as the initial
-        one. Drift is reported once; acquire decides under the same lock whether
-        current user config can advance the snapshot. Backends without a render
+        snapshot renders from this invocation's settings with no published
+        endpoints (:attr:`_fresh_profile`). That is not written here: it
+        commits with the first publication marker (:meth:`_mark_pending`), and
+        an acquire or access commits the invocation's catalogs with its own
+        transaction, because writing ``catalogs`` is publishing them. Drift is
+        reported once; acquire decides under the same lock whether current
+        user config can advance the snapshot. Backends without a render
         profile (null, test fakes) are left alone.
         """
         from .._log import logger
         from .profile import profile_drift
 
-        render = getattr(self.backend, 'render_profile', None)
-        use = getattr(self.backend, 'use_profile', None)
-        read = getattr(self.ledger, 'profile', None)
-        if render is None or use is None or read is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             return
+        render, use, read = recovery.render_profile, recovery.use_profile, self.ledger.profile
         if create and self._profile_error is not None:
             raise self._profile_error
         stored = read()
@@ -1168,13 +1319,9 @@ class Controller:
         if self._invocation_profile is None:
             self._invocation_profile = render()
         if stored is None:
-            stored = self._invocation_profile
-            self.ledger.set_profile(stored)
-            logger.info(
-                'Froze the initial recovery snapshot ({} backend, {} catalog(s)); '
-                'normal acquire advances it automatically from current user config',
-                stored.get('backend'), len(stored.get('catalogs') or []),
-            )
+            # Settings only: endpoints are published by the operations that
+            # publish them, in their own transaction.
+            stored = self._fresh_profile = {**self._invocation_profile, 'catalogs': []}
         elif not self._profile_drift_warned:
             drift = profile_drift(stored, self._invocation_profile)
             if drift:
@@ -1191,8 +1338,7 @@ class Controller:
             self._applied_profile = stored
 
     def _mark_pending(
-        self, *, apply: bool, placement_context: dict | None = None,
-        create_profile: bool = True,
+        self, *, apply: bool, create_profile: bool = True,
     ) -> dict:
         """Record that desired state is about to change (caller holds the lock).
 
@@ -1201,31 +1347,29 @@ class Controller:
         ever turns ``apply_requested`` on: a staged change never cancels an
         apply already requested (promotion, see the plan's D23).
 
-        If an earlier acquire died between committing and its first render, its
-        placement scope is still in the marker: render once with that scope
-        first, so its deployment is placed where that caller was allowed.
+        A placement scope left in the marker by pre-admission code is dropped:
+        a row that code committed without an allocation stays unresolved and is
+        never placed, so no render needs that caller's scope.
         """
         if create_profile:
             self._sync_profile(create=True)
         current = self.ledger.publication_pending()
         if current and current.get('placement_context'):
-            self._render_in_scope(current['placement_context'])
+            self.ledger.clear_placement_context()
         return self.ledger.mark_publication_pending(
-            apply_requested=apply, placement_context=placement_context,
-        )
+            apply_requested=apply, profile=self._take_fresh_profile())
 
-    def _render_in_scope(self, context: dict) -> None:
-        """Render with another caller's admission scope, then forget the scope.
+    def _take_fresh_profile(self) -> dict | None:
+        """The first snapshot to commit with the next marker, or ``None``
+        when the ledger already has one."""
+        from .._log import logger
 
-        The scope is cleared only after a render that succeeded (and so pinned
-        the placement). A declined or failed render propagates and keeps it,
-        so no later caller can place that deployment within its own scope.
-        """
-        scope = getattr(self.backend, 'placement_scope', None)
-        if scope is not None:
-            with scope(context):
-                rec = self._render()
-        self.ledger.clear_placement_context()
+        fresh, self._fresh_profile = self._fresh_profile, None
+        if fresh is None or self.ledger.profile() is not None:
+            return None
+        logger.info('Froze the initial recovery snapshot ({} backend); acquire and '
+                    'access publish endpoints into it', fresh.get('backend'))
+        return fresh
 
     def _apply_pending(self, rec: ReconcileResult) -> ReconcileResult:
         """Apply the last render if the marker requests it; clear on success.
@@ -1240,31 +1384,37 @@ class Controller:
         marker = self.ledger.publication_pending()
         if marker is None:
             return rec
-        apply_fn = getattr(self.backend, 'apply', None)
-        if apply_fn is None:
-            # realize/teardown backends applied during the render itself.
-            self.ledger.clear_publication_pending(marker['version'])
-            rec.publication_pending = False
-            return rec
+        apply_fn = self.backend.apply
         if not marker['apply_requested']:
             rec.publication_pending = True    # staged; never applied here
             return rec
         approved = marker.get('approved_digest')
-        rendered = getattr(self.backend, 'last_planned_digest', None)
-        if approved and rendered and rendered != approved and not self._explicit_apply:
-            from .profile import ProfileMismatch
+        rendered = self.backend.last_planned_digest
+        # Fail closed: an approved render and no digest for this one is not
+        # proof they are the same.
+        if approved and rendered != approved:
+            if not self._explicit_apply:
+                from .profile import ProfileMismatch
 
-            rec.publication_pending = True
-            raise ProfileMismatch(
-                'the rendered state differs from what was approved at publication '
-                '(e.g. infer-stack was upgraded in between); review and approve it '
-                'with `infer-stack apply`'
-            )
+                rec.publication_pending = True
+                raise ProfileMismatch(
+                    'the rendered state differs from what was approved at publication '
+                    '(e.g. infer-stack was upgraded in between); review and approve it '
+                    'with `infer-stack apply`'
+                )
+            # `infer-stack apply` approved this render: record it before
+            # applying, so a partial apply leaves THIS render approved and an
+            # ordinary retry of it proceeds (a later, different one still
+            # needs approval).
+            if rendered is not None:
+                self.ledger.reapprove_render(rendered)
+            approved = rendered
         if marker['interrupted']:
             self._wait_for_settled_runtime()
         before = set(self.backend.observe())
+        self._apply_began = True
         try:
-            ok = apply_fn()
+            outcome = ApplyResult.of(apply_fn())
         except BaseException as ex:
             from .compose import ApplyAborted
 
@@ -1275,21 +1425,25 @@ class Controller:
                 apply_requested=True, interrupted=not isinstance(ex, ApplyAborted))
             rec.publication_pending = True
             raise
-        if approved:
-            # The approved render reached Docker; a retry for routes (or any
-            # later change) renders from newer state and needs no re-approval.
-            self.ledger.store.clear_approved_digest()
         after = set(self.backend.observe())
         rec.realized = sorted(set(rec.realized) | (after - before))
         rec.torn_down = sorted(set(rec.torn_down) | (before - after))
         rec.applied = True
-        if ok is False:
+        rec.runtime_applied = outcome.runtime
+        rec.apply_detail = outcome.detail
+        if not outcome.complete:
+            # The publication is not done, so neither is the approval of its
+            # render: a retry re-renders, and a render that drifted (an
+            # upgrade in between) must be approved again, not applied.
             rec.publication_pending = True
             logger.warning(
-                'apply did not fully take effect; the change stays pending and '
-                'the next acquire/release or `infer-stack apply` retries it'
-            )
+                'apply did not fully take effect ({}); the change stays pending and '
+                'the next acquire/release or `infer-stack apply` retries it',
+                outcome.detail or ('routes not verified' if outcome.runtime
+                                   else 'runtime not reached'))
             return rec
+        if approved:
+            self.ledger.clear_approved_digest()
         self.ledger.clear_publication_pending(marker['version'])
         rec.publication_pending = False
         return rec
@@ -1301,14 +1455,14 @@ class Controller:
         cannot be read, a container still ``removing``, or a runtime that keeps
         changing past :data:`SETTLE_DEADLINE_S` raises
         :class:`~infer_stack.leasing.backend.RuntimeUnsettled` and leaves the
-        change pending. Backends without ``settle_snapshot`` (KubeAI's apply is
-        declarative server-side) skip the check.
+        change pending. A backend whose ``settle_snapshot`` returns ``None``
+        has nothing local to wait for (an in-process backend, or KubeAI with
+        its gateway in the cluster); KubeAI with a host gateway returns that
+        gateway's Compose containers and is waited on like Compose.
         """
         from .backend import RuntimeUnsettled
 
-        snapshot = getattr(self.backend, 'settle_snapshot', None)
-        if snapshot is None:
-            return
+        snapshot = self.backend.settle_snapshot
         deadline = self.clock() + SETTLE_DEADLINE_S
         previous = None
         while True:
@@ -1319,6 +1473,8 @@ class Controller:
                     f'cannot read the runtime after an interrupted apply: {ex}; '
                     'the change stays pending'
                 ) from ex
+            if current is None:
+                return                      # nothing local that could still be running
             busy = any(state == 'removing' for _, state in current)
             if previous is not None and current == previous and not busy:
                 return
@@ -1360,9 +1516,18 @@ class Controller:
         Heals drift (re-ups a container that died out-of-band) and publishes
         anything pending, including leases staged with ``--no-apply``. It is
         also the explicit approval that clears an approved-digest mismatch.
+
+        On a ledger with no profile yet (``stack up`` on a fresh stack) it
+        publishes the invocation's endpoints first, through the same preview,
+        approval and single commit as ``access`` (:meth:`publish_endpoints`), so
+        catalog routes exist before any model runs and the first acquire does
+        not recreate the gateway. Other mutations (gc, release, evict) never
+        publish endpoints.
         """
         self._explicit_apply = True
         try:
+            if self.backend.recovery_profile is not None and self.ledger.profile() is None:
+                return self.publish_endpoints()
             return self.reconcile(apply=True)
         finally:
             self._explicit_apply = False
@@ -1393,14 +1558,31 @@ class Controller:
             if endpoints is None or ep in endpoints
         ]
         deadline = self.clock() + timeout
+        last_room = float('-inf')
+        last_details = {}
         while True:
             pending = []
             failures = []
+            blocked: dict[str, Deployment] = {}
             for (g, ep) in pairs:
                 probe = self.backend.probe_ready(g, ep)
+                detail = 'generation verified' if probe.ready else probe.detail
+                if detail and last_details.get((g.id, ep)) != detail:
+                    from .._log import logger
+                    message = f'{ep}: {detail}'
+                    logger.info('{}', message)
+                    progress = getattr(self.backend, 'progress', None)
+                    if progress is not None:
+                        try:
+                            progress(message)
+                        except Exception:
+                            pass  # presentation must not affect lease readiness
+                    last_details[(g.id, ep)] = detail
                 if probe.ready:
                     continue
                 pending.append((g, ep))
+                if probe.needs_room:
+                    blocked[g.id] = g
                 if probe.fatal:
                     failures.append((g.id, ep, probe.detail))
             if not pending:
@@ -1416,28 +1598,59 @@ class Controller:
                     ready=False,
                     pending=[(g.id, ep) for g, ep in pending],
                 )
+            # After the deadline check: a wait that has given up evicts nothing.
+            if blocked and self.clock() - last_room >= ROOM_COOLDOWN_S:
+                # A leased model is waiting on capacity: an idle model the
+                # backend says could free it gives it up.
+                if self._make_room(list(blocked.values())):
+                    last_room = self.clock()
             self.sleep(interval)
             pairs = pending
+
+    def _make_room(self, blocked: list[Deployment]) -> str | None:
+        """Evict one idle deployment that could free room for ``blocked``.
+
+        The policy is here: only idle deployments (no lease holds them, so a
+        leased one is never a victim), the longest idle first, one at a time,
+        since the runtime cannot say how much room is needed and every warm
+        model kept is a load avoided. Whether a victim could help at all is
+        the backend's to say (:meth:`ServingBackend.reclaim_candidates`: the
+        same node pool and the resource that is short); when none could,
+        nothing is evicted. Returns the victim's id, or ``None``.
+        """
+        from .._log import logger
+
+        _, deployments = self.ledger.status(virtual_expiry=True)
+        idle = sorted((g for g in deployments if g.state == DeploymentState.IDLE),
+                      key=lambda g: (g.updated_at, g.id))
+        if not idle:
+            return None
+        useful: set[str] = set()
+        for g in blocked:
+            useful.update(self.backend.reclaim_candidates(g, idle))
+        victims = [g for g in idle if g.id in useful]
+        if not victims:
+            return None
+        victim = victims[0]
+        logger.info('making room for leased demand: evicting idle keep-warm {} ({})',
+                    victim.id, ', '.join(sorted(victim.served)))
+        self.evict([victim.id])
+        return victim.id
 
     def _never_ran(self, deployment_ids: list[str]) -> list[str]:
         """Which of these deployments definitely have no container at all.
 
-        Uses strict residency where the backend has it: a deployment with any
-        container, in any state, is kept, and if Docker cannot be read nothing
-        is reported (so nothing warm is ever evicted on a failed look). Backends
-        without residency fall back to ``observe()``.
+        Uses strict residency: a deployment with any container, in any state,
+        is kept, and if the runtime cannot be read nothing is reported (so
+        nothing warm is ever evicted on a failed look).
         """
-        residency = getattr(self.backend, 'residency', None)
-        if residency is None:
-            running = set(self.backend.observe())
-            return [gid for gid in deployment_ids if gid not in running]
         from .residency import ResidencyUnknown
 
         try:
-            snap = residency()
+            snap = self.backend.residency()
         except ResidencyUnknown:
             return []
-        return [gid for gid in deployment_ids if not snap.containers(gid)]
+        return [gid for gid in deployment_ids if not snap.units(gid)]
 
     def _rollback_acquire(self, lease_id: str, *, apply: bool) -> ReconcileResult | None:
         """Roll a failed acquire back and publish the result, under the lock.
@@ -1465,7 +1678,7 @@ class Controller:
             self._mark_pending(apply=apply)
             # The approved admission is being compensated away: its digest no
             # longer describes the pending desired state.
-            self.ledger.store.clear_approved_digest()
+            self.ledger.clear_approved_digest()
             rel = self.ledger.release(lease_id)
             if rel.idled_deployment_ids:
                 never_ran = self._never_ran(list(rel.idled_deployment_ids))
@@ -1548,114 +1761,133 @@ class Controller:
             grabs. Head-of-line GPU reservation is a follow-up; for the small-fleet
             case (few GPUs, rare multi-GPU jobs) plain queueing is sufficient.
         """
-        from .backend import ConvergeAborted, PlacementError
-
-        if self._admission_mode():
-            result, rec = self._acquire_by_admission(
-                owner, requests, ttl_seconds=ttl_seconds, apply=apply,
-                wait_for_placement=wait_for_placement,
-                placement_timeout=timeout if placement_timeout is None else placement_timeout,
-                placement_interval=interval if placement_interval is None else placement_interval,
-            )
-            return self._finish_acquire(result, rec, apply=apply, wait=wait,
-                                        timeout=timeout, interval=interval)
-
-        # Intent, ledger write, render and (once placed) apply all under one lock
-        # hold, so a second caller blocks before touching sqlite and no render
-        # can change the files this apply reads. The readiness wait and the
-        # admission-queue sleep stay OUTSIDE the lock.
-        with self._global_lock():
-            self._sync_profile(create=True)
-            stored_profile = self.ledger.profile()
-            candidate_profile = self._acquire_profile_candidate()
-            if candidate_profile is not None:
-                self._use_profile_candidate(candidate_profile)
-            try:
-                validate = getattr(self.backend, 'validate_requests', None)
-                if validate is not None:
-                    validate(requests)      # before desired state is written
-            except BaseException:
-                if candidate_profile is not None:
-                    self._restore_stored_profile(stored_profile)
-                raise
-            if candidate_profile is not None:
-                # The user catalog is authoritative. Persist the compatible
-                # recovery inputs now; the desired-state marker belongs to the
-                # acquire immediately below, not to this snapshot refresh.
-                self._commit_profile_candidate(candidate_profile)
-            context = getattr(self.backend, 'placement_context', lambda: None)()
-            self._mark_pending(apply=apply, placement_context=context)
-            result = self.ledger.acquire(
-                owner, requests, ttl_seconds=ttl_seconds
-            )
-            try:
-                try:
-                    rec = self._render()
-                finally:
-                    # Rendered (placement pinned) or about to roll back: either
-                    # way a recovery no longer needs this caller's scope.
-                    if context is not None:
-                        self.ledger.clear_placement_context()
-            except ConvergeAborted:
-                # The operator declined the compose changes -- don't leave the
-                # just-created lease dangling in the ledger.
-                self._rollback_acquire(result.lease.id, apply=apply)
-                raise
-            # If a deployment this lease just requested could not be placed (e.g. no
-            # free GPU), either queue for one (wait_for_placement) or -- the default --
-            # roll the lease back and report the planner's reason, so the deployment
-            # never lingers as a phantom ``live`` with nothing behind it.
-            requested = {g.id for g in result.deployments}
-            unplaced = requested & set(rec.unplaced)
-            if not unplaced:
-                rec = self._apply_admitted(rec, result.lease.id, apply=apply)
-        if unplaced and wait_for_placement and apply:
-            # Never queue for capacity that cannot exist. Re-plan this lease's
-            # deployments ALONE on an idle host: if they do not fit there, no
-            # amount of waiting will help, and waiting is actively harmful --
-            # the lease holds whatever it did place for the whole timeout, so a
-            # request that was never satisfiable can block ones that are.
-            #
-            # Only the aggregate case needs this. A single deployment too large
-            # for any card is already caught by the planner's permanent branch;
-            # what is missed is a lease whose deployments cannot fit TOGETHER,
-            # e.g. a 4-GPU model plus a 1-GPU extractor on a 4-GPU host.
-            infeasible = self._infeasible_alone(result.deployments, requested)
-            if infeasible:
-                self._rollback_acquire(result.lease.id, apply=apply)
-                raise PlacementError(sorted(infeasible.keys()),
-                                     sorted(infeasible.values()))
-            p_timeout = timeout if placement_timeout is None else placement_timeout
-            p_interval = (
-                interval if placement_interval is None else placement_interval
-            )
-            deadline = self.clock() + p_timeout
-            while unplaced and self.clock() < deadline:
-                self.sleep(p_interval)
-                # Re-render under the lock: each retry sweeps (reclaiming a crashed
-                # job's TTL-expired lease) and re-plans against the freed GPUs.
-                with self._global_lock():
-                    self._mark_pending(apply=True)   # the render sweeps
-                    rec = self._render()
-                    unplaced = requested & set(rec.unplaced)
-                    if not unplaced:
-                        rec = self._apply_admitted(rec, result.lease.id, apply=True)
-        if unplaced:
-            self._rollback_acquire(result.lease.id, apply=apply)
-            reasons = [
-                e
-                for e in rec.placement_errors
-                if any(e.startswith(gid) for gid in unplaced)
-            ]
-            raise PlacementError(sorted(unplaced), reasons)
+        result, rec = self._acquire_by_admission(
+            owner, requests, ttl_seconds=ttl_seconds, apply=apply,
+            wait_for_placement=wait_for_placement,
+            placement_timeout=timeout if placement_timeout is None else placement_timeout,
+            placement_interval=interval if placement_interval is None else placement_interval,
+        )
         return self._finish_acquire(result, rec, apply=apply, wait=wait,
                                     timeout=timeout, interval=interval)
+
+    #: Seconds ``access`` waits for the front door to accept its key, when an
+    #: external member has nothing else to wait for.
+    FRONT_DOOR_WAIT_S = 120.0
+
+    def access(
+        self,
+        owner: str,
+        endpoints: list,
+        *,
+        sharing: str | None = None,
+        ttl_seconds: float | None = None,
+        wait: bool = True,
+        timeout: float = 300.0,
+        interval: float = 2.0,
+        wait_for_placement: bool = False,
+    ) -> AccessResult:
+        """Make ``endpoints`` reachable: lease the managed ones, publish all.
+
+        ``endpoints`` are :class:`~infer_stack.leasing.endpoints.
+        ResolvedEndpoint` s (``catalog.resolve(names)``). The managed members
+        take one lease through :meth:`acquire`, whose transaction also
+        publishes the invocation's catalogs, external definitions included
+        (docs/planning/external-endpoints.md, decision 3). With no managed
+        member there is no ledger mutation: :meth:`publish_endpoints` runs the
+        same preview, approval and publication without one. External members
+        need the LiteLLM front door, a value for their key, and a front door
+        that accepts its key (decision 6); nothing is sent to the external
+        server. If the front door never answers, the lease this call took is
+        released and ``front_door_ready`` is ``False``.
+        """
+        from .profile import ProfileMismatch
+
+        aliases = [e.alias for e in endpoints]
+        external = [e for e in endpoints if not e.managed]
+        front = self.backend.front_door() if external else None
+        if external:
+            if front is None or not front.litellm:
+                raise ProfileMismatch(
+                    f'{", ".join(repr(e.alias) for e in external)} '
+                    f'{"is" if len(external) == 1 else "are"} served by an external '
+                    'server, reached only through the LiteLLM front door; this '
+                    'backend has none (turn `litellm` on)')
+        managed = [e.to_request(sharing_override=sharing) for e in endpoints if e.managed]
+        outcome = None
+        if managed:
+            outcome = self.acquire(
+                owner, managed, ttl_seconds=ttl_seconds, wait=wait, timeout=timeout,
+                interval=interval, wait_for_placement=wait_for_placement)
+            rec = outcome.reconcile
+        else:
+            rec = self.publish_endpoints()
+        result = AccessResult(
+            endpoints=aliases, external=[e.alias for e in external],
+            request_names=self.backend.request_names(aliases),
+            connection=self.backend.connection_info(),
+            lease=outcome.lease if outcome is not None else None, acquire=outcome,
+            # An external member is reached only through the routes this
+            # publication installs: gateway liveness alone does not prove them.
+            published=not (external and rec.publication_pending), waited=wait)
+        if (front is not None and wait and result.published
+                and not (outcome and outcome.released_on_timeout)):
+            accepted = front.gateway_accepts(
+                front.master_key(), wait=min(timeout, self.FRONT_DOOR_WAIT_S))
+            result.front_door_ready = accepted is True
+            if not result.front_door_ready and outcome is not None:
+                self.release(outcome.lease.id)
+        return result
+
+    def publish_endpoints(self) -> ReconcileResult:
+        """Publish the invocation's endpoint definitions with no lease.
+
+        The same transaction an acquire runs, minus the ledger mutation:
+        under the lock, derive the profile candidate (the invocation's
+        catalogs merged into the published union), preview its render with
+        approval, then store it with the approved digest and publish. When the
+        union already has them it still publishes: the front door may be down
+        (a fresh stack, or after ``stack down``), and an unchanged render
+        applies as a no-op.
+        """
+        from .residency import ResidencyUnknown
+
+        recovery = self.backend.recovery_profile
+        with self._global_lock():
+            self._sync_profile(create=True)
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            candidate = self._acquire_profile_candidate(residency=residency)
+            if candidate is None or recovery is None:
+                self._mark_pending(apply=True)
+                return self._publish()
+            stored = self.ledger.profile()
+            self._use_profile_candidate(candidate)
+            try:
+                self._prepare_network(self.backend.host_runtime)
+                desired, inputs = self._admission_view(residency, virtual_expiry=True)
+                self.backend.preview(desired, inputs, approve=True)
+            except BaseException:
+                self._restore_stored_profile(stored)
+                raise
+            try:
+                # Profile (the published endpoints) and approved marker at once.
+                self.ledger.publish_profile(
+                    candidate, approved_digest=self.backend.last_preview_digest)
+            except BaseException:
+                self._restore_stored_profile(stored)
+                raise
+            self._fresh_profile = None
+            self._profile_error = None
+            self._applied_profile = candidate
+            return self._publish()
 
     def _acquire_by_admission(
         self, owner, requests, *, ttl_seconds, apply, wait_for_placement,
         placement_timeout, placement_interval,
     ):
-        """Admission-mode acquire: preview in memory, commit only if admissible.
+        """The acquire: preview in memory, commit only if admissible.
 
         Each attempt runs under the lock: sweep (itself a published mutation),
         observe residency, overlay the request on the ledger, and preview
@@ -1682,30 +1914,29 @@ class Controller:
                     self.ledger.sweep()
                     self._publish()
                 try:
-                    residency = self._admitting.residency()
-                except ResidencyUnknown:
+                    residency = self.backend.residency()
+                    self._residency_error = None
+                except ResidencyUnknown as ex:
                     residency = None
+                    self._residency_error = str(ex)
                 candidate_profile = self._acquire_profile_candidate(
                     residency=residency
                 )
                 if candidate_profile is not None:
                     self._use_profile_candidate(candidate_profile)
                 try:
-                    validate = getattr(self.backend, 'validate_requests', None)
-                    if validate is not None:
-                        validate(requests)
-                    overlay = self.ledger.plan_acquire(requests)
+                    self.backend.validate_requests(requests)
+                    overlay = self.ledger.plan_acquire(
+                        requests,
+                        resident=residency.is_resident if residency is not None else None)
                     allocations, reasons = self._admit(overlay, residency)
                 except BaseException:
                     if candidate_profile is not None:
                         self._restore_stored_profile(stored_profile)
                     raise
                 if not reasons:
-                    if candidate_profile is not None:
-                        self._commit_profile_candidate(candidate_profile)
                     # Allocations are committed with the lease, so no placement
                     # scope needs recording for recovery.
-                    context = None
                     self._mark_pending(apply=apply)
                     try:
                         result = self.ledger.acquire(
@@ -1714,15 +1945,20 @@ class Controller:
                             # Nothing is applied for --no-apply, so there is no
                             # approval to guard; staged state stays discardable.
                             approved_digest=self._admission_digest if apply else None,
+                            # The published endpoints commit with the lease.
+                            profile=candidate_profile,
                         )
                     except AdmissionConflict:
                         continue            # the ledger moved; preview again
+                    except BaseException:
+                        if candidate_profile is not None:
+                            self._restore_stored_profile(self.ledger.profile())
+                        raise
+                    if candidate_profile is not None:
+                        self._profile_error = None
+                        self._applied_profile = candidate_profile
                     try:
-                        try:
-                            rec = self._render()
-                        finally:
-                            if context is not None:
-                                self.ledger.clear_placement_context()
+                        rec = self._render()
                     except ConvergeAborted:
                         self._rollback_acquire(result.lease.id, apply=apply)
                         raise
@@ -1750,15 +1986,16 @@ class Controller:
                     if gid in overlay.created or gid in overlay.revived
                 )
             if not (wait_for_placement and apply):
-                raise PlacementError(blocked, reasons)
+                raise PlacementError(blocked, reasons, capacity=self._admission_capacity)
             if not checked_feasible:
                 checked_feasible = True
                 infeasible = self._infeasible_alone(
                     list(overlay.deployments.values()), set(blocked))
                 if infeasible:
-                    raise PlacementError(sorted(infeasible), sorted(infeasible.values()))
+                    raise PlacementError(sorted(infeasible), sorted(infeasible.values()),
+                                         capacity=False)
             if self.clock() + placement_interval > deadline:
-                raise PlacementError(blocked, reasons)
+                raise PlacementError(blocked, reasons, capacity=self._admission_capacity)
             self.sleep(placement_interval)
 
     def _finish_acquire(self, result, rec, *, apply, wait, timeout, interval) -> AcquireOutcome:
@@ -1854,15 +2091,250 @@ class Controller:
             rec = self._publish()
         return ReleaseLeasesOutcome(released, missing, idled, list(evicted), rec)
 
-    def publish_change(self, change: Callable[[], _T]) -> tuple[_T, ReconcileResult]:
+    # -- the gateway's route registry (routes seed / prune) ----------------
+
+    def _route_gateway(self) -> FrontDoorControl:
+        """The front door, or a ProfileMismatch saying there is none."""
+        from .profile import ProfileMismatch
+
+        front = self.backend.front_door()
+        if front is None or not front.litellm:
+            raise ProfileMismatch(
+                'the `routes` commands need a LiteLLM gateway (the compose or '
+                'kubeai backend, with `litellm` on)')
+        return front
+
+    def route_view(self) -> list:
+        """The routes the gateway serves now (``routes list``): derived from the
+        published catalogs, the placed deployments and any legacy registry,
+        exactly as the next render derives them."""
+        from .residency import ResidencyUnknown
+
+        self._route_gateway()
+        try:
+            residency = self.backend.residency()
+        except ResidencyUnknown:
+            residency = None
+        desired, inputs = self._admission_view(residency, virtual_expiry=True)
+        return self.backend.routes(desired, inputs)
+
+    def _published_sources(self) -> list[dict]:
+        """The published catalog union's sources: the stored profile's, and
+        none before the first publication."""
+        return list((self.ledger.profile() or {}).get('catalogs') or [])
+
+    def _meanings(self, union) -> dict:
+        """``{alias: Meaning}`` for every endpoint of ``union``."""
+        from .catalog import CatalogError
+        from .routes import Meaning
+
+        if union is None:
+            return {}
+        routes = {r.alias: r for r in self.backend.catalog_routes(union)}
+        meanings = {}
+        for name in sorted(union.endpoints):
+            try:
+                key = union.resolve_endpoint(name).semantic_key()
+            except CatalogError:
+                continue
+            meanings[name] = Meaning(routes.get(name), key)
+        return meanings
+
+    def _published_meanings(self) -> dict:
+        """What every published alias means: route registry rows, then the
+        published union's definitions over them."""
+        from .profile import CatalogUnion
+        from .routes import Meaning
+
+        meanings = {r.alias: Meaning(r) for r in self._route_gateway().registry_routes()}
+        sources = self._published_sources()
+        meanings.update(self._meanings(CatalogUnion.from_sources(sources) if sources else None))
+        return meanings
+
+    def _store_catalogs(self, catalogs: list[dict]) -> None:
+        """Replace the published union (caller holds the lock, marker set)."""
+        stored = self.ledger.profile() or self.invocation_profile()
+        if stored is None:
+            return
+        profile = {**stored, 'catalogs': catalogs}
+        if profile != stored:
+            self._commit_profile_candidate(profile)
+            self._use_profile_candidate(profile)
+
+    def plan_route_seed(self, catalogs: Iterable) -> RoutePlan:
+        """What publishing these catalogs would add, keep, or redefine.
+        Raises :class:`~infer_stack.leasing.profile.CatalogConflict` if they
+        disagree among themselves."""
+        from .profile import CatalogUnion, catalog_sources
+        from .routes import plan_seed
+
+        gateway = self._route_gateway()
+        sources = [s for c in catalogs for s in catalog_sources(c)]
+        union = CatalogUnion.from_sources(sources) if sources else None
+        self._require_keys(gateway, union)
+        incoming = self._meanings(union)
+        plan = plan_seed(self._published_meanings(), incoming)
+        plan.sources = sources
+        return plan
+
+    def _require_keys(self, front: FrontDoorControl, catalog) -> None:
+        """Refuse a seed when the routes it would publish -- everything
+        published plus ``catalog`` -- send a key with no value. Checked before
+        the marker: the render refuses too, but only after the seed stored its
+        catalogs."""
+        from .profile import CatalogUnion
+
+        sources = self._published_sources()
+        published = CatalogUnion.from_sources(sources) if sources else None
+        front.require_route_keys([*self.backend.catalog_routes(published),
+                                  *self.backend.catalog_routes(catalog)])
+
+    def commit_route_seed(self, plan: RoutePlan, *, replace: bool = False
+                          ) -> tuple[RoutePlan, ReconcileResult]:
+        """Merge the plan's catalogs into the published union and publish;
+        redefine conflicts only with ``replace``, and never one a resident
+        workload runs. Rechecked under the lock: a conflict that appeared
+        since the plan refuses too
+        (:class:`~infer_stack.leasing.routes.RouteConflict`) and nothing is
+        written. ``replace`` is compare-and-swap: each redefinition replaces
+        exactly the meaning the plan showed; one another process changed
+        meanwhile refuses (``RouteConflict(changed=True)``)."""
+        from .profile import CatalogConflict, ProfileMismatch, adopt_catalog_sources
+        from .residency import ResidencyUnknown
+        from .routes import RouteConflict, plan_seed
+
+        gateway = self._route_gateway()
+        fresh = plan_seed(self._published_meanings(), plan.incoming)
+        if fresh.conflicted and not replace:
+            raise RouteConflict(sorted(fresh.conflicted))
+
+        def preflight():
+            # Under the lock, before the marker: a conflict another process
+            # made since the plan refuses without leaving a publication pending.
+            now = plan_seed(self._published_meanings(), plan.incoming)
+            if now.conflicted and not replace:
+                raise RouteConflict(sorted(now.conflicted))
+            if replace:
+                # Compare-and-swap: replace only what was shown and confirmed.
+                shown = {n: old for n, (old, _) in plan.conflicted.items()}
+                moved = sorted(n for n, (old, _) in now.conflicted.items()
+                               if n not in shown or not (shown[n] == old))
+                if moved:
+                    raise RouteConflict(moved, changed=True)
+            from .profile import CatalogUnion
+
+            self._require_keys(gateway, CatalogUnion.from_sources(plan.sources)
+                               if plan.sources else None)
+            # A resident alias keeps its meaning, wherever that meaning lived
+            # (a catalog, a registry row, a dynamic route): refused before the
+            # marker, with or without --replace.
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            published = self._published_sources()
+            blocked = self._pinned_changes(
+                published, adopt_catalog_sources(published, plan.sources, set()),
+                residency)
+            if blocked:
+                raise self._pinned_refusal(blocked, 'routes seed')
+
+        def change():
+            now = plan_seed(self._published_meanings(), plan.incoming)
+            try:
+                residency = self.backend.residency()
+            except ResidencyUnknown:
+                residency = None
+            pinned = self._pinned_endpoints(residency)
+            try:
+                catalogs = adopt_catalog_sources(
+                    self._published_sources(), plan.sources, pinned)
+            except CatalogConflict as ex:
+                blocked = sorted(set(ex.names) & pinned) or sorted(ex.names)
+                raise ProfileMismatch(
+                    f'routes seed would redefine {", ".join(map(repr, blocked))}, '
+                    'which a resident deployment is running; evict it first '
+                    f'(`infer-stack evict {blocked[0]}`)') from ex
+            self._store_catalogs(catalogs)
+            # A published definition supersedes a registry row of the same name.
+            legacy = gateway.route_entries()
+            kept = {k: v for k, v in legacy.items() if k not in plan.incoming}
+            if kept != legacy:
+                gateway.replace_route_entries(kept)
+            return now
+
+        return self.publish_change(change, preflight=preflight)
+
+    def _prune_keep(self) -> set[str]:
+        """Aliases a prune keeps: the invocation's catalogs', and every one a
+        deployment the next render places (or a resident one) serves."""
+        from .profile import CatalogUnion
+        from .residency import ResidencyUnknown
+
+        mine = (self.invocation_profile() or {}).get('catalogs') or []
+        keep = set(CatalogUnion.from_sources(mine).endpoints) if mine else set()
+        try:
+            residency = self.backend.residency()
+        except ResidencyUnknown:
+            residency = None
+        desired, _ = self._admission_view(residency, virtual_expiry=True)
+        keep.update(ep for g in desired for ep in g.served)
+        return keep | self._pinned_endpoints(residency)
+
+    def _prunable(self) -> list[str]:
+        from .profile import CatalogUnion
+        from .routes import plan_prune
+
+        sources = self._published_sources()
+        current = set(self._route_gateway().route_entries())
+        if sources:
+            current |= set(CatalogUnion.from_sources(sources).endpoints)
+        return plan_prune(current, self._prune_keep()).dropped
+
+    def plan_route_prune(self) -> RoutePlan:
+        """Which aliases a prune unpublishes: every published definition and
+        registry row but the invocation's catalogs' and the ones deployments
+        serve."""
+        return RoutePlan(dropped=self._prunable())
+
+    def commit_route_prune(self, plan: RoutePlan) -> tuple[list[str], ReconcileResult]:
+        """Unpublish the plan's aliases that are still unneeded, and publish.
+        One that became needed since the plan is kept."""
+        from .profile import drop_catalog_names
+
+        gateway = self._route_gateway()
+        confirmed = set(plan.dropped)
+
+        def change():
+            drop = sorted(confirmed & set(self._prunable()))
+            if drop:
+                legacy = gateway.route_entries()
+                kept = {k: v for k, v in legacy.items() if k not in drop}
+                if kept != legacy:
+                    gateway.replace_route_entries(kept)
+                # A bundle naming an unpublished endpoint goes with it.
+                self._store_catalogs(drop_catalog_names(self._published_sources(), set(drop)))
+            return drop
+
+        return self.publish_change(change)
+
+    def publish_change(self, change: Callable[[], _T], *,
+                       preflight: Callable[[], None] | None = None
+                       ) -> tuple[_T, ReconcileResult]:
         """Run ``change`` and publish, as one serialised desired-state mutation.
 
-        For changes to backend state that the render reads (the route registry,
-        via ``routes seed`` / ``routes prune``). ``change`` runs under the lock
+        For changes to state the render reads outside the ledger (the published
+        catalogs and the legacy route registry, via ``routes seed`` / ``routes
+        prune``). ``change`` runs under the lock
         after the marker is set, so a crash leaves it pending like any other
         mutation. Returns ``(change's result, reconcile result)``.
+
+        ``preflight`` runs under the lock before the marker is set: a check
+        that refuses there (raises) leaves no publication pending.
         """
         with self._global_lock():
+            if preflight is not None:
+                preflight()
             self._mark_pending(apply=True)
             result = change()
             rec = self._publish()
@@ -1881,9 +2353,10 @@ class Controller:
         from .profile import ProfileMismatch
         from .residency import ResidencyUnknown
 
-        use = getattr(self.backend, 'use_profile', None)
-        if use is None:
+        recovery = self.backend.recovery_profile
+        if recovery is None:
             raise ProfileMismatch('this backend has no publishable profile')
+        use = recovery.use_profile
         stored = self.ledger.profile()
         if stored is not None and stored.get('backend') != profile.get('backend'):
             # The quiescence check below can only see the NEW backend's
@@ -1901,68 +2374,43 @@ class Controller:
                     f'config publish needs a quiescent stack: {len(active)} active '
                     f'lease(s) ({", ".join(active[:3])}); release them first'
                 )
-            residency = getattr(self.backend, 'residency', None)
-            if residency is not None:
-                try:
-                    snap = residency()
-                except ResidencyUnknown as ex:
-                    raise ProfileMismatch(
-                        f'config publish cannot confirm the stack is quiescent: {ex}'
-                    ) from ex
-                running = sorted({c.deployment_id for c in snap.all_containers()
-                                  if c.deployment_id})
-                if running:
-                    raise ProfileMismatch(
-                        'config publish needs a quiescent stack: deployment '
-                        f'container(s) exist for {", ".join(running[:3])}; '
-                        '`infer-stack evict --all` first'
-                    )
-            if self._admission_mode():
-                # A PURE preview first: the real render persists append-only
-                # state (route registry, addresses), which must not happen for
-                # a candidate whose publication has not committed.
-                previous = self._applied_profile
-                use(profile)
-                try:
-                    residency = self._admitting.residency()
-                    self._prepare_network()
-                    desired, inputs = self._admission_view(
-                        residency, virtual_expiry=True
-                    )
-                    self._admitting.preview(desired, inputs, approve=True)
-                except BaseException:
-                    if previous is not None:
-                        use(previous)
-                    raise
-                self.ledger.store.publish_profile(
-                    profile, approved_digest=self._admitting.last_preview_digest)
-                self._profile_error = None
-                self._applied_profile = profile
-                self._invocation_profile = profile
-                self._profile_drift_warned = False
-                return self._publish()
-            # Backends without a preview (KubeAI): render, then commit.
-            # No implicit profile here: on a fresh ledger a declined preview
-            # must leave neither a profile nor a marker behind.
-            existed = self.ledger.publication_pending() is not None
-            marker = self._mark_pending(apply=True, create_profile=False)
+            try:
+                snap = self.backend.residency()
+            except ResidencyUnknown as ex:
+                raise ProfileMismatch(
+                    f'config publish cannot confirm the stack is quiescent: {ex}'
+                ) from ex
+            running = sorted({c.deployment_id for c in snap.all_containers()
+                              if c.deployment_id})
+            if running:
+                raise ProfileMismatch(
+                    'config publish needs a quiescent stack: deployment '
+                    f'container(s) exist for {", ".join(running[:3])}; '
+                    '`infer-stack evict --all` first'
+                )
+            # A PURE preview first: the real render persists append-only
+            # state (route registry, addresses), which must not happen for
+            # a candidate whose publication has not committed.
             previous = self._applied_profile
             use(profile)
             try:
-                rec = self._render()
+                residency = self.backend.residency()
+                self._prepare_network(self.backend.host_runtime)
+                desired, inputs = self._admission_view(
+                    residency, virtual_expiry=True
+                )
+                self.backend.preview(desired, inputs, approve=True)
             except BaseException:
                 if previous is not None:
                     use(previous)
-                if not existed:
-                    self.ledger.clear_publication_pending(marker['version'])
                 raise
-            self.ledger.store.publish_profile(
-                profile, approved_digest=getattr(self.backend, 'last_planned_digest', None))
+            self.ledger.publish_profile(
+                profile, approved_digest=self.backend.last_preview_digest)
             self._profile_error = None
             self._applied_profile = profile
             self._invocation_profile = profile
             self._profile_drift_warned = False
-            return self._apply_pending(rec)
+            return self._publish()
 
     def prune(self) -> tuple[int, int]:
         """Forget released/expired leases and stopped deployments, under the lock.
@@ -1982,7 +2430,7 @@ class Controller:
         nothing.
 
         **Slow path, under the lock:** a deployment went IDLE, so the renew is a
-        desired-state change. In admission mode it is re-admitted: the IDLE
+        desired-state change, so it is re-admitted: the IDLE
         deployment adopts its resident GPUs, or is placed fresh; if neither is
         possible the renew fails with :class:`PlacementError` and writes
         nothing. The lease is re-validated as ACTIVE under the lock first.
@@ -1993,52 +2441,39 @@ class Controller:
         if fast is not False:
             return RenewOutcome(fast, [])
         with self._global_lock():
-            if self._admission_mode():
-                lease = self.ledger.get_lease(lease_id)
-                if lease is None or lease.state != LeaseState.ACTIVE:
-                    return RenewOutcome(None, [])
-                from .residency import ResidencyUnknown
-
-                try:
-                    residency = self._admitting.residency()
-                except ResidencyUnknown:
-                    residency = None
-                overlay = self.ledger.plan_acquire([])
-                for gid in dict.fromkeys(lease.deployment_ids):
-                    deployment = self.ledger.get_deployment(gid)
-                    if deployment is not None and deployment.state == DeploymentState.IDLE:
-                        deployment.state = DeploymentState.LIVE
-                        overlay.deployments[gid] = deployment
-                        overlay.revived.append(gid)
-                if not overlay.revived:
-                    return RenewOutcome(
-                        self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
-                allocations, reasons = self._admit(overlay, residency)
-                if reasons:
-                    raise PlacementError(list(overlay.revived), reasons)
-                self._mark_pending(apply=True)
-                if self._admission_digest:
-                    self.ledger.mark_publication_pending(
-                        apply_requested=True, approved_digest=self._admission_digest)
-                renewed = self.ledger.renew(
-                    lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
-                rec = self._publish()
-                return RenewOutcome(renewed, list(overlay.revived), rec)
             lease = self.ledger.get_lease(lease_id)
-            reviving = []
-            if lease is not None and lease.state == LeaseState.ACTIVE:
-                for gid in dict.fromkeys(lease.deployment_ids):
-                    deployment = self.ledger.get_deployment(gid)
-                    if deployment is not None and deployment.state == DeploymentState.IDLE:
-                        reviving.append(gid)
-            if not reviving:
+            if lease is None or lease.state != LeaseState.ACTIVE:
+                return RenewOutcome(None, [])
+            from .residency import ResidencyUnknown
+
+            try:
+                residency = self.backend.residency()
+                self._residency_error = None
+            except ResidencyUnknown as ex:
+                residency = None
+                self._residency_error = str(ex)
+            overlay = self.ledger.plan_acquire([])
+            for gid in dict.fromkeys(lease.deployment_ids):
+                deployment = self.ledger.get_deployment(gid)
+                if deployment is not None and deployment.state == DeploymentState.IDLE:
+                    deployment.state = DeploymentState.LIVE
+                    overlay.deployments[gid] = deployment
+                    overlay.revived.append(gid)
+            if not overlay.revived:
                 return RenewOutcome(
-                    self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [],
-                )
+                    self.ledger.renew(lease_id, ttl_seconds=ttl_seconds), [])
+            allocations, reasons = self._admit(overlay, residency)
+            if reasons:
+                raise PlacementError(list(overlay.revived), reasons,
+                                     capacity=self._admission_capacity)
             self._mark_pending(apply=True)
-            renewed = self.ledger.renew(lease_id, ttl_seconds=ttl_seconds)
+            if self._admission_digest:
+                self.ledger.mark_publication_pending(
+                    apply_requested=True, approved_digest=self._admission_digest)
+            renewed = self.ledger.renew(
+                lease_id, ttl_seconds=ttl_seconds, allocations=allocations)
             rec = self._publish()
-        return RenewOutcome(renewed, reviving, rec)
+            return RenewOutcome(renewed, list(overlay.revived), rec)
 
     def evict(self, deployment_ids: Iterable[str] | None = None) -> EvictOutcome:
         """Force-evict idle (released) deployments now, overriding keep-warm.

@@ -60,6 +60,18 @@ IDENTITY_FLAGS = frozenset({
     '--max-model-len',
 })
 
+#: vLLM serving defaults: what infer-stack launches with when an endpoint's
+#: runtime does not set a knob. :func:`effective_max_model_len` is the one
+#: derivation of the effective ``max_model_len``: it must equal the value
+#: that ends up on the engine's command line, because it is also advertised
+#: to clients (LiteLLM ``model_info.max_input_tokens``).
+VLLM_DEFAULTS = {
+    'gpu_memory_utilization': 0.9,
+    'max_model_len': 8192,
+    'max_num_batched_tokens': 8192,
+    'max_num_seqs': 256,
+}
+
 _TEMPLATE = re.compile(r'\{(max_model_len|gpu_memory_utilization|served_model_name|port)\}')
 _ENV_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -102,6 +114,31 @@ def translate_legacy(runtime: dict[str, Any]) -> dict[str, Any]:
         out['env'] = {**out['env'],
                       'PREFIX_CACHE': '1' if runtime.get('enable_prefix_caching') else '0'}
     return out
+
+
+def effective_max_model_len(runtime: dict[str, Any] | None) -> int:
+    """The ``--max-model-len`` a vLLM deployment runs with.
+
+    The runtime's ``max_model_len`` when set (a legacy ``serve_recipe``
+    translated first, exactly as the launch does; the translation is
+    idempotent, so an already-translated runtime is fine), else the engine
+    default. This is the single derivation of an endpoint/runtime's effective
+    window: it launches a newly created deployment and seeds that endpoint's
+    LiteLLM ``model_info.max_input_tokens`` contract. Capacity subsumption may
+    later serve a smaller endpoint from a larger compatible deployment; in
+    that case the endpoint correctly keeps the smaller contract. Nothing is
+    coerced beyond the value itself.
+
+    Example:
+        >>> effective_max_model_len({'max_model_len': 262144})
+        262144
+        >>> effective_max_model_len({'tensor_parallel_size': 2})
+        8192
+        >>> effective_max_model_len(None)
+        8192
+    """
+    value = (translate_legacy(runtime or {}) or {}).get('max_model_len')
+    return VLLM_DEFAULTS['max_model_len'] if value is None else value
 
 
 def launch_errors(name: str, engine: str, runtime: dict[str, Any]) -> list[str]:

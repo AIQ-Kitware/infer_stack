@@ -3180,3 +3180,330 @@ labels are stable enough to key residency on.
 **Takeaway.** Before unifying internals, check what callers see. Two backends
 that share 90% of their code but answer to different names are two products
 to the people using them.
+
+## 2026-09-24 12:54:30 -0400
+
+**Intent.** The user approved the backend-unification plan, asked for the
+work on a branch (`dev/backend-unification`), and authorised installing k3s
+on the guest to test KubeAI for real. Model: Claude Opus 5.5 (1M context).
+
+**What happened.** K0: k3s plus KubeAI 0.23.4, using the chart's `cpu`
+profile. It runs real vLLM on CPU, which beats the simulator: KubeAI builds
+vLLM's own command line, and the simulator's CLI would have refused it. The
+backend passed unchanged on its first real run since July. K1: the kubeai
+backend now owns a gateway-only ComposeBackend and feeds it generic
+`upstream` route rows. Before, a card's alias got 404 from KubeAI; after,
+the same request answered. K2 and K4: strict pod residency, and the crash
+diagnosis moved into a backend-neutral module. A Model whose vLLM rejected a
+flag failed in 52 s instead of the 800 s timeout. K5: one served-name rule.
+It fixed a real disagreement between the engine and two route builders.
+Removed the dead profile-era KubeAI renderer.
+
+**What I got wrong along the way.** I wrote a second e2e script before
+finding `dev/kubeai_e2e.sh`, a duplicate authority created in the middle of
+a de-duplication task, and folded it back in. That script's generation check
+could never fail (a `curl | grep && echo` list, where `set -e` does not
+fire), so it "passed" on a 404. The plan's claim that KubeAI's lenient
+`observe()` was a bug was wrong: Compose's is lenient by the same contract.
+I corrected the plan.
+
+**Open: K3 (one acquire path).** It is feasible: only 12 controller tests and
+the null backend depend on the old path. It carries a semantic decision the
+user should make. On a cluster nothing displaces an idle keep-warm Model, so
+the September starvation incident can recur on KubeAI unless admission
+evicts idle keep-warm Models when a new one cannot be scheduled.
+
+**Takeaways.** (1) A test that has never failed is not evidence. Make it
+fail on purpose first; GATEWAY=0 is that switch here. (2) "Has method X" is
+a poor stand-in for "is backend Y": when a second backend gains X, every
+such check silently changes meaning.
+
+## 2026-09-24 14:39:35 -0400
+
+**Intent.** Make infer-stack more elegant, architecture first and the TUI
+after. The user agreed that the Compose backend's real seam is gateway vs.
+engines. Model: Claude Opus 5.5 (1M context).
+
+**What I did.** Four steps on `dev/backend-unification`, each green before
+the next: naming rules into `naming.py`, the gateway's module code into
+`gateway.py`, a `Gateway` class for its state, and `render_front_door`.
+The one real design change: the registry merge no longer reads backend
+state. Backends supply rows and the gateway only merges them, which removed
+the `upstream_routes` side-channel I had added for KubeAI in K1. Settings the
+gateway reads became backend properties onto the single `Gateway`, because
+`use_profile` and tests set them on the backend after construction. Two
+copies would drift.
+
+**How I checked a pure refactor.** Unit tests alone are weak evidence for
+moved code, so I also rendered six stack configurations with the old and new
+code and compared bytes (identical), then ran the real Compose gateway,
+`secrets rotate` and the KubeAI e2e.
+
+**What went wrong.** My first byte comparison "passed" on two empty files,
+because the script crashed in both runs. I caught it only because the byte
+count was 0. More serious: the weight-floor doctest I wrote earlier wrote
+4 GiB of real zeros into /tmp on every run and never cleaned up. A day of
+test runs filled 49 GB, k3s went into disk pressure and evicted KubeAI.
+Fixed with sparse files.
+
+**Takeaways.** (1) A comparison of outputs must check the outputs exist:
+equality of two failures is not evidence. (2) Test fixtures that need large
+files should be sparse. Size was the property under test, not the bytes.
+
+## 2026-09-26 13:05:00 -0400
+
+**Intent.** Execute the backend-parity queue (`docs/queue.md`): the roadmap
+phases that can be built and verified without a GPU or a second machine,
+refactoring duplicate authorities on the way, and not stopping before a
+passing UX audit. Model: Claude Opus 5.5 (Claude Code).
+
+**What landed.** P1b deleted the pre-admission acquire branch: a
+`SimpleAdmission` mixin gives the dry-run and test backends the admission
+surface, so the controller has one path. P2 put `ps`, `logs`, `status` and
+the TUI behind an `Instance` view built from residency, on both backends.
+P3 made the gateway in front of a cluster the compose gateway (UI, proxy,
+dynamic routing, one approval). P6 is a parity suite, one test per *same*
+row. P4 picks a KubeAI resource profile by GPU size from node labels.
+
+**Decisions.** The review split P1: a `preview` alone would have dropped
+every KubeAI lease, because the admission view assumed GPU accounting, so
+"does this backend allocate GPUs" became one function. Under dynamic
+routing a KubeAI Model is named per deployment with compose's own tail
+rule, rather than a new scheme. A profile's size is what its node selector
+selects; the chart's selector-less profiles deliberately have none, because
+guessing a size for "anywhere" would pick wrong silently.
+
+**What surprised me.** Three bugs older than this work surfaced only in a
+real terminal or a real cluster: the TUI replaced kubeai's kubectl runner
+with Docker's (no KUBECONFIG, so every kubectl call failed), a kwconf flag
+swallowed the positional after it on every command, and the TUI swapped an
+injected runner for the real Docker. Fakes passed throughout; each was
+found by running the thing. The e2e also failed once on its own
+`grep -q` + pipefail pattern (lessons.md).
+
+**Risks.** The kubeai recovery profile now nests the gateway's profile;
+old profiles (a bare boolean) keep this process's settings. P4 is verified
+with fake labels only; `dev/handover/p4_gpu_labels.sh` is the real test.
+
+**Takeaways.** (1) When a refactor removes a branch, first run the whole
+suite with the other branch forced on: the failures list exactly what to
+migrate. (2) A seam that wraps a runner must wrap only what it owns; a
+wrapper that replaces is a second authority. (3) Put every e2e check's
+output in a file before testing it.
+
+## 2026-09-26 — UX audit passes 5 and 6
+
+**Did.** Pass 5 (both audit scripts, the TUI by eye on both backends at
+80x24 and 200x50, the README's first run from empty roots, a naming grep)
+found eight things, each fixed with a test: instance start times in UTC,
+the TUI deriving the gateway URL itself (a duplicate authority; now
+`Gateway.urls()`), top tabs unreachable from the keyboard, a sidebar and
+log pane that ignored the terminal's size, and a released `reclaim: stop`
+deployment reported as missing (now `Controller.keeps_up`). Pass 6 found a
+traceback on `release --env-file` for a file never written.
+
+**Environment.** Pass 6's kubeai run failed because the dev cluster's node
+went into disk pressure: my audit roots filled the shared disk. Deleting
+them did not clear the taint (minimum reclaim, lessons.md). I wrote
+`/etc/rancher/k3s/config.yaml` with a 1Gi minimum reclaim and restarted k3s;
+remove the file to undo it.
+
+**Takeaways.** (1) An audit that passes when its command is missing is not
+an audit: the script now refuses to start without `infer-stack` on PATH.
+(2) Read a report whole: the one pass-5 finding I nearly missed was a line
+my own `sed` range skipped.
+
+## 2026-09-26 18:30:00 -0400 — review hardening of the backend-parity campaign
+
+**Intent.** An outside review, in two parts, of the finished queue: fix what
+it confirmed (replica residency, the backend protocol, cross-feature tests;
+then scheduler reclaim, approval lifetime, secret rotation, route ordering,
+coalescing, route seeding, preview purity, decomposition, docs), queueing
+the work first. Model: Claude Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** Queue items 11-22, each with a poison test that fails on the old
+code. The common thread the review named held: several shared concepts
+carried less than the controller needed. `Residency` now says whether
+several units are replicas or a conflict; `Readiness.needs_room` is only
+set for a capacity shortage, and the backend names useful victims;
+`apply()` returns how far it got; routes retire before upstreams go. The
+protocol the controller takes is the one the backends implement, checked by
+`ty` (a deliberate drift fails it).
+
+**Found on the way.** KubeAI's `apply` dropped its host gateway's result,
+so unverified routes behind KubeAI cleared the marker; `routes seed --json`
+printed its conflict list into the JSON; a TUI test counted unrelated
+refusals.
+
+**Uncertain.** The scheduler parsing reads Kubernetes' English message
+("Insufficient <resource>"); a scheduler that words it differently evicts
+nothing, which is the safe failure. Required node affinity is not
+evaluated, also safe. The replica diagnosis quotes the concatenated pod
+logs; with mixed failures it names the first fatal line it finds.
+
+**Takeaways.** (1) A "same" row is a claim about one path; the bug lived
+where two rows met, so a backend feature needs one test with the common
+lifecycle. (2) When a boolean crosses a boundary, ask what the caller does
+with the cases it merges; `True/False` and `needs_room` each merged cases
+that needed opposite actions. (3) Run long e2e passes from a frozen copy
+(lessons.md).
+
+## 2026-09-26 20:23:05 -0400 — re-review: second-order cases
+
+**Intent.** The re-review closed most of items 11-22 and reopened five, plus
+a route-seed race, for states the richer abstractions exposed but did not
+carry through; and it classified the optional backend hooks instead of
+promoting them all. Model: Claude Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** In the order the reviewer asked, each with a test failing on the
+code before it: KubeAI settles its host gateway after an interrupted apply
+(the safety bug: `settle_snapshot` was an optional probe KubeAI lacked);
+rotation keys on "the runtime changed", not "apply was called"; an explicit
+re-approval is durable; replicas are judged from their own logs and
+`deployment_health` separates serving from residency; reclaim fails closed
+on schedulers and constraints it does not model; a race-time seed conflict
+leaves no marker; the hooks are required state, common operations, or two
+typed nullable capabilities (`recovery_profile`, `FrontDoor`).
+
+**Mistake.** One commit went in with a failing test: the chain ran pytest
+and then committed regardless. Fixed forward in the next commit; later
+commits gate on pytest's exit code.
+
+**Takeaways.** (1) An optional structural probe is a silent default: absent
+meant "nothing to settle" and "owns host GPUs", both wrong for a backend
+that simply had not implemented them. Required members make the checker
+catch it. (2) Physical state and serving state are different questions;
+once residency became physical, every reader that meant "is it serving"
+needed its own summary. (3) A race test must inject the other writer at the
+lock, not before the call; otherwise an earlier unlocked check passes it.
+
+## 2026-09-27 — campaign 2, item 32: one GatewayRoute, routes derived at render
+
+**Intent.** Replace the route plumbing (registry rows of three shapes, four
+`render_front_door` strategies, `UPSTREAM_ROUTE`, KubeAI's parallel
+`upstream_rows`) with one route type, and make the published catalog union
+the only store of endpoint definitions (design decision 2). Model: Claude
+Opus 5.5 (claude-opus-5-5), Claude Code.
+
+**Did.** `GatewayRoute` with one renderer; `front_door_routes` derives the
+static table or the dynamic set for all three gateways; `routes seed` /
+`prune` publish into and unpublish from the union; external endpoints route
+to their own servers on every backend, with a dynamic id from their alias.
+
+**Changed my mind.** The design said deployment routes would be derived only
+while live. The first full run failed
+`test_converge_to_empty_keeps_the_front_door`: releasing an ad-hoc
+deployment then recreated the gateway, a blip for every client. The registry
+keeps that one owner (routes of aliases no catalog defines), and the design
+doc says so. Also dropped the seed-from-`litellm_config.yaml` migration:
+with catalog rows no longer written, reseeding from our own rendered config
+would have made every route permanent.
+
+**Mistakes.** `Gateway.remember` took the converge flock inside a converge
+and hung the suite (lesson added). A `pkill -f pytest` pattern matched my
+own shell and killed the edit in the same command; the edit had to be
+reapplied.
+
+**Takeaways.** (1) A "derive, do not store" rule needs checking against
+every property the store was providing: the registry was also what kept the
+gateway byte-stable across an ad-hoc release. (2) Tests that called
+`render_compose` with deployments that serve no catalog endpoint were
+testing a branch production never took; making the deployments serve the
+catalog's aliases made them test the real property.
+
+## 2026-09-27 — items 33-34: external routes, keys by name, a real-LiteLLM e2e
+
+**Did.** Survival and replacement tests for external routes; keys by name
+on both gateways (host env interpolation + fingerprint, in-cluster Secret +
+key-hash); `env` says when a key takes effect; `routes seed` refuses a key
+with no value. `dev/external_e2e.sh` drives a real LiteLLM against the mock
+OpenAI server on the guest, static and dynamic, through a key rotation.
+
+**Found by the e2e, not the unit tests.** After `routes seed`, every command
+warned that the catalogs drifted: `profile_drift` compared sources by digest,
+and merging rewrites the union's sources. It now compares endpoint meaning.
+Also: LiteLLM's upstream request lowercases `authorization`, and Postgres
+leaves its data dir owned by its own uid (the script removes it through a
+container).
+
+## 2026-09-27 — items 35-40: access above leasing, and the e2e that checked it
+
+**Did.** `Controller.access` over `acquire` (managed members, one lease) and
+`publish_endpoints` (external-only: the same preview, approved marker and
+publication, no ledger mutation); typed `ConnectionInfo` /
+`request_names()` replace the `access` dict hook; `infer-stack access`,
+`run` on top; lease-less env-files; `status` and TUI views; the
+`FrontDoorControl` / `RenderedFrontDoor` names. `dev/external_e2e.sh`
+covers eight phases in both routing modes on the guest.
+
+**Found by the e2e.** Redefining a bundle member (managed -> external) left
+the published copy of the bundle naming an endpoint its own source had
+dropped; every source must validate alone, so `drop_catalog_names` now
+drops such bundles. The first external-only access on a fresh ledger
+published nothing: freezing the snapshot consumed the candidate. Access now
+always publishes.
+
+**Mistake.** A nested heredoc (`<<EOF` inside `<<'EOF'`) ended my edit
+early and ran the rest as shell; nothing was written, but edit scripts with
+heredocs inside now go through the Write tool.
+
+## 2026-09-27 — campaign 2 closed: the alternatives, and why not
+
+Recorded here because the design doc lists them in one line each; these are
+the arguments that decided them.
+
+- **A fake lease for an external endpoint** would have kept `acquire` the
+  only verb and every descriptor shaped as today. It puts demand, TTL and
+  reclaim state in the ledger for something with no runtime, and `release`
+  of it would have to mean something. Access above leasing costs one verb
+  (`access`) and one optional field (no `INFER_STACK_LEASE_ID`), and the
+  ledger keeps describing only what infer-stack runs.
+- **`engine: external`** reads naturally in YAML but mixes how a runtime is
+  realized with who owns it: every engine-keyed code path (placement,
+  render, readiness, measure) would have needed an "except external" branch.
+  A target (`ManagedTarget` / `ExternalTarget`) says who fulfils the
+  endpoint; engines stay a managed-runtime detail.
+- **External endpoints authored as route rows** (`routes add`) would have
+  been the smallest diff: the registry already fed the renderer. It makes
+  the registry a second catalog outside the conflict and pinning rules that
+  protect endpoint meaning. Deriving routes from the published union removed
+  catalog rows from the registry instead of adding a kind to it; the
+  registry kept one owner, ad-hoc deployments, because dropping those caused
+  a gateway blip on release (the first full test run showed it).
+- **Direct access to an external server** (the env-file points at its URL)
+  saves a hop. It gives external-only requests a second access mode where
+  the alias stops being the model name and the key is the provider's, so a
+  workflow changes when an endpoint moves. Through the front door, moving
+  `qwen` between managed and external changed nothing in the e2e's phase 8.
+
+## 2026-09-27 — campaign 2 review: the publication boundary caught up
+
+**Intent.** A review of campaign 2 found that the profile/publication
+transaction model had not caught up with `profile.catalogs` being the
+published endpoint set (items 42-50). Model: Claude Opus 5.5
+(claude-opus-5-5), Claude Code.
+
+**Did.** (42) Nothing writes catalogs outside a publication's commit: the
+first profile rides the first marker, an acquire's candidate rides its lease
+transaction, access and a first `apply` go through `publish_profile`; `gc`
+no longer publishes on a fresh ledger. (43) Access readiness includes the
+publication's result, tri-state. (44) A route key with no value refuses at
+the render, for every command. (45) Pinning compares a resident alias's new
+meaning with the deployment running it, whatever source held the old one.
+(46) `FrontDoorControl` is the whole interface. (48-50) desired-state
+labelling, strict `api_base`, and an explicit no-migration decision.
+
+**Wider than reported.** Item 42 was reported for a fresh ledger; the same
+gap existed on every acquire with a catalog change (profile, marker and
+lease were three transactions). Fixed together.
+
+**Kept deliberately.** `apply` on a fresh ledger still publishes the
+invocation's endpoints (through the approved single commit): the parity test
+`test_catalog_routes_exist_before_models_run_and_do_not_churn` pins the
+no-blip property of `stack up` then `acquire`, and `gc` / `release` /
+`evict` are the non-endpoint operations the review meant.
+
+**Evidence.** Each poison test fails on the old code (item 45's two ran the
+full 180 s dynamic reconcile budget there, because the unfixed seed went on
+to publish). Suite 1114, ty, flake8, `external_e2e.sh` on Compose (8 phases,
+both routing modes) and on KubeAI (1-5, both).

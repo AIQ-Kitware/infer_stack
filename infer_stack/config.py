@@ -25,7 +25,8 @@ PINNED_IMAGES = {
     'postgres': 'postgres:16.8',
     'open_webui': 'ghcr.io/open-webui/open-webui:v0.8.6',
     'litellm': 'ghcr.io/berriai/litellm:v1.82.3-stable',
-    'vllm': 'vllm/vllm-openai:v0.19.1',
+    # TODO: have the default vary based on detection of what cuda version can run on the system when possible
+    'vllm': 'vllm/vllm-openai:v0.30.0-cu129',
     'ollama': 'ollama/ollama:latest',
     'nginx': 'nginx:1.29.7-alpine',
 }
