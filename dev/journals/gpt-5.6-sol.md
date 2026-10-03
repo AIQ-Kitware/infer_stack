@@ -248,3 +248,49 @@ Focused CPU-only validation in the extracted source (with only a minimal
 suites pass; broader catalog/ledger/admission/routing coverage passes apart
 from two Compose tests that also fail on the unmodified base in this container
 and CLI tests blocked by missing `kwconf`. `compileall` is clean.
+
+
+## 2026-10-03 13:18:00 -0400
+
+Summary of user intent: document a detailed future architecture for infer-stack
+that can be controlled remotely, can eventually run multiple redundant
+control-plane processes without creating competing authorities, and treats
+security of the remote control surface as a primary design constraint.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+I wrote a planning document rather than changing runtime behavior. The central
+design decision is to distinguish one logical control plane from one physical
+control-plane machine: a managed backend domain should have one authoritative
+state, while one or more controller replicas may serve API traffic and
+reconciliation. Existing inference is deliberately a data-plane concern and
+should continue if every controller is temporarily unavailable; only mutations,
+reconciliation, TTL GC, and route changes should pause.
+
+The proposed evolution keeps SQLite for simple standalone mode and introduces
+PostgreSQL for remote/server/HA mode instead of attempting network-shared
+SQLite. The first HA shape is active-active API replicas plus one elected
+reconciler, with monotonically increasing leadership epochs and per-object
+desired generations so stale leaders cannot overwrite newer state. Remote
+Compose hosts are controlled through authenticated node agents rather than SSH
+or exposed Docker sockets; Kubernetes/KubeAI continues to use Kubernetes as its
+scheduler/agent substrate rather than adding a competing infer-stack scheduler.
+
+Security is intentionally part of the architecture rather than a later
+hardening pass. Remote listeners default to loopback, remote access requires
+TLS/authentication, normal users operate only on approved catalog endpoints,
+catalog mutation is a separate privilege, and the control API must not expose a
+generic exec surface or arbitrary images/commands/host mounts. The plan also
+defines durable operations/idempotency, audit records, failure semantics,
+backup/restore expectations, staged implementation phases, and a test strategy
+for leader failover, stale-generation fencing, node partitions, and data-plane
+independence.
+
+I also linked the current "one control plane per host or backend namespace"
+known limitation to this proposed successor architecture so the repository
+clearly distinguishes today's supported behavior from the future direction.
+This is documentation-only; no tests were required or run. The principal open
+questions left intentionally unresolved are API transport, agent transport,
+authentication provider, catalog authority, and whether infer-stack and LiteLLM
+share one physical PostgreSQL service or only colocate operationally while
+keeping separate schemas/credentials.
