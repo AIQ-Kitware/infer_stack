@@ -1125,14 +1125,17 @@ paths.
 
 Before remote/HA work:
 
+- maintain the current state/authority inventory in
+  [control-plane-authority-inventory.md](control-plane-authority-inventory.md);
 - keep acquire/release transactional;
 - keep route retirement ordered before upstream teardown;
 - ensure dynamic route reconciliation is idempotent;
 - ensure all desired mutations have stable identities;
 - identify all remaining process-local or rendered-file authority.
 
-Deliverable: a written inventory of state that must move behind the state-store
-interface.
+Deliverable: the authority inventory names every state item that must move
+behind the state-store/secret-store boundary, and every file that remains a
+derived realization or local cache.
 
 ### Phase 1 — controller service boundary
 

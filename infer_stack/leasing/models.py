@@ -100,41 +100,10 @@ def is_reservation(obj: Any) -> bool:
     return getattr(obj, 'engine', None) == RESERVED_ENGINE
 
 
-# Fields that must match *exactly* for two requests to share one deployment.
-# Capacity fields (e.g. ``max_model_len``) are deliberately NOT here: they are
-# handled by subsumption (existing >= requested) in
-# :func:`capacity_satisfies`, so a 32k deployment can serve an 8k request.
-VLLM_STRUCTURAL_FIELDS = (
-    'engine',
-    'model_ref',
-    'revision',
-    'quantization',
-    'dtype',
-    'tensor_parallel_size',
-    'pipeline_parallel_size',
-    'data_parallel_size',
-    'image',
-    'chat_template',
-    'trust_remote_code',
-    'lora_adapters',
-    'served_name',
-    # Optional: present only for an operator-pinned endpoint. Keeping it absent
-    # for auto placement preserves the compatibility key of existing catalogs.
-    'gpu_indices',
-)
-
-# For Ollama the coalescing unit is the *daemon*, so the structural identity is
-# the host config, not the model tag (tags load/unload inside the daemon).
-OLLAMA_STRUCTURAL_FIELDS = (
-    'engine',
-    'host',
-    'gpu_indices',
-    'keep_alive',
-    'num_parallel',
-    'max_loaded_models',
-    'model_store',
-)
-
+# Structural identity has one executable definition per engine below
+# (``vllm_structural`` / ``ollama_structural``).  Keep it executable rather
+# than mirroring the fields in constants: a stale descriptive list can make a
+# reader believe a compatibility field is ignored when the hash actually uses it.
 
 def _canonical(value: Any) -> Any:
     """Normalize a value so equal-meaning configs hash identically."""

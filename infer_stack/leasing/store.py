@@ -336,18 +336,16 @@ class SqliteStore:
                 self._conn.execute('ROLLBACK')
                 raise
 
-    # -- generation (legacy; unused by the controller) ----------------------
+    # -- desired-state generation -------------------------------------------
     #
-    # Superseded by the publication marker below, which the controller uses to
-    # serialise render and apply. The counters are still bumped and kept so an
-    # older reader of the same ledger does not break. Their original meaning:
-    #   desired_gen  bumped whenever a mutation changes the desired set (a new
-    #                deployment, an idled/evicted/expired one). Captured by an
-    #                acquirer right after it renders -> "the generation my change
-    #                is in".
-    #   applied_gen  the floor a successful apply has materialized. An acquirer is
-    #                covered once applied_gen >= its captured desired_gen, so one
-    #                apply satisfies every waiter that rendered before it.
+    # ``desired_gen`` is the ledger-wide monotonic epoch for demand/desired-state
+    # changes; ``applied_gen`` is the monotonic floor an older apply-generation
+    # scheme materialized.  The current standalone controller uses the richer
+    # publication marker below to recover render/apply intent, so it does not
+    # wait on these counters directly.  They remain meaningful state, not a
+    # rendered-file authority: the distributed-control-plane design will need
+    # generation/fencing semantics and can evolve this coarse epoch into
+    # per-object desired/observed generations without changing that ownership.
 
     def bump_desired_generation(self) -> int:
         """Increment `desired_gen`. MUST be called inside :meth:`transaction`

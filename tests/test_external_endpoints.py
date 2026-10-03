@@ -454,7 +454,7 @@ def test_a_front_door_that_never_answers_releases_the_lease_access_took(tmp_path
     cat = Catalog.from_dict(catalog(remote=REMOTE))
     ledger, ctl = _keyed(tmp_path, cat)
     ctl.FRONT_DOOR_WAIT_S = 0.0
-    ctl.backend.gateway_accepts = lambda key, wait=0.0: None
+    ctl.backend.front_door().gateway_accepts = lambda key, wait=0.0: None
     result = ctl.access('me', cat.resolve(['pair']))
     assert result.front_door_ready is False and not result.ready
     leases, _ = ledger.status()

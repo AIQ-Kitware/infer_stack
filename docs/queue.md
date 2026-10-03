@@ -1426,16 +1426,15 @@ Poison: resident ad-hoc `qwen`, `routes seed --replace` qwen -> external,
 dynamic routing: refuse, no catalog/registry change, no marker.
 
 ### 46. [x] Finish `FrontDoorControl`
-*Done 2026-09-27.* No `gateway: Any`: the capability has `env_path`,
-`require_route_keys`, `registry_routes`, `route_entries`,
-`replace_route_entries` beside the key operations and `connection_info`;
-the controller's route commands, `env` and `secrets rotate` use only it.
-KubeAI's backend-level key proxies are gone (its front door is its gateway).
-Upper layers still reach `front.gateway` (`missing_keys`, `_env_path`,
-registry rows) and backend-level gateway proxies; the secrets CLI uses
-`getattr(backend, 'litellm')`, `backend.master_key()`. Give the capability
-the operations callers need; drop `gateway: Any` from it and proxies whose
-only job was exposing the gateway.
+*Done 2026-09-27; boundary cleanup completed 2026-10-03.* No `gateway: Any`:
+the capability has `env_path`, `require_route_keys`, `registry_routes`,
+`route_entries`, `replace_route_entries` beside the key operations and
+`connection_info`; controller, CLI and TUI callers use `backend.front_door()`
+for those operations. `ComposeBackend.front_door()` now returns its `Gateway`
+instead of re-exporting a second operational gateway API; KubeAI returns its
+gateway realization's front door. Backend-level settings used to render the
+project remain backend settings, while keys and route-registry state have one
+authority.
 
 ### 47. [ ] Published catalog state: one mutation API (design candidate)
 *Recorded 2026-09-27, not done:* today the mutations are

@@ -40,8 +40,8 @@ def _front(backend, litellm_port=14042, ui_port=None):
     ports = {'litellm': litellm_port or 0, 'open_webui': ui_port or 0}
     gateway = Gateway(tempfile.mkdtemp(), ports=ports,
                       litellm=bool(litellm_port), ui=bool(ui_port))
-    backend.front_door = lambda: type('Front', (), {'gateway': gateway})()
-    backend.master_key = lambda: 'sk-test'
+    gateway.master_key = lambda: 'sk-test'
+    backend.front_door = lambda: gateway
 
 
 class _FakeProc:

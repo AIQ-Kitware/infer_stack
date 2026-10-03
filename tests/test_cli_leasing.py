@@ -1010,13 +1010,16 @@ def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkey
 
 def test_read_only_views_show_ttl_expiry_without_writing_the_ledger(env, capsys, monkeypatch):
     import sqlite3
-    import time as _time
 
     from infer_stack.cli.commands_leasing import WaitCLI
     from infer_stack.leasing import Ledger, SqliteStore
 
     AcquireCLI.main(argv=['qwen-coder', *_base(env), '--ttl', '1s', '--owner', 'a'])
-    _time.sleep(1.2)
+    # Expiry semantics are the thing under test, not the wall clock. Move the
+    # already-created lease into the past before opening the watcher; this is
+    # deterministic and avoids a 1.2 s sleep in every full-suite run.
+    with sqlite3.connect(env.db) as conn:
+        conn.execute('UPDATE leases SET expires_at = 0')
 
     # A watcher connection's data_version changes iff another connection
     # COMMITS a write; WAL checkpoints and schema no-ops do not count.
@@ -1032,7 +1035,8 @@ def test_read_only_views_show_ttl_expiry_without_writing_the_ledger(env, capsys,
         assert data['deployments'][0]['state'] == 'idle'
         WaitCLI.main(argv=['--ledger', env.db, '--timeout', '0'])
         assert digest() == before                            # ...never written
-        leases, _ = Ledger(SqliteStore(env.db)).status()
+        with SqliteStore(env.db) as store:
+            leases, _ = Ledger(store).status()
         assert leases[0].state == 'active'
     finally:
         watcher.close()
@@ -1137,9 +1141,11 @@ def test_a_released_stop_deployment_is_neither_missing_nor_left_to_clean(env, ca
     # offered to tear it down again. It is IDLE in the ledger by design.
     from infer_stack.cli.commands_leasing import CleanCLI
 
-    catalog = yaml.safe_load(open(env.cat))
+    with open(env.cat) as file:
+        catalog = yaml.safe_load(file)
     catalog['endpoints']['reranker']['reclaim'] = {'policy': 'stop'}
-    open(env.cat, 'w').write(yaml.safe_dump(catalog))
+    with open(env.cat, 'w') as file:
+        file.write(yaml.safe_dump(catalog))
     AcquireCLI.main(argv=['reranker', *_base(env)])
     ReleaseCLI.main(argv=['--ledger', env.db, '--all'])
     capsys.readouterr()
@@ -1239,7 +1245,7 @@ def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, 
     config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
     controller = cl._open_controller(config, interactive=False)
     plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
-    gateway = controller.backend.front_door().gateway
+    gateway = controller.backend.front_door()
     real_lock = controller._global_lock
 
     def racing_lock():
@@ -1268,7 +1274,7 @@ def test_replace_is_compare_and_swap_against_what_was_shown(tmp_path, monkeypatc
     _patch_backend(monkeypatch, state)
     config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
     controller = cl._open_controller(config, interactive=False)
-    gateway = controller.backend.front_door().gateway
+    gateway = controller.backend.front_door()
     gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'shown'}})
     plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
     assert list(plan.conflicted) == ['alpha']               # shown: 'shown' -> alpha

@@ -48,7 +48,12 @@ import hashlib
 import json
 from typing import Any
 
-from .catalog import Catalog, CatalogError
+from .catalog import (
+    Catalog,
+    CatalogError,
+    expand_endpoint_names,
+    resolve_endpoint_requests,
+)
 
 PROFILE_VERSION = 1
 
@@ -142,22 +147,13 @@ class CatalogUnion:
         return self._owner[name].resolve_endpoint(name, sharing=sharing)
 
     def expand(self, names: list[str]) -> list[str]:
-        ordered: list[str] = []
-        for name in names:
-            for member in self.bundles.get(name, [name]):
-                if member not in ordered:
-                    ordered.append(member)
-        return ordered
+        return expand_endpoint_names(self.bundles, names)
 
     def resolve(self, names: list[str]):
         return [self.resolve_endpoint(n) for n in self.expand(names)]
 
     def resolve_requests(self, names: list[str], *, sharing: str | None = None):
-        try:
-            return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
-                    for n in self.expand(names)]
-        except ValueError as ex:        # an external member: no lease request
-            raise CatalogError(str(ex)) from ex
+        return resolve_endpoint_requests(self.resolve_endpoint, self.bundles, names, sharing)
 
     resolve_names = resolve_requests
 

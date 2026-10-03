@@ -522,7 +522,7 @@ def test_a_refused_acquire_writes_no_secret(tmp_path):
     assert not env.exists() or 'LITELLM_MASTER_KEY' not in parse_env_file(env)
 
     acquire(ctl, 'one')
-    assert parse_env_file(env)['LITELLM_MASTER_KEY'] == backend.master_key()
+    assert parse_env_file(env)['LITELLM_MASTER_KEY'] == backend.front_door().master_key()
     assert ledger.publication_pending() is None      # no second approval needed
 
 

@@ -170,6 +170,9 @@ class ClusterGateway(ConvergeScaffold):
     def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
         self.gateway.replace_route_entries(entries)
 
+    def urls(self) -> tuple[str | None, str | None]:
+        return self.gateway.urls()
+
     def connection_info(self):
         return self.gateway.connection_info()
 

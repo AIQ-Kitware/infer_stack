@@ -225,6 +225,64 @@ def test_dry_run_does_not_write(tmp_path, capsys):
     assert 'm' not in cat.models                 # but not persisted
 
 
+def test_catalog_writer_canonicalizes_legacy_served_name(tmp_path):
+    from infer_stack.leasing.catalog_edit import (
+        load_catalog_source,
+        write_catalog_source,
+    )
+
+    path = tmp_path / 'catalog.yaml'
+    path.write_text(yaml.safe_dump({
+        'models': {'m': {'source': 'hf://a'}},
+        'endpoints': {
+            'e': {'engine': 'vllm', 'model': 'm', 'public_name': 'upstream'},
+        },
+    }))
+    write_catalog_source(path, load_catalog_source(path))
+    data = yaml.safe_load(path.read_text())
+    assert data['endpoints']['e']['served_name'] == 'upstream'
+    assert 'public_name' not in data['endpoints']['e']
+
+
+def test_catalog_rejects_conflicting_served_name_spellings(tmp_path):
+    from infer_stack.leasing.catalog_edit import write_catalog_source
+
+    path = tmp_path / 'catalog.yaml'
+    data = {
+        'models': {'m': {'source': 'hf://a'}},
+        'endpoints': {
+            'e': {
+                'engine': 'vllm',
+                'model': 'm',
+                'served_name': 'new',
+                'public_name': 'old',
+            },
+        },
+    }
+    with pytest.raises(SystemExit, match='both.*served_name.*public_name'):
+        write_catalog_source(path, data)
+    assert not path.exists()
+
+
+def test_catalog_load_rejects_non_mapping_yaml(tmp_path):
+    from infer_stack.leasing.catalog_edit import load_catalog_source
+
+    path = tmp_path / 'catalog.yaml'
+    path.write_text('- not\n- a\n- mapping\n')
+    with pytest.raises(SystemExit, match='YAML mapping'):
+        load_catalog_source(path)
+
+
+def test_rm_dry_run_validates_but_does_not_claim_removal(tmp_path, capsys):
+    ModelAddCLI.main(argv=['m', '--source', 'hf://a', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['e', '--model', 'm', *_opts(tmp_path)])
+    capsys.readouterr()
+    EndpointRmCLI.main(argv=['e', '--dry-run', *_opts(tmp_path)])
+    out = capsys.readouterr().out
+    assert 'removed endpoint' not in out
+    assert 'e' in Catalog.load(cat_path(tmp_path)).endpoints
+
+
 def test_endpoint_show_no_name_lists_all(tmp_path, capsys):
     from infer_stack.cli.commands_catalog import EndpointShowCLI
 

@@ -16,7 +16,7 @@ to reserve, so ``last_assignments`` stays empty and placement can only fail at
 admission (a Model that never gets a pod shows up as not-ready, not unplaced).
 
 Model naming mirrors the compose service-name contract: the CR name is derived
-purely from the served model name (``_dns_slug``), so it is stable across
+purely from the served model name (``dns_slug``), so it is stable across
 releases/re-acquires, and it doubles as the *request* name — the KubeAI gateway
 routes ``model=<CR name>`` to the backing pods. Collisions between
 simultaneously desired deployments are reported loudly (``last_unplaced`` /
@@ -140,7 +140,7 @@ def _model_doc(
     """Build one KubeAI ``Model`` CR for a vLLM deployment.
 
     ``spec.args`` reuses the exact arg pipeline the compose backend renders
-    with (``_vllm_service_dict`` + ``vllm_args``), so every serving knob the
+    with (``vllm_service_dict`` + ``vllm_args``), so every serving knob the
     compat key distinguishes (revision/quantization/dtype/pp/...) reaches the
     engine here too. KubeAI injects the served name from the CR name before
     spec.args (engine_vllm.go); emit only the remaining infer-stack flags.
@@ -677,8 +677,8 @@ class KubeaiBackend(ConvergeScaffold):
         return self.gateway.compose_project() if self.gateway is not None else None
 
     def front_door(self):
-        """What holds the gateway's keys and route registry: the gateway."""
-        return self.gateway
+        """The gateway realization's actual front-door authority."""
+        return self.gateway.front_door() if self.gateway is not None else None
 
     @property
     def _state_file(self) -> Path:

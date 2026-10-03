@@ -3287,8 +3287,8 @@ class InferStackTUI(App):
         if name in self._served_endpoints():
             self._refuse(f'{name} is actively served — release it before editing')
             return
-        from .cli.commands_catalog import _load_raw
-        entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
+        from .leasing.catalog_edit import load_catalog_source
+        entry = load_catalog_source(self.catalog_path)['endpoints'].get(name, {})
         if 'external' in (entry or {}):
             # The editor describes a runtime infer-stack runs; saving would
             # turn the external endpoint into one.
@@ -3420,17 +3420,17 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _save_endpoint(self, result: dict) -> None:
         try:
-            from .cli.commands_catalog import (
-                _load_raw,
-                _next_indexed_name,
-                _save_raw,
-                _slug_alias,
+            from .leasing.catalog_edit import (
+                load_catalog_source,
+                next_indexed_name,
+                slug_alias,
+                write_catalog_source,
             )
-            data = _load_raw(self.catalog_path)
+            data = load_catalog_source(self.catalog_path)
             name = result['name']
             if not name:
-                name = _next_indexed_name(
-                    data['endpoints'], _slug_alias(result['model'])
+                name = next_indexed_name(
+                    data['endpoints'], slug_alias(result['model'])
                 )
             old_entry = data['endpoints'].get(name)
             new_entry = self._endpoint_entry(result)
@@ -3450,7 +3450,7 @@ class InferStackTUI(App):
                 ]
 
             data['endpoints'][name] = new_entry
-            _save_raw(self.catalog_path, data)  # validates before publication
+            write_catalog_source(self.catalog_path, data)  # validates before publication
             self.call_from_thread(self._cli, cli.endpoint_add(
                 name, new_entry, force=old_entry is not None))
 
@@ -3497,10 +3497,10 @@ class InferStackTUI(App):
 
     def _do_remove(self, section: str, name: str) -> None:
         try:
-            from .cli.commands_catalog import _load_raw, _save_raw
-            data = _load_raw(self.catalog_path)
+            from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+            data = load_catalog_source(self.catalog_path)
             data[section].pop(name, None)
-            _save_raw(self.catalog_path, data)  # validates cross-refs
+            write_catalog_source(self.catalog_path, data)  # validates cross-refs
             self._status(f'removed {section[:-1]} {name}')
             self._cli(cli.command('catalog', section[:-1], 'rm', name))
         except Exception as ex:  # noqa: BLE001
@@ -3509,10 +3509,10 @@ class InferStackTUI(App):
         self._reload_catalog()
 
     def _write_catalog(self, section: str, name: str, entry: dict) -> None:
-        from .cli.commands_catalog import _load_raw, _save_raw
-        data = _load_raw(self.catalog_path)
+        from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+        data = load_catalog_source(self.catalog_path)
         data[section][name] = entry
-        _save_raw(self.catalog_path, data)  # validates; raises on a bad write
+        write_catalog_source(self.catalog_path, data)  # validates; raises on a bad write
 
     def action_suggest(self) -> None:
         if not self.catalog_path:
@@ -3538,8 +3538,8 @@ class InferStackTUI(App):
                     'no pooled model fits the detected GPUs — add one with m/n'
                 )
                 return
-            from .cli.commands_catalog import _load_raw, _save_raw
-            data = _load_raw(self.catalog_path)
+            from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+            data = load_catalog_source(self.catalog_path)
             migrated = migrate_known_suggestion_aliases(data)
             added = 0
             for sec in ('models', 'endpoints'):
@@ -3547,7 +3547,7 @@ class InferStackTUI(App):
                     if nm not in data[sec]:
                         data[sec][nm] = val
                         added += 1
-            _save_raw(self.catalog_path, data)
+            write_catalog_source(self.catalog_path, data)
             self.call_from_thread(self._reload_catalog)
             rename = f'; renamed {len(migrated)} prior suggestion(s)' if migrated else ''
             self._after_mutation(
@@ -3567,9 +3567,9 @@ class InferStackTUI(App):
         if not base:
             return None, None
         key = None
-        mk = getattr(backend, 'master_key', None)
+        front = backend.front_door()
         try:
-            key = mk() if callable(mk) else None
+            key = front.master_key() if front is not None and front.litellm else None
         except Exception:  # noqa: BLE001
             key = None
         return base, key

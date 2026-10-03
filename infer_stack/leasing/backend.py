@@ -196,14 +196,15 @@ class FrontDoorControl(Protocol):
     """The LiteLLM gateway as the controller and the CLI address it.
 
     ``backend.front_door()`` returns one, or ``None`` for a backend without a
-    gateway: the Compose project itself, KubeAI's gateway on this host or in
-    the cluster. Keys, the route registry, and "does it accept this key" live
-    here, not as copies on every serving backend; callers never reach the
-    gateway object behind it.
+    gateway: Compose's :class:`Gateway`, or KubeAI's gateway realization on
+    this host or in the cluster. Keys, the route registry, and "does it accept
+    this key" live here, not as copies on every serving backend.
     """
 
     #: Whether LiteLLM is on (a front door can be Open WebUI alone).
     litellm: bool
+    #: Whether the Open WebUI surface is on.
+    ui: bool
 
     @property
     def env_path(self) -> Path:
@@ -238,6 +239,10 @@ class FrontDoorControl(Protocol):
         ...
 
     def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
+        ...
+
+    def urls(self) -> tuple[str | None, str | None]:
+        """``(OpenAI base URL, Open WebUI URL)`` exposed by this front door."""
         ...
 
     def connection_info(self) -> ConnectionInfo | None:
@@ -899,7 +904,7 @@ def _conforms() -> None:  # pragma: no cover - read by the type checker only
         return backend
 
     def compose_front(backend: ComposeBackend) -> FrontDoorControl:
-        return backend
+        return backend.front_door()
 
     def cluster_front(backend: ClusterGateway) -> FrontDoorControl:
         return backend

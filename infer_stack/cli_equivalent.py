@@ -32,7 +32,7 @@ MODELS_CURL = ('curl -s "$(infer-stack env OPENAI_BASE_URL)/models" '
 
 
 #: Endpoint fields `catalog endpoint add` can express.
-_ENDPOINT_FIELDS = {'engine', 'model', 'host', 'public_name', 'reclaim',
+_ENDPOINT_FIELDS = {'engine', 'model', 'host', 'served_name', 'reclaim',
                     'protocol', 'placement', 'runtime'}
 
 
@@ -48,9 +48,9 @@ def endpoint_add(name: str, entry: dict[str, Any], *, force: bool = False) -> st
     parts: list[object] = ['catalog', 'endpoint', 'add', name]
     if entry.get('engine', 'vllm') != 'vllm':
         parts += ['--engine', entry['engine']]
-    for key in ('model', 'host', 'public_name', 'protocol'):
+    for key in ('model', 'host', 'served_name', 'protocol'):
         if entry.get(key):
-            parts += [f'--{key}', entry[key]]
+            parts += [f'--{key.replace("_", "-")}', entry[key]]
     policy = (entry.get('reclaim') or {}).get('policy')
     if policy:
         parts += ['--reclaim', policy]

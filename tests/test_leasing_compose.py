@@ -281,7 +281,7 @@ def _hyperqwen_from_suggestion(endpoint_name=None, **runtime_changes):
     ep = frag['endpoints'][endpoint_name]
     ep['public_name'] = 'local-qwen38'
     ep['runtime'].update(runtime_changes)
-    req = Catalog.from_dict(frag).resolve_endpoint(endpoint_name)
+    req = Catalog.from_dict(frag).resolve_endpoint(endpoint_name).to_request()
     deployment = vllm('grp-q38', hf=req.spec['hf_model_id'], served='local-qwen38')
     deployment.spec['runtime'] = req.spec['runtime']
     rc = render_compose(
@@ -538,6 +538,13 @@ def make_backend(tmp_path, *, spec='4x80', **kw):
         images=IMAGES, ports=PORTS, state=STATE,
         **kw,
     )
+
+
+def test_backend_accepts_legacy_require_generation_keyword(tmp_path):
+    # Readiness now always verifies a real generation, but keep the constructor
+    # keyword as an ignored compatibility boundary for direct Python embedders.
+    be = make_backend(tmp_path, require_generation=False)
+    assert not hasattr(be, 'require_generation')
 
 
 def test_converge_writes_and_observes(tmp_path):
@@ -1085,6 +1092,14 @@ def test_access_includes_ui_url_when_ui_on(tmp_path):
     assert 'ui_url' not in access_info(be_noui, ['a'])
 
 
+def test_front_door_urls_use_the_front_door_authority_directly(tmp_path):
+    from infer_stack.leasing.gateway import front_door_urls
+
+    be = make_backend(tmp_path, ui=True)
+    assert be.front_door() is be.gateway
+    assert front_door_urls(be) == be.gateway.urls()
+
+
 def test_converge_diff_decline_aborts(tmp_path, monkeypatch):
     import infer_stack.diff_prompt as dp
     from infer_stack.leasing.backend import ConvergeAborted
@@ -1227,18 +1242,18 @@ def test_access_reports_litellm_base_url(tmp_path):
 
 def test_master_key_managed_stable_and_persisted(tmp_path):
     be = make_backend(tmp_path)
-    k1 = be.master_key()
+    k1 = be.front_door().master_key()
     assert k1.startswith('sk-')
-    assert be.master_key() == k1                  # reused, not regenerated
+    assert be.front_door().master_key() == k1                  # reused, not regenerated
     # a fresh backend over the same state dir recovers the same key
-    assert make_backend(tmp_path).master_key() == k1
+    assert make_backend(tmp_path).front_door().master_key() == k1
 
 
 def test_converge_references_master_key_via_env_not_baked(tmp_path):
     be = make_backend(tmp_path)
     be.converge([vllm('a')])
     raw = be.compose_file.read_text()
-    key = be.master_key()
+    key = be.front_door().master_key()
     assert key.startswith('sk-')
     # The compose YAML references the var, it does NOT contain the secret value.
     compose = yaml.safe_load(raw)
@@ -1469,8 +1484,8 @@ def test_catalog_parses_endpoint_protocol(tmp_path):
         'chatty': {'engine': 'vllm', 'model': 'm'},
         'compl': {'engine': 'vllm', 'model': 'm', 'protocol': 'completions'},
     }})
-    assert cat.resolve_endpoint('chatty').served['protocol'] == 'chat'
-    assert cat.resolve_endpoint('compl').served['protocol'] == 'completions'
+    assert cat.resolve_endpoint('chatty').to_request().served['protocol'] == 'chat'
+    assert cat.resolve_endpoint('compl').to_request().served['protocol'] == 'completions'
     with pytest.raises(CatalogError):
         Catalog.from_dict({**base, 'endpoints': {
             'bad': {'engine': 'vllm', 'model': 'm', 'protocol': 'embeddings'},
