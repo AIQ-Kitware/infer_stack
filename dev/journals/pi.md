@@ -167,3 +167,61 @@ fails closed. Uncertain: whether any client other than pi treats
 Also: `AGENTS.md` picked up aivm's commit-attribution rule (agent commits
 carry a `Co-authored-by:` trailer naming the model that produced them);
 infer_stack had no equivalent.
+
+## 2026-10-03 14:10:23 -0400
+
+Model: qwen3.8-27b-dbirks-hyperqwen-long (pi, litellm, reasoning off)
+
+**User intent:** bump the default vLLM version in infer-stack. First asked me
+to locate the places needing change; then said "update the default to v0.30.0
+and commit", clarified to the exact tag `vllm/vllm-openai:v0.30.0-cu129`; then
+asked for a `# TODO:` note above the source of truth saying the default should
+eventually vary by detected host CUDA capability ("not doing this now, just
+note it").
+
+**What I did:**
+
+- `infer_stack/config.py`: `PINNED_IMAGES['vllm']` v0.19.1 →
+  `v0.30.0-cu129`, with the requested TODO comment directly above that entry.
+  This dict is the single source of truth: `leasing/compose.py` merges it into
+  every Compose render (image default for vLLM services, pull planning) and
+  `backends/kubeai_gateway.py` merges it too, but KubeAI's own vLLM image
+  comes from the chart's default profile (`runtime.image` is refused there),
+  so the practical blast radius is Compose-only.
+- Synced the two dev pre-pull docs (`dev/e2e_tests/README.md`,
+  `dev/leasing-test-plan.md`) to the new tag. Deliberately left
+  `dockerfiles/vllm-hack.dockerfile` on v0.19.0: it is a dev-only patched
+  image (transformers upgrade) whose pin is a patch baseline, not the
+  default; noted it as a separate follow-up in the CHANGELOG. Same for the
+  historical F9 note in the test plan (v0.19.1 removed
+  `--disable-log-requests`) — history stays accurate.
+- New CHANGELOG section at top: the bump, the one-time container recreate on
+  next converge (image is part of service identity), KubeAI exemption, and
+  the hack-image follow-up.
+- Added the TODO comment verbatim above the pinned entry.
+
+**Validation:** `docker manifest inspect vllm/vllm-openai:v0.30.0-cu129`
+exists on Docker Hub (amd64 + arm64, linux). Full suite
+(`python run_tests.py`): 1292 passed, 3 skipped, 0 failed — no test pins the
+old default (they use synthetic tags like `:test`). Not validated, honestly:
+the vLLM v0.30.0 *flag surface* against our `vllm_args` output — this host
+has Docker but no GPU, so a live `acquire`/`vllm serve --help` pass on a GPU
+host is the real acceptance gate (last bump, v0.19.1, broke on a removed
+flag). The VRAM measurement key includes the image string, so expect one-time
+profile re-measurement on first use of affected endpoints.
+
+**Tradeoffs / risks:** the `cu129` suffix bakes a driver assumption into the
+default — hosts with older NVIDIA drivers (below what CUDA 12.9 needs) will
+fail to run the image until the TODO's detection-based selection lands, or
+until an operator pins a different tag via catalog `runtime.image` (that
+override path already exists and is the escape hatch today). Acceptable for a
+planning-stage project with explicit catalog overrides.
+
+**Takeaways:** (1) A vendor image tag bump is cheap to make and asymmetric to
+verify — the tag existing in the registry does not imply the CLI flag surface
+is still compatible, so keep live GPU-host validation as the acceptance
+step; (2) distinguish "the default" (one dict entry, auto-propagated) from
+"deliberately pinned baselines" (dev dockerfiles, historical notes) before
+bulk-replacing version strings — the former wants a one-line edit, the latter
+wants a decision; (3) the catalog `runtime.image` override is the existing
+per-endpoint escape hatch that keeps a global default bump reversible.

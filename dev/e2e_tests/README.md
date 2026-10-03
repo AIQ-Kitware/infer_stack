@@ -25,7 +25,7 @@ Then rsync the printed results dir back; I review `report.md`.
 ### Before `--gpu` (one-time, so timeouts reflect logic not 10GB pulls)
 
 ```bash
-docker pull vllm/vllm-openai:v0.19.1
+docker pull vllm/vllm-openai:v0.30.0-cu129
 docker pull ghcr.io/berriai/litellm:v1.82.3-stable
 docker pull ollama/ollama:latest
 ```

@@ -89,7 +89,7 @@ docker compose version       # need v2
 docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 
 # Pre-pull images so acquire timeouts reflect logic, not 10GB downloads:
-docker pull vllm/vllm-openai:v0.19.1      # confirm this tag exists; else F6 blocks you
+docker pull vllm/vllm-openai:v0.30.0-cu129 # confirm this tag exists; else F6 blocks you
 docker pull ghcr.io/berriai/litellm:v1.82.3-stable
 docker pull ollama/ollama:latest
 

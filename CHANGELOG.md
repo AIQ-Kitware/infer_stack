@@ -2,6 +2,20 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Bump the default vLLM engine image to v0.30.0-cu129
+
+- `PINNED_IMAGES['vllm']` is now `vllm/vllm-openai:v0.30.0-cu129` (previously
+  `v0.19.1`). Compose endpoints without a catalog `runtime.image` override now
+  render the CUDA 12.9 build; the image is part of service identity, so an
+  existing vLLM container is recreated once on the next converge. The KubeAI
+  backend is unaffected: its vLLM image comes from the KubeAI chart's default
+  profile, and `runtime.image` overrides are not supported there.
+- The dev pre-pull instructions (`dev/e2e_tests/README.md`,
+  `dev/leasing-test-plan.md`) track the new tag.
+- The dev-only patched image `dockerfiles/vllm-hack.dockerfile` still bases on
+  `v0.19.0`; bump it separately if that transformers patch needs the new
+  baseline.
+
 ### Reversible Kubernetes / Compose workstation handoff
 
 - Added `infer-stack kube node status|detach|attach`. `detach` is a preview by
