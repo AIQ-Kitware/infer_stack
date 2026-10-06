@@ -2,6 +2,16 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Command-scoped leases release on SIGTERM
+
+- `run` now unwinds acquisition and command cleanup on SIGTERM (exit 143),
+  instead of exiting with an active lease. Ctrl-C retains its existing exit
+  behavior. Cancellation forwards to the child before a bounded shutdown wait,
+  allowing an initialized Docker worker to stop before its lease is released.
+- Descriptor construction is covered by release cleanup as well. Real-signal
+  regressions cover wrapper-only and process-group cancellation, plus readiness
+  cancellation. SIGKILL and host crashes still require TTL or explicit recovery.
+
 ### Bump the default vLLM engine image to v0.30.0-cu129
 
 - `PINNED_IMAGES['vllm']` is now `vllm/vllm-openai:v0.30.0-cu129` (previously

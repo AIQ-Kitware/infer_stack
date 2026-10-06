@@ -205,3 +205,14 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Applies when:** a controller advertises endpoint metadata through a proxy
     while sharing/superset placement can map multiple endpoint contracts onto
     one runtime, or the proxy enriches returned metadata independently.
+
+- **Lesson:** A Python finally block is not SIGTERM cleanup unless a handler
+  turns termination into stack unwinding. A command-scoped lease must cover
+  acquisition/readiness as well as the running child, and forward cancellation
+  before killing a Docker client that still needs to signal its worker.
+  - **Evidence / MWE:** `tests/test_cli_run_signals.py` reproduces active leases
+    left behind by default SIGTERM and verifies release after wrapper-only and
+    whole-group cancellation; `infer_stack/cli/_run_lifecycle.py` implements
+    bounded child shutdown and handler restoration.
+  - **Applies when:** a scheduler or operator terminates a Python wrapper that
+    owns resources released in finally blocks. SIGKILL still cannot unwind.

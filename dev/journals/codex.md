@@ -476,3 +476,36 @@ and the broader dev e2e comments distinguish worker acceptance from its
 namespace-wide lifecycle assumptions. This preserves one Python installer
 implementation while making the operator's path concrete for all three planned
 worker shapes.
+
+## 2026-10-06 18:40:02 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+
+The user asked whether treating scheduler cancellation as failure had broken
+lease cleanup. The command wrapper owns acquisition and release in one process;
+there is no scheduler release dependency. Real SIGTERM exposed an older defect:
+Python's default termination exits without unwinding the release finally block.
+SIGINT already unwound correctly. I kept release with its owner rather than
+adding a second lifecycle authority in the scheduler.
+
+The new signal context covers acquisition through release, converts SIGTERM
+to exit 143, preserves Ctrl-C behavior and restores previous handlers afterward.
+Repeated termination signals are ignored during cleanup. A Popen wait forwards
+cancellation to the child and permits ten seconds of graceful shutdown before
+killing it. This matters for Docker clients that must forward to an initialized
+worker. Descriptor construction now shares the release guard. Non-main-thread
+embedded calls retain their existing signal behavior. SIGKILL, host crashes and
+cleanup backend failures remain recovery cases; this is not durable finalization.
+
+Five subprocess regressions cover parent-only and whole-group SIGTERM/SIGINT
+and cancellation while waiting for readiness, using isolated real ledgers. A
+downstream real CPU Slurm/Docker integration also confirmed failed cancellation,
+skipped dependencies, stopped container, released lease and cached-node skip.
+Slurm can publish CANCELLED before termination cleanup finishes; checking resource
+state immediately after that report gave a false negative, so the integration
+waits briefly for release. Scheduler status is not a resource-cleanup barrier.
+
+Focused leasing/controller checks: 86 passed. Full suite: 1296 passed, 3 skipped
+and one unrelated rich-colour assertion failed under TERM=dumb/NO_COLOR=1. With
+TERM=xterm and NO_COLOR unset, all 11 CLI-meta tests passed. Scoped Ruff and ty
+checks passed. No production GPU or scheduler resources were mutated.

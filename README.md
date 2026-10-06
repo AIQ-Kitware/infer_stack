@@ -33,6 +33,16 @@ the affected stack is quiescent. `infer-stack config publish` is an advanced
 pre-seeding/preview tool for multi-catalog operators, not a required fourth
 step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 
+For a command-scoped lease, use `infer-stack run --endpoint <endpoint> --
+<command>`. Completion, Ctrl-C and SIGTERM release the command's own lease;
+cancellation during endpoint readiness also rolls back acquisition. SIGTERM
+returns status 143. The wrapper forwards cancellation to its child and waits
+up to ten seconds before killing an unresponsive child. Docker workers should
+use `docker run --init` so termination reaches the container process. Release
+runs inside the wrapper, without a separate scheduler cleanup job. SIGKILL or
+a host crash cannot run cleanup: TTL expiry and explicit `release <lease-id>`
+remain recovery paths.
+
 ## Related work
 
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation

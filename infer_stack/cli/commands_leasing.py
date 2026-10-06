@@ -21,9 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 import sys
-from typing import Any
 from pathlib import Path
 
 import kwconf as kw
@@ -2048,7 +2046,6 @@ class RunCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        from ..leasing.profile import ProfileMismatch
 
         controller = _open_controller(config)
         catalog = _requests_catalog(controller, config)
@@ -2059,48 +2056,55 @@ class RunCLI(_LeasingCommonMixin):
         if not command:
             raise SystemExit('run: give a command after --')
         endpoints = _resolve_endpoints(catalog, names)
+        from ._run_lifecycle import cancellation_signals
+
+        with cancellation_signals():
+            return cls._run_with_lease(config, controller, endpoints, command)
+
+    @classmethod
+    def _run_with_lease(cls, config, controller, endpoints, command):
+        from ..leasing.profile import ProfileMismatch
+        from ._run_lifecycle import run_child
+
+        result = None
         try:
-            result = controller.access(
-                config.owner or _default_owner(),
-                endpoints,
-                ttl_seconds=_parse_duration(config.ttl),
-                wait=True,
-                timeout=float(config.timeout),
-                interval=float(config.interval),
-                wait_for_placement=bool(getattr(config, 'queue', False)),
-            )
-        except ProfileMismatch as ex:
-            raise SystemExit(f'run: {ex}')
-        outcome = result.acquire
-        if outcome is not None and outcome.wait is not None and not outcome.wait.ready:
-            # The controller already released the lease on timeout
-            # (released_on_timeout); just surface why we're not running.
-            if outcome.wait.failures:
-                detail = '; '.join(
-                    f'{ep} ({gid}): {why}'
-                    for gid, ep, why in outcome.wait.failures
+            try:
+                result = controller.access(
+                    config.owner or _default_owner(),
+                    endpoints,
+                    ttl_seconds=_parse_duration(config.ttl),
+                    wait=True,
+                    timeout=float(config.timeout),
+                    interval=float(config.interval),
+                    wait_for_placement=bool(getattr(config, 'queue', False)),
                 )
-                raise SystemExit(f'run: engine cannot start: {detail}')
-            raise SystemExit(
-                f'run: endpoints not ready: {outcome.wait.pending}'
+            except ProfileMismatch as ex:
+                raise SystemExit(f'run: {ex}')
+            outcome = result.acquire
+            if outcome is not None and outcome.wait is not None and not outcome.wait.ready:
+                # The controller releases the lease on readiness timeout.
+                if outcome.wait.failures:
+                    detail = '; '.join(
+                        f'{ep} ({gid}): {why}'
+                        for gid, ep, why in outcome.wait.failures
+                    )
+                    raise SystemExit(f'run: engine cannot start: {detail}')
+                raise SystemExit(f'run: endpoints not ready: {outcome.wait.pending}')
+            if not result.published or result.front_door_ready is False:
+                raise SystemExit('run: the gateway\'s routes were not published'
+                                 if not result.published else
+                                 'run: the front door did not accept its key in time')
+            descriptor = _descriptor_for(
+                controller, result.lease, result.deployments, config,
+                endpoints=result.endpoints,
             )
-        if not result.published or result.front_door_ready is False:
-            if result.lease is not None and result.front_door_ready is not False:
-                controller.release(result.lease.id)
-            raise SystemExit('run: the gateway\'s routes were not published'
-                             if not result.published else
-                             'run: the front door did not accept its key in time')
-        descriptor = _descriptor_for(
-            controller, result.lease, result.deployments, config,
-            endpoints=result.endpoints,
-        )
-        env = dict(os.environ)
-        env.update(descriptor_env(descriptor))
-        try:
-            proc = subprocess.run(command, env=env)
-            return int(proc.returncode)
+            env = dict(os.environ)
+            env.update(descriptor_env(descriptor))
+            return run_child(command, env=env)
         finally:
-            if result.lease is not None:
+            if (result is not None and result.lease is not None
+                    and not (result.acquire and result.acquire.released_on_timeout)
+                    and result.front_door_ready is not False):
                 controller.release(result.lease.id)
 
 
