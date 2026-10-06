@@ -391,6 +391,19 @@ def test_run_returns_child_exit_code(env):
     assert rc == 3
 
 
+@pytest.mark.parametrize('source', ['list', 'sys', 'none'])
+def test_run_preserves_literal_child_arguments(env, monkeypatch, source):
+    out = env.tmp / 'child-args.json'
+    code = 'import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))'
+    child_args = ['8192', '001', '0.6', 'false', 'None', '', '--timeout', '1200', '3,6']
+    args = ['--endpoint', 'qwen-coder', *_base(env), '--',
+            sys.executable, '-c', code, str(out), *child_args]
+    monkeypatch.setattr(sys, 'argv', ['infer-stack run', *args])
+    rc = RunCLI.main(argv=args if source == 'list' else True if source == 'sys' else None)
+    assert rc == 0
+    assert json.loads(out.read_text()) == child_args
+
+
 def test_run_releases_on_exit(env, capsys):
     RunCLI.main(
         argv=['--endpoint', 'qwen-coder', *_base(env), '--',

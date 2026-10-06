@@ -2,6 +2,13 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Preserve literal child arguments after `run --`
+
+- Split the child command before configuration parsing. Numeric-looking tokens
+  previously became integers even with `type=str`, causing subprocess launch
+  errors or losing leading zeros. Real child-process tests preserve integers,
+  decimals, booleans, empty strings and child options through list and system argv.
+
 ### Command-scoped leases release on SIGTERM
 
 - `run` now unwinds acquisition and command cleanup on SIGTERM (exit 143),

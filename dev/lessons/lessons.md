@@ -216,3 +216,10 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
     bounded child shutdown and handler restoration.
   - **Applies when:** a scheduler or operator terminates a Python wrapper that
     owns resources released in finally blocks. SIGKILL still cannot unwind.
+
+- **Lesson:** A wrapper's child argv must bypass configuration smartcasting.
+  Declaring a variadic positional field type=str did not prevent numeric tokens
+  from becoming integers; converting back also loses leading zeros.
+  - **Evidence / MWE:** `test_run_preserves_literal_child_arguments` in
+    `tests/test_cli_leasing.py`, reproduced with kwconf 0.11.0.
+  - **Applies when:** forwarding everything after -- to an arbitrary command.

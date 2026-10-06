@@ -509,3 +509,17 @@ Focused leasing/controller checks: 86 passed. Full suite: 1296 passed, 3 skipped
 and one unrelated rich-colour assertion failed under TERM=dumb/NO_COLOR=1. With
 TERM=xterm and NO_COLOR unset, all 11 CLI-meta tests passed. Scoped Ruff and ty
 checks passed. No production GPU or scheduler resources were mutated.
+
+## 2026-10-06 19:13:53 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+The user reported a child launch TypeError after successful endpoint readiness.
+Reproduced kwconf 0.11.0 smartcasting numeric child tokens into integers despite
+the positional command's type=str. Casting them back would still corrupt 001
+and boolean-looking strings, so run now splits literal child argv at -- before
+configuration parsing. Existing data-based commands remain on their prior path.
+List arguments, True and None system-argv modes are covered by real subprocess
+tests preserving numeric/decimal/boolean/empty tokens and child options.
+Readiness still releases on errors; the reported failure occurred before the
+child started, not in the service. Focused leasing and signal checks: 74 passed.
+Scoped fatal/unused checks and ty validation are recorded with this repair.

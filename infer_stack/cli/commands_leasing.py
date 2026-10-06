@@ -2045,12 +2045,24 @@ class RunCLI(_LeasingCommonMixin):
 
     @classmethod
     def main(cls, argv=True, **kwargs):
+        # Child argv is opaque: parsing it can smartcast numeric-looking tokens.
+        if argv is True or argv is None:
+            tokens = list(sys.argv[1:])
+        elif isinstance(argv, (list, tuple)):
+            tokens = list(argv)
+        else:
+            tokens = None
+        child_argv = None
+        if tokens is not None and '--' in tokens:
+            separator = tokens.index('--')
+            child_argv = tokens[separator + 1:]
+            argv = tokens[:separator]
         config = cls.cli(argv=argv, data=kwargs)
 
         controller = _open_controller(config)
         catalog = _requests_catalog(controller, config)
         names = _collect_names(config.endpoint)
-        command = list(config.command or [])
+        command = child_argv if child_argv is not None else list(config.command or [])
         if not names:
             raise SystemExit('run: --endpoint is required')
         if not command:

@@ -34,7 +34,8 @@ pre-seeding/preview tool for multi-catalog operators, not a required fourth
 step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 
 For a command-scoped lease, use `infer-stack run --endpoint <endpoint> --
-<command>`. Completion, Ctrl-C and SIGTERM release the command's own lease;
+<command>`. Arguments after `--` pass to the child unchanged, including numeric
+strings and child options. Completion, Ctrl-C and SIGTERM release the command's own lease;
 cancellation during endpoint readiness also rolls back acquisition. SIGTERM
 returns status 143. The wrapper forwards cancellation to its child and waits
 up to ten seconds before killing an unresponsive child. Docker workers should
