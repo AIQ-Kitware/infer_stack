@@ -312,3 +312,79 @@ I added `docs/planning/control-plane-authority-inventory.md` as the distributed 
 I deliberately did not fold the TUI's Kubernetes replica-readiness view into a new generic status/view-model abstraction in this change. Compose residency, KubeAI Model declaration, and Kubernetes replica readiness are not presently the same fact, and the TUI also gates expensive cluster polling on visible panes. Forcing those through a new hierarchy now would add indirection immediately before the HA observed-state/generation design gives that boundary a durable meaning. The authority inventory makes the future direction explicit instead.
 
 Validation in this extracted/offline checkout: `python -m compileall -q infer_stack tests` and `git diff --check` pass. A direct dependency-light harness verifies catalog canonicalization, conflicting-name rejection, and friendly malformed-YAML failure. With a minimal external `ubelt` stub, the focused catalog/admission/Compose/model-serving suite passes 187 tests with 4 skipped; two known Compose lifecycle tests are intentionally deselected because they fail identically on the pristine supplied base in this container. A broader run reached 240 passing before CLI cases hit the environment's missing `kwconf`; an attempted dependency install could not reach the package index. The supplied base journal records 1292 passed / 3 skipped before this overlay, so the real kwconf CLI suite should be rerun in the normal development environment before merge.
+
+## 2026-10-07 19:18:12 -0400
+
+Summary of user intent: preserve the first real two-node K3s/KubeAI bring-up
+while the debugging context is fresh, answer whether the TUI belongs on worker
+nodes, capture the kubeconfig/setup footguns, and finish or at least record the
+cleanup work exposed by worker acceptance so a lost session does not lose the
+operational lessons.
+
+Model: GPT-5.6 Sol. Configuration: tool-enabled reasoning session.
+
+The physical test used `yardrat` as the K3s server/admin host and
+`namek.kitware.com` as an agent with one RTX 3090. The generic cluster path
+worked after one provisioning defect already fixed earlier in the session: the
+K3s network installer was incorrectly subject to the generic 60-second command
+timeout, while the real worker download/install needed longer. With both nodes
+Ready, NVIDIA device-plugin/GFD present, and KubeAI installed, targeted worker
+acceptance eventually passed end to end: a fresh runtime/device probe on namek,
+exact-node placement of a one-GPU vLLM replica, device UUID/product verification,
+and a real OpenAI generation. The broader physical `p5_two_hosts.sh` gateway /
+NodePort / secret-rotation handover is still pending.
+
+The failed attempts were useful. The first vLLM pull crossed kubelet ephemeral
+storage pressure on namek. K3s/containerd itself occupied only about 2 GiB; the
+root filesystem was shared with a much larger stale Docker image/build cache.
+Node events showed repeated `Evicted` events while the roughly 14 GB vLLM image
+was pulled/extracted. The host's K3s defaults were 5% hard
+`imagefs/nodefs.available`, 10% minimum reclaim, and a five-minute pressure
+transition period, so freeing enough space to merely cross 5% did not clear the
+NoSchedule taint immediately. After root free space reached roughly 162 GiB on
+a 938 GiB filesystem and the transition period elapsed, DiskPressure cleared
+automatically. The reusable lesson is to diagnose kubelet's own nodefs/imagefs
+stats and node events; do not assume `du /var/lib/rancher/k3s` identifies the
+ephemeral-storage consumer, and do not hand-remove the pressure taint.
+
+That eviction exposed a worker-test state-machine bug. The Model polling loop
+removed `Failed` pods from its active set before interpreting them, so an
+`Evicted` pod changed the displayed state from "container running; model
+loading" back to "waiting for scheduler" and consumed the rest of the
+15-minute timeout. The repair in this change treats failed serving pods as
+terminal immediately and includes status reason/message plus container
+termination details. A second interrupted run left a Pending, already-bound
+Model pod reserving namek's one `nvidia.com/gpu`, which made the next probe
+correctly fail scheduling with `Insufficient nvidia.com/gpu`. Explicit cleanup
+then hit a 180-second `kubectl wait --for=delete` timeout even though the pod
+disappeared at the deadline. Cleanup now re-reads after that timeout, accepts
+the deletion race if no pod remains, reports the names/phases/deletion timestamps
+when resources really remain, and preserves the original acceptance error if
+cleanup also fails.
+
+The admin kubeconfig ergonomics remain intentionally open rather than being
+"fixed" by weakening credentials. Bootstrap already provisions a private
+`~/.kube/infer-stack-k3s.yaml` and links `~/.kube/config` when safe, but on the
+real server K3s had installed its bundled `kubectl` shim; with `KUBECONFIG`
+unset that shim still tried root-only `/etc/rancher/k3s/k3s.yaml`. Persisting
+`KUBECONFIG` in the operator shell works, but infer-stack cannot set a parent
+shell environment, should not silently edit `.bashrc`, and should not make the
+root admin file world/group-readable merely for convenience. The queued design
+is an infer-stack-owned cluster-target/kubeconfig setting used explicitly by
+KubeAI/TUI/kube runners while leaving the operator's general kubectl context
+alone.
+
+The TUI boundary is also now explicit in the docs. Today `infer-stack tui` is
+an authority UI: it opens the local settings/SQLite ledger/backend state and,
+in KubeAI mode, issues Kubernetes operations from that same admin machine. A
+worker does not need or want its own KubeAI TUI merely because it runs model
+pods; its local Compose configuration may remain intact. Running a separately
+configured TUI/ledger on each worker would create multiple infer-stack
+authorities for one namespace, which remains unsupported until the proposed
+remote/distributed control-plane server exists.
+
+Validation in this extracted checkout: `python -m compileall -q infer_stack tests`
+passes, and the changed files pass `git diff --no-index --check`. The focused
+pytest regressions cannot collect because `ubelt` is absent; `uv run --offline`
+also cannot build the environment because `pygments` is missing from the local
+cache. Run `tests/test_kube_worker.py` in the normal development environment.

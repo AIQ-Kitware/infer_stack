@@ -176,6 +176,13 @@ export INFER_STACK_DATA_DIR="$HOME/.local/share/infer_stack-kubeai"
 Unset those variables to return to that host's existing Compose authority after
 the Kubernetes node has been detached as described in the cluster setup guide.
 
+`infer-stack tui` follows this same authority boundary. It reads and mutates the
+local infer-stack ledger; it is not a stateless Kubernetes dashboard that should
+be launched independently on every worker. In the current architecture, run the
+KubeAI TUI on the one infer-stack authority/admin host. A worker needs only its
+Kubernetes agent/runtime. A future remote control-plane API can make the TUI a
+client from arbitrary machines without duplicating authority.
+
 Catalog endpoints opt into a specific profile per endpoint; the GPU count is
 appended automatically from `tensor_parallel_size × pipeline_parallel_size ×
 data_parallel_size`:
