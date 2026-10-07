@@ -29,7 +29,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Generator
 
 from .models import Deployment, Lease, LeaseState
 
@@ -317,7 +317,7 @@ class SqliteStore:
     # -- transactions ------------------------------------------------------
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[_SerializedConnection]:
+    def transaction(self) -> Generator[_SerializedConnection, None, None]:
         """Take the write lock up front and commit/rollback atomically.
 
         ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
