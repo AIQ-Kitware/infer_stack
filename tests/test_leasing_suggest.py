@@ -35,7 +35,7 @@ def test_builtin_pool_is_nonempty_and_real():
     assert qwen38.hf_model_id == 'dbirks/Qwen3.8-27B-W4A16-AutoRound'
     assert qwen38.family == 'qwen3.8'
     assert qwen38.memory_class_gib == 20
-    assert qwen38.min_vram_gib_per_replica == 24
+    assert qwen38.min_vram_gib_per_replica == 23.9
     assert qwen38.context_window == 262144
     assert qwen38.gpu_name_hints == []
     assert qwen38.requires_ampere is False
@@ -50,7 +50,7 @@ def test_builtin_pool_is_nonempty_and_real():
     }
     assert qwen38.endpoint_variants['long']['runtime']['max_model_len'] == 150000
     assert qwen38.endpoint_variants['huge']['runtime']['max_model_len'] == 245760
-    assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-684e927'
+    assert qwen38.defaults['image'] == 'ghcr.io/syv-ai/hyperqwen:sha-53557bc'
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
@@ -112,8 +112,29 @@ def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
         assert ep['runtime']['command'] == ['single']
         assert ep['runtime']['env']['MAX_LEN'] == '{max_model_len}'
         assert ep['runtime']['mounts']['/cache'] == 'hyperqwen/qwen3.8-27b/cache'
-        assert ep['placement'] == {'min_vram_gib': 24}
+        assert ep['placement'] == {'min_vram_gib': 23.9}
         assert ep['reclaim']['policy'] == 'stop'
+
+
+def test_rtx_a6000_gets_fast_and_full_context_hyperqwen_profiles():
+    # RTX A6000 is an sm86 Ampere card with 48 GiB.  It should follow the
+    # roomy-Ampere policy rather than requiring an exact product-name gate.
+    base = 'qwen3.8-27b-dbirks-hyperqwen'
+    inv = {'gpu_count': 1, 'gpus': [
+        _gpu(0, 47.99, name='NVIDIA RTX A6000', compute_cap=8.6),
+    ]}
+    endpoints = suggest_catalog(inv)['endpoints']
+
+    assert {base, f'{base}-full'} <= set(endpoints)
+    assert f'{base}-long' not in endpoints
+    assert f'{base}-huge' not in endpoints
+
+    full = endpoints[f'{base}-full']
+    assert full['placement'] == {'min_vram_gib': 47.9}
+    assert full['runtime']['max_model_len'] == 262144
+    assert full['runtime']['command'] == ['batch']
+    assert '--dtype=bfloat16' in full['runtime']['env']['EXTRA_ARGS']
+    assert '--kv-cache-dtype=auto' in full['runtime']['env']['EXTRA_ARGS']
 
 
 def test_hyperqwen_variants_follow_capability_and_vram_classes():
@@ -122,7 +143,7 @@ def test_hyperqwen_variants_follow_capability_and_vram_classes():
     # A non-3090 24 GiB Ampere card gets the same memory-tight context choices:
     # the class is what matters, not an exact product string.
     small = {'gpu_count': 1, 'gpus': [
-        _gpu(0, 24, name='NVIDIA RTX A5000', compute_cap=8.6),
+        _gpu(0, 23.99, name='NVIDIA RTX A5000', compute_cap=8.6),
     ]}
     small_eps = suggest_catalog(small)['endpoints']
     assert {base, f'{base}-long', f'{base}-huge'} <= set(small_eps)
@@ -176,12 +197,12 @@ def test_qwen38_27b_suggestion_uses_the_hyperqwen_profile_on_any_card_that_fits(
     )
     ep = out['endpoints']['qwen3.8-27b-dbirks-hyperqwen']
     # Fit decides, not the card's name: no GPU pin, the placer chooses.
-    assert ep['placement'] == {'min_vram_gib': 24}
+    assert ep['placement'] == {'min_vram_gib': 23.9}
     assert ep['runtime'] == {
         'max_model_len': 65536,
         'gpu_memory_utilization': 0.93,
         'enable_prefix_caching': True,
-        'image': 'ghcr.io/syv-ai/hyperqwen:sha-684e927',
+        'image': 'ghcr.io/syv-ai/hyperqwen:sha-53557bc',
         'command': ['single'],
         'env': {'PORT': '{port}', 'SPEC': 'dflash2', 'CTX': 'fast',
                 'PREFIX_CACHE': 1, 'MAX_LEN': '{max_model_len}',
@@ -201,7 +222,7 @@ def test_roomy_blackwell_gets_provisional_full_context_prefab():
     ep = suggest_catalog(inv)['endpoints'][f'{base}-full']
     # All four GPUs are the same eligible class, so class gating need not turn
     # into an arbitrary exact GPU pin.
-    assert ep['placement'] == {'min_vram_gib': 48}
+    assert ep['placement'] == {'min_vram_gib': 47.9}
     rt = ep['runtime']
     assert rt['max_model_len'] == 262144
     assert rt['command'] == ['batch']
