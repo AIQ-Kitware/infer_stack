@@ -20,6 +20,7 @@ from .manage import default_run
 
 RunFunc = Callable[..., str]
 K3S_INSTALL_URL = 'https://get.k3s.io'
+K3S_INSTALL_TIMEOUT_SECONDS = 600
 HELM_INSTALL_URL = (
     'https://raw.githubusercontent.com/helm/helm/'
     '83a46119086589a593a62ca544982977a60318ca/scripts/get-helm-4'
@@ -153,7 +154,12 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
         if preserve:
             cmd.append('--preserve-env=' + ','.join(preserve))
         cmd.extend(['sh', '-'])
-        run(cmd, input_text=installer, env=env)
+        run(
+            cmd,
+            input_text=installer,
+            env=env,
+            timeout=K3S_INSTALL_TIMEOUT_SECONDS,
+        )
 
     run(['sudo', '-n', 'chmod', '0600', str(K3S_KUBECONFIG)])
     _provision_user_kubeconfig(run)
@@ -218,6 +224,7 @@ def join(
         ['sudo', '-n', '--preserve-env=' + ','.join(preserve), 'sh', '-'],
         input_text=installer,
         env=env,
+        timeout=K3S_INSTALL_TIMEOUT_SECONDS,
     )
     run(['systemctl', 'is-active', '--quiet', 'k3s-agent'])
 

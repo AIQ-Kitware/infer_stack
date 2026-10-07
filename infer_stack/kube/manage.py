@@ -39,15 +39,21 @@ def default_run(
     *,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Run a command and return stdout while preserving useful stderr errors."""
+    if timeout is None:
+        timeout = (
+            360 if ('upgrade' in args or 'wait' in args or 'drain' in args)
+            else 60
+        )
     proc = subprocess.run(
         args,
         input=input_text,
         env=env,
         text=True,
         capture_output=True,
-        timeout=360 if ('upgrade' in args or 'wait' in args or 'drain' in args) else 60,
+        timeout=timeout,
         check=False,
     )
     if proc.returncode:

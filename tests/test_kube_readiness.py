@@ -351,7 +351,7 @@ def test_k3s_fresh_then_interrupted_start_never_reinstalls(monkeypatch):
     installed = False
     def run(args, **kwargs):
         nonlocal installed
-        calls.append(args)
+        calls.append((list(args), dict(kwargs)))
         if args[:2] == ['systemctl', 'is-active']:
             raise RuntimeError('inactive')
         if args == ['curl', '-sfL', k3s.K3S_INSTALL_URL]:
@@ -366,9 +366,17 @@ def test_k3s_fresh_then_interrupted_start_never_reinstalls(monkeypatch):
     monkeypatch.setattr(k3s, '_provision_user_kubeconfig', lambda run: None)
     k3s.bootstrap(run=run)
     k3s.bootstrap(run=run)
-    assert sum(c[0] == 'curl' for c in calls) == 1
-    assert ['sudo', '-n', 'systemctl', 'start', 'k3s'] in calls
-    assert not any('restart' in c for c in calls)
+    assert sum(args[0] == 'curl' for args, _ in calls) == 1
+    assert ['sudo', '-n', 'systemctl', 'start', 'k3s'] in [
+        args for args, _ in calls
+    ]
+    installs = [
+        kwargs for args, kwargs in calls
+        if args[-2:] == ['sh', '-']
+    ]
+    assert len(installs) == 1
+    assert installs[0]['timeout'] == k3s.K3S_INSTALL_TIMEOUT_SECONDS
+    assert not any('restart' in args for args, _ in calls)
 
 
 def test_kubeconfig_preserved(tmp_path, monkeypatch):
