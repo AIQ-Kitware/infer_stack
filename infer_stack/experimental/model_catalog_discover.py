@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.panel import Panel
@@ -164,30 +164,38 @@ class HubInspector:
             return list(self.api.list_models(**fallback))
 
     def model_info(self, repo_id: str) -> Any:
-        attempts = [
-            {
-                'expand': [
-                    'cardData',
-                    'config',
-                    'transformersInfo',
-                    'siblings',
-                    'tags',
-                    'pipeline_tag',
-                    'downloads',
-                    'likes',
-                    'createdAt',
-                    'lastModified',
-                    'safetensors',
-                ]
-            },
-            {'expand': ['cardData', 'config', 'transformersInfo', 'siblings']},
-            {'files_metadata': True},
-            {},
+        # Keep each model_info call statically typed. Building heterogeneous
+        # **kwargs dictionaries widens their values into one union, which makes
+        # type checkers treat e.g. ``expand`` as a possible value for
+        # ``files_metadata``/``token``/``timeout``. ``list[Any]`` is deliberate
+        # here because huggingface_hub's ExpandModelProperty_T is a versioned
+        # Literal union and this compatibility probe spans API generations.
+        full_expand: list[Any] = [
+            'cardData',
+            'config',
+            'transformersInfo',
+            'siblings',
+            'tags',
+            'pipeline_tag',
+            'downloads',
+            'likes',
+            'createdAt',
+            'lastModified',
+            'safetensors',
+        ]
+        compact_expand: list[Any] = [
+            'cardData', 'config', 'transformersInfo', 'siblings'
+        ]
+        attempts: list[Callable[[], Any]] = [
+            lambda: self.api.model_info(repo_id, expand=full_expand),
+            lambda: self.api.model_info(repo_id, expand=compact_expand),
+            lambda: self.api.model_info(repo_id, files_metadata=True),
+            lambda: self.api.model_info(repo_id),
         ]
         last_error: Exception | None = None
-        for kwargs in attempts:
+        for attempt in attempts:
             try:
-                return self.api.model_info(repo_id, **kwargs)
+                return attempt()
             except (TypeError, ValueError) as ex:
                 last_error = ex
                 continue
