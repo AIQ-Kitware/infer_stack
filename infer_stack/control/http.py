@@ -131,6 +131,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(202, service.acquire(principal, key, self._body(), identity=identity))
         elif self.command == 'POST' and path == '/v1/access':
             self._send(202, service.access(principal, key, self._body(), identity=identity))
+        elif self.command == 'POST' and path == '/v1/catalog/revisions':
+            if identity.role != 'catalog-admin':
+                raise PermissionError('Catalog administrator capability required')
+            self._send(202, service.approve_catalog(principal, key, self._body(), identity=identity))
         elif self.command == 'POST' and path == '/v1/waits':
             self._send(202, service.wait(principal, key, self._body(), operator=identity.operator))
         elif self.command == 'POST' and path == '/v1/renewals':
@@ -155,6 +159,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, [{'alias': name, 'protocol': catalog.resolve_endpoint(name).protocol}
                              for name in sorted(catalog.endpoints)
                              if identity.allowed_endpoints is None or name in identity.allowed_endpoints])
+        elif self.command == 'GET' and (path == '/v1/catalog/revisions' or path.startswith('/v1/catalog/revisions/')):
+            if identity.role != 'catalog-admin':
+                raise PermissionError('Catalog administrator capability required')
+            self._send(200, service.catalog_revisions.history() if path == '/v1/catalog/revisions'
+                       else service.catalog_revisions.get(path.removeprefix('/v1/catalog/revisions/')))
         elif self.command == 'GET' and path in {'/v1/nodes', '/v1/audit'}:
             query = parse_qs(urlsplit(self.path).query)
             if path == '/v1/nodes':

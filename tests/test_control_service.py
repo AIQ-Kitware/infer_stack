@@ -59,7 +59,7 @@ def test_retry_after_commit_before_progress_does_not_acquire_twice(service, monk
 
 def test_idempotency_survives_catalog_change_and_rejects_changed_request(service):
     first = service.acquire('alice', 'key', {'endpoints': ['q']})
-    service.catalog = Catalog.from_dict({})
+    approve_catalog(service, {})
     assert first['id'] == service.acquire('alice', 'key', {'endpoints': ['q']})['id']
     with pytest.raises(ValueError, match='different request'):
         service.acquire('alice', 'key', {'endpoints': ['q'], 'dedicated': True})
@@ -168,9 +168,26 @@ def test_capacity_queue_does_not_block_release(service, monkeypatch):
 
 
 def test_bundle_readiness_uses_resolved_endpoint_aliases(service):
-    service.catalog = Catalog.from_dict({'models': {'m': {'source': 'hf://org/m'}},
+    approve_catalog(service, {'models': {'m': {'source': 'hf://org/m'}},
                                          'endpoints': {'q': {'engine': 'vllm', 'model': 'm'}},
                                          'bundles': {'bundle': ['q']}})
     op = service.acquire('alice', 'bundle', {'endpoints': ['bundle']})
     service.step()
     assert service.operations.get(op['id'])['state'] == 'succeeded'
+
+
+def approve_catalog(service, source):
+    """Publish through the actual audited CAS protocol, even in unit fixtures."""
+    import uuid
+
+    from infer_stack.control.auth import Identity
+
+    operation = service.approve_catalog('catalog-admin', uuid.uuid4().hex,
+                                       {'base_revision': service.catalog_revisions.active(), 'source': source},
+                                       identity=Identity('catalog-admin', 'catalog-admin'))
+    # Earlier queued work can advance first; do not assume approval jumps it.
+    for _ in range(100):
+        if service.operations.get(operation['id'])['state'] in {'succeeded', 'failed'}:
+            break
+        service.step()
+    assert service.operations.get(operation['id'])['state'] == 'succeeded'

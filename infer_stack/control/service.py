@@ -8,6 +8,7 @@ from dataclasses import asdict
 from ..leasing.cluster_placement import narrow
 from ..leasing.models import EndpointRequest, LeaseState, Sharing
 from ..leasing.profile import canonical_digest
+from .catalog import CatalogRevisions, validate_source
 from .operations import Operations
 
 
@@ -25,10 +26,27 @@ class ControlService:
     """
 
     def __init__(self, controller, catalog, *, clock=time.time, usage_path=None):
-        self.controller, self.catalog, self.clock = controller, catalog, clock
+        self.controller, self.clock = controller, clock
         self.operations = Operations(controller.ledger.store, clock=clock)
+        self.catalog_revisions = CatalogRevisions(controller.ledger.store, clock=clock)
+        self.catalog_revisions.seed(catalog.source)
         self._last_room = float('-inf')
         self.usage_path = usage_path
+
+    @property
+    def catalog(self):
+        return self.catalog_revisions.catalog()
+
+    def approve_catalog(self, principal, key, payload, *, identity):
+        if identity.role != 'catalog-admin':
+            raise PermissionError('Catalog administrator capability required')
+        if set(payload) != {'base_revision', 'source'}:
+            raise ValueError('Catalog approval requires source and base_revision only')
+        base = payload['base_revision']
+        if not isinstance(base, str) or len(base) != 64 or any(c not in '0123456789abcdef' for c in base):
+            raise ValueError('base_revision must be the current catalog SHA256 revision')
+        validate_source(payload['source'])
+        return public_operation(self.operations.submit(principal, key, {'action': 'catalog-approve', 'client': payload}))
 
     def usage(self) -> list[dict]:
         from pathlib import Path
@@ -174,7 +192,7 @@ class ControlService:
                 observed = observe(deployments)
             except Exception:
                 observed = {g.id: {'phase': 'UNKNOWN', 'next_action': 'Restore backend observation access'} for g in deployments}
-        return {'catalog_revision': canonical_digest(self.catalog.source),
+        return {'catalog_revision': self.catalog_revisions.active(),
                 'leases': [{'id': le.id, 'owner': le.owner, 'state': le.state,
                             'endpoints': le.endpoints, 'deployment_ids': le.deployment_ids,
                             'expires_at': le.expires_at} for le in leases],
@@ -191,7 +209,9 @@ class ControlService:
             op = pending[0]
             self.operations.transition(op['id'], 'running')
             try:
-                if op['request']['action'] == 'release':
+                if op['request']['action'] == 'catalog-approve':
+                    self.catalog_revisions.approve(op, self.operations)
+                elif op['request']['action'] == 'release':
                     self.controller.release_leases([op['request']['client']['lease_id']], evict=op['request']['client'].get('evict', False))
                     self.operations.transition(op['id'], 'succeeded', result={'lease_id': op['request']['client']['lease_id']})
                 elif op['request']['action'] == 'renew':

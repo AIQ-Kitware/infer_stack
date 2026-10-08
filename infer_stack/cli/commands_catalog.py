@@ -36,7 +36,7 @@ from .options import (
     _PathOverridesMixin,
     _SimulateHardwareMixin,
 )
-
+from .remote import RemoteOptions
 
 
 def _print_yaml(text: str) -> None:
@@ -998,6 +998,68 @@ class CatalogBundleCLI(kw.ModalCLI):
 # ---------------------------------------------------------------------------
 
 
+class CatalogRevisionsCLI(RemoteOptions, _PathOverridesMixin):
+    """List approved remote revisions, or retrieve one source for review."""
+
+    __command__ = 'revisions'
+    revision = kw.Value(None, position=1, type=str, help='Optional immutable revision SHA256 to retrieve.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from . import remote
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not remote.server_url(config):
+            raise SystemExit('catalog revisions requires a control server')
+        resource = '/v1/catalog/revisions'
+        if config.revision:
+            if len(config.revision) != 64 or any(c not in '0123456789abcdef' for c in config.revision):
+                raise SystemExit('revision must be a catalog SHA256')
+            resource += '/' + config.revision
+        print(json.dumps(remote.client(config).request('GET', resource), indent=2))
+        return 0
+
+
+class CatalogPublishCLI(RemoteOptions, _PathOverridesMixin):
+    """Approve a reviewed YAML catalog for future remote requests."""
+
+    __command__ = 'publish'
+    source = kw.Value(None, position=1, type=str, help='Reviewed catalog YAML path.')
+    base_revision = kw.Value(None, type=str, help='Required current approved SHA256; prevents overwriting another edit.')
+    idempotency_key = kw.Value(None, type=str, help='Stable identity for retries of this exact approval.')
+    timeout = kw.Value(60, type=float)
+    dry_run = kw.Value(False, isflag=True, help='Validate locally and print the proposed revision.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from ..control.catalog import validate_source
+        from ..leasing.profile import canonical_digest
+        from . import remote
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not config.source:
+            raise SystemExit('catalog publish requires a reviewed YAML path')
+        source = yaml.safe_load(Path(config.source).expanduser().read_text())
+        validate_source(source)
+        if config.dry_run:
+            print(json.dumps({'catalog_revision': canonical_digest(source), 'endpoints': sorted(source.get('endpoints', {}))}, indent=2))
+            return 0
+        if not remote.server_url(config):
+            raise SystemExit('catalog publish requires a control server; local catalog edits remain file-based')
+        if not config.base_revision:
+            raise SystemExit('catalog publish requires --base-revision from catalog revisions')
+        client = remote.client(config)
+        operation = client.request('POST', '/v1/catalog/revisions', key=config.idempotency_key,
+                                   payload={'base_revision': config.base_revision, 'source': source})
+        completed = client.wait(operation['id'], timeout=config.timeout)
+        print(json.dumps({'operation_id': operation['id'], **completed['result']}, indent=2))
+        return 0
+
+
 class CatalogModalCLI(kw.ModalCLI):
     """Edit the user serving catalog (models / endpoints / hosts / bundles)."""
 
@@ -1013,3 +1075,5 @@ class CatalogModalCLI(kw.ModalCLI):
     endpoint = CatalogEndpointCLI
     host = CatalogHostCLI
     bundle = CatalogBundleCLI
+    revisions = CatalogRevisionsCLI
+    publish = CatalogPublishCLI

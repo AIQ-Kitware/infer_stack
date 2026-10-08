@@ -4,6 +4,7 @@ import threading
 
 import pytest
 import yaml
+from test_control_service import approve_catalog
 from test_external_endpoints import REMOTE, _ctl, catalog
 from test_leasing_compose import FakeDocker
 
@@ -78,7 +79,7 @@ def test_pending_snapshot_survives_catalog_changes_then_new_access_adopts_them(e
     payload = {'endpoints': ['remote']}
     accepted = service.access('alice', 'old', payload)
     changed = Catalog.from_dict(catalog(remote={**REMOTE, 'external': {**REMOTE['external'], 'model': 'org/new'}}))
-    service.catalog = changed
+    approve_catalog(service, changed.source)
     assert service.access('alice', 'old', payload)['id'] == accepted['id']
     assert done(service, accepted)['state'] == 'succeeded'
     assert service.controller.backend.catalog.resolve_endpoint('remote').target.model == REMOTE['external']['model']
@@ -111,7 +112,7 @@ def test_changed_external_route_supersedes_converging_mixed_access(external_serv
     monkeypatch.setattr(service.controller.backend.front_door(), 'gateway_accepts', lambda *a, **kw: None)
     old = done(service, service.access('alice', 'old', {'endpoints': ['pair']}))
     assert old['state'] == 'converging'
-    service.catalog = Catalog.from_dict(catalog(remote={**REMOTE, 'external': {**REMOTE['external'], 'api_base': 'http://new/v1'}}))
+    approve_catalog(service, catalog(remote={**REMOTE, 'external': {**REMOTE['external'], 'api_base': 'http://new/v1'}}))
     monkeypatch.setattr(service.controller.backend.front_door(), 'gateway_accepts', lambda *a, **kw: True)
     new = done(service, service.access('alice', 'new', {'endpoints': ['pair']}))
     assert new['state'] == 'succeeded'
