@@ -476,3 +476,154 @@ and the broader dev e2e comments distinguish worker acceptance from its
 namespace-wide lifecycle assumptions. This preserves one Python installer
 implementation while making the operator's path concrete for all three planned
 worker shapes.
+
+## 2026-10-07 23:21:08 -0400
+
+User intent: review the north star and Kubernetes/remote-controller roadmaps,
+revise them where needed, then implement both roadmaps in a coherent order.
+The latest steering ends the broad goal: finish the current catalog feature,
+stop at a coherent checkpoint, and make logical, attributed commits.
+Model/runtime identification: GPT-6-based Codex. The exact runtime model ID and
+weights/configuration variant are not exposed and cannot be determined. No
+delegated agents are authorized or used in this session.
+
+The plans agree on authority and scheduler boundaries, but their seams need
+executable contracts. I tightened constrained routing, warm versus on-demand
+residency, single-server SQLite eligibility, authenticated remote access, and
+destination-side fencing. My main concern is that a successful pod render can
+hide a broken user contract: a shared alias can defeat placement, a zero-replica
+Model can deadlock readiness, and a post-write database check cannot fence an
+external mutation. I favor conservative compatibility and fail-closed admission
+over opportunistic sharing until policy merging is defined.
+
+Implementation starts with the roadmap's locally testable onboarding, placement,
+replica-policy, and accounting foundations, then the service boundary. Physical
+K3s migration/GPU proofs need explicit handover rather than simulated claims.
+Existing untracked benchmark results and setup notes belong to the user and are
+left alone. Reusable takeaways: enforce user constraints through routing as well
+as scheduling; distinguish durable logical presence from warm process residency;
+and prove concurrency protection at the side-effect destination.
+
+The service slice now uses durable typed operations over the existing controller,
+with stable lease IDs for recovery between demand commit and result publication.
+Shared-token access is supplemented by reloadable named identities, ownership,
+endpoint scopes, finite TTL limits and transactional pending/active lease quotas.
+The remote CLI and a separate small Textual dashboard use HTTP only; separating
+that dashboard avoids fabricating a local controller or leaking local commands
+through an adapter. External-endpoint access and the richer local dashboard
+capabilities still need a deliberate remote contract.
+
+I extracted relational ledger operations while preserving the public SQLite
+store. PostgreSQL serializes short writes with an advisory transaction lock and
+whole publications with a separate session lock. This intentionally favors a
+small-fleet, understandable serialization point over speculative fine-grained
+locking. Real PostgreSQL 17 tests passed for contention, rollback on interruption,
+operation idempotency, precision and service exclusion. These locks coordinate
+healthy sessions; they are not destination-side fencing after partitions. HA
+must remain unavailable until that distinction is addressed.
+
+An isolated Docker K3s v1.36.4 / KubeAI v0.23.2 cluster passed the new
+`dev/kubernetes_service_e2e.py` contract with a CPU mock serving image: bundle
+generation, serving during controller loss, restart idempotency, stop-policy
+pruning, return to zero, logical Model retention through GC, wake from zero and
+explicit eviction. This exposed two useful seams: probes must use expanded
+bundle aliases, and pod-only warm residency otherwise prunes an on-demand Model
+at zero replicas. The latter now preserves only an already-existing Model,
+never starts a missing idle workload. A full checkpoint passed 1366 tests with
+9 skips and two existing resource warnings; later changes receive focused and
+final validation. Hardware GPU/TP/energy proof and actual K3s migration remain
+separate from this synthetic-runtime evidence.
+
+The PostgreSQL-backed real K3s/KubeAI service contract also passed, including
+scale-up to two ready replicas under eight concurrent generation loops. A
+first return-to-zero attempt exceeded its timeout even with a one-second
+Model delay: the operator's default ten-minute moving average had sampled a
+request and still calculated one desired replica. Shortening the disposable
+cluster's averaging window to twenty seconds made that test bounded. The
+fixture now records both timing controls; production tuning should preserve
+that distinction. This is a confirmed lesson, not a change to product defaults.
+
+Read-only remote node inventory and cursor-paginated audit history now complement
+the mutation API. Node capacity survives pod-list failure while allocation stays
+unknown. The dashboard preserves selected lease identity across reordered
+refreshes, and accepted HTTP requests finish before service authority is
+released at shutdown. Slow TLS handshakes no longer block the listener, and
+connection/rate limits have bounded state. I am confident in those isolated
+boundaries; destination fencing, authority migration/restore and live power
+collection still deserve their own protocols and failure injection rather than
+being inferred from these tests. The plans and operator guides now expose those
+remaining requirements. The latest SQLite cluster run additionally passed node
+inventory and audit recovery; artifacts remain in
+`/tmp/infer-stack-service-e2e-4_gudm8k`, with PostgreSQL scaling evidence in
+`/tmp/infer-stack-service-e2e-smll_w_q`. Disposable containers are removed after
+validation; no physical user cluster was changed.
+
+Final checkpoint validation passed 1383 tests with four skips and two existing
+resource warnings while real PostgreSQL contract cases were enabled. `ty check
+infer_stack`, scoped Ruff checks, shell syntax and `git diff --check` also passed.
+The broader goal remains active: the next software gaps are external remote
+access, durable catalog administration, authority migration/restore, startup
+history, collectors and destination fencing/agents. Physical K3s HA/GPU proof
+needs the target access, stable address and server-host choices requested from
+the user; that does not prevent independent software work.
+
+The following tranche closes remote external and mixed access. Accepted
+operations now retain their full approved catalog sources, not just a digest
+and resolved managed requests. Restart can use those original inputs without
+silently changing an external upstream or duplicating a committed dedicated
+lease. External-only access publishes routes without a lease or test generation
+upstream; mixed access applies ordinary generation readiness to managed members
+and gateway readiness to external routes. Converging access notices an external
+alias replaced by a newer publication rather than reporting the old contract
+ready. The remote run wrapper clears inherited lease identity, releases only its
+own managed demand, and preserves the child's exit status. The dashboard now
+uses access for approved endpoints, exposes finite TTL selection and respects
+observer/operator capabilities.
+
+Real Docker/LiteLLM acceptance passed twice, including inference with the actual
+upstream credential, controller-loss inference, same-operation restart recovery,
+and a no-lease remote child exiting 7. Latest private artifacts are in
+`/tmp/infer-stack-remote-external-qdcq2wgl`; the harness removes only its unique
+Compose project. The preceding full suite passed 1392 tests with four skips,
+with PostgreSQL contract cases enabled. This validates the data-plane boundary
+without pretending the mock upstream is GPU inference.
+
+I then implemented immutable approved catalog revisions because accepted
+snapshots alone do not establish who may change future intent. Files seed a new
+remote authority once; explicit catalog-admin approval advances a content hash
+in the database. A required base hash prevents concurrent editors from silently
+overwriting each other. Activation and terminal success/audit commit together,
+so interruption cannot leave an approved revision whose retried operation
+misreports failure. Existing leases retain their specifications; approval is
+not deployment replacement, and resident alias compatibility still governs
+publication. Operators can maintain demand but cannot inspect full catalog
+sources or approve launches. Local file editing stays unchanged.
+
+The accepted tradeoff is a reviewed whole-catalog publication rather than a
+field-by-field remote editor or Git integration. It is smaller, reviewable and
+preserves a clear launch-trust boundary. Strict JSON/catalog validation keeps
+malformed sources and credentials embedded in external URLs out of remote
+revisions; errors do not reflect private launch data. Tests exercise concurrent
+SQLite/PostgreSQL approvals, restart with changed bootstrap files, rollback
+before commit, original lease preservation, explicit first publication, HTTP
+role enforcement and CLI retry identity. Reusable takeaways: snapshot accepted
+intent independently from current approval; commit authority changes with their
+durable success record; treat catalog approval and backend realization as
+separate operations.
+
+The user cleared the broad goal and requested a stopping point and logical
+commits. I will finish verification and commit this checkpoint, without starting
+authority migration, agents or HA. Destination fencing, live telemetry/startup
+history, native backup/restore and physical K3s HA/GPU acceptance remain explicit
+roadmap work. Benchmark archives/results and the user's setup notes remain
+untracked and untouched. Commit attribution names the exposed GPT-6-based
+Codex identity and explicitly records that exact runtime/config identification
+is unavailable, rather than copying a previous agent's model attribution.
+
+Stopping-point validation: the full suite passed 1405 tests with four skips and
+the same two existing resource warnings, with real PostgreSQL enabled. The
+final focused catalog suite passed all 14 cases, including real PostgreSQL
+approval/conflict cases and the additional malformed-source check. Type checking, scoped Ruff,
+fixture shell syntax and diff whitespace checks passed. The real LiteLLM rerun
+passed after catalog persistence was introduced. Test containers are cleaned up
+after validation, while private temporary evidence is retained.

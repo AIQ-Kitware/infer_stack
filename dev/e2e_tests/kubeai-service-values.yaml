@@ -1,0 +1,17 @@
+# Disposable CPU/mock KubeAI service proof. Never use these timing values as
+# production autoscaling recommendations.
+open-webui:
+  enabled: false
+modelServers:
+  VLLM:
+    images:
+      cpu: infer-stack-kubeai-mock:local
+resourceProfiles:
+  cpu:
+    imageName: cpu
+    requests:
+      cpu: 100m
+      memory: 256Mi
+modelAutoscaling:
+  interval: 2s
+  timeWindow: 20s

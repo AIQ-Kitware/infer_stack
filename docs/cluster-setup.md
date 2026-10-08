@@ -126,8 +126,10 @@ private: the root admin file stays `0600`, and only the invoking user receives
 a `0600` copy at `~/.kube/infer-stack-k3s.yaml`. Existing default configs and
 `KUBECONFIG` are never replaced. `provider=k3s` always reconciles this local
 server through its explicit private kubeconfig, even when EKS or another cluster
-is selected. Use `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` for subsequent
-inventory/install. Repeating bootstrap refreshes the copied certificates when
+is selected. Bootstrap saves this private path as infer-stack's `kubeconfig`
+setting for subsequent inventory/install/backend/TUI commands. Use
+`export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` for raw kubectl/Helm commands.
+Repeating bootstrap refreshes the copied certificates when
 K3s rotates its admin credentials. The older `scripts/bootstrap_k3s.sh` calls
 `infer-stack kube k3s bootstrap`, which provisions only the local server.
 
@@ -139,9 +141,11 @@ workstation dedicated to this cluster, persist
 `export KUBECONFIG="$HOME/.kube/infer-stack-k3s.yaml"` in the operator's shell
 startup. Bootstrap cannot change its parent shell environment, and it does not
 edit shell startup files or broaden the root credential's permissions. A
-future infer-stack cluster-target setting should remove the need for this
-environment dependency for infer-stack/TUI commands without silently changing
-the operator's general `kubectl` context.
+saved `kubeconfig` setting removes this environment dependency for infer-stack
+commands. Set it explicitly for an existing cluster with
+`infer-stack config set kubeconfig /absolute/path/to/config`. Explicit per-command
+kubeconfig flags still take precedence, and general shell commands retain their
+own context selection.
 
 Then explicitly select the local K3s server and inspect the generic integration:
 
@@ -240,12 +244,30 @@ Host drivers/toolkit remain prerequisites: a missing toolkit fails before any
 agent changes. An existing agent on a different server is refused. Repeating
 onboarding rechecks membership and launches a fresh acceptance test.
 
+Choose K3s/containerd storage before installing an agent. Onboarding accepts
+`--k3s-data-dir=/absolute/path` and persists that path through the K3s installer;
+it refuses to move an already-running agent's data directory implicitly. For
+example, add these options to the preview above:
+
+```text
+--k3s-data-dir=/data/k3s --image-headroom-gib=30 --kubelet-config=/path/to/kubelet.yaml
+```
+
+The estimate covers image pull **plus extraction**, not just compressed image
+size. Preflight reports available bytes/inodes on the nearest existing ancestor
+and separately evaluates supplied `nodefs.available` / `imagefs.available`
+eviction and minimum-reclaim thresholds. Mount the intended filesystem first.
+Threshold applicability, Docker cache usage and effective kubelet defaults are
+not discovered automatically; unknown values remain explicit warnings. A larger
+containerd directory does not by itself cure pressure on a different nodefs.
+
 Acceptance briefly reserves **all GPUs on the named node** for a fresh runtime
-query, then uses **one GPU** for a small KubeAI Model and real generation.
+query, then uses **one GPU by default** for a small KubeAI Model and real generation.
 Allow those GPUs to become available first; the test does not evict workloads.
-It asserts actual pod placement on the requested node, exactly one GPU
-request/limit, NVIDIA runtime, nested KubeAI replica readiness, and an actual
-OpenAI generation response. The serving pod's device UUID/product are reported.
+It asserts actual pod placement on the requested node, the requested serving GPU
+count in both requests and limits, NVIDIA runtime, nested KubeAI replica
+readiness, and an actual OpenAI generation response. Serving device UUIDs must
+belong to the node's fresh inventory, and their products are reported.
 Other cluster nodes cannot satisfy the test. The default model is the public
 `HuggingFaceTB/SmolLM2-135M-Instruct`; first image/model downloads may take
 minutes (`--timeout=900` by default). State changes are printed while waiting.
@@ -262,6 +284,10 @@ infer-stack kube node test namek --expected-gpus=1 --namespace=default --apply
 # The same acceptance surface handles later workers:
 infer-stack kube node test yardrat --expected-gpus=2 --namespace=default --apply
 infer-stack kube node test aiq-gpu2 --expected-gpus=4 --namespace=default --apply
+
+# Separately prove four-GPU serving with an architecture compatible with TP=4:
+infer-stack kube node test aiq-gpu2 --expected-gpus=4 --serve-gpus=4 \
+  --model=Qwen/Qwen2.5-1.5B-Instruct --namespace=default --apply
 ```
 
 `--kubeconfig=...` scopes all administrative commands to an explicit file;
@@ -278,8 +304,20 @@ For heterogeneous `yardrat`, the device query reports both GPU products and
 memories independently. GFD selectors describe nodes, and Kubernetes' generic
 `nvidia.com/gpu` allocation does not select a particular physical product within
 a mixed node. The generation check verifies one allocated GPU and reports which
-one; it does **not** claim generation on every GPU/product or multi-GPU tensor
-parallelism. The other devices receive the fresh runtime/device query.
+one. `--serve-gpus=N` requests a tensor-parallel serving replica with N GPUs and
+checks all visible UUIDs; choose a model whose architecture/runtime supports
+that TP size. The example above is an acceptance command, not a claim that it
+has run successfully on this hardware. `--expected-gpus=4` alone establishes
+inventory count, not four-GPU serving. Other devices receive the runtime query.
+
+After that query succeeds, acceptance records per-device UUID/product/memory
+facts in the `infer-stack.ai/gpu-inventory` node annotation. Eligibility uses the
+smallest verified device memory on a mixed node because generic NVIDIA allocation
+cannot promise which device is selected. An incomplete inventory makes that
+size unknown. These facts have an observation timestamp, not automatic freshness
+guarantees; repeat acceptance after hardware changes. The annotation can remain
+even if the later serving generation fails, since inventory and inference are
+separate evidence.
 
 Temporary Models and probe Pods have their own acceptance-run labels and are
 outside infer-stack's normal managed lease set. Catalog, recovery ledger,

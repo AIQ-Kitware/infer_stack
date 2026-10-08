@@ -549,6 +549,8 @@ the managed key and the endpoint alias on either backend.
   [docs/cluster-setup.md](docs/cluster-setup.md).
 * KubeAI setup, settings and semantics:
   [docs/kubeai-backend.md](docs/kubeai-backend.md).
+* Authenticated remote CLI/TUI, optional PostgreSQL authority and usage facts:
+  [remote control service](docs/kubeai-backend.md#remote-control-service).
 * What matches Compose, what does not yet, and what is deliberate:
   [docs/backend-parity.md](docs/backend-parity.md); the plan to close the
   rest: [docs/planning/backend-parity-roadmap.md](docs/planning/backend-parity-roadmap.md).
@@ -630,9 +632,10 @@ installed runtime on startup; bootstrap restarts local K3s only when runtime
 discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels, and verifies unknown
 GPU-node runtime handlers with small node-specific canary pods. Root admin
 credentials stay `0600`; a private `0600` copy lives at
-`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Select the
-local server explicitly with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`
-before inventory/install; rerun bootstrap to refresh copied certificates.
+`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Bootstrap
+saves that path as infer-stack's `kubeconfig` setting; raw shell kubectl/Helm
+can select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`.
+Rerun bootstrap to refresh copied certificates.
 
 `kube install` shows inferred Helm values; `--apply` uses Helm upgrade/install
 and checks readiness afterward. `--dry-run`/`--plan` forces read-only behavior.
@@ -710,7 +713,10 @@ vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
 plans a local GPU worker join and node-specific acceptance; add `--apply` to
 execute it. Host NVIDIA drivers/toolkit are prerequisites. It infers the server
 version, verifies every locally detected device, then checks actual one-GPU
-KubeAI placement and generation on this worker. Admin credentials are explicit
+KubeAI placement and generation on this worker by default. `--serve-gpus=N`
+adds multi-GPU serving acceptance with a compatible model. `--k3s-data-dir`,
+`--image-headroom-gib` and `--kubelet-config` expose storage preflight decisions.
+Admin credentials are explicit
 private files, separate from any selected EKS context.
 
 For an already joined worker, run `infer-stack kube node test namek

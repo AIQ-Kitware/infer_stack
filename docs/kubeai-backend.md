@@ -27,9 +27,11 @@ alias gets HTTP 404.
 A deployment in the desired set renders as one `Model` CR labeled
 `infer-stack/managed=true` + `infer-stack/deployment=<id>`; `apply` is
 `kubectl apply` plus pruning of managed Models the render dropped. Reclaim
-semantics carry over: an idle `keep-warm` deployment keeps its CR (model stays
-resident); `stop` deployments are pruned on release; `evict`/`gc` free the
-cluster. Hand-applied Models without the managed label are never touched.
+semantics carry over: an idle `keep-warm` deployment retains its warm CR or an
+existing on-demand CR at zero replicas; `stop` deployments are pruned on release;
+explicit eviction removes the logical Model and its replicas. Ordinary `gc`
+expires leases and reconciles reclaim policy. Hand-applied Models without the
+managed label are never touched.
 
 Where the two backends match and where they still differ, row by row:
 [backend-parity.md](backend-parity.md); the plan for the rest is
@@ -59,7 +61,12 @@ install are distribution-neutral. `bootstrap --provider=k3s` always targets
 the local K3s server, never an unrelated selected context (reachable or stale).
 Root admin credentials remain `0600`. Bootstrap refreshes a private user copy at
 `~/.kube/infer-stack-k3s.yaml`, preserving existing default configs. Explicitly
-select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` before inventory/install.
+select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml` for raw shell
+commands. Bootstrap also saves the `kubeconfig` setting for infer-stack's own
+kubectl/Helm/backend operations, including the TUI. Change it deliberately with
+`infer-stack config set kubeconfig /absolute/path/to/config`; explicit command
+kubeconfig flags take precedence. Newly frozen recovery profiles retain that
+path so later shell context changes cannot redirect an existing authority.
 Use `--version` to pin K3s; active clusters are never implicitly upgraded.
 
 `inventory`, `doctor`, and `status` accept `--json`. Errors belong to individual
@@ -176,12 +183,10 @@ export INFER_STACK_DATA_DIR="$HOME/.local/share/infer_stack-kubeai"
 Unset those variables to return to that host's existing Compose authority after
 the Kubernetes node has been detached as described in the cluster setup guide.
 
-`infer-stack tui` follows this same authority boundary. It reads and mutates the
-local infer-stack ledger; it is not a stateless Kubernetes dashboard that should
-be launched independently on every worker. In the current architecture, run the
-KubeAI TUI on the one infer-stack authority/admin host. A worker needs only its
-Kubernetes agent/runtime. A future remote control-plane API can make the TUI a
-client from arbitrary machines without duplicating authority.
+Local `infer-stack tui` follows this same authority boundary. Run it on the
+authority/admin host. With a configured `server_url`, it becomes an HTTP client
+to the canonical authority instead; see [remote control service](#remote-control-service).
+A worker needs only its Kubernetes agent/runtime.
 
 Catalog endpoints opt into a specific profile per endpoint; the GPU count is
 appended automatically from `tensor_parallel_size × pipeline_parallel_size ×
@@ -303,10 +308,12 @@ provides a synthetic second K3s node for development;
   admitted at once. A Model the cluster cannot place sits not-ready until
   the acquire's `--timeout`, which rolls the lease back; the wait says why
   (`pod: Unschedulable`, `pod: ImagePullBackOff`).
-- **An idle keep-warm Model stays only while its pod has started**, as an
+- **An idle warm Model stays only while its pod has started**, as an
   idle keep-warm container does on compose (a crash-looping pod counts, like
   a restarting container). One whose pod is gone, still Pending or finished
-  is pruned at the next render.
+  is pruned at the next render. An explicit `min_replicas: 0` endpoint instead
+  retains an already-existing logical Model without pods; GC does not recreate
+  a missing idle Model. A generation request wakes it.
 - **A keep-warm model without a lease gives way to one with a lease.** When
   a leased Model's pod is `Unschedulable`, the wait evicts the longest-idle
   keep-warm deployment, one per 30 s, until it fits. Compose applies the same
@@ -322,8 +329,9 @@ provides a synthetic second K3s node for development;
   deployments, and **ollama endpoints** — KubeAI serves models, not daemons,
   so the catalog's host-centric ollama endpoints don't map onto it yet; use
   `--backend compose` for those.
-- `min_replicas` / `max_replicas` runtime keys pass through to the CR
-  (default 1/1 — the lease lifecycle, not the autoscaler, decides residency).
+- `min_replicas` / `max_replicas` default to 1/1. The catalog validates bounds
+  and includes nondefault policy in deployment compatibility. See below for
+  opt-in on-demand serving and load-based replication.
 - `dev/kubeai_e2e.sh` runs the full lifecycle (doctor → acquire → a request
   by alias, as a card makes it → release → prune verified) against a real
   cluster with an isolated config/data root; use it as the first smoke test
@@ -398,3 +406,245 @@ those settings. Compose retains its image and command controls.
 The editor's vLLM data-parallel size consumes GPUs inside one serving deployment;
 it does not create independent Kubernetes replicas. KubeAI pod replication uses
 `runtime.min_replicas` / `runtime.max_replicas`.
+
+## Placement and replica policy
+
+Administrators classify canonical Kubernetes node names and install selector
+profiles using the existing Helm release:
+
+```bash
+infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090
+infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090 --apply
+```
+
+Users can narrow an approved endpoint with `acquire`, `access`, or `run`
+`--node namek.kitware.com` or `--pool interactive`. Node and pool constraints
+intersect the catalog's node/pool constraints; they cannot broaden permission.
+Kubernetes still assigns physical GPUs. Constraint equality is required for
+sharing, and simultaneously live deployments with the same public alias but
+different hard constraints are refused because alias routing would defeat the
+placement promise. Compose rejects these cluster constraints.
+
+An on-demand catalog endpoint can declare:
+
+```yaml
+runtime:
+  resource_profile: nvidia-gpu-rtx-3090
+  min_replicas: 0
+  max_replicas: 2
+  target_requests: 8
+  scale_down_delay_seconds: 60
+  load_balancing: LeastLoad
+```
+
+`PrefixHash` is the other supported load-balancing strategy. Minimum zero is
+explicit opt-in; ordinary warm endpoints keep the 1/1 default. The lease protects
+logical demand, while KubeAI owns replica count. Reclaim `stop` removes the Model
+after the last lease; `keep-warm` retains its logical route even when the
+autoscaler returns it to zero. Readiness always sends a real generation, which
+can wake an on-demand Model. Passive status refresh does not wake it. Compose
+refuses nondefault replica/autoscaling policy rather than silently ignoring it.
+
+KubeAI's Helm-level `modelAutoscaling.timeWindow` defaults to ten minutes and
+affects return-to-zero in addition to per-Model scale-down delay. The integration
+harness uses a short test window; select production values from measured
+traffic and startup latency. Status reports desired min/max, observed/ready
+replica counts, individual nodes/reasons, and suggested actions. Replica
+readiness alone does not establish generation readiness; unknown counts stay
+unknown. Startup event history and latency distributions remain follow-up work.
+
+## Remote control service
+
+Run one canonical server on the machine holding the approved catalog, recovery
+data, Kubernetes credentials and backend/gateway configuration. Preserve that
+data root across restarts. The server reconciles TTLs periodically; clients do
+not need kubeconfig or copies of its ledger.
+
+Create a private control token on that host:
+
+```bash
+umask 077
+python -c 'import secrets; from pathlib import Path; Path("control.token").write_text(secrets.token_urlsafe(32))'
+infer-stack server --token-file ./control.token
+```
+
+The default listener is `127.0.0.1:14043`. Any off-host listener requires TLS:
+
+```bash
+infer-stack server --host 0.0.0.0 --token-file ./control.token \
+  --tls-cert /absolute/path/control.crt --tls-key /absolute/path/control.key
+```
+
+Use a certificate valid for the hostname clients use. Tokens, identity files,
+DSNs and TLS keys must be private and owned by the service user. TLS keys and
+certificates load at server startup; token/identity files reload per request for
+rotation and revocation. Configure clients with the securely distributed token
+and CA (or system trust):
+
+```bash
+infer-stack config set server_url https://control.example:14043
+infer-stack config set server_token_file /absolute/path/control.token
+infer-stack config set server_ca_file /absolute/path/control-ca.pem
+infer-stack acquire qwen-coder --ttl 2h --env-file lease.env --yes
+infer-stack status
+infer-stack operations
+infer-stack operations --audit --limit 100
+infer-stack kube nodes --json
+infer-stack tui
+infer-stack release --env-file lease.env
+```
+
+`--server-url`, `--server-token-file`, and `--server-ca-file` override those
+settings; `INFER_STACK_SERVER` also selects the server URL. Remote lease verbs
+include acquire, access, release, wait, renew, run, apply,
+gc and evict. `operations OPERATION_ID` recovers a durable result. Mutations
+return an operation before admission/readiness finishes; `--idempotency-key`
+on acquire/access makes an exact request retry recover the same operation.
+Connection retries keep their generated key. A generation timeout releases a
+new acquisition's lease; a timeout on an explicit wait retains a held lease.
+
+Use `access` or `run` for approved external endpoints or mixed bundles.
+External-only access returns a descriptor with `lease_id: null`; it verifies
+route publication and gateway readiness without sending inference upstream.
+Managed bundle members still require a successful generation. Remote `run`
+preserves the child exit status and releases only a lease it actually acquired.
+Descriptors include the immutable catalog revision accepted by the operation.
+
+The control credential authorizes resource operations. Inference credentials
+are separately provisioned: connection descriptors and env files reference
+`INFER_STACK_INFERENCE_KEY` without exposing the server's control token or
+gateway master key. Set that variable from your inference credential before
+sourcing `lease.env` or using `run`. The server does not yet mint user-scoped
+inference keys. Only inference's actual base URL determines whether an API key
+is required; a private development KubeAI service may have none.
+
+For individual ownership and restricted users, replace `--token-file` with
+`--identity-file /absolute/path/identities.json`. The private JSON registry is:
+
+```json
+{
+  "identities": [
+    {
+      "principal": "alice",
+      "role": "lease-user",
+      "token_sha256": "<64 lowercase hex characters: SHA256 of token text without surrounding whitespace>",
+      "allowed_endpoints": ["qwen-coder"],
+      "max_active_leases": 2,
+      "max_ttl_seconds": 7200
+    }
+  ]
+}
+```
+
+Supported roles are `observer` (read-only), `lease-user` (own leases and allowed
+endpoints), `operator`, and `catalog-admin`. Catalog administrators have operator
+operations plus exclusive permission to inspect full catalog revisions and
+approve new ones. A shared `--token-file` identity has operator capability;
+catalog publication requires a named `catalog-admin` in the identity file. Lease-user
+defaults are ten active/pending leases and a maximum one-day TTL. Endpoint
+scopes apply after bundle expansion. Pending and active lease admission is
+counted transactionally. Removing a credential revokes subsequent requests;
+already accepted operations retain their durable intent. Observers/operators
+see all state; lease users see their own leases, operations and related usage.
+
+The listener bounds simultaneous connections, including TLS handshakes
+(`--max-connections=32`), and requests per peer/principal
+(`--requests-per-minute=600`; zero disables that rate limit). HTTP 429 reports
+`Retry-After`. The API accepts typed catalog operations, not shell commands,
+container launch specs or arbitrary Kubernetes YAML. `/v1/events` sends a
+current SSE snapshot; polling operations is the durable recovery contract.
+`/v1/audit` pages immutable transitions with `after` (sequence ID) and `limit`
+(1..1000); lease users see their own records. `/v1/nodes` reports read-only
+Kubernetes inventory, including per-device facts and GPU requests across
+namespaces. Request counts are reserved capacity, not observed utilization.
+Pod-list failure leaves requests unknown while preserving known node facts.
+`kube nodes` uses that API when a control server is configured; the remote TUI
+also displays it. Full local-dashboard parity, node administration and streaming
+logs/events remain incomplete.
+
+### Approved catalog revisions
+
+The server seeds its approved catalog from `--catalog` or the configured local
+catalog when first started. Subsequent starts keep the database's approved
+revision even if that YAML changed. Local catalog commands continue to edit
+files; they do not change a remote server's approved catalog.
+
+Review a complete catalog file, then publish using a catalog-admin credential:
+
+```bash
+infer-stack catalog revisions
+infer-stack catalog publish reviewed.yaml --dry-run
+infer-stack catalog publish reviewed.yaml --base-revision CURRENT_SHA256 \
+  --idempotency-key catalog-review-2026-10-08
+infer-stack catalog revisions REVISION_SHA256
+```
+
+`catalog revisions` reports the active hash and retained revision provenance;
+giving a hash retrieves that immutable source. Publication returns a durable
+operation. The base hash is required: competing edits fail with a catalog
+conflict instead of replacing a newer approval. Retry the exact request with
+the same idempotency key to recover a lost response. After a conflict, review
+the new current revision before submitting a new request/key. Activation and
+its success/audit record are one database transaction.
+
+Approval applies to future acquisitions. Existing leases and serving processes
+keep their accepted launch specifications; redefining a resident alias can
+still be refused by the publication compatibility rules. Queued operations
+retain their original catalog snapshots. Full sources stay visible only to
+catalog administrators. External keys must use `api_key_env` references; remote
+catalog URLs cannot embed credentials, queries or fragments. Keep secrets in
+the service's managed environment, outside reviewed catalog files.
+
+### PostgreSQL authority
+
+SQLite on the server's local disk is the default. PostgreSQL is optional for
+the same single-authority service:
+
+```bash
+pip install 'infer-stack[postgres]'
+infer-stack server --token-file ./control.token \
+  --postgres-dsn-file /absolute/path/postgres.dsn
+```
+
+The DSN file contains a libpq DSN; off-host databases require
+`sslmode=verify-full` with a trusted CA. The saved `postgres_dsn_file` setting
+selects it for local controller commands too. Use a dedicated authority database
+and retain the backend data root/configuration alongside it. PostgreSQL locks
+serialize ledger transactions and whole publications and refuse a second
+server. They do not provide safe automatic takeover after partitions; controller
+HA is unavailable until destination-side fencing is implemented.
+
+There is no automatic SQLite import. Pointing at an empty PostgreSQL database
+starts a new authority, so do not do that against a namespace still managed by
+another ledger. Explicit authority migration and restore acceptance remain
+planned. Use native PostgreSQL backups; SQLite archive/rotation commands refuse
+this store. Supported schema compatibility is checked at startup, including
+refusal of future versions. Database failure prevents new mutations; existing
+inference continues independently where its data plane remains available.
+
+## Resource and energy observations
+
+`infer-stack usage --json` reports immutable deployment/replica intervals,
+GPU-hours and energy provenance. `--node` and `--deployment` filter records; a
+remote client reads the same facts through the API. The remote TUI includes a
+usage table. Import explicit collector facts on the authority host:
+
+```bash
+infer-stack usage --import-file collector-intervals.json --json
+```
+
+The file is a JSON list of `UsageInterval` mappings; its contract is in
+`infer_stack/accounting.py`. Times are UTC epoch seconds and intervals are
+half-open. Measured samples are total GPU watts for exactly the recorded UUID
+set, with source and a maximum acceptable sample gap. Large gaps stay unknown;
+an optional per-device proxy must name its method, source and version. Reports
+distinguish measured, partial, proxy, mixed and resource-time-only results, and
+show measurement coverage. Unknown energy is not zero. Shared leases do not
+receive duplicate copies of deployment energy.
+
+Imports are immutable and idempotent per interval ID and reject overlapping
+replica/device intervals. A multi-record import can commit earlier records
+before a later overlap fails; retrying unchanged records is safe. Querying an
+empty store creates no database. Live NVML/DCGM collection, whole-node power,
+reservation/activity aggregates and lease energy attribution are not yet
+implemented; imported/synthetic evidence must not be described as live telemetry.
