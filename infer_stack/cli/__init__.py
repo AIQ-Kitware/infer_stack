@@ -42,6 +42,8 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_kube import KubeModalCLI
 from .commands_ledger import LedgerModalCLI
+from .commands_usage import UsageCLI
+from .commands_server import OperationsCLI, ServerCLI
 from .commands_leasing import (
     AccessCLI,
     AcquireCLI,
@@ -147,6 +149,9 @@ class ManageCLI(kw.ModalCLI):
     apply = ApplyCLI  # bring the desired set up (the trigger for acquire --no-apply)
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
+    usage = UsageCLI
+    server = ServerCLI
+    operations = OperationsCLI
     ledger = LedgerModalCLI
     routes = RoutesModalCLI  # inspect/seed/prune the LiteLLM route registry
     network = NetworkModalCLI  # stable per-service addresses + upstream routing check
@@ -223,6 +228,7 @@ def main(argv=None) -> int:
     from ..leasing import LeaseLockError
     from ..leasing.backend import BackendTimeout
     from ..leasing.gateway import MissingRouteKey
+    from ..control.errors import ControlError, ControlTimeout
 
     try:
         rv = ManageCLI.main(argv=argv)
@@ -239,6 +245,8 @@ def main(argv=None) -> int:
         raise SystemExit(str(exc))
     except MissingRouteKey as exc:
         # Any publishing verb: the render refused before anything changed.
+        raise SystemExit(str(exc))
+    except (ControlError, ControlTimeout) as exc:
         raise SystemExit(str(exc))
     return int(rv) if rv is not None else 0
 

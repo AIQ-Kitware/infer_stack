@@ -409,6 +409,13 @@ KNOWN_SETTINGS = {s.key: s.help for s in _SETTINGS}
 # Backend-specific keys `config init` does not prompt for but `config set`
 # recognizes without a warning (see docs/kubeai-backend.md).
 BACKEND_SETTINGS = {
+    'postgres_dsn_file': 'Private PostgreSQL authority DSN file; install infer-stack[postgres]. Default is local SQLite.',
+    'server_url': 'Canonical infer-stack control API URL for remote client verbs.',
+    'server_token_file': 'Private client control credential file path.',
+    'server_ca_file': 'Trusted CA PEM path for the control API TLS certificate.',
+    'kubeconfig':
+        'Private administrative kubeconfig path used by infer-stack Kubernetes '
+        'and Helm commands. Explicit command kubeconfig flags take precedence.',
     'kubeai_namespace':
         'Kubernetes namespace the KubeAI chart is installed in '
         '(default: kubeai).',

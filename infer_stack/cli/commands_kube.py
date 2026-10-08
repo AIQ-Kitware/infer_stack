@@ -18,6 +18,7 @@ from ..kube.manage import NVIDIA_DEVICE_PLUGIN_VERSION
 from .commands_kube_worker import K3sExportCLI, K3sOnboardCLI, KubeNodeTestCLI
 from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
+from .remote import RemoteOptions
 
 
 def _namespace(config) -> str:
@@ -79,7 +80,7 @@ def _print_node_lifecycle(plan) -> None:
             print(f'  - {name}')
 
 
-class KubeNodesCLI(_PathOverridesMixin):
+class KubeNodesCLI(RemoteOptions, _PathOverridesMixin):
     """Show the cluster nodes and the GPU facts infer-stack uses."""
 
     __command__ = 'nodes'
@@ -89,11 +90,19 @@ class KubeNodesCLI(_PathOverridesMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
-        manager = KubeManager()
-        try:
-            rows = manager.node_rows(manager.nodes())
-        except RuntimeError as ex:
-            raise SystemExit(str(ex)) from ex
+        from . import remote
+        if remote.server_url(config):
+            report = remote.client(config).request('GET', '/v1/nodes')
+            rows = report['nodes']
+            if report['errors']:
+                import sys
+                print('; '.join(report['errors'].values()), file=sys.stderr)
+        else:
+            manager = KubeManager()
+            try:
+                rows = manager.node_rows(manager.nodes())
+            except RuntimeError as ex:
+                raise SystemExit(str(ex)) from ex
         if config.json:
             print(json.dumps(rows, indent=2, sort_keys=True))
             return 0

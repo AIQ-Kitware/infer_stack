@@ -53,6 +53,7 @@ from ..leasing.envfile import (
 from ..paths import config_root, data_root
 from .context import _apply_path_overrides
 from .options import _AllowedGpusMixin, _DisplayGpuMixin, _PathOverridesMixin
+from .remote import RemoteOptions
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -285,6 +286,7 @@ def _make_backend(config, *, interactive: bool = False):
                 return ClusterGateway(
                     state_dir=data_root() / 'leasing' / 'kubeai-cluster-gateway',
                     namespace=get_setting('kubeai_namespace') or 'kubeai',
+                    kubeconfig=get_setting('kubeconfig') or None,
                     run=_default_kubectl_run,
                     node_port=int(get_setting('kubeai_gateway_node_port')
                                   or DEFAULT_NODE_PORT),
@@ -316,6 +318,7 @@ def _make_backend(config, *, interactive: bool = False):
         backend = KubeaiBackend(
             state_dir=data_root() / 'leasing' / 'kubeai',
             namespace=get_setting('kubeai_namespace') or 'kubeai',
+            kubeconfig=get_setting('kubeconfig') or None,
             base_url=get_setting('kubeai_base_url') or None,
             default_resource_profile=get_setting('kubeai_resource_profile')
             or None,
@@ -337,11 +340,21 @@ def _make_backend(config, *, interactive: bool = False):
 
 def _open_controller(config, *, interactive: bool = False) -> Controller:
     from .._log import configure_logging
+    from ..paths import get_setting
 
+    from .remote import server_url
+    if getattr(config, '__command__', None) != 'server' and server_url(config):
+        raise SystemExit('This verb does not yet support remote control; no local ledger was opened')
     configure_logging()  # narrate the leasing verbs (stderr); off the help path
     _apply_path_overrides(config)
     ledger_path = config.ledger or str(default_ledger_path())
-    ledger = Ledger(SqliteStore(ledger_path))
+    dsn_file = getattr(config, 'postgres_dsn_file', None) or get_setting('postgres_dsn_file')
+    if dsn_file:
+        from ..control.http import private_text
+        from ..leasing.postgres import PostgresStore
+        ledger = Ledger(PostgresStore(private_text(dsn_file)))
+    else:
+        ledger = Ledger(SqliteStore(ledger_path))
     return Controller(ledger, _make_backend(config, interactive=interactive))
 
 
@@ -720,11 +733,19 @@ def _print_front_door(info) -> None:
         print(f'  front door: {info.proxy_url}  (UI: /   API: /v1)')
 
 
-def _resolve_endpoints(catalog, names):
+def _resolve_endpoints(catalog, names, *, node=None, pool=None):
     """``catalog.resolve(names)``: endpoint meanings, bundles expanded."""
     try:
-        return catalog.resolve(names)
-    except CatalogError as ex:
+        endpoints = catalog.resolve(names)
+        if node is not None or pool is not None:
+            from dataclasses import replace
+            from ..leasing.cluster_placement import narrow
+            from ..leasing.endpoints import ManagedTarget
+            if any(not e.managed for e in endpoints):
+                raise ValueError('Cluster placement cannot constrain an external endpoint')
+            endpoints = [replace(e, target=ManagedTarget(narrow([e.to_request()], node=node, pool=pool)[0])) for e in endpoints]
+        return endpoints
+    except (CatalogError, ValueError) as ex:
         raise SystemExit(str(ex))
 
 
@@ -784,6 +805,9 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
     from .._log import logger
     from ..leasing.backend import ConvergeAborted, PlacementError
     from ..leasing.profile import ProfileMismatch
+    from . import remote
+    if remote.server_url(config):
+        return remote.acquire(config, names=_collect_names(config.names), ttl_seconds=ttl_seconds)
 
     render_only = not bool(getattr(config, 'apply', True))
     # Staging (--no-apply) is non-destructive (no docker up), so don't gate it
@@ -807,6 +831,11 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
             raise SystemExit('give at least one endpoint or bundle name')
         sharing = Sharing.DEDICATED if getattr(config, 'dedicated', False) else None
         requests = _resolve(catalog, names, sharing=sharing)
+        from ..leasing.cluster_placement import narrow
+        try:
+            requests = narrow(requests, node=getattr(config, 'node', None), pool=getattr(config, 'pool', None))
+        except ValueError as ex:
+            raise SystemExit(str(ex)) from ex
     logger.info('Acquiring {} for {}', ', '.join(names), owner)
     if render_only:
         logger.info('Render-only: staging the compose project without applying')
@@ -851,7 +880,7 @@ def _do_acquire(config, *, owner: str, ttl_seconds: float | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-class _LeasingCommonMixin(_PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
+class _LeasingCommonMixin(RemoteOptions, _PathOverridesMixin, _AllowedGpusMixin, _DisplayGpuMixin):
     backend = kw.Value(
         None,
         type=str, choices=['null', 'compose', 'kubeai'],
@@ -930,6 +959,9 @@ class _ApprovalMixin(_LeasingCommonMixin):
 
 class _AcquireFlagsMixin(_LeasingCommonMixin):
     catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    node = kw.Value(None, type=str, help='Narrow approved Kubernetes placement to this canonical node; needs an installed selector profile.')
+    pool = kw.Value(None, type=str, help='Narrow approved Kubernetes placement to this administrator-defined pool.')
+    idempotency_key = kw.Value(None, type=str, help='Stable remote acquire retry identity; defaults to a new identity per invocation.')
     base_url = kw.Value(
         'http://127.0.0.1:14042/v1',
         type=str,
@@ -1113,12 +1145,15 @@ class AccessCLI(_AcquireFlagsMixin):
         config = cls.cli(argv=argv, data=kwargs)
         if not config.apply:
             raise SystemExit('access: --no-apply stages a lease; use `acquire --no-apply`')
+        from . import remote
+        if remote.server_url(config):
+            return remote.acquire(config, names=_collect_names(config.names), ttl_seconds=_parse_duration(config.ttl), access=True)
         controller = _open_controller(config)
         catalog = _requests_catalog(controller, config)
         names = _collect_names(config.names)
         if not names:
             raise SystemExit('give at least one endpoint or bundle name')
-        endpoints = _resolve_endpoints(catalog, names)
+        endpoints = _resolve_endpoints(catalog, names, node=config.node, pool=config.pool)
         try:
             result = controller.access(
                 config.owner or _default_owner(), endpoints,
@@ -1202,6 +1237,12 @@ class ApplyCLI(_ApprovalMixin):
         from ..leasing.backend import ConvergeAborted
 
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            result = remote.administer(config, 'reconcile', {})
+            if config.wait and result == 0:
+                return remote.wait(config, names=[])
+            return result
         controller = _open_controller(config, interactive=True)
         try:
             # apply_now() always runs the docker up and publishes anything
@@ -1297,6 +1338,9 @@ class ReleaseCLI(_ApprovalMixin):
         from ..leasing.backend import ConvergeAborted
 
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            return remote.release(config, resolve_lease=_resolve_lease)
         controller = _open_controller(config, interactive=True)
 
         if config.all:
@@ -1395,10 +1439,13 @@ class EvictCLI(_ApprovalMixin):
         from ..leasing.backend import ConvergeAborted
 
         config = cls.cli(argv=argv, data=kwargs)
-        controller = _open_controller(config, interactive=True)
         names = _collect_names(config.names)
         if not names and not config.all:
             raise SystemExit('evict: give an endpoint/deployment name or --all')
+        from . import remote
+        if remote.server_url(config):
+            return remote.evict(config, names=names)
+        controller = _open_controller(config, interactive=True)
         missing: list[str] = []
         try:
             if config.all:
@@ -1481,6 +1528,11 @@ class GcCLI(_ApprovalMixin):
         from ..leasing.profile import ProfileMismatch
 
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            if config.orphans or config.forget:
+                raise SystemExit('Remote gc supports TTL reclamation and --evict; history pruning and orphan removal require server administration')
+            return remote.administer(config, 'gc', {'evict_idle': bool(config.evict)})
         controller = _open_controller(config, interactive=True)
         if config.forget:
             n_leases, n_deployments = controller.prune()
@@ -1685,6 +1737,9 @@ class WaitCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            return remote.wait(config, names=_collect_names(config.names))
         controller = _open_controller(config)
         _, deployments = controller.ledger.status(virtual_expiry=True)
         live = [g for g in deployments if g.state == DeploymentState.LIVE]
@@ -1942,6 +1997,14 @@ class TuiCLI(_LeasingCommonMixin):
         from ..paths import settings_path
 
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            try:
+                from ..control.tui import run_tui as run_remote_tui
+            except ImportError as ex:
+                raise SystemExit('Remote TUI requires pip install "infer-stack[tui]"') from ex
+            return run_remote_tui(remote.client(config), interval=float(config.interval),
+                                  exit_after_paint=bool(config.exit_after_paint))
         try:
             from ..tui import run_tui
         except ImportError as ex:
@@ -1980,10 +2043,13 @@ class RenewCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        controller = _open_controller(config)
         sid = _resolve_lease(config, 'renew')
         if not sid:
             raise SystemExit('renew: give a lease id or --env-file')
+        from . import remote
+        if remote.server_url(config):
+            return remote.renew(config, lease_id=sid, ttl_seconds=_parse_duration(config.ttl))
+        controller = _open_controller(config)
         # Through the controller: a renew can revive an idle deployment, which
         # is a desired-state change and must be serialised with applies.
         from ..leasing.backend import PlacementError
@@ -2022,6 +2088,8 @@ class RunCLI(_LeasingCommonMixin):
     __command__ = 'run'
 
     catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
+    node = kw.Value(None, type=str, help='Canonical Kubernetes node constraint.')
+    pool = kw.Value(None, type=str, help='Administrator-approved Kubernetes pool constraint.')
     endpoint = kw.Value(
         None,
         type=str,
@@ -2049,15 +2117,18 @@ class RunCLI(_LeasingCommonMixin):
         config = cls.cli(argv=argv, data=kwargs)
         from ..leasing.profile import ProfileMismatch
 
-        controller = _open_controller(config)
-        catalog = _requests_catalog(controller, config)
         names = _collect_names(config.endpoint)
         command = list(config.command or [])
         if not names:
             raise SystemExit('run: --endpoint is required')
         if not command:
             raise SystemExit('run: give a command after --')
-        endpoints = _resolve_endpoints(catalog, names)
+        from . import remote
+        if remote.server_url(config):
+            return remote.run(config, names=names, ttl_seconds=_parse_duration(config.ttl), command=command)
+        controller = _open_controller(config)
+        catalog = _requests_catalog(controller, config)
+        endpoints = _resolve_endpoints(catalog, names, node=config.node, pool=config.pool)
         try:
             result = controller.access(
                 config.owner or _default_owner(),
@@ -2094,6 +2165,7 @@ class RunCLI(_LeasingCommonMixin):
             endpoints=result.endpoints,
         )
         env = dict(os.environ)
+        env.pop('INFER_STACK_LEASE_ID', None)
         env.update(descriptor_env(descriptor))
         try:
             proc = subprocess.run(command, env=env)
@@ -2285,6 +2357,9 @@ class LeasesCLI(_LeasingCommonMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
+        from . import remote
+        if remote.server_url(config):
+            return remote.status(config)
         controller = _open_controller(config)
         leases, deployments = controller.ledger.status(virtual_expiry=True)
         observed, assignments = _placement_view(controller)

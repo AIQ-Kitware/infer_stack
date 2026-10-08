@@ -80,3 +80,11 @@ def test_append_is_idempotent_and_refuses_overlap_after_reopen(tmp_path):
 def test_invalid_facts_cannot_be_integrated(kw):
     with pytest.raises(ValueError):
         energy(interval(**kw))
+
+
+def test_usage_cli_empty_is_read_only(tmp_path, capsys):
+    from infer_stack.cli.commands_usage import UsageCLI
+    from infer_stack.paths import data_root
+    UsageCLI.main(argv=False, json=True)
+    assert capsys.readouterr().out.strip() == '[]'
+    assert not (data_root() / 'usage').exists()
