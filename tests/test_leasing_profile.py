@@ -86,15 +86,17 @@ def test_drift_is_warned_once(tmp_path):
     assert len(warnings) == 1 and 'ui' in warnings[0]
 
 
-def test_acquire_auto_adopts_current_catalog_when_quiescent(tmp_path):
+def test_a_quiescent_acquire_publishes_its_catalog_beside_the_others(tmp_path):
+    """Quiescence lets settings change; it does not unpublish endpoints
+    (campaign 2 decision 1: an external endpoint has no lease to keep it)."""
     a = Catalog.from_dict(cat('alpha'))
     b = Catalog.from_dict(cat('beta'))
     ledger, ctl = controller(tmp_path, catalog=a)
-    ctl.gc()                                              # freezes {alpha}
+    ctl.apply_now()                                       # publishes {alpha}
     _, ctl2 = controller(tmp_path, catalog=b)
     out = ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
     assert out.lease.endpoints == ['beta']
-    assert set(ctl2.backend.catalog.endpoints) == {'beta'}
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
     assert ledger.publication_pending() is None
 
 
@@ -129,13 +131,13 @@ def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path)
     _, ctl3 = controller(tmp_path, catalog=changed)
     out = ctl3.acquire('y', changed.resolve_names(['alpha']), wait=False)
     assert out.lease.endpoints == ['alpha']
-    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').to_request().capacity['max_model_len'] == 1024
 
 
 def test_union_of_catalogs_serves_either_runbook(tmp_path):
     union = CatalogUnion.from_sources([cat('alpha'), cat('beta')])
     ledger, ctl = controller(tmp_path, catalog=union)
-    ctl.gc()
+    ctl.apply_now()
     # A runbook that only knows `beta` passes its own catalog: no drift, accepted.
     b = Catalog.from_dict(cat('beta'))
     _, ctl2 = controller(tmp_path, catalog=b)
@@ -281,25 +283,16 @@ def test_publish_on_a_fresh_ledger_that_does_not_complete_stores_nothing(tmp_pat
     assert ledger.publication_pending() is None
 
 
-def test_a_declined_recovery_render_keeps_the_crashed_acquires_scope(tmp_path):
-    from infer_stack.leasing.backend import ConvergeAborted
-
+def test_a_stale_scope_from_pre_admission_code_is_dropped(tmp_path):
+    """No render needs a crashed legacy acquire's scope: its row stays
+    unresolved (see above), so the next change simply clears it."""
     a = Catalog.from_dict(cat('alpha'))
     ledger, ctl = controller(tmp_path, catalog=a)
     ctl.gc()
     ledger.mark_publication_pending(apply_requested=True,
                                     placement_context={'allowed_gpus': [3]})
-    ledger.acquire('x', a.resolve_names(['alpha']))
-    _, ctl2 = controller(tmp_path, catalog=a, allowed_gpus=[0])
-
-    def decline(planned):
-        raise ConvergeAborted('no')
-
-    ctl2.backend._approve_changes = decline
-    with pytest.raises(ConvergeAborted):
-        ctl2.gc()
-    assert ledger.publication_pending()['placement_context'] == {'allowed_gpus': [3]}
-
+    ctl.acquire('x', a.resolve_names(['alpha']), wait=False, apply=False)
+    assert ledger.publication_pending()['placement_context'] is None
 
 def test_cli_catalog_edit_then_acquire_needs_no_publish_step(tmp_path, monkeypatch):
     from infer_stack.cli import commands_leasing as cl
@@ -528,7 +521,7 @@ def test_a_publish_that_never_commits_leaves_no_append_only_state(tmp_path):
     ledger, ctl = controller(tmp_path, catalog=a)
     ctl.gc()
     before = ledger.profile()
-    registry = ctl.backend._registry_file
+    registry = ctl.backend.gateway._registry_file
     registry_before = registry.read_text() if registry.exists() else None
 
     def crash(*args, **kw):
@@ -579,7 +572,7 @@ def test_env_writes_hold_the_publication_lock(tmp_path, monkeypatch):
             handle.close()
 
     monkeypatch.setattr(cl, 'write_env_file', write)
-    monkeypatch.setattr(cl, '_secret_env_path', lambda: tmp_path / '.env')
+    monkeypatch.setattr(cl, '_secret_env_path', lambda config=None: tmp_path / '.env')
     assert cl.EnvCLI.main(argv=['HF_TOKEN=x']) == 0
     assert held == [True]
 
@@ -608,7 +601,7 @@ def test_redefining_an_endpoint_nothing_runs_does_not_block_the_host(tmp_path):
     out = ctl2.acquire('y', changed.resolve_names(['beta']), wait=False)
 
     assert out.lease.endpoints == ['beta']
-    assert ctl2.backend.catalog.resolve_endpoint('beta').capacity['max_model_len'] == 4096
+    assert ctl2.backend.catalog.resolve_endpoint('beta').to_request().capacity['max_model_len'] == 4096
     # ...and the resident definition is still frozen as it was.
     assert 'alpha' in ctl2.backend.catalog.endpoints
     assert ledger.get_lease(live.lease.id).state == 'active'
@@ -629,4 +622,60 @@ def test_an_idle_but_resident_keep_warm_definition_stays_frozen(tmp_path):
     ctl2.evict(None)                               # evicting it frees the definition
     _, ctl3 = controller(tmp_path, catalog=changed, docker=docker)
     ctl3.acquire('z', changed.resolve_names(['alpha']), wait=False)
-    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').to_request().capacity['max_model_len'] == 1024
+
+
+def test_catalogs_naming_one_model_differently_agree_on_its_endpoint():
+    """Endpoint meaning is the resolved request, not the catalog's model key
+    (campaign 2, item 29): `alias-a` and `alias-b` for one source agree."""
+    from infer_stack.leasing.profile import CatalogUnion
+
+    def cat(model_key):
+        return {'models': {model_key: {'source': 'hf://org/m'}},
+                'endpoints': {'qwen': {'engine': 'vllm', 'model': model_key}}}
+
+    union = CatalogUnion.from_sources([cat('alias-a'), cat('alias-b')])
+    assert list(union.endpoints) == ['qwen']
+    a, b = (Catalog.from_dict(cat(k)).resolve_endpoint('qwen') for k in ('alias-a', 'alias-b'))
+    assert a.semantic_key() == b.semantic_key()
+
+
+# -- the published endpoint union (campaign 2, decision 1) ---------------------------
+
+
+def test_quiescence_adopts_new_settings_but_keeps_published_endpoints(tmp_path):
+    a = Catalog.from_dict(cat('alpha'))
+    b = Catalog.from_dict(cat('beta'))
+    ledger, ctl = controller(tmp_path, catalog=a, ui=True)
+    ctl.apply_now()                                       # freezes ui=True, {alpha}
+    _, ctl2 = controller(tmp_path, catalog=b, ui=False)
+    ctl2.acquire('x', b.resolve_names(['beta']), wait=False)
+    assert ledger.profile()['ui'] is False               # settings: the invocation's
+    assert set(ctl2.backend.catalog.endpoints) == {'alpha', 'beta'}
+
+
+def test_a_live_redefinition_drops_only_the_redefined_name(tmp_path):
+    """A conflict used to drop every unpinned published definition; an
+    external endpoint published by another runbook would have gone with it."""
+    def beta(**runtime):
+        return {'engine': 'vllm', 'model': 'm', 'reclaim': 'stop',
+                **({'runtime': runtime} if runtime else {})}
+
+    other = Catalog.from_dict({
+        'models': {'m': {'source': 'hf://org/beta'}},
+        'endpoints': {'beta': beta(),
+                      'remote': {'external': {'api_base': 'http://box/v1', 'model': 'q'}}},
+    })
+    edited = Catalog.from_dict({'models': {'m': {'source': 'hf://org/beta'}},
+                                'endpoints': {'beta': beta(max_model_len=1024)}})
+    a = Catalog.from_dict(cat('alpha'))
+    ledger, ctl = controller(tmp_path, catalog=a)
+    ctl.acquire('a', a.resolve_names(['alpha']), wait=False)       # alpha live, pinned
+    _, ctl2 = controller(tmp_path, catalog=other)
+    lease = ctl2.acquire('b', other.resolve_names(['beta']), wait=False).lease
+    ctl2.release(lease.id)                                          # beta stopped: unpinned
+    _, ctl3 = controller(tmp_path, catalog=edited)
+    ctl3.acquire('c', edited.resolve_names(['beta']), wait=False)   # redefines beta
+    published = ctl3.backend.catalog
+    assert {'alpha', 'beta', 'remote'} <= set(published.endpoints)
+    assert published.resolve_endpoint('beta').to_request().capacity == {'max_model_len': 1024}

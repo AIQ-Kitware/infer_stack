@@ -82,15 +82,23 @@ class SuggestionModel:
     # are case-insensitive substrings of the detected nvidia-smi GPU name. A
     # portable model leaves the list empty.
     gpu_name_hints: list[str] = field(default_factory=list)
-    # A recipe that cannot run before Ampere (no bf16, or a CUDA that dropped
-    # the architecture) sets this; the check is the name sniff below.
+    # A model source that cannot be useful before Ampere can still set this
+    # coarse gate.  More commonly, serving-profile hardware requirements belong
+    # in ``default_hardware`` / endpoint variants so one model source can expose
+    # different launch strategies on different GPU classes.
     requires_ampere: bool = False
+    # Optional class constraints for the *default endpoint* only.  Supported
+    # keys mirror variant gates: min/max compute capability, min/max per-GPU
+    # VRAM, and gpu_name_hints.  This lets a model source remain suggestible on
+    # (say) high-VRAM Turing while the normal default endpoint stays Ampere+.
+    default_hardware: dict[str, Any] = field(default_factory=dict)
     defaults: dict[str, Any] = field(default_factory=dict)
-    # Optional named endpoint variants. Each variant can gate itself on GPU-name
-    # substrings and overlay generic runtime fields on the model defaults. The
-    # generated endpoint is named ``<model>-<variant>`` and still references the
-    # same model source. This is intentionally suggestion-time convenience, not
-    # a runtime recipe mechanism.
+    # Optional named endpoint variants. Each variant can gate itself on GPU
+    # capability / VRAM classes (and, for true measured exceptions, name
+    # substrings) then overlay generic runtime fields on the model defaults.
+    # The generated endpoint is named ``<model>-<variant>`` and still references
+    # the same model source. This remains suggestion-time convenience, not a
+    # runtime recipe mechanism.
     endpoint_variants: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
@@ -113,6 +121,7 @@ class SuggestionModel:
                 str(v).lower() for v in (spec.get('gpu_name_hints') or [])
             ],
             requires_ampere=bool(spec.get('requires_ampere', False)),
+            default_hardware=copy.deepcopy(spec.get('default_hardware') or {}),
             defaults=copy.deepcopy(spec.get('defaults') or {}),
             endpoint_variants=copy.deepcopy(spec.get('endpoint_variants') or {}),
         )
@@ -191,21 +200,24 @@ def migrate_known_suggestion_aliases(data: dict[str, Any]) -> list[str]:
 # the join: inventory × pool → derived runtime
 # ---------------------------------------------------------------------------
 
-# GPUs that predate Ampere (compute capability < 8.0) have no bf16, so vLLM must
-# be pinned to fp16 (``--dtype=half``). The inventory does not yet carry the
-# compute capability (``detect_inventory`` queries name/memory/display only), so
-# we sniff the GPU *name*. This is the one place that wants a real signal: adding
-# ``compute_cap`` to the nvidia-smi query in hardware.py would make this exact.
-_PRE_AMPERE_NAME_HINTS = (
-    'quadro rtx',  # Turing Quadro (RTX 8000/6000/5000/4000) — e.g. yardrat
+# GPUs that predate Ampere (compute capability < 8.0) have no native bf16, so
+# stock vLLM must be pinned to fp16 (``--dtype=half``).  Current inventories carry
+# compute capability when nvidia-smi exposes it; these name hints remain only as
+# a compatibility fallback for older drivers and historical/synthetic inventory
+# dictionaries that predate that field.
+_TURING_NAME_HINTS = (
+    'quadro rtx',  # RTX 8000/6000/5000/4000 — e.g. yardrat
     'titan rtx',
-    'titan v',
     'tesla t4',
     ' t4',
+    'rtx 20',  # GeForce RTX 2080 etc.
+    'gtx 16',  # GTX 1660
+)
+
+_PRE_AMPERE_NAME_HINTS = _TURING_NAME_HINTS + (
+    'titan v',
     'tesla v100',
     'v100',
-    'rtx 20',  # GeForce RTX 2080 etc. (Turing)
-    'gtx 16',  # GTX 1660 (Turing, no tensor cores)
     'gtx 10',  # Pascal
     'tesla p100',
     'tesla p40',
@@ -221,6 +233,23 @@ def _gpu_mem(gpu: dict[str, Any]) -> float:
     return float(gpu.get('memory_gib') or 0.0)
 
 
+def _gpu_compute_cap(gpu: dict[str, Any]) -> float | None:
+    value = gpu.get('compute_cap')
+    if value in (None, ''):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gpu_needs_fp16(gpu: dict[str, Any]) -> bool:
+    cap = _gpu_compute_cap(gpu)
+    if cap is not None:
+        return cap < 8.0
+    return _needs_fp16(gpu.get('name'))
+
+
 def _name_matches_hints(gpu: dict[str, Any], hints: list[str]) -> bool:
     if not hints:
         return True
@@ -228,56 +257,87 @@ def _name_matches_hints(gpu: dict[str, Any], hints: list[str]) -> bool:
     return any(str(hint).lower() in name for hint in hints)
 
 
+def _compute_cap_matches(
+    gpu: dict[str, Any], *, min_cap: float | None, max_cap: float | None
+) -> bool:
+    """Match a capability class, with a conservative name fallback.
+
+    Real inventories now carry ``compute_cap``.  Older nvidia-smi versions and
+    historical/synthetic inventory dictionaries may not.  For the only coarse
+    boundary infer-stack previously understood (pre-Ampere vs Ampere+), retain
+    the established GPU-name fallback instead of making an unknown capability
+    silently exclude all suggestions.
+    """
+    cap = _gpu_compute_cap(gpu)
+    if cap is not None:
+        if min_cap is not None and cap < min_cap:
+            return False
+        if max_cap is not None and cap > max_cap:
+            return False
+        return True
+
+    name = str(gpu.get('name') or '').lower()
+    pre_ampere = _needs_fp16(name)
+    if min_cap is not None and min_cap >= 8.0:
+        return not pre_ampere
+    if max_cap is not None and max_cap < 8.0:
+        # The full-context HyperQwen evidence is specifically sm75.  When an
+        # old driver cannot expose compute_cap, distinguish Turing from older
+        # Pascal/Volta rather than treating every pre-Ampere card as sm75.
+        if min_cap is not None and min_cap >= 7.5:
+            return any(hint in name for hint in _TURING_NAME_HINTS)
+        return pre_ampere
+    return True
+
+
+def _gpu_matches_constraints(
+    gpu: dict[str, Any], constraints: dict[str, Any]
+) -> bool:
+    hints = [str(v).lower() for v in (constraints.get('gpu_name_hints') or [])]
+    if not _name_matches_hints(gpu, hints):
+        return False
+
+    min_vram = constraints.get('min_vram_gib_per_replica')
+    if min_vram is not None and _gpu_mem(gpu) < float(min_vram):
+        return False
+    max_vram = constraints.get('max_vram_gib_per_replica')
+    if max_vram is not None and _gpu_mem(gpu) > float(max_vram):
+        return False
+
+    min_cap = constraints.get('min_compute_cap')
+    max_cap = constraints.get('max_compute_cap')
+    return _compute_cap_matches(
+        gpu,
+        min_cap=None if min_cap is None else float(min_cap),
+        max_cap=None if max_cap is None else float(max_cap),
+    )
+
+
 def _gpu_is_eligible(model: SuggestionModel, gpu: dict[str, Any]) -> bool:
     if _gpu_mem(gpu) < model.min_vram_gib_per_replica:
         return False
-    if model.requires_ampere and _needs_fp16(gpu.get('name')):
+    if model.requires_ampere and not _compute_cap_matches(
+        gpu, min_cap=8.0, max_cap=None
+    ):
         return False
     if not _name_matches_hints(gpu, model.gpu_name_hints):
         return False
     return True
 
 
-def fits_on(model: SuggestionModel, gpus: list[dict[str, Any]]) -> bool:
-    """True iff ``preferred_gpu_count`` GPUs each hold one replica's VRAM."""
-    eligible = [g for g in gpus if _gpu_is_eligible(model, g)]
-    return len(eligible) >= model.preferred_gpu_count
-
-
-def _host_gpus(
-    model: SuggestionModel, gpus: list[dict[str, Any]]
+def _profile_host_gpus(
+    model: SuggestionModel,
+    constraints: dict[str, Any],
+    gpus: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """The GPUs this model would most plausibly land on (smallest that fit).
-
-    Picking the *smallest* viable GPUs (rather than the largest) makes the
-    derived ``gpu_memory_utilization`` honest: it must reserve enough on the
-    tightest GPU the placer might choose, not the roomiest.
-    """
-    big_enough = sorted(
-        (g for g in gpus if _gpu_is_eligible(model, g)),
-        key=_gpu_mem,
-    )
-    return big_enough[: model.preferred_gpu_count]
-
-
-def _variant_host_gpus(
-    model: SuggestionModel, variant: dict[str, Any], gpus: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Return the concrete GPUs that make a suggestion-only variant valid.
-
-    Variant gates refine the model's ordinary eligibility. A GPU-name gate is
-    also a placement promise: when it is present, the generated endpoint is
-    pinned to the matching GPU(s) so a later best-fit placement cannot move the
-    measured profile onto different hardware.
-    """
-    hints = [str(v).lower() for v in (variant.get('gpu_name_hints') or [])]
+    """Smallest concrete GPUs satisfying model + serving-profile constraints."""
     min_vram = float(
-        variant.get('min_vram_gib_per_replica')
+        constraints.get('min_vram_gib_per_replica')
         or model.min_vram_gib_per_replica
         or 0.0
     )
     count = int(
-        variant.get('preferred_gpu_count')
+        constraints.get('preferred_gpu_count')
         or model.preferred_gpu_count
         or 1
     )
@@ -286,11 +346,74 @@ def _variant_host_gpus(
             gpu for gpu in gpus
             if _gpu_is_eligible(model, gpu)
             and _gpu_mem(gpu) >= min_vram
-            and _name_matches_hints(gpu, hints)
+            and _gpu_matches_constraints(gpu, constraints)
         ),
         key=_gpu_mem,
     )
     return eligible[:count] if len(eligible) >= count else []
+
+
+def _default_host_gpus(
+    model: SuggestionModel, gpus: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    return _profile_host_gpus(model, model.default_hardware, gpus)
+
+
+def _variant_host_gpus(
+    model: SuggestionModel, variant: dict[str, Any], gpus: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    return _profile_host_gpus(model, variant, gpus)
+
+
+def _profile_needs_pin(
+    model: SuggestionModel,
+    constraints: dict[str, Any],
+    gpus: list[dict[str, Any]],
+) -> bool:
+    """Whether runtime placement cannot express this suggestion's class gate.
+
+    ``placement.min_vram_gib`` is portable, but today's live catalog has no
+    compute-capability/max-VRAM predicate.  Keep a class-based suggestion
+    portable when every GPU that could satisfy the min-VRAM floor is also in
+    the class; otherwise exact-pin the endpoint selected during suggestion so a
+    heterogeneous host cannot later move it onto incompatible hardware.
+    """
+    class_keys = {
+        'min_compute_cap', 'max_compute_cap', 'max_vram_gib_per_replica',
+        'gpu_name_hints',
+    }
+    if not any(constraints.get(key) not in (None, [], '') for key in class_keys):
+        return False
+    min_vram = float(
+        constraints.get('min_vram_gib_per_replica')
+        or model.min_vram_gib_per_replica
+        or 0.0
+    )
+    generic_candidates = [
+        gpu for gpu in gpus
+        if _gpu_is_eligible(model, gpu) and _gpu_mem(gpu) >= min_vram
+    ]
+    return any(
+        not _gpu_matches_constraints(gpu, constraints)
+        for gpu in generic_candidates
+    )
+
+
+def _host_gpus(
+    model: SuggestionModel, gpus: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Backward-compatible helper for the model's default endpoint profile."""
+    return _default_host_gpus(model, gpus)
+
+
+def fits_on(model: SuggestionModel, gpus: list[dict[str, Any]]) -> bool:
+    """True iff the default endpoint or at least one variant fits this host."""
+    if _default_host_gpus(model, gpus):
+        return True
+    return any(
+        _variant_host_gpus(model, variant, gpus)
+        for variant in model.endpoint_variants.values()
+    )
 
 
 def _merge_runtime(
@@ -323,7 +446,13 @@ def derive_runtime(
     * ``tensor_parallel_size`` — ``preferred_gpu_count`` when > 1.
     * ``extra_args: [--dtype=half]`` — only on pre-Ampere GPUs (no bf16).
     """
-    host = _host_gpus(model, gpus)
+    # ``gpus`` may already be the concrete host set selected for a hardware-
+    # gated variant, so do not re-apply the default endpoint's constraints here.
+    # Only the model-level source constraints remain relevant to runtime sizing.
+    host = sorted(
+        (g for g in gpus if _gpu_is_eligible(model, g)),
+        key=_gpu_mem,
+    )[: model.preferred_gpu_count]
     host_mem = min((_gpu_mem(g) for g in host), default=0.0)
 
     runtime: dict[str, Any] = {}
@@ -359,6 +488,9 @@ def derive_runtime(
 
     if model.preferred_gpu_count > 1:
         runtime['tensor_parallel_size'] = model.preferred_gpu_count
+        # Workers across GPUs talk through /dev/shm; Docker's default is
+        # 64 MiB (vLLM's Docker guidance: a few GiB, or ipc: host).
+        runtime['shm_size'] = '16g'
 
     if model.defaults.get('enable_prefix_caching'):
         runtime['enable_prefix_caching'] = True
@@ -372,11 +504,33 @@ def derive_runtime(
         if model.defaults.get(key):
             runtime[key] = copy.deepcopy(model.defaults[key])
 
-    if any(_needs_fp16(g.get('name')) for g in host) and 'command' not in runtime:
+    if any(_gpu_needs_fp16(g) for g in host) and 'command' not in runtime:
         # Stock vLLM only: a custom launcher takes no vLLM flags directly.
         runtime['extra_args'] = ['--dtype=half']
 
     return runtime
+
+
+#: A simulator endpoint for a host without a GPU (``catalog suggest
+#: --simulator``): llm-d-inference-sim answers like vLLM with random text, so
+#: the whole workflow (acquire, the gateway, a request, release) runs here.
+#: Never a result. The same entry as dev/e2e_tests/catalog-mock.yaml's.
+SIMULATOR_FRAGMENT: dict[str, Any] = {
+    'models': {'smol135': {'source': 'hf://HuggingFaceTB/SmolLM2-135M-Instruct'}},
+    'endpoints': {'mock-smol': {
+        'engine': 'vllm',
+        'model': 'smol135',
+        'runtime': {
+            'image': 'ghcr.io/llm-d/llm-d-inference-sim:v0.9.0',
+            'max_model_len': 2048,
+            'max_num_seqs': 8,
+            'simulator': {'kind': 'llm-d-sim', 'mode': 'random', 'seed': 20260731,
+                          'time_to_first_token': '120ms',
+                          'inter_token_latency': '8ms', 'startup_duration': '10s'},
+        },
+        'reclaim': {'policy': 'stop'},
+    }},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -415,51 +569,92 @@ def suggest_catalog(
     endpoints: dict[str, Any] = {}
     for rank, model in enumerate(fitting):
         models[model.name] = {'source': f'hf://{model.hf_model_id}'}
-        endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
-        if model.min_vram_gib_per_replica > 0:
-            endpoint['placement'] = {
-                'min_vram_gib': model.min_vram_gib_per_replica,
+
+        default_host = _default_host_gpus(model, gpus)
+        if default_host:
+            endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
+            if model.min_vram_gib_per_replica > 0:
+                endpoint['placement'] = {
+                    'min_vram_gib': model.min_vram_gib_per_replica,
+                }
+            if model.gpu_name_hints or _profile_needs_pin(
+                model, model.default_hardware, gpus
+            ):
+                # Hardware-class gates are suggestion-time facts.  The live
+                # placement schema currently expresses only min VRAM + exact
+                # indices, so pin only when a heterogeneous host could otherwise
+                # move the generated endpoint outside the selected class.
+                endpoint.setdefault('placement', {})['gpu_indices'] = [
+                    int(g['index']) for g in default_host
+                ]
+            runtime = derive_runtime(model, default_host)
+            if runtime:
+                endpoint['runtime'] = runtime
+            endpoint['reclaim'] = {
+                'policy': 'keep-warm' if rank == 0 else 'stop'
             }
-        if model.gpu_name_hints:
-            # Hardware-specific recipes are only suggested after a concrete
-            # inventory match. Preserve that decision in the generated
-            # catalog: a later generic best-fit pass must not move the endpoint
-            # onto a different same-size GPU the recipe was never measured on.
-            host = _host_gpus(model, gpus)
-            endpoint.setdefault('placement', {})['gpu_indices'] = [
-                int(g['index']) for g in host
-            ]
-        runtime = derive_runtime(model, gpus)
-        if runtime:
-            endpoint['runtime'] = runtime
-        endpoint['reclaim'] = {'policy': 'keep-warm' if rank == 0 else 'stop'}
-        endpoints[model.name] = endpoint
+            endpoints[model.name] = endpoint
 
         # Variants are additional endpoint suggestions over the same model, not
-        # duplicate model identities. They exist only when their hardware gates
-        # match this inventory. The live catalog is fully explicit afterwards:
-        # apply/acquire never re-detects a GPU and silently changes a profile.
+        # duplicate model identities.  A model can now be useful solely through
+        # variants (for example the full-context Turing HyperQwen path) even when
+        # its ordinary default endpoint targets another GPU class.
+        matching_variants: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
         for variant_name, variant in model.endpoint_variants.items():
             variant_host = _variant_host_gpus(model, variant, gpus)
-            if not variant_host:
-                continue
-            variant_endpoint = copy.deepcopy(endpoint)
+            if variant_host:
+                matching_variants.append((variant_name, variant, variant_host))
+
+        preferred_variant = None
+        if not default_host and matching_variants:
+            preferred_variant = next(
+                (
+                    name for name, variant, _host in matching_variants
+                    if variant.get('preferred')
+                ),
+                matching_variants[0][0],
+            )
+
+        for variant_name, variant, variant_host in matching_variants:
+            variant_endpoint: dict[str, Any] = {
+                'engine': 'vllm',
+                'model': model.name,
+            }
+            placement: dict[str, Any] = {}
+            min_vram = variant.get('min_vram_gib_per_replica')
+            if min_vram is None:
+                min_vram = model.min_vram_gib_per_replica
+            if min_vram:
+                placement['min_vram_gib'] = min_vram
+            if model.gpu_name_hints or _profile_needs_pin(model, variant, gpus):
+                placement['gpu_indices'] = [
+                    int(g['index']) for g in variant_host
+                ]
+            if placement:
+                variant_endpoint['placement'] = placement
+
             variant_runtime = derive_runtime(model, variant_host)
+            runtime_overrides = dict(variant.get('runtime') or {})
+            # Most variants want deep inheritance (e.g. change only CTX/SPEC),
+            # but a different launcher may need a wholly different env mapping.
+            # Keep replacement explicit in suggestion data rather than adding
+            # model-specific branches here.
+            for key in variant.get('runtime_replace_keys') or []:
+                variant_runtime.pop(str(key), None)
             variant_runtime = _merge_runtime(
-                variant_runtime, dict(variant.get('runtime') or {})
+                variant_runtime, runtime_overrides
             )
             if variant_runtime:
                 variant_endpoint['runtime'] = variant_runtime
-            placement = dict(variant_endpoint.get('placement') or {})
-            if variant.get('gpu_name_hints'):
-                placement['gpu_indices'] = [int(g['index']) for g in variant_host]
-            if variant.get('min_vram_gib_per_replica') is not None:
-                placement['min_vram_gib'] = variant['min_vram_gib_per_replica']
-            if placement:
-                variant_endpoint['placement'] = placement
-            variant_endpoint['reclaim'] = {
-                'policy': str(variant.get('reclaim_policy') or 'stop')
-            }
+
+            policy = variant.get('reclaim_policy')
+            if policy is None:
+                policy = (
+                    'keep-warm'
+                    if rank == 0 and preferred_variant == variant_name
+                    else 'stop'
+                )
+            variant_endpoint['reclaim'] = {'policy': str(policy)}
             endpoints[f'{model.name}-{variant_name}'] = variant_endpoint
 
     return {'models': models, 'endpoints': endpoints}

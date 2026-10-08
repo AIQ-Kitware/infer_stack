@@ -554,6 +554,12 @@ def test_a_wrong_key_is_rejected():
             _post_with(server.url + '/v1/completions',
                        {'model': 'strong', 'prompt': 'hi'}, token='sk-wrong')
         assert excinfo.value.code == 401
+        # Consume the response body before closing the HTTPError.  urllib can
+        # otherwise leave its response socket pending until GC, which Python
+        # 3.13 reports as a ResourceWarning under the full suite.
+        error = json.loads(excinfo.value.read())['error']
+        assert error['code'] == 'invalid_api_key'
+        excinfo.value.close()
 
 
 def test_auth_is_off_unless_asked_for():

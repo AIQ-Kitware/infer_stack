@@ -35,7 +35,7 @@ def _render(endpoint_name: str):
     endpoint = catalog['endpoints'][endpoint_name]
     runtime = dict(endpoint.get('runtime') or {})
     hf_id = catalog['models'][endpoint['model']]['source'].split('://', 1)[-1]
-    served = endpoint.get('public_name', endpoint_name)
+    served = endpoint.get('served_name', endpoint.get('public_name', endpoint_name))
 
     spec = {
         'engine': 'vllm', 'hf_model_id': hf_id, 'served_model_name': served,
@@ -166,7 +166,7 @@ FIXTURE_ON_DISK = (
 
 def _deployment_spec(endpoint_name: str) -> dict:
     """Resolve an oracle endpoint the way a real acquire does."""
-    request = Catalog.load(CATALOG).resolve_endpoint(endpoint_name)
+    request = Catalog.load(CATALOG).resolve_endpoint(endpoint_name).to_request()
     return request.spec
 
 

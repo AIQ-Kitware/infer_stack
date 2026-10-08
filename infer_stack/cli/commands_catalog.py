@@ -16,10 +16,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import scriptconfig as scfg
+import kwconf as kw
 import yaml
 
 from ..leasing import Catalog, CatalogError
+from ..leasing.catalog_edit import (
+    SECTIONS,
+    dump_catalog_source,
+    load_catalog_source,
+    next_indexed_name,
+    slug_alias,
+    write_catalog_source,
+)
 from ..paths import config_root
 from .context import _apply_path_overrides
 from .options import (
@@ -29,7 +37,6 @@ from .options import (
     _SimulateHardwareMixin,
 )
 
-SECTIONS = ('models', 'endpoints', 'runtime_hosts', 'bundles')
 
 
 def _print_yaml(text: str) -> None:
@@ -66,34 +73,12 @@ def _catalog_path(config) -> Path:
     return config_root() / 'catalog.yaml'
 
 
-def _load_raw(path: Path) -> dict[str, Any]:
-    data = yaml.safe_load(path.read_text()) if path.exists() else {}
-    data = data or {}
-    for section in SECTIONS:
-        data.setdefault(section, {})
-    return data
-
-
-def _validate(data: dict[str, Any]) -> None:
-    """Refuse to persist a catalog the leasing path would reject."""
-    try:
-        Catalog.from_dict(data)
-    except CatalogError as ex:
-        raise SystemExit(f'refusing to write an invalid catalog: {ex}')
-
-
-def _save_raw(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> None:
-    # Drop empty sections for a tidy file.
-    out = {k: v for k, v in data.items() if v or k == 'models'}
-    text = yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+def _save_catalog(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> None:
+    """Publish through the canonical catalog writer; dry-run only presents it."""
     if dry_run:
-        _print_yaml(text)
-        return
-    _validate(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(text)
-    tmp.replace(path)
+        _print_yaml(dump_catalog_source(data))
+    else:
+        write_catalog_source(path, data)
 
 
 def _exists_guard(data, section, name, force, entry, hint='') -> str:
@@ -129,39 +114,12 @@ def _exists_guard(data, section, name, force, entry, hint='') -> str:
     )
 
 
-def _next_indexed_name(existing, base: str) -> str:
-    """First free ``{base}-{N}`` (N starting at 1) not already in ``existing``.
-
-    Defaulted endpoint names get a numeric suffix so repeated ``endpoint add``
-    for the same model don't collide — they accumulate as ``base-1``, ``base-2``,
-    … and the first is deterministically ``base-1``.
-    """
-    n = 1
-    while f'{base}-{n}' in existing:
-        n += 1
-    return f'{base}-{n}'
-
-
-def _slug_alias(text: str) -> str:
-    """Make ``text`` safe to use as an endpoint alias.
-
-    An endpoint name doubles as the LiteLLM ``model_name`` (what clients ask for
-    and what Open WebUI shows) and as a CLI-typed token, so keep it shell/URL
-    friendly: collapse model/tag separators (``/``, ``:``) and any other
-    non-``[A-Za-z0-9._-]`` runs to a single ``-``.
-    """
-    import re
-
-    out = re.sub(r'[^A-Za-z0-9._-]+', '-', text).strip('-')
-    return out or text
-
-
 def _rm(config, section, names) -> int:
     names = [names] if isinstance(names, str) else list(names or [])
     if not names:
         raise SystemExit(f'{section[:-1]} rm: give at least one name')
     path = _catalog_path(config)
-    data = _load_raw(path)
+    data = load_catalog_source(path)
     missing = [n for n in names if n not in data[section]]
     if missing:
         raise SystemExit(
@@ -169,21 +127,23 @@ def _rm(config, section, names) -> int:
         )
     for name in names:
         del data[section][name]
-    _save_raw(path, data, dry_run=getattr(config, 'dry_run', False))
-    for name in names:
-        print(f"removed {section[:-1]} '{name}'")
+    dry_run = getattr(config, 'dry_run', False)
+    _save_catalog(path, data, dry_run=dry_run)
+    if not dry_run:
+        for name in names:
+            print(f"removed {section[:-1]} '{name}'")
     return 0
 
 
 def _list(config, section) -> int:
-    data = _load_raw(_catalog_path(config))
+    data = load_catalog_source(_catalog_path(config))
     names = sorted(data[section])
     print('\n'.join(names) if names else f'(no {section})')
     return 0
 
 
 def _show(config, section, name) -> int:
-    data = _load_raw(_catalog_path(config))
+    data = load_catalog_source(_catalog_path(config))
     entries = data.get(section) or {}
     # No name -> show every entry in the section (the whole `endpoints:` block),
     # rather than erroring on a `None` lookup.
@@ -223,8 +183,8 @@ def _parse_kv(items) -> dict[str, Any]:
 
 
 class _CatalogCommon(_PathOverridesMixin):
-    catalog = scfg.Value(None, type=str, help='Catalog path (default: config dir).')
-    dry_run = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Catalog path (default: config dir).')
+    dry_run = kw.Value(
         False, isflag=True, help='Print the resulting YAML, do not write.'
     )
 
@@ -233,7 +193,7 @@ class CatalogInitCLI(_CatalogCommon):
     """Write a starter catalog.yaml (empty sections) if none exists."""
 
     __command__ = 'init'
-    force = scfg.Value(False, isflag=True, help='Overwrite an existing catalog.')
+    force = kw.Value(False, isflag=True, help='Overwrite an existing catalog.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -241,7 +201,7 @@ class CatalogInitCLI(_CatalogCommon):
         path = _catalog_path(config)
         if path.exists() and not config.force:
             raise SystemExit(f'{path} already exists; pass --force to reset')
-        _save_raw(path, {s: {} for s in SECTIONS}, dry_run=config.dry_run)
+        _save_catalog(path, {s: {} for s in SECTIONS}, dry_run=config.dry_run)
         if not config.dry_run:
             print(f'wrote starter catalog -> {path}')
         return 0
@@ -267,22 +227,41 @@ class CatalogSuggestCLI(
     catalog (additive: existing entries are kept unless ``--force``).
 
     Pure + offline: ``--simulate-hardware 2x80`` suggests for hardware you do not
-    have in front of you.
+    have in front of you; append ``@CC`` (for example ``48@7.5`` or
+    ``4x96@12.0``) when a capability-gated profile matters.
+
+    On the kubeai backend the hardware is the cluster's: GPU Feature
+    Discovery's node labels (``nvidia.com/gpu.product`` / ``.memory``) and each
+    node's allocatable GPUs. The catalog is sized to the largest GPU node, and
+    a ``resourceProfiles`` block (one per GPU product, selecting its nodes) is
+    printed for the helm values, so ``min_vram_gib`` can pick a profile by size.
 
         infer-stack catalog suggest                      # render only (no write)
         infer-stack catalog suggest --simulate-hardware 4x48
+        infer-stack catalog suggest --simulate-hardware 4x96@12.0
         infer-stack catalog suggest --apply              # merge into the catalog
     """
 
     __command__ = 'suggest'
-    catalog = scfg.Value(None, type=str, help='Catalog path (default: config dir).')
-    apply = scfg.Value(
+    catalog = kw.Value(None, type=str, help='Catalog path (default: config dir).')
+    apply = kw.Value(
         False, isflag=True,
         help='Merge the suggestion into the catalog (default: render only).',
     )
-    force = scfg.Value(
+    force = kw.Value(
         False, isflag=True,
         help='With --apply, overwrite catalog entries that already exist.',
+    )
+    backend = kw.Value(
+        None, type=str,
+        help='Whose hardware (default: the configured `backend` setting): this '
+        "host's GPUs, or on kubeai the cluster's.",
+    )
+    simulator = kw.Value(
+        False, isflag=True,
+        help='Suggest a simulator endpoint instead (`mock-smol`): it answers '
+        "like vLLM with random text and needs no GPU, to try infer-stack's "
+        'workflow on any host. Never for results.',
     )
 
     @classmethod
@@ -292,16 +271,47 @@ class CatalogSuggestCLI(
             migrate_known_suggestion_aliases,
             suggest_catalog,
         )
-        from .commands_leasing import _resolve_skip_display
+        from ..paths import get_setting
+        from .commands_leasing import _make_backend, _resolve_skip_display
         from .context import effective_inventory
 
         config = cls.cli(argv=argv, data=kwargs)
-        inventory = effective_inventory(config) or detect_inventory()
+        if config.simulator:
+            import copy
+
+            from ..leasing.suggest import SIMULATOR_FRAGMENT
+
+            return _merge_or_print(config, copy.deepcopy(SIMULATOR_FRAGMENT),
+                                   'a simulator: no GPU needed, random text, never results')
+        profiles: dict = {}
+        cluster = (config.backend or get_setting('backend')) == 'kubeai'
+        inventory = effective_inventory(config)
+        if inventory is None and cluster:
+            backend = _make_backend(config)
+            inventory, profiles = backend.suggestion_inventory()
+            if not inventory['gpus']:
+                print(
+                    'no cluster node reports GPUs: suggest needs each GPU node\'s '
+                    'allocatable nvidia.com/gpu and GPU Feature Discovery\'s '
+                    'nvidia.com/gpu.product / .memory labels (the NVIDIA device '
+                    'plugin with gfd.enabled=true; see the README). Pass '
+                    '--simulate-hardware NxM to plan without them.',
+                    file=sys.stderr,
+                )
+                return 1
+        inventory = inventory or detect_inventory()
         gpus = inventory.get('gpus') or []
-        skip_display = _resolve_skip_display(config)
+        skip_display = _resolve_skip_display(config) and not cluster
         frag = suggest_catalog(
             inventory, reserve_display_gpu='auto' if skip_display else False
         )
+        if cluster:
+            # A cluster has no host GPU indices: the profile says where.
+            for endpoint in frag['endpoints'].values():
+                placement = endpoint.get('placement') or {}
+                placement.pop('gpu_indices', None)
+                if not placement:
+                    endpoint.pop('placement', None)
 
         max_mem = max((g.get('memory_gib') or 0 for g in gpus), default=0)
         n_display = sum(1 for g in gpus if g.get('display_active'))
@@ -315,13 +325,20 @@ class CatalogSuggestCLI(
             print(
                 f'no pooled model fits the detected hardware ({hw}). '
                 'Pass --simulate-hardware NxM to plan for a bigger box, or add '
-                'models by hand with `catalog model add`.',
+                'models by hand with `catalog model add`.'
+                + ('' if gpus else ' With no GPU here, `infer-stack catalog suggest '
+                   '--simulator --apply` adds an endpoint that answers like vLLM '
+                   '(random text), to try the workflow.'),
                 file=sys.stderr,
             )
             return 0
 
         text = yaml.safe_dump(frag, sort_keys=False, default_flow_style=False)
 
+        if cluster:
+            hw = f'the cluster\'s largest GPU node: {hw}'
+        values = (yaml.safe_dump({'resourceProfiles': profiles}, sort_keys=False)
+                  if profiles else '')
         if not config.apply:
             print(
                 f'# suggested for: {hw}  ({usable} usable)\n'
@@ -330,11 +347,15 @@ class CatalogSuggestCLI(
                 file=sys.stderr,
             )
             _print_yaml(text)
+            if values:
+                print('# discovered KubeAI resourceProfiles (the same shape reconciled by '
+                      '`infer-stack kube install`; review with `infer-stack kube install`):\n' + values,
+                      file=sys.stderr)
             return 0
 
         # --apply: additive merge into the catalog (keep existing entries).
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         migrated = migrate_known_suggestion_aliases(data)
         added: list[str] = []
         skipped: list[str] = []
@@ -345,7 +366,7 @@ class CatalogSuggestCLI(
                     continue
                 data[section][name] = value
                 added.append(f'{section[:-1]}:{name}')
-        _save_raw(path, data, dry_run=False)
+        _save_catalog(path, data, dry_run=False)
         print(f'merged suggestion into {path}  ({hw})')
         if migrated:
             print(f'  renamed prior suggestion: {", ".join(migrated)}')
@@ -356,14 +377,44 @@ class CatalogSuggestCLI(
                 f'  kept existing (pass --force to overwrite): '
                 f'{", ".join(skipped)}'
             )
+        if values:
+            print('discovered KubeAI resource profiles (normally reconciled by '
+                  '`infer-stack kube install --apply`; review with `infer-stack kube install`):')
+            print(values, end='')
         return 0
+
+
+def _merge_or_print(config, frag: dict, what: str) -> int:
+    """Print a suggested catalog fragment, or with ``--apply`` merge it."""
+    text = yaml.safe_dump(frag, sort_keys=False, default_flow_style=False)
+    if not config.apply:
+        print(f'# suggested: {what}; re-run with --apply to merge', file=sys.stderr)
+        _print_yaml(text)
+        return 0
+    path = _catalog_path(config)
+    data = load_catalog_source(path)
+    added, skipped = [], []
+    for section in ('models', 'endpoints'):
+        for name, value in frag[section].items():
+            if name in data[section] and not config.force:
+                skipped.append(f'{section[:-1]}:{name}')
+                continue
+            data[section][name] = value
+            added.append(f'{section[:-1]}:{name}')
+    _save_catalog(path, data, dry_run=False)
+    print(f'merged suggestion into {path}  ({what})')
+    if added:
+        print(f'  added: {", ".join(added)}')
+    if skipped:
+        print(f'  kept existing (pass --force to overwrite): {", ".join(skipped)}')
+    return 0
 
 
 class CatalogPathCLI(_PathOverridesMixin):
     """Print the catalog path."""
 
     __command__ = 'path'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -392,13 +443,13 @@ class CatalogShowCLI(_PathOverridesMixin):
     """Pretty-print the whole catalog (or one named entry across sections)."""
 
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str, help='Optional entry name.')
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str, help='Optional entry name.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        data = _load_raw(_catalog_path(config))
+        data = load_catalog_source(_catalog_path(config))
         if config.name:
             hits = {
                 s: data[s][config.name]
@@ -417,7 +468,7 @@ class CatalogValidateCLI(_PathOverridesMixin):
     """Parse + cross-reference check the catalog."""
 
     __command__ = 'validate'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -440,7 +491,7 @@ class CatalogEditCLI(_PathOverridesMixin):
     """Open the catalog in $EDITOR (escape hatch), then validate it."""
 
     __command__ = 'edit'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -450,7 +501,7 @@ class CatalogEditCLI(_PathOverridesMixin):
         config = cls.cli(argv=argv, data=kwargs)
         path = _catalog_path(config)
         if not path.exists():
-            _save_raw(path, {s: {} for s in SECTIONS})
+            _save_catalog(path, {s: {} for s in SECTIONS})
         editor = os.environ.get('EDITOR', 'vi')
         subprocess.run([*editor.split(), str(path)], check=False)
         try:
@@ -470,12 +521,12 @@ class ModelAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a model: a Hugging Face / local weight source."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    source = scfg.Value(None, type=str, help='e.g. hf://org/Model or a path.')
-    revision = scfg.Value(None, type=str)
-    quantization = scfg.Value(None, type=str)
-    dtype = scfg.Value(None, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    source = kw.Value(None, type=str, help='e.g. hf://org/Model or a path.')
+    revision = kw.Value(None, type=str)
+    quantization = kw.Value(None, type=str)
+    dtype = kw.Value(None, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -483,7 +534,7 @@ class ModelAddCLI(_CatalogCommon):
         if not config.name or not config.source:
             raise SystemExit('model add: NAME and --source are required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         entry: dict[str, Any] = {'source': config.source}
         for key in ('revision', 'quantization', 'dtype'):
             if getattr(config, key) is not None:
@@ -494,7 +545,7 @@ class ModelAddCLI(_CatalogCommon):
                 print(f"model '{config.name}' already up to date")
             return 0
         data['models'][config.name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added model '{config.name}'")
         return 0
@@ -503,7 +554,7 @@ class ModelAddCLI(_CatalogCommon):
 class ModelListCLI(_PathOverridesMixin):
     """List model names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -513,8 +564,8 @@ class ModelListCLI(_PathOverridesMixin):
 class ModelShowCLI(_PathOverridesMixin):
     """Show a model entry, or all of them when no NAME is given."""
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str,
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str,
                       help='Model name; omit to show every model.')
 
     @classmethod
@@ -526,7 +577,7 @@ class ModelShowCLI(_PathOverridesMixin):
 class ModelRmCLI(_CatalogCommon):
     """Remove one or more models by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Model name(s) to remove.')
 
     @classmethod
@@ -535,7 +586,7 @@ class ModelRmCLI(_CatalogCommon):
         return _rm(config, 'models', config.names)
 
 
-class CatalogModelCLI(scfg.ModalCLI):
+class CatalogModelCLI(kw.ModalCLI):
     """Manage catalog models."""
     __command__ = 'model'
     add = ModelAddCLI
@@ -559,64 +610,90 @@ class EndpointAddCLI(_CatalogCommon):
     model just gets the next index instead of colliding. Give an explicit
     ``NAME`` when you want a stable alias decoupled from the model (e.g. ``chat``
     you can re-point).
+
+    ``--external-api-base`` and ``--external-model`` instead register a server
+    that already runs elsewhere (OpenAI-compatible): infer-stack routes the
+    alias to it through the gateway and runs nothing, so none of the runtime
+    options apply. ``--external-api-key-env`` names the variable holding its
+    key (set it with ``infer-stack env NAME=...``); the key itself is never
+    written to the catalog.
     """
 
     __command__ = 'add'
-    name = scfg.Value(
+    name = kw.Value(
         None, position=1, type=str,
         help='Endpoint alias (default: {model}-N, auto-incrementing).',
     )
-    engine = scfg.Value('vllm', choices=['vllm', 'ollama'])
-    model = scfg.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
-    host = scfg.Value(None, type=str, help='Runtime host (ollama).')
-    public_name = scfg.Value(
-        None, type=str, help='Served/public name (for coalescing aliases).'
+    engine = kw.Value(None, type=str, choices=['vllm', 'ollama'],
+                      help='How infer-stack runs it (default: vllm).')
+    external_api_base = kw.Value(
+        None, type=str,
+        help='An OpenAI-compatible server that already runs, e.g. '
+             'http://box:8000/v1 (with --external-model; runs nothing).',
     )
-    reclaim = scfg.Value(
-        None, choices=['keep-warm', 'stop', 'scale-to-zero'],
+    external_model = kw.Value(
+        None, type=str, help='The model name that external server expects.',
+    )
+    external_api_key_env = kw.Value(
+        None, type=str,
+        help="Variable holding the external server's key (its name, not the key).",
+    )
+    model = kw.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
+    host = kw.Value(None, type=str, help='Runtime host (ollama).')
+    served_name = kw.Value(
+        None, type=str, alias=['public-name'],
+        help='Upstream model name the engine serves (--served-model-name; '
+             'default: the alias). Endpoints with the same upstream name and '
+             'model coalesce onto one deployment. Legacy --public-name is '
+             'accepted but infer-stack writes served_name.',
+    )
+    reclaim = kw.Value(
+        None, type=str, choices=['keep-warm', 'stop', 'scale-to-zero'],
         help='Reclaim policy when idle.',
     )
-    protocol = scfg.Value(
-        None, choices=['chat', 'completions'],
+    protocol = kw.Value(
+        None, type=str, choices=['chat', 'completions'],
         help='Which OpenAI surface this endpoint serves. Load-bearing twice: '
              'a base model has no chat template, and the readiness probe '
              'follows this — declaring chat for a completions-only serve '
              'blocks `acquire` until the TTL. Default (unset): chat.',
     )
-    min_vram_gib = scfg.Value(
+    min_vram_gib = kw.Value(
         None, type=float,
         help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
              'planner can pick any eligible free GPU. Declaring this is what '
              'lets one catalog be correct on every host.',
     )
-    gpu = scfg.Value(
+    gpu = kw.Value(
         [], nargs='*', type=int,
         help='placement.gpu_indices — exact physical GPU index/indices. Omit '
              'for automatic VRAM-aware placement. This is a local operator '
              'override and is intentionally less portable than --min-vram-gib.',
     )
     # vLLM runtime conveniences
-    max_model_len = scfg.Value(None, type=int)
-    gpu_mem = scfg.Value(
+    max_model_len = kw.Value(None, type=int)
+    gpu_mem = kw.Value(
         None, type=float, help='gpu_memory_utilization (0-1).'
     )
-    tensor_parallel = scfg.Value(None, type=int)
-    extra_args = scfg.Value(
+    tensor_parallel = kw.Value(None, type=int)
+    extra_args = kw.Value(
         None, type=str,
         help="Raw vLLM flags as one string (shell-split), "
         "e.g. --extra-args='--dtype=half --enforce-eager'.",
     )
-    runtime = scfg.Value(
+    runtime = kw.Value(
         [], nargs='*', type=str,
         help='Extra runtime KEY=VALUE pairs (YAML-typed).',
     )
-    force = scfg.Value(False, isflag=True)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
+        if config.external_api_base or config.external_model or config.external_api_key_env:
+            return cls._add_external(config, path, data)
         if config.name:
             name = config.name
             # The guard moved below, after the entry exists to compare against.
@@ -628,16 +705,16 @@ class EndpointAddCLI(_CatalogCommon):
                 )
             # Default name = {model}-N, auto-incrementing so repeated adds for
             # one model accumulate (smol135-1, smol135-2, …) instead of colliding.
-            name = _next_indexed_name(
-                data['endpoints'], _slug_alias(config.model)
+            name = next_indexed_name(
+                data['endpoints'], slug_alias(config.model)
             )
-        entry: dict[str, Any] = {'engine': config.engine}
+        entry: dict[str, Any] = {'engine': config.engine or 'vllm'}
         if config.model:
             entry['model'] = config.model
         if config.host:
             entry['host'] = config.host
-        if config.public_name:
-            entry['public_name'] = config.public_name
+        if config.served_name:
+            entry['served_name'] = config.served_name
         runtime: dict[str, Any] = _parse_kv(config.runtime)
         if config.max_model_len is not None:
             runtime['max_model_len'] = config.max_model_len
@@ -662,7 +739,7 @@ class EndpointAddCLI(_CatalogCommon):
         if placement:
             entry['placement'] = placement
         # Only guarded for an explicit NAME: a derived name is picked by
-        # _next_indexed_name from the free slots, so it never collides.
+        # next_indexed_name from the free slots, so it never collides.
         if config.name:
             action = _exists_guard(
                 data, 'endpoints', name, config.force, entry)
@@ -671,17 +748,62 @@ class EndpointAddCLI(_CatalogCommon):
                     print(f"endpoint '{name}' already up to date")
                 return 0
         data['endpoints'][name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             model_note = f' -> {config.model}' if config.model else ''
             print(f"added endpoint '{name}'{model_note}")
         return 0
 
 
+    @classmethod
+    def _add_external(cls, config, path, data) -> int:
+        """``endpoint add NAME --external-api-base URL --external-model M``."""
+        from ..leasing.endpoints import external_errors
+
+        if not config.name:
+            raise SystemExit('endpoint add: an external endpoint needs a NAME '
+                             '(the alias clients will request)')
+        managed = {
+            '--engine': config.engine, '--model': config.model, '--host': config.host,
+            '--served-name': config.served_name, '--reclaim': config.reclaim,
+            '--min-vram-gib': config.min_vram_gib, '--gpu': config.gpu or None,
+            '--max-model-len': config.max_model_len, '--gpu-mem': config.gpu_mem,
+            '--tensor-parallel': config.tensor_parallel,
+            '--extra-args': config.extra_args, '--runtime': config.runtime or None,
+        }
+        given = [flag for flag, value in managed.items() if value is not None]
+        if given:
+            raise SystemExit(
+                f'endpoint add: {", ".join(given)} '
+                f'{"describe" if len(given) > 1 else "describes"} a runtime '
+                'infer-stack runs; an external endpoint (--external-*) runs nothing')
+        ext: dict[str, Any] = {'api_base': config.external_api_base,
+                               'model': config.external_model}
+        if config.external_api_key_env:
+            ext['api_key_env'] = config.external_api_key_env
+        entry: dict[str, Any] = {'external': ext}
+        if config.protocol:
+            entry['protocol'] = config.protocol
+        problems = external_errors(config.name, entry, ext)
+        if problems:
+            raise SystemExit('endpoint add: ' + '; '.join(problems))
+        action = _exists_guard(data, 'endpoints', config.name, config.force, entry)
+        if action == 'unchanged':
+            if not config.dry_run:
+                print(f"endpoint '{config.name}' already up to date")
+            return 0
+        data['endpoints'][config.name] = entry
+        _save_catalog(path, data, dry_run=config.dry_run)
+        if not config.dry_run:
+            print(f"added external endpoint '{config.name}' -> "
+                  f"{config.external_model} at {config.external_api_base}")
+        return 0
+
+
 class EndpointListCLI(_PathOverridesMixin):
     """List endpoint names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -691,8 +813,8 @@ class EndpointListCLI(_PathOverridesMixin):
 class EndpointShowCLI(_PathOverridesMixin):
     """Show an endpoint entry, or all of them when no NAME is given."""
     __command__ = 'show'
-    catalog = scfg.Value(None, type=str)
-    name = scfg.Value(None, position=1, type=str,
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str,
                       help='Endpoint name; omit to show every endpoint.')
 
     @classmethod
@@ -704,7 +826,7 @@ class EndpointShowCLI(_PathOverridesMixin):
 class EndpointRmCLI(_CatalogCommon):
     """Remove one or more endpoints by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Endpoint name(s) to remove.')
 
     @classmethod
@@ -713,7 +835,7 @@ class EndpointRmCLI(_CatalogCommon):
         return _rm(config, 'endpoints', config.names)
 
 
-class CatalogEndpointCLI(scfg.ModalCLI):
+class CatalogEndpointCLI(kw.ModalCLI):
     """Manage catalog endpoints."""
     __command__ = 'endpoint'
     add = EndpointAddCLI
@@ -731,15 +853,15 @@ class HostAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a runtime host (e.g. an Ollama daemon)."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    engine = scfg.Value('ollama', choices=['ollama'])
-    gpu = scfg.Value([], nargs='*', type=int, help='GPU index/indices.')
-    keep_alive = scfg.Value(None, type=str, help='Ollama keep_alive, e.g. 5m.')
-    num_parallel = scfg.Value(None, type=int)
-    max_loaded_models = scfg.Value(None, type=int)
-    context_length = scfg.Value(None, type=int)
-    image = scfg.Value(None, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    engine = kw.Value('ollama', type=str, choices=['ollama'])
+    gpu = kw.Value([], nargs='*', type=int, help='GPU index/indices.')
+    keep_alive = kw.Value(None, type=str, help='Ollama keep_alive, e.g. 5m.')
+    num_parallel = kw.Value(None, type=int)
+    max_loaded_models = kw.Value(None, type=int)
+    context_length = kw.Value(None, type=int)
+    image = kw.Value(None, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -747,7 +869,7 @@ class HostAddCLI(_CatalogCommon):
         if not config.name:
             raise SystemExit('host add: NAME is required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         entry: dict[str, Any] = {'engine': config.engine}
         if config.gpu:
             entry['placement'] = {'gpu_indices': list(config.gpu)}
@@ -771,7 +893,7 @@ class HostAddCLI(_CatalogCommon):
                 print(f"host '{config.name}' already up to date")
             return 0
         data['runtime_hosts'][config.name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added host '{config.name}'")
         return 0
@@ -780,7 +902,7 @@ class HostAddCLI(_CatalogCommon):
 class HostListCLI(_PathOverridesMixin):
     """List runtime-host names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -790,7 +912,7 @@ class HostListCLI(_PathOverridesMixin):
 class HostRmCLI(_CatalogCommon):
     """Remove one or more runtime hosts by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Runtime-host name(s) to remove.')
 
     @classmethod
@@ -799,7 +921,7 @@ class HostRmCLI(_CatalogCommon):
         return _rm(config, 'runtime_hosts', config.names)
 
 
-class CatalogHostCLI(scfg.ModalCLI):
+class CatalogHostCLI(kw.ModalCLI):
     """Manage runtime hosts (Ollama daemons / placement)."""
     __command__ = 'host'
     add = HostAddCLI
@@ -816,9 +938,9 @@ class BundleAddCLI(_CatalogCommon):
     """Add (or --force overwrite) a bundle: a named group of endpoints."""
 
     __command__ = 'add'
-    name = scfg.Value(None, position=1, type=str)
-    members = scfg.Value([], nargs='*', position=2, type=str)
-    force = scfg.Value(False, isflag=True)
+    name = kw.Value(None, position=1, type=str)
+    members = kw.Value([], nargs='*', position=2, type=str)
+    force = kw.Value(False, isflag=True)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -827,7 +949,7 @@ class BundleAddCLI(_CatalogCommon):
         if not config.name or not members:
             raise SystemExit('bundle add: NAME and at least one endpoint required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         action = _exists_guard(
             data, 'bundles', config.name, config.force, members)
         if action == 'unchanged':
@@ -835,7 +957,7 @@ class BundleAddCLI(_CatalogCommon):
                 print(f"bundle '{config.name}' already up to date")
             return 0
         data['bundles'][config.name] = members
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added bundle '{config.name}' -> {', '.join(members)}")
         return 0
@@ -844,7 +966,7 @@ class BundleAddCLI(_CatalogCommon):
 class BundleListCLI(_PathOverridesMixin):
     """List bundle names."""
     __command__ = 'list'
-    catalog = scfg.Value(None, type=str)
+    catalog = kw.Value(None, type=str)
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -854,7 +976,7 @@ class BundleListCLI(_PathOverridesMixin):
 class BundleRmCLI(_CatalogCommon):
     """Remove one or more bundles by name."""
     __command__ = 'rm'
-    names = scfg.Value([], nargs='+', position=1, type=str,
+    names = kw.Value([], nargs='+', position=1, type=str,
                        help='Bundle name(s) to remove.')
 
     @classmethod
@@ -863,7 +985,7 @@ class BundleRmCLI(_CatalogCommon):
         return _rm(config, 'bundles', config.names)
 
 
-class CatalogBundleCLI(scfg.ModalCLI):
+class CatalogBundleCLI(kw.ModalCLI):
     """Manage endpoint bundles."""
     __command__ = 'bundle'
     add = BundleAddCLI
@@ -876,7 +998,7 @@ class CatalogBundleCLI(scfg.ModalCLI):
 # ---------------------------------------------------------------------------
 
 
-class CatalogModalCLI(scfg.ModalCLI):
+class CatalogModalCLI(kw.ModalCLI):
     """Edit the user serving catalog (models / endpoints / hosts / bundles)."""
 
     __command__ = 'catalog'

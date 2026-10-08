@@ -93,7 +93,11 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     if text and not text.endswith('\n'):
         text += '\n'
 
-    print(f'Write .env to {path}')
+    from ._log import logger
+
+    # Debug, not stdout: a command's output (its --json above all) is not the
+    # place for an internal file write; `env set` confirms its own.
+    logger.debug('wrote {}', path)
     # Atomic replace: Docker Compose (or a fingerprint) must never read a
     # half-written file.
     import os

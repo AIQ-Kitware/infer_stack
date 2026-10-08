@@ -29,7 +29,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Generator
 
 from .models import Deployment, Lease, LeaseState
 
@@ -234,6 +234,61 @@ class SqliteStore:
                 if 'duplicate column' not in str(ex).lower():
                     raise
 
+    def backup_to(self, path: Path) -> None:
+        """Publish a consistent SQLite archive, including committed WAL contents.
+
+        The caller holds the controller publication lock. A temporary file plus
+        atomic replace ensures an interrupted backup is never a valid archive.
+        """
+        import os
+        import tempfile
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.ledger-backup-', dir=path.parent)
+        os.close(fd)
+        try:
+            with self._lock, contextlib.closing(sqlite3.connect(temporary)) as destination:
+                self._conn._conn.backup(destination)
+            with open(temporary, 'rb') as file:
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def start_backend_epoch(self, profile: dict, archive: dict, *,
+                            expected_profile: dict, expected_version: int) -> None:
+        """Atomically replace archived history with a new backend snapshot.
+
+        Keep the same database inode: other processes may already hold SQLite
+        connections. Replacing/renaming the live DB would strand those writers
+        in the old epoch. The new profile rejects them at their next mutation.
+        """
+        from .profile import ProfileMismatch
+
+        with self.transaction() as conn:
+            if (self.profile() != expected_profile
+                    or self.admission_state_version() != expected_version):
+                raise ProfileMismatch('Ledger changed during rotation; review and retry')
+            archives = self.meta_json('ledger_archives', [])
+            conn.execute('DELETE FROM claims')
+            conn.execute('DELETE FROM leases')
+            conn.execute('DELETE FROM deployments')
+            conn.execute('DELETE FROM service_addresses')
+            conn.execute("DELETE FROM meta WHERE key NOT IN "
+                         "('schema_version', 'desired_gen', 'applied_gen', "
+                         "'admission_state_version', 'ledger_archives')")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('ledger_archives', ?) "
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (_dumps([*archives, archive]),))
+            self._write_profile(profile)
+            self.bump_desired_generation()
+
     def close(self) -> None:
         """Close the owned sqlite connection. Safe to call more than once."""
         self._conn.close()
@@ -262,7 +317,7 @@ class SqliteStore:
     # -- transactions ------------------------------------------------------
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[_SerializedConnection]:
+    def transaction(self) -> Generator[_SerializedConnection, None, None]:
         """Take the write lock up front and commit/rollback atomically.
 
         ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
@@ -281,18 +336,16 @@ class SqliteStore:
                 self._conn.execute('ROLLBACK')
                 raise
 
-    # -- generation (legacy; unused by the controller) ----------------------
+    # -- desired-state generation -------------------------------------------
     #
-    # Superseded by the publication marker below, which the controller uses to
-    # serialise render and apply. The counters are still bumped and kept so an
-    # older reader of the same ledger does not break. Their original meaning:
-    #   desired_gen  bumped whenever a mutation changes the desired set (a new
-    #                deployment, an idled/evicted/expired one). Captured by an
-    #                acquirer right after it renders -> "the generation my change
-    #                is in".
-    #   applied_gen  the floor a successful apply has materialized. An acquirer is
-    #                covered once applied_gen >= its captured desired_gen, so one
-    #                apply satisfies every waiter that rendered before it.
+    # ``desired_gen`` is the ledger-wide monotonic epoch for demand/desired-state
+    # changes; ``applied_gen`` is the monotonic floor an older apply-generation
+    # scheme materialized.  The current standalone controller uses the richer
+    # publication marker below to recover render/apply intent, so it does not
+    # wait on these counters directly.  They remain meaningful state, not a
+    # rendered-file authority: the distributed-control-plane design will need
+    # generation/fencing semantics and can evolve this coarse epoch into
+    # per-object desired/observed generations without changing that ownership.
 
     def bump_desired_generation(self) -> int:
         """Increment `desired_gen`. MUST be called inside :meth:`transaction`
@@ -385,17 +438,25 @@ class SqliteStore:
 
     def set_profile(self, profile: dict) -> None:
         with self.transaction():
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                (json.dumps(profile, sort_keys=True),),
-            )
+            self._write_profile(profile)
+
+    def _write_profile(self, profile: dict) -> None:
+        """The profile upsert; the caller holds a :meth:`transaction`."""
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('profile', ?) "
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            (json.dumps(profile, sort_keys=True),),
+        )
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
         placement_context: dict | None = None, approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> dict:
         """Record that desired state is changing; return the marker written.
+
+        ``profile``, when given, is written in the same transaction (a first
+        recovery profile commits with the publication intent it belongs to).
 
         Both flags only ever turn on until the marker is cleared.
         ``interrupted`` records that an apply was killed mid-flight, so the
@@ -404,6 +465,8 @@ class SqliteStore:
         ``allowed_gpus``) replaces any stored one; ``None`` keeps it.
         """
         with self.transaction():
+            if profile is not None:
+                self._write_profile(profile)
             return self._write_marker(
                 apply_requested=apply_requested, interrupted=interrupted,
                 placement_context=placement_context, approved_digest=approved_digest,
@@ -435,11 +498,16 @@ class SqliteStore:
     def clear_approved_digest(self) -> None:
         """The approved render was applied, or deliberately abandoned (a
         rollback); the digest no longer describes the pending state."""
+        self.set_approved_digest(None)
+
+    def set_approved_digest(self, digest: str | None) -> None:
+        """Replace the pending marker's approved digest in place (same
+        version: the pending change is the same one, only its approval moved)."""
         with self.transaction():
             current = self._read_publication_pending()
-            if current is None or current.get('approved_digest') is None:
+            if current is None or current.get('approved_digest') == digest:
                 return
-            current['approved_digest'] = None
+            current['approved_digest'] = digest
             self._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'publication_pending'",
                 (json.dumps(current, sort_keys=True),),
@@ -450,15 +518,11 @@ class SqliteStore:
         in one transaction, so a crash cannot leave a published profile whose
         approval nothing records."""
         with self.transaction():
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                (json.dumps(profile, sort_keys=True),),
-            )
+            self._write_profile(profile)
             self._write_marker(apply_requested=True, approved_digest=approved_digest)
 
     def migrate_network(self, *, subnet: str, reset_addresses: bool,
-                        approved_digest: str | None) -> None:
+                        approved_digest: str | None, profile: dict | None = None) -> None:
         """Switch subnet, reset addresses and mark the change pending, atomically.
 
         A crash leaves either the old subnet with its address table, or the new
@@ -466,6 +530,8 @@ class SqliteStore:
         which could hand a service's address to another service.
         """
         with self.transaction():
+            if profile is not None:
+                self._write_profile(profile)
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('network_config', ?) "
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value',

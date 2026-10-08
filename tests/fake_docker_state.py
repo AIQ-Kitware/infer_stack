@@ -73,7 +73,9 @@ class ComposeFake:
                     state['Health'] = {'Status': c['health']}
                 out.append({'Id': cid, 'State': state,
                             'RestartCount': c.get('restart_count', 0),
-                            'Config': {'Labels': c['labels']},
+                            'Config': {'Labels': c['labels'],
+                                       'Env': [f'{k}={v}' for k, v in
+                                               sorted((c.get('env') or {}).items())]},
                             'HostConfig': {'DeviceRequests': requests,
                                            'RestartPolicy': {
                                                'Name': c.get('restart_policy', ''),
@@ -118,6 +120,8 @@ class ComposeFake:
             self.compose_file = args[args.index('-f') + 1]
         if '-p' in args:
             self.project = args[args.index('-p') + 1]
+        if '--env-file' in args:
+            self.env_file = args[args.index('--env-file') + 1]
         if 'up' in args:
             services = self._services()
             for name, spec in (self._doc().get('networks') or {}).items():
@@ -169,6 +173,29 @@ class ComposeFake:
         self.containers[cid]['restart_policy'] = str(svc.get('restart') or '')
         if svc.get('healthcheck'):
             self.containers[cid]['health'] = self.initial_health
+        self.containers[cid]['env'] = self._interpolated(svc.get('environment') or {})
+
+    def _interpolated(self, environment) -> dict:
+        """The service's environment as compose sets it: ${VAR} and
+        ${VAR:-default} from the --env-file, as the container starts."""
+        import re
+
+        values = {}
+        env_file = getattr(self, 'env_file', None)
+        if env_file and Path(env_file).exists():
+            for line in Path(env_file).read_text().splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    key, _, value = line.partition('=')
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+        if isinstance(environment, list):
+            environment = dict(item.split('=', 1) for item in environment if '=' in item)
+
+        def sub(match):
+            name, _, default = match.group(1).partition(':-')
+            return values.get(name, default)
+
+        return {str(k): re.sub(r'\$\{([^}]+)\}', sub, str(v))
+                for k, v in environment.items()}
 
 
 def answer_residency(args, *, compose_file, running, project):  # pragma: no cover - legacy

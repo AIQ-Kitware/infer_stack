@@ -131,3 +131,348 @@ Design takeaways:
 1. Once a file becomes canonical input, stale detection must treat it as input everywhere apply-style commands rely on freshness checks.
 2. A clean source-of-truth split is only complete when freshness logic follows the same split.
 3. Focused tests around stale detection are worth adding because timestamp-based bugs are easy to reintroduce during unrelated CLI cleanup.
+
+## 2026-10-01 19:28:25 -0400
+
+User intent: make Kubernetes inventory, detailed readiness, K3s bootstrap and
+KubeAI installation first-class kwconf commands, then fix the real-machine
+Compose-to-KubeAI migration failures (stack down left the old recovery identity,
+gc threw ProfileMismatch, status hid the active backend, sudo diagnostics implied
+an all-clear, and the vLLM pod received served-model-name twice). Validation is
+on this VM with fake runtimes; the maintainer will exercise the GPU machine.
+
+Model/configuration: GPT-6 (Codex), Default collaboration mode, standard session
+configuration; the exact reasoning-effort setting is not exposed to this agent.
+No sub-agents used. No real-host bootstrap/install mutations performed.
+
+I extended the existing kube ModalCLI and KubeManager rather than introducing
+another shell implementation. Independent probes retain their own errors; node
+GPU facts cannot depend on installed chart configuration because they determine
+that configuration. Inventory describes facts; readiness applies dependency
+policy. Bootstrap is a provider adapter with a read-only default and explicit
+apply; working clusters/kubeconfigs win over installation convenience. The local
+K3s restart gate verifies cluster identity, and unknown runtime state never means
+quiescent. NVIDIA driver/toolkit installation remains host-distribution work.
+Helm 0.17.1 NVIDIA plugin/GFD behavior is retained. KubeAI upgrades share
+kubeai_ops and protect tokens in temporary 0600 values files.
+
+The migration failure clarified that runtime teardown and recovery epoch
+ownership are separate operations. The chosen ledger rotate command previews
+and rechecks quiescence under the publication lock, archives SQLite using its
+backup API (including WAL), then atomically clears archived rows and publishes
+the new configured backend snapshot in the same database. Keeping the database
+inode avoids stranding already-open processes on a renamed old ledger. Archive
+publication precedes reset; interruption before reset retains old state and
+interruption after commit is a no-op on retry. Active leases and strict runtime
+objects block rotation. Catalog/settings files remain authority and untouched.
+GC reports a mismatch before mutation; status names both backend identities and
+reads old rows with their frozen backend. KubeAI's engine_vllm.go injects the CR
+served name before spec.args; an optional flag in the shared arg builder removes
+only infer-stack's own served-name emission for KubeAI, preserving Compose and
+arbitrary extra arguments.
+
+I am confident in the node/config separation and archive transaction design;
+remaining risk is integration behavior on a real K3s host, particularly runtime
+PATH discovery, chart rollout timing and configured API routing. Final combined
+focused validation passed 213 tests. The full suite passed 1098 tests with 7 skips
+and 8 existing cleanup/ResourceWarnings. `ty check ./infer_stack`, the CI flake8
+E9/F63/F7/F82 gate, scoped Ruff checks of changed implementation/new tests, and
+`git diff --check` passed. Actual entrypoint help tree, all five kube leaves,
+ledger rotate, status, gc and both GPU/sudo doctor forms were inspected. A
+standalone simulated integration using real Controllers/SQLite and fake runtime
+commands exercised acquire/refusal, clean GC refusal, preview/rotation/retry,
+archive inspection and subsequent KubeAI acquire successfully. Read-only probes
+on the VM's existing CPU K3s cluster retained both node facts and diagnosed the
+missing plugin, unready node and unavailable configured API. No setup mutation
+was performed. Remaining acceptance is the maintainer's GPU host: inventory and
+doctor, bootstrap/install preview then explicit apply where needed, followed by
+both detailed and operational doctor checks with the intended namespace/API URL.
+
+Reusable takeaways: prerequisite inventory must precede configuration that
+consumes it; teardown does not erase persistence ownership; SQLite history
+rotation should preserve live connections and change epochs transactionally.
+
+## 2026-10-01 20:12:00 -0400
+
+User intent: extend the TUI with efficient Kubernetes node/cluster reporting and
+controls, then prioritize the real-host review of the previous setup work before
+resuming that UI task. Model/configuration: GPT-6 (Codex), Default collaboration
+mode; reasoning effort not exposed. Commit attribution requested by the user is
+GPT-6.1-Sol. No sub-agents. TUI work was paused and stashed during this review.
+
+The review exposed three product boundary mistakes: admin credential access was
+made too broad, provider=k3s reused whatever admin context was selected, and an
+optional NVIDIA DaemonSet with no targets counted as unhealthy. Root K3s config
+now remains 0600; the invoking user gets a private, atomically refreshed 0600
+copy. This accepts certificate refresh maintenance in exchange for preserving
+other users' privileges and unrelated kubeconfigs. Explicit K3s provisioning
+always scopes reconciliation to that local copy. A worker's local membership is
+reported independently from its admin context, and an active agent must match
+requested server/name/version before join may return idempotently.
+
+RuntimeClass existence is a cluster fact, not evidence of node handlers. The
+inventory now reports observed nvidia-runtime pod startup separately per node;
+unknown handlers block detailed readiness rather than implying success. Explicit
+bootstrap/install can run tiny node-specific runtime canaries without reserving
+a GPU, retaining completed pods as diagnostic evidence. This avoids taking busy
+GPU capacity merely to test a handler. Successful startup proves the observed
+runtime invocation, not future driver health. Kube setup is deprecated and routes
+to the native install leaf so the shell-visible workflows share policy. Readiness
+waits report changed states and final generation verification; KubeAI includes
+node/image/replica detail with one pod list for nonfatal diagnosis.
+
+Review validation: 207 focused tests passed; the full suite before restoring
+the TUI passed 1194 tests with 3 skips and 8 cleanup/ResourceWarnings. An
+additional startup-detail regression passed in the review module (15 tests).
+Type checks, CI flake8, scoped Ruff, shell syntax and actual entrypoint help
+checks passed. Remaining real-host checks include private credential access/
+refresh, stale-EKS context isolation, active-worker config inspection, and runtime
+canaries on aiq-gpu/namek. No real cluster mutation is part of this work.
+
+## 2026-10-01 20:29:02 -0400
+
+User intent: resume the Kubernetes TUI work after the bootstrap review and
+make logical commits. Model/configuration: GPT-6 (Codex), Default collaboration
+mode; reasoning effort not exposed. User-requested commit attribution:
+GPT-6.1-Sol. No sub-agents.
+
+I separated the review corrections from the TUI changes. The dashboard needs
+live scheduling facts cheaply; running full inventory/Helm/API diagnosis every
+ledger tick would create avoidable latency and subprocess load. kube.monitor
+instead gathers three batched lists, retains independent errors, and computes
+scheduled GPU requests across namespaces. It explicitly does not call those
+requests utilization. Runtime evidence remains observed pod startup, never a
+claim inferred from a cluster RuntimeClass. The cached Cluster tab samples at
+least 15 seconds apart only while visible; ledger/instance observation has its
+own cadence, and non-overlap guards prevent canceled Textual workers from
+leaving duplicate subprocesses behind. Existing node GPU parsing and residency
+parsing supply tables and cached Instances data. Doctor is deliberate/on-demand. Log followers pause while their tab is hidden;
+returning retains backend action output captured in the meantime. Textual
+Expanded/Collapsed messages need their own handlers for immediate gating;
+relying on the base Toggled message delayed the update until a timer tick.
+
+Control reuses the existing lifecycle manager: node actions preview affected
+workloads, warn about emptyDir loss or Compose ownership handback, confirm, then
+recheck before mutation. Apply stays with the controller; Down works for Model
+renders without a local gateway file, confirms Model/gateway teardown, retains
+leases, and holds the publication lock. Mutations invalidate caches. The endpoint
+editor exposes resource_profile rather than physical GPU indices on KubeAI.
+Compose behavior and host metrics remain available; local metrics are explicitly
+labeled as local on the cluster backend. The tradeoff is bounded polling rather
+than persistent Kubernetes watches: this avoids adding a second client/session
+lifecycle, and count-based tests pin the request budget. Small retained runtime
+canaries prove an observed invocation, not permanent future handler health.
+
+Validation: 79 existing TUI tests and 11 new Kubernetes TUI tests passed (90 total),
+including hidden log streams and captured action output. The
+final combined full suite passed 1206 tests with 3 skips and 8 cleanup/ResourceWarnings.
+A final N/A representation check passed 49 review/readiness tests. Type checks,
+CI flake8, scoped Ruff and diff whitespace checks passed. A read-only headless
+TUI run against this VM's actual K3s cluster showed two node rows and four pod
+rows with no probe errors; screenshot /tmp/infer-stack-kubernetes-tui.svg.
+No real Apply/Down/node/bootstrap/install action was invoked. Maintainer
+validation remains the GPU hosts' credential refresh, actual agent membership,
+canary startup, and confirmed node handoff with real workloads.
+
+## 2026-10-01 20:55:21 -0400
+
+User intent: correct the reviewed KubeAI 40-character Model-name blocker,
+refresh runtime canaries on explicit apply, and make GPU-worker join verification
+explicit. Keep the long e2e identity and logical commits. Model/configuration:
+GPT-6 (Codex), Default collaboration mode, reasoning effort not exposed;
+user-requested attribution GPT-6.1-Sol. No sub-agents.
+
+The name budget belonged in model_name_for, shared by rendered Models and gateway
+routes. Kubernetes DNS validity alone did not imply CRD validity. Short names
+retain their existing identities; overlong names reserve an eight-character
+SHA-256 digest of the full served identity and the existing deployment tail.
+Simple truncation would merge distinct models sharing a prefix. This changes
+only names which the existing KubeAI CRD could not accept. The regression keeps
+HuggingFaceTB/SmolLM2-135M-Instruct and checks the two dedicated Model/route
+identities together. A first test unnecessarily invoked gateway apply with a
+fake HTTP implementation that never completed dynamic registration; interrupted
+after 73 preceding passes and restricted this rendering regression to its actual
+contract. No real workload was created by that test.
+
+Naming validation: tests/test_leasing_kubeai.py passed all 74 tests, including
+short/boundary names, static/dynamic long-prefix collisions, dedicated
+separation, and the exact long e2e Model with matching gateway routes. Type
+checks, scoped Ruff and whitespace checks passed. The script's long alias is
+unchanged. Read-only probes found an existing CPU KubeAI chart and no managed
+Models on this VM; its API needs a temporary port-forward before e2e.
+
+The second correction separates historical observation from explicit verification.
+Every bootstrap/install apply replaces infer-stack-owned canaries on all GPU
+nodes, even when old pods or currently running workloads supplied evidence.
+Bootstrap tracks nodes checked during that invocation to avoid recreating
+canaries on every readiness poll. Unrelated same-name pods remain protected;
+failed fresh waits abort installation. Inventory retains historical startup
+facts with evidence state/timestamp and explicit wording. A successful old
+container start is valuable diagnosis, but cannot establish today's handler.
+
+Worker join now detects local GPU products best-effort after membership is
+established and warns that drivers/toolkit and control-plane readiness are
+separate. It directs the operator to check the specific worker's allocatable
+GPUs, GFD product/memory and fresh runtime canary, so aiq-gpu's four GPUs cannot
+mask namek exposing zero. This is an explicit warning, not automated driver
+installation or a claim that worker-side admin credentials exist.
+
+Focused runtime/CLI tests: 72 passed. This includes repeated bootstrap/install
+canaries, historical timestamps, later runtime breakage, unrelated pod refusal,
+dry-run nonmutation and RTX 3090 join output. Type checks, CI flake8, scoped
+Ruff, compileall, shell syntax and diff whitespace checks passed. Actual kwconf
+join help and read-only inventory were inspected. Real e2e runs from a frozen
+source snapshot with the unchanged script, E2E_MODEL=HuggingFaceTB/SmolLM2-135M-Instruct,
+E2E_RESOURCE_PROFILE=cpu, E2E_BASE_URL=http://127.0.0.1:18000/openai/v1,
+and all default dynamic/replica/gateway phases enabled. The optional sized,
+make-room and remote-node phases remain disabled by their normal defaults;
+this VM has no GPU and its old container worker is NotReady. A temporary local
+port-forward supplies the installed chart's API. Initial real generation
+already passed; the full result is pending.
+
+Full unit validation: pytest -q passed 1218 tests, 3 skipped, 8 existing cleanup/
+ResourceWarnings (133.24s). Extended Ruff on tests/test_leasing_kubeai.py reports
+three import-order findings; checking the parent commit via stdin reproduces
+the identical three findings. They predate this correction and are left alone.
+CI flake8/type checks and scoped Ruff on changed production/readiness files
+remain green. The real CRD has accepted the shortened dynamic long-name Model,
+and the gateway has registered its route; generation is still in progress.
+
+Real e2e completed with exit zero and PASS: kubeai backend end-to-end lifecycle.
+The unchanged long identity passed static generation, two keep-warm replicas,
+two dynamic dedicated deployments and independent route teardown, dynamic key
+rotation, in-cluster NodePort generation/doctor, Secret rotation and gateway
+teardown. Log: /tmp/infer-stack-review-e2e.log. Post-run probes confirm zero
+managed Models, no infer-stack-gateway Deployment, and no gateway Docker
+containers. The temporary port-forward was stopped. The script's cleanup left
+root/container-owned temporary PostgreSQL data with a permission warning;
+no running database/workload remains. GPU canary freshness and a real RTX 3090
+worker's join/placement/generation still require aiq-gpu/namek validation.
+
+## 2026-10-01 22:29:42 -0400
+
+User intent: correct the TUI/status review on top of the already committed name
+and canary fixes; secondary review also asks for CLI replica counts and truthful
+historical-runtime doctor warnings. Keep efficient monitoring, kwconf and Compose
+semantics, and make logical commits. Model/configuration: GPT-6 (Codex), Default
+collaboration mode; reasoning effort not exposed. Requested commit attribution:
+GPT-6.1-Sol. No sub-agents.
+
+I kept Model declaration as observation rather than changing the backend's
+ownership contract. A shared replica helper understands the actual nested
+KubeAI CR status and older flat counters, retaining unknown counts. Model/pod
+samples derive declared/scheduled/container-running/replica-ready stages. The
+API picker requires positive ready-replica evidence and labels generation as
+unverified until an explicit successful request. Last-generation proof belongs
+to an endpoint/pool; it does not prove every dedicated deployment or replica
+served a request. Proof is scoped to observed Model/pod incarnations and removed
+when replacement/restarts, readiness loss or failures invalidate it. No passive
+generation probes are introduced.
+
+The global observation still costs one Model list at the existing cadence; it
+previously spent that request on observe() and threw the status away. Fresh
+Cluster samples are reused, and its three list reads remain visible-only. Tests
+that injected slow observe() now inject the actual Model query seam, with count
+budgets for the independent global and Cluster workers. Historical runtime
+startup becomes WARN/evidence rather than an ok claim of fresh verification;
+unknown/failing handlers still fail and explicit apply still creates new canaries.
+
+The KubeAI editor hides image/command and retains environment. Existing custom
+launches are refused during edit instead of silently erased, and rendering now
+rejects image overrides as well as command/mounts. vLLM data parallelism is
+explicitly distinguished from independent KubeAI pod replicas. Compose keeps
+its image/command controls. I prefer rejection to inventing unsupported CR fields
+or pretending an ignored image override changed the realization.
+
+Combined correction validation: 149 backend/CLI/readiness focused tests passed;
+97 existing/new TUI tests passed before the three extra editor-refusal cases,
+and those four editor cases passed separately. The final full suite passed
+1231 tests, 3 skipped, 8 existing cleanup/ResourceWarnings (137.18s). Type check,
+CI flake8, scoped Ruff, compileall, shell syntax and whitespace checks passed.
+The previously confirmed three import-order Ruff findings in the pre-existing
+KubeAI test module remain untouched. Actual kwconf inventory/doctor help and a
+read-only headless TUI against the VM cluster passed (two nodes, four pods, no
+probe errors). No workload or host mutations occurred in this correction.
+The earlier unchanged long-model CPU e2e passed; GPU placement/generation and
+fresh worker/runtime tests still need aiq-gpu/namek. Readiness and editor changes
+are committed separately so operator-evidence policy is reviewable on its own.
+
+## 2026-10-01 23:13:37 -0400
+
+The user wants easier worker onboarding and GPU acceptance for namek (one
+3090), then yardrat (two heterogeneous GPUs) and aiq-gpu2 (four smaller GPUs),
+while correcting three focused TUI review findings. Model/configuration: GPT-6
+Codex, Default collaboration mode; reasoning effort is not exposed. Commits
+retain the requested GPT-6.1-Sol co-author attribution.
+
+I separated evidence identity from sampling detail: a Model-only observation
+retains known pod incarnation only when Model UID/generation agrees, while
+fresh pod observations and readiness loss remain authoritative contradictions.
+Old asynchronous failures now invalidate only their own incarnation's proof;
+late success likewise cannot alter a replacement. The editor and renderer now
+share the stock KubeAI launch capability policy, including mounts and legacy
+recipes. This protects evidence from UI tab changes without pretending stale
+pod observations are current pod facts. Focused TUI/backend validation: 97
+passed; scoped Ruff passed. A temporary missing local render variable during
+refactoring was caught by focused tests and corrected before commit.
+
+The onboarding design should separate local agent membership from explicit
+administrative access and test the named worker rather than total cluster
+capacity. Mixed-product nodes need actual device observations: a product label
+on a node cannot promise which physical GPU Kubernetes will allocate. I am
+building a package-native, reviewed plan/apply path with isolated test resources,
+exact placement checks, real generation and ownership-limited cleanup. Driver
+installation remains an explicit host prerequisite rather than an implicit OS
+migration. Real GPU acceptance will be run by the maintainer, not on this VM.
+
+The worker path is now `kube k3s export` on the server (private join bundle),
+`kube k3s onboard NAME` on the worker (plan/apply), and `kube node test NAME`
+for repeat acceptance from any admin host. Export writes 0700/0600 artifacts,
+rewrites only the copied server URL, identifies ownership by cluster CA, and
+writes its manifest first so interrupted export can resume. Onboard requires
+explicit matching admin access and existing host driver/toolkit, infers server
+version, reuses membership validation and the existing plugin/chart installers,
+then waits for this worker's exact expected resources. Stale EKS context does
+not define its target. I intentionally did not add an OS package/driver upgrade
+policy to a cluster join command.
+
+Acceptance reserves all expected GPUs briefly for a fresh NVML device query,
+then one GPU for a Model rendered through the existing backend. It asserts the
+actual node, request/limit/runtime, replica readiness, serving GPU identity and
+real generation response. The temporary Model is outside the lease managed
+selector, so no second ledger authority can prune production Models. Stable
+node profiles are added through the shared Helm helper with existing version
+and values preserved; profiles remain for reuse, while exact owned run resources
+are cleaned on failure/success. Interrupted runs have explicit ownership-checked
+cleanup, not namespace-wide deletion. Heterogeneous nodes report every UUID,
+product and memory; they do not claim generation on every product or GPU-index
+selection. Pod startup polling replaces a long opaque wait and emits changes.
+
+Focused CLI/backend/readiness/TUI validation initially passed 228 cases; worker
+acceptance/export tests now cover additional cases. The first full-suite run
+passed 1251 with 3 skips and 8 existing ResourceWarnings; final validation follows
+after the last export and preservation regressions. Manual root CLI simulations
+for namek, yardrat and aiq-gpu2 all passed, with real kwconf parsing/rendering and
+fake command/HTTP seams (`/tmp/infer-stack-worker-simulated.log`). A real VM
+loopback service forward returned /models HTTP 200 and was stopped on exit;
+no worker join, GPU workload, chart upgrade or credential export ran on the VM.
+
+Final validation: focused suites 233 passed; final full `pytest -q` 1256 passed,
+3 skipped, 8 pre-existing cleanup/ResourceWarnings (140.19 seconds), using
+`/tmp/infer-stack-venv/bin` (CPython 3.14.6). `ty check infer_stack`, CI flake8
+(E9/F63/F7/F82), scoped Ruff for all changed Python/new worker/TUI tests,
+compileall, shell syntax and diff whitespace checks passed. Real help tree and
+kube/node/test/k3s/onboard/export help were inspected. Export --plan created no
+files. A real read-only VM node-test JSON plan returned exit 1 and correctly
+reported Ready but zero allocatable GPUs/missing GFD, rather than using another
+node as evidence. The full worker hardware/generation acceptance remains for
+namek/aiq-gpu, with heterogeneous generation limited to one allocated GPU per
+run. No maintainer design decision is needed to try that documented workflow.
+
+The documentation is committed separately from implementation: README links the
+worker recipe, cluster setup gives the exact private export -> secure transfer
+-> onboard plan/apply sequence plus repeat node tests and interrupted cleanup,
+and the broader dev e2e comments distinguish worker acceptance from its
+namespace-wide lifecycle assumptions. This preserves one Python installer
+implementation while making the operator's path concrete for all three planned
+worker shapes.

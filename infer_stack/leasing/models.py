@@ -73,46 +73,37 @@ RESERVED_ENGINE = 'reserved'
 # Synthetic endpoint/claim name for a reservation (it serves nothing).
 RESERVED_ENDPOINT = 'reserved-gpu'
 
+def served_name(deployment: Any) -> str:
+    """The model name a deployment's engine serves under: the one rule.
+
+    The spec's ``served_model_name``, else its first served alias, else its
+    id. The engine's ``--served-model-name``, the gateway route's upstream
+    model, the Compose service name and the KubeAI Model name all derive
+    from this, so they cannot disagree.
+
+    Example:
+        >>> from types import SimpleNamespace as NS
+        >>> served_name(NS(spec={'served_model_name': 'q'}, served={'a': {}}, id='g'))
+        'q'
+        >>> served_name(NS(spec={}, served={'b': {}, 'a': {}}, id='g'))
+        'a'
+        >>> served_name(NS(spec={}, served={}, id='g'))
+        'g'
+    """
+    return deployment.spec.get('served_model_name') or (
+        sorted(deployment.served)[0] if deployment.served else deployment.id
+    )
+
+
 def is_reservation(obj: Any) -> bool:
     """True if a :class:`Deployment` / :class:`EndpointRequest` is a GPU reservation."""
     return getattr(obj, 'engine', None) == RESERVED_ENGINE
 
 
-# Fields that must match *exactly* for two requests to share one deployment.
-# Capacity fields (e.g. ``max_model_len``) are deliberately NOT here: they are
-# handled by subsumption (existing >= requested) in
-# :func:`capacity_satisfies`, so a 32k deployment can serve an 8k request.
-VLLM_STRUCTURAL_FIELDS = (
-    'engine',
-    'model_ref',
-    'revision',
-    'quantization',
-    'dtype',
-    'tensor_parallel_size',
-    'pipeline_parallel_size',
-    'data_parallel_size',
-    'image',
-    'chat_template',
-    'trust_remote_code',
-    'lora_adapters',
-    'served_name',
-    # Optional: present only for an operator-pinned endpoint. Keeping it absent
-    # for auto placement preserves the compatibility key of existing catalogs.
-    'gpu_indices',
-)
-
-# For Ollama the coalescing unit is the *daemon*, so the structural identity is
-# the host config, not the model tag (tags load/unload inside the daemon).
-OLLAMA_STRUCTURAL_FIELDS = (
-    'engine',
-    'host',
-    'gpu_indices',
-    'keep_alive',
-    'num_parallel',
-    'max_loaded_models',
-    'model_store',
-)
-
+# Structural identity has one executable definition per engine below
+# (``vllm_structural`` / ``ollama_structural``).  Keep it executable rather
+# than mirroring the fields in constants: a stale descriptive list can make a
+# reader believe a compatibility field is ignored when the hash actually uses it.
 
 def _canonical(value: Any) -> Any:
     """Normalize a value so equal-meaning configs hash identically."""
@@ -340,8 +331,8 @@ class Deployment:
     created_at: float
     updated_at: float
     demand: int = 0
-    # The committed GPU allocation of a LIVE deployment (admission-mode
-    # backends). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
+    # The committed GPU allocation of a LIVE deployment (empty where the
+    # cluster schedules). ``None`` when not LIVE, or LIVE but unresolved (a ledger from
     # before allocations existed). Cleared in the same transaction as any
     # transition out of LIVE.
     assigned_gpus: list[int] | None = None

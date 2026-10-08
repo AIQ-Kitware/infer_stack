@@ -133,8 +133,8 @@ revived and LiteLLM's admin API (`/model/new`, `/model/delete`,
 `STORE_MODEL_IN_DB` + `DATABASE_URL`) updates routes on a **running** gateway —
 zero blip, no restart. Off by default; enable with `config set dynamic_routing
 true` / `--dynamic-routing`. See `docs/litellm-gateway-routing.md` and
-`infer_stack/leasing/compose.py` (`_litellm_routes`,
-`ComposeBackend._reconcile_routes`); tests in
+`infer_stack/leasing/gateway.py` (`deployment_routes`,
+`Gateway._reconcile_routes`); tests in
 `tests/test_leasing_dynamic_routing.py`.
 
 It is strictly nicer than #1 (no blip, no advertising of undeployed models) and

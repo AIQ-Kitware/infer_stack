@@ -179,7 +179,9 @@ def test_a_ledger_change_between_preview_and_commit_retries(tmp_path):          
     assert len(calls) == 2 and ledger.get_deployment(out.deployments[0].id).assigned_gpus == [0]
 
 
-def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):         # 35
+def test_unknown_residency_admits_nothing(tmp_path):         # 35
+    """The render after a commit needs residency, so admission refuses without
+    it, even for a request that needs no new GPU."""
     from infer_stack.leasing.residency import ResidencyUnknown
 
     ledger, ctl, _ = make(tmp_path)
@@ -189,12 +191,11 @@ def test_unknown_residency_admits_only_resource_neutral_requests(tmp_path):     
         raise ResidencyUnknown('docker ps failed')
 
     ctl.backend.residency = unknown
-    with pytest.raises(PlacementError, match='residency is unknown'):
+    with pytest.raises(PlacementError, match='cannot be read'):
         ctl.acquire('x', CAT.resolve_names(['two']), wait=False, apply=False)
-    # Coalescing onto the LIVE, allocated deployment needs no new GPU. Its render
-    # still needs residency, so stage it without rendering residency-dependent state.
     overlay = ledger.plan_acquire(CAT.resolve_names(['one']))
-    assert ctl._admit(overlay, None) == ({}, [])
+    allocations, reasons = ctl._admit(overlay, None)
+    assert allocations == {} and reasons
 
 
 # -- P5: allocations and renew ----------------------------------------------------------
@@ -317,7 +318,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
     first = ctl.acquire('x', cat.resolve_names(['a']), wait=False)
     gid = first.deployments[0].id
     served = dict(ledger.get_deployment(gid).served)
-    registry = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    registry = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
 
     def decline(planned):
         raise ConvergeAborted('no')
@@ -327,7 +328,7 @@ def test_declined_approval_of_a_coalescing_acquire_changes_nothing(tmp_path):
         ctl.acquire('y', cat.resolve_names(['b']), wait=False)    # would add alias b
     assert len(ledger.status()[0]) == 1
     assert ledger.get_deployment(gid).served == served
-    now = ctl.backend._registry_file.read_text() if ctl.backend._registry_file.exists() else None
+    now = ctl.backend.gateway._registry_file.read_text() if ctl.backend.gateway._registry_file.exists() else None
     assert now == registry
 
 
@@ -465,3 +466,94 @@ def test_a_failed_apply_rollback_drops_the_admission_digest(tmp_path):
     assert ledger.publication_pending()['approved_digest'] is None
     acquire(ctl, 'two')                                          # an ordinary publisher proceeds
     assert ledger.publication_pending() is None
+
+
+def test_a_partial_apply_keeps_the_approval_so_a_drifted_render_is_refused(tmp_path):
+    """Queue item 15: the approved digest outlives an apply that did not finish.
+
+    The first apply reaches the runtime but its routes do not verify, so the
+    publication stays pending. The renderer then changes (an upgrade): an
+    ordinary retry must refuse the unapproved render, and `infer-stack apply`
+    is the deliberate re-approval.
+    """
+    from infer_stack.leasing.backend import ApplyResult, ConvergeScaffold
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, ctl, docker = make(tmp_path)
+    real = ctl.backend.apply
+
+    def partial():
+        real()                                       # the runtime changes...
+        return ApplyResult(routes=False)             # ...its routes do not verify
+
+    ctl.backend.apply = partial
+    acquire(ctl, 'one')
+    approved = ledger.publication_pending()['approved_digest']
+    assert approved and approved == ctl.backend.last_planned_digest
+    assert docker.containers                         # the runtime did change
+
+    ctl.backend.apply = real
+    original = ConvergeScaffold._planned_digest
+    ctl.backend._planned_digest = lambda planned: 'v2-' + original(planned)  # an upgrade
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()                                     # an ordinary retry
+    assert ledger.publication_pending()['approved_digest'] == approved
+    ctl.apply_now()                                  # the explicit re-approval
+    assert ledger.publication_pending() is None
+
+
+def test_a_refused_acquire_writes_no_secret(tmp_path):
+    """Queue item 20: admission previews the render, and the render names the
+    gateway's secrets; a preview must not create them. A refused acquire on a
+    fresh data root leaves no .env; the next admitted one writes the key its
+    preview staged, so the commit's render matches what was approved."""
+    from infer_stack.leasing.backend import PlacementError
+    from infer_stack.env_utils import parse_env_file
+
+    state = tmp_path / 'state'
+    backend = ComposeBackend(state_dir=state, inventory=simulate_inventory('1x80'),
+                             run=FakeDocker(), http=FakeHttp(state), images=IMAGES,
+                             ports=PORTS, state=STATE, catalog=CAT, litellm=True, ui=True)
+    ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=Clock())
+    ctl = Controller(ledger, backend)
+    env = backend.gateway._env_path
+    with pytest.raises(PlacementError):
+        acquire(ctl, 'big')                          # two GPUs on a one-GPU host
+    assert not env.exists() or 'LITELLM_MASTER_KEY' not in parse_env_file(env)
+
+    acquire(ctl, 'one')
+    assert parse_env_file(env)['LITELLM_MASTER_KEY'] == backend.front_door().master_key()
+    assert ledger.publication_pending() is None      # no second approval needed
+
+
+def test_an_explicit_reapproval_survives_its_own_partial_apply(tmp_path):
+    """Re-review 4: `infer-stack apply` approving D2 over D1 must be durable,
+    so a partial D2 apply leaves D2 approved; D3 still needs approval."""
+    from infer_stack.leasing.backend import ApplyResult, ConvergeScaffold
+    from infer_stack.leasing.profile import ProfileMismatch
+
+    ledger, ctl, docker = make(tmp_path)
+    real = ctl.backend.apply
+
+    def partial():
+        real()
+        return ApplyResult(routes=False)
+
+    ctl.backend.apply = partial
+    acquire(ctl, 'one')                                    # D1 approved, partial
+    original = ConvergeScaffold._planned_digest
+    ctl.backend._planned_digest = lambda planned: 'v2-' + original(planned)   # D2
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()
+    ctl.apply_now()                                        # approves D2; partial again
+    d2 = ctl.backend.last_planned_digest
+    assert ledger.publication_pending()['approved_digest'] == d2
+    ctl.backend.apply = real
+    ctl.gc()                                               # an ordinary retry of D2
+    assert ledger.publication_pending() is None
+
+    ctl.backend.apply = partial                            # D3 needs its own approval
+    acquire(ctl, 'two')
+    ctl.backend._planned_digest = lambda planned: 'v3-' + original(planned)
+    with pytest.raises(ProfileMismatch, match='approved'):
+        ctl.gc()

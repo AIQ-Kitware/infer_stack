@@ -40,6 +40,9 @@ from .simulator import ModelProfile, Simulator, flatten_messages
 __all__ = ['MockServer', 'build_simulator']
 
 
+_SERVE_POLL_INTERVAL = 0.01
+
+
 def build_simulator(config: dict) -> Simulator:
     """
     Build a :class:`Simulator` from a config mapping.
@@ -440,7 +443,7 @@ class MockServer:
     def start(self) -> 'MockServer':
         """Start serving in a background thread."""
         self._thread = threading.Thread(
-            target=self._httpd.serve_forever,
+            target=self.serve_forever,
             name='infer-stack-mockserver',
             daemon=True,
         )
@@ -456,7 +459,7 @@ class MockServer:
 
     def serve_forever(self) -> None:
         """Serve in the foreground until interrupted."""
-        self._httpd.serve_forever()
+        self._httpd.serve_forever(poll_interval=_SERVE_POLL_INTERVAL)
 
     def __enter__(self) -> 'MockServer':
         return self.start()

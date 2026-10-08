@@ -7,6 +7,9 @@ unprivileged ``lsof``/``fuser`` see only the caller's own processes, so they
 reported "nothing holds it" while ``nvidia-smi -r`` said ``In use by another
 client``, and a reset was recommended on that basis.
 """
+from types import SimpleNamespace
+from unittest import mock
+
 from infer_stack.gpu_doctor import GpuSample, Holder, gpu_checks
 
 
@@ -50,7 +53,7 @@ def test_unprivileged_holder_check_is_unknown_not_clear():
     res = _checks(_sample=lambda: [GpuSample(0, 0, 2)], _apps=lambda: [],
                   _holders=lambda: None)
     ok, detail = res['device holders']
-    assert ok is True                      # not a failure, but...
+    assert ok is False                     # incomplete diagnostic must not pass
     assert 'not checked' in detail         # ...explicitly not an all-clear
     assert '--sudo' in detail
 
@@ -67,12 +70,30 @@ def test_persistenced_alone_is_expected():
     assert '-pm 0' in res['reset would be blocked'][1]
 
 
+def test_passive_monitor_and_device_plugin_are_expected():
+    """Passive observers should not make a healthy Compose host fail doctor."""
+    holders = [
+        Holder(10857, '/dev/nvidia0', 'nvidia-device-plugin',
+               '0::/kubepods.slice/cri-containerd-deadbeef.scope'),
+        Holder(1932476, '/dev/nvidia0', 'nvtop', '/user.slice'),
+        Holder(2646, '/dev/nvidia0',
+               '/usr/bin/nvidia-persistenced --user nvidia-persistenced', '/'),
+    ]
+    res = _checks(_sample=lambda: [GpuSample(0, 0, 2)], _apps=lambda: [],
+                  _holders=lambda: holders)
+    ok, detail = res['device holders']
+    assert ok is True
+    assert 'nvidia-device-plugin' in detail
+    assert 'nvtop' in detail
+    assert 'nvidia-persistenced' in detail
+
+
 def test_a_kubernetes_pod_holding_a_device_is_named():
     """`pid 9030` is useless; the pod it lives in is the answer."""
     cg = ('0::/kubepods.slice/kubepods-besteffort.slice/'
           'kubepods-besteffort-pod00397bb3_dbeb_412e_8a60_731e5d34b4a7.slice/'
           'cri-containerd-4471688cb2a43ab78441da05bebe492e712d64fedbcfcc02c176d5e16273c8f9.scope')
-    h = Holder(9030, '/dev/nvidia0', 'gpu-feature-discovery', cg)
+    h = Holder(9030, '/dev/nvidia0', 'python -m rogue-gpu-prober', cg)
     assert 'kubernetes pod' in h.where
     res = _checks(_sample=lambda: [GpuSample(0, 100, 2)], _apps=lambda: [],
                   _holders=lambda: [h])
@@ -111,3 +132,66 @@ def test_sampling_takes_the_minimum_so_one_spike_is_not_load():
 def test_no_gpus_is_a_failure_not_a_pass():
     res = _checks(_sample=lambda: [], _apps=lambda: [], _holders=lambda: [])
     assert res['GPUs visible'][0] is False
+
+
+def test_requested_sudo_unavailable_has_actionable_hint():
+    res = _checks(use_sudo=True, _sample=lambda: [GpuSample(0, 0, 2)],
+                  _apps=lambda: [], _holders=lambda: None)
+    ok, detail = res['device holders']
+    assert not ok
+    assert 'sudo -v' in detail
+    assert 'Re-run with --sudo' not in detail
+
+
+def test_proc_find_race_keeps_valid_holder_results():
+    """GNU find may return 1 when an fd vanishes while walking live /proc.
+
+    That is a normal race, not a failed privileged scan.  Preserve the valid
+    stdout instead of turning the whole holder check into "not checked".
+    """
+    from infer_stack import gpu_doctor
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ['sudo', '-n', 'true']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if cmd[:4] == ['sudo', '-n', 'find', '/proc']:
+            return SimpleNamespace(
+                returncode=1,
+                stdout='/proc/10857/fd /dev/nvidia0\n',
+                stderr=("find: '/proc/2960321/fd/6': "
+                        'No such file or directory\n'),
+            )
+        raise AssertionError(cmd)
+
+    with mock.patch.object(
+        gpu_doctor.subprocess, 'run', side_effect=fake_run
+    ), \
+            mock.patch.object(gpu_doctor, '_proc_text', side_effect=[
+                'nvidia-device-plugin',
+                '0::/kubepods.slice/cri-containerd-deadbeef.scope',
+            ]):
+        holders = gpu_doctor.device_holders(use_sudo=True)
+
+    assert holders is not None
+    assert [h.pid for h in holders] == [10857]
+    assert holders[0].cmdline == 'nvidia-device-plugin'
+    assert calls[0] == ['sudo', '-n', 'true']
+
+
+def test_proc_find_real_error_still_fails_closed():
+    """Only disappearing /proc entries are tolerated; real errors are not."""
+    from infer_stack import gpu_doctor
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ['sudo', '-n', 'true']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if cmd[:4] == ['sudo', '-n', 'find', '/proc']:
+            return SimpleNamespace(returncode=1, stdout='',
+                                   stderr='find: /proc: Permission denied\n')
+        raise AssertionError(cmd)
+
+    with mock.patch.object(gpu_doctor.subprocess, 'run', side_effect=fake_run):
+        assert gpu_doctor.device_holders(use_sudo=True) is None

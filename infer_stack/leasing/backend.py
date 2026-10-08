@@ -1,14 +1,18 @@
 """Backend protocol: the seam between the ledger and real serving.
 
-The ledger decides *what should be running* (desired deployment deployments); a
-backend makes it so. The :class:`Controller` reconciles between them through the
-four methods below. Keeping this surface tiny is deliberate — it is the only
-thing a new backend (Compose, KubeAI, ...) must implement, and it is where the
-redesign draws the line between "infer-stack coordinates" and "the backend /
-KubeAI / k8s schedules".
+The ledger decides *what should be running* (the desired deployments); a
+backend makes it so. :class:`ServingBackend` is everything the
+:class:`Controller` asks of one, and all of it has a meaning on every
+backend: render a desired set, apply it, say what is resident, probe
+readiness, preview an admission. Compose, KubeAI, and the in-process
+backends (through :class:`SimpleAdmission`) implement it.
 
-All four methods MUST be idempotent: the reconciler may ``realize`` a deployment that
-is already up, or ``teardown`` one that is already gone.
+What only a backend that runs containers on this host can do (a stable
+address network, adopting containers from before ownership labels, removing
+unmanaged containers) is :class:`HostRuntime`, reached through
+``backend.host_runtime``, which is ``None`` everywhere else. The controller
+asks for the capability by meaning; the ``docker`` commands and the sidecar
+stay inside Compose.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from .models import Deployment
+from .routes import GatewayRoute
 
 
 @dataclass
@@ -33,6 +38,50 @@ class Readiness:
     ready: bool
     detail: str = ''
     fatal: bool = False
+    #: The endpoint is waiting for capacity held by others: the scheduler says
+    #: a node is short of a resource, not that no node could ever host it.
+    #: The controller then evicts an idle keep-warm deployment the backend
+    #: names in ``reclaim_candidates`` (none: nothing is evicted).
+    needs_room: bool = False
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    """How far an apply got: the runtime, then the gateway's routes.
+
+    A publication is complete only when both hold. ``runtime`` false: the
+    runtime was not brought to the render (an unreadable render, a render
+    from before fingerprints). ``routes`` false: the runtime reached the
+    render but the gateway's routes (dynamic routing) were not verified. In
+    either case the publication stays pending, and so does the approval of
+    the render it is applying. Failures raise instead; this is for the
+    outcomes that are not errors.
+
+    >>> ApplyResult.of(None).complete, ApplyResult.of(False).runtime
+    (True, False)
+    >>> ApplyResult(routes=False).complete
+    False
+    """
+
+    runtime: bool = True
+    routes: bool = True
+    detail: str = ''
+
+    @property
+    def complete(self) -> bool:
+        return self.runtime and self.routes
+
+    @classmethod
+    def of(cls, value: ApplyResult | bool | None) -> ApplyResult:
+        """An apply's return value as a result; ``None``/``True`` is complete."""
+        if isinstance(value, ApplyResult):
+            return value
+        return cls() if value is not False else cls(runtime=False)
+
+    def __and__(self, other: ApplyResult) -> ApplyResult:
+        """Both parts of one apply (KubeAI's Models, then its gateway)."""
+        return ApplyResult(self.runtime and other.runtime, self.routes and other.routes,
+                           '; '.join(d for d in (self.detail, other.detail) if d))
 
 
 class BackendTimeout(RuntimeError):
@@ -70,103 +119,237 @@ class PlacementError(Exception):
     controller rolls back the just-created lease before raising, so a request
     that cannot be satisfied does not linger as a phantom ``live`` deployment with no
     container behind it. ``reasons`` carries the planner's per-deployment messages.
+
+    ``capacity`` says whether free GPUs would have let it in, as opposed to a
+    request no amount of room admits (a render refusal, an unreadable
+    runtime, a host too small): only then is "free a GPU" the advice.
     """
 
-    def __init__(self, deployment_ids, reasons):
+    def __init__(self, deployment_ids, reasons, *, capacity: bool = True):
         self.deployment_ids = list(deployment_ids)
         self.reasons = list(reasons)
+        self.capacity = bool(capacity)
         super().__init__(
             '; '.join(self.reasons)
             or f'could not place: {", ".join(self.deployment_ids)}'
         )
 
 
-@runtime_checkable
-class Backend(Protocol):
-    """What the :class:`Controller` needs from a serving backend.
+def allocates_gpus(backend) -> bool:
+    """Whether ``backend`` allocates host GPU indices itself.
 
-    Implementations: :class:`MemoryBackend` (here, for tests/dry-runs), and
-    later ``ComposeBackend`` / ``KubeAIBackend``.
+    True for Compose, which places on this host and records the GPUs each
+    deployment holds. False for a backend whose cluster schedules (KubeAI):
+    admission commits an empty allocation, and no GPU is ever "unresolved".
+    The one place the controller and the CLI ask this.
+    """
+    return bool(backend.allocates_gpus)
+
+
+class HostRuntime(Protocol):
+    """Capabilities of a backend that runs containers on this host (Compose).
+
+    ``backend.host_runtime`` is one of these, or ``None`` for a backend with
+    nothing of the kind (KubeAI: the cluster owns the network and the pods;
+    the in-process backends). Each method is a meaning; how it is done
+    (``docker network``, ``docker rm``, the render sidecar) is the
+    implementation's business.
     """
 
-    def realize(self, deployment: Deployment) -> None:
-        """Ensure a deployment for ``deployment`` exists and is converging."""
+    def network_table(self) -> dict[str, Any] | None:
+        """The stable-address table renders use, or ``None`` before a migration."""
         ...
 
-    def teardown(self, deployment: Deployment) -> None:
-        """Ensure ``deployment``'s deployment is stopped/removed."""
+    def configure_network(self, table: dict[str, Any] | None, *,
+                          on_addresses: Callable[[dict[str, str]], None] | None = None,
+                          ) -> None:
+        """Render with this table (``{'subnet', 'addresses'}``); ``on_addresses``
+        persists addresses an approved render allocates."""
         ...
 
-    def observe(self) -> set[str]:
-        """Return the set of deployment ids currently realized in the backend."""
+    def subnet_clashes(self, subnet: str) -> list[str]:
+        """Why ``subnet`` cannot be used here: overlapping networks or routes."""
         ...
 
-    def probe_ready(
-        self, deployment: Deployment, endpoint: str
-    ) -> Readiness:
-        """Report whether one served ``endpoint`` of ``deployment`` is ready."""
+    def rendered_services(self) -> dict[str, tuple[str, str]]:
+        """``{service: (fingerprint, deployment id or '')}`` of the last render."""
+        ...
+
+    def set_adopted(self, table: dict[str, dict[str, str]]) -> None:
+        """Containers from before ownership labels that count as managed."""
+        ...
+
+    def remove_containers(self, container_ids: list[str]) -> None:
+        """Remove these containers now (orphans the operator agreed to remove)."""
+        ...
+
+    def pull_images(self, images: Any) -> list[str]:
+        """Pull these images now; return the ones that failed."""
+        ...
+
+    def upstream_check(self) -> dict[str, dict[str, Any]]:
+        """Probe each model upstream by name from inside the gateway's network."""
+        ...
+
+
+class FrontDoorControl(Protocol):
+    """The LiteLLM gateway as the controller and the CLI address it.
+
+    ``backend.front_door()`` returns one, or ``None`` for a backend without a
+    gateway: Compose's :class:`Gateway`, or KubeAI's gateway realization on
+    this host or in the cluster. Keys, the route registry, and "does it accept
+    this key" live here, not as copies on every serving backend.
+    """
+
+    #: Whether LiteLLM is on (a front door can be Open WebUI alone).
+    litellm: bool
+    #: Whether the Open WebUI surface is on.
+    ui: bool
+
+    @property
+    def env_path(self) -> Path:
+        """The managed ``.env`` holding the gateway's keys (``infer-stack env``)."""
+        ...
+
+    def require_route_keys(self, routes: list[GatewayRoute]) -> None:
+        """Refuse (:class:`~infer_stack.leasing.gateway.MissingRouteKey`) when a
+        route sends a key variable the managed ``.env`` does not set."""
+        ...
+
+    def registry_routes(self) -> list[GatewayRoute]:
+        """The route registry's routes (ad-hoc deployments, older rows)."""
+        ...
+
+    def route_entries(self) -> dict[str, dict[str, Any]]:
+        """The route registry's rows: alias -> row."""
+        ...
+
+    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
+        """Write the route registry's rows."""
+        ...
+
+    def master_key(self) -> str:
+        ...
+
+    def rotate_master_key(self) -> dict[str, str | None]:
+        """Write a fresh key; return what it replaced (for :meth:`restore_env`)."""
+        ...
+
+    def restore_env(self, values: dict[str, str | None]) -> None:
+        ...
+
+    def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
+        ...
+
+    def urls(self) -> tuple[str | None, str | None]:
+        """``(OpenAI base URL, Open WebUI URL)`` exposed by this front door."""
+        ...
+
+    def connection_info(self) -> ConnectionInfo | None:
+        """Where a client reaches this front door; ``None`` when nothing does."""
+        ...
+
+
+@dataclass(frozen=True)
+class ConnectionInfo:
+    """Where a client reaches the endpoints: a base URL and its credential.
+
+    Through the LiteLLM front door, one ``base_url`` for every alias and the
+    managed master key (``api_key``, read from ``api_key_env``); without one,
+    whatever the backend's own server offers (KubeAI's, keyless:
+    ``api_key='EMPTY'``). ``ui_url`` / ``proxy_url`` are Open WebUI and the
+    single-port reverse proxy, when on. The request name per endpoint is the
+    backend's (:meth:`ServingBackend.request_names`), not the front door's.
+    """
+
+    base_url: str | None
+    api_key_env: str | None = None
+    api_key: str | None = None
+    ui_url: str | None = None
+    proxy_url: str | None = None
+
+
+class RecoveryProfile(Protocol):
+    """A backend's recovery snapshot: what it would render, and adopting one.
+
+    ``backend.recovery_profile`` is one of these, or ``None`` (the in-process
+    backends have no settings to snapshot).
+    """
+
+    def render_profile(self) -> dict[str, Any]:
+        ...
+
+    def use_profile(self, profile: dict[str, Any]) -> None:
         ...
 
 
 @runtime_checkable
-class ConvergeBackend(Backend, Protocol):
-    """The optional converge-style surface the controller prefers.
+class ServingBackend(Protocol):
+    """What the :class:`Controller` needs from a serving backend.
 
-    A backend exposing these drives the render/apply split: the controller
-    calls ``converge(desired, apply=False)`` inside the render lock (fast,
-    writes on-disk state only) and then ``apply()`` in the same lock hold
-    (slow, bounded; see :meth:`Controller._apply_pending`). After a
-    converge the controller reads the three ``last_*`` attributes:
+    Every acquire goes through admission: a strict :meth:`residency`, an
+    in-memory :meth:`preview`, then :meth:`converge` inside the render lock
+    (fast, writes the backend's state only) and :meth:`apply` in the same
+    lock hold (slow, bounded; see ``Controller._apply_pending``). After a
+    converge the controller reads the ``last_*`` attributes:
 
-    * ``last_unplaced`` — desired deployment ids the render/placement could not
-      deliver; an acquire whose deployment lands here fails loudly
-      (:class:`PlacementError`) and rolls its lease back.
-    * ``last_errors`` — per-deployment reasons, each prefixed with the
-      deployment id.
-    * ``last_assignments`` — deployment id -> GPU indices (empty for backends
-      where the cluster schedules).
+    * ``last_unplaced``: desired deployment ids the render could not deliver;
+      an acquire whose deployment lands here fails (:class:`PlacementError`)
+      and rolls its lease back;
+    * ``last_errors``: per-deployment reasons, each prefixed with the id;
+    * ``last_assignments``: deployment id -> GPU indices (empty where the
+      cluster schedules).
 
-    Backends without this surface fall back to the per-deployment
-    ``realize``/``teardown`` path in :meth:`Controller._render`.
+    Compose and KubeAI implement it directly; :class:`SimpleAdmission`
+    supplies it for the in-process backends.
     """
 
     last_unplaced: set[str]
     last_errors: list[str]
     last_assignments: dict[str, list[int]]
-
-    def converge(self, desired: list[Deployment], *, apply: bool = True):
-        """Render the desired set to backend state; optionally apply it."""
-        ...
-
-    def apply(self) -> bool | None:
-        """Converge reality to the last render (idempotent, slow half).
-
-        Return ``False`` if the apply did not fully take effect (the controller
-        keeps the change pending and retries); ``True`` or ``None`` otherwise.
-        Raise on backend failure, which also leaves the change pending.
-        """
-        ...
-
-
-@runtime_checkable
-class AdmissionBackend(ConvergeBackend, Protocol):
-    """The surface admission mode uses (see ``Controller._admission_mode``).
-
-    Today only :class:`~infer_stack.leasing.compose.ComposeBackend` has it:
-    strict residency, an in-memory placement ``preview``, and the Compose
-    network and adoption state the controller hands it. The controller
-    reaches these through ``Controller._admitting``, only after the
-    capability check, so the type checker sees one named capability instead
-    of attributes a minimal :class:`Backend` does not have.
-    """
-
-    network: dict[str, Any] | None
-    on_addresses: Callable[[dict[str, str]], None] | None
-    adopted: dict[str, Any]
     last_preview_digest: str | None
+    #: The digest of the last render's files: the approval guard compares it
+    #: with the approved one, so every backend must keep it current.
+    last_planned_digest: str | None
+    #: Whether this backend owns host GPU indices (Compose) or the cluster
+    #: does (KubeAI). Required: a wrong default would claim host GPUs.
+    allocates_gpus: bool
+
+    @property
+    def recovery_profile(self) -> RecoveryProfile | None:
+        """This backend's recovery snapshot, or ``None`` (see :class:`RecoveryProfile`)."""
+        ...
+
+    def plan_on_idle_host(self, desired: list[Deployment]) -> Any:
+        """Placement for ``desired`` alone, as if nothing else ran (a plan)."""
+        ...
+
+    def validate_requests(self, requests: list[Any]) -> None:
+        """Refuse requests this backend can never serve (raise); else nothing."""
+        ...
+
+    @property
+    def host_runtime(self) -> HostRuntime | None:
+        """This host's container capabilities, or ``None`` (see :class:`HostRuntime`)."""
+        ...
+
+    def observe(self) -> set[str]:
+        """Deployment ids the backend has rendered and brought up (lenient)."""
+        ...
 
     def residency(self) -> Any:
         """A strict :class:`~infer_stack.leasing.residency.Residency`, or raise."""
+        ...
+
+    def instances(self) -> list[Any]:
+        """Every running unit, as :class:`~infer_stack.leasing.instances.Instance`.
+
+        Built from :meth:`residency`, so it raises when that does.
+        """
+        ...
+
+    def probe_ready(self, deployment: Deployment, endpoint: str) -> Readiness:
+        """Whether one served ``endpoint`` of ``deployment`` answers."""
         ...
 
     def preview(self, desired: list[Deployment], placement: Any = None, *,
@@ -174,11 +357,128 @@ class AdmissionBackend(ConvergeBackend, Protocol):
         """Place and render ``desired`` without writing; ``(plan, rendered)``."""
         ...
 
-    def run(self, args: list[str], **kwargs: Any) -> str:
-        """Run a runtime command (``docker ...``) and return its stdout."""
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None) -> Any:
+        """Render the desired set to backend state; optionally apply it."""
         ...
 
-    def _load_sidecar(self) -> dict:
+    def apply(self) -> ApplyResult | bool | None:
+        """Converge reality to the last render (idempotent, slow half).
+
+        Return an :class:`ApplyResult` saying how far it got; ``None`` or
+        ``True`` means complete, ``False`` means the runtime was not reached.
+        The controller keeps the change pending, and its approval, until a
+        complete result. Raise on backend failure, which also leaves the
+        change pending.
+        """
+        ...
+
+    def settle_snapshot(self) -> Any:
+        """A sample of runtime work that can outlive a killed client, or ``None``.
+
+        After an interrupted apply the controller samples this until two
+        consecutive samples are equal (``Controller._wait_for_settled_runtime``).
+        ``None`` means nothing of the kind to wait for: an in-process backend,
+        or a cluster whose apply is declarative server-side. A backend that
+        drives a local runtime anywhere (KubeAI's host gateway is a Compose
+        project) must return its sample, not ``None``. Raises when the runtime
+        cannot be read.
+        """
+        ...
+
+    def placement_notes(self) -> dict[str, list[str]]:
+        """What the last render recorded about placement, for health views:
+        ``degraded`` (committed GPUs no longer valid) and ``displaced`` (idle
+        residents that yielded their GPUs). Empty where nothing is placed."""
+        ...
+
+    def front_door(self) -> FrontDoorControl | None:
+        """What holds the LiteLLM gateway (its keys and routes), or
+        ``None`` for a backend without one."""
+        ...
+
+    def routes(self, desired: list[Deployment], placement: Any = None
+               ) -> list[GatewayRoute]:
+        """The gateway routes a render of ``desired`` produces."""
+        ...
+
+    def connection_info(self) -> ConnectionInfo | None:
+        """Where a client reaches this backend's endpoints, or ``None``
+        (an in-process backend serves nothing)."""
+        ...
+
+    #: Whether this backend runs engine processes (containers, pods) whose
+    #: logs can be read; ``False`` for the in-process backends.
+    runs_engines: bool
+    #: The catalog it renders from (the published union once a profile is in
+    #: use), or ``None``.
+    catalog: Any
+    #: Recorded VRAM measurements (``measure --record``), or ``None`` where
+    #: nothing is measured.
+    measurements: Any
+
+    def compose_project(self) -> Any | None:
+        """The Compose project on this host (the stack itself, or KubeAI's
+        gateway), or ``None`` where there is none."""
+        ...
+
+    def down(self) -> None:
+        """Take down everything this backend runs (``stack down``)."""
+        ...
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        """Preflight checks: ``(check, ok, detail)``; empty when there are none."""
+        ...
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        """The tail of a deployment's engine log; ``''`` when there is none."""
+        ...
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        """The ``model`` a client sends for each of ``endpoints``, for those
+        this backend decides (the alias itself behind a LiteLLM front door; a
+        KubeAI Model's name without one). Others fall back to the deployment's
+        served name."""
+        ...
+
+    def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
+        """The routes every endpoint of ``catalog`` would get here."""
+        ...
+
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """Which of ``idle`` could free room ``blocked`` is waiting for.
+
+        Asked only when a probe said ``needs_room``. The backend knows the
+        scheduling domain (which nodes, which resources); the controller
+        keeps the policy (only idle deployments, longest idle first, one at
+        a time). Return in ``idle``'s order; empty means evicting would not help.
+        """
+        ...
+
+
+#: The name ``infer_stack.leasing`` has always exported for the controller's
+#: backend protocol.
+Backend = ServingBackend
+
+class Realizer(Protocol):
+    """The per-deployment primitives :class:`SimpleAdmission` converges with.
+
+    Only the in-process backends implement these; a real backend converges a
+    whole desired set at once, where realizing one deployment alone would
+    prune the others.
+    """
+
+    def realize(self, deployment: Deployment) -> None:
+        """Ensure ``deployment`` exists (idempotent)."""
+        ...
+
+    def teardown(self, deployment: Deployment) -> None:
+        """Ensure ``deployment`` is gone (idempotent)."""
+        ...
+
+    def observe(self) -> set[str]:
+        """The deployment ids realized now."""
         ...
 
 
@@ -250,8 +550,41 @@ class ConvergeScaffold:
 
         self._atomic_write(self._state_file, json.dumps(data, indent=2))
 
+    def placement_notes(self) -> dict[str, list[str]]:
+        """``degraded`` / ``displaced`` as the last render recorded them."""
+        sidecar = self._load_sidecar()
+        return {key: list(sidecar.get(key) or ()) for key in ('degraded', 'displaced')}
+
+    #: Digest of files an admission preview already had approved.
+    _preapproved: str | None = None
+    #: Digest of the files the last render produced (approved-digest guard).
+    last_planned_digest: str | None = None
+    #: Digest of the files the last preview produced.
+    last_preview_digest: str | None = None
+
+    @staticmethod
+    def _planned_digest(planned: dict) -> str:
+        import hashlib
+        import json
+
+        material = json.dumps({str(k): v for k, v in planned.items()}, sort_keys=True)
+        return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+    def _preview_approval(self, planned: dict, *, approve: bool) -> None:
+        """Record a preview's digest; with ``approve``, ask now, not after commit.
+
+        The render that follows the commit skips the prompt when it produces
+        the same files (see :meth:`_approve_changes`).
+        """
+        self.last_preview_digest = self._planned_digest(planned)
+        if approve:
+            self._approve_changes(planned)
+            self._preapproved = self.last_preview_digest
+
     def _approve_changes(self, planned: dict) -> None:
         """Show pending rendered-state changes and confirm them.
+
+        Files a preview already had approved (same digest) pass silently once.
 
         ``planned`` maps target paths to their new content. When nothing
         actually changed, this is a quiet no-op. When ``assume_yes`` (scripts /
@@ -261,6 +594,9 @@ class ConvergeScaffold:
         """
         from .._log import logger
 
+        preapproved, self._preapproved = self._preapproved, None
+        if preapproved is not None and self._planned_digest(planned) == preapproved:
+            return
         changed = {
             p: text
             for p, text in planned.items()
@@ -283,7 +619,176 @@ class ConvergeScaffold:
             )
 
 
-class MemoryBackend:
+@dataclass
+class RenderPreview:
+    """The render half of a :meth:`SimpleAdmission.preview`: what it refused."""
+
+    unrenderable: set[str]
+    errors: list[str]
+
+
+class SimpleAdmission:
+    """:class:`ServingBackend` for a backend that neither places nor inspects.
+
+    For in-process backends (the dry-run and test backends): they allocate no
+    GPUs, their :meth:`residency` is what :meth:`observe` reports (each
+    deployment one warm instance), and converge/apply is the subclass's
+    :class:`Realizer` primitives over the rendered set. A subclass that
+    emulates capacity overrides :meth:`plan`; one that emulates render
+    failures overrides :meth:`refuse`. Everything else goes through the one
+    admission path the real backends use.
+    """
+
+    allocates_gpus = False
+    last_preview_digest: str | None = None
+    last_planned_digest: str | None = None
+    #: No containers on this host to manage, no settings to snapshot.
+    host_runtime: HostRuntime | None = None
+    recovery_profile: RecoveryProfile | None = None
+
+    def plan_on_idle_host(self, desired: list[Deployment]):
+        """Nothing else competes in-process: the ordinary plan."""
+        return self.plan(desired)
+
+    def validate_requests(self, requests: list[Any]) -> None:
+        """Every request is servable in-process."""
+
+    def placement_notes(self) -> dict[str, list[str]]:
+        return {}
+
+    def settle_snapshot(self) -> None:
+        return None                     # in-process: nothing outlives a call
+
+    def reclaim_candidates(self, blocked: Deployment,
+                           idle: list[Deployment]) -> list[str]:
+        """One scheduling domain in-process: any idle deployment frees room."""
+        return [g.id for g in idle]
+
+    def front_door(self) -> FrontDoorControl | None:
+        return None                     # no gateway in-process
+
+    def routes(self, desired: list[Deployment], placement: Any = None
+               ) -> list[GatewayRoute]:
+        return []
+
+    def connection_info(self) -> ConnectionInfo | None:
+        return None
+
+    def request_names(self, endpoints: list[str]) -> dict[str, str]:
+        return {}
+
+    #: In-process: nothing runs, so nothing to log, check, measure or bring down.
+    runs_engines = False
+    catalog: Any = None
+    measurements: Any = None
+
+    def compose_project(self) -> Any | None:
+        return None
+
+    def down(self) -> None:
+        return None
+
+    def doctor(self) -> list[tuple[str, bool, str]]:
+        return []
+
+    def deployment_logs(self, deployment: Deployment, *, tail: int = 400) -> str:
+        return ''
+
+    def catalog_routes(self, catalog: Any) -> list[GatewayRoute]:
+        return []
+
+    def plan(self, desired: list[Deployment], placement: Any = None):
+        """Which of ``desired`` fit; here, all of them, on no GPU."""
+        from .placement import GpuPlan
+
+        return GpuPlan(assignments={g.id: [] for g in desired})
+
+    def refuse(self, desired: list[Deployment]) -> dict[str, str]:
+        """``{deployment id: reason}`` for what cannot be rendered; none here."""
+        return {}
+
+    def residency(self):
+        from .residency import Container, Residency
+
+        return Residency(by_deployment={
+            gid: (Container(container_id=gid, deployment_id=gid,
+                            state='running', labelled=True),)
+            for gid in sorted(self.observe())
+        })
+
+    def instances(self):
+        """One in-process instance per realized deployment; no log to read."""
+        from .instances import MEMORY, from_residency
+
+        return from_residency(self.residency(), runtime=MEMORY)
+
+    def _preview(self, desired: list[Deployment], placement: Any = None):
+        desired = list(desired)
+        plan = self.plan(desired, placement)
+        refused = self.refuse(desired)
+        return plan, RenderPreview(set(refused), [f'{g}: {why}' for g, why in refused.items()])
+
+    @staticmethod
+    def _digest(plan, rendered) -> str:
+        """What an in-process render amounts to: who is placed where. One
+        representation for the preview and the converge, so the approval
+        guard compares like with like."""
+        return repr(sorted(
+            (gid, list(gpus)) for gid, gpus in plan.assignments.items()
+            if gid not in rendered.unrenderable))
+
+    def preview(self, desired: list[Deployment], placement: Any = None, *,
+                approve: bool = False):
+        plan, rendered = self._preview(desired, placement)
+        self.last_preview_digest = self._digest(plan, rendered)
+        return plan, rendered
+
+    def converge(self, desired: list[Deployment], *, apply: bool = True,
+                 placement: Any = None):
+        """Record the renderable, placed part of ``desired``; ``apply`` realizes it."""
+        desired = list(desired)
+        plan, rendered = self._preview(desired, placement)
+        self.last_planned_digest = self._digest(plan, rendered)
+        self.last_errors = list(plan.errors) + list(rendered.errors)
+        self.last_unplaced = {
+            g.id for g in desired
+            if g.id not in plan.assignments or g.id in rendered.unrenderable}
+        self.last_assignments = (dict(plan.assignments)
+                                 if self.allocates_gpus else {})
+        self._rendered = {g.id: g for g in desired if g.id not in self.last_unplaced}
+        known = getattr(self, '_known', {})
+        known.update({g.id: g for g in desired})
+        self._known = known
+        if apply:
+            self.apply()
+
+    def apply(self) -> None:
+        """Realize what the last converge rendered; tear down the rest."""
+        rendered = getattr(self, '_rendered', {})
+        for gid in sorted(self.observe() - set(rendered)):
+            deployment = getattr(self, '_known', {}).get(gid)
+            if deployment is not None:
+                self.teardown(deployment)
+        for gid, deployment in rendered.items():
+            if gid not in self.observe():
+                self.realize(deployment)
+
+    # Replaced (never mutated) by each converge.
+    last_unplaced: set[str] = set()
+    last_errors: list[str] = []
+    last_assignments: dict[str, list[int]] = {}
+
+    def observe(self) -> set[str]:  # pragma: no cover - provided by the backend
+        raise NotImplementedError
+
+    def realize(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def teardown(self, deployment: Deployment) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+
+class MemoryBackend(SimpleAdmission):
     """In-memory backend that records calls and has configurable readiness.
 
     Not a real serving backend — it never starts a process. It exists so the
@@ -347,7 +852,7 @@ class MemoryBackend:
             self.ready_overrides[(deployment_id, endpoint)] = ready
 
 
-class NullBackend:
+class NullBackend(SimpleAdmission):
     """A no-op backend that serves nothing — for ``--dry-run`` and ``leases``.
 
     It never starts a process. ``observe`` returns the empty set, so the
@@ -371,3 +876,41 @@ class NullBackend:
         self, deployment: Deployment, endpoint: str
     ) -> Readiness:
         return Readiness(True, 'dry-run')
+
+
+def _conforms() -> None:  # pragma: no cover - read by the type checker only
+    """Each backend the controller drives is a :class:`ServingBackend`.
+
+    Never called: ``ty`` checks these returns, so a backend that drifts from
+    the protocol fails the type check rather than a run.
+    """
+    from ..backends.kubeai import KubeaiBackend
+    from ..backends.kubeai_gateway import ClusterGateway
+    from .compose import ComposeBackend
+
+    def compose(backend: ComposeBackend) -> ServingBackend:
+        return backend
+
+    def kubeai(backend: KubeaiBackend) -> ServingBackend:
+        return backend
+
+    def memory(backend: MemoryBackend) -> ServingBackend:
+        return backend
+
+    def null(backend: NullBackend) -> ServingBackend:
+        return backend
+
+    def host(backend: ComposeBackend) -> HostRuntime:
+        return backend
+
+    def compose_front(backend: ComposeBackend) -> FrontDoorControl:
+        return backend.front_door()
+
+    def cluster_front(backend: ClusterGateway) -> FrontDoorControl:
+        return backend
+
+    def compose_profile(backend: ComposeBackend) -> RecoveryProfile:
+        return backend
+
+    def kubeai_profile(backend: KubeaiBackend) -> RecoveryProfile:
+        return backend

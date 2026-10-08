@@ -20,40 +20,56 @@ def _run(cmd: list[str], *, timeout: float = 20.0) -> str:
 
 
 def simulate_inventory(spec: str) -> dict[str, Any]:
-    """Build a fake inventory from a spec string.
+    """Build a fake inventory from a compact GPU specification.
 
-    Comma-separated entries, each ``M`` (one GPU of M GiB) or ``NxM`` (N GPUs
-    of M GiB), so heterogeneous hosts are expressible: ``'4x96'`` is four
-    96-GiB cards, ``'48,16'`` is yardrat (one 48 + one 16), ``'2x48,16'``
-    composes both forms.
+    Comma-separated entries are ``M`` / ``NxM`` for memory-only simulation or
+    ``M@CC`` / ``NxM@CC`` when compute capability matters to a suggestion.
+    Examples: ``4x96@12.0`` approximates a four-GPU Blackwell workstation,
+    ``48@7.5`` a high-VRAM Turing card, and ``48,16`` keeps the historical
+    memory-only spelling.  The optional capability makes class-gated catalog
+    suggestions testable without hard-coding product names.
     """
-    sizes: list[float] = []
+    entries: list[tuple[float, float | None]] = []
     try:
-        for entry in spec.lower().split(','):
-            entry = entry.strip()
-            if 'x' in entry:
-                count_str, gib_str = entry.split('x', 1)
-                sizes.extend([float(gib_str)] * int(count_str))
+        for raw_entry in spec.lower().split(','):
+            raw_entry = raw_entry.strip()
+            if not raw_entry:
+                raise ValueError
+            if '@' in raw_entry:
+                shape, cap_str = raw_entry.rsplit('@', 1)
+                compute_cap = float(cap_str)
             else:
-                sizes.append(float(entry))
-        if not sizes:
+                shape = raw_entry
+                compute_cap = None
+            if 'x' in shape:
+                count_str, gib_str = shape.split('x', 1)
+                entries.extend(
+                    [(float(gib_str), compute_cap)] * int(count_str)
+                )
+            else:
+                entries.append((float(shape), compute_cap))
+        if not entries:
             raise ValueError
     except (ValueError, AttributeError):
         raise ValueError(
             f'Invalid --simulate-hardware spec {spec!r}. Expected '
-            f'comma-separated NxM or M entries (e.g. 4x96, 2x80, 48,16).'
+            'comma-separated NxM[@CC] or M[@CC] entries '
+            '(e.g. 4x96@12.0, 2x80@9.0, 48@7.5,16).'
         )
-    gpus = [
-        {
+    gpus = []
+    for i, (memory_gib, compute_cap) in enumerate(entries):
+        suffix = '' if compute_cap is None else f', sm{int(round(compute_cap * 10))}'
+        gpu = {
             'index': i,
             'uuid': f'GPU-simulated-{i:04d}',
-            'name': f'Simulated GPU ({memory_gib:.0f}GiB)',
+            'name': f'Simulated GPU ({memory_gib:.0f}GiB{suffix})',
             'memory_mib': int(memory_gib * 1024),
             'memory_gib': memory_gib,
             'display_active': False,
         }
-        for i, memory_gib in enumerate(sizes)
-    ]
+        if compute_cap is not None:
+            gpu['compute_cap'] = compute_cap
+        gpus.append(gpu)
     return {'gpu_count': len(gpus), 'gpus': gpus}
 
 
@@ -65,6 +81,29 @@ def detect_inventory() -> dict[str, Any]:
             '--format=csv,noheader,nounits',
         ]
     )
+    # Keep compute capability optional.  Asking for it in a second query means
+    # an older nvidia-smi that does not expose ``compute_cap`` cannot turn an
+    # otherwise healthy host into an empty inventory.
+    cap_query = _run(
+        [
+            'nvidia-smi',
+            '--query-gpu=index,compute_cap',
+            '--format=csv,noheader,nounits',
+        ]
+    )
+    caps: dict[int, float] = {}
+    if cap_query:
+        reader = csv.reader(
+            line for line in cap_query.splitlines() if line.strip()
+        )
+        for row in reader:
+            if len(row) < 2:
+                continue
+            try:
+                caps[int(row[0].strip())] = float(row[1].strip())
+            except ValueError:
+                continue
+
     gpus: list[dict[str, Any]] = []
     if query:
         reader = csv.reader(line for line in query.splitlines() if line.strip())
@@ -72,17 +111,19 @@ def detect_inventory() -> dict[str, Any]:
             if len(row) < 5:
                 continue
             idx, uuid, name, mem, display_active = [x.strip() for x in row[:5]]
-            gpus.append(
-                {
-                    'index': int(idx),
-                    'uuid': uuid,
-                    'name': name,
-                    'memory_mib': int(float(mem)),
-                    'memory_gib': round(int(float(mem)) / 1024, 2),
-                    'display_active': display_active.lower()
-                    in {'enabled', 'active', 'on', 'true'},
-                }
-            )
+            index = int(idx)
+            gpu = {
+                'index': index,
+                'uuid': uuid,
+                'name': name,
+                'memory_mib': int(float(mem)),
+                'memory_gib': round(int(float(mem)) / 1024, 2),
+                'display_active': display_active.lower()
+                in {'enabled', 'active', 'on', 'true'},
+            }
+            if index in caps:
+                gpu['compute_cap'] = caps[index]
+            gpus.append(gpu)
     return {
         'gpu_count': len(gpus),
         'gpus': gpus,

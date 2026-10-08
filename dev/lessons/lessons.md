@@ -95,3 +95,113 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   absent.
 - **Applies when:** writing or reviewing any multi-threaded test that uses a
   barrier, latch, or queue rendezvous.
+
+- **Lesson:** A test that needs a large file for its *size* should create it
+  sparse (`file.truncate(n)`), and remove its temp dir. `os.path.getsize`
+  reports the full size, but no disk is used. Writing real bytes leaks gigabytes
+  per run unless the test cleans up.
+- **Evidence / MWE:** 21f5e09. The `weight_floor_gib` doctest wrote two 2 GiB
+  files into `mkdtemp()` and never removed them. A day of suite runs left
+  49 GB in `/tmp` on the guest, k3s tainted its node for disk pressure, and
+  KubeAI's pods were evicted. With sparse files the doctest takes 0.15 s and
+  leaves nothing behind.
+- **Applies when:** a test exercises size-dependent logic (VRAM floors, disk
+  checks, download sizes).
+
+- **Lesson:** A kwconf flag (`isflag=True`) takes an optional value, so a
+  flag written before a positional swallows it: `logs -f qwen` parsed as
+  `follow='qwen'` with no names. infer-stack's flags are all boolean, so
+  `_FlagSafeMixin` hands a non-boolean string back to the positional list.
+- **Evidence / MWE:** `tests/test_day2.py::test_a_flag_never_swallows_the_positional_after_it`;
+  `infer_stack/cli/options.py` (`reclaim_swallowed_positionals`). Found live
+  2026-09-26: `logs -f <alias>` followed every instance.
+- **Applies when:** a kwconf command has both flags and positional
+  arguments.
+
+- **Lesson:** `producer | grep -q pattern` under `set -o pipefail` can fail
+  although the pattern matched: `grep -q` exits at the first match and the
+  producer's next write dies of SIGPIPE (141). Write to a file, then grep it.
+- **Evidence / MWE:** `dev/lessons/mwe/grep_q_pipefail.sh` prints 141 for
+  the pipeline and 0 for the file.
+- **Applies when:** an e2e or handover script checks a command's output with
+  `grep -q` under `set -euo pipefail`.
+
+- **Lesson:** On a disk other work keeps nearly full, a k3s node that dips
+  under the 5% eviction threshold stays tainted `disk-pressure` after the
+  space comes back: the kubelet's default minimum reclaim adds 10%, so the
+  taint clears only at 15% free. Freeing your own files is not enough; set
+  `eviction-minimum-reclaim` to a fixed size (1Gi) on a dev cluster.
+- **Evidence / MWE:** 2026-09-26 on the guest: ten UX-audit data roots
+  (0.9 GB each) pushed the disk over; after deleting them the node sat at
+  12.8% free, still tainted, for 10 minutes, KubeAI's controller Pending.
+  `kubectl get --raw /api/v1/nodes/<node>/proxy/configz` showed
+  `evictionMinimumReclaim: 10%`. With `kubelet-arg:
+  eviction-minimum-reclaim=imagefs.available=1Gi,nodefs.available=1Gi` in
+  `/etc/rancher/k3s/config.yaml` and a k3s restart, the taint cleared.
+  `dev/k3s_agent_container.sh` passes the same to the second node.
+- **Applies when:** a dev cluster shares its disk with anything else, and
+  whenever a test or audit keeps large artifacts in `/tmp`.
+
+- **Lesson:** An e2e that runs `infer-stack` from an editable install imports
+  the live checkout, so editing the tree while it runs can break it midway.
+  Run long e2e passes from a copy: `cp -r infer_stack dev/... $SNAP` and
+  `PYTHONPATH=$SNAP` (it precedes the editable install's path entry).
+- **Evidence / MWE:** 2026-09-26: a `dev/kubeai_e2e.sh` run failed at its
+  routes step with `ImportError: cannot import name 'Backend'` while the
+  backend protocol was being renamed, and its cleanup failed the same way,
+  leaving a Model and the gateway containers behind. The rerun from a copy
+  printed the copy's `infer_stack.__file__` and passed while edits continued.
+- **Applies when:** a long e2e or audit runs in tmux while work continues in
+  the same checkout.
+
+- **Lesson:** Code that runs inside `converge` must not take the backend's
+  converge flock again. `flock` locks belong to an open file description, so a
+  second open of the same lock file in the same process waits on itself for
+  ever; nothing times out and pytest just hangs. Helpers called from a
+  converge assume the caller holds the lock (and say so); only entry points
+  called from outside take it.
+- **Evidence / MWE:** 2026-09-27: `Gateway.remember` opened with
+  `with self._converge_lock():` and was called from `ComposeBackend.converge`,
+  which already held it. `tests/test_leasing_compose.py` hung with no output
+  until killed; removing the inner lock made it finish in 4 s.
+- **Applies when:** adding a gateway/backend helper that writes state under
+  the state dir and may be reached from a render or converge.
+
+- **Lesson:** A traversal of live `/proc` can return useful stdout and exit 1
+  because a PID or fd disappears between directory enumeration and `stat`.
+  Treating any nonzero `find /proc` status as total scan failure discards valid
+  observations and can be misreported as a sudo/authentication problem. Check
+  privilege separately, tolerate only the expected `/proc/...: No such file or
+  directory` race, and fail closed on other errors.
+  - **Evidence / MWE:** `tests/test_gpu_doctor.py::test_proc_find_race_keeps_valid_holder_results`;
+    live aiq-gpu reproduction on 2026-10-02 produced 52 valid NVIDIA-device
+    holder records while one vanished fd made GNU find exit 1.
+  - **Applies when:** inspecting process/fd state under live `/proc`, especially
+    privileged diagnostics that must distinguish incomplete observation from
+    authentication failure.
+
+- **Lesson:** Once ordinary KV on a high-VRAM GPU already exceeds a model's
+  native context window, treat context capacity and long-session performance as
+  separate problems. Prefer the ordinary-KV full-context path first, then
+  benchmark cold prefill, prefix reuse, and decode-at-depth before introducing
+  lower-bit/compressed KV solely for capacity.
+  - **Evidence / MWE:** `dev/qwen38_rtx8000_findings.md`, especially completed
+    round 3 (`qwen38-rtx8000-round3-20260924T150901`): 48-GiB sm75 exposed
+    426K-437K FP16 KV tokens for a 262K model window; cached 128K follow-up turns
+    completed in ~18-20 s while cold 128K prefill took ~3341-3344 s.
+  - **Applies when:** serving a model whose ordinary KV cache already covers its
+    advertised maximum context on the target GPU class, especially persistent
+    agent/chat workloads with reusable prefixes.
+
+- **Lesson:** A serving deployment's capacity is not necessarily the public
+  contract of every alias routed to it. With subsumption/coalescing, a smaller
+  endpoint may ride a larger process; persist route metadata per alias and use
+  deployment capacity only as a fallback. Also distinguish metadata your
+  controller owns from fields a gateway synthesizes, or reconciliation can
+  churn forever on harmless enrichment.
+  - **Evidence / MWE:** `tests/test_leasing_context_metadata.py::test_coalesced_aliases_keep_their_own_catalog_context_contract`,
+    `test_legacy_coalesced_deployment_recovers_alias_windows_from_catalog`, and
+    `test_litellm_synthesized_context_does_not_churn_external_route`.
+  - **Applies when:** a controller advertises endpoint metadata through a proxy
+    while sharing/superset placement can map multiple endpoint contracts onto
+    one runtime, or the proxy enriches returned metadata independently.

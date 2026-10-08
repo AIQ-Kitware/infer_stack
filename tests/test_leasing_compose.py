@@ -39,6 +39,19 @@ IMAGES = {
 PORTS = {'ollama': 11434}
 
 
+
+def access_info(be, endpoints):
+    """What a client is handed for ``endpoints`` (the descriptor's inputs), as
+    a dict: the backend's connection info and its request names."""
+    info = be.connection_info()
+    if info is None:
+        return None
+    out = {k: v for k, v in vars(info).items()
+           if v is not None or (k == 'api_key_env' and info.base_url is not None)}
+    if info.base_url is not None:
+        out['request_names'] = be.request_names(list(endpoints))
+    return out
+
 def vllm(gid, *, hf='org/model', served=None, tp=1, max_len=32768, reclaim='keep-warm',
          protocol='chat', t=0.0):
     # endpoint (public alias) is the deployment id; served_model_name is the upstream
@@ -268,7 +281,7 @@ def _hyperqwen_from_suggestion(endpoint_name=None, **runtime_changes):
     ep = frag['endpoints'][endpoint_name]
     ep['public_name'] = 'local-qwen38'
     ep['runtime'].update(runtime_changes)
-    req = Catalog.from_dict(frag).resolve_endpoint(endpoint_name)
+    req = Catalog.from_dict(frag).resolve_endpoint(endpoint_name).to_request()
     deployment = vllm('grp-q38', hf=req.spec['hf_model_id'], served='local-qwen38')
     deployment.spec['runtime'] = req.spec['runtime']
     rc = render_compose(
@@ -527,6 +540,13 @@ def make_backend(tmp_path, *, spec='4x80', **kw):
     )
 
 
+def test_backend_accepts_legacy_require_generation_keyword(tmp_path):
+    # Readiness now always verifies a real generation, but keep the constructor
+    # keyword as an ignored compatibility boundary for direct Python embedders.
+    be = make_backend(tmp_path, require_generation=False)
+    assert not hasattr(be, 'require_generation')
+
+
 def test_converge_writes_and_observes(tmp_path):
     be = make_backend(tmp_path)
     be.converge([vllm('grp-a', tp=2)])
@@ -637,7 +657,7 @@ def test_converge_writes_nginx_conf_and_access_reports_proxy(tmp_path):
     be.converge([vllm('a', served='aa')])
     assert (tmp_path / 'nginx.conf').exists()
     assert 'reverse-proxy' in yaml.safe_load(be.compose_file.read_text())['services']
-    info = be.access(['aa'])
+    info = access_info(be, ['aa'])
     assert info['proxy_url'] == 'http://127.0.0.1:8080'
 
 
@@ -795,6 +815,11 @@ def test_render_litellm_front_door(tmp_path):
 def _two_endpoint_catalog():
     from infer_stack.leasing.catalog import Catalog
 
+    # Runtime matches the ``vllm`` fixture (tp 1, 32768): a live-acquired
+    # catalog endpoint carries the endpoint's own runtime, so its deployment
+    # and its catalog route agree on the advertised window and the gateway
+    # config never moves as models come and go.
+    runtime = {'tensor_parallel_size': 1, 'max_model_len': 32768}
     return Catalog.from_dict(
         {
             'models': {
@@ -802,8 +827,8 @@ def _two_endpoint_catalog():
                 'mb': {'source': 'hf://org/b'},
             },
             'endpoints': {
-                'alpha': {'engine': 'vllm', 'model': 'ma'},
-                'beta': {'engine': 'vllm', 'model': 'mb'},
+                'alpha': {'engine': 'vllm', 'model': 'ma', 'runtime': dict(runtime)},
+                'beta': {'engine': 'vllm', 'model': 'mb', 'runtime': dict(runtime)},
             },
         }
     )
@@ -812,16 +837,18 @@ def _two_endpoint_catalog():
 def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
     """The no-blip property at the rendering level: with a catalog, the LiteLLM
     config + service spec do NOT change when the live model set changes, so
-    `docker compose up` would not recreate the gateway (no blip)."""
+    `docker compose up` would not recreate the gateway (no blip). The
+    deployments serve catalog endpoints, as every acquire under a catalog
+    does."""
     cat = _two_endpoint_catalog()
     # alpha live, then beta live -- two different desired sets, same catalog.
     rc_a = render_compose(
-        [vllm('grp-a', served='alpha')], {'grp-a': [0]},
+        [vllm('alpha', served='alpha')], {'alpha': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
     rc_b = render_compose(
-        [vllm('grp-b', served='beta')], {'grp-b': [0]},
+        [vllm('beta', served='beta')], {'beta': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
@@ -855,6 +882,9 @@ def test_litellm_superset_config_is_invariant_across_model_set(tmp_path):
 def _three_endpoint_catalog():
     from infer_stack.leasing.catalog import Catalog
 
+    # Same runtime as the ``vllm`` fixture, for the same reason as in
+    # ``_two_endpoint_catalog``: live vs released must render identical bytes.
+    runtime = {'tensor_parallel_size': 1, 'max_model_len': 32768}
     return Catalog.from_dict(
         {
             'models': {
@@ -863,9 +893,9 @@ def _three_endpoint_catalog():
                 'mb': {'source': 'hf://org/b'},
             },
             'endpoints': {
-                'cee': {'engine': 'vllm', 'model': 'mc'},
-                'alpha': {'engine': 'vllm', 'model': 'ma'},
-                'beta': {'engine': 'vllm', 'model': 'mb'},
+                'cee': {'engine': 'vllm', 'model': 'mc', 'runtime': dict(runtime)},
+                'alpha': {'engine': 'vllm', 'model': 'ma', 'runtime': dict(runtime)},
+                'beta': {'engine': 'vllm', 'model': 'mb', 'runtime': dict(runtime)},
             },
         }
     )
@@ -883,14 +913,14 @@ def test_untouched_model_stable_when_another_swaps_gpu(tmp_path):
     """
     cat = _three_endpoint_catalog()
     rc1 = render_compose(
-        [vllm('grp-c', served='cee'), vllm('grp-a', served='alpha')],
-        {'grp-c': [2], 'grp-a': [0]},
+        [vllm('cee', served='cee'), vllm('alpha', served='alpha')],
+        {'cee': [2], 'alpha': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
     rc2 = render_compose(
-        [vllm('grp-c', served='cee'), vllm('grp-b', served='beta')],
-        {'grp-c': [2], 'grp-b': [0]},
+        [vllm('cee', served='cee'), vllm('beta', served='beta')],
+        {'cee': [2], 'beta': [0]},
         images=IMAGES, ports=PORTS, state=STATE,
         litellm=True, litellm_port=14042, aux_dir=tmp_path, catalog=cat,
     )
@@ -929,7 +959,7 @@ def test_litellm_config_hash_label_tracks_model_list(tmp_path):
     (spec unchanged), so the new alias never became routable. Stamping the
     config hash onto a label makes converge recreate litellm on a config change.
     """
-    from infer_stack.leasing.compose import CONFIG_HASH_LABEL
+    from infer_stack.leasing.gateway import CONFIG_HASH_LABEL
 
     def label(deployment):
         rc = render_compose(
@@ -1057,9 +1087,17 @@ def test_litellm_router_settings_present(tmp_path):
 
 def test_access_includes_ui_url_when_ui_on(tmp_path):
     be = make_backend(tmp_path, ui=True)
-    assert be.access(['a'])['ui_url'] == 'http://127.0.0.1:13000'
+    assert access_info(be, ['a'])['ui_url'] == 'http://127.0.0.1:13000'
     be_noui = make_backend(tmp_path, ui=False)
-    assert 'ui_url' not in be_noui.access(['a'])
+    assert 'ui_url' not in access_info(be_noui, ['a'])
+
+
+def test_front_door_urls_use_the_front_door_authority_directly(tmp_path):
+    from infer_stack.leasing.gateway import front_door_urls
+
+    be = make_backend(tmp_path, ui=True)
+    assert be.front_door() is be.gateway
+    assert front_door_urls(be) == be.gateway.urls()
 
 
 def test_converge_diff_decline_aborts(tmp_path, monkeypatch):
@@ -1108,11 +1146,20 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
     from infer_stack.leasing import EndpointRequest, LeaseState, vllm_structural
     from infer_stack.leasing.backend import ConvergeAborted
 
-    class DeclineBackend:
+    from infer_stack.leasing.backend import SimpleAdmission
+
+    class DeclineBackend(SimpleAdmission):
+        """The operator declines the diff, which admission asks at preview."""
+
         def observe(self):
             return set()
 
-        def converge(self, desired):
+        def preview(self, desired, placement=None, *, approve=False):
+            if approve:
+                raise ConvergeAborted('declined')
+            return super().preview(desired, placement)
+
+        def converge(self, desired, *, apply=True, placement=None):
             raise ConvergeAborted('declined')
 
     led = Ledger(SqliteStore(tmp_path / 'ledger.db'))
@@ -1185,7 +1232,7 @@ def test_controller_acquire_render_only_stages(tmp_path):
 
 def test_access_reports_litellm_base_url(tmp_path):
     be = make_backend(tmp_path)
-    info = be.access(['qwen-coder', 'reranker'])
+    info = access_info(be, ['qwen-coder', 'reranker'])
     assert info['base_url'] == 'http://127.0.0.1:14042/v1'
     assert info['api_key_env'] == 'LITELLM_MASTER_KEY'
     assert info['api_key'].startswith('sk-')      # infer-stack manages the key
@@ -1195,18 +1242,18 @@ def test_access_reports_litellm_base_url(tmp_path):
 
 def test_master_key_managed_stable_and_persisted(tmp_path):
     be = make_backend(tmp_path)
-    k1 = be.master_key()
+    k1 = be.front_door().master_key()
     assert k1.startswith('sk-')
-    assert be.master_key() == k1                  # reused, not regenerated
+    assert be.front_door().master_key() == k1                  # reused, not regenerated
     # a fresh backend over the same state dir recovers the same key
-    assert make_backend(tmp_path).master_key() == k1
+    assert make_backend(tmp_path).front_door().master_key() == k1
 
 
 def test_converge_references_master_key_via_env_not_baked(tmp_path):
     be = make_backend(tmp_path)
     be.converge([vllm('a')])
     raw = be.compose_file.read_text()
-    key = be.master_key()
+    key = be.front_door().master_key()
     assert key.startswith('sk-')
     # The compose YAML references the var, it does NOT contain the secret value.
     compose = yaml.safe_load(raw)
@@ -1227,7 +1274,7 @@ def test_envfile_carries_managed_api_key(tmp_path):
     from infer_stack.leasing.models import Lease
 
     be = make_backend(tmp_path)
-    info = be.access(['qwen-coder'])
+    info = access_info(be, ['qwen-coder'])
     lease = Lease('sess-x', 'me', 'active', 0.0, None, None, 0.0,
                   endpoints=['qwen-coder'])
     g = Deployment('g', 'ck', 'vllm', 'shared-compatible', {}, {},
@@ -1244,13 +1291,13 @@ def test_envfile_carries_managed_api_key(tmp_path):
 def test_access_none_without_litellm(tmp_path):
     # No gateway and no UI -> no single access point.
     be = make_backend(tmp_path, litellm=False, ui=False)
-    assert be.access(['x']) is None
+    assert access_info(be, ['x']) is None
 
 
 def test_access_reports_ui_url_without_litellm(tmp_path):
     # No gateway but a managed UI -> the UI is still a useful access point.
     be = make_backend(tmp_path, litellm=False, ui=True)
-    info = be.access(['x'])
+    info = access_info(be, ['x'])
     assert info == {'ui_url': 'http://127.0.0.1:13000'}
 
 
@@ -1437,8 +1484,8 @@ def test_catalog_parses_endpoint_protocol(tmp_path):
         'chatty': {'engine': 'vllm', 'model': 'm'},
         'compl': {'engine': 'vllm', 'model': 'm', 'protocol': 'completions'},
     }})
-    assert cat.resolve_endpoint('chatty').served['protocol'] == 'chat'
-    assert cat.resolve_endpoint('compl').served['protocol'] == 'completions'
+    assert cat.resolve_endpoint('chatty').to_request().served['protocol'] == 'chat'
+    assert cat.resolve_endpoint('compl').to_request().served['protocol'] == 'completions'
     with pytest.raises(CatalogError):
         Catalog.from_dict({**base, 'endpoints': {
             'bad': {'engine': 'vllm', 'model': 'm', 'protocol': 'embeddings'},
@@ -1841,3 +1888,23 @@ def test_default_docker_run_can_redirect_stderr_lines():
     out = _default_docker_run(['sh', '-c', 'echo out; echo err1 >&2; echo err2 >&2'],
                               timeout=10, stderr_lines=seen.append)
     assert out.strip() == 'out' and seen == ['err1', 'err2']
+
+
+def test_open_webui_runs_as_its_data_directorys_owner(tmp_path):
+    """As root it left files only root could delete (the data root could not
+    be removed without sudo); now it runs as the directory's owner, with a
+    managed session key and its static assets inside its data."""
+    import os
+
+    be = ComposeBackend(
+        state_dir=tmp_path / 'state', inventory=simulate_inventory('1x80'),
+        run=FakeDocker(), http=FakeHttp(tmp_path / 'state'), litellm=True, ui=True,
+        images={**IMAGES, 'open_webui': 'owui:test'}, ports=PORTS,
+        state=dict(STATE, open_webui=str(tmp_path / 'open-webui')),
+    )
+    be.converge([], apply=False)
+    svc = yaml.safe_load(be.compose_file.read_text())['services']['open-webui']
+    assert svc['user'] == f'{os.getuid()}:{tmp_path.stat().st_gid}'
+    assert svc['environment']['STATIC_DIR'] == '/app/backend/data/static'
+    assert svc['environment']['WEBUI_SECRET_KEY'] == '${WEBUI_SECRET_KEY}'
+    assert 'WEBUI_SECRET_KEY=' in (tmp_path / 'state' / '.env').read_text()

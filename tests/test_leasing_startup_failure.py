@@ -150,6 +150,8 @@ def test_an_unrecoverable_error_is_fatal_on_the_very_first_crash(tmp_path):
     (CRASH_LOG, 'fatal'),
     ('ValueError: quantization fp8 is not supported on this device', 'fatal'),
     ('torch.OutOfMemoryError: CUDA out of memory', 'fatal'),
+    # vLLM rejecting a flag (e.g. from runtime.extra_args) repeats every restart.
+    ('api_server.py: error: unrecognized arguments: --bogus', 'fatal'),
     (HUB_TIMEOUT_LOG, 'transient'),
     ('OSError: [Errno 98] Address already in use', 'transient'),
     ('INFO starting\nSegmentation fault', None),

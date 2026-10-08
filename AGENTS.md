@@ -47,3 +47,7 @@ new entry; keep diffs small.
 
 If a lesson seems important, but a MWE is not possible, label the lesson as
 SPECULATIVE.
+
+## Commit attribution
+
+Every agent-authored commit must carry a `Co-authored-by:` trailer naming the exact model (and weights/config variant, when known) that produced it, per its own runtime identification — never copied from earlier commits; if undeterminable, say so.

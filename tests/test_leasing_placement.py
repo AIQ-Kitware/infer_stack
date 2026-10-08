@@ -204,6 +204,10 @@ def test_simulate_inventory_heterogeneous():
     assert [g['memory_gib'] for g in inventory['gpus']] == [48.0, 48.0, 16.0]
     # the homogeneous legacy form still works
     assert [g['memory_gib'] for g in simulate_inventory('4x96')['gpus']] == [96.0] * 4
+    # Optional @CC keeps class-gated suggestion tests product-name agnostic.
+    inventory = simulate_inventory('2x96@12.0,48@7.5')
+    assert [g['memory_gib'] for g in inventory['gpus']] == [96.0, 96.0, 48.0]
+    assert [g['compute_cap'] for g in inventory['gpus']] == [12.0, 12.0, 7.5]
 
 
 def test_simulate_inventory_invalid_spec_errors():

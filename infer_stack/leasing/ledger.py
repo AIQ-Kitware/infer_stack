@@ -149,9 +149,25 @@ class Ledger:
 
     # -- public API --------------------------------------------------------
 
-    def plan_acquire(self, requests: list[EndpointRequest]) -> AcquireOverlay:
-        """Decide how ``requests`` would coalesce, without writing anything."""
+    def plan_acquire(self, requests: list[EndpointRequest], *,
+                     resident: Callable[[str], bool] | None = None) -> AcquireOverlay:
+        """Decide how ``requests`` would coalesce, without writing anything.
+
+        Among the shared deployments whose capacity covers a request, the one
+        that costs least to use wins: one already LIVE (nothing to place or
+        start), then one this plan is already creating, then an IDLE one that
+        is still ``resident`` (the controller's hint from residency: a revival
+        with nothing to start), then any other IDLE one; creation order within
+        each. Eligibility stays here; ``resident`` only orders.
+        """
         import copy
+
+        def cost(deployment: Deployment, pending: bool) -> int:
+            if deployment.state == DeploymentState.LIVE and not pending:
+                return 0
+            if pending:
+                return 1
+            return 2 if resident is not None and resident(deployment.id) else 3
 
         now = self.clock()
         state_version = self.store.admission_state_version()
@@ -171,8 +187,11 @@ class Ledger:
                     g for g in created.values()
                     if g.compat_key == req.compat_key and g.sharing == Sharing.SHARED
                 ]
-                for candidate in [*stored, *pending]:
-                    current = view.get(candidate.id) or copy.deepcopy(candidate)
+                candidates = [(view.get(g.id) or copy.deepcopy(g), False) for g in stored]
+                candidates += [(g, True) for g in pending]
+                ranked = sorted(enumerate(candidates),
+                                key=lambda item: (cost(*item[1]), item[0]))
+                for _, (current, _) in ranked:
                     if capacity_satisfies(current.capacity, req.capacity):
                         chosen = current
                         break
@@ -203,6 +222,28 @@ class Ledger:
             state_version=state_version,
         )
 
+    # -- the publication marker's approval (see Controller._apply_pending) ------
+
+    def clear_approved_digest(self) -> None:
+        """The approved render was applied, or deliberately abandoned."""
+        self.store.clear_approved_digest()
+
+    def reapprove_render(self, digest: str) -> None:
+        """An operator approved this render over the one the marker records
+        (``infer-stack apply``); it is now the approved one, durably."""
+        self.store.set_approved_digest(digest)
+
+    def publish_profile(self, profile: dict, *, approved_digest: str | None) -> None:
+        """Write the recovery profile and its pending, approved marker at once."""
+        self.store.publish_profile(profile, approved_digest=approved_digest)
+
+    def migrate_network(self, *, subnet: str, reset_addresses: bool,
+                        approved_digest: str | None, profile: dict | None = None) -> None:
+        """Switch the stable-address subnet and mark it pending, at once
+        (with a first ``profile``, if there is none yet)."""
+        self.store.migrate_network(subnet=subnet, reset_addresses=reset_addresses,
+                                   approved_digest=approved_digest, profile=profile)
+
     def acquire(
         self,
         owner: str,
@@ -212,6 +253,7 @@ class Ledger:
         overlay: AcquireOverlay | None = None,
         allocations: dict[str, list[int]] | None = None,
         approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> AcquireResult:
         """Create a lease and coalesce its endpoints onto deployment deployments.
 
@@ -222,6 +264,11 @@ class Ledger:
         committed as they are, together with ``allocations`` (deployment id ->
         GPUs), in one transaction. If the admission state changed since the
         preview, :class:`AdmissionConflict` is raised and nothing is written.
+
+        ``profile`` (the acquire's recovery-profile candidate, whose catalogs
+        are the published endpoint set) commits in the same transaction: the
+        endpoints it publishes are never durable without the lease and the
+        publication intent that go with them.
         """
         lease_id = self.id_factory('lease')
         deployment_ids: list[str] = []
@@ -250,6 +297,8 @@ class Ledger:
                 self.store.update_deployment_served(gid, served, now)
             for gid, gpus in (allocations or {}).items():
                 self.store.set_deployment_allocation(gid, gpus)
+            if profile is not None:
+                self.store._write_profile(profile)
             if approved_digest is not None:
                 # In the same transaction as the lease: the digest can never
                 # describe a candidate that was not committed.
@@ -464,16 +513,18 @@ class Ledger:
             ]
         return leases, deployments
 
-    # -- generation (legacy, see store; superseded by the publication marker) --
+    # -- desired-state generation (see store; distinct from apply intent) -------
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,
         placement_context: dict | None = None, approved_digest: str | None = None,
+        profile: dict | None = None,
     ) -> dict:
         """See :meth:`SqliteStore.mark_publication_pending`."""
         return self.store.mark_publication_pending(
             apply_requested=apply_requested, interrupted=interrupted,
             placement_context=placement_context, approved_digest=approved_digest,
+            profile=profile,
         )
 
     def clear_placement_context(self) -> None:
