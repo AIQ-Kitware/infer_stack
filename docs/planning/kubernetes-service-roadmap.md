@@ -1,6 +1,6 @@
 # Kubernetes service roadmap: from two-node proof to shared accelerator service
 
-**Status:** current implementation plan · 2026-10-07
+**Status:** implementation in progress · updated 2026-10-08
 
 This document is the current executable plan for moving from the working
 physical two-node K3s/KubeAI proof toward the goals in
@@ -19,6 +19,48 @@ This roadmap incorporates, rather than replaces:
 - [vram-aware-placement.md](vram-aware-placement.md).
 
 ---
+
+## Implementation checkpoint
+
+| Roadmap area | Implemented | Remaining proof or work |
+| --- | --- | --- |
+| Worker onboarding | Persisted kubeconfig, explicit agent data directory, storage/inode and supplied kubelet-threshold preflight, configurable serving GPU count | Automatic effective kubelet/storage discovery; physical four-GPU generation |
+| Classification and placement | Admin node/pool/class/site labels and profiles; acquire/access/run node or pool narrowing; constrained compatibility and routing admission | Richer eligibility operators and automatic refresh of per-device facts |
+| Replicas | Validated min/max/target/delay/load-balancing policy; min=0 logical retention and wake by generation | GPU-backed load acceptance and hardware-specific scaling measurements |
+| Lifecycle | Model/replica counts, pod reasons, failed/blocked/capacity/on-demand/degraded state and next actions | Scheduler-event/image-pull/model-fetch stages and persisted startup distributions |
+| Accounting | Immutable deployment/replica intervals, gap-aware measured/proxy energy, CLI/API and remote TUI | Live power collectors, reservation/activity aggregation and local TUI parity |
+| Remote authority | Authenticated single-server SQLite/PostgreSQL service, durable operations, managed/external/mixed access and run, approved immutable catalog revisions, remote CLI and TUI | Full administrative API and local-dashboard parity |
+| Kubernetes and infer-stack HA | Architecture and safe rollout requirements | Target-cluster access, stable API address, three-server K3s migration, agent/destination fencing and failover acceptance |
+
+The executable cluster contract is `dev/kubernetes_service_e2e.py`: generation,
+controller-loss data-plane survival, restart idempotency, stop pruning, return
+to zero, GC retention, wake and eviction. CPU/mock serving proves control and
+KubeAI lifecycle behavior; it does not establish GPU inference or measured GPU
+power. Existing physical proof below remains historical evidence, not a new
+hardware test of this implementation. Operator instructions live in
+[cluster-setup.md](../cluster-setup.md) and
+[kubeai-backend.md](../kubeai-backend.md).
+
+The earlier 2026-10-08 checkpoint passed 1383 tests with real PostgreSQL contract cases
+enabled (four skips), plus real single-node K3s/KubeAI CPU/mock runs with both
+SQLite and PostgreSQL authority. Concurrent generation reached two ready
+replicas; return-to-zero, controller-loss inference, restart recovery and
+explicit eviction passed. These runs used a disposable namespace and short
+autoscaler test window, and made no physical-cluster migration.
+
+The following remote-access checkpoint passed 1392 tests (four skips) with
+PostgreSQL enabled. `dev/remote_external_e2e.py` additionally proved approved
+external routing through real LiteLLM, independently provisioned upstream
+credentials, inference during controller loss, restart idempotency and remote
+`run` exit-status preservation without creating a lease. Catalog-revision
+acceptance extends this with explicit admin approval, conflict detection and
+atomic activation/audit; its final validation is recorded in the developer
+journal.
+
+The work proceeds through these checkpoints without treating a foundation as a
+completed phase. PostgreSQL is available for one authority; safe HA remains
+gated on destination-side fencing. Physical migration requires the actual
+cluster target and stable address before any host changes.
 
 ## Current proof point
 
@@ -326,6 +368,18 @@ Exact spelling may change. Required semantics:
 - hard placement constraints participate in deployment compatibility, so two
   incompatible requests do not coalesce onto one deployment.
 
+Initially, normalize hard node/pool constraints into deployment identity using
+exact equality. Intersect catalog and request constraints; never replace catalog
+policy with request policy. Overlapping but unequal constraints may run as
+separate deployments until safe intersection-based sharing is implemented.
+
+Scheduling and routing must enforce the same constraint. Static alias routing
+cannot represent simultaneous, differently constrained realizations of one
+alias: reject that combination before committing a lease. A later scoped access
+contract must select the lease's deployment rather than load balance across
+every deployment advertising that alias. Dynamic routing alone does not provide
+this isolation.
+
 ### 2.4 Kubernetes remains the scheduler
 
 Translate normalized placement constraints to selectors/affinity/resource
@@ -367,7 +421,21 @@ this deliberately rather than building infer-stack replica scheduling.
 - Keep replica policy out of structural model identity unless changing it would
   make sharing unsafe; distinguish serving policy from model/runtime identity.
 
+Define residency explicitly: the default warm policy requires a positive
+minimum while leased. An explicit on-demand policy permits `min_replicas: 0`
+while retaining the Model and route. The readiness path must send a request
+through KubeAI to wake a zero-replica Model instead of waiting for a ready pod
+before sending its first request. Reclaim must distinguish zero replicas from a
+deleted logical deployment. Until serving-policy merge rules exist, conflicting
+scaling/residency policies must not silently share the first lease's policy.
+
 ### 3.2 Autoscaling policy
+
+KubeAI's controller-wide `modelAutoscaling.timeWindow` also affects scale-down:
+the default ten-minute moving average can retain a positive desired replica
+count after current requests finish. `scale_down_delay_seconds` acts in addition
+to that average. Use an explicitly short window only in the isolated integration
+test; choose production settings from measured traffic and cold-start latency.
 
 Expose the KubeAI policy needed to scale from request pressure, including the
 current operator's supported equivalent of:
@@ -668,6 +736,12 @@ On the trusted LAN, the first deployment may use one shared credential or
 simple scoped tokens. Do not postpone the API boundary by building a full OIDC
 or quota system first.
 
+Use authenticated TLS for every off-host listener, including trusted-LAN mode.
+A shared token represents one operator principal initially; retain operation
+ownership and audit identity. SQLite on the server's local disk remains valid
+for this single-authority milestone. PostgreSQL is required when adding shared
+state/controller replicas, rather than simply because a client is remote.
+
 ### 6.4 TUI becomes a client
 
 The TUI should be able to connect to the canonical infer-stack service from
@@ -738,6 +812,12 @@ operationally real if the trusted-LAN shared-credential phase has outlived its
 usefulness.
 
 Per-user quotas remain optional until there is a concrete need.
+
+Before HA, prove fencing at each side-effect destination: Kubernetes conditional
+writes/deletes, route publication, and agent command acceptance. Checking the
+database generation after a backend mutation cannot prevent that mutation.
+Restore must introduce a fresh authority incarnation so commands created before
+the restored backup cannot overwrite recovered state.
 
 ---
 

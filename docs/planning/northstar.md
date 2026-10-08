@@ -22,6 +22,11 @@ Related implementation documents:
 - [vram-aware-placement.md](vram-aware-placement.md) — current resource-fit
   model.
 
+Implementation progress is recorded in the roadmap checkpoints. The current
+service has one authority, remote clients and recomputable usage facts; machine
+failure tolerance, live energy collection and physical multi-GPU acceptance
+remain goals to prove rather than properties implied by those foundations.
+
 ---
 
 ## Motivating idea
@@ -199,6 +204,11 @@ The system should make the relationship visible: lease demand, desired
 residency, desired replica count, ready replica count, and actual request load
 are different facts.
 
+An active lease preserves its declared residency contract. A warm policy keeps
+at least one serving replica; an explicit on-demand policy may keep only a
+logical deployment and route while replicas scale to zero. Acquisition still
+verifies a real generation; later cold starts remain visible to the user.
+
 ---
 
 ## Placement is a constraint, not a replacement scheduler
@@ -220,6 +230,12 @@ may narrow that domain but must not widen it.
 Placement constraints are part of whether two leases can safely share one
 logical deployment. Requests with incompatible hard constraints must not be
 silently coalesced.
+
+The returned inference contract must preserve those constraints too. Two leases
+for the same alias but different machines must not receive a shared route that
+can send either user's requests to the other machine. A constrained deployment
+needs a scoped inference target, or acquisition must reject that combination
+until the front door can represent it safely.
 
 ---
 
@@ -371,6 +387,10 @@ separate from the beginning:
 
 Authentication, quotas, and hardened multi-tenant isolation can arrive later
 without requiring the core domain model to be rewritten.
+
+This staging permits a shared authenticated operator identity, not an anonymous
+remote control listener. Off-host control traffic uses authenticated TLS from
+the first supported remote deployment; finer roles and quotas can follow.
 
 ---
 

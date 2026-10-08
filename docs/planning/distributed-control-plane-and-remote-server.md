@@ -1,6 +1,45 @@
 # Distributed control plane, remote server, and HA controller plan
 
-**Status:** proposed 2026-10-03 · design only · no implementation in this PR
+**Status:** implementation in progress · updated 2026-10-08
+
+## Implementation checkpoint
+
+The supported implementation boundary is one canonical control server, with
+SQLite on its local disk or PostgreSQL as its lease authority. Standalone local
+CLI/TUI operation remains available. Remote clients use typed HTTP operations
+and do not open a local ledger or require Kubernetes credentials. Operator
+instructions are in [kubeai-backend.md](../kubeai-backend.md#remote-control-service).
+
+| Milestone | Implemented and tested | Remaining acceptance |
+| --- | --- | --- |
+| Service boundary | Durable operations, immutable catalog snapshots, idempotency, restart recovery, ownership and paginated audit transitions; acquire/access/release/wait/renew/reconcile/gc/evict; read-only node inventory | Node administration and streaming log/event APIs |
+| Catalog administration | Content-addressed revisions, catalog-admin approval, compare-and-swap conflict detection and atomic activation/audit | Richer policy editing and configuration review integrations |
+| PostgreSQL | Shared relational contract, concurrent coalescing and catalog approval, interruption rollback, server exclusion, schema compatibility checks | Explicit SQLite-to-PostgreSQL migration and restore acceptance |
+| Secure remote mode | TLS, private credentials, live token rotation/revocation, named roles, endpoint scopes, TTL/lease quotas, bounded connections and rate limits | Enrollment/OIDC, inference credentials scoped to individual users, full administrative API |
+| Remote clients | CLI operations/recovery/audit/status/usage/node inventory/catalog revisions and an HTTP-only TUI; managed, external and mixed access/run | Full parity with the local dashboard |
+| Compose agents and HA | Design constraints retained; neither enabled | Enrollment, agent execution/reporting, destination fencing, leadership epochs and failover proof |
+| Operations | Periodic TTL reconciliation and durable accounting facts | Backup/restore tooling, monitoring/alerts and rolling upgrade acceptance |
+
+PostgreSQL session/advisory locks coordinate healthy processes. They do not
+fence an external write already in flight after a partition. A second service
+is therefore refused; installing PostgreSQL does not enable HA. Destination
+acceptance of authority incarnation, leadership epoch and resource generation
+remains a prerequisite for controller replicas.
+
+Catalog files seed a new server once. Afterwards immutable revisions in the
+authority database determine new requests; restarting with different YAML is
+not approval. A named `catalog-admin` approves a complete reviewed source with
+the current revision as a compare-and-swap precondition. Activation and its
+terminal operation/audit transition commit together. Existing leases retain
+their accepted specifications; catalog approval does not redeploy them. A
+conflicting pinned alias remains subject to ordinary publication refusal.
+Standalone local catalog editing remains file-based.
+
+`POST /v1/access` handles managed, external and mixed endpoints. External-only
+access publishes approved routes without inventing a lease or sending a test
+generation upstream; gateway readiness and upstream generation are separate
+facts. Managed members still require generation readiness. Accepted snapshots
+survive catalog changes and service restart without acquiring duplicate leases.
 
 > Planning relationship (2026-10-07): [northstar.md](northstar.md) is the
 > stable statement of product intent.
@@ -108,7 +147,8 @@ and records observed/converged state.
 The transactional source of truth for the logical control plane.
 
 - Local/standalone mode: SQLite remains appropriate.
-- Server/HA mode: PostgreSQL is the proposed store.
+- Single-server mode: local SQLite is supported behind the service API.
+- HA mode: PostgreSQL is the proposed shared store.
 
 ### Node agent
 
@@ -298,10 +338,12 @@ SQLite is a good fit when:
 
 Do not remove this mode merely to make the distributed design cleaner.
 
-### Server / HA mode: PostgreSQL
+### HA mode: PostgreSQL; single remote server may use local SQLite
 
-PostgreSQL should become the authoritative infer-stack state store for remote
-multi-client and HA deployments.
+PostgreSQL should become the authoritative infer-stack state store for HA
+deployments. Remote clients do not access the database: a single server may
+serialize their mutations against local SQLite using the existing controller
+locking. Adding a remote API alone does not require changing stores.
 
 Do **not** put the existing SQLite ledger on NFS/SMB/shared storage as the HA
 design.
@@ -555,6 +597,21 @@ attempted publication generation = 103
 The backend adapters should record which generation they attempted and verify
 the desired generation again before committing publication state.
 
+That check protects observed-state recording, not the preceding external write.
+HA acceptance therefore requires destination-side fencing. Specify conditional
+Kubernetes writes/deletes using resource versions and object identities, a
+route-publication mechanism that rejects stale leadership epochs, and persisted
+agent fences. A DB preflight check followed by an unconditional external write
+has a race and cannot satisfy the stale-leader invariant. If a destination cannot
+enforce fencing, keep it behind a single fenced publisher and test its takeover
+protocol before supporting HA there.
+
+Fence metadata includes authority incarnation, leadership epoch, object identity,
+and desired generation. Deletion/recreation and database restore must not reset
+tokens in a way that revalidates delayed old commands. Test a paused stale actor
+resuming after takeover, including a stale delete and an unchanged object
+generation under a newer leadership epoch.
+
 ### Future sharding
 
 If one reconciler becomes a throughput bottleneck, reconciliation can later be
@@ -626,18 +683,25 @@ This is illustrative, not a frozen REST contract.
 Acquiring a large model may take minutes. Do not hold the semantics of the
 operation inside one HTTP connection.
 
-A mutation should quickly return something like:
+A mutation first durably accepts an operation and returns HTTP 202:
 
 ```json
 {
-  "lease_id": "lease-...",
-  "operation_id": "op-...",
-  "accepted_generation": 42
+  "id": "op-...",
+  "state": "queued",
+  "result": null,
+  "error": null
 }
 ```
 
-The CLI may then wait by polling or subscribing to operation/events, preserving
-today's convenient blocking UX.
+Admission commits the lease later. The operation then exposes its lease ID and
+connection descriptor in `result`, and progresses through `running` and
+`converging` to `succeeded`, `failed`, or `superseded`. Accepted operation identity
+must not imply that capacity or generation readiness has already been obtained.
+An idempotency key is scoped to a principal and the exact request; retries
+recover that operation, including after server restart. The CLI waits by polling
+while preserving today's convenient blocking UX. Generation timeout rolls back
+an acquisition's lease; a fresh wait timeout retains an existing lease.
 
 ### Event streaming
 
@@ -650,6 +714,11 @@ The server needs a structured event stream for:
 
 Start with SSE or another simple server-to-client stream unless bidirectional
 requirements justify WebSockets/gRPC.
+
+The initial `/v1/events` implementation sends a current status snapshot and
+closes the stream. Clients reconnect or poll durable operations. It does not
+yet provide an event cursor, replay history, or log streaming; those require a
+separate retained event contract.
 
 Do not make log streaming the transport for state changes; logs are diagnostic,
 operations/events are protocol.
@@ -1132,6 +1201,12 @@ remote CLI -> infer-stack server -> PostgreSQL -> local backend
 Only one controller replica is required. This proves API/state semantics before
 adding failover.
 
+The first server may use local SQLite instead of PostgreSQL. This is the Phase 6
+milestone in the Kubernetes service roadmap; TLS and an authenticated shared
+operator identity are required for off-host access. Fine-grained RBAC and quota
+enforcement can follow, but typed catalog-only operations and private credential
+handling are required from the beginning.
+
 ### Add node agents
 
 Move Compose execution behind node agents:
@@ -1383,13 +1458,11 @@ Do not invent a full user/password database unless there is a compelling need.
 
 ### Catalog authority
 
-Options:
-
-- Git/file remains authoritative; server loads approved revision;
-- server stores catalog revisions;
-- hybrid: Git publishes signed/hashed revisions into control state.
-
-Whichever wins, runtime objects must record immutable revision identity.
+Implemented choice: the single remote service stores approved immutable catalog
+revisions. Git/file review can supply their sources through explicit catalog-admin
+publication; it cannot silently alter service authority on restart. Accepted
+operations record their revision and private launch snapshot. Automatic signed
+Git publication remains an optional integration.
 
 ### One PostgreSQL service or two
 
@@ -1423,7 +1496,7 @@ Unless future evidence contradicts them:
 
 1. **Model the system as one logical control plane with N controller replicas,
    not N independent control planes.**
-2. **Keep SQLite for standalone mode; use PostgreSQL for remote/HA mode.**
+2. **Keep local SQLite for standalone/single-server mode; use PostgreSQL for HA.**
 3. **Do not use network-shared SQLite.**
 4. **Start HA with active-active API replicas and one elected reconciler.**
 5. **Use generation/fencing semantics in addition to leader locking.**
@@ -1438,8 +1511,11 @@ Unless future evidence contradicts them:
 12. **Treat dynamic LiteLLM routing as the intended normal mechanism for server
     mode once its recovery behavior is fully hardened.**
 13. **Add controller/agent/audit observability before claiming HA support.**
-14. **Build in stages: service boundary -> PostgreSQL -> secure remote mode ->
-    node agents -> HA.**
+14. **Build in stages: service boundary -> secure single remote server ->
+    PostgreSQL and optional Compose node agents -> HA.** The phase numbers below
+    identify work packages rather than overriding the Kubernetes roadmap's
+    execution order. PostgreSQL and Compose agents are not prerequisites for a
+    single remote Kubernetes authority.
 
 ---
 
