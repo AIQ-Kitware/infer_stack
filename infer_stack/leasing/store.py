@@ -82,6 +82,33 @@ CREATE TABLE IF NOT EXISTS service_addresses (
 CREATE INDEX IF NOT EXISTS idx_claims_lease ON claims(lease_id);
 CREATE INDEX IF NOT EXISTS idx_claims_deployment ON claims(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_deployments_compat ON deployments(compat_key);
+
+CREATE TABLE IF NOT EXISTS control_operations (
+    id TEXT PRIMARY KEY,
+    principal TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    result TEXT,
+    error TEXT,
+    UNIQUE(principal, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS control_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    action TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS control_catalog_revisions (
+    revision TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -141,124 +168,34 @@ class _SerializedConnection:
             self._conn.close()
 
 
-class SqliteStore:
-    """Thin sqlite wrapper exposing ledger row operations."""
+class LedgerStore:
+    """Shared relational row operations; dialects supply connection/transactions."""
 
-    def __init__(self, path: str | Path = ':memory:', *, busy_timeout_ms: int = 5000):
-        self.path = str(path)
-        if self.path != ':memory:':
-            Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False lets a long-running process (e.g. the TUI) use
-        # this connection from worker threads. That is only safe because every
-        # statement runs under ``_lock`` (see _SerializedConnection): sqlite's
-        # own serialized mode does NOT make a shared Python connection safe for
-        # concurrent reads.
-        raw = sqlite3.connect(
-            self.path, isolation_level=None, timeout=busy_timeout_ms / 1000,
-            check_same_thread=False,
-        )
-        raw.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        # Every use of the connection holds the lock: see _SerializedConnection.
-        self._conn = _SerializedConnection(raw, self._lock)
-        self._busy_timeout_ms = busy_timeout_ms
-        self._conn.execute('PRAGMA foreign_keys = ON')
-        self._conn.execute(f'PRAGMA busy_timeout = {busy_timeout_ms}')
-        if self.path != ':memory:':
-            # Switching the journal to WAL needs a brief *exclusive* lock, and
-            # sqlite returns "database is locked" immediately rather than honoring
-            # busy_timeout for this pragma. Several processes opening the SAME
-            # fresh ledger at once (e.g. a batch of pipeline jobs all calling
-            # `infer-stack acquire`) therefore race here — so retry. Idempotent:
-            # once it is WAL, re-running the pragma is a quick no-op.
-            self._retry_locked(lambda: self._conn.execute('PRAGMA journal_mode = WAL'))
-        self._ensure_schema()
+    _conn: Any
+    path: str | None = None
 
-    def _retry_locked(self, fn, *, attempts: int = 100, delay: float = 0.05):
-        """Run ``fn``, retrying on a transient "database is locked" from a
-        concurrent opener. Re-raises any other error (and the lock error if it
-        never clears within ``attempts``)."""
-        import time
+    def transaction(self):
+        raise NotImplementedError
 
-        for _ in range(attempts - 1):
-            try:
-                return fn()
-            except sqlite3.OperationalError as ex:
-                if 'locked' not in str(ex).lower():
-                    raise
-                time.sleep(delay)
-        return fn()  # last attempt: let a persistent lock surface
+    def backup_to(self, path: Path) -> None:
+        raise NotImplementedError
 
-    def _ensure_schema(self) -> None:
-        # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
-        # first-open race as the WAL switch, so retry it too.
-        self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
-        self._retry_locked(self._add_missing_columns)
-        # Stamp the version idempotently rather than SELECT-then-INSERT. That
-        # read-then-write was a TOCTOU across processes: two CLIs opening the
-        # same fresh ledger both saw no row, both inserted, and the loser died
-        # with `UNIQUE constraint failed: meta.key`. Retrying could not help --
-        # the row exists by then, so the retry fails the same way.
-        #
-        # Two processes racing to open one ledger is the normal case here, not
-        # an edge: it is exactly what the cross-process lock further down
-        # exists to serialize, and that lock is taken *after* the store is
-        # constructed. ON CONFLICT is the idiom already used for desired_gen
-        # and applied_gen below.
-        self._retry_locked(
-            lambda: self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-                'ON CONFLICT(key) DO NOTHING',
-                (str(SCHEMA_VERSION),),
-            )
-        )
+    def publication_lock(self):
+        """None uses the controller's existing standalone file lock."""
+        return None
+
+    def service_lock(self):
+        raise NotImplementedError
+
+
+
 
     #: Columns added after the first schema, as (table, column, declaration).
     _ADDED_COLUMNS = (
         ('deployments', 'assigned_gpus', 'TEXT'),
     )
 
-    def _add_missing_columns(self) -> None:
-        """Add columns newer code needs to an older ledger (nullable, so safe).
 
-        Two processes can race here; a duplicate-column error from the loser
-        is the desired end state.
-        """
-        for table, column, decl in self._ADDED_COLUMNS:
-            have = {r['name'] for r in self._conn.execute(f'PRAGMA table_info({table})')}
-            if column in have:
-                continue
-            try:
-                self._conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
-            except sqlite3.OperationalError as ex:
-                if 'duplicate column' not in str(ex).lower():
-                    raise
-
-    def backup_to(self, path: Path) -> None:
-        """Publish a consistent SQLite archive, including committed WAL contents.
-
-        The caller holds the controller publication lock. A temporary file plus
-        atomic replace ensures an interrupted backup is never a valid archive.
-        """
-        import os
-        import tempfile
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix='.ledger-backup-', dir=path.parent)
-        os.close(fd)
-        try:
-            with self._lock, contextlib.closing(sqlite3.connect(temporary)) as destination:
-                self._conn._conn.backup(destination)
-            with open(temporary, 'rb') as file:
-                os.fsync(file.fileno())
-            os.replace(temporary, path)
-            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
 
     def start_backend_epoch(self, profile: dict, archive: dict, *,
                             expected_profile: dict, expected_version: int) -> None:
@@ -271,11 +208,16 @@ class SqliteStore:
         from .profile import ProfileMismatch
 
         with self.transaction() as conn:
+            if conn.execute("SELECT id FROM control_operations WHERE state IN ('queued', 'running', 'converging') LIMIT 1").fetchone():
+                raise ProfileMismatch('Remote operations are pending; finish or cancel them before rotating the ledger')
             if (self.profile() != expected_profile
                     or self.admission_state_version() != expected_version):
                 raise ProfileMismatch('Ledger changed during rotation; review and retry')
             archives = self.meta_json('ledger_archives', [])
             conn.execute('DELETE FROM claims')
+            conn.execute('DELETE FROM control_operations')
+            conn.execute('DELETE FROM control_audit')
+            conn.execute('DELETE FROM control_catalog_revisions')
             conn.execute('DELETE FROM leases')
             conn.execute('DELETE FROM deployments')
             conn.execute('DELETE FROM service_addresses')
@@ -293,7 +235,7 @@ class SqliteStore:
         """Close the owned sqlite connection. Safe to call more than once."""
         self._conn.close()
 
-    def __enter__(self) -> 'SqliteStore':
+    def __enter__(self) -> 'LedgerStore':
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -316,25 +258,6 @@ class SqliteStore:
 
     # -- transactions ------------------------------------------------------
 
-    @contextlib.contextmanager
-    def transaction(self) -> Generator[_SerializedConnection, None, None]:
-        """Take the write lock up front and commit/rollback atomically.
-
-        ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
-        step race-safe across processes. ``_lock`` adds the same guarantee
-        across threads in one process (overlapping ``BEGIN IMMEDIATE`` on a
-        shared connection would otherwise raise).
-        """
-        with self._lock:
-            self._conn.execute('BEGIN IMMEDIATE')
-            try:
-                yield self._conn
-                self._conn.execute('COMMIT')
-            except BaseException:
-                # Also on KeyboardInterrupt: never leave a half-done write open
-                # on this connection for the next statement to commit.
-                self._conn.execute('ROLLBACK')
-                raise
 
     # -- desired-state generation -------------------------------------------
     #
@@ -354,7 +277,7 @@ class SqliteStore:
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES ('desired_gen', '1') "
             'ON CONFLICT(key) DO UPDATE SET '
-            'value = CAST(meta.value AS INTEGER) + 1'
+            'value = CAST(CAST(meta.value AS BIGINT) + 1 AS TEXT)'
         )
         # Every demand-changing mutation is also an admission-state change.
         self.bump_admission_state_version()
@@ -779,7 +702,7 @@ class SqliteStore:
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES ('admission_state_version', '1') "
             'ON CONFLICT(key) DO UPDATE SET '
-            'value = CAST(meta.value AS INTEGER) + 1'
+            'value = CAST(CAST(meta.value AS BIGINT) + 1 AS TEXT)'
         )
         return self.admission_state_version()
 
@@ -865,3 +788,159 @@ class SqliteStore:
             updated_at=row['updated_at'],
             assigned_gpus=_loads(row['assigned_gpus']) if row['assigned_gpus'] else None,
         )
+
+
+class SqliteStore(LedgerStore):
+    """SQLite authority for standalone and one canonical service process."""
+
+    @contextlib.contextmanager
+    def service_lock(self):
+        import fcntl
+
+        assert self.path is not None
+        with Path(self.path).with_suffix('.server.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as ex:
+                raise ValueError('Another control server already owns this ledger') from ex
+            yield
+
+    def __init__(self, path: str | Path = ':memory:', *, busy_timeout_ms: int = 5000):
+        self.path = str(path)
+        if self.path != ':memory:':
+            Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False lets a long-running process (e.g. the TUI) use
+        # this connection from worker threads. That is only safe because every
+        # statement runs under ``_lock`` (see _SerializedConnection): sqlite's
+        # own serialized mode does NOT make a shared Python connection safe for
+        # concurrent reads.
+        raw = sqlite3.connect(
+            self.path, isolation_level=None, timeout=busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        raw.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        # Every use of the connection holds the lock: see _SerializedConnection.
+        self._conn = _SerializedConnection(raw, self._lock)
+        self._busy_timeout_ms = busy_timeout_ms
+        self._conn.execute('PRAGMA foreign_keys = ON')
+        self._conn.execute(f'PRAGMA busy_timeout = {busy_timeout_ms}')
+        if self.path != ':memory:':
+            # Switching the journal to WAL needs a brief *exclusive* lock, and
+            # sqlite returns "database is locked" immediately rather than honoring
+            # busy_timeout for this pragma. Several processes opening the SAME
+            # fresh ledger at once (e.g. a batch of pipeline jobs all calling
+            # `infer-stack acquire`) therefore race here — so retry. Idempotent:
+            # once it is WAL, re-running the pragma is a quick no-op.
+            self._retry_locked(lambda: self._conn.execute('PRAGMA journal_mode = WAL'))
+        self._ensure_schema()
+
+
+    def _retry_locked(self, fn, *, attempts: int = 100, delay: float = 0.05):
+        """Run ``fn``, retrying on a transient "database is locked" from a
+        concurrent opener. Re-raises any other error (and the lock error if it
+        never clears within ``attempts``)."""
+        import time
+
+        for _ in range(attempts - 1):
+            try:
+                return fn()
+            except sqlite3.OperationalError as ex:
+                if 'locked' not in str(ex).lower():
+                    raise
+                time.sleep(delay)
+        return fn()  # last attempt: let a persistent lock surface
+
+
+    def _ensure_schema(self) -> None:
+        if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+            version = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if version is not None and int(version['value']) != SCHEMA_VERSION:
+                raise ValueError('Unsupported SQLite ledger schema version')
+        # CREATE TABLE IF NOT EXISTS also needs the write lock; same concurrent
+        # first-open race as the WAL switch, so retry it too.
+        self._retry_locked(lambda: self._conn.executescript(_SCHEMA))
+        self._retry_locked(self._add_missing_columns)
+        # Stamp the version idempotently rather than SELECT-then-INSERT. That
+        # read-then-write was a TOCTOU across processes: two CLIs opening the
+        # same fresh ledger both saw no row, both inserted, and the loser died
+        # with `UNIQUE constraint failed: meta.key`. Retrying could not help --
+        # the row exists by then, so the retry fails the same way.
+        #
+        # Two processes racing to open one ledger is the normal case here, not
+        # an edge: it is exactly what the cross-process lock further down
+        # exists to serialize, and that lock is taken *after* the store is
+        # constructed. ON CONFLICT is the idiom already used for desired_gen
+        # and applied_gen below.
+        self._retry_locked(
+            lambda: self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                'ON CONFLICT(key) DO NOTHING',
+                (str(SCHEMA_VERSION),),
+            )
+        )
+
+
+    def _add_missing_columns(self) -> None:
+        """Add columns newer code needs to an older ledger (nullable, so safe).
+
+        Two processes can race here; a duplicate-column error from the loser
+        is the desired end state.
+        """
+        for table, column, decl in self._ADDED_COLUMNS:
+            have = {r['name'] for r in self._conn.execute(f'PRAGMA table_info({table})')}
+            if column in have:
+                continue
+            try:
+                self._conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {decl}')
+            except sqlite3.OperationalError as ex:
+                if 'duplicate column' not in str(ex).lower():
+                    raise
+
+
+    def backup_to(self, path: Path) -> None:
+        """Publish a consistent SQLite archive, including committed WAL contents.
+
+        The caller holds the controller publication lock. A temporary file plus
+        atomic replace ensures an interrupted backup is never a valid archive.
+        """
+        import os
+        import tempfile
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.ledger-backup-', dir=path.parent)
+        os.close(fd)
+        try:
+            with self._lock, contextlib.closing(sqlite3.connect(temporary)) as destination:
+                self._conn._conn.backup(destination)
+            with open(temporary, 'rb') as file:
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+    @contextlib.contextmanager
+    def transaction(self) -> Generator[_SerializedConnection, None, None]:
+        """Take the write lock up front and commit/rollback atomically.
+
+        ``BEGIN IMMEDIATE`` is what makes the ledger's find-or-create-deployment
+        step race-safe across processes. ``_lock`` adds the same guarantee
+        across threads in one process (overlapping ``BEGIN IMMEDIATE`` on a
+        shared connection would otherwise raise).
+        """
+        with self._lock:
+            self._conn.execute('BEGIN IMMEDIATE')
+            try:
+                yield self._conn
+                self._conn.execute('COMMIT')
+            except BaseException:
+                # Also on KeyboardInterrupt: never leave a half-done write open
+                # on this connection for the next statement to commit.
+                self._conn.execute('ROLLBACK')
+                raise

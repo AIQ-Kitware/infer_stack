@@ -49,6 +49,9 @@ optional-dependencies.tests = [
 optional-dependencies.tui = [
   "textual>=0.50",
 ]
+optional-dependencies.postgres = [
+  "psycopg[binary]>=3.2,<4",
+]
 urls.Homepage = "https://github.com/AIQ-Kitware/infer_stack"
 scripts.infer-stack = "infer_stack.cli:main"
 
