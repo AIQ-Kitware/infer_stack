@@ -2,6 +2,13 @@
 
 **Status:** proposed 2026-10-03 · design only · no implementation in this PR
 
+> Planning relationship (2026-10-07): [northstar.md](northstar.md) is the
+> stable statement of product intent.
+> [kubernetes-service-roadmap.md](kubernetes-service-roadmap.md) is the current
+> executable path from the physical two-node proof. This document remains the
+> detailed remote/HA controller design and is subordinate to the north star if
+> implementation details diverge.
+
 ## Objective
 
 > **Evolve infer-stack from a host-local controller into a model-serving control
@@ -422,6 +429,30 @@ Security-sensitive changes should create append-only audit events:
 - source address/client metadata where appropriate;
 - catalog revision;
 - timestamp.
+
+### Resource and energy accounting
+
+Usage/accounting is not desired-state authority, but server mode should preserve
+the durable facts needed to explain and recompute resource consumption. See
+[northstar.md](northstar.md#resource-accounting-and-energy-transparency) and
+[kubernetes-service-roadmap.md](kubernetes-service-roadmap.md#phase-5--resource-accounting-and-energy-telemetry-v1).
+
+Records should retain provenance rather than only a final cost-like scalar. At a
+minimum the durable model should be able to represent:
+
+- observation interval and node/GPU identity;
+- deployment/model/endpoint identity;
+- allocated GPU-seconds / replica residency;
+- request/token activity when available;
+- sampled or aggregated power telemetry when available;
+- integrated energy;
+- measured-vs-estimated method and source;
+- sample coverage/gaps and proxy version/input where relevant.
+
+Shared deployments must not copy the same total energy onto every lease. It is
+acceptable to preserve deployment-level truth before per-user attribution is
+implemented. Raw resource/telemetry facts should be sufficient to recompute a
+later estimate without rewriting historical desired state.
 
 ---
 
@@ -1029,7 +1060,9 @@ Also expose:
 - oldest unconverged generation;
 - connected/offline node agents;
 - route publication health;
-- controller build/schema versions.
+- controller build/schema versions;
+- resource-accounting collector health and telemetry coverage, so a missing
+  energy estimate is distinguishable from measured zero use.
 
 Do not infer "healthy control plane" solely from process liveness.
 
