@@ -632,6 +632,8 @@ class Controller:
         hard: dict[str, list[int]] = {}
         hints: dict[str, list[int]] = {}
         optional: list[Deployment] = []
+        logical = getattr(self.backend, 'logical_idle_ids', None)
+        logical_ids = logical([g for g in by_id.values() if g.state == DeploymentState.IDLE and self.keeps_up(g)]) if logical is not None else set()
         for gid, deployment in by_id.items():
             if deployment.state == DeploymentState.LIVE:
                 if deployment.assigned_gpus is not None:
@@ -649,6 +651,8 @@ class Controller:
                 # KubeAI Model's replicas), a conflict or an unmappable
                 # reservation does not. [] where the cluster places.
                 gpus = residency.resident_gpus(gid) if residency is not None else None
+                if gpus is None and gid in logical_ids:
+                    gpus = []  # logical Model retained; no physical GPU claim
                 if gpus is not None:
                     hints[gid] = gpus
                     optional.append(deployment)

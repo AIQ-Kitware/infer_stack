@@ -236,7 +236,7 @@ def _parse_protocol(value: Any) -> str:
 #: Keys the endpoint-level ``placement`` block accepts. Deliberately strict —
 #: an unknown key is a typo (min_vram_gb) that would otherwise silently mean
 #: "no constraint", which on a heterogeneous host means an OOM later.
-PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices'})
+PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices', 'node', 'pool'})
 
 
 def _placement_errors(ep: EndpointSpec) -> list[str]:
@@ -258,6 +258,8 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
             f"(supported: {sorted(PLACEMENT_KEYS)})"
         )
     value = ep.placement.get('min_vram_gib')
+    from .cluster_placement import validate
+    errors.extend(f"endpoint '{ep.name}': {e}" for e in validate(ep.placement))
     if value is not None:
         if not isinstance(value, (int, float)) or isinstance(value, bool) \
                 or value <= 0:
@@ -321,6 +323,11 @@ def _runtime_errors(ep: EndpointSpec) -> list[str]:
     from .launch import launch_errors
 
     errors = launch_errors(ep.name, ep.engine, ep.runtime)
+    from .serving_policy import policy
+    try:
+        policy(ep.runtime)
+    except ValueError as ex:
+        errors.append(f"endpoint '{ep.name}': {ex}")
     shm = (ep.runtime or {}).get('shm_size')
     if shm is not None:
         if ep.engine != VLLM:
@@ -624,6 +631,13 @@ class Catalog:
             gpu_indices=gpu_indices,
             launch=launch_identity(rt),
         )
+        from .serving_policy import identity
+        scaling = identity(rt)
+        if scaling:
+            structural['serving_policy'] = scaling
+        cluster = {k: ep.placement[k] for k in ('node', 'pool') if k in ep.placement}
+        if cluster:
+            structural['cluster_placement'] = cluster
         capacity: dict[str, Any] = {}
         if rt.get('max_model_len') is not None:
             capacity['max_model_len'] = rt['max_model_len']

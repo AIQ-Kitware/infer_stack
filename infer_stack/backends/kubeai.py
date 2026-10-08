@@ -153,8 +153,8 @@ def _model_doc(
     if ':' not in profile:
         profile = f'{profile}:{_gpu_count(deployment)}'
     runtime = deployment.spec.get('runtime', {}) or {}
-    min_replicas = int(runtime.get('min_replicas', 1) or 1)
-    max_replicas = max(min_replicas, int(runtime.get('max_replicas', 1) or 1))
+    from ..leasing.serving_policy import policy
+    scaling = policy(runtime)
     # Bound separately so its type comes from the annotation rather than
     # being inferred from the literal: `env` is added below and a value type
     # narrowed to what the literal happens to contain would reject it.
@@ -163,10 +163,16 @@ def _model_doc(
         'url': f'hf://{deployment.spec["hf_model_id"]}',
         'engine': 'VLLM',
         'resourceProfile': profile,
-        'minReplicas': min_replicas,
-        'maxReplicas': max_replicas,
+        'minReplicas': scaling['min_replicas'],
+        'maxReplicas': scaling['max_replicas'],
         'args': vllm_args(svc, include_served_name=False),
     }
+    for source, target in [('target_requests', 'targetRequests'),
+                           ('scale_down_delay_seconds', 'scaleDownDelaySeconds')]:
+        if source in scaling:
+            spec[target] = scaling[source]
+    if 'load_balancing' in scaling:
+        spec['loadBalancing'] = {'strategy': scaling['load_balancing']}
     doc: dict[str, Any] = {
         'apiVersion': 'kubeai.org/v1',
         'kind': 'Model',
@@ -197,6 +203,7 @@ def _model_doc(
 GPU_PRODUCT_LABEL = 'nvidia.com/gpu.product'
 GPU_MEMORY_LABEL = 'nvidia.com/gpu.memory'
 GPU_RESOURCE = 'nvidia.com/gpu'
+DEVICE_FACTS_ANNOTATION = 'infer-stack.ai/gpu-inventory'
 
 
 def node_gpus(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -221,12 +228,33 @@ def node_gpus(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         except ValueError:
             memory_gib = None
         count = str(((node.get('status') or {}).get('allocatable') or {}).get(GPU_RESOURCE) or '')
-        out[str(meta.get('name'))] = {
+        facts = {
             'product': labels.get(GPU_PRODUCT_LABEL),
             'memory_gib': memory_gib,
             'count': int(count) if count.isdigit() else 0,
             'labels': labels,
         }
+        observed = (meta.get('annotations') or {}).get(DEVICE_FACTS_ANNOTATION)
+        if observed:
+            try:
+                inventory = json.loads(observed)
+                devices = inventory['devices']
+                if inventory.get('version') != 1 or not isinstance(devices, list) or len(devices) < facts['count']:
+                    raise ValueError('Incomplete per-device inventory')
+                if not devices or len({d['uuid'] for d in devices}) != len(devices):
+                    raise ValueError('Invalid per-device identities')
+                memories = [int(d['memory_mib']) / 1024 for d in devices]
+                if any(m <= 0 for m in memories):
+                    raise ValueError('Invalid per-device memory')
+                facts.update(devices=devices, inventory_observed_at=inventory.get('observed_at'),
+                             heterogeneous=len({d['product'] for d in devices}) > 1)
+                # Every possible generic GPU allocation must fit. A scalar
+                # GFD label on a mixed node cannot promote a smaller device.
+                facts['memory_gib'] = min([*memories, memory_gib] if memory_gib is not None else memories)
+            except (ValueError, TypeError, KeyError):
+                facts['memory_gib'] = None
+                facts['inventory_error'] = 'Per-device inventory is invalid or incomplete; repeat worker acceptance'
+        out[str(meta.get('name'))] = facts
     return out
 
 
@@ -345,6 +373,8 @@ def render_models(
     default_resource_profile: str | None,
     unique_names: bool = False,
     sized: dict[str, float] | None = None,
+    profiles: dict[str, Any] | None = None,
+    nodes: dict[str, dict[str, Any]] | None = None,
 ) -> RenderedModels:
     """Render the desired set into KubeAI ``Model`` docs (pure, no I/O).
 
@@ -356,6 +386,9 @@ def render_models(
     """
     out = RenderedModels()
     ordered = sorted(deployments, key=lambda g: (g.created_at, g.id))
+    constrained_aliases = {alias for g in ordered
+                           if any((g.spec.get('placement') or {}).get(k) for k in ('node', 'pool'))
+                           for alias in g.served}
     for deployment in ordered:
         if deployment.engine != 'vllm':
             out.unrenderable.add(deployment.id)
@@ -369,6 +402,13 @@ def render_models(
         from ..leasing.launch import translate_legacy
 
         runtime = translate_legacy(deployment.spec.get('runtime', {}) or {})
+        from ..leasing.serving_policy import policy
+        try:
+            policy(runtime)
+        except ValueError as ex:
+            out.unrenderable.add(deployment.id)
+            out.errors.append(f'{deployment.id}: {ex}')
+            continue
         custom = unsupported_runtime_fields(runtime)
         if custom:
             # A KubeAI Model runs stock vLLM: it has no place for a container
@@ -384,6 +424,24 @@ def render_models(
         min_vram = (deployment.spec.get('placement') or {}).get('min_vram_gib')
         profile, why = pick_profile(runtime.get('resource_profile'), min_vram,
                                     sized or {}, default_resource_profile)
+        from ..leasing.cluster_placement import constrained_profile
+        placement = deployment.spec.get('placement') or {}
+        if placement.get('node') or placement.get('pool'):
+            try:
+                profile = constrained_profile(placement, profiles or {}, nodes or {},
+                                              explicit=runtime.get('resource_profile'),
+                                              min_vram=min_vram, gpu_count=_gpu_count(deployment))
+                why = 'hard cluster placement'
+            except ValueError as ex:
+                out.unrenderable.add(deployment.id)
+                out.errors.append(f'{deployment.id}: {ex}')
+                continue
+        constrained_alias = next((alias for alias in deployment.served
+                                  if alias in out.request_names and alias in constrained_aliases), None)
+        if constrained_alias:
+            out.unrenderable.add(deployment.id)
+            out.errors.append(f'{deployment.id}: alias {constrained_alias!r} has multiple constrained deployments; scoped inference routing is required')
+            continue
         if not str(profile or '').strip():
             out.unrenderable.add(deployment.id)
             out.errors.append(
@@ -427,6 +485,10 @@ def _default_kubectl_run(args: list[str]) -> str:
     text needed to debug a cluster that isn't set up yet.
     """
     import subprocess
+
+    from ..kube.context import command
+
+    args = command(args)
 
     proc = subprocess.run(
         args, capture_output=True, text=True, timeout=120,
@@ -620,10 +682,12 @@ class KubeaiBackend(ConvergeScaffold):
         gateway: Any = None,
         gateway_upstream: str | None = None,
         gateway_factory: Callable[[str], Any] | None = None,
+        kubeconfig: str | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self.kubeconfig = kubeconfig
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip('/')
         self.default_resource_profile = default_resource_profile
         self.run = run or _default_kubectl_run
@@ -687,7 +751,8 @@ class KubeaiBackend(ConvergeScaffold):
     # -- kubectl plumbing ------------------------------------------------------
 
     def _kubectl(self, args: list[str]) -> str:
-        return self.run(['kubectl', '-n', self.namespace, *args])
+        target = ['--kubeconfig', self.kubeconfig] if self.kubeconfig else []
+        return self.run(['kubectl', *target, '-n', self.namespace, *args])
 
     def _cluster_models(self) -> dict[str, str | None]:
         """Managed Model CRs on the cluster: ``{name: deployment id}``.
@@ -878,6 +943,37 @@ class KubeaiBackend(ConvergeScaffold):
         nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']) or '{}')
         return node_gpus(nodes.get('items') or [])
 
+    def node_inventory(self) -> dict:
+        """Read-only public inventory with unknown allocation on pod-list errors."""
+        import time
+
+        from ..kube.manage import KubeManager
+        from ..kube.monitor import gpu_request
+
+        nodes = json.loads(self._kubectl(['get', 'nodes', '-o', 'json']))['items']
+        facts, errors, requested = node_gpus(nodes), {}, None
+        try:
+            pods = json.loads(self._kubectl(['get', 'pods', '-A', '-o', 'json']))['items']
+            requested = {}
+            for pod in pods:
+                if (pod.get('status') or {}).get('phase') in {'Succeeded', 'Failed'}:
+                    continue
+                node = (pod.get('spec') or {}).get('nodeName')
+                if node:
+                    requested[node] = requested.get(node, 0) + gpu_request(pod)
+        except Exception:
+            requested = None
+            errors['pods'] = 'GPU request observation unavailable; allocation remains unknown'
+        rows = KubeManager.node_rows(nodes)
+        for row in rows:
+            gpu = facts[row['name']]
+            row.update(gpu_requested=requested.get(row['name'], 0) if requested is not None else None,
+                       gpu_devices=gpu.get('devices'), inventory_observed_at=gpu.get('inventory_observed_at'),
+                       inventory_error=gpu.get('inventory_error'),
+                       labels={k: v for k, v in gpu['labels'].items() if k.startswith('infer-stack.ai/')})
+        return {'nodes': sorted(rows, key=lambda row: row['name']), 'errors': errors,
+                'observed_at': time.time(), 'source': 'kubernetes'}
+
     def installed_resource_profiles(self) -> dict[str, Any]:
         """Read installed chart profiles; callers decide how to handle absence."""
         config = json.loads(self._kubectl(
@@ -946,12 +1042,15 @@ class KubeaiBackend(ConvergeScaffold):
 
         desired = list(desired)
         self._enrich_min_vram(desired)
+        constrained = any((g.spec.get('placement') or {}).get(k) for g in desired for k in ('node', 'pool'))
         rendered = render_models(
             desired,
             namespace=self.namespace,
             default_resource_profile=self.default_resource_profile,
             unique_names=self.dynamic_routing,
             sized=self.gpu_facts()[1] if self._needs_sizing(desired) else None,
+            profiles=self.installed_resource_profiles() if constrained else None,
+            nodes=self.node_gpu_facts() if constrained else None,
         )
         plan = GpuPlan(
             assignments={g.id: [] for g in desired if g.id not in rendered.unrenderable},
@@ -1048,7 +1147,7 @@ class KubeaiBackend(ConvergeScaffold):
         """This backend's render inputs, as a publishable profile."""
         from ..leasing.profile import PROFILE_VERSION, catalog_sources
 
-        return {
+        profile = {
             'version': PROFILE_VERSION,
             'backend': 'kubeai',
             'namespace': self.namespace,
@@ -1060,6 +1159,9 @@ class KubeaiBackend(ConvergeScaffold):
             'gateway_upstream': self.gateway_upstream,
             'catalogs': catalog_sources(self.catalog),
         }
+        if self.kubeconfig:
+            profile['kubeconfig'] = self.kubeconfig
+        return profile
 
     def validate_requests(self, requests) -> None:
         from ..leasing.profile import validate_requests_against
@@ -1079,6 +1181,8 @@ class KubeaiBackend(ConvergeScaffold):
         from ..leasing.profile import CatalogUnion
 
         self.namespace = profile['namespace']
+        if 'kubeconfig' in profile:
+            self.kubeconfig = profile['kubeconfig']
         self.base_url = profile['base_url']
         self.default_resource_profile = profile['resource_profile']
         self.gateway_upstream = profile.get('gateway_upstream') or self.gateway_upstream
@@ -1296,6 +1400,28 @@ class KubeaiBackend(ConvergeScaffold):
         except Exception:  # noqa: BLE001 - observe must not brick acquire
             return set()
         return {gid for gid in models.values() if gid}
+
+    def logical_idle_ids(self, deployments: list[Deployment]) -> set[str]:
+        """Existing on-demand Models survive zero replicas after final release.
+
+        The query is strict: an unavailable API must not prune a logical route.
+        A missing Model is never recreated merely because an idle ledger row
+        remains from earlier serving.
+        """
+        from ..leasing.serving_policy import policy
+
+        candidates = {g.id for g in deployments if policy(g.spec.get('runtime') or {})['min_replicas'] == 0}
+        return candidates & {gid for gid in self._cluster_models().values() if gid} if candidates else set()
+
+    def lifecycle(self, deployments: list[Deployment]) -> dict:
+        """Read-only replica evidence; never wake a scale-to-zero Model."""
+        from ..leasing.lifecycle import kube_view
+
+        models = json.loads(self._kubectl(['get', 'models.kubeai.org', '-l', f'{MANAGED_LABEL}=true', '-o', 'json'])).get('items', [])
+        pods = json.loads(self._kubectl(['get', 'pods', '-l', f'{MANAGED_LABEL}=true', '-o', 'json'])).get('items', [])
+        by_id = {m.get('metadata', {}).get('labels', {}).get(DEPLOYMENT_LABEL): m for m in models}
+        return {g.id: kube_view(by_id.get(g.id), [p for p in pods if p.get('metadata', {}).get('labels', {}).get(DEPLOYMENT_LABEL) == g.id])
+                for g in deployments}
 
     def probe_ready(self, deployment: Deployment, endpoint: str) -> Readiness:
         """Ready == the model actually served a (protocol-aware) generation.

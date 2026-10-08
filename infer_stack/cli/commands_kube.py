@@ -270,12 +270,61 @@ class KubeNodeAttachCLI(_PathOverridesMixin):
         return 0
 
 
+class KubeNodeClassifyCLI(_PathOverridesMixin):
+    """Plan/apply administrator labels and corresponding KubeAI selector profiles."""
+
+    __command__ = 'classify'
+    node = kw.Value(None, position=1, type=str, required=True)
+    pool = kw.Value(None, type=str)
+    machine_class = kw.Value(None, type=str, alias=['class'])
+    site = kw.Value(None, type=str)
+    namespace = kw.Value('kubeai', type=str)
+    release = kw.Value('kubeai', type=str)
+    apply = kw.Value(False, isflag=True)
+    dry_run = kw.Value(False, isflag=True, alias=['plan'])
+    json = kw.Value(False, isflag=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import copy
+        from ..kube.classification import labels, profiles
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        manager = KubeManager()
+        try:
+            changes = labels(pool=config.pool, machine_class=config.machine_class, site=config.site)
+            nodes = copy.deepcopy(manager.nodes())
+            target = next((n for n in nodes if n.get('metadata', {}).get('name') == config.node), None)
+            if target is None:
+                raise ValueError(f'Unknown canonical Kubernetes node {config.node!r}')
+            target['metadata'].setdefault('labels', {}).update(changes)
+            planned = profiles(nodes)
+            result = {'node': config.node, 'labels': changes, 'resource_profiles': planned,
+                      'applied': bool(config.apply and not config.dry_run)}
+            if result['applied']:
+                found = manager.kubeai_release(config.release)
+                if not found or found.get('namespace') != config.namespace:
+                    raise ValueError('Classification profile installation requires the matching managed KubeAI Helm release')
+                if changes:
+                    manager.run(['kubectl', 'label', 'node', config.node,
+                                 *[f'{k}={v}' for k, v in sorted(changes.items())], '--overwrite'])
+                manager.install_kubeai(namespace=config.namespace, release=config.release,
+                                       resource_profiles=planned, version=manager._release_chart_version(found))
+            print(json.dumps(result, indent=2) if config.json else
+                  f"{config.node}: {changes}; {len(planned)} selector profiles {'applied' if result['applied'] else 'planned; rerun with --apply'}")
+            return 0
+        except (RuntimeError, ValueError) as ex:
+            raise SystemExit(str(ex)) from ex
+
+
 class KubeNodeModalCLI(kw.ModalCLI):
     """Temporarily hand a cluster node between Kubernetes and local Compose."""
 
     __command__ = 'node'
     status = KubeNodeStatusCLI
     test = KubeNodeTestCLI
+    classify = KubeNodeClassifyCLI
     detach = KubeNodeDetachCLI
     attach = KubeNodeAttachCLI
 
@@ -645,7 +694,7 @@ class KubeBootstrapCLI(KubeInventoryCLI):
         checks = readiness(report, installation=False)
         if not config.json:
             from ..kube.k3s import user_kubeconfig
-            print(f'Local K3s reconciled. For inventory/install: export KUBECONFIG={user_kubeconfig()}')
+            print(f'Local K3s reconciled. Saved infer-stack kubeconfig: {user_kubeconfig()}')
         if config.json:
             print(json.dumps({'inventory': report, 'checks': checks}, indent=2))
         else:

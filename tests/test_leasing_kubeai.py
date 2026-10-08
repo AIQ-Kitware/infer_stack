@@ -330,6 +330,21 @@ def test_observe_is_best_effort_on_kubectl_failure(tmp_path):
     assert be.observe() == set()
 
 
+def test_node_inventory_keeps_capacity_when_allocation_is_unavailable(tmp_path):
+    node = {'metadata': {'name': 'worker', 'labels': {'nvidia.com/gpu.product': 'L4'}},
+            'status': {'allocatable': {'nvidia.com/gpu': '2'},
+                       'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+    def run(args):
+        if 'nodes' in args:
+            return json.dumps({'items': [node]})
+        raise RuntimeError('pod-list RBAC failure')
+    backend = KubeaiBackend(state_dir=tmp_path, run=run)
+    observed = backend.node_inventory()
+    assert observed['nodes'][0]['gpu_count'] == 2
+    assert observed['nodes'][0]['gpu_requested'] is None
+    assert observed['errors']['pods'] and observed['source'] == 'kubernetes'
+
+
 # -- probe / access -----------------------------------------------------------
 
 
@@ -454,6 +469,31 @@ def test_keep_warm_stays_resident_after_release(tmp_path):
     assert set(kubectl.applied) == {'qwen'}   # idle keep-warm stays up
     ctl.evict(None)
     assert kubectl.applied == {}              # evict frees the cluster
+
+
+def test_existing_on_demand_model_survives_zero_without_recreating_missing_idle(tmp_path):
+    class ZeroReplicaKubectl(FakeKubectl):
+        def __call__(self, args):
+            if 'get' in args and 'pods' in args:
+                return json.dumps({'items': []})
+            return super().__call__(args)
+
+    run = ZeroReplicaKubectl()
+    backend = KubeaiBackend(state_dir=tmp_path / 'state', run=run, http=FakeHttp(run))
+    store = SqliteStore(str(tmp_path / 'ledger.db'))
+    controller = Controller(Ledger(store), backend)
+    request = _req('cold', reclaim='keep-warm')
+    request.spec['runtime']['min_replicas'] = 0
+    try:
+        acquired = controller.acquire('alice', [request], wait=False)
+        controller.release(acquired.lease.id)
+        controller.gc()
+        assert set(run.applied) == {'cold'}
+        run.applied.clear()  # external removal is not permission to restart idle
+        controller.reconcile()
+        assert run.applied == {}
+    finally:
+        store.close()
 
 # -- edge cases / preflight ----------------------------------------------------
 

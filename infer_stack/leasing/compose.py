@@ -1462,7 +1462,7 @@ class ComposeBackend(ConvergeScaffold):
                 hard=dict(placement.hard),
                 optional_hints=dict(placement.optional_hints),
             )
-        return plan_placement(
+        result = plan_placement(
             desired,
             self.inventory,
             allowed_gpus=self.allowed_gpus,
@@ -1471,6 +1471,16 @@ class ComposeBackend(ConvergeScaffold):
             skip_display=self.skip_display,
             **keywords,
         )
+        for deployment in desired:
+            constraints = deployment.spec.get('placement') or {}
+            if constraints.get('node') or constraints.get('pool'):
+                result.assignments.pop(deployment.id, None)
+                result.errors.append(f'{deployment.id}: node/pool placement requires the Kubernetes backend')
+            from .serving_policy import identity
+            if identity(deployment.spec.get('runtime') or {}):
+                result.assignments.pop(deployment.id, None)
+                result.errors.append(f'{deployment.id}: replica/autoscaling policy requires the Kubernetes backend')
+        return result
 
     def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
         """Place and render ``desired`` exactly as :meth:`converge` would; write nothing.
