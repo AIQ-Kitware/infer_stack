@@ -1179,7 +1179,10 @@ States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
 including cards allocated to another job, and the failure surfaces later as a
 CUDA OOM in whichever job loses.
 
-## Version 0.7.2 - Unreleased
+## Version 0.7.3 - Unreleased
+
+
+## Version 0.7.2 - Released 2026-10-07
 
 
 ## Version 0.7.1 - Released 2026-09-24
