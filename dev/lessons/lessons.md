@@ -223,3 +223,12 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Evidence / MWE:** `test_run_preserves_literal_child_arguments` in
     `tests/test_cli_leasing.py`, reproduced with kwconf 0.11.0.
   - **Applies when:** forwarding everything after -- to an arbitrary command.
+
+- **Lesson:** Sharing compatible engines does not reconcile external GPU
+  reservations or extend the original allocation's lifetime. A caller's
+  allowed_gpus limits new placement; existing engines can be reused elsewhere.
+  - **Evidence / MWE:** `plan_placement()` in `infer_stack/leasing/placement.py`
+    validates existing pins against the full pool while restricting new
+    placements; `docs/slurm-compatibility.md` describes the two-client case.
+  - **Applies when:** a batch scheduler reserves GPUs per client job while
+    infer-stack coalesces their requests onto common deployments.

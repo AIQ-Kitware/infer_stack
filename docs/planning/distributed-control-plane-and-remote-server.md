@@ -2,6 +2,10 @@
 
 **Status:** proposed 2026-10-03 · design only · no implementation in this PR
 
+Companion: [GPU ownership and serving capacity](gpu-ownership-and-serving-capacity.md)
+defines an incremental Compose-first path for shared allocations, replicas and
+KubeAI scaling without waiting for the remote/HA control plane.
+
 ## Objective
 
 > **Evolve infer-stack from a host-local controller into a model-serving control

@@ -523,3 +523,36 @@ tests preserving numeric/decimal/boolean/empty tokens and child options.
 Readiness still releases on errors; the reported failure occurred before the
 child started, not in the service. Focused leasing and signal checks: 74 passed.
 Scoped fatal/unused checks and ty validation are recorded with this repair.
+
+## 2026-10-08 20:50:38 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+The user requested completing an interrupted update and a plan for efficient
+GPU use when concurrent scheduler clients share engines, prioritizing Compose
+and covering Kubernetes. The pending merge joins two local wrapper fixes with
+six upstream commits on dev/0.7.2 (through 3ba2d6f). Only CHANGELOG conflicted;
+both sides add valid entries, so retain all entries. Automatic source merges
+preserve cancellation cleanup and literal child argv across the incoming
+control-plane authority refactor. No runtime restart or live mutation is needed.
+
+The capacity plan separates resource ownership from throughput policy. Sharing
+can avoid duplicate model loads while still duplicating external GPU reservations;
+per-call allowed_gpus only constrains new placement, not an existing engine's
+ownership lifetime. First benchmark explicit dedicated deployments against shared
+engines, then prove a serving allocation that CPU clients borrow. Compose replica
+groups require unique units, readiness-gated routes, draining and device ownership
+fences. KubeAI should retain native pod placement and autoscaling ownership instead
+of having two controllers change the same replica field. Lease count alone is not
+load. These are design proposals; no new replica API is promised by the document.
+
+Link the plan to the existing remote/HA design without making that larger project
+a prerequisite. Correct the Slurm runbook's claim that matching device slices
+reconciles accounting: compatible deployment reuse can still leave reserved GPUs
+idle, or leave a borrowing client dependent on an allocation that ends first.
+Existing modes remain available; performance and lifetime guarantees need real
+hardware checks before changing defaults. Generic documentation carries no
+downstream workload identity or private model-selection intent.
+
+Validation: tests/ has 1268 passed, 2 skipped; package doctests have 44 passed,
+1 skipped. Fatal syntax/name checks and ty pass. This validates the merged code
+and preserved wrappers, not a new replication implementation or GPU throughput.

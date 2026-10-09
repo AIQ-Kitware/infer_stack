@@ -73,6 +73,11 @@ Operational and security constraints that are accepted during the current
 planning-stage release are tracked in
 [docs/planning/known-limitations.md](docs/planning/known-limitations.md).
 
+The [GPU ownership and serving capacity plan](docs/planning/gpu-ownership-and-serving-capacity.md)
+describes how to reduce duplicate scheduler reservations when clients share
+engines, then add measured Compose/KubeAI capacity. It is a proposed roadmap;
+existing acquisition and placement behavior remains the current interface.
+
 `infer-stack` serves the endpoints declared in a catalog. `acquire` takes a
 lease on an endpoint; the controller places its engine on free GPUs and
 reconciles the backend to run it:
