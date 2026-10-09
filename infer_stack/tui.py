@@ -32,7 +32,7 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from rich.markup import escape as escape_markup
 from textual import events, work
@@ -206,21 +206,22 @@ class _EndpointTable(DataTable):
         row = self._row_from_event(event)
         if row is None or getattr(event, 'button', 1) != 1:
             return
-        if not (0 <= row < len(self.app._endpoint_names)):
+        app = cast('InferStackTUI', self.app)
+        if not (0 <= row < len(app._endpoint_names)):
             return
-        name = self.app._endpoint_names[row]
+        name = app._endpoint_names[row]
         ctrl = getattr(event, 'ctrl', False) or getattr(event, 'meta', False)
         if ctrl:
             self._last_click_name = None
             self._last_click_at = 0.0
             event.prevent_default()
-            self.app._open_endpoint_row(row)
+            app._open_endpoint_row(row)
             return
 
         now = time.monotonic()
         last_name = getattr(self, '_last_click_name', None)
         last_at = getattr(self, '_last_click_at', 0.0)
-        threshold = float(getattr(self.app, 'CLICK_CHAIN_TIME_THRESHOLD', 0.5))
+        threshold = float(getattr(app, 'CLICK_CHAIN_TIME_THRESHOLD', 0.5))
         native_double = getattr(event, 'chain', 1) >= 2
         timed_double = name == last_name and (now - last_at) <= threshold
         if native_double or timed_double:
@@ -230,7 +231,7 @@ class _EndpointTable(DataTable):
             self._last_click_name = None
             self._last_click_at = 0.0
             event.prevent_default()
-            self.app._activate_endpoint_row(row)
+            app._activate_endpoint_row(row)
             return
         self._last_click_name = name
         self._last_click_at = now
@@ -241,7 +242,8 @@ class _EndpointTable(DataTable):
             # action from also posting RowSelected and double-firing the acquire.
             event.prevent_default()
             event.stop()
-            self.app._activate_endpoint_row(self.cursor_row)
+            app = cast('InferStackTUI', self.app)
+            app._activate_endpoint_row(self.cursor_row)
 
 
 # A warm alternative palette, kept registered (selectable from the command
@@ -2750,7 +2752,9 @@ class InferStackTUI(App):
     def action_toggle_select(self) -> None:
         """Space: toggle the cursor row of the focused leases/deployments table."""
         focused = self.focused
-        tid = getattr(focused, 'id', None)
+        if not isinstance(focused, DataTable):
+            return
+        tid = focused.id
         if tid is None:
             return
         res = self._table_sel(tid)
@@ -3248,6 +3252,15 @@ class InferStackTUI(App):
 
     # -- catalog editing (suggest + wizards) -------------------------------
 
+    def _editable_catalog_path(self) -> Path:
+        """Return the catalog path or fail if this TUI cannot edit it."""
+        path = self.catalog_path
+        if path is None:
+            raise RuntimeError(
+                'no catalog path — launch the TUI with a catalog to edit'
+            )
+        return path
+
     def action_add_model(self) -> None:
         if not self.catalog_path:
             self._refuse('no catalog path — launch the TUI with a catalog to edit')
@@ -3287,8 +3300,8 @@ class InferStackTUI(App):
         if name in self._served_endpoints():
             self._refuse(f'{name} is actively served — release it before editing')
             return
-        from .cli.commands_catalog import _load_raw
-        entry = _load_raw(self.catalog_path)['endpoints'].get(name, {})
+        from .leasing.catalog_edit import load_catalog_source
+        entry = load_catalog_source(self.catalog_path)['endpoints'].get(name, {})
         if 'external' in (entry or {}):
             # The editor describes a runtime infer-stack runs; saving would
             # turn the external endpoint into one.
@@ -3420,17 +3433,18 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _save_endpoint(self, result: dict) -> None:
         try:
-            from .cli.commands_catalog import (
-                _load_raw,
-                _next_indexed_name,
-                _save_raw,
-                _slug_alias,
+            from .leasing.catalog_edit import (
+                load_catalog_source,
+                next_indexed_name,
+                slug_alias,
+                write_catalog_source,
             )
-            data = _load_raw(self.catalog_path)
+            catalog_path = self._editable_catalog_path()
+            data = load_catalog_source(catalog_path)
             name = result['name']
             if not name:
-                name = _next_indexed_name(
-                    data['endpoints'], _slug_alias(result['model'])
+                name = next_indexed_name(
+                    data['endpoints'], slug_alias(result['model'])
                 )
             old_entry = data['endpoints'].get(name)
             new_entry = self._endpoint_entry(result)
@@ -3450,7 +3464,7 @@ class InferStackTUI(App):
                 ]
 
             data['endpoints'][name] = new_entry
-            _save_raw(self.catalog_path, data)  # validates before publication
+            write_catalog_source(catalog_path, data)  # validates before publication
             self.call_from_thread(self._cli, cli.endpoint_add(
                 name, new_entry, force=old_entry is not None))
 
@@ -3497,10 +3511,11 @@ class InferStackTUI(App):
 
     def _do_remove(self, section: str, name: str) -> None:
         try:
-            from .cli.commands_catalog import _load_raw, _save_raw
-            data = _load_raw(self.catalog_path)
+            from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+            catalog_path = self._editable_catalog_path()
+            data = load_catalog_source(catalog_path)
             data[section].pop(name, None)
-            _save_raw(self.catalog_path, data)  # validates cross-refs
+            write_catalog_source(catalog_path, data)  # validates cross-refs
             self._status(f'removed {section[:-1]} {name}')
             self._cli(cli.command('catalog', section[:-1], 'rm', name))
         except Exception as ex:  # noqa: BLE001
@@ -3509,10 +3524,11 @@ class InferStackTUI(App):
         self._reload_catalog()
 
     def _write_catalog(self, section: str, name: str, entry: dict) -> None:
-        from .cli.commands_catalog import _load_raw, _save_raw
-        data = _load_raw(self.catalog_path)
+        from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+        catalog_path = self._editable_catalog_path()
+        data = load_catalog_source(catalog_path)
         data[section][name] = entry
-        _save_raw(self.catalog_path, data)  # validates; raises on a bad write
+        write_catalog_source(catalog_path, data)  # validates; raises on a bad write
 
     def action_suggest(self) -> None:
         if not self.catalog_path:
@@ -3538,8 +3554,9 @@ class InferStackTUI(App):
                     'no pooled model fits the detected GPUs — add one with m/n'
                 )
                 return
-            from .cli.commands_catalog import _load_raw, _save_raw
-            data = _load_raw(self.catalog_path)
+            from .leasing.catalog_edit import load_catalog_source, write_catalog_source
+            catalog_path = self._editable_catalog_path()
+            data = load_catalog_source(catalog_path)
             migrated = migrate_known_suggestion_aliases(data)
             added = 0
             for sec in ('models', 'endpoints'):
@@ -3547,7 +3564,7 @@ class InferStackTUI(App):
                     if nm not in data[sec]:
                         data[sec][nm] = val
                         added += 1
-            _save_raw(self.catalog_path, data)
+            write_catalog_source(catalog_path, data)
             self.call_from_thread(self._reload_catalog)
             rename = f'; renamed {len(migrated)} prior suggestion(s)' if migrated else ''
             self._after_mutation(
@@ -3567,9 +3584,9 @@ class InferStackTUI(App):
         if not base:
             return None, None
         key = None
-        mk = getattr(backend, 'master_key', None)
+        front = backend.front_door()
         try:
-            key = mk() if callable(mk) else None
+            key = front.master_key() if front is not None and front.litellm else None
         except Exception:  # noqa: BLE001
             key = None
         return base, key

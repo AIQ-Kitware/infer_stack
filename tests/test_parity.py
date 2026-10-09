@@ -53,7 +53,8 @@ class Stack:
     ctl: Controller
     backend: Any
     runtime: Any                 # the fake Docker or the fake kubectl
-    front: Any                   # the ComposeBackend holding the gateway
+    front: Any                   # the backend's FrontDoorControl authority
+    front_runtime: Any           # the object that renders/applies that front door
 
     def acquire(self, *names, dedicated: bool = False, **kw):
         from infer_stack.leasing import Sharing
@@ -111,7 +112,10 @@ def _compose(tmp_path, **gateway_kw) -> Stack:
         ports=PORTS, state=STATE, litellm=True, catalog=CAT, **gateway_kw,
     )
     ctl = Controller(Ledger(SqliteStore(str(tmp_path / 'ledger.db'))), backend)
-    return Stack('compose', ctl, backend, docker, backend)
+    return Stack(
+        'compose', ctl, backend, docker,
+        backend.front_door(), backend,
+    )
 
 
 class _Kubectl:
@@ -206,7 +210,10 @@ def _kubeai(tmp_path, **gateway_kw) -> Stack:
                             gateway_upstream=UPSTREAM, default_resource_profile='gpu')
     backend.catalog = CAT
     ctl = Controller(Ledger(SqliteStore(str(tmp_path / 'ledger.db'))), backend)
-    return Stack('kubeai', ctl, backend, kubectl, gateway)
+    return Stack(
+        'kubeai', ctl, backend, kubectl,
+        backend.front_door(), gateway,
+    )
 
 
 BUILDERS = {'compose': _compose, 'kubeai': _kubeai}
@@ -419,7 +426,7 @@ def test_open_webui_and_the_reverse_proxy(make_stack):
 
     stack = make_stack(ui=True, reverse_proxy=True)
     stack.acquire('one', apply=False)
-    doc = yaml.safe_load(stack.front.compose_file.read_text())
+    doc = yaml.safe_load(stack.front_runtime.compose_file.read_text())
     assert {OPEN_WEBUI_SERVICE, NGINX_SERVICE} <= set(doc['services'])
 
 
@@ -427,7 +434,10 @@ def test_the_gateways_changes_are_approved_with_the_acquire(make_stack, monkeypa
     from infer_stack import diff_prompt as dp
 
     stack = make_stack()
-    for b in {id(stack.backend): stack.backend, id(stack.front): stack.front}.values():
+    for b in {
+        id(stack.backend): stack.backend,
+        id(stack.front_runtime): stack.front_runtime,
+    }.values():
         b.assume_yes = False
     asked = []
     monkeypatch.setattr(dp, 'confirm_writes',
@@ -687,26 +697,26 @@ def test_kubeai_settles_its_host_gateway_after_an_interrupted_apply(tmp_path):
     clock = {'now': 0.0}
     stack.ctl.clock = lambda: clock['now']
     stack.ctl.sleep = lambda s: clock.__setitem__('now', clock['now'] + s)
-    real = stack.front.apply
+    real = stack.front_runtime.apply
     calls = []
 
     def timed_out():
         calls.append('apply')
         raise BackendTimeout('docker compose up timed out')
 
-    stack.front.apply = timed_out
+    stack.front_runtime.apply = timed_out
     with pytest.raises(BackendTimeout):
         stack.acquire('one')
     assert stack.ctl.ledger.publication_pending()['interrupted']
 
     samples = iter(range(1000))                    # Docker still changing
-    stack.front.settle_snapshot = lambda: ((f'c{next(samples)}', 'running'),)
-    stack.front.apply = real
+    stack.front_runtime.settle_snapshot = lambda: ((f'c{next(samples)}', 'running'),)
+    stack.front_runtime.apply = real
     with pytest.raises(RuntimeUnsettled):
         stack.ctl.apply_now()
     assert calls == ['apply']                      # no second Compose operation
 
-    stack.front.settle_snapshot = lambda: (('c1', 'running'),)   # settled
+    stack.front_runtime.settle_snapshot = lambda: (('c1', 'running'),)   # settled
     stack.ctl.apply_now()
     assert stack.ctl.ledger.publication_pending() is None
 

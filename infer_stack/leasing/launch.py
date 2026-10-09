@@ -65,9 +65,10 @@ IDENTITY_FLAGS = frozenset({
 #: derivation of the effective ``max_model_len``: it must equal the value
 #: that ends up on the engine's command line, because it is also advertised
 #: to clients (LiteLLM ``model_info.max_input_tokens``).
+VLLM_DEFAULT_MAX_MODEL_LEN: int = 8192
 VLLM_DEFAULTS = {
     'gpu_memory_utilization': 0.9,
-    'max_model_len': 8192,
+    'max_model_len': VLLM_DEFAULT_MAX_MODEL_LEN,
     'max_num_batched_tokens': 8192,
     'max_num_seqs': 256,
 }
@@ -138,7 +139,7 @@ def effective_max_model_len(runtime: dict[str, Any] | None) -> int:
         8192
     """
     value = (translate_legacy(runtime or {}) or {}).get('max_model_len')
-    return VLLM_DEFAULTS['max_model_len'] if value is None else value
+    return VLLM_DEFAULT_MAX_MODEL_LEN if value is None else value
 
 
 def launch_errors(name: str, engine: str, runtime: dict[str, Any]) -> list[str]:

@@ -131,7 +131,7 @@ def test_changed_live_definition_waits_for_quiescence_then_auto_adopts(tmp_path)
     _, ctl3 = controller(tmp_path, catalog=changed)
     out = ctl3.acquire('y', changed.resolve_names(['alpha']), wait=False)
     assert out.lease.endpoints == ['alpha']
-    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').to_request().capacity['max_model_len'] == 1024
 
 
 def test_union_of_catalogs_serves_either_runbook(tmp_path):
@@ -601,7 +601,7 @@ def test_redefining_an_endpoint_nothing_runs_does_not_block_the_host(tmp_path):
     out = ctl2.acquire('y', changed.resolve_names(['beta']), wait=False)
 
     assert out.lease.endpoints == ['beta']
-    assert ctl2.backend.catalog.resolve_endpoint('beta').capacity['max_model_len'] == 4096
+    assert ctl2.backend.catalog.resolve_endpoint('beta').to_request().capacity['max_model_len'] == 4096
     # ...and the resident definition is still frozen as it was.
     assert 'alpha' in ctl2.backend.catalog.endpoints
     assert ledger.get_lease(live.lease.id).state == 'active'
@@ -622,7 +622,7 @@ def test_an_idle_but_resident_keep_warm_definition_stays_frozen(tmp_path):
     ctl2.evict(None)                               # evicting it frees the definition
     _, ctl3 = controller(tmp_path, catalog=changed, docker=docker)
     ctl3.acquire('z', changed.resolve_names(['alpha']), wait=False)
-    assert ctl3.backend.catalog.resolve_endpoint('alpha').capacity['max_model_len'] == 1024
+    assert ctl3.backend.catalog.resolve_endpoint('alpha').to_request().capacity['max_model_len'] == 1024
 
 
 def test_catalogs_naming_one_model_differently_agree_on_its_endpoint():

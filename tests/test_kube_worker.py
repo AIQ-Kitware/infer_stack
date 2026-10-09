@@ -187,6 +187,79 @@ def test_pending_model_timeout_cleanup_reports_wait_state():
     assert not w.resources
 
 
+def test_failed_serving_pod_reports_eviction_instead_of_scheduler_timeout():
+    w = Worker()
+    original = w.manager.run
+
+    def run(args, **kw):
+        data = original(args, **kw)
+        if (args[:4] == ['kubectl', '-n', 'default', 'get']
+                and len(args) > 4 and args[4] == 'pods'):
+            doc = json.loads(data)
+            for pod in doc.get('items') or []:
+                pod['status'] = {
+                    'phase': 'Failed',
+                    'reason': 'Evicted',
+                    'message': 'The node was low on resource: ephemeral-storage.',
+                }
+            return json.dumps(doc)
+        return data
+
+    w.manager.run = run
+    with pytest.raises(RuntimeError, match='Evicted.*ephemeral-storage'):
+        run_test(w)
+    assert not w.resources and not w.generation_calls
+
+
+def test_cleanup_rechecks_after_kubectl_wait_timeout_race():
+    w = Worker()
+    name = 'infer-stack-e2e-abcdefgh'
+    w.resources[('Model', name)] = {
+        'metadata': {'labels': {RUN_LABEL: 'abcdefgh', NODE_LABEL: 'namek'}},
+    }
+    original = w.manager.run
+    waits = []
+
+    def run(args, **kw):
+        if (args[:4] == ['kubectl', '-n', 'default', 'wait']
+                and 'pods' in args):
+            waits.append(args)
+            raise RuntimeError('timed out waiting for the condition')
+        if (args[:5] == ['kubectl', '-n', 'default', 'get', 'pods']
+                and '-l' in args):
+            return json.dumps({'items': []})
+        return original(args, **kw)
+
+    w.manager.run = run
+    cleanup(w.manager, node='namek', namespace='default', run_id='abcdefgh')
+    assert not w.resources
+    assert len(waits) == 2
+
+
+def test_cleanup_failure_does_not_mask_primary_acceptance_failure():
+    w = Worker()
+    w.model_ready = 0
+    original = w.manager.run
+
+    def run(args, **kw):
+        if (args[:4] == ['kubectl', '-n', 'default', 'wait']
+                and 'pods' in args):
+            raise RuntimeError('cleanup wait failed')
+        if (args[:5] == ['kubectl', '-n', 'default', 'get', 'pods']
+                and '-l' in args and args[args.index('-l') + 1].startswith(RUN_LABEL)):
+            return json.dumps({'items': [{
+                'metadata': {'name': 'stuck', 'deletionTimestamp': '2026-10-07T20:00:00Z'},
+                'status': {'phase': 'Pending'},
+            }]})
+        return original(args, **kw)
+
+    w.manager.run = run
+    progress = []
+    with pytest.raises(RuntimeError, match='timed out'):
+        run_test(w, timeout=0, progress=progress.append)
+    assert any('cleanup incomplete after the primary failure' in line for line in progress)
+
+
 def test_explicit_interrupted_run_cleanup_refuses_unrelated_and_retries_safely():
     w = Worker()
     name = 'infer-stack-e2e-abcdefgh'

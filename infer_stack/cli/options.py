@@ -76,57 +76,6 @@ class _PathOverridesMixin(_FlagSafeMixin):
     )
 
 
-class _BackendOverrideMixin(kw.Config):
-    backend = kw.Value(
-        None, type=str, choices=['compose', 'kubeai'], help='Active backend override.'
-    )
-
-
-class _ComposeOverrideMixin(kw.Config):
-    compose_cmd = kw.Value(
-        None,
-        type=str,
-        help="Docker compose command override (e.g. 'podman compose').",
-    )
-
-
-class _ProfileOverrideMixin(kw.Config):
-    profile = kw.Value(
-        None,
-        type=str,
-        help='Active profile override (sets config.active_profile).',
-    )
-
-
-class _PortOverridesMixin(kw.Config):
-    litellm_port = kw.Value(None, type=int)
-    open_webui_port = kw.Value(None, type=int)
-    postgres_port = kw.Value(None, type=int)
-
-
-class _ClusterOverridesMixin(kw.Config):
-    namespace = kw.Value(
-        None, type=str, help='Kubernetes namespace for kubeai deployments.'
-    )
-    ingress_host = kw.Value(
-        None, type=str, help='Ingress host (kubeai only).'
-    )
-    ingress_enabled = kw.Value(
-        None,
-        isflag=True,
-        alias=['ingress'],
-        help='Enable cluster ingress (kubeai only); use --no-ingress to disable.',
-    )
-
-
-class _AllowUnsupportedMixin(kw.Config):
-    allow_unsupported = kw.Value(
-        False,
-        isflag=True,
-        help='Allow validation errors when planning/rendering.',
-    )
-
-
 class _SimulateHardwareMixin(kw.Config):
     simulate_hardware = kw.Value(
         None,
@@ -161,34 +110,3 @@ class _DisplayGpuMixin(kw.Config):
             '`infer-stack config set skip_display_gpus true`.'
         ),
     )
-
-
-class _PlanOverridesCLI(
-    _PathOverridesMixin,
-    _ProfileOverrideMixin,
-    _BackendOverrideMixin,
-    _ComposeOverrideMixin,
-    _PortOverridesMixin,
-    _ClusterOverridesMixin,
-    _AllowUnsupportedMixin,
-    _SimulateHardwareMixin,
-    _AllowedGpusMixin,
-):
-    """Standard set of overrides for any command that builds a plan."""
-
-    pass
-
-
-class _SwitchPathOverridesCLI(
-    _PathOverridesMixin,
-    _BackendOverrideMixin,
-    _ComposeOverrideMixin,
-    _PortOverridesMixin,
-    _ClusterOverridesMixin,
-    _AllowUnsupportedMixin,
-    _SimulateHardwareMixin,
-    _AllowedGpusMixin,
-):
-    """Overrides for commands that take a positional ``profile`` (no --profile)."""
-
-    pass

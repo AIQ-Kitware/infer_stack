@@ -73,7 +73,7 @@ def catalog():
 
 
 def test_resolve_vllm_endpoint(catalog):
-    req = catalog.resolve_endpoint('qwen-coder')
+    req = catalog.resolve_endpoint('qwen-coder').to_request()
     assert req.engine == 'vllm'
     assert req.capacity == {'max_model_len': 32768}
     assert req.sharing == Sharing.SHARED
@@ -81,8 +81,21 @@ def test_resolve_vllm_endpoint(catalog):
     assert req.spec['hf_model_id'] == 'Qwen/Qwen2.5-Coder-32B-Instruct'
 
 
+def test_resolved_endpoint_keeps_derived_request_compatibility(catalog):
+    resolved = catalog.resolve_endpoint('qwen-coder')
+    req = resolved.to_request()
+    # Old Python callers can still read these fields, but the values are views
+    # of the one managed request rather than independently stored state.
+    assert resolved.endpoint == req.endpoint
+    assert resolved.engine == req.engine
+    assert resolved.structural == req.structural
+    assert resolved.capacity == req.capacity
+    assert resolved.served == req.served
+    assert resolved.compat_key == req.compat_key
+
+
 def test_resolve_ollama_endpoint(catalog):
-    req = catalog.resolve_endpoint('qwen-small')
+    req = catalog.resolve_endpoint('qwen-small').to_request()
     assert req.engine == 'ollama'
     assert req.host == 'local-ollama'
     assert req.served == {'model': 'qwen3.5:4b'}
@@ -91,16 +104,16 @@ def test_resolve_ollama_endpoint(catalog):
 
 
 def test_alias_shares_compat_key(catalog):
-    a = catalog.resolve_endpoint('qwen-coder')
-    b = catalog.resolve_endpoint('qwen-coder-alias')
+    a = catalog.resolve_endpoint('qwen-coder').to_request()
+    b = catalog.resolve_endpoint('qwen-coder-alias').to_request()
     # different endpoint names, same model+runtime -> same deployment identity
     assert a.endpoint != b.endpoint
     assert a.compat_key == b.compat_key
 
 
 def test_runtime_difference_splits_compat_key(catalog):
-    a = catalog.resolve_endpoint('qwen-coder')        # tp=1
-    b = catalog.resolve_endpoint('verifier-model')    # tp=2, same model
+    a = catalog.resolve_endpoint('qwen-coder').to_request()        # tp=1
+    b = catalog.resolve_endpoint('verifier-model').to_request()    # tp=2, same model
     assert a.compat_key != b.compat_key
 
 
@@ -132,7 +145,7 @@ def test_resolve_unknown_name_did_you_mean(catalog):
 
 
 def test_sharing_override(catalog):
-    req = catalog.resolve_endpoint('qwen-coder', sharing=Sharing.DEDICATED)
+    req = catalog.resolve_endpoint('qwen-coder', sharing=Sharing.DEDICATED).to_request()
     assert req.sharing == Sharing.DEDICATED
 
 
@@ -210,7 +223,7 @@ def test_resolve_vllm_carries_model_knobs_into_spec():
             'q': {'model': 'q-awq', 'engine': 'vllm'},
         },
     })
-    req = cat.resolve_endpoint('q')
+    req = cat.resolve_endpoint('q').to_request()
     assert req.spec['revision'] == 'v1.2'
     assert req.spec['quantization'] == 'awq'
     assert req.spec['dtype'] == 'half'
@@ -232,9 +245,9 @@ def test_attention_backend_is_structural_and_splits_compat_key():
                       'runtime': {'attention_backend': 'FLASH_ATTN'}},
         },
     })
-    default = cat.resolve_endpoint('default')
-    sdpa = cat.resolve_endpoint('sdpa')
-    flash = cat.resolve_endpoint('flash')
+    default = cat.resolve_endpoint('default').to_request()
+    sdpa = cat.resolve_endpoint('sdpa').to_request()
+    flash = cat.resolve_endpoint('flash').to_request()
     # carried into the structural key...
     assert default.structural['attention_backend'] is None
     assert sdpa.structural['attention_backend'] == 'TORCH_SDPA'
@@ -265,7 +278,7 @@ def _one_vllm(placement=None, engine='vllm'):
 
 def test_placement_min_vram_reaches_resolved_spec():
     cat = Catalog.from_dict(_one_vllm({'min_vram_gib': 24}))
-    req = cat.resolve_endpoint('e')
+    req = cat.resolve_endpoint('e').to_request()
     assert req.spec['placement'] == {'min_vram_gib': 24}
 
 
@@ -273,23 +286,23 @@ def test_absent_placement_keeps_spec_byte_identical():
     # No declaration -> no 'placement' key at all, so existing catalogs
     # produce exactly the specs they produced before this feature.
     cat = Catalog.from_dict(_one_vllm())
-    req = cat.resolve_endpoint('e')
+    req = cat.resolve_endpoint('e').to_request()
     assert 'placement' not in req.spec
 
 
 def test_min_vram_placement_is_not_structural():
     # Same model/runtime with different declarations still coalesces: the
     # requirement says where a deployment may LAND, not what process it is.
-    a = Catalog.from_dict(_one_vllm({'min_vram_gib': 8})).resolve_endpoint('e')
-    b = Catalog.from_dict(_one_vllm({'min_vram_gib': 24})).resolve_endpoint('e')
+    a = Catalog.from_dict(_one_vllm({'min_vram_gib': 8})).resolve_endpoint('e').to_request()
+    b = Catalog.from_dict(_one_vllm({'min_vram_gib': 24})).resolve_endpoint('e').to_request()
     assert a.compat_key == b.compat_key
 
 
 def test_explicit_gpu_pin_reaches_spec_and_is_structural():
-    auto = Catalog.from_dict(_one_vllm()).resolve_endpoint('e')
+    auto = Catalog.from_dict(_one_vllm()).resolve_endpoint('e').to_request()
     pinned = Catalog.from_dict(
         _one_vllm({'gpu_indices': [1]})
-    ).resolve_endpoint('e')
+    ).resolve_endpoint('e').to_request()
     assert pinned.spec['placement'] == {'gpu_indices': [1]}
     assert pinned.structural['gpu_indices'] == [1]
     assert auto.compat_key != pinned.compat_key
@@ -301,7 +314,7 @@ def test_explicit_gpu_pin_reaches_spec_and_is_structural():
 def _with_runtime(runtime):
     data = _one_vllm()
     data['endpoints']['e']['runtime'] = runtime
-    return Catalog.from_dict(data).resolve_endpoint('e')
+    return Catalog.from_dict(data).resolve_endpoint('e').to_request()
 
 
 def test_every_launch_field_is_deployment_identity():
@@ -370,7 +383,7 @@ def test_unknown_vllm_serve_recipe_is_rejected():
 def test_gpu_pin_count_matches_runtime_parallelism():
     data = _one_vllm({'min_vram_gib': 24, 'gpu_indices': [0, 2]})
     data['endpoints']['e']['runtime'] = {'tensor_parallel_size': 2}
-    req = Catalog.from_dict(data).resolve_endpoint('e')
+    req = Catalog.from_dict(data).resolve_endpoint('e').to_request()
     assert req.spec['placement'] == {
         'min_vram_gib': 24,
         'gpu_indices': [0, 2],

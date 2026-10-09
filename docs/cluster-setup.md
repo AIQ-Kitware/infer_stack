@@ -131,6 +131,18 @@ inventory/install. Repeating bootstrap refreshes the copied certificates when
 K3s rotates its admin credentials. The older `scripts/bootstrap_k3s.sh` calls
 `infer-stack kube k3s bootstrap`, which provisions only the local server.
 
+**K3s `kubectl` footgun.** On a server where the K3s installer supplied
+`kubectl` as the bundled `k3s` shim, an unset `KUBECONFIG` makes that command
+try `/etc/rancher/k3s/k3s.yaml` even when `~/.kube/config` points at the private
+infer-stack copy. The root file intentionally remains `0600`. On an admin
+workstation dedicated to this cluster, persist
+`export KUBECONFIG="$HOME/.kube/infer-stack-k3s.yaml"` in the operator's shell
+startup. Bootstrap cannot change its parent shell environment, and it does not
+edit shell startup files or broaden the root credential's permissions. A
+future infer-stack cluster-target setting should remove the need for this
+environment dependency for infer-stack/TUI commands without silently changing
+the operator's general `kubectl` context.
+
 Then explicitly select the local K3s server and inspect the generic integration:
 
 ```bash
@@ -286,6 +298,33 @@ run ID is refused until explicit cleanup. Plans and results also support
 control-plane lifecycle/gateway suite and should run in a quiescent test namespace;
 use the targeted test above to accept individual joining workers.
 
+Operational notes from the first physical two-node acceptance run (2026-10-07):
+
+- Use the **actual Kubernetes node object name** from `kubectl get nodes`. A host
+  whose shell hostname is `namek` registered as `namek.kitware.com`; targeting
+  `node/namek` correctly returned NotFound.
+- A first vLLM pull can consume substantial ephemeral storage while downloading
+  and unpacking the serving image. On `namek`, Docker and K3s/containerd shared
+  the root filesystem; an old Docker image/build cache pushed the node through
+  K3s's configured `imagefs.available`/`nodefs.available` eviction threshold even
+  though `/var/lib/rancher/k3s` itself was small. Diagnose with node events plus
+  `/api/v1/nodes/<node>/proxy/stats/summary`, not only `du` of the K3s directory.
+  Clear space on the filesystem kubelet reports and let `DiskPressure`/the
+  `NoSchedule` taint clear automatically; do not hand-remove the pressure taint.
+  That host used a 5% hard threshold, 10% minimum reclaim and 5-minute pressure
+  transition period, so recovery required materially more than merely crossing
+  back above 5% free. These are observed settings, not an infer-stack constant.
+- A Pending pod that is already assigned to a node still consumes its requested
+  `nvidia.com/gpu` in scheduler accounting. If a prior acceptance run was
+  interrupted, its stale Model/pod can make the next GPU probe report
+  `Insufficient nvidia.com/gpu`; run the printed `--cleanup --run-id=...` command
+  and verify the node's allocated GPU count before retrying.
+- Failed serving pods (including `Evicted` for ephemeral storage) are terminal
+  acceptance failures, not a return to "waiting for scheduler". Cleanup rechecks
+  after a `kubectl wait --for=delete` timeout because the last pod can disappear
+  at the client deadline; if resources really remain, it reports their state and
+  preserves the primary acceptance failure.
+
 ### 5. Reconcile newly visible hardware
 
 Back on the machine operating infer-stack:
@@ -364,6 +403,16 @@ shared, so the same endpoint definitions can be exercised on both backends.
 Workstation B does not need a local KubeAI infer-stack authority merely because
 it is a Kubernetes worker. Its existing Compose configuration can remain
 untouched while the authority on workstation A schedules KubeAI pods onto it.
+
+The same rule applies to `infer-stack tui`: today it is an **authority UI**, not
+a worker-local cluster console. The TUI opens the local settings, ledger and
+backend state, and in KubeAI mode also issues Kubernetes operations through the
+admin context visible on that machine. Run it on the one infer-stack authority
+workstation (workstation A in this example). Launching a separately configured
+KubeAI TUI on a worker would create another local ledger/controller authority
+for the same namespace, which is unsupported. Remote/multi-controller TUI use
+belongs to the planned distributed control-plane/server work. Read-only worker
+membership remains available locally via `infer-stack kube k3s status`.
 
 ### Hand one node back to Compose
 

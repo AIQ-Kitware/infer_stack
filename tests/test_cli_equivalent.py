@@ -53,7 +53,7 @@ def test_acquire_matches_what_the_tui_does():
 ENTRIES = [
     {'engine': 'vllm', 'model': 'm'},
     {'engine': 'vllm', 'model': 'm', 'reclaim': {'policy': 'stop'},
-     'protocol': 'completions', 'public_name': 'shared',
+     'protocol': 'completions', 'served_name': 'shared',
      'placement': {'min_vram_gib': 24.0, 'gpu_indices': [0, 3]},
      'runtime': {'max_model_len': 65536, 'gpu_memory_utilization': 0.93,
                  'enable_prefix_caching': True, 'tensor_parallel_size': 2,
@@ -70,14 +70,14 @@ ENTRIES = [
 
 @pytest.mark.parametrize('entry', ENTRIES)
 def test_endpoint_add_round_trips_the_entry(tmp_path, entry):
-    from infer_stack.cli.commands_catalog import _load_raw
+    from infer_stack.leasing.catalog_edit import load_catalog_source
 
     path = tmp_path / 'catalog.yaml'
     words = shlex.split(cli.command('catalog', 'model', 'add', 'm', '--source', 'hf://org/m'))
     ManageCLI.main(argv=[*words[1:], '--catalog', str(path)])
     words = shlex.split(cli.endpoint_add('e', entry))
     ManageCLI.main(argv=[*words[1:], '--catalog', str(path)])
-    assert _load_raw(path)['endpoints']['e'] == entry
+    assert load_catalog_source(path)['endpoints']['e'] == entry
 
 
 def test_fields_the_cli_cannot_set_are_named_not_dropped():

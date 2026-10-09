@@ -70,7 +70,6 @@ from .models import Deployment, is_reservation, served_name
 from .naming import (  # noqa: F401  (public names re-exported for callers)
     OLLAMA_CONTAINER_PORT,
     VLLM_CONTAINER_PORT,
-    _dns_slug,
     _unique_vllm_service_name,
     dns_slug,
     ollama_service_name,
@@ -371,7 +370,6 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
     }
 
 
-_vllm_service_dict = vllm_service_dict  # historical internal name
 
 
 def _serve_config_hash(
@@ -430,7 +428,7 @@ def _vllm_service(
     # Merge over the defaults so direct callers (tests, embedders) with a
     # partial state dict still resolve every cache-mount key below.
     state = {**default_state_paths(), **(state or {})}
-    svc = _vllm_service_dict(deployment)
+    svc = vllm_service_dict(deployment)
     simulated = bool(svc.get('simulator'))
     if simulated:
         command = simulator_args(svc)
@@ -1079,10 +1077,10 @@ class ComposeBackend(ConvergeScaffold):
         reverse_proxy: bool = False,
         reverse_proxy_port: int = 80,
         reverse_proxy_config: str | None = None,
-        require_generation: bool = False,
         assume_yes: bool = True,
         catalog: Any = None,
         dynamic_routing: bool = False,
+        require_generation: bool | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -1126,14 +1124,16 @@ class ComposeBackend(ConvergeScaffold):
         self.reverse_proxy_config = reverse_proxy_config
         # Set by use_profile(): the published proxy config content.
         self._profile_proxy_text: str | None = None
-        # Retained for API/CLI compatibility but no longer consulted: probe_ready
-        # always verifies a real generation now (the only trustworthy readiness).
-        self.require_generation = require_generation
         self.assume_yes = assume_yes
         # Optional catalog: when present, the LiteLLM gateway is rendered with a
         # static superset route table (one route per catalog endpoint) so the
         # gateway is never recreated as models come and go. See render_compose.
         self.catalog = catalog
+        # Compatibility only.  Readiness has required a real generation since
+        # the controller made that invariant unconditional; keep accepting the
+        # old constructor keyword so embedders do not break, but do not store a
+        # second policy knob that cannot affect behavior.
+        _ = require_generation
         # Dynamic routing: manage the gateway's routes live via the admin API
         # against a Postgres-backed model store, instead of a static config file.
         # Gives each deployment its own upstream (so same-model --dedicated
@@ -1185,9 +1185,9 @@ class ComposeBackend(ConvergeScaffold):
         """The Compose project on this host: this one."""
         return self
 
-    def front_door(self):
-        """What holds the gateway's keys and routes: this project."""
-        return self
+    def front_door(self) -> Gateway:
+        """The gateway is the front-door authority; Compose only realizes it."""
+        return self.gateway
 
     def compose_argv(self) -> list[str]:
         """``docker compose [--env-file ...] -p <project> -f <file>``: the one base.
@@ -1285,34 +1285,6 @@ class ComposeBackend(ConvergeScaffold):
     @property
     def ui_port(self) -> int:
         return self.gateway.ui_port
-
-    def master_key(self) -> str:
-        return self.gateway.master_key()
-
-    def rotate_master_key(self) -> dict[str, str | None]:
-        return self.gateway.rotate_master_key()
-
-    def restore_env(self, values: dict[str, str | None]) -> None:
-        self.gateway.restore_env(values)
-
-    def gateway_accepts(self, key: str, *, wait: float = 0.0) -> bool | None:
-        return self.gateway.gateway_accepts(key, wait=wait)
-
-    @property
-    def env_path(self) -> Path:
-        return self.gateway.env_path
-
-    def require_route_keys(self, routes) -> None:
-        self.gateway.require_route_keys(routes)
-
-    def registry_routes(self):
-        return self.gateway.registry_routes()
-
-    def route_entries(self) -> dict[str, dict[str, Any]]:
-        return self.gateway.route_entries()
-
-    def replace_route_entries(self, entries: dict[str, dict[str, Any]]) -> None:
-        self.gateway.replace_route_entries(entries)
 
     def connection_info(self):
         """Where a client reaches these endpoints: the front door."""
@@ -1539,7 +1511,7 @@ class ComposeBackend(ConvergeScaffold):
         rendered = render_compose(
             desired, plan.assignments, images=self.images, ports=self.ports,
             state=self.state, litellm=self.litellm, litellm_port=self.litellm_port,
-            litellm_master_key=self.master_key() if self.litellm else None,
+            litellm_master_key=self.gateway.master_key() if self.litellm else None,
             litellm_salt_key=SALT_KEY_ENV in parse_env_file(self.gateway._env_path),
             ui=self.ui, ui_port=self.ui_port, reverse_proxy=self.reverse_proxy,
             reverse_proxy_port=self.reverse_proxy_port,
@@ -2535,7 +2507,7 @@ class ComposeBackend(ConvergeScaffold):
             # (ollama-<host>), not ollama-<deployment.id> — a host runs one daemon
             # that coalesces tags, so the service is keyed by host. Using the
             # deployment id targets a non-existent service ("is not running") and
-            # the tag is never pulled, so --require-generation times out.
+            # the tag is never pulled, so the generation probe times out.
             service = ollama_service_name(deployment)
             self._compose(['exec', '-T', service, 'ollama', 'pull', tag])
         except Exception as ex:  # noqa: BLE001 - readiness is retryable
@@ -2596,10 +2568,10 @@ class ComposeBackend(ConvergeScaffold):
             protocol = 'chat'  # Ollama's OpenAI surface is chat
         if self.litellm:
             # The alias must be routable (require_listed) AND actually serve
-            # (require_generation) — listing alone is trivially true here.
+            # A real generation is required; listing alone is trivially true here.
             ok, reason = openai_ready(
                 base_url=f'http://127.0.0.1:{self.litellm_port}/v1',
-                headers={'Authorization': f'Bearer {self.master_key()}'},
+                headers={'Authorization': f'Bearer {self.gateway.master_key()}'},
                 model=endpoint,
                 protocol=protocol,
                 require_listed=True,

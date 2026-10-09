@@ -332,6 +332,28 @@ def _runtime_errors(ep: EndpointSpec) -> list[str]:
     return errors
 
 
+def expand_endpoint_names(bundles: dict[str, list[str]], names: list[str]) -> list[str]:
+    """Expand bundles, preserving first occurrence order."""
+    ordered: list[str] = []
+    for name in names:
+        for member in bundles.get(name, [name]):
+            if member not in ordered:
+                ordered.append(member)
+    return ordered
+
+
+def resolve_endpoint_requests(resolve_endpoint, bundles: dict[str, list[str]],
+                      names: list[str], sharing: str | None) -> list[EndpointRequest]:
+    """One managed-endpoint -> ledger-request path for Catalog and unions."""
+    try:
+        return [
+            resolve_endpoint(name).to_request(sharing_override=sharing)
+            for name in expand_endpoint_names(bundles, names)
+        ]
+    except ValueError as ex:  # an external member has no lease request
+        raise CatalogError(str(ex)) from ex
+
+
 @dataclass
 class Catalog:
     """A parsed, validated serving catalog."""
@@ -357,7 +379,7 @@ class Catalog:
             ...         'e': {'engine': 'vllm', 'model': 'm',
             ...               'runtime': {'max_model_len': 8192}}},
             ... })
-            >>> req = cat.resolve_endpoint('e')
+            >>> req = cat.resolve_endpoint('e').to_request()
             >>> req.engine, req.capacity
             ('vllm', {'max_model_len': 8192})
         """
@@ -410,9 +432,10 @@ class Catalog:
                 runtime=translate_legacy(dict(spec.get('runtime') or {})),
                 sharing=_parse_sharing(spec.get('sharing')),
                 reclaim=_parse_reclaim(spec.get('reclaim')),
-                served_name=spec.get('public_name') or spec.get('served_name'),
+                served_name=spec.get('served_name') or spec.get('public_name'),
                 protocol=_parse_protocol(spec.get('protocol')),
                 placement=dict(spec.get('placement') or {}),
+                raw=dict(spec),
             )
         bundles = {
             name: list(members or [])
@@ -443,6 +466,12 @@ class Catalog:
     def errors(self) -> list[str]:
         errors: list[str] = []
         for ep in self.endpoints.values():
+            if ('served_name' in ep.raw and 'public_name' in ep.raw
+                    and ep.raw.get('served_name') != ep.raw.get('public_name')):
+                errors.append(
+                    f"endpoint {ep.name!r} sets both 'served_name' and legacy "
+                    f"'public_name' differently; keep only 'served_name'"
+                )
             if 'external' in ep.raw:
                 errors.extend(external_errors(ep.name, ep.raw, ep.raw.get('external')))
                 continue
@@ -555,14 +584,8 @@ class Catalog:
         return ResolvedEndpoint(ep.name, ep.protocol, ManagedTarget(request))
 
     def expand(self, names: list[str]) -> list[str]:
-        """Endpoint names for a mix of endpoint and bundle names: bundles
-        expand to their members, duplicates go, order stays."""
-        ordered: list[str] = []
-        for name in names:
-            for member in self.bundles.get(name, [name]):
-                if member not in ordered:
-                    ordered.append(member)
-        return ordered
+        """Endpoint names for a mix of endpoint and bundle names."""
+        return expand_endpoint_names(self.bundles, names)
 
     def resolve(self, names: list[str]) -> list[ResolvedEndpoint]:
         """The meanings of a mix of endpoint and bundle names."""
@@ -571,13 +594,8 @@ class Catalog:
     def resolve_requests(
         self, names: list[str], *, sharing: str | None = None
     ) -> list[EndpointRequest]:
-        """Ledger requests for a mix of endpoint and bundle names
-        (``sharing`` overrides the catalog's, e.g. ``--dedicated``)."""
-        try:
-            return [self.resolve_endpoint(n).to_request(sharing_override=sharing)
-                    for n in self.expand(names)]
-        except ValueError as ex:        # an external member: no lease request
-            raise CatalogError(str(ex)) from ex
+        """Ledger requests for endpoint/bundle names (managed members only)."""
+        return resolve_endpoint_requests(self.resolve_endpoint, self.bundles, names, sharing)
 
     #: The name from before :meth:`resolve_requests`; kept for its callers.
     resolve_names = resolve_requests

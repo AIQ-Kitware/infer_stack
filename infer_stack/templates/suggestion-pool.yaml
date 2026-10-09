@@ -128,7 +128,10 @@ vllm_models:
     family: qwen3.8
     modalities: [text]
     memory_class_gib: 20
-    min_vram_gib_per_replica: 24
+    # Professional 24-GB Ampere cards such as RTX A5000 commonly report
+    # 24564 MiB (23.99 GiB) through nvidia-smi.  Keep the eligibility floor
+    # just below the nominal class so class-based suggestions include them.
+    min_vram_gib_per_replica: 23.9
     preferred_gpu_count: 1
     context_window: 262144
     # The ordinary speed-first single-user launcher uses BF16 speculative paths.
@@ -140,7 +143,7 @@ vllm_models:
       max_model_len: 65536
       gpu_memory_utilization: 0.93
       enable_prefix_caching: true
-      image: ghcr.io/syv-ai/hyperqwen:sha-684e927
+      image: ghcr.io/syv-ai/hyperqwen:sha-53557bc
       command: [single]
       env:
         PORT: '{port}'
@@ -183,7 +186,9 @@ vllm_models:
       # every >=48-GiB card; benchmark it with profile_qwen38_hyperqwen.sh.
       full:
         min_compute_cap: 8.0
-        min_vram_gib_per_replica: 48
+        # RTX A6000 / RTX 6000 Ada commonly report 49140 MiB (47.99 GiB),
+        # so 47.9 is the observed-memory floor for the nominal 48-GB class.
+        min_vram_gib_per_replica: 47.9
         runtime_replace_keys: [command, env]
         runtime:
           max_model_len: 262144
@@ -211,7 +216,7 @@ vllm_models:
       turing-fast-full:
         min_compute_cap: 7.5
         max_compute_cap: 7.9
-        min_vram_gib_per_replica: 48
+        min_vram_gib_per_replica: 47.9
         preferred: true
         runtime_replace_keys: [command, env]
         runtime:
@@ -234,7 +239,7 @@ vllm_models:
       turing-full:
         min_compute_cap: 7.5
         max_compute_cap: 7.9
-        min_vram_gib_per_replica: 48
+        min_vram_gib_per_replica: 47.9
         runtime_replace_keys: [command, env]
         runtime:
           max_model_len: 262144

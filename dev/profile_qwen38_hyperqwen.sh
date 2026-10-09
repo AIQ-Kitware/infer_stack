@@ -27,7 +27,7 @@ set -uo pipefail
 BASE_URL="${BASE_URL:-0.0.0.0:14042}"  # metadata / infer-stack sanity only
 MODEL_NAME="qwen3.8-27b-dbirks-hyperqwen"
 MODEL_SOURCE="hf://dbirks/Qwen3.8-27B-W4A16-AutoRound"
-IMAGE="${IMAGE:-ghcr.io/syv-ai/hyperqwen:sha-684e927}"
+IMAGE="${IMAGE:-ghcr.io/syv-ai/hyperqwen:sha-53557bc}"
 GPU_INDEX="${GPU_INDEX:-}"
 GPU_NAME="${GPU_NAME:-}"
 GPU_UTIL="${GPU_UTIL:-0.90}"

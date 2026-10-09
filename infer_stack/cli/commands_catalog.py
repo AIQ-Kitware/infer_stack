@@ -20,6 +20,14 @@ import kwconf as kw
 import yaml
 
 from ..leasing import Catalog, CatalogError
+from ..leasing.catalog_edit import (
+    SECTIONS,
+    dump_catalog_source,
+    load_catalog_source,
+    next_indexed_name,
+    slug_alias,
+    write_catalog_source,
+)
 from ..paths import config_root
 from .context import _apply_path_overrides
 from .options import (
@@ -29,7 +37,6 @@ from .options import (
     _SimulateHardwareMixin,
 )
 
-SECTIONS = ('models', 'endpoints', 'runtime_hosts', 'bundles')
 
 
 def _print_yaml(text: str) -> None:
@@ -66,34 +73,12 @@ def _catalog_path(config) -> Path:
     return config_root() / 'catalog.yaml'
 
 
-def _load_raw(path: Path) -> dict[str, Any]:
-    data = yaml.safe_load(path.read_text()) if path.exists() else {}
-    data = data or {}
-    for section in SECTIONS:
-        data.setdefault(section, {})
-    return data
-
-
-def _validate(data: dict[str, Any]) -> None:
-    """Refuse to persist a catalog the leasing path would reject."""
-    try:
-        Catalog.from_dict(data)
-    except CatalogError as ex:
-        raise SystemExit(f'refusing to write an invalid catalog: {ex}')
-
-
-def _save_raw(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> None:
-    # Drop empty sections for a tidy file.
-    out = {k: v for k, v in data.items() if v or k == 'models'}
-    text = yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+def _save_catalog(path: Path, data: dict[str, Any], *, dry_run: bool = False) -> None:
+    """Publish through the canonical catalog writer; dry-run only presents it."""
     if dry_run:
-        _print_yaml(text)
-        return
-    _validate(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(text)
-    tmp.replace(path)
+        _print_yaml(dump_catalog_source(data))
+    else:
+        write_catalog_source(path, data)
 
 
 def _exists_guard(data, section, name, force, entry, hint='') -> str:
@@ -129,39 +114,12 @@ def _exists_guard(data, section, name, force, entry, hint='') -> str:
     )
 
 
-def _next_indexed_name(existing, base: str) -> str:
-    """First free ``{base}-{N}`` (N starting at 1) not already in ``existing``.
-
-    Defaulted endpoint names get a numeric suffix so repeated ``endpoint add``
-    for the same model don't collide — they accumulate as ``base-1``, ``base-2``,
-    … and the first is deterministically ``base-1``.
-    """
-    n = 1
-    while f'{base}-{n}' in existing:
-        n += 1
-    return f'{base}-{n}'
-
-
-def _slug_alias(text: str) -> str:
-    """Make ``text`` safe to use as an endpoint alias.
-
-    An endpoint name doubles as the LiteLLM ``model_name`` (what clients ask for
-    and what Open WebUI shows) and as a CLI-typed token, so keep it shell/URL
-    friendly: collapse model/tag separators (``/``, ``:``) and any other
-    non-``[A-Za-z0-9._-]`` runs to a single ``-``.
-    """
-    import re
-
-    out = re.sub(r'[^A-Za-z0-9._-]+', '-', text).strip('-')
-    return out or text
-
-
 def _rm(config, section, names) -> int:
     names = [names] if isinstance(names, str) else list(names or [])
     if not names:
         raise SystemExit(f'{section[:-1]} rm: give at least one name')
     path = _catalog_path(config)
-    data = _load_raw(path)
+    data = load_catalog_source(path)
     missing = [n for n in names if n not in data[section]]
     if missing:
         raise SystemExit(
@@ -169,21 +127,23 @@ def _rm(config, section, names) -> int:
         )
     for name in names:
         del data[section][name]
-    _save_raw(path, data, dry_run=getattr(config, 'dry_run', False))
-    for name in names:
-        print(f"removed {section[:-1]} '{name}'")
+    dry_run = getattr(config, 'dry_run', False)
+    _save_catalog(path, data, dry_run=dry_run)
+    if not dry_run:
+        for name in names:
+            print(f"removed {section[:-1]} '{name}'")
     return 0
 
 
 def _list(config, section) -> int:
-    data = _load_raw(_catalog_path(config))
+    data = load_catalog_source(_catalog_path(config))
     names = sorted(data[section])
     print('\n'.join(names) if names else f'(no {section})')
     return 0
 
 
 def _show(config, section, name) -> int:
-    data = _load_raw(_catalog_path(config))
+    data = load_catalog_source(_catalog_path(config))
     entries = data.get(section) or {}
     # No name -> show every entry in the section (the whole `endpoints:` block),
     # rather than erroring on a `None` lookup.
@@ -241,7 +201,7 @@ class CatalogInitCLI(_CatalogCommon):
         path = _catalog_path(config)
         if path.exists() and not config.force:
             raise SystemExit(f'{path} already exists; pass --force to reset')
-        _save_raw(path, {s: {} for s in SECTIONS}, dry_run=config.dry_run)
+        _save_catalog(path, {s: {} for s in SECTIONS}, dry_run=config.dry_run)
         if not config.dry_run:
             print(f'wrote starter catalog -> {path}')
         return 0
@@ -395,7 +355,7 @@ class CatalogSuggestCLI(
 
         # --apply: additive merge into the catalog (keep existing entries).
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         migrated = migrate_known_suggestion_aliases(data)
         added: list[str] = []
         skipped: list[str] = []
@@ -406,7 +366,7 @@ class CatalogSuggestCLI(
                     continue
                 data[section][name] = value
                 added.append(f'{section[:-1]}:{name}')
-        _save_raw(path, data, dry_run=False)
+        _save_catalog(path, data, dry_run=False)
         print(f'merged suggestion into {path}  ({hw})')
         if migrated:
             print(f'  renamed prior suggestion: {", ".join(migrated)}')
@@ -432,7 +392,7 @@ def _merge_or_print(config, frag: dict, what: str) -> int:
         _print_yaml(text)
         return 0
     path = _catalog_path(config)
-    data = _load_raw(path)
+    data = load_catalog_source(path)
     added, skipped = [], []
     for section in ('models', 'endpoints'):
         for name, value in frag[section].items():
@@ -441,7 +401,7 @@ def _merge_or_print(config, frag: dict, what: str) -> int:
                 continue
             data[section][name] = value
             added.append(f'{section[:-1]}:{name}')
-    _save_raw(path, data, dry_run=False)
+    _save_catalog(path, data, dry_run=False)
     print(f'merged suggestion into {path}  ({what})')
     if added:
         print(f'  added: {", ".join(added)}')
@@ -489,7 +449,7 @@ class CatalogShowCLI(_PathOverridesMixin):
     @classmethod
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
-        data = _load_raw(_catalog_path(config))
+        data = load_catalog_source(_catalog_path(config))
         if config.name:
             hits = {
                 s: data[s][config.name]
@@ -541,7 +501,7 @@ class CatalogEditCLI(_PathOverridesMixin):
         config = cls.cli(argv=argv, data=kwargs)
         path = _catalog_path(config)
         if not path.exists():
-            _save_raw(path, {s: {} for s in SECTIONS})
+            _save_catalog(path, {s: {} for s in SECTIONS})
         editor = os.environ.get('EDITOR', 'vi')
         subprocess.run([*editor.split(), str(path)], check=False)
         try:
@@ -574,7 +534,7 @@ class ModelAddCLI(_CatalogCommon):
         if not config.name or not config.source:
             raise SystemExit('model add: NAME and --source are required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         entry: dict[str, Any] = {'source': config.source}
         for key in ('revision', 'quantization', 'dtype'):
             if getattr(config, key) is not None:
@@ -585,7 +545,7 @@ class ModelAddCLI(_CatalogCommon):
                 print(f"model '{config.name}' already up to date")
             return 0
         data['models'][config.name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added model '{config.name}'")
         return 0
@@ -680,12 +640,12 @@ class EndpointAddCLI(_CatalogCommon):
     )
     model = kw.Value(None, type=str, help='Model name (vllm) or tag (ollama).')
     host = kw.Value(None, type=str, help='Runtime host (ollama).')
-    public_name = kw.Value(
-        None, type=str,
+    served_name = kw.Value(
+        None, type=str, alias=['public-name'],
         help='Upstream model name the engine serves (--served-model-name; '
              'default: the alias). Endpoints with the same upstream name and '
-             'model coalesce onto one deployment. Not the public name: clients '
-             'request the alias.',
+             'model coalesce onto one deployment. Legacy --public-name is '
+             'accepted but infer-stack writes served_name.',
     )
     reclaim = kw.Value(
         None, type=str, choices=['keep-warm', 'stop', 'scale-to-zero'],
@@ -731,7 +691,7 @@ class EndpointAddCLI(_CatalogCommon):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         if config.external_api_base or config.external_model or config.external_api_key_env:
             return cls._add_external(config, path, data)
         if config.name:
@@ -745,16 +705,16 @@ class EndpointAddCLI(_CatalogCommon):
                 )
             # Default name = {model}-N, auto-incrementing so repeated adds for
             # one model accumulate (smol135-1, smol135-2, …) instead of colliding.
-            name = _next_indexed_name(
-                data['endpoints'], _slug_alias(config.model)
+            name = next_indexed_name(
+                data['endpoints'], slug_alias(config.model)
             )
         entry: dict[str, Any] = {'engine': config.engine or 'vllm'}
         if config.model:
             entry['model'] = config.model
         if config.host:
             entry['host'] = config.host
-        if config.public_name:
-            entry['public_name'] = config.public_name
+        if config.served_name:
+            entry['served_name'] = config.served_name
         runtime: dict[str, Any] = _parse_kv(config.runtime)
         if config.max_model_len is not None:
             runtime['max_model_len'] = config.max_model_len
@@ -779,7 +739,7 @@ class EndpointAddCLI(_CatalogCommon):
         if placement:
             entry['placement'] = placement
         # Only guarded for an explicit NAME: a derived name is picked by
-        # _next_indexed_name from the free slots, so it never collides.
+        # next_indexed_name from the free slots, so it never collides.
         if config.name:
             action = _exists_guard(
                 data, 'endpoints', name, config.force, entry)
@@ -788,7 +748,7 @@ class EndpointAddCLI(_CatalogCommon):
                     print(f"endpoint '{name}' already up to date")
                 return 0
         data['endpoints'][name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             model_note = f' -> {config.model}' if config.model else ''
             print(f"added endpoint '{name}'{model_note}")
@@ -805,7 +765,7 @@ class EndpointAddCLI(_CatalogCommon):
                              '(the alias clients will request)')
         managed = {
             '--engine': config.engine, '--model': config.model, '--host': config.host,
-            '--public-name': config.public_name, '--reclaim': config.reclaim,
+            '--served-name': config.served_name, '--reclaim': config.reclaim,
             '--min-vram-gib': config.min_vram_gib, '--gpu': config.gpu or None,
             '--max-model-len': config.max_model_len, '--gpu-mem': config.gpu_mem,
             '--tensor-parallel': config.tensor_parallel,
@@ -833,7 +793,7 @@ class EndpointAddCLI(_CatalogCommon):
                 print(f"endpoint '{config.name}' already up to date")
             return 0
         data['endpoints'][config.name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added external endpoint '{config.name}' -> "
                   f"{config.external_model} at {config.external_api_base}")
@@ -909,7 +869,7 @@ class HostAddCLI(_CatalogCommon):
         if not config.name:
             raise SystemExit('host add: NAME is required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         entry: dict[str, Any] = {'engine': config.engine}
         if config.gpu:
             entry['placement'] = {'gpu_indices': list(config.gpu)}
@@ -933,7 +893,7 @@ class HostAddCLI(_CatalogCommon):
                 print(f"host '{config.name}' already up to date")
             return 0
         data['runtime_hosts'][config.name] = entry
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added host '{config.name}'")
         return 0
@@ -989,7 +949,7 @@ class BundleAddCLI(_CatalogCommon):
         if not config.name or not members:
             raise SystemExit('bundle add: NAME and at least one endpoint required')
         path = _catalog_path(config)
-        data = _load_raw(path)
+        data = load_catalog_source(path)
         action = _exists_guard(
             data, 'bundles', config.name, config.force, members)
         if action == 'unchanged':
@@ -997,7 +957,7 @@ class BundleAddCLI(_CatalogCommon):
                 print(f"bundle '{config.name}' already up to date")
             return 0
         data['bundles'][config.name] = members
-        _save_raw(path, data, dry_run=config.dry_run)
+        _save_catalog(path, data, dry_run=config.dry_run)
         if not config.dry_run:
             print(f"added bundle '{config.name}' -> {', '.join(members)}")
         return 0

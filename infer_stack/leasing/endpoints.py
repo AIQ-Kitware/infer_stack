@@ -175,10 +175,10 @@ class ResolvedEndpoint:
     """One endpoint's meaning: ``alias`` (what clients request), ``protocol``
     (``chat`` / ``completions``) and ``target``.
 
-    Callers from before this type read ``EndpointRequest`` fields off
-    ``Catalog.resolve_endpoint(name)`` (``engine``, ``served``, ``spec``,
-    ``compat_key``...); for a managed target those still work, delegated to
-    its request. New code uses :meth:`to_request`.
+    New code should use :meth:`to_request` when it needs the managed ledger
+    shape.  The read-only properties below are compatibility views for callers
+    that predate this type; they are derived from the managed target and are not
+    a second source of deployment identity or capacity.
 
     Example:
         >>> from infer_stack.leasing.models import vllm_structural
@@ -186,7 +186,7 @@ class ResolvedEndpoint:
         ...                       served={'served_model_name': 'qwen', 'protocol': 'chat'})
         >>> local = ResolvedEndpoint('qwen', 'chat', ManagedTarget(req))
         >>> remote = ResolvedEndpoint('qwen', 'chat', ExternalTarget('http://box/v1', 'Qwen/Q'))
-        >>> local.managed, remote.managed, local.engine
+        >>> local.managed, remote.managed, local.to_request().engine
         (True, False, 'vllm')
         >>> local.semantic_key() == remote.semantic_key()
         False
@@ -230,9 +230,14 @@ class ResolvedEndpoint:
         text = json.dumps(self.semantic(), sort_keys=True, separators=(',', ':'), default=str)
         return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
-    # -- EndpointRequest fields, for callers from before this type -------------
+    # -- Compatibility-only EndpointRequest views ---------------------------
+    #
+    # These preserve the pre-ResolvedEndpoint Python API without giving this
+    # object a second copy of managed deployment state.  Repository code uses
+    # ``to_request()`` explicitly; external callers may keep reading these
+    # fields while migrating.
 
-    def _request(self) -> EndpointRequest:
+    def _compat_request(self) -> EndpointRequest:
         return self.to_request()
 
     @property
@@ -241,32 +246,32 @@ class ResolvedEndpoint:
 
     @property
     def engine(self) -> str:
-        return self._request().engine
+        return self._compat_request().engine
 
     @property
     def structural(self) -> dict[str, Any]:
-        return self._request().structural
+        return self._compat_request().structural
 
     @property
     def capacity(self) -> dict[str, Any]:
-        return self._request().capacity
+        return self._compat_request().capacity
 
     @property
     def sharing(self) -> str:
-        return self._request().sharing
+        return self._compat_request().sharing
 
     @property
     def spec(self) -> dict[str, Any]:
-        return self._request().spec
+        return self._compat_request().spec
 
     @property
     def served(self) -> dict[str, Any]:
-        return self._request().served
+        return self._compat_request().served
 
     @property
     def host(self) -> str | None:
-        return self._request().host
+        return self._compat_request().host
 
     @property
     def compat_key(self) -> str:
-        return self._request().compat_key
+        return self._compat_request().compat_key

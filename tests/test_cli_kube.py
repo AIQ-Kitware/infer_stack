@@ -274,6 +274,32 @@ def test_apply_preserves_custom_profile_and_existing_chart_version(tmp_path, mon
     assert helm_upgrade[helm_upgrade.index('--version') + 1] == '0.22.0'
 
 
+def test_default_run_accepts_explicit_timeout(monkeypatch):
+    from infer_stack.kube import manage
+
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = 'ok\n'
+        stderr = ''
+
+    def fake_subprocess_run(args, **kwargs):
+        calls.append((list(args), dict(kwargs)))
+        return Result()
+
+    monkeypatch.setattr(manage.subprocess, 'run', fake_subprocess_run)
+    assert manage.default_run(['slow-command'], timeout=600) == 'ok\n'
+    assert calls == [(['slow-command'], {
+        'input': None,
+        'env': None,
+        'text': True,
+        'capture_output': True,
+        'timeout': 600,
+        'check': False,
+    })]
+
+
 def test_k3s_join_keeps_token_out_of_argv(tmp_path, monkeypatch):
     from infer_stack.kube import k3s
 
@@ -307,6 +333,7 @@ def test_k3s_join_keeps_token_out_of_argv(tmp_path, monkeypatch):
     install = [item for item in calls if item[0] and item[0][0] == 'sudo'][0]
     assert install[1]['env']['K3S_TOKEN'] == token
     assert 'K3S_TOKEN' in install[0][2]
+    assert install[1]['timeout'] == k3s.K3S_INSTALL_TIMEOUT_SECONDS
 
 
 def test_missing_helm_is_required_when_setup_has_managed_actions():

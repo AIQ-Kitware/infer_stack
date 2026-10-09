@@ -1524,7 +1524,6 @@ def front_door_urls(backend) -> tuple[str | None, str | None]:
     """
     try:
         front = getattr(backend, 'front_door', lambda: None)()
-        gateway = getattr(front, 'gateway', None)
-        return gateway.urls() if gateway is not None else (None, None)
+        return front.urls() if front is not None else (None, None)
     except Exception:  # noqa: BLE001 - see the docstring
         return None, None

@@ -19,6 +19,13 @@ We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
   regressions cover wrapper-only and process-group cancellation, plus readiness
   cancellation. SIGKILL and host crashes still require TTL or explicit recovery.
 
+### Allow slow K3s installs during bootstrap and join
+
+- `infer-stack kube k3s bootstrap` and `infer-stack kube k3s join` now give the
+  upstream K3s installer an explicit 10-minute timeout instead of inheriting
+  the generic 60-second command timeout. Other commands keep their existing
+  timeout behavior. Regression tests cover both server and worker installs.
+
 ### Bump the default vLLM engine image to v0.30.0-cu129
 
 - `PINNED_IMAGES['vllm']` is now `vllm/vllm-openai:v0.30.0-cu129` (previously

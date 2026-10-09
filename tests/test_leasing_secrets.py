@@ -74,8 +74,8 @@ def test_rotation_replaces_the_key_and_recreates_the_gateway(tmp_path):
     new = env(ctl)[API_KEY_ENV]
     assert new != old and new.startswith('sk-')
     assert gateway(ctl)['labels'][FINGERPRINT_LABEL] != fingerprint   # recreated
-    assert ctl.backend.gateway_accepts(new) is True
-    assert ctl.backend.gateway_accepts(old) is False
+    assert ctl.backend.front_door().gateway_accepts(new) is True
+    assert ctl.backend.front_door().gateway_accepts(old) is False
 
 
 def test_the_first_rotation_pins_the_salt_to_the_old_key(tmp_path):
@@ -146,7 +146,7 @@ def test_a_hand_set_key_must_look_like_a_litellm_key(tmp_path):
 def test_an_unreachable_gateway_is_not_a_rejection(tmp_path):
     ledger, ctl = make(tmp_path)
     ctl.backend.http.down = True
-    assert ctl.backend.gateway_accepts('sk-anything', wait=5.0) is None
+    assert ctl.backend.front_door().gateway_accepts('sk-anything', wait=5.0) is None
 
 
 # -- rotation is a transaction (queue item 16) --------------------------------------
@@ -190,14 +190,14 @@ def test_a_render_failure_before_apply_keeps_file_and_gateway_on_the_old_key(tmp
 
     ledger, ctl = make_started(tmp_path)
     old = env(ctl)[API_KEY_ENV]
-    assert ctl.backend.gateway_accepts(old)
+    assert ctl.backend.front_door().gateway_accepts(old)
     real = ctl.backend.residency
     ctl.backend.residency = lambda: (_ for _ in ()).throw(ResidencyUnknown('docker down'))
     with pytest.raises(ResidencyUnknown):
         ctl.rotate_gateway_key()
     assert env(ctl)[API_KEY_ENV] == old            # the file says what the gateway runs
     ctl.backend.residency = real
-    assert ctl.backend.gateway_accepts(old)
+    assert ctl.backend.front_door().gateway_accepts(old)
 
 
 def test_a_declined_rotation_keeps_file_and_gateway_on_the_old_key(tmp_path):
@@ -208,7 +208,7 @@ def test_a_declined_rotation_keeps_file_and_gateway_on_the_old_key(tmp_path):
     ctl.backend._approve_changes = lambda planned: (_ for _ in ()).throw(ConvergeAborted('no'))
     with pytest.raises(ConvergeAborted):
         ctl.rotate_gateway_key()
-    assert env(ctl)[API_KEY_ENV] == old and ctl.backend.gateway_accepts(old)
+    assert env(ctl)[API_KEY_ENV] == old and ctl.backend.front_door().gateway_accepts(old)
 
 
 def test_a_failure_after_apply_began_keeps_the_new_key_and_converges(tmp_path):
@@ -226,7 +226,7 @@ def test_a_failure_after_apply_began_keeps_the_new_key_and_converges(tmp_path):
     assert ledger.publication_pending()['apply_requested']
     ctl.backend.apply = real
     ctl.apply_now()                                # the pending publication converges
-    assert ctl.backend.gateway_accepts(new) and not ctl.backend.gateway_accepts(old)
+    assert ctl.backend.front_door().gateway_accepts(new) and not ctl.backend.front_door().gateway_accepts(old)
     assert ledger.publication_pending() is None
 
 
@@ -241,7 +241,7 @@ def test_an_apply_that_cleanly_misses_the_runtime_keeps_the_old_key(tmp_path):
     with pytest.raises(ProfileMismatch, match='key was not changed.*render unreadable'):
         ctl.rotate_gateway_key()
     assert env(ctl)[API_KEY_ENV] == old
-    assert ctl.backend.gateway_accepts(env(ctl)[API_KEY_ENV])   # what clients get works
+    assert ctl.backend.front_door().gateway_accepts(env(ctl)[API_KEY_ENV])   # what clients get works
 
 
 # -- rotation under dynamic routing (queue item 24) ---------------------------------
@@ -301,13 +301,13 @@ def test_rotation_completes_under_a_running_dynamic_routing_gateway(tmp_path):
     ctl = Controller(ledger, backend, clock=clock, sleep=clock.sleep)
     ctl.release(acquire(ctl, 'one').lease.id)       # a keep-warm model, routed
     old = env(ctl)[API_KEY_ENV]
-    assert backend.gateway_accepts(old) and backend.http.routes
+    assert backend.front_door().gateway_accepts(old) and backend.http.routes
 
     rec = ctl.rotate_gateway_key()
 
     new = env(ctl)[API_KEY_ENV]
     assert new != old and not rec.publication_pending
-    assert backend.gateway_accepts(new) and not backend.gateway_accepts(old)
+    assert backend.front_door().gateway_accepts(new) and not backend.front_door().gateway_accepts(old)
     assert backend.http.routes                      # verified with the new key
     assert ledger.publication_pending() is None
 
@@ -337,13 +337,13 @@ def test_rotation_completes_behind_kubeai_with_a_dynamic_host_gateway(tmp_path):
     ctl.release(acquire(ctl, 'one').lease.id)
     env_path = gateway.gateway._env_path
     old = parse_env_file(env_path)[API_KEY_ENV]
-    assert gateway.gateway_accepts(old)
+    assert gateway.front_door().gateway_accepts(old)
 
     ctl.rotate_gateway_key()
 
     new = parse_env_file(env_path)[API_KEY_ENV]
     assert new != old
-    assert gateway.gateway_accepts(new) and not gateway.gateway_accepts(old)
+    assert gateway.front_door().gateway_accepts(new) and not gateway.front_door().gateway_accepts(old)
     assert ledger.publication_pending() is None
 
 

@@ -929,11 +929,14 @@ there, and `status` shows `starting`. The docstrings of `observe_state` and
 Everything known to be open that is not a numbered item above or in
 campaign 2. None blocks campaign 2.
 
-- [ ] **GPU handover runs (operator).** `dev/handover/p4_gpu_labels.sh` on a
-  GPU k3s node (GFD labels feed sizing, `measure --record`) and
-  `dev/handover/p5_two_hosts.sh` across two real machines (pod-to-pod over
-  the real network, the NodePort on the second node, rotation with a Model
-  served). Verified here only with fake labels and a node in a container.
+- [ ] **GPU handover runs (operator).** Targeted physical-worker acceptance
+  passed 2026-10-07: `namek.kitware.com` joined `yardrat`, exposed one RTX 3090,
+  ran the fresh GPU probe, scheduled the one-GPU KubeAI serving replica on that
+  exact node, and completed a real generation. The run also exposed/fixed
+  acceptance diagnostics and cleanup races below. Still run
+  `dev/handover/p4_gpu_labels.sh` for the sizing/`measure --record` handover and
+  `dev/handover/p5_two_hosts.sh` across the two real machines (pod-to-pod over
+  the real network, NodePort on the second node, rotation with a Model served).
 - [ ] **Confirm 8a and 8b on GPUs.** The three 4 x 96 GB suggestion variants
   were not re-run since leasing; `runtime.shm_size` fixes a TP > 1 failure
   never observed here. Serve one variant and a TP=2 endpoint with and
@@ -975,6 +978,25 @@ campaign 2. None blocks campaign 2.
   1Gi eviction minimum reclaim for the dev cluster (undo: remove it, restart
   k3s); the second node is recreated by `dev/k3s_agent_container.sh` with the
   same setting.
+- [x] **Worker-acceptance failure/cleanup diagnostics.** *Done 2026-10-07 in
+  this change after the first physical `namek` run.* A serving pod evicted for
+  ephemeral-storage was filtered out of the active set, so status regressed from
+  "container running; model loading" to "waiting for scheduler" until the
+  15-minute timeout. Failed pods now terminate acceptance immediately with pod
+  reason/message/termination details. Cleanup rechecks after a timed-out
+  `kubectl wait --for=delete` (the observed stale pod disappeared at the timeout
+  boundary), reports any truly remaining pods, and no longer masks the primary
+  acceptance failure when cleanup also has trouble.
+- [ ] **Persist K3s admin-context selection without shell footguns.** Bootstrap
+  already writes `~/.kube/infer-stack-k3s.yaml` and, when safe, links
+  `~/.kube/config` to it. On the real K3s server the installer-provided
+  `kubectl -> k3s` shim still defaulted to root-only
+  `/etc/rancher/k3s/k3s.yaml` whenever `KUBECONFIG` was unset, so the operator
+  had to persist `export KUBECONFIG=...` in shell startup. Do not fix this by
+  widening the root admin file or silently editing `.bashrc`. Design an
+  infer-stack-owned cluster target/kubeconfig setting so KubeAI/TUI/kube commands
+  can use the private provisioned config explicitly, while arbitrary `kubectl`
+  context remains operator-owned.
 
 ---
 
@@ -1426,16 +1448,15 @@ Poison: resident ad-hoc `qwen`, `routes seed --replace` qwen -> external,
 dynamic routing: refuse, no catalog/registry change, no marker.
 
 ### 46. [x] Finish `FrontDoorControl`
-*Done 2026-09-27.* No `gateway: Any`: the capability has `env_path`,
-`require_route_keys`, `registry_routes`, `route_entries`,
-`replace_route_entries` beside the key operations and `connection_info`;
-the controller's route commands, `env` and `secrets rotate` use only it.
-KubeAI's backend-level key proxies are gone (its front door is its gateway).
-Upper layers still reach `front.gateway` (`missing_keys`, `_env_path`,
-registry rows) and backend-level gateway proxies; the secrets CLI uses
-`getattr(backend, 'litellm')`, `backend.master_key()`. Give the capability
-the operations callers need; drop `gateway: Any` from it and proxies whose
-only job was exposing the gateway.
+*Done 2026-09-27; boundary cleanup completed 2026-10-03.* No `gateway: Any`:
+the capability has `env_path`, `require_route_keys`, `registry_routes`,
+`route_entries`, `replace_route_entries` beside the key operations and
+`connection_info`; controller, CLI and TUI callers use `backend.front_door()`
+for those operations. `ComposeBackend.front_door()` now returns its `Gateway`
+instead of re-exporting a second operational gateway API; KubeAI returns its
+gateway realization's front door. Backend-level settings used to render the
+project remain backend settings, while keys and route-registry state have one
+authority.
 
 ### 47. [ ] Published catalog state: one mutation API (design candidate)
 *Recorded 2026-09-27, not done:* today the mutations are

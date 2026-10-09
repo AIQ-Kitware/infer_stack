@@ -651,7 +651,7 @@ def test_with_a_gateway_clients_use_the_alias_and_the_managed_key(tmp_path):
     info = access_info(be, ['tiny'])
     assert info['request_names'] == {'tiny': 'tiny'}        # the alias, as on compose
     assert info['base_url'].startswith('http://127.0.0.1:')
-    assert info['api_key'] == be.gateway.master_key()
+    assert info['api_key'] == be.front_door().master_key()
     # Ready is judged the way a client sees it: the alias, through the gateway.
     assert be.probe_ready(dep, 'tiny').ready
 
@@ -1101,7 +1101,7 @@ def test_the_key_is_a_secret_never_a_diff_and_rotating_it_rolls_the_pods(tmp_pat
 
 def test_doctor_checks_the_in_cluster_gateway_not_a_port_forward(tmp_path):
     be, _ = make_cluster_gateway_backend(tmp_path)
-    be.gateway.gateway_accepts = lambda key, wait=0.0: True
+    be.front_door().gateway_accepts = lambda key, wait=0.0: True
     names = [name for name, ok, _ in be.doctor()]
     assert names[-1] == 'in-cluster gateway at http://10.0.0.7:30442/v1'
     assert not any('port-forward' in name for name in names)

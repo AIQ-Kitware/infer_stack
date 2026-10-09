@@ -26,7 +26,6 @@ def dns_slug(text: str) -> str:
     return out or 'model'
 
 
-_dns_slug = dns_slug  # historical internal name
 
 
 def vllm_service_name_for(served: str) -> str:
@@ -41,7 +40,7 @@ def vllm_service_name_for(served: str) -> str:
     the gateway is never recreated (no "blip"); see
     :func:`~infer_stack.leasing.gateway.front_door_routes`.
     """
-    return f'vllm-{_dns_slug(served)}'
+    return f'vllm-{dns_slug(served)}'
 
 
 def _unique_vllm_service_name(served: str, deployment_id: str) -> str:
@@ -66,7 +65,7 @@ def deployment_tail(deployment_id: str) -> str:
     >>> deployment_tail('grp-0123456789ab')
     '01234567'
     """
-    return _dns_slug(deployment_id.rsplit('-', 1)[-1][:8] or 'x')
+    return dns_slug(deployment_id.rsplit('-', 1)[-1][:8] or 'x')
 
 
 def vllm_service_name(deployment: Deployment, *, unique: bool = False) -> str:
@@ -102,7 +101,7 @@ def ollama_service_name_for(host: str) -> str:
     stable key — matching :func:`vllm_service_name_for`'s role for vLLM so the
     gateway's static route table addresses it regardless of which tags are live.
     """
-    return f'ollama-{_dns_slug(host)}'
+    return f'ollama-{dns_slug(host)}'
 
 
 def ollama_service_name(deployment: Deployment) -> str:

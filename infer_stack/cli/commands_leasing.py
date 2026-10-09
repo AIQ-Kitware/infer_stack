@@ -267,7 +267,6 @@ def _make_backend(config, *, interactive: bool = False):
             reverse_proxy=rp_enabled,
             reverse_proxy_port=rp_port,
             reverse_proxy_config=rp_config,
-            require_generation=bool(getattr(config, 'require_generation', False)),
             assume_yes=_resolve_assume_yes(config, interactive=interactive),
             catalog=catalog,
             dynamic_routing=_resolve_dynamic_routing(config),
@@ -1011,7 +1010,7 @@ class AcquireCLI(_AcquireFlagsMixin):
     __epilog__ = """
     Examples:
         # stand up one model: render + up + wait until it can generate
-        infer-stack acquire qwen05-1 --require-generation
+        infer-stack acquire qwen05-1
 
         # a time-boxed reservation with a sourceable env-file, released by id
         infer-stack acquire qwen-coder --ttl 2h --env-file is.env
@@ -1023,7 +1022,7 @@ class AcquireCLI(_AcquireFlagsMixin):
         # fan out: start several without blocking, then wait together
         infer-stack acquire smol17b-1 --no-wait --yes
         infer-stack acquire qwen15-1  --no-wait --yes
-        infer-stack wait    smol17b-1 qwen15-1 --require-generation
+        infer-stack wait    smol17b-1 qwen15-1
 
         # see what is actually running and on which GPUs
         infer-stack leases
@@ -1666,9 +1665,9 @@ class WaitCLI(_LeasingCommonMixin):
     its container without blocking), then ``wait smol17b-1 smol135-1`` blocks
     until they can actually serve. With no names it waits for every live deployment.
 
-    ``--require-generation`` makes "ready" mean a real generated token (not just
-    a model that is listed) — the same readiness *criterion* the ``acquire``
-    verb takes; this command is the *blocking* half, distinct from it.
+    Readiness always requires a real generated token, not merely a listed model
+    or a running container.  This command is the blocking half of an earlier
+    ``acquire --no-wait``.
     """
 
     __command__ = 'wait'

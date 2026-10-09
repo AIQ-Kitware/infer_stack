@@ -513,7 +513,7 @@ class Ledger:
             ]
         return leases, deployments
 
-    # -- generation (legacy, see store; superseded by the publication marker) --
+    # -- desired-state generation (see store; distinct from apply intent) -------
 
     def mark_publication_pending(
         self, *, apply_requested: bool, interrupted: bool = False,

@@ -131,6 +131,38 @@ def _names(node: str, run_id: str) -> tuple[str, str]:
     return f'infer-stack-gpu-{run_id}', f'infer-stack-e2e-{run_id}'
 
 
+def _wait_for_acceptance_pods_deleted(manager: KubeManager, *, namespace: str,
+                                      selector: str, timeout: int = 180) -> None:
+    """Wait for acceptance pods, tolerating the kubectl timeout/delete race.
+
+    ``kubectl wait --for=delete`` can return its timeout just as the final pod
+    disappears. Re-read the selector before calling that a cleanup failure, and
+    include the remaining pod state when deletion really is still incomplete.
+    """
+    try:
+        manager.run(['kubectl', '-n', namespace, 'wait', '--for=delete', 'pods',
+                     '-l', selector, f'--timeout={timeout}s'])
+        return
+    except Exception as ex:
+        remaining = manager.kubectl_json([
+            '-n', namespace, 'get', 'pods', '-l', selector, '-o', 'json',
+        ]).get('items') or []
+        if not remaining:
+            return
+        states = []
+        for pod in remaining:
+            meta = pod.get('metadata') or {}
+            status = pod.get('status') or {}
+            state = status.get('phase') or 'Unknown'
+            if meta.get('deletionTimestamp'):
+                state += f' deleting-since={meta["deletionTimestamp"]}'
+            states.append(f'{meta.get("name", "?")}({state})')
+        raise RuntimeError(
+            f'Acceptance cleanup timed out waiting for pods matching {selector!r}: '
+            + ', '.join(states)
+        ) from ex
+
+
 def cleanup(manager: KubeManager, *, node: str, namespace: str, run_id: str) -> None:
     """Explicit retry/cleanup deletes only exact, matching acceptance resources."""
     pod_name, model_name = _names(node, run_id)
@@ -144,10 +176,12 @@ def cleanup(manager: KubeManager, *, node: str, namespace: str, run_id: str) -> 
             raise RuntimeError(f'Refusing to delete unrelated {kind}/{name}')
         manager.run(['kubectl', '-n', namespace, 'delete', kind, name, '--wait=true', '--timeout=180s'])
     # Model deletion is asynchronous; wait for its backing Pods to release GPUs.
-    manager.run(['kubectl', '-n', namespace, 'wait', '--for=delete', 'pods',
-                 '-l', f'{RUN_LABEL}={run_id},{NODE_LABEL}={node}', '--timeout=180s'])
-    manager.run(['kubectl', '-n', namespace, 'wait', '--for=delete', 'pods',
-                 '-l', f'model={model_name}', '--timeout=180s'])
+    # A timed-out kubectl wait is re-checked because the final deletion can race
+    # the client's deadline by a fraction of a second.
+    _wait_for_acceptance_pods_deleted(
+        manager, namespace=namespace, selector=f'{RUN_LABEL}={run_id},{NODE_LABEL}={node}')
+    _wait_for_acceptance_pods_deleted(
+        manager, namespace=namespace, selector=f'model={model_name}')
 
 
 def plan(manager: KubeManager, *, node: str, namespace: str, expected_gpus: int,
@@ -242,6 +276,7 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
     # Deliberately outside the normal lease authority's managed selector.
     doc['metadata']['labels'] = labels
     created = False
+    primary_error: BaseException | None = None
     result = {'context': prepared['context'], 'namespace': namespace, 'run_id': run_id, 'node': node, 'profile': prepared['profile_name'], 'model': model_name}
     try:
         # Atomic create refuses occupied names, even an interrupted test.
@@ -274,6 +309,28 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
         while True:
             cr = manager.kubectl_json(['-n', namespace, 'get', 'models.kubeai.org', model_name, '-o', 'json'])
             pods = manager.kubectl_json(['-n', namespace, 'get', 'pods', '-l', f'model={model_name}', '-o', 'json']).get('items') or []
+            failed = [p for p in pods if not p.get('metadata', {}).get('deletionTimestamp')
+                      and p.get('status', {}).get('phase') == 'Failed']
+            if failed:
+                pod = failed[0]
+                status = pod.get('status') or {}
+                meta = pod.get('metadata') or {}
+                reason = status.get('reason') or 'Failed'
+                detail = status.get('message') or ''
+                terminated = []
+                for container in status.get('containerStatuses') or []:
+                    term = (container.get('state') or {}).get('terminated') or {}
+                    if term:
+                        terminated.append(
+                            f'{container.get("name", "container")}: '
+                            f'{term.get("reason") or "terminated"} exit={term.get("exitCode", "?")}'
+                        )
+                suffix = '; '.join(part for part in [detail, *terminated] if part)
+                where = (pod.get('spec') or {}).get('nodeName') or 'unscheduled'
+                raise RuntimeError(
+                    f'Model pod {meta.get("name", "?")} failed on {where}: {reason}'
+                    + (f': {suffix}' if suffix else '')
+                )
             active = [p for p in pods if not p.get('metadata', {}).get('deletionTimestamp')
                       and p.get('status', {}).get('phase') not in {'Succeeded', 'Failed'}]
             state = 'waiting for scheduler'
@@ -328,9 +385,20 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
             if clock() >= deadline:
                 raise RuntimeError(f'Worker acceptance timed out: {state}')
             sleep(min(5, max(0, deadline - clock())))
+    except BaseException as ex:
+        primary_error = ex
+        raise
     finally:
         if created:
-            cleanup(manager, node=node, namespace=namespace, run_id=run_id)
+            try:
+                cleanup(manager, node=node, namespace=namespace, run_id=run_id)
+            except Exception as cleanup_ex:
+                if primary_error is None:
+                    raise
+                progress(
+                    f'{node}: acceptance cleanup incomplete after the primary failure: '
+                    f'{cleanup_ex}; retry the printed --cleanup command'
+                )
 
 
 @contextmanager
