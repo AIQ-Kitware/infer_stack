@@ -314,7 +314,33 @@ infer-stack acquire chat
 ```
 
 `infer-stack catalog suggest --apply` fills the catalog with endpoints sized
-for the detected GPUs instead.
+for the detected GPUs instead. The normal suggestions are a curated *frontier*
+across model sizes and modalities, plus GPT-2 and SmolLM2-135M smoke-test
+models. **Every frontier model that fits is included**, even when a larger one
+also fits. This means a 48 GiB machine still suggests the tiny models and the
+0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 adds distinct multimodal choices;
+HyperQwen 27B and Qwen3.5 122B appear on compatible hardware. The frontier is
+curated, not a claim of measured statistical dominance.
+
+The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
+Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting
+them automatically. All options remain discoverable:
+
+```bash
+infer-stack catalog suggest                 # curated fitting frontier + smoke tests
+infer-stack catalog suggest --all           # every hardware-compatible pool entry
+infer-stack catalog suggest --include mistral-7b-instruct
+infer-stack catalog suggest --apply         # additive: does not remove old entries
+```
+
+GPT-2 is suggested as a `completions` endpoint (it has no chat template),
+while SmolLM2-135M-Instruct remains a `chat` debugging endpoint.
+
+Suggested endpoints use `reclaim: stop` by default: the last released/expired
+lease frees their resources. Keep-warm requires an explicit per-endpoint policy,
+and is not selected automatically based on model size. Changing the suggestions
+does **not** prune previously added catalog entries; remove unwanted entries
+explicitly after checking for leases or other references.
 
 ### Test that it is responding
 
@@ -360,10 +386,11 @@ infer-stack clean -f                 # no leases, nothing on a GPU; the gateway 
 infer-stack stack down               # docker compose down, bypassing the ledger
 ```
 
-After a plain `release`, `keep-warm` endpoints (the default `reclaim` policy)
-stay loaded until another lease needs their GPUs or `infer-stack evict` stops
-them. `stack down` releases no lease, so the next `apply` or `acquire` brings
-leased models back.
+After the final `release` on an endpoint, the default `reclaim: stop` tears the
+model down. Endpoints explicitly set to `reclaim: keep-warm` remain resident
+until another lease needs their GPUs or `infer-stack evict` stops them.
+`stack down` releases no lease, so the next `apply` or `acquire` brings leased
+models back.
 
 All state is bind-mounted from the data dir, so none of these delete it,
 including `stack down --volumes`. For a destructive reset, remove the

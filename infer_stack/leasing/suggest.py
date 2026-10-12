@@ -16,24 +16,27 @@ the real entries of the legacy ``default-vllm-models.yaml``).
 Two layers, kept apart on purpose:
 
 * :class:`SuggestionModel` — model facts (footprint, min per-GPU VRAM,
-  preferred GPU count, context window, sane vLLM defaults), plus optional
+  preferred GPU count, context window, sane vLLM defaults), a curated
+  ``suggestion_tier`` (``smoke`` / ``frontier`` / ``optional``), plus optional
   hardware-gated endpoint variants for measured serving profiles. Variants are
   data: they override generic endpoint runtime fields and never add
   model-specific renderer behavior.
 * :func:`suggest_catalog` — derives the *server-specific* layer (which models
   fit, what ``max_model_len`` / ``gpu_memory_utilization`` / ``dtype`` to use,
-  which one to keep warm) by joining the pool against an inventory dict.
+  which variants fit) by joining the pool against an inventory dict. The
+  curated frontier retains **every fitting size class**, not just the largest.
+  Nothing is kept warm by default.
 
 Example:
     >>> from infer_stack.hardware import simulate_inventory
     >>> # a single 48 GiB GPU (yardrat's free Quadro RTX 8000)
     >>> out = suggest_catalog(simulate_inventory('1x48'))
-    >>> 'qwen2.5-7b' in out['models'] and 'qwen2.5-72b' not in out['models']
+    >>> 'qwen3.5-9b' in out['models'] and 'qwen2.5-7b' not in out['models']
     True
-    >>> out['endpoints']['qwen2.5-7b']['runtime']['max_model_len']
+    >>> out['endpoints']['qwen3.5-9b']['runtime']['max_model_len']
     32768
-    >>> # the 72B (needs 2 GPUs) only appears once there are two
-    >>> 'qwen2.5-72b' in suggest_catalog(simulate_inventory('2x80'))['models']
+    >>> # optional models remain accessible through all_models=True
+    >>> 'qwen2.5-72b' in suggest_catalog(simulate_inventory('2x80'), all_models=True)['models']
     True
 """
 
@@ -63,6 +66,7 @@ __all__ = [
 _OLD_DBIRKS_QWEN38_NAME = 'qwen3.8-27b'
 _DBIRKS_QWEN38_NAME = 'qwen3.8-27b-dbirks-hyperqwen'
 _DBIRKS_QWEN38_SOURCE = 'hf://dbirks/Qwen3.8-27B-W4A16-AutoRound'
+_SUGGESTION_TIERS = {'smoke', 'frontier', 'optional'}
 
 
 @dataclass
@@ -73,7 +77,14 @@ class SuggestionModel:
     hf_model_id: str
     served_model_name: str | None = None
     family: str | None = None
+    # Curated visibility, independent of the serving requirements. ``smoke``
+    # and ``frontier`` enter normal suggestions on *any* fitting host, even if
+    # larger models fit. Entries without a tier are opt-in (``--all``).
+    suggestion_tier: str = 'optional'
     modalities: list[str] = field(default_factory=lambda: ['text'])
+    # The readiness probe/API surface: base GPT-2 has no chat template and
+    # must be tested through the completions endpoint, unlike instruct models.
+    protocol: str = 'chat'
     memory_class_gib: float = 0.0
     min_vram_gib_per_replica: float = 0.0
     preferred_gpu_count: int = 1
@@ -103,12 +114,23 @@ class SuggestionModel:
 
     @classmethod
     def from_entry(cls, name: str, spec: dict[str, Any]) -> SuggestionModel:
+        tier = str(spec.get('suggestion_tier', 'optional'))
+        if tier not in _SUGGESTION_TIERS:
+            raise ValueError(
+                f'{name}: unknown suggestion_tier {tier!r}; '
+                f'expected one of {sorted(_SUGGESTION_TIERS)}'
+            )
+        protocol = str(spec.get('protocol', 'chat'))
+        if protocol not in {'chat', 'completions'}:
+            raise ValueError(f'{name}: unsupported suggestion protocol {protocol!r}')
         return cls(
             name=name,
             hf_model_id=spec['hf_model_id'],
             served_model_name=spec.get('served_model_name'),
             family=spec.get('family'),
+            suggestion_tier=tier,
             modalities=list(spec.get('modalities') or ['text']),
+            protocol=protocol,
             memory_class_gib=spec.get('memory_class_gib', 0) or 0,
             min_vram_gib_per_replica=(
                 spec.get('min_vram_gib_per_replica')
@@ -542,6 +564,8 @@ def suggest_catalog(
     inventory: dict[str, Any],
     *,
     pool: dict[str, SuggestionModel] | None = None,
+    all_models: bool = False,
+    include: list[str] | tuple[str, ...] = (),
     reserve_display_gpu: str | bool | None = False,
 ) -> dict[str, Any]:
     """Join an inventory against the pool into a mergeable catalog fragment.
@@ -549,30 +573,46 @@ def suggest_catalog(
     Returns ``{'models': {...}, 'endpoints': {...}}`` shaped exactly like a
     ``catalog.yaml`` (so it round-trips through
     :meth:`~infer_stack.leasing.catalog.Catalog.from_dict` and merges into an
-    existing catalog without rewriting it). The single largest fitting model is
-    marked ``reclaim: keep-warm`` (worth the resident GPU to avoid cold-start
-    thrash); the rest ``reclaim: stop`` — mirroring the leasing demo.
+    existing catalog without rewriting it).
+
+    By default, suggest every fitting ``smoke`` and ``frontier`` model,
+    *including smaller models when a larger one fits*. The tiers describe a
+    manually curated capability/size/speed frontier, not a runtime dominance
+    calculation. Optional entries remain available with ``all_models=True``
+    or by model name in ``include``. All generated endpoints use
+    ``reclaim: stop`` unless an endpoint variant explicitly overrides it.
 
     Pure and offline: pass ``simulate_inventory('2x80')`` to suggest for
     hardware you do not have in front of you.
     """
     pool = builtin_pool() if pool is None else pool
+    requested = set(include)
+    unknown = requested - pool.keys()
+    if unknown:
+        raise ValueError(f'unknown suggestion model(s): {", ".join(sorted(unknown))}')
     all_gpus = inventory.get('gpus') or []
     allowed = set(available_gpu_indices(inventory, reserve_display_gpu))
     gpus = [g for g in all_gpus if g.get('index') in allowed]
 
-    fitting = [m for m in pool.values() if fits_on(m, gpus)]
-    # Largest first, so the keep-warm pick is the biggest thing this box can run.
-    fitting.sort(key=lambda m: m.min_vram_gib_per_replica, reverse=True)
+    fitting = [
+        model for model in pool.values()
+        if (all_models or model.suggestion_tier != 'optional' or model.name in requested)
+        and fits_on(model, gpus)
+    ]
+    # Small to large is helpful for reviewing the frontier; **never** prune a
+    # smaller model just because another fitting model is more capable.
+    fitting.sort(key=lambda m: (m.memory_class_gib, m.min_vram_gib_per_replica, m.name))
 
     models: dict[str, Any] = {}
     endpoints: dict[str, Any] = {}
-    for rank, model in enumerate(fitting):
+    for model in fitting:
         models[model.name] = {'source': f'hf://{model.hf_model_id}'}
 
         default_host = _default_host_gpus(model, gpus)
         if default_host:
             endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
+            if model.protocol != 'chat':
+                endpoint['protocol'] = model.protocol
             if model.min_vram_gib_per_replica > 0:
                 endpoint['placement'] = {
                     'min_vram_gib': model.min_vram_gib_per_replica,
@@ -590,9 +630,7 @@ def suggest_catalog(
             runtime = derive_runtime(model, default_host)
             if runtime:
                 endpoint['runtime'] = runtime
-            endpoint['reclaim'] = {
-                'policy': 'keep-warm' if rank == 0 else 'stop'
-            }
+            endpoint['reclaim'] = {'policy': 'stop'}
             endpoints[model.name] = endpoint
 
         # Variants are additional endpoint suggestions over the same model, not
@@ -601,25 +639,19 @@ def suggest_catalog(
         # its ordinary default endpoint targets another GPU class.
         matching_variants: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
         for variant_name, variant in model.endpoint_variants.items():
+            if (not all_models and not variant.get('suggest_by_default', True)):
+                continue
             variant_host = _variant_host_gpus(model, variant, gpus)
             if variant_host:
                 matching_variants.append((variant_name, variant, variant_host))
-
-        preferred_variant = None
-        if not default_host and matching_variants:
-            preferred_variant = next(
-                (
-                    name for name, variant, _host in matching_variants
-                    if variant.get('preferred')
-                ),
-                matching_variants[0][0],
-            )
 
         for variant_name, variant, variant_host in matching_variants:
             variant_endpoint: dict[str, Any] = {
                 'engine': 'vllm',
                 'model': model.name,
             }
+            if model.protocol != 'chat':
+                variant_endpoint['protocol'] = model.protocol
             placement: dict[str, Any] = {}
             min_vram = variant.get('min_vram_gib_per_replica')
             if min_vram is None:
@@ -647,14 +679,9 @@ def suggest_catalog(
             if variant_runtime:
                 variant_endpoint['runtime'] = variant_runtime
 
-            policy = variant.get('reclaim_policy')
-            if policy is None:
-                policy = (
-                    'keep-warm'
-                    if rank == 0 and preferred_variant == variant_name
-                    else 'stop'
-                )
-            variant_endpoint['reclaim'] = {'policy': str(policy)}
+            variant_endpoint['reclaim'] = {
+                'policy': str(variant.get('reclaim_policy', 'stop'))
+            }
             endpoints[f'{model.name}-{variant_name}'] = variant_endpoint
 
     return {'models': models, 'endpoints': endpoints}

@@ -218,8 +218,11 @@ class CatalogSuggestCLI(
     Introspects the GPU inventory and joins it against the curated suggestion
     pool (``templates/suggestion-pool.yaml``) to derive a concrete, fits-this-box
     set of models + endpoints — sized ``max_model_len`` / ``gpu_memory_utilization``,
-    ``--dtype=half`` on pre-Ampere GPUs, the largest model kept warm. It mirrors
-    the hand-tuning of the leasing demo, but derived rather than guessed.
+    ``--dtype=half`` on pre-Ampere GPUs, and ``reclaim: stop`` for every
+    endpoint by default. A curated frontier retains every size class that fits,
+    plus smoke-test models. Hardware limits are the only reason a curated model
+    disappears on a more capable machine. ``--all`` includes optional models;
+    ``--include`` names individual opt-in models.
 
     Render then apply (a plan/apply split): by default it *renders* the
     suggestion as YAML to stdout and writes nothing — so you can review it, pipe
@@ -239,6 +242,8 @@ class CatalogSuggestCLI(
         infer-stack catalog suggest                      # render only (no write)
         infer-stack catalog suggest --simulate-hardware 4x48
         infer-stack catalog suggest --simulate-hardware 4x96@12.0
+        infer-stack catalog suggest --all                 # all fitting pool entries
+        infer-stack catalog suggest --include mistral-7b-instruct
         infer-stack catalog suggest --apply              # merge into the catalog
     """
 
@@ -251,6 +256,16 @@ class CatalogSuggestCLI(
     force = kw.Value(
         False, isflag=True,
         help='With --apply, overwrite catalog entries that already exist.',
+    )
+    all = kw.Value(
+        False, isflag=True,
+        help='Include every hardware-compatible model and serving variant from '
+        'the registry, including optional/legacy entries.',
+    )
+    include = kw.Value(
+        [], nargs='*', type=str,
+        help='Opt additional registered model name(s) into this suggestion. '
+        'Hardware eligibility still applies.',
     )
     backend = kw.Value(
         None, type=str,
@@ -302,9 +317,15 @@ class CatalogSuggestCLI(
         inventory = inventory or detect_inventory()
         gpus = inventory.get('gpus') or []
         skip_display = _resolve_skip_display(config) and not cluster
-        frag = suggest_catalog(
-            inventory, reserve_display_gpu='auto' if skip_display else False
-        )
+        try:
+            frag = suggest_catalog(
+                inventory,
+                all_models=config.all,
+                include=config.include,
+                reserve_display_gpu='auto' if skip_display else False,
+            )
+        except ValueError as ex:
+            raise SystemExit(f'catalog suggest: {ex}') from ex
         if cluster:
             # A cluster has no host GPU indices: the profile says where.
             for endpoint in frag['endpoints'].values():

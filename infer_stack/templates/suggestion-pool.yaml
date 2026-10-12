@@ -10,14 +10,19 @@
 # fits-this-server catalog ("seeding is a pure function
 # inventory × registry → catalog").
 #
-# Entries are lifted from the legacy `default-vllm-models.yaml`, spanning the
-# current-generation families (Qwen3.5 / Qwen3.6 / Gemma 4 — all real, released
-# Feb-Apr 2026) down through the prior-gen instruct workhorses (Qwen2.5, Llama 3,
-# Mistral) and a couple of tiny smoke-test models, plus the two SmolLM2/Qwen2.5
-# models the leasing demo serves so the demo's set is reproducible. Big entries
-# are kept even where they need more than one GPU — the pool is hardware-blind,
-# and `suggest` filters per box. served_model_name is normalized to a clean slug
-# (the legacy Together-style `org/model-turbo` aliases are dropped).
+# The *default* suggestion is a curated, hardware-filtered approximation of a
+# Pareto frontier across size, quality, speed and modality, plus smoke tests:
+#
+#   suggestion_tier: smoke      — explicit debugging/CI fixture
+#   suggestion_tier: frontier   — best-in-size-class or distinct capabilities
+#   omitted / optional        — opt-in via `catalog suggest --all` / --include
+#
+# Every fitting frontier/smoke entry is suggested, regardless of whether a
+# larger model ALSO fits. An expensive GPU is useful for running tiny models
+# too. No statistical dominance is claimed here; future benchmark evidence may
+# refine this hand-curated list. Model sources and serving profiles stay in the
+# complete registry for compatibility and experiments. The legacy
+# `default-vllm-models.yaml` is kept as an old compiler fixture.
 #
 # This file is a *suggestion source*, never a live catalog — nothing here has a
 # lifecycle. The legacy `default-vllm-models.yaml` is left untouched as the
@@ -28,6 +33,8 @@ vllm_models:
   # -- tiny: smoke-test / CI models, fit on any GPU ----------------------
   gpt2:
     hf_model_id: openai-community/gpt2
+    suggestion_tier: smoke
+    protocol: completions  # base model; no chat template
     served_model_name: gpt2
     family: gpt2
     modalities: [text]
@@ -52,6 +59,7 @@ vllm_models:
       gpu_memory_utilization: 0.3
   smollm2-135m:
     hf_model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+    suggestion_tier: smoke
     served_model_name: smollm2-135m
     family: smollm2
     modalities: [text]
@@ -124,6 +132,7 @@ vllm_models:
   #     dev/profile_qwen38_hyperqwen.sh searches for a faster class profile.
   qwen3.8-27b-dbirks-hyperqwen:
     hf_model_id: dbirks/Qwen3.8-27B-W4A16-AutoRound
+    suggestion_tier: frontier
     served_model_name: qwen3.8-27b-dbirks-hyperqwen
     family: qwen3.8
     modalities: [text]
@@ -170,6 +179,8 @@ vllm_models:
             SPEC: mtp
             CTX: long
       huge:
+        # Full compressed-context experimentation remains available with --all.
+        suggest_by_default: false
         min_compute_cap: 8.0
         max_vram_gib_per_replica: 32
         runtime:
@@ -210,9 +221,8 @@ vllm_models:
 
       # RTX 8000 results generalize conservatively by architecture + capacity: sm75
       # with >=48 GiB has enough room for ordinary FP16 KV at 262K, while BF16
-      # launchers are inappropriate.  Suggest both the slightly faster prepared
-      # target and the conservative standard target; keep the fast one warm when
-      # this model is the largest available suggestion.
+      # launchers are inappropriate. Suggest the measured prepared fast target;
+      # leave the standard target opt-in as a comparative baseline.
       turing-fast-full:
         min_compute_cap: 7.5
         max_compute_cap: 7.9
@@ -237,6 +247,7 @@ vllm_models:
             INT8_LAYERS: ''
             EXTRA_ARGS: '--served-model-name={served_model_name} --dtype=half --kv-cache-dtype=auto --attention-backend=TRITON_ATTN --max-num-batched-tokens=8192'
       turing-full:
+        suggest_by_default: false
         min_compute_cap: 7.5
         max_compute_cap: 7.9
         min_vram_gib_per_replica: 47.9
@@ -344,6 +355,7 @@ vllm_models:
   # 0.8B-9B fit a single 24 GiB GPU; 27B+ need a 48 GiB card or more.
   qwen3.5-0.8b:
     hf_model_id: Qwen/Qwen3.5-0.8B
+    suggestion_tier: frontier
     served_model_name: qwen3.5-0.8b
     family: qwen3.5
     modalities: [text]
@@ -357,6 +369,7 @@ vllm_models:
       enable_prefix_caching: true
   qwen3.5-2b:
     hf_model_id: Qwen/Qwen3.5-2B
+    suggestion_tier: frontier
     served_model_name: qwen3.5-2b
     family: qwen3.5
     modalities: [text]
@@ -370,6 +383,7 @@ vllm_models:
       enable_prefix_caching: true
   qwen3.5-4b:
     hf_model_id: Qwen/Qwen3.5-4B
+    suggestion_tier: frontier
     served_model_name: qwen3.5-4b
     family: qwen3.5
     modalities: [text]
@@ -383,6 +397,7 @@ vllm_models:
       enable_prefix_caching: true
   qwen3.5-9b:
     hf_model_id: Qwen/Qwen3.5-9B
+    suggestion_tier: frontier
     served_model_name: qwen3.5-9b
     family: qwen3.5
     modalities: [text]
@@ -422,6 +437,7 @@ vllm_models:
       enable_prefix_caching: true
   qwen3.5-122b-a10b:
     hf_model_id: Qwen/Qwen3.5-122B-A10B
+    suggestion_tier: frontier
     served_model_name: qwen3.5-122b-a10b
     family: qwen3.5
     modalities: [text]
@@ -450,6 +466,8 @@ vllm_models:
           extra_args: [--language-model-only, --reasoning-parser, qwen3]
   qwen3.5-122b-a10b-fp8:
     hf_model_id: Qwen/Qwen3.5-122B-A10B-FP8
+    # Distinct precision/context option alongside the regular 122B checkpoint.
+    suggestion_tier: frontier
     served_model_name: qwen3.5-122b-a10b-fp8
     family: qwen3.5
     modalities: [text]
@@ -522,9 +540,12 @@ vllm_models:
       enable_prefix_caching: false
 
   # -- Gemma 4 (current gen, multimodal, reasoning) ----------------------
-  # All four fit a single 24 GiB GPU.
+  # Audio-capable E2B/E4B and image-capable 26B MoE / 31B dense expose useful
+  # speed/capability tradeoffs not covered by the text-only Qwen frontier.
+  # Each remains in the suggested set if it fits, even on large GPUs.
   gemma4-e2b:
     hf_model_id: google/gemma-4-E2B-it
+    suggestion_tier: frontier
     served_model_name: gemma4-e2b
     family: gemma4
     modalities: [text, image, audio]
@@ -538,6 +559,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-e4b:
     hf_model_id: google/gemma-4-E4B-it
+    suggestion_tier: frontier
     served_model_name: gemma4-e4b
     family: gemma4
     modalities: [text, image, audio]
@@ -551,6 +573,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-26b:
     hf_model_id: google/gemma-4-26B-A4B-it
+    suggestion_tier: frontier
     served_model_name: gemma4-26b
     family: gemma4
     modalities: [text, image]
@@ -564,6 +587,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-31b:
     hf_model_id: google/gemma-4-31B-it
+    suggestion_tier: frontier
     served_model_name: gemma4-31b
     family: gemma4
     modalities: [text, image]

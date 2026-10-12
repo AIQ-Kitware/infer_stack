@@ -119,6 +119,18 @@ def test_release_last_stop_tears_down():
     assert backend.observe() == set()
 
 
+def test_omitted_reclaim_policy_stops_after_final_lease():
+    ctl, backend, _ = make_controller()
+    req = vreq('qwen')
+    req.spec.pop('reclaim')
+    a = ctl.acquire('alice', [req])
+    gid = a.deployments[0].id
+    ctl.release(a.lease.id)
+    # The ledger keeps a historical IDLE row; the backend releases resources.
+    assert backend.teardown_calls == [gid]
+    assert backend.observe() == set()
+
+
 def test_wait_ready_timeout_releases_lease():
     # A readiness timeout must roll the lease back (release + reconcile) so a
     # never-ready acquire doesn't leave the deployment LIVE pinning a GPU.

@@ -28,6 +28,7 @@ CATALOG = {
             'engine': 'vllm',
             'model': 'qc',
             'runtime': {'max_model_len': 32768},
+            'reclaim': {'policy': 'keep-warm'},  # explicit resident deployment
         },
         'reranker': {'engine': 'vllm', 'model': 'rr'},
     },
@@ -175,7 +176,7 @@ def test_release_via_env_file(env, capsys):
     assert rc == 0
     data = _leases_json(env, capsys)
     assert data['leases'][0]['state'] == 'released'
-    # default reclaim is keep-warm, so the deployment is idle but not torn down
+    # qwen-coder explicitly opts into keep-warm, so the deployment stays idle.
     assert data['deployments'][0]['state'] == 'idle'
     assert data['deployments'][0]['demand'] == 0
 

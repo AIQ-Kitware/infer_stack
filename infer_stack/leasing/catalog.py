@@ -39,7 +39,7 @@ Schema (all sections optional except as referenced)::
         #             env: {MAX_LEN: '{max_model_len}', SPEC: mtp},
         #             mounts: {/cache: my-model/cache}}
         sharing: {mode: shared-compatible}
-        reclaim: {policy: keep-warm}
+        reclaim: {policy: stop}  # default; keep-warm is explicit opt-in
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
                               # surface the readiness probe (and clients) use; a
                               # completions-only model needs protocol: completions
@@ -98,7 +98,7 @@ from .models import (
 VLLM = 'vllm'
 OLLAMA = 'ollama'
 
-DEFAULT_RECLAIM = 'keep-warm'
+DEFAULT_RECLAIM = 'stop'
 
 
 #: How many names a did-you-mean offers.

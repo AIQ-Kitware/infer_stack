@@ -10,10 +10,11 @@ The reconcile loop is the standard desired-vs-actual converge:
     actual  = backend.observe()
     realize(desired - actual);  teardown(actual - desired)
 
-``reclaim`` policy lives on each deployment's spec (from the catalog): ``keep-warm``
-(default — survive idle until pressure, avoids cold-start thrash) keeps an idle
-deployment running; ``stop`` / ``scale-to-zero`` let it be torn down as soon as demand
-hits zero. TTL expiry is enforced here too: every ``reconcile`` first
+``reclaim`` policy lives on each deployment's spec (from the catalog): ``stop``
+is the default, so a deployment is torn down after its final lease is released.
+Explicit ``keep-warm`` keeps an idle deployment running until GPU pressure;
+``scale-to-zero`` is also available. TTL expiry is enforced here too: every
+``reconcile`` first
 ``sweep``s the ledger, so a crashed job's lease stops protecting its deployment once
 its TTL elapses.
 """
@@ -231,7 +232,7 @@ class Controller:
         *,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] = time.sleep,
-        reclaim_default: str = KEEP_WARM,
+        reclaim_default: str = 'stop',
     ):
         self.ledger = ledger
         self.backend = backend
@@ -602,7 +603,7 @@ class Controller:
     def keeps_up(self, deployment: Deployment) -> bool:
         """Whether the reconciler keeps ``deployment`` running.
 
-        LIVE always; IDLE only under ``keep-warm`` (the default policy). An
+        LIVE always; IDLE only under an explicit ``keep-warm`` policy. An
         IDLE ``stop`` deployment is torn down by the release that idled it
         and stays IDLE in the ledger, so a view that treats every IDLE row as
         running reports a missing container that is exactly as intended.
