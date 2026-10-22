@@ -10,8 +10,7 @@ the models it needs, block until ready, and release after:
     infer-stack acquire qwen-coder      # standing service (no --ttl)
     infer-stack leases                  # status of leases + deployments
 
-Until the Compose/KubeAI backends land, the default ``--backend null`` is a
-dry-run: the ledger does all the real bookkeeping (coalescing, demand, TTL) but
+With ``--backend null``, the ledger does the real bookkeeping (coalescing, demand, TTL) but
 nothing is actually served. This lets the whole surface — including env-file
 emission and the ``run`` wrapper — be exercised end to end without docker.
 """
@@ -22,6 +21,7 @@ import json
 import os
 import shlex
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import kwconf as kw
@@ -2119,6 +2119,11 @@ class RunCLI(_LeasingCommonMixin):
                 controller.release(result.lease.id)
 
 
+def _lease_created(le) -> str:
+    """Immutable lease creation time in UTC, including after renewal."""
+    return datetime.fromtimestamp(le.created_at, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 def _lease_ttl(le, now: float | None = None) -> str:
     """Time left on a lease, for a person: ``1h59m``, ``12m``, ``expired``.
 
@@ -2196,7 +2201,8 @@ def _print_leases_plain(leases, deployments, observed, assignments) -> None:
     for le in leases:
         print(
             f'  {le.id}  owner={le.owner}  state={le.state}  '
-            f'ttl={_lease_ttl(le)}  endpoints={",".join(le.endpoints) or "-"}'
+            f'ttl={_lease_ttl(le)}  created={_lease_created(le)}  '
+            f'endpoints={",".join(le.endpoints) or "-"}'
         )
     print('deployments:')
     if not deployments:
@@ -2232,12 +2238,13 @@ def _print_leases_rich(leases, deployments, observed, assignments, console) -> N
         lt.add_column('owner')
         lt.add_column('state')
         lt.add_column('ttl', style='dim')
+        lt.add_column('created (UTC)', style='dim', no_wrap=True)
         lt.add_column('endpoints', style='magenta', overflow='fold')
         for le in leases:
             lt.add_row(
                 le.id, le.owner,
                 Text(str(le.state), style=state_style(le.state)),
-                _lease_ttl(le), ','.join(le.endpoints) or '-',
+                _lease_ttl(le), _lease_created(le), ','.join(le.endpoints) or '-',
             )
         console.print(lt)
 
@@ -2272,7 +2279,10 @@ class LeasesCLI(_LeasingCommonMixin):
     """Show current leases and deployments (the leasing-model status).
 
     Two tables. **leases** are who asked for what (id, owner, state, ttl,
-    endpoints). **deployments** are the actual deployments behind them — one deployment is
+    created, endpoints), oldest first. Creation is when the lease was recorded,
+    before serving readiness; renewals preserve it. JSON also includes
+    ``heartbeat_at`` (last acquisition or renewal), with timestamps in Unix seconds.
+    **deployments** are the actual deployments behind them — one deployment is
     one model in one container (it may serve several endpoint aliases). For each
     deployment:
 
@@ -2315,6 +2325,8 @@ class LeasesCLI(_LeasingCommonMixin):
                                 'owner': le.owner,
                                 'state': le.state,
                                 'endpoints': le.endpoints,
+                                'created_at': le.created_at,
+                                'heartbeat_at': le.heartbeat_at,
                                 'expires_at': le.expires_at,
                             }
                             for le in leases

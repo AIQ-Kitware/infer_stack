@@ -556,3 +556,19 @@ downstream workload identity or private model-selection intent.
 Validation: tests/ has 1268 passed, 2 skipped; package doctests have 44 passed,
 1 skipped. Fatal syntax/name checks and ty pass. This validates the merged code
 and preserved wrappers, not a new replication implementation or GPU throughput.
+
+## 2026-10-22 16:49:17 -0400
+
+Model: GPT-6.1-Sol (high).
+The user needed to distinguish older infinite-TTL leases. SQLite already stores
+created_at and heartbeat_at, and returns leases oldest first. Show creation time
+in UTC in both CLI renderers and the TUI; expose both existing timestamps in
+leases --json. Creation records the reservation before serving readiness and
+survives renewal. heartbeat_at means last acquisition or renewal, not every
+state change, so it is not labelled modified. No schema or runtime changes.
+
+CLI and TUI tests: 149 passed, including renewal preserving infinite-lease age,
+JSON timestamps, ordering and both CLI renderers. Scoped ty passed. Ruff adds no
+findings relative to HEAD; the four checked files have 11 existing findings.
+README and command help document timestamp semantics. Tests used NullBackend
+and isolated stores; no live leases or GPU processes were touched.

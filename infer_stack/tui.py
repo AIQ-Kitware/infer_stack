@@ -64,6 +64,7 @@ from . import __version__
 from . import cli_equivalent as cli
 from .cli.commands_leasing import (
     _gpu_label,
+    _lease_created,
     _lease_ttl,
     _placement_view,
     _running_label,
@@ -1308,7 +1309,7 @@ class InferStackTUI(App):
         leases_tbl = self.query_one('#leases', DataTable)
         leases_tbl.add_column('', width=2, key='sel')  # multi-select marker
         leases_tbl.add_columns(
-            'id', 'owner', 'state', 'ttl', 'endpoints', 'deployment'
+            'id', 'owner', 'state', 'ttl', 'created (UTC)', 'endpoints', 'deployment'
         )
         deployments_tbl = self.query_one('#deployments', DataTable)
         deployments_tbl.add_column('', width=2, key='sel')  # multi-select marker
@@ -2064,6 +2065,7 @@ class InferStackTUI(App):
             (
                 SELECT_MARK if le.id in self._lease_sel else '',
                 le.id, le.owner, str(le.state), _lease_ttl(le),
+                _lease_created(le),
                 ','.join(le.endpoints) or '-',
                 ','.join(le.deployment_ids) or '-',
             )

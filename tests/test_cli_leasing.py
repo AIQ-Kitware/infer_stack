@@ -357,6 +357,55 @@ def test_leases_gpu_and_running_labels():
     assert _gpu_label('gX', observed, assignments) == '-'     # unknown
 
 
+def test_leases_creation_survives_renewal(monkeypatch, capsys):
+    from io import StringIO
+
+    from rich.console import Console
+
+    from infer_stack.cli import commands_leasing as cl
+    from infer_stack.leasing import (
+        Catalog,
+        Controller,
+        Ledger,
+        NullBackend,
+        SqliteStore,
+    )
+
+    now = 1767225600.0  # 2026-01-01T00:00:00Z
+    ledger = Ledger(SqliteStore(':memory:'), clock=lambda: now)
+    controller = Controller(ledger, NullBackend())
+    catalog = Catalog.from_dict(CATALOG)
+    endpoints = catalog.resolve_names(['qwen-coder'])
+    older = controller.acquire('alice', endpoints).lease
+    now += 3600
+    newer = controller.acquire('bob', endpoints).lease
+    now += 3600
+    ledger.renew(older.id, ttl_seconds=None)
+    monkeypatch.setattr(cl, '_open_controller', lambda config: controller)
+
+    LeasesCLI.main(argv=['--json'])
+    rows = json.loads(capsys.readouterr().out)['leases']
+    assert [row['id'] for row in rows] == [older.id, newer.id]
+    assert rows[0]['created_at'] == 1767225600.0
+    assert rows[0]['heartbeat_at'] == now
+    assert rows[1]['created_at'] == rows[1]['heartbeat_at'] == now - 3600
+    assert all(row['expires_at'] is None for row in rows)
+
+    LeasesCLI.main(argv=[])
+    plain = capsys.readouterr().out
+    assert 'ttl=inf  created=2026-01-01T00:00:00Z' in plain
+    assert plain.index(older.id) < plain.index(newer.id)
+
+    output = StringIO()
+    console = Console(file=output, width=200)
+    leases, deployments = ledger.status()
+    cl._print_leases_rich(leases, deployments, set(), {}, console)
+    rich = output.getvalue()
+    assert 'created (UTC)' in rich
+    assert '2026-01-01T00:00:00Z' in rich
+    assert rich.index(older.id) < rich.index(newer.id)
+
+
 def test_renew_extends(env):
     envf = env.tmp / 'is.env'
     AcquireCLI.main(

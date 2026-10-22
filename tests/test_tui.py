@@ -65,6 +65,7 @@ def test_tui_panes_list_catalog_leases_and_deployments():
     from infer_stack.tui import InferStackTUI
 
     controller, catalog = _ctx()
+    controller.ledger.clock = lambda: 1767225600.0  # 2026-01-01T00:00:00Z
     controller.acquire('alice', catalog.resolve_names(['qwen-coder']))
 
     async def scenario():
@@ -76,7 +77,10 @@ def test_tui_panes_list_catalog_leases_and_deployments():
             assert eps.row_count == 2                 # both catalog endpoints
             assert app._endpoint_names == ['qwen-coder', 'qwen-fast']
             assert app.query_one('#models', DataTable).row_count == 1
-            assert app.query_one('#leases', DataTable).row_count == 1
+            leases = app.query_one('#leases', DataTable)
+            assert leases.row_count == 1
+            assert 'created (UTC)' in [str(c.label) for c in leases.columns.values()]
+            assert '2026-01-01T00:00:00Z' in leases.get_row_at(0)
             assert app.query_one('#deployments', DataTable).row_count == 1
 
     _run(scenario)

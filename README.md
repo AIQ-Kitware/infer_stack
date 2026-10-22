@@ -115,6 +115,10 @@ infer-stack version
 infer-stack help tree                 # the whole command surface
 ```
 
+Lease tables show creation times in UTC, oldest first, including for infinite
+leases. Renewals preserve creation time. `infer-stack leases --json` also exposes
+`heartbeat_at`, the last acquisition or renewal, as Unix seconds.
+
 The CLI is built on [`kwconf`](https://github.com/Erotemic/kwconf),
 so every subcommand is also importable as a Python class:
 
