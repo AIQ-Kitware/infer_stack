@@ -134,6 +134,8 @@ vllm_models:
     hf_model_id: dbirks/Qwen3.8-27B-W4A16-AutoRound
     suggestion_tier: frontier
     served_model_name: qwen3.8-27b-dbirks-hyperqwen
+    # Chat template's native request-level effort values (not token budgets).
+    reasoning_efforts: [low, medium, xhigh]
     family: qwen3.8
     modalities: [text]
     memory_class_gib: 20

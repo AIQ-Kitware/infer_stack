@@ -192,6 +192,9 @@ class EndpointSpec:
     # /chat/completions, 'completions' hits /completions. A completions-only
     # model never answers a chat probe, so this must match how it is served.
     protocol: str = 'chat'
+    # Per-request wire levels understood by this endpoint's chat template.
+    # This is metadata, not a model launch parameter.
+    reasoning_efforts: tuple[str, ...] = ()
     # Placement constraints / operator overrides (vllm only; validated in
     # errors()). ``min_vram_gib`` is the portable eligibility declaration;
     # ``gpu_indices`` is an optional exact local pin from the TUI/CLI.
@@ -441,6 +444,8 @@ class Catalog:
                 reclaim=_parse_reclaim(spec.get('reclaim')),
                 served_name=spec.get('served_name') or spec.get('public_name'),
                 protocol=_parse_protocol(spec.get('protocol')),
+                reasoning_efforts=tuple(spec.get('reasoning_efforts') or ())
+                    if isinstance(spec.get('reasoning_efforts'), (list, tuple)) else (),
                 placement=dict(spec.get('placement') or {}),
                 raw=dict(spec),
             )
@@ -510,6 +515,19 @@ class Catalog:
                 errors.append(
                     f"endpoint '{ep.name}' has unknown engine '{ep.engine}'"
                 )
+            if 'reasoning_efforts' in ep.raw:
+                levels = ep.raw['reasoning_efforts']
+                allowed = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
+                if (ep.engine != VLLM or ep.protocol != 'chat'
+                    or not isinstance(levels, list) or not levels
+                    or any(not isinstance(v, str) or v not in allowed for v in levels)
+                    or len(set(levels)) != len(levels)):
+                    errors.append(
+                        f"endpoint '{ep.name}': reasoning_efforts must be a nonempty "
+                        'list of distinct OpenAI reasoning effort levels '
+                        '(none, minimal, low, medium, high, xhigh, max) '
+                        'on a vllm chat endpoint; declare only levels your template supports'
+                    )
             errors.extend(_placement_errors(ep))
             errors.extend(_runtime_errors(ep))
         for bundle, members in self.bundles.items():
@@ -672,6 +690,8 @@ class Catalog:
             # alias instead of re-deriving it from the deployment later.
             'max_input_tokens': effective_max_model_len(rt),
         }
+        if ep.reasoning_efforts:
+            served['reasoning_efforts'] = list(ep.reasoning_efforts)
         return EndpointRequest(
             endpoint=ep.name,
             engine=VLLM,

@@ -61,3 +61,52 @@ and failed identically there, demonstrating that they predate this change:
 `test_converge_no_change_does_not_prompt`. The earlier full suite timeout is
 not treated as a successful full-suite run. Work remains to fix the baseline
 Compose diff/prompt behavior independently.
+
+## 2026-11-05 19:17:00 -0500
+
+User intent: expose Qwen3.8/HyperQwen's native reasoning effort selection from
+pi's `/effort` UI through LiteLLM without using a reasoning-token cutoff or
+needing to restart the inference engine for each change.
+
+Model/configuration: GPT-6 (ChatGPT); exact runtime reasoning effort not
+exposed. Worked against the user-uploaded infer-stack source snapshot from
+2026-11-05; no remote inference service or GPU container accessed.
+
+I chose an opt-in `reasoning_efforts` declaration on a vLLM chat endpoint,
+carried as per-alias served metadata rather than process-wide runtime settings.
+This preserves the endpoint's structural deployment identity and lets several
+aliases sharing one vLLM process advertise their own request contract. The
+suggestion pool now supplies `[low, medium, xhigh]` for the HyperQwen model and
+all of its suggested variants. The catalog validates the generic OpenAI effort
+vocabulary but intentionally leaves model-template compatibility to the
+operator; HyperQwen's native supported set is explicitly narrow.
+
+Both static and dynamic LiteLLM routes declare `supports_reasoning`,
+`reasoning_effort_levels`, and `allowed_openai_params: [reasoning_effort]`.
+The first two permit Pi's LiteLLM provider to expose the selector; the third
+makes the nonstandard custom-model route accept and forward the request field.
+Dynamic reconciliation checks all three fields for drift. Remembered routes
+preserve the per-alias effort contract after a deployment disappears, and a
+published catalog can provide missing metadata for older live deployments.
+The new `docs/reasoning-effort.md` shows pi install/refresh and a curl smoke
+request. No default reasoning budget is changed and no new vLLM launcher
+argument is introduced.
+
+Tests: 163 passed in the focused catalog, suggestion, context metadata,
+route registry, dynamic routing, and new effort suites, using an in-memory
+`ubelt.Path` shim because this runtime lacks that dependency. Tests include
+rendered static LiteLLM YAML and simulated dynamic route add/repair/no-churn.
+An earlier broader run exposed missing `kwconf` in this offline environment
+and two previously documented baseline Compose failures, so it is not claimed
+as a successful full suite. Real HyperQwen template rendering through the
+pinned vLLM/LiteLLM containers and pi client remains a follow-up live smoke
+check; `reasoning_effort` forwarding is supported by current vLLM and pi
+provider documentation but untested against this deployed image.
+
+Reusable takeaways:
+- Model-specific reasoning controls belong to the endpoint's request contract,
+  not process launch identity, when a gateway can forward the field per call.
+- Explicit supported levels and an explicit forwarding allowlist are both
+  needed for clients discovering a custom LiteLLM model.
+- Reconciliation should consider advertised capability drift as well as
+  routing destinations, but never churn unchanged legacy routes.

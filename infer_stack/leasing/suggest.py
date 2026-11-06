@@ -85,6 +85,7 @@ class SuggestionModel:
     # The readiness probe/API surface: base GPT-2 has no chat template and
     # must be tested through the completions endpoint, unlike instruct models.
     protocol: str = 'chat'
+    reasoning_efforts: list[str] = field(default_factory=list)
     memory_class_gib: float = 0.0
     min_vram_gib_per_replica: float = 0.0
     preferred_gpu_count: int = 1
@@ -131,6 +132,7 @@ class SuggestionModel:
             suggestion_tier=tier,
             modalities=list(spec.get('modalities') or ['text']),
             protocol=protocol,
+            reasoning_efforts=list(spec.get('reasoning_efforts') or []),
             memory_class_gib=spec.get('memory_class_gib', 0) or 0,
             min_vram_gib_per_replica=(
                 spec.get('min_vram_gib_per_replica')
@@ -613,6 +615,8 @@ def suggest_catalog(
             endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
             if model.protocol != 'chat':
                 endpoint['protocol'] = model.protocol
+            if model.reasoning_efforts:
+                endpoint['reasoning_efforts'] = list(model.reasoning_efforts)
             if model.min_vram_gib_per_replica > 0:
                 endpoint['placement'] = {
                     'min_vram_gib': model.min_vram_gib_per_replica,
@@ -652,6 +656,8 @@ def suggest_catalog(
             }
             if model.protocol != 'chat':
                 variant_endpoint['protocol'] = model.protocol
+            if model.reasoning_efforts:
+                variant_endpoint['reasoning_efforts'] = list(model.reasoning_efforts)
             placement: dict[str, Any] = {}
             min_vram = variant.get('min_vram_gib_per_replica')
             if min_vram is None:
