@@ -137,3 +137,19 @@ platform; all verification here is static/offline. The example also avoids
 claiming a hard RAM cap where no Compose memory limit was set. Future variants
 might provide a generic explicit host memory cap, but that should be designed
 with per-host contention and leasing in mind, not smuggled into this example.
+
+## 2026-11-05 22:38:19 -0500
+
+User intent: make the single-3090 Qwen3.8 setup respect infer-stack's already configured directories, avoiding hard-coded, retyped, or manually edited paths. The requested improvement is a query for exactly one configured directory and end-to-end copy/paste setup, including non-destructive catalog registration.
+
+Model/configuration: GPT-6 (ChatGPT); reasoning configuration not exposed. Worked on the previous managed-Qwen ZIP overlay and the provided infer-stack source snapshot; no user-host GPU, Docker daemon, or model download was available.
+
+The old `paths` command exposed only group views, useful for humans but unusable as a scalar value because headers and status annotations polluted stdout. I kept its group and JSON behavior stable, added a scalar alias (`runtime_dir`) plus a few names (`catalog`, `compose_file`), and returned only the absolute path for scalar queries. The quickstart now substitutes `$(infer-stack paths runtime_dir)` directly into the Hugging Face download destination. The query does not touch disk or infer which path a user meant: it reports the one configured value. A missing directory is still a valid answer.
+
+Another piece of friction was the manual catalog merge. I packaged the Qwen profile alongside infer-stack's existing templates and introduced `catalog import qwen38-flash-next-3090`. It merges through the existing validated/atomic catalog writer, accepts repeat identical imports without rewrite, and refuses conflicting definitions instead of silently clobbering other agents' work. This is deliberately a small, bundled-preset operation, not a second generic catalog parser.
+
+Testing: added targeted scalar path query, configured data-root, import idempotence, conflict, packaged-template sync, and dry-run checks. Basic syntax and pure YAML validation can run offline; the CLI suite depends on `kwconf`/`ubelt` not installed in this execution environment. See current test results accompanying the overlay. The actual GPU deployment remains to be tested on the host.
+
+Reusable takeaways: (1) a path-reporting CLI should expose machine-readable scalar values as well as a human inventory; (2) persisted configuration should be the source of setup-command destinations; (3) bundled, validated, non-clobbering presets are preferable to telling users to copy a YAML fragment into a configured file manually.
+
+Validation update for this entry: all 11 existing single-3090 managed integration tests passed. Five new catalog-import tests and those 11 integration tests passed together (16 total) using a minimal kwconf CLI-parser stub, and a targeted logic probe exercised single-path stdout/JSON, first import, repeat import without touching mtime, and conflict refusal. All new Python modules compile and packaged/example YAML agrees. Genuine subprocess CLI tests could not run here because `kwconf`/`ubelt` were unavailable and package installation could not reach the index; parser-level behavior and live Docker inference are therefore not claimed verified.

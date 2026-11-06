@@ -1,89 +1,75 @@
 # Single-RTX-3090 Qwen3.8-Flash-Next in infer-stack (Compose)
 
-This example integrates the upstream [single-GPU runtime](https://github.com/DominikBucko/qwen38-flash-next-3090),
-not the two-GPU launcher. The single-GPU image is a patched vLLM backend built
-on the dual-GPU project's image, and serves an OpenAI-compatible API. infer-stack
-manages the selected GPU, container lifetime, readiness probe, and LiteLLM route.
-The other physical GPU is never reserved for this endpoint.
+This preset uses the upstream [single-3090 patched vLLM runtime](https://github.com/DominikBucko/qwen38-flash-next-3090), **not** the dual-GPU launcher. infer-stack owns the container lifecycle, physical-GPU placement, readiness probes, and LiteLLM routing. It reserves GPU **1**, leaving GPU **0** available for other work.
 
-## Prepare model weights
+This guide deliberately uses your existing infer-stack configuration. **No absolute host path, manual YAML merge, `cd` into the config directory, or copy/paste of a path is required.** Commands work from any working directory. If you haven't configured infer-stack yet, run `infer-stack config init` once; otherwise, leave your existing configuration alone.
 
-Install `infer-stack` with this overlay. Use the Compose backend. Before
-acquiring the endpoint, locate its persistent **runtime state directory**:
+## Setup (copy/paste)
 
 ```bash
-infer-stack config init
-infer-stack paths
-```
-
-Look for the `runtime_dir` entry. The catalog's `/model` mount refers to
-`<runtime_dir>/qwen38-flash-next-3090/model` on the host. Download the
-pinned checkpoint there (about 129 GB; keep it on an NVMe-backed data dir):
-
-```bash
+# Download the ~129 GB checkpoint into the already configured runtime directory.
 python3 -m pip install -U huggingface_hub
 hf download albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE \
   --revision ef554143369a706525336f6b42a09094835dc077 \
-  --local-dir /ABSOLUTE/RUNTIME_DIR/qwen38-flash-next-3090/model
+  --local-dir "$(infer-stack paths runtime_dir)/qwen38-flash-next-3090/model"
+
+# Add the bundled preset without modifying unrelated catalog entries.
+infer-stack catalog import qwen38-flash-next-3090
+infer-stack catalog validate
+
+# Acquire on physical GPU 1, then exercise the OpenAI-compatible API.
+infer-stack acquire qwen38-flash-next-3090
+infer-stack test qwen38-flash-next-3090
 ```
 
-Replace `/ABSOLUTE/RUNTIME_DIR` with the path printed by `infer-stack paths`.
-The model must contain `model.safetensors.index.json` and
-`runtime/mtp-int4-g32/model.safetensors.index.json`.
-Do not copy the checkpoint into tmpfs: it already keeps the actively used cold
-experts in RAM with 128 GB installed, and still uses mmap for its N-gram table.
+`infer-stack catalog import` is idempotent. Re-running an identical import leaves the catalog untouched; if an existing model or endpoint with the same name *differs*, it reports the conflicting fields and refuses to overwrite it. There is no `--force` shortcut for preset imports. To inspect the preset before merging, use `infer-stack catalog import qwen38-flash-next-3090 --dry-run`.
 
-The `runtime.mounts` paths are under infer-stack's runtime directory, not
-arbitrary host paths. If the checkpoint is already on your NVMe elsewhere,
-move it to the runtime data dir or use a carefully configured host-side
-symlink at the expected path (the Docker daemon must be able to resolve it).
-The other mounts persist Humming and Triton compiled kernels across leases.
+The checkpoint must contain `model.safetensors.index.json` and `runtime/mtp-int4-g32/model.safetensors.index.json`. `hf download --local-dir` creates the destination directory and reuses matching files on subsequent runs. The runtime's persistent Humming/Triton caches are also kept under your configured `runtime_dir`; infer-stack creates those bind mounts at launch.
 
-## Add and serve
+**Hardware prerequisites:** Linux, Docker, NVIDIA Container Toolkit, a suitable NVIDIA driver, at least 23 GiB free on physical GPU 1, and enough host RAM. The single-GPU runtime is tuned for 24 GiB VRAM and can hold its full cold-expert pool in RAM when 96+ GiB RAM is available. Its published throughput came from a Threadripper PRO benchmark host; performance on an i9-11900KF should be measured separately. This setup does not reserve GPU 0. The image and checkpoint downloads require network access.
 
-Merge [the example catalog](../examples/qwen38-flash-next-3090.yaml) into your
-existing `catalog.yaml`; do not overwrite other agents' or users' entries.
-`infer-stack paths` identifies the catalog path. On a machine with two 3090s,
-the example pins physical GPU **1**, leaving GPU **0** for other uses. Swap
-`placement.gpu_indices: [1]` to `[0]` if preferred. The upstream image's
-`CUDA_VISIBLE_DEVICES` fallback uses the remapped device 0 *inside the
-container*; do not set host GPU indices in `runtime.env`.
+## Inspect paths without copying them by hand
+
+`infer-stack paths` still shows the full human-readable inventory. **A single-path query prints only the pathname**, making it suitable for command substitution:
 
 ```bash
-infer-stack catalog validate
-infer-stack acquire qwen38-flash-next-3090 --no-apply
-infer-stack paths leasing   # inspect the rendered docker-compose.yml
-infer-stack apply
-infer-stack test qwen38-flash-next-3090
+infer-stack paths runtime_dir        # absolute directory for custom-runtime weights/caches
+infer-stack paths catalog            # absolute catalog.yaml path
+infer-stack paths compose_file       # rendered docker-compose.yml path
+infer-stack paths runtime_dir --json # one object with path, kind, and status
+infer-stack paths                   # full grouped inventory (existing behavior)
+```
+
+`infer-stack config paths runtime_dir` is equivalent to `infer-stack paths runtime_dir`. Queries respect `INFER_STACK_CONFIG_DIR`, `INFER_STACK_DATA_DIR`, the persisted `config set data_dir`, and the corresponding CLI overrides. A missing directory is **not** an error: querying paths does not create directories. The command prints one absolute line without terminal decorations, status text, or diagnostic banners.
+
+The preset's `runtime.mounts` paths are *relative to the configured* `runtime_dir`, so `/model` inside the container resolves to `qwen38-flash-next-3090/model` under that directory. No `MODEL_DIR` setting or host-side path edit is needed. The bundled preset is also available for reference as [`examples/qwen38-flash-next-3090.yaml`](../examples/qwen38-flash-next-3090.yaml).
+
+## Day-2 use
+
+```bash
+infer-stack leases
+infer-stack logs -f qwen38-flash-next-3090
 infer-stack release qwen38-flash-next-3090
 ```
 
-Alternatively acquire without `--no-apply` for a normal managed lease. The
-LiteLLM API base is `http://127.0.0.1:14042/v1` by default. Model requests
-use the catalog alias `qwen38-flash-next-3090`, while the upstream image's
-served name is `Qwen3.8-Flash-Next`.
+For an explicit preview that does not launch the container:
 
-## What infer-stack changes and what it does not
+```bash
+infer-stack acquire qwen38-flash-next-3090 --no-apply
+infer-stack paths compose_file
+infer-stack apply
+infer-stack test qwen38-flash-next-3090
+```
 
-- `runtime.command: [/model]` passes the model path to the upstream image's
-  `qwen38-serve` entrypoint. The upstream launcher supplies its patched vLLM
-  arguments, INT8 KV, MoE CPU offload, and speculative decoding.
-- `runtime.compose` adds host IPC, `SYS_PTRACE`, and memlock/stack limits as
-  requested by its Docker launcher. These Compose-only options are deliberately
-  not supported on KubeAI; no `privileged` container setting is introduced.
-- `placement.weight_floor: false` disables infer-stack's generic checkpoint-size
-  VRAM floor for this RAM-offloaded model. The explicit `min_vram_gib: 23`
-  remains in effect. This does not affect ordinary non-offloaded models.
-- The example sets `QWEN38_HOST_RESERVE_GIB=16`: with no Docker memory cap,
-  the upstream runtime budgets roughly 128 - 16 GiB for its RAM pool and
-  keeps the remaining system memory available to the host. This is not a
-  hard cgroup RAM cap. The upstream `MEMORY_LIMIT` launcher variable is not
-  interpreted by Compose; do not assume it is enforced here.
-- The checkpoint stays on NVMe; serving uses the CPU/RAM/GPU hierarchy of
-  the single-GPU implementation. The other GPU is not borrowed or split.
-- The published decode numbers come from a high-memory-bandwidth Threadripper
-  benchmark host, not the i9-11900KF. Benchmark prefill and decode independently.
+The managed gateway normally listens at `http://127.0.0.1:14042/v1`. Ask for the alias `qwen38-flash-next-3090`; the upstream vLLM container's served name is `Qwen3.8-Flash-Next`. One request is served at a time, up to 135,168 tokens per request, using an INT8 KV cache and MTP3 speculative decoding.
 
-No GPU, Docker daemon, or downloaded checkpoint was available in the overlay
-build environment, so the end-to-end generation path must be validated on the
-actual workstation. Static tests validate catalog/placement/Compose rendering.
+## Implementation notes
+
+- `runtime.command: [/model]` delegates argument construction to the upstream `qwen38-serve` entrypoint, which owns its patched vLLM flags and CPU/GPU MoE configuration.
+- `runtime.compose` supplies host IPC, `SYS_PTRACE`, and memlock/stack limits. This is Compose-specific; KubeAI deliberately rejects it.
+- `placement.weight_floor: false` disables the generic on-disk-checkpoint VRAM floor for this RAM-offloaded model, while `placement.min_vram_gib: 23` remains mandatory.
+- `QWEN38_HOST_RESERVE_GIB=16` asks the upstream runtime to leave host RAM for other work. This is an internal runtime budget, **not** a hard Docker memory cgroup limit. The upstream single-GPU launcher in its own repository has separate `MEMORY_LIMIT` handling.
+- The checkpoint remains on NVMe, with hot experts in GPU VRAM, other experts in system RAM, and the FP8 N-gram table memory-mapped. A `tmpfs` checkpoint is not needed for this profile.
+- If GPU 1 is already occupied, acquire will be unable to place the endpoint there. To prefer GPU 0 instead, use `infer-stack catalog edit` and change `placement.gpu_indices` to `[0]`. The import command never overwrites that local edit.
+
+Offline contract tests validate the bundled preset, scalar paths, additive catalog import, and Compose/GPU placement. Actual CUDA startup and tokens-per-second require running the copied setup commands on the workstation.

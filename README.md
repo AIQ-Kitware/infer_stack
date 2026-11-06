@@ -36,9 +36,11 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 ## Related work
 
 - [Qwen3.8-Flash-Next on one RTX 3090](docs/qwen38-flash-next-3090.md):
-  catalog-managed patched vLLM container with CPU expert offload, explicit
-  single-GPU placement, and persistent compiled-kernel caches (Compose backend).
-  The other GPU remains available to the host.
+  `infer-stack catalog import qwen38-flash-next-3090` installs a bundled,
+  non-destructive Compose preset; `infer-stack paths runtime_dir` supplies its
+  configured weight/cache root directly for download commands. The patched
+  vLLM backend offloads experts to host RAM and reserves only GPU 1, leaving
+  GPU 0 available.
 
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
   and serving stack for Qwen3.8-27B. infer-stack delegates requantization,
@@ -99,7 +101,8 @@ infer-stack test <endpoint>           # one generation through the gateway
 infer-stack leases                    # desired vs running, per deployment
 infer-stack status                    # paths, backend and a lease summary
 infer-stack release --all             # drop every lease
-infer-stack paths                     # where settings, catalog, ledger and caches live
+infer-stack paths                     # grouped inventory of config, data and leasing paths
+infer-stack paths runtime_dir         # just one configured directory, for $(...)
 infer-stack version
 infer-stack help tree                 # the whole command surface
 ```
@@ -159,6 +162,15 @@ infer-stack apply                           # start it (or `release --all` to di
 ```
 
 ## Catalog model
+
+A built-in catalog preset can be imported additively without locating or editing
+`catalog.yaml` (for example `infer-stack catalog import qwen38-flash-next-3090`).
+The import is idempotent and rejects differing existing names rather than
+clobbering them. Use `--dry-run` to preview the merged catalog. A single
+path can be queried as plain, absolute stdout using `infer-stack paths NAME`
+(`runtime_dir`, `catalog`, `compose_file`, and inventory labels are supported);
+`--json` returns status metadata for that entry. The grouped `infer-stack
+paths` inventory is unchanged.
 
 `catalog.yaml` is the one user-edited description of what can run. Its
 sections:

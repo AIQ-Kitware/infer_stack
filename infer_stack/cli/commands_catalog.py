@@ -431,6 +431,73 @@ def _merge_or_print(config, frag: dict, what: str) -> int:
     return 0
 
 
+# The builtin catalog presets are packaged with infer-stack, so their names
+# resolve regardless of the caller's CWD or the location of the source tree.
+BUILTIN_CATALOGS = {
+    'qwen38-flash-next-3090': 'catalog-qwen38-flash-next-3090.yaml',
+}
+
+
+class CatalogImportCLI(_CatalogCommon):
+    """Merge a built-in catalog preset without overwriting existing entries.
+
+    Example: ``infer-stack catalog import qwen38-flash-next-3090``. Re-running
+    an identical import is a no-op. Differing existing entries are conflicts,
+    not invitations to silently change another operator's configuration.
+    """
+
+    __command__ = 'import'
+    name = kw.Value(None, position=1, type=str, help='Name of bundled catalog preset.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from copy import deepcopy
+        from importlib import resources
+
+        config = cls.cli(argv=argv, data=kwargs)
+        name = str(config.name or '').strip()
+        if name not in BUILTIN_CATALOGS:
+            known = ', '.join(sorted(BUILTIN_CATALOGS))
+            raise SystemExit(f'Unknown catalog preset {name!r}; available: {known}')
+        preset = resources.files('infer_stack').joinpath(
+            'templates'
+        ).joinpath(BUILTIN_CATALOGS[name])
+        fragment = yaml.safe_load(preset.read_text(encoding='utf-8')) or {}
+        if not isinstance(fragment, dict) or any(
+            section not in SECTIONS for section in fragment
+        ):
+            raise SystemExit(f'Invalid packaged catalog preset: {name}')
+
+        path = _catalog_path(config)
+        existing = load_catalog_source(path)
+        updated = deepcopy(existing)
+        added = []
+        for section in SECTIONS:
+            entries = fragment.get(section, {})
+            if not isinstance(entries, dict):
+                raise SystemExit(f'Invalid {section} in packaged catalog preset: {name}')
+            for key, value in entries.items():
+                if key in updated[section]:
+                    _exists_guard(updated, section, key, False, value)
+                else:
+                    updated[section][key] = deepcopy(value)
+                    added.append(f'{section}:{key}')
+
+        # Canonical writer performs full catalog cross-reference validation.
+        # Validate before reporting a no-op, too, in case the current catalog
+        # has changed independently of the preset.
+        if config.dry_run:
+            _save_catalog(path, updated, dry_run=True)
+        elif added:
+            _save_catalog(path, updated)
+            print(f'imported {name} into {path}: {", ".join(added)}')
+        else:
+            from ..leasing.catalog_edit import validate_catalog_source
+            validate_catalog_source(updated)
+            print(f'catalog preset {name} already present (unchanged)')
+        return 0
+
+
 class CatalogPathCLI(_PathOverridesMixin):
     """Print the catalog path."""
 
@@ -1088,6 +1155,7 @@ class CatalogModalCLI(kw.ModalCLI):
 
     init = CatalogInitCLI
     suggest = CatalogSuggestCLI
+    import_preset = CatalogImportCLI
     path = CatalogPathCLI
     show = CatalogShowCLI
     validate = CatalogValidateCLI
