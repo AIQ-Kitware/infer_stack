@@ -344,6 +344,7 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'command': list(runtime.get('command') or []),
         'env': dict(runtime.get('env') or {}),
         'mounts': dict(runtime.get('mounts') or {}),
+        'compose': dict(runtime.get('compose') or {}),
         # The effective window: one source of truth (launch.py) shared with
         # the LiteLLM route metadata, so the advertised context can never
         # diverge from the one on the engine's command line.
@@ -500,6 +501,10 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
+    if svc['compose'] and not simulated:
+        # launch_errors() restricts these options to the supported keys.
+        # They are Compose-only; unsupported_runtime_fields rejects them on KubeAI.
+        service.update(svc['compose'])
     if svc['mounts']:
         # An image that keeps prepared weights or caches outside vLLM's
         # /root/.cache layout persists them here, so a release and re-acquire
@@ -1647,7 +1652,7 @@ class ComposeBackend(ConvergeScaffold):
                     if measured:
                         placement['min_vram_gib'] = measured
                         placement['min_vram_source'] = 'measured'
-                if not placement.get('floor_vram_gib'):
+                if placement.get('weight_floor', True) and not placement.get('floor_vram_gib'):
                     model_id = spec.get('hf_model_id') or ''
                     if model_id not in self._floor_cache:
                         self._floor_cache[model_id] = weight_floor_gib(

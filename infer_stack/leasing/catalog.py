@@ -52,6 +52,10 @@ Schema (all sections optional except as referenced)::
         #   placement: {min_vram_gib: 24}
         # Optional exact local override (normally set from the TUI):
         #   placement: {gpu_indices: [1]}
+        # For a specialized image that intentionally offloads most weights
+        # into CPU RAM, the on-disk checkpoint size is NOT a VRAM lower bound.
+        # Opt out of that heuristic while still declaring the real GPU floor:
+        #   placement: {min_vram_gib: 23, weight_floor: false}
       qwen-small:
         engine: ollama
         host: local-ollama
@@ -239,7 +243,7 @@ def _parse_protocol(value: Any) -> str:
 #: Keys the endpoint-level ``placement`` block accepts. Deliberately strict —
 #: an unknown key is a typo (min_vram_gb) that would otherwise silently mean
 #: "no constraint", which on a heterogeneous host means an OOM later.
-PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices', 'node', 'pool'})
+PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices', 'node', 'pool', 'weight_floor'})
 
 
 def _placement_errors(ep: EndpointSpec) -> list[str]:
@@ -270,6 +274,11 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
                 f"endpoint '{ep.name}': placement.min_vram_gib must be a "
                 f"positive number of GiB, got {value!r}"
             )
+    weight_floor = ep.placement.get('weight_floor')
+    if weight_floor is not None and type(weight_floor) is not bool:
+        errors.append(
+            f"endpoint '{ep.name}': placement.weight_floor must be a boolean"
+        )
     indices = ep.placement.get('gpu_indices')
     if indices is not None:
         if not isinstance(indices, list) or not indices:

@@ -110,3 +110,30 @@ Reusable takeaways:
   needed for clients discovering a custom LiteLLM model.
 - Reconciliation should consider advertised capability drift as well as
   routing destinations, but never churn unchanged legacy routes.
+
+## 2026-11-05 22:17:35 -0500
+
+Model: GPT-6 (thinking configuration not exposed).
+
+The user wants Qwen3.8-Flash-Next integrated into infer-stack on their dual-3090
+workstation, ideally using only one card so the second stays available. They
+provided infer_stack and dual-3090 source archives; the upstream project also
+has a separate single-3090 runtime. I inspected the upstream single-card image
+entrypoint and Docker launcher rather than trying to run the two-card model
+with tensor_parallel_size=1 (which would not work).
+
+infer-stack already has generic vLLM image/command/env/mounts support and
+single-card placement, so this integration should remain an ordinary managed
+catalog endpoint instead of adding a special inference engine. The missing
+container privileges are added through a narrowly validated, Compose-only
+`runtime.compose` mapping (host IPC, SYS_PTRACE, memlock/stack). The existing
+VRAM size floor assumes a whole checkpoint sits on GPUs; a new explicit
+`placement.weight_floor: false` override is justified for RAM-offloaded
+runtimes, retaining the per-GPU eligibility minimum. This opt-in avoids making
+all models less safely placeable.
+
+The remaining unknown is performance and startup on the user's i9-11900KF
+platform; all verification here is static/offline. The example also avoids
+claiming a hard RAM cap where no Compose memory limit was set. Future variants
+might provide a generic explicit host memory cap, but that should be designed
+with per-host contention and leasing in mind, not smuggled into this example.

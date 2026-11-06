@@ -50,7 +50,7 @@ MANAGED_LABEL = 'infer-stack/managed'
 DEPLOYMENT_LABEL = 'infer-stack/deployment'
 # KubeAI's Model CRD is stricter than Kubernetes's usual DNS label limit.
 MODEL_NAME_MAX_LENGTH = 40
-UNSUPPORTED_RUNTIME_FIELDS = ('image', 'command', 'mounts')
+UNSUPPORTED_RUNTIME_FIELDS = ('image', 'command', 'mounts', 'compose')
 DEFAULT_NAMESPACE = 'kubeai'
 # The standard local access path: `kubectl port-forward svc/kubeai 8000:80`.
 # An ingress-fronted cluster overrides this via the kubeai_base_url setting.

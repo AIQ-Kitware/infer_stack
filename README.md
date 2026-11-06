@@ -35,6 +35,11 @@ step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
 
 ## Related work
 
+- [Qwen3.8-Flash-Next on one RTX 3090](docs/qwen38-flash-next-3090.md):
+  catalog-managed patched vLLM container with CPU expert offload, explicit
+  single-GPU placement, and persistent compiled-kernel caches (Compose backend).
+  The other GPU remains available to the host.
+
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
   and serving stack for Qwen3.8-27B. infer-stack delegates requantization,
   patched-vLLM launchers, speculative decoding, and GPU-level tuning to its
