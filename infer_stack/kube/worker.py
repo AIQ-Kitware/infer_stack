@@ -185,13 +185,17 @@ def cleanup(manager: KubeManager, *, node: str, namespace: str, run_id: str) -> 
 
 
 def plan(manager: KubeManager, *, node: str, namespace: str, expected_gpus: int,
-         resource_profile: str | None = None) -> dict:
+         resource_profile: str | None = None, serve_gpus: int = 1) -> dict:
+    if isinstance(serve_gpus, bool) or not isinstance(serve_gpus, int) or not 1 <= serve_gpus <= expected_gpus:
+        raise ValueError('serve_gpus must be between 1 and expected_gpus')
     facts = worker_facts(manager, node, expected_gpus)
     result = {'facts': facts, 'actions': [
         f'Fresh NVIDIA runtime/device query reserving all {expected_gpus} GPUs on {node} temporarily',
-        f'Create one temporary KubeAI Model on {node}; verify GPU requests, replica readiness and real generation',
+        'Record verified per-device UUID/product/memory facts in a node annotation for conservative mixed-node eligibility',
+        f'Create one temporary KubeAI Model on {node} using {serve_gpus} GPUs; verify GPU requests, replica readiness and real generation',
         'Delete only this run\'s Model/Pod; retain its reusable node profile; leave catalog/ledger/gateway untouched'],
-        'context': manager.current_context(), 'namespace': namespace, 'profile_name': None, 'profile': None, 'needs_profile': False}
+        'context': manager.current_context(), 'namespace': namespace, 'serve_gpus': serve_gpus,
+        'profile_name': None, 'profile': None, 'needs_profile': False}
     if facts['errors']:
         return result
     name, profile, missing = worker_profile(manager, facts, namespace=namespace, resource_profile=resource_profile)
@@ -232,12 +236,14 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
                kubeconfig: str | None = None,
                resource_profile: str | None = None, model=DEFAULT_MODEL,
                expected_devices: list[dict] | None = None, http=requests,
+               serve_gpus: int = 1,
                progress=print, sleep=time.sleep, clock=time.monotonic) -> dict:
     """Fresh GPU launch + node-specific KubeAI generation with bounded cleanup."""
     pod_name, model_name = _names(node, run_id)
     scope = f' --kubeconfig={shlex.quote(str(kubeconfig))}' if kubeconfig else ''
     progress(f'Acceptance run {run_id} on {node}; cleanup: infer-stack kube node test {node} --run-id={run_id} --cleanup --apply --namespace={namespace}{scope}')
-    prepared = plan(manager, node=node, namespace=namespace, expected_gpus=expected_gpus, resource_profile=resource_profile)
+    prepared = plan(manager, node=node, namespace=namespace, expected_gpus=expected_gpus,
+                    resource_profile=resource_profile, serve_gpus=serve_gpus)
     if prepared['facts']['errors']:
         raise RuntimeError('; '.join(prepared['facts']['errors']))
     for kind, name in [('pod', pod_name), ('models.kubeai.org', model_name)]:
@@ -266,8 +272,9 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
                             sharing='dedicated', capacity={}, state='live', created_at=0, updated_at=0,
                             spec={'engine': 'vllm', 'hf_model_id': model,
                                   'runtime': {'resource_profile': prepared['profile_name'], 'max_model_len': 2048,
+                                              'tensor_parallel_size': serve_gpus,
                                               'gpu_memory_utilization': 0.5},
-                                  'topology': {'tensor_parallel_size': 1}},
+                                  'topology': {'tensor_parallel_size': serve_gpus}},
                             served={model_name: {'served_model_name': model_name, 'protocol': 'chat'}})
     rendered = render_models([deployment], namespace=namespace, default_resource_profile=None)
     if rendered.errors:
@@ -277,7 +284,7 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
     doc['metadata']['labels'] = labels
     created = False
     primary_error: BaseException | None = None
-    result = {'context': prepared['context'], 'namespace': namespace, 'run_id': run_id, 'node': node, 'profile': prepared['profile_name'], 'model': model_name}
+    result = {'context': prepared['context'], 'namespace': namespace, 'run_id': run_id, 'node': node, 'profile': prepared['profile_name'], 'model': model_name, 'serve_gpus': serve_gpus}
     try:
         # Atomic create refuses occupied names, even an interrupted test.
         manager.run(['kubectl', 'create', '-f', '-'], input_text=json.dumps(pod))
@@ -300,9 +307,13 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
             if any(abs(int(prepared['facts']['memory_mib']) - d['memory_mib']) > 512 for d in observed):
                 raise RuntimeError('GFD memory label disagrees with freshly observed GPU memory')
         else:
-            result['limitations'] = ['Heterogeneous node: GFD labels are node-level; this test verifies every device, but generation uses one Kubernetes-allocated GPU, not every product.']
+            result['limitations'] = [f'Heterogeneous node: GFD labels are node-level; generation uses {serve_gpus} Kubernetes-allocated GPUs and does not imply uniform product eligibility.']
         result['devices'] = observed
         result['gfd'] = {'product': prepared['facts']['product'], 'memory_mib': prepared['facts']['memory_mib']}
+        from ..backends.kubeai import DEVICE_FACTS_ANNOTATION
+        inventory = {'version': 1, 'observed_at': time.time(), 'source': 'nvidia-smi/acceptance', 'devices': observed}
+        manager.run(['kubectl', 'patch', 'node', node, '--type=merge', '-p',
+                     json.dumps({'metadata': {'annotations': {DEVICE_FACTS_ANNOTATION: json.dumps(inventory)}}})])
         manager.run(['kubectl', '-n', namespace, 'delete', 'pod', pod_name, '--wait=true', '--timeout=180s'])
         manager.run(['kubectl', 'create', '-f', '-'], input_text=json.dumps(doc))
         deadline, last = clock() + timeout, None
@@ -342,8 +353,8 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
                 containers = spec.get('containers') or []
                 requested = sum(int(c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', 0)) for c in containers)
                 limited = sum(int(c.get('resources', {}).get('limits', {}).get('nvidia.com/gpu', 0)) for c in containers)
-                if scheduled and (requested != 1 or limited != 1 or spec.get('runtimeClassName') != 'nvidia'):
-                    raise RuntimeError('Model pod does not request/limit exactly one GPU with NVIDIA runtime')
+                if scheduled and (requested != serve_gpus or limited != serve_gpus or spec.get('runtimeClassName') != 'nvidia'):
+                    raise RuntimeError(f'Model pod does not request/limit exactly {serve_gpus} GPU(s) with NVIDIA runtime')
                 state = f'scheduled on {scheduled}' if scheduled else state
                 for c in p.get('status', {}).get('containerStatuses') or []:
                     waiting = c.get('state', {}).get('waiting') or {}
@@ -364,8 +375,8 @@ def acceptance(manager: KubeManager, *, node: str, namespace: str, release: str,
                                                           ready_pods[0]['metadata']['name'], '--',
                                                           'nvidia-smi', '--query-gpu=uuid,name,memory.total',
                                                           '--format=csv,noheader,nounits']))
-                if len(serving_devices) != 1 or serving_devices[0] not in observed:
-                    raise RuntimeError("Serving replica must expose exactly one of this worker's verified GPUs")
+                if len(serving_devices) != serve_gpus or any(d not in observed for d in serving_devices):
+                    raise RuntimeError(f"Serving replica must expose exactly {serve_gpus} of this worker's verified GPUs")
                 result['serving_devices'] = serving_devices
                 with api_access(namespace=namespace, kubeconfig=kubeconfig, base_url=base_url) as base:
                     try:
@@ -411,6 +422,8 @@ def api_access(*, namespace: str, kubeconfig: str | None = None, base_url: str |
     if kubeconfig:
         args += ['--kubeconfig', str(Path(kubeconfig).expanduser().resolve())]
     args += ['-n', namespace, 'port-forward', '--address=127.0.0.1', 'service/kubeai', ':80']
+    from .context import command
+    args = command(args)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         assert proc.stdout is not None
@@ -451,7 +464,9 @@ def private_file(path: str | Path, purpose: str) -> Path:
 
 
 def onboarding_plan(local: KubeManager, cluster: KubeManager, *, server: str,
-                    node: str, version: str | None = None) -> dict:
+                    node: str, version: str | None = None,
+                    data_dir: str | None = None, image_gib: float | None = None,
+                    kubelet_config: str | None = None) -> dict:
     """Verify host prerequisites and the explicit administrative cluster target."""
     _names(node, 'onboardcheck')
     if not server.startswith('https://'):
@@ -477,7 +492,11 @@ def onboarding_plan(local: KubeManager, cluster: KubeManager, *, server: str,
         version = next(iter(versions))
     if versions and version not in versions:
         raise RuntimeError(f'Requested K3s version {version} differs from control-plane versions {sorted(str(v) for v in versions)}')
+    from .preflight import storage_facts
+    storage = storage_facts(data_dir or '/var/lib/rancher/k3s', image_gib=image_gib,
+                            kubelet_config=kubelet_config)
     return {'node': node, 'server': server, 'version': version, 'devices': hardware,
+            'data_dir': data_dir, 'storage': storage,
             'expected_gpus': len(hardware), 'actions': [
                 'Verify existing agent membership or install/start a K3s agent using the private token file',
                 'Verify local containerd NVIDIA handler; restart this agent only if discovery needs it',
@@ -489,6 +508,7 @@ def onboarding_plan(local: KubeManager, cluster: KubeManager, *, server: str,
 def onboard(local: KubeManager, cluster: KubeManager, prepared: dict, *, token_file: str,
             namespace: str, release: str, base_url: str | None, run_id: str,
             kubeconfig: str | None = None,
+            serve_gpus: int = 1,
             timeout=900, model=DEFAULT_MODEL, resource_profile=None,
             progress=print, sleep=time.sleep, clock=time.monotonic, http=requests) -> dict:
     """Join, wait for the exact worker, then use the same targeted acceptance."""
@@ -497,9 +517,11 @@ def onboard(local: KubeManager, cluster: KubeManager, prepared: dict, *, token_f
     from .operations import install
 
     node = prepared['node']
+    if isinstance(serve_gpus, bool) or not isinstance(serve_gpus, int) or not 1 <= serve_gpus <= prepared['expected_gpus']:
+        raise ValueError('serve_gpus must be between 1 and expected_gpus; no host changes made')
     k3s.join(server=prepared['server'], token_file=token_file, node_name=node,
-             version=prepared['version'], run=local.run)
-    config_path = '/var/lib/rancher/k3s/agent/etc/containerd/config.toml'
+             version=prepared['version'], data_dir=prepared.get('data_dir'), run=local.run)
+    config_path = str(Path(prepared.get('data_dir') or '/var/lib/rancher/k3s') / 'agent/etc/containerd/config.toml')
     runtime_config = local.run(['sudo', '-n', 'cat', config_path])
     if 'nvidia-container-runtime' not in runtime_config:
         progress(f'{node}: restarting local agent for NVIDIA runtime discovery')
@@ -539,5 +561,6 @@ def onboard(local: KubeManager, cluster: KubeManager, prepared: dict, *, token_f
         install(cluster, report)
     return acceptance(cluster, node=node, namespace=namespace, release=release,
                       expected_gpus=prepared['expected_gpus'], expected_devices=prepared['devices'],
+                      serve_gpus=serve_gpus,
                       base_url=base_url, kubeconfig=kubeconfig, run_id=run_id, timeout=timeout, model=model,
                       resource_profile=resource_profile, progress=progress, sleep=sleep, clock=clock, http=http)

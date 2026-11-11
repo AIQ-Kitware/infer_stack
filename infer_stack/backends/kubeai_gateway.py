@@ -72,10 +72,12 @@ class ClusterGateway(ConvergeScaffold):
         images: dict[str, str] | None = None,
         http: Any = None,
         assume_yes: bool = True,
+        kubeconfig: str | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self.kubeconfig = kubeconfig
         self.run = run
         self.node_port = int(node_port)
         self.url = url
@@ -115,7 +117,8 @@ class ClusterGateway(ConvergeScaffold):
         return self.node_port
 
     def _kubectl(self, args: list[str]) -> str:
-        return self.run(['kubectl', '-n', self.namespace, *args])
+        target = ['--kubeconfig', self.kubeconfig] if self.kubeconfig else []
+        return self.run(['kubectl', *target, '-n', self.namespace, *args])
 
     def base_url(self) -> str:
         """Where clients reach it: the ``url`` setting, else a node's NodePort.
@@ -290,8 +293,11 @@ class ClusterGateway(ConvergeScaffold):
     # -- the recovery profile ------------------------------------------------
 
     def render_profile(self) -> dict[str, Any]:
-        return {'placement': 'cluster', 'node_port': self.node_port, 'url': self.url,
+        profile = {'placement': 'cluster', 'node_port': self.node_port, 'url': self.url,
                 'image': self.images['litellm']}
+        if self.kubeconfig:
+            profile['kubeconfig'] = self.kubeconfig
+        return profile
 
     def use_profile(self, profile: dict[str, Any]) -> None:
         if profile.get('placement') != 'cluster':
@@ -301,6 +307,8 @@ class ClusterGateway(ConvergeScaffold):
                 'the active recovery snapshot has the gateway on this host; '
                 '`infer-stack stack down` it before moving it into the cluster')
         self.node_port = int(profile.get('node_port') or self.node_port)
+        if 'kubeconfig' in profile:
+            self.kubeconfig = profile['kubeconfig']
         self.url = profile.get('url') or self.url
         self.images['litellm'] = profile.get('image') or self.images['litellm']
 

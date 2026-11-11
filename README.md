@@ -46,6 +46,13 @@ remain recovery paths.
 
 ## Related work
 
+- [Qwen3.8-Flash-Next on one RTX 3090](docs/qwen38-flash-next-3090.md):
+  `infer-stack catalog import qwen38-flash-next-3090` installs a bundled,
+  non-destructive Compose preset; `infer-stack paths runtime_dir` supplies its
+  configured weight/cache root directly for download commands. The patched
+  vLLM backend offloads experts to host RAM and reserves only GPU 1, leaving
+  GPU 0 available.
+
 - [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
   and serving stack for Qwen3.8-27B. infer-stack delegates requantization,
   patched-vLLM launchers, speculative decoding, and GPU-level tuning to its
@@ -110,7 +117,8 @@ infer-stack test <endpoint>           # one generation through the gateway
 infer-stack leases                    # desired vs running, per deployment
 infer-stack status                    # paths, backend and a lease summary
 infer-stack release --all             # drop every lease
-infer-stack paths                     # where settings, catalog, ledger and caches live
+infer-stack paths                     # grouped inventory of config, data and leasing paths
+infer-stack paths runtime_dir         # just one configured directory, for $(...)
 infer-stack version
 infer-stack help tree                 # the whole command surface
 ```
@@ -170,6 +178,15 @@ infer-stack apply                           # start it (or `release --all` to di
 ```
 
 ## Catalog model
+
+A built-in catalog preset can be imported additively without locating or editing
+`catalog.yaml` (for example `infer-stack catalog import qwen38-flash-next-3090`).
+The import is idempotent and rejects differing existing names rather than
+clobbering them. Use `--dry-run` to preview the merged catalog. A single
+path can be queried as plain, absolute stdout using `infer-stack paths NAME`
+(`runtime_dir`, `catalog`, `compose_file`, and inventory labels are supported);
+`--json` returns status metadata for that entry. The grouped `infer-stack
+paths` inventory is unchanged.
 
 `catalog.yaml` is the one user-edited description of what can run. Its
 sections:
@@ -330,7 +347,33 @@ infer-stack acquire chat
 ```
 
 `infer-stack catalog suggest --apply` fills the catalog with endpoints sized
-for the detected GPUs instead.
+for the detected GPUs instead. The normal suggestions are a curated *frontier*
+across model sizes and modalities, plus GPT-2 and SmolLM2-135M smoke-test
+models. **Every frontier model that fits is included**, even when a larger one
+also fits. This means a 48 GiB machine still suggests the tiny models and the
+0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 adds distinct multimodal choices;
+HyperQwen 27B and Qwen3.5 122B appear on compatible hardware. The frontier is
+curated, not a claim of measured statistical dominance.
+
+The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
+Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting
+them automatically. All options remain discoverable:
+
+```bash
+infer-stack catalog suggest                 # curated fitting frontier + smoke tests
+infer-stack catalog suggest --all           # every hardware-compatible pool entry
+infer-stack catalog suggest --include mistral-7b-instruct
+infer-stack catalog suggest --apply         # additive: does not remove old entries
+```
+
+GPT-2 is suggested as a `completions` endpoint (it has no chat template),
+while SmolLM2-135M-Instruct remains a `chat` debugging endpoint.
+
+Suggested endpoints use `reclaim: stop` by default: the last released/expired
+lease frees their resources. Keep-warm requires an explicit per-endpoint policy,
+and is not selected automatically based on model size. Changing the suggestions
+does **not** prune previously added catalog entries; remove unwanted entries
+explicitly after checking for leases or other references.
 
 ### Test that it is responding
 
@@ -376,10 +419,11 @@ infer-stack clean -f                 # no leases, nothing on a GPU; the gateway 
 infer-stack stack down               # docker compose down, bypassing the ledger
 ```
 
-After a plain `release`, `keep-warm` endpoints (the default `reclaim` policy)
-stay loaded until another lease needs their GPUs or `infer-stack evict` stops
-them. `stack down` releases no lease, so the next `apply` or `acquire` brings
-leased models back.
+After the final `release` on an endpoint, the default `reclaim: stop` tears the
+model down. Endpoints explicitly set to `reclaim: keep-warm` remain resident
+until another lease needs their GPUs or `infer-stack evict` stops them.
+`stack down` releases no lease, so the next `apply` or `acquire` brings leased
+models back.
 
 All state is bind-mounted from the data dir, so none of these delete it,
 including `stack down --volumes`. For a destructive reset, remove the
@@ -565,6 +609,8 @@ the managed key and the endpoint alias on either backend.
   [docs/cluster-setup.md](docs/cluster-setup.md).
 * KubeAI setup, settings and semantics:
   [docs/kubeai-backend.md](docs/kubeai-backend.md).
+* Authenticated remote CLI/TUI, optional PostgreSQL authority and usage facts:
+  [remote control service](docs/kubeai-backend.md#remote-control-service).
 * What matches Compose, what does not yet, and what is deliberate:
   [docs/backend-parity.md](docs/backend-parity.md); the plan to close the
   rest: [docs/planning/backend-parity-roadmap.md](docs/planning/backend-parity-roadmap.md).
@@ -646,9 +692,10 @@ installed runtime on startup; bootstrap restarts local K3s only when runtime
 discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels, and verifies unknown
 GPU-node runtime handlers with small node-specific canary pods. Root admin
 credentials stay `0600`; a private `0600` copy lives at
-`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Select the
-local server explicitly with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`
-before inventory/install; rerun bootstrap to refresh copied certificates.
+`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Bootstrap
+saves that path as infer-stack's `kubeconfig` setting; raw shell kubectl/Helm
+can select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`.
+Rerun bootstrap to refresh copied certificates.
 
 `kube install` shows inferred Helm values; `--apply` uses Helm upgrade/install
 and checks readiness afterward. `--dry-run`/`--plan` forces read-only behavior.
@@ -726,7 +773,10 @@ vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
 plans a local GPU worker join and node-specific acceptance; add `--apply` to
 execute it. Host NVIDIA drivers/toolkit are prerequisites. It infers the server
 version, verifies every locally detected device, then checks actual one-GPU
-KubeAI placement and generation on this worker. Admin credentials are explicit
+KubeAI placement and generation on this worker by default. `--serve-gpus=N`
+adds multi-GPU serving acceptance with a compatible model. `--k3s-data-dir`,
+`--image-headroom-gib` and `--kubelet-config` expose storage preflight decisions.
+Admin credentials are explicit
 private files, separate from any selected EKS context.
 
 For an already joined worker, run `infer-stack kube node test namek

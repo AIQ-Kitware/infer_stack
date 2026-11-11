@@ -17,6 +17,11 @@ data, not in Python. The fields, all under ``runtime`` and all optional:
     outside vLLM's usual ``/root/.cache``. With ``command`` set they are the
     only mounts (such an image does not use vLLM's caches); on the stock
     command they are added to them.
+``compose``
+    Compose-only container options for a specialized image. Only ``ipc``,
+    ``cap_add``, and ``ulimits`` are accepted (e.g. host IPC, SYS_PTRACE,
+    memlock/stack limits for a custom MoE runtime). Kubernetes never inherits
+    these Docker-specific settings.
 ``extra_args``
     Extra vLLM flags appended to the stock command (after infer-stack's own,
     so a repeated flag takes the extra value). Not allowed with ``command``.
@@ -33,12 +38,13 @@ never share a process.
 
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import PurePosixPath
 from typing import Any
 
 #: The fields this module owns, in the order they are documented.
-LAUNCH_FIELDS = ('command', 'env', 'mounts', 'extra_args')
+LAUNCH_FIELDS = ('command', 'env', 'mounts', 'extra_args', 'compose')
 
 #: The port every engine container serves on (what routing and probes use).
 ENGINE_PORT = 8000
@@ -188,6 +194,33 @@ def launch_errors(name: str, engine: str, runtime: dict[str, Any]) -> list[str]:
                     errors.append(f'{where}: runtime.mounts.{target} must be a '
                                   'subdirectory of the runtime data dir, not '
                                   f'{sub!r}')
+    compose = runtime.get('compose')
+    if compose is not None:
+        if not isinstance(compose, dict):
+            errors.append(f'{where}: runtime.compose must be a mapping')
+        else:
+            unknown = sorted(set(compose) - {'ipc', 'cap_add', 'ulimits'}, key=str)
+            if unknown:
+                errors.append(f'{where}: unknown runtime.compose fields {unknown}')
+            if 'ipc' in compose and compose['ipc'] != 'host':
+                errors.append(f"{where}: runtime.compose.ipc only supports 'host'")
+            if compose.get('ipc') == 'host' and runtime.get('shm_size'):
+                errors.append(f'{where}: runtime.shm_size and runtime.compose.ipc '
+                              'cannot both be set')
+            if 'cap_add' in compose and (not isinstance(compose['cap_add'], list)
+                    or not compose['cap_add']
+                    or any(v != 'SYS_PTRACE' for v in compose['cap_add'])
+                    or len(set(compose['cap_add'])) != len(compose['cap_add'])):
+                errors.append(f'{where}: runtime.compose.cap_add currently '
+                              'supports only [SYS_PTRACE]')
+            if 'ulimits' in compose:
+                limits = compose['ulimits']
+                if (not isinstance(limits, dict) or not limits
+                        or set(limits) - {'memlock', 'stack'}
+                        or any(type(v) is not int or v < -1 or v == 0
+                               for v in limits.values())):
+                    errors.append(f'{where}: runtime.compose.ulimits must map '
+                                  'memlock/stack to positive integers or -1')
     extra = runtime.get('extra_args') or []
     if extra and command:
         errors.append(f'{where}: runtime.extra_args apply to the stock vLLM command; '
@@ -210,8 +243,13 @@ def launch_identity(runtime: dict[str, Any]) -> dict[str, Any]:
     for key in LAUNCH_FIELDS:
         value = runtime.get(key)
         if value:
-            out[key] = ({str(k): env_string(v) for k, v in value.items()}
-                        if isinstance(value, dict) else [str(v) for v in value])
+            if key == 'compose':
+                # Nested container options are part of the deployment identity.
+                # JSON serialization of the structural key canonicalizes keys.
+                out[key] = copy.deepcopy(value)
+            else:
+                out[key] = ({str(k): env_string(v) for k, v in value.items()}
+                            if isinstance(value, dict) else [str(v) for v in value])
     return out
 
 

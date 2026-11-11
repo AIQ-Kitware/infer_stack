@@ -1,0 +1,5 @@
+models:
+  org/mock-cold:
+    latency_s: 1.5
+  org/mock-warm:
+    latency_s: 0.1

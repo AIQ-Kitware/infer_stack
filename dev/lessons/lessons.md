@@ -232,3 +232,15 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
     placements; `docs/slurm-compatibility.md` describes the two-client case.
   - **Applies when:** a batch scheduler reserves GPUs per client job while
     infer-stack coalesces their requests onto common deployments.
+- **Lesson:** KubeAI's per-Model scale-down delay is additional to its
+  controller-wide request averaging window. A sampled request can keep the
+  desired replica count positive until it leaves that window, even after all
+  requests finish; bound both settings in scale-to-zero integration tests.
+- **Evidence / MWE:** KubeAI v0.23.2
+  [`values.yaml`](https://github.com/kubeai-project/kubeai/blob/v0.23.2/charts/kubeai/values.yaml)
+  (`modelAutoscaling.timeWindow: 10m`) and
+  [`autoscaler.go`](https://github.com/kubeai-project/kubeai/blob/v0.23.2/internal/modelautoscaler/autoscaler.go)
+  (ceil of moving-average requests / target). The 2026-10-08 service test
+  timed out with zero current requests but one sampled request in its
+  60-sample history; a 20-second window passed return-to-zero acceptance.
+- **Applies when:** testing or tuning on-demand KubeAI endpoints.

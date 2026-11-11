@@ -89,7 +89,8 @@ def compose_catalog_route(alias: str, request: Any) -> GatewayRoute | None:
         served = request.served.get('served_model_name') or alias
         return GatewayRoute(alias, 'openai', served,
                             f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1',
-                            max_input_tokens=effective_max_model_len(request.spec.get('runtime')))
+                            max_input_tokens=effective_max_model_len(request.spec.get('runtime')),
+                            reasoning_efforts=tuple(request.served.get('reasoning_efforts') or ()))
     if request.engine == 'ollama':
         host = request.spec.get('host') or request.host
         tag = request.served.get('model') or alias
@@ -187,10 +188,21 @@ def deployment_routes(
             for endpoint in sorted(deployment.served):
                 context = deployment_route_max_input_tokens(
                     deployment, endpoint, catalog=catalog)
+                levels = tuple((deployment.served.get(endpoint) or {}).get(
+                    'reasoning_efforts') or ())
+                # On upgrade, a live deployment may predate the capability
+                # field. The published catalog is authoritative for that alias.
+                if catalog is not None and endpoint in (
+                    getattr(catalog, 'endpoints', None) or {}
+                ):
+                    try:
+                        levels = tuple(catalog.endpoints[endpoint].reasoning_efforts)
+                    except (AttributeError, KeyError):
+                        pass
                 routes.append(GatewayRoute(
                     endpoint, 'openai', served, api_base, origin='deployment',
                     route_id=_route_id(deployment.id, endpoint) if dynamic else None,
-                    max_input_tokens=context))
+                    max_input_tokens=context, reasoning_efforts=levels))
         elif deployment.engine == 'ollama':
             host = deployment.spec.get('host') or deployment.id
             service = (ollama_service_name(deployment) if dynamic
@@ -292,6 +304,9 @@ def remembered_rows(
                 context = deployment_route_max_input_tokens(deployment, endpoint)
                 rows[endpoint] = {'engine': 'vllm', 'served': served,
                                   'max_input_tokens': context}
+                levels = (deployment.served.get(endpoint) or {}).get('reasoning_efforts')
+                if levels:
+                    rows[endpoint]['reasoning_efforts'] = list(levels)
         elif deployment.engine == 'ollama':
             host = deployment.spec.get('host') or deployment.id
             for endpoint, payload in sorted(deployment.served.items()):
@@ -333,7 +348,8 @@ def registry_route(name: str, row: Any) -> GatewayRoute | None:
             name, 'openai', served,
             f'http://{vllm_service_name_for(served)}:{VLLM_CONTAINER_PORT}/v1',
             origin='registry',
-            max_input_tokens=_remembered_context(row))
+            max_input_tokens=_remembered_context(row),
+            reasoning_efforts=tuple(row.get('reasoning_efforts') or ()))
     if engine == 'ollama':
         host = row.get('host') or name
         return GatewayRoute(
@@ -1388,8 +1404,11 @@ class Gateway(ConvergeScaffold):
             'model_name': route.get('model_name'),
             'model': params.get('model'),
             'api_base': params.get('api_base'),
+            'allowed_openai_params': params.get('allowed_openai_params'),
             'key_env': info.get('infer_stack_key_env'),
             'max_input_tokens': info.get('max_input_tokens'),
+            'supports_reasoning': info.get('supports_reasoning'),
+            'reasoning_effort_levels': info.get('reasoning_effort_levels'),
         }
 
     @staticmethod
@@ -1405,9 +1424,17 @@ class Gateway(ConvergeScaffold):
         delete/re-add loop.  When infer-stack *does* advertise a context window,
         it remains strict and any difference is semantic drift.
         """
+        current = dict(current)
         if desired.get('max_input_tokens') is None:
-            current = dict(current)
             current['max_input_tokens'] = None
+        # LiteLLM may derive a false/empty reasoning capability from its own
+        # model map. Only infer-stack's positive per-endpoint declaration is
+        # authoritative; don't churn an otherwise identical legacy route.
+        if not desired.get('allowed_openai_params'):
+            current['allowed_openai_params'] = None
+        if not desired.get('reasoning_effort_levels'):
+            current['supports_reasoning'] = None
+            current['reasoning_effort_levels'] = None
         return desired == current
 
     def _list_managed_routes(

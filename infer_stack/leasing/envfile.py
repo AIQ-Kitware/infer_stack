@@ -140,8 +140,9 @@ def render_env_file(descriptor: dict[str, Any]) -> str:
         export INFER_STACK_ENDPOINT_QWEN_CODER=qwen-coder
         export INFER_STACK_MODELS=qwen-coder
     """
+    import shlex
     return ''.join(
-        f'export {key}={value}\n'
+        f'export {key}={shlex.quote(str(value))}\n'
         for key, value in descriptor_env(descriptor).items()
     )
 

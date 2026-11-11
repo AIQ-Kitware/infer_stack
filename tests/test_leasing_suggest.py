@@ -54,6 +54,71 @@ def test_builtin_pool_is_nonempty_and_real():
     assert pool['gemma4-31b'].hf_model_id == 'google/gemma-4-31B-it'
     # the demo's models are reproducible from the pool
     assert {'smollm2-1.7b', 'qwen2.5-0.5b'} <= set(pool)
+    assert {name for name, model in pool.items() if model.suggestion_tier == 'smoke'} == {
+        'gpt2', 'smollm2-135m',
+    }
+    assert pool['qwen3.5-0.8b'].suggestion_tier == 'frontier'
+    assert pool['qwen3.5-122b-a10b'].suggestion_tier == 'frontier'
+    assert pool['gemma4-e2b'].suggestion_tier == 'frontier'
+    assert pool['qwen3.5-27b'].suggestion_tier == 'optional'
+    assert pool['qwen3.5-35b-a3b'].suggestion_tier == 'optional'
+    assert pool['gpt-oss-20b'].suggestion_tier == 'optional'
+    assert pool['qwen2.5-7b'].suggestion_tier == 'optional'
+    assert pool['gpt2'].protocol == 'completions'
+    assert pool['smollm2-135m'].protocol == 'chat'
+
+
+def test_frontier_is_hardware_filtered_not_pruned_by_larger_models():
+    # A larger GPU must *add* size classes, not replace the tiny useful models.
+    sizes = ['1x4', '1x8', '1x12', '1x24', '1x96']
+    catalogs = [suggest_catalog(simulate_inventory(size)) for size in sizes]
+    for smaller, bigger in zip(catalogs, catalogs[1:]):
+        assert set(smaller['models']) <= set(bigger['models'])
+
+    big = set(catalogs[-1]['models'])
+    assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-2b',
+            'qwen3.5-4b', 'qwen3.5-9b', 'qwen3.8-27b-dbirks-hyperqwen',
+            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'} <= big
+    assert 'qwen3.5-122b-a10b' not in big  # still needs two 80 GiB GPUs
+    assert 'qwen3.5-27b' not in big           # non-frontier, though it fits
+    assert 'qwen3.5-35b-a3b' not in big
+    assert 'gpt-oss-20b' not in big
+
+
+def test_large_multi_gpu_frontier_includes_122b_and_smaller_models():
+    models = suggest_catalog(simulate_inventory('4x96'))['models']
+    assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-9b',
+            'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-122b-a10b',
+            'qwen3.5-122b-a10b-fp8', 'gemma4-e2b', 'gemma4-e4b',
+            'gemma4-26b', 'gemma4-31b'} <= set(models)
+
+
+def test_gpt2_debug_endpoint_uses_completions_protocol():
+    cat = Catalog.from_dict(suggest_catalog(simulate_inventory('1x24')))
+    assert cat.endpoints['gpt2'].protocol == 'completions'
+    assert cat.endpoints['smollm2-135m'].protocol == 'chat'
+
+
+def test_all_and_include_restore_optional_models_without_ignoring_hardware():
+    inv = simulate_inventory('1x48')
+    default = suggest_catalog(inv)
+    all_models = suggest_catalog(inv, all_models=True)
+    selected = suggest_catalog(inv, include=['gpt-oss-20b'])
+    assert 'qwen2.5-7b' not in default['models']
+    assert 'qwen2.5-7b' in all_models['models']
+    assert 'gpt-oss-20b' not in default['models']
+    assert 'gpt-oss-20b' in selected['models']
+    assert 'qwen2.5-7b' not in selected['models']
+    assert 'gpt-oss-20b' not in suggest_catalog(
+        simulate_inventory('1x24'), include=['gpt-oss-20b']
+    )['models']
+    assert 'qwen3.8-27b-dbirks-hyperqwen-huge' in suggest_catalog(
+        simulate_inventory('1x24'), all_models=True
+    )['endpoints']
+
+    import pytest
+    with pytest.raises(ValueError, match='unknown suggestion model'):
+        suggest_catalog(inv, include=['does-not-exist'])
 
 
 def test_derive_runtime_never_sizes_below_pool_default():
@@ -75,39 +140,39 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     # should be suggested; the ones needing a bigger/second GPU should not.
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6)]}
     models = suggest_catalog(inv)['models']
-    fits = {'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-0.8b', 'qwen3.5-2b',
-            'qwen3.5-4b', 'qwen3.5-9b',
-            'qwen3.6-35b-a3b-fp8', 'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b',
-            'gemma4-31b'}
+    fits = {'gpt2', 'smollm2-135m', 'qwen3.8-27b-dbirks-hyperqwen',
+            'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
+            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'}
     too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
                'qwen3.6-35b-a3b'}  # 35b-a3b needs 2 GPUs even at 24 GiB each
     assert fits <= set(models)
     assert too_big.isdisjoint(models)
+    assert 'qwen3.6-35b-a3b-fp8' not in models  # opt-in even if it fits
 
 
 def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6)]}
     out = suggest_catalog(inv)
     base = 'qwen3.8-27b-dbirks-hyperqwen'
-    assert {base, f'{base}-long', f'{base}-huge'} <= set(out['endpoints'])
-    # One model identity, three explicit ways to serve it.
-    assert set(out['models']) & {f'{base}-long', f'{base}-huge'} == set()
+    assert {base, f'{base}-long'} <= set(out['endpoints'])
+    assert f'{base}-huge' not in out['endpoints']  # experimental, via --all
+    # One model identity, two default ways to serve it.
+    assert set(out['models']) & {f'{base}-long'} == set()
     assert out['endpoints'][f'{base}-long']['model'] == base
-    assert out['endpoints'][f'{base}-huge']['model'] == base
 
     fast = out['endpoints'][base]['runtime']
     long = out['endpoints'][f'{base}-long']['runtime']
-    huge = out['endpoints'][f'{base}-huge']['runtime']
     assert (fast['max_model_len'], fast['env']['SPEC'], fast['env']['CTX']) == (
         65536, 'dflash2', 'fast')
     assert (long['max_model_len'], long['env']['SPEC'], long['env']['CTX']) == (
         150000, 'mtp', 'long')
+    huge = suggest_catalog(inv, all_models=True)['endpoints'][f'{base}-huge']['runtime']
     assert (huge['max_model_len'], huge['env']['SPEC'], huge['env']['CTX']) == (
         245760, 'dflash2', 'huge')
     # The variants inherit the generic launcher contract rather than repeating
     # a model-specific recipe in Python.  A homogeneous host needs no arbitrary
     # exact pin: the min-VRAM placement is sufficient for this capability class.
-    for name in (f'{base}-long', f'{base}-huge'):
+    for name in (f'{base}-long',):
         ep = out['endpoints'][name]
         assert ep['runtime']['command'] == ['single']
         assert ep['runtime']['env']['MAX_LEN'] == '{max_model_len}'
@@ -146,7 +211,8 @@ def test_hyperqwen_variants_follow_capability_and_vram_classes():
         _gpu(0, 23.99, name='NVIDIA RTX A5000', compute_cap=8.6),
     ]}
     small_eps = suggest_catalog(small)['endpoints']
-    assert {base, f'{base}-long', f'{base}-huge'} <= set(small_eps)
+    assert {base, f'{base}-long'} <= set(small_eps)
+    assert f'{base}-huge' not in small_eps
     assert f'{base}-full' not in small_eps
 
     # A roomy Ampere card keeps the speed-first baseline and gains an ordinary-
@@ -180,7 +246,8 @@ def test_suggested_catalog_roundtrips_through_catalog():
 
 def test_fit_filter_tracks_gpu_size():
     one_small = suggest_catalog(simulate_inventory('1x16'))['models']
-    assert 'qwen2.5-7b' in one_small        # 16 GiB model fits a 16 GiB GPU
+    assert 'qwen3.5-4b' in one_small
+    assert 'qwen2.5-7b' not in one_small     # optional despite fitting
     assert 'qwen3.8-27b-dbirks-hyperqwen' not in one_small   # 24 GiB serving floor
     assert 'gpt-oss-20b' not in one_small    # 40 GiB model does not
     assert 'qwen2.5-72b' not in one_small    # needs two GPUs
@@ -261,14 +328,18 @@ def test_qwen38_high_vram_turing_gets_measured_full_context_profiles_only():
     out = suggest_catalog(inv)
     assert base in out['models']
     assert base not in out['endpoints']  # speculative default is Ampere+
-    assert {f'{base}-turing-fast-full', f'{base}-turing-full'} <= set(out['endpoints'])
+    assert f'{base}-turing-fast-full' in out['endpoints']
     fast = out['endpoints'][f'{base}-turing-fast-full']
     assert fast['runtime']['max_model_len'] == 262144
     assert fast['runtime']['command'] == ['batch']
     assert fast['runtime']['env']['MODEL'].endswith('AutoRound-fast')
     assert '--dtype=half' in fast['runtime']['env']['EXTRA_ARGS']
     assert '--attention-backend=TRITON_ATTN' in fast['runtime']['env']['EXTRA_ARGS']
-    assert fast['reclaim']['policy'] in {'keep-warm', 'stop'}
+    assert fast['reclaim']['policy'] == 'stop'
+    assert f'{base}-turing-full' not in out['endpoints']
+    assert f'{base}-turing-full' in suggest_catalog(
+        inv, all_models=True
+    )['endpoints']
 
     # Turing with only 24 GiB has neither the Ampere speculative path nor enough
     # room for the measured ordinary-KV full-context recipe.
@@ -353,14 +424,12 @@ def test_tensor_parallel_for_multi_gpu_model():
     assert rt['tensor_parallel_size'] == 2
 
 
-def test_largest_fitting_model_is_kept_warm():
-    out = suggest_catalog(simulate_inventory('1x48'))
-    warm = [n for n, e in out['endpoints'].items()
-            if e['reclaim']['policy'] == 'keep-warm']
-    assert len(warm) == 1
-    others = [e['reclaim']['policy'] for n, e in out['endpoints'].items()
-              if n not in warm]
-    assert set(others) == {'stop'}
+def test_no_suggested_endpoint_is_implicitly_kept_warm():
+    for hardware in ('1x8', '1x24', '1x48@7.5', '4x96'):
+        for all_models in (False, True):
+            out = suggest_catalog(simulate_inventory(hardware), all_models=all_models)
+            assert out['endpoints']
+            assert {ep['reclaim']['policy'] for ep in out['endpoints'].values()} == {'stop'}
 
 
 def test_display_gpu_reservation_shrinks_the_pool():
@@ -370,8 +439,8 @@ def test_display_gpu_reservation_shrinks_the_pool():
     ]}
     reserved = suggest_catalog(inv, reserve_display_gpu='auto')['models']
     used_all = suggest_catalog(inv, reserve_display_gpu=False)['models']
-    assert 'qwen2.5-72b' not in reserved     # only 1 usable GPU -> no 2-GPU model
-    assert 'qwen2.5-72b' in used_all         # both GPUs -> it fits
+    assert 'qwen3.5-122b-a10b' not in reserved     # only one 80 GiB GPU
+    assert 'qwen3.5-122b-a10b' in used_all         # two 80 GiB GPUs
 
 
 def test_empty_inventory_yields_empty_suggestion():
@@ -386,14 +455,17 @@ def test_a_4x96_host_gets_the_former_recipes_as_variants():
     out = suggest_catalog(inv)
     eps = out['endpoints']
     wanted = {'qwen3.5-122b-a10b-tp4-128k': (4, 131072),
-              'qwen3.5-122b-a10b-fp8-tp4-262k': (4, 262144),
-              'qwen3.6-35b-a3b-tp2-262k': (2, 262144)}
+              'qwen3.5-122b-a10b-fp8-tp4-262k': (4, 262144)}
     for name, (tp, ctx) in wanted.items():
         rt = eps[name]['runtime']
         assert (rt['tensor_parallel_size'], rt['max_model_len']) == (tp, ctx)
         assert rt['shm_size'] == '16g'
         assert rt['extra_args'] == ['--language-model-only', '--reasoning-parser', 'qwen3']
     Catalog.from_dict(out)                          # a valid catalog as suggested
+    assert 'qwen3.6-35b-a3b-tp2-262k' not in eps
+    assert 'qwen3.6-35b-a3b-tp2-262k' in suggest_catalog(
+        inv, all_models=True
+    )['endpoints']
 
     small = {'gpu_count': 2, 'gpus': [_gpu(i, 48) for i in range(2)]}
     assert not set(wanted) & set(suggest_catalog(small)['endpoints'])

@@ -165,6 +165,9 @@ class CatalogUnion:
         try:
             mine = cat.resolve_endpoint(request.endpoint).to_request(
                 sharing_override=request.sharing)
+            from .cluster_placement import narrow
+            placement = request.spec.get('placement') or {}
+            mine = narrow([mine], node=placement.get('node'), pool=placement.get('pool'))[0]
         except (CatalogError, ValueError):
             return False
         return dataclasses.asdict(mine) == dataclasses.asdict(request)

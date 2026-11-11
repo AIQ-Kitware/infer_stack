@@ -72,6 +72,11 @@ class Worker:
             return json.dumps({'items': self.nodes})
         if args[:3] == ['kubectl', 'get', 'node']:
             return json.dumps(next(n for n in self.nodes if n['metadata']['name'] == args[3]))
+        if args[:3] == ['kubectl', 'patch', 'node']:
+            target = next(n for n in self.nodes if n['metadata']['name'] == args[3])
+            patch = json.loads(args[args.index('-p') + 1])
+            target['metadata'].setdefault('annotations', {}).update(patch['metadata']['annotations'])
+            return ''
         if args[0] == 'kubectl' and 'configmap' in args:
             return json.dumps({'data': {'system.yaml': yaml.safe_dump({'resourceProfiles': self.profiles})}})
         if args[:2] == ['helm', 'list']:
@@ -158,7 +163,7 @@ def test_plan_is_read_only_and_aggregate_does_not_mask_broken_worker():
     assert not any('create' in c for c in w.calls)
 
 
-@pytest.mark.parametrize('change,match', [('landing', 'expected namek'), ('model_gpu_count', 'exactly one GPU')])
+@pytest.mark.parametrize('change,match', [('landing', 'expected namek'), ('model_gpu_count', 'exactly 1 GPU')])
 def test_wrong_placement_or_gpu_request_fails_and_cleans(change, match):
     w = Worker()
     setattr(w, change, 'aiq-gpu' if change == 'landing' else 2)

@@ -276,7 +276,8 @@ def _hyperqwen_from_suggestion(endpoint_name=None, **runtime_changes):
     from infer_stack.leasing.suggest import suggest_catalog
 
     frag = suggest_catalog({'gpu_count': 1, 'gpus': [
-        {'index': 0, 'name': 'NVIDIA GeForce RTX 3090', 'memory_gib': 24}]})
+        {'index': 0, 'name': 'NVIDIA GeForce RTX 3090', 'memory_gib': 24}]},
+        all_models=bool(endpoint_name and endpoint_name.endswith('-huge')))
     endpoint_name = endpoint_name or 'qwen3.8-27b-dbirks-hyperqwen'
     ep = frag['endpoints'][endpoint_name]
     ep['public_name'] = 'local-qwen38'
@@ -740,7 +741,8 @@ CATALOG = {
     },
     'endpoints': {
         'qwen-coder': {'engine': 'vllm', 'model': 'qc',
-                       'runtime': {'max_model_len': 32768}},
+                       'runtime': {'max_model_len': 32768},
+                       'reclaim': {'policy': 'keep-warm'}},
         'reranker': {'engine': 'vllm', 'model': 'rr',
                      'reclaim': {'policy': 'stop'}},
     },

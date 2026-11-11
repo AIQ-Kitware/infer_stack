@@ -218,7 +218,8 @@ def min_vram_per_gpu(deployment: Deployment) -> float:
     requirement.
     """
     placement = deployment.spec.get('placement', {}) or {}
-    floor = float(placement.get('floor_vram_gib') or 0.0)
+    floor = (float(placement.get('floor_vram_gib') or 0.0)
+             if placement.get('weight_floor', True) else 0.0)
     floor = floor / weight_shard_count(deployment)
     if placement.get('min_vram_source') == 'measured':
         # A recorded measurement is the real footprint of this exact serve

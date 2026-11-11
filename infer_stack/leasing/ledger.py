@@ -38,7 +38,8 @@ from .models import (
     capacity_satisfies,
     is_reservation,
 )
-from .store import SqliteStore
+from .store import LedgerStore
+from .store import SqliteStore as SqliteStore
 
 
 def default_ledger_path() -> Path:
@@ -134,7 +135,7 @@ class Ledger:
 
     def __init__(
         self,
-        store: SqliteStore,
+        store: LedgerStore,
         *,
         clock: Callable[[], float] = time.time,
         id_factory: Callable[[str], str] | None = None,
@@ -254,6 +255,7 @@ class Ledger:
         allocations: dict[str, list[int]] | None = None,
         approved_digest: str | None = None,
         profile: dict | None = None,
+        lease_id: str | None = None,
     ) -> AcquireResult:
         """Create a lease and coalesce its endpoints onto deployment deployments.
 
@@ -270,7 +272,7 @@ class Ledger:
         endpoints it publishes are never durable without the lease and the
         publication intent that go with them.
         """
-        lease_id = self.id_factory('lease')
+        lease_id = lease_id or self.id_factory('lease')
         deployment_ids: list[str] = []
         with self.store.transaction():
             if overlay is None:

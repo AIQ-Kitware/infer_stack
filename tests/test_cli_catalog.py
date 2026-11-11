@@ -365,8 +365,10 @@ def test_suggest_render_only_writes_nothing(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     rendered = yaml.safe_load(out)
-    assert 'qwen2.5-72b' in rendered['models']        # 2 GPUs -> the 72B fits
-    assert 'qwen2.5-72b' in rendered['endpoints']
+    assert 'qwen3.5-122b-a10b' in rendered['models']  # 2 x 80 GiB
+    assert 'qwen3.5-122b-a10b' in rendered['endpoints']
+    assert 'qwen2.5-72b' not in rendered['models']     # opt-in legacy model
+    assert 'qwen3.5-0.8b' in rendered['models']        # tiny models are retained
     assert not (tmp_path / 'catalog.yaml').exists()    # nothing written
 
 
@@ -375,10 +377,40 @@ def test_suggest_apply_merges_and_validates(tmp_path):
         argv=['--simulate-hardware', '1x48', '--apply', *_opts(tmp_path)]
     )
     cat = Catalog.load(cat_path(tmp_path))            # parses + cross-refs ok
-    assert 'qwen2.5-7b' in cat.endpoints
-    # the largest fitting model is kept warm, the rest stop
-    warm = [n for n, e in cat.endpoints.items() if e.reclaim == 'keep-warm']
-    assert len(warm) == 1
+    assert 'qwen3.5-9b' in cat.endpoints
+    assert 'qwen3.5-0.8b' in cat.endpoints
+    assert 'qwen2.5-7b' not in cat.endpoints
+    assert {ep.reclaim for ep in cat.endpoints.values()} == {'stop'}
+
+
+def test_suggest_all_and_include_are_opt_in(tmp_path, capsys):
+    options = ['--simulate-hardware', '1x48', *_opts(tmp_path)]
+    CatalogSuggestCLI.main(argv=[*options, '--include', 'gpt-oss-20b'])
+    include = yaml.safe_load(capsys.readouterr().out)
+    assert 'gpt-oss-20b' in include['models']
+    assert 'qwen2.5-7b' not in include['models']
+
+    CatalogSuggestCLI.main(argv=[*options, '--all'])
+    all_entries = yaml.safe_load(capsys.readouterr().out)
+    assert {'gpt-oss-20b', 'qwen2.5-7b'} <= set(all_entries['models'])
+    assert not (tmp_path / 'catalog.yaml').exists()
+
+    with pytest.raises(SystemExit, match='unknown suggestion model'):
+        CatalogSuggestCLI.main(argv=[*options, '--include', 'not-a-model'])
+
+
+def test_suggest_apply_does_not_prune_prior_optional_models(tmp_path):
+    # A new default frontier must not delete endpoints added by an old seed.
+    CatalogSuggestCLI.main(argv=[
+        '--simulate-hardware', '1x48', '--all', '--apply', *_opts(tmp_path)
+    ])
+    before = Catalog.load(cat_path(tmp_path))
+    assert 'gpt-oss-20b' in before.endpoints
+    CatalogSuggestCLI.main(argv=[
+        '--simulate-hardware', '1x48', '--apply', *_opts(tmp_path)
+    ])
+    after = Catalog.load(cat_path(tmp_path))
+    assert 'gpt-oss-20b' in after.endpoints
 
 
 def test_suggest_apply_is_additive_and_idempotent(tmp_path):

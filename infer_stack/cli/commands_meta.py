@@ -238,14 +238,12 @@ class ConfigPathsCLI(_PathOverridesMixin):
 
     Reports the editable config files under ``config_root()`` plus the
     resolved rendered-artifact and bind-mount locations (``generated_dir``,
-    ``runtime_dir``, and the ``state.*`` caches). Each entry is tagged with its
-    kind (file/dir) and an exists/missing status, so the same command works as
-    a layout reference and a quick health check. Honours ``--config-dir`` /
-    ``--data-dir`` (and the matching env vars) so it reports the layout a given
-    invocation would actually use.
-
-    Output is colorized when writing to a terminal; piped/redirected output
-    stays plain so it remains greppable (use ``--json`` for machine parsing).
+    ``runtime_dir``, and the ``state.*`` caches). A group selector preserves
+    the readable status inventory. A *single path* selector (for example,
+    ``infer-stack paths runtime_dir``) prints exactly one absolute pathname,
+    without headings, status annotations or terminal formatting, so it is safe
+    to use in command substitution. ``--json`` emits metadata for the entry.
+    Honours ``--config-dir`` / ``--data-dir`` and their environment overrides.
     """
 
     __command__ = 'paths'
@@ -253,7 +251,7 @@ class ConfigPathsCLI(_PathOverridesMixin):
     target: Any = kw.Value(
         'all',
         position=1,
-        help='Path group to show: all, config, data, or leasing.',
+        help='Group (all/config/data/leasing) or one path (e.g. runtime_dir).',
     )
     json: Any = kw.Value(
         False,
@@ -267,12 +265,49 @@ class ConfigPathsCLI(_PathOverridesMixin):
         _apply_path_overrides(config)
 
         target = str(config.target or 'all').strip().lower()
-        valid = {'all', 'config', 'data', 'leasing'}
-        if target not in valid:
-            raise SystemExit(
-                f'Unknown path group {target!r}. Expected one of: '
-                + ', '.join(sorted(valid))
-            )
+        groups_only = {'all', 'config', 'data', 'leasing'}
+        # Keep the group inventory stable, including its human-readable labels.
+        # Aliases provide the more descriptive names in scripting contexts.
+        aliases = {
+            'runtime_dir': 'runtime',
+            'catalog': 'catalog.yaml',
+            'config_dir': 'config_root',
+            'data_dir': 'data_root',
+            'compose_file': 'docker-compose.yml',
+        }
+        if target not in groups_only:
+            name = aliases.get(target, target)
+            from ..config import default_state_paths
+
+            known = {
+                'config_root': (config_root(), 'dir'),
+                'settings.yaml': (settings_path(), 'file'),
+                'catalog.yaml': (config_root() / 'catalog.yaml', 'file'),
+                'data_root': (data_root(), 'dir'),
+                **{key: (Path(value), 'dir')
+                   for key, value in default_state_paths().items()},
+                'ledger': (data_root() / 'leasing' / 'ledger.db', 'file'),
+                'compose_dir': (data_root() / 'leasing' / 'compose', 'dir'),
+                'docker-compose.yml': (
+                    data_root() / 'leasing' / 'compose' / 'docker-compose.yml', 'file'),
+                'litellm_config.yaml': (
+                    data_root() / 'leasing' / 'compose' / 'litellm_config.yaml', 'file'),
+                'env (secrets)': (
+                    data_root() / 'leasing' / 'compose' / '.env', 'file'),
+                'compose_state': (
+                    data_root() / 'leasing' / 'compose' / 'leasing-compose-state.json', 'file'),
+            }
+            if name not in known:
+                raise SystemExit(
+                    f'Unknown path group or entry {target!r}. '
+                    'Run `infer-stack paths` to see available entries.'
+                )
+            # Do not recursively walk an entire model directory to answer a
+            # scalar path query. The status inventory still checks ownership.
+            path, kind = known[name]
+            entry = _entry(name, path.expanduser().absolute(), kind=kind)
+            print(json.dumps(entry, indent=2) if config.json else entry['path'])
+            return 0
 
         groups: dict[str, list[dict[str, str]]] = {}
         if target in {'all', 'config'}:
@@ -409,6 +444,13 @@ KNOWN_SETTINGS = {s.key: s.help for s in _SETTINGS}
 # Backend-specific keys `config init` does not prompt for but `config set`
 # recognizes without a warning (see docs/kubeai-backend.md).
 BACKEND_SETTINGS = {
+    'postgres_dsn_file': 'Private PostgreSQL authority DSN file; install infer-stack[postgres]. Default is local SQLite.',
+    'server_url': 'Canonical infer-stack control API URL for remote client verbs.',
+    'server_token_file': 'Private client control credential file path.',
+    'server_ca_file': 'Trusted CA PEM path for the control API TLS certificate.',
+    'kubeconfig':
+        'Private administrative kubeconfig path used by infer-stack Kubernetes '
+        'and Helm commands. Explicit command kubeconfig flags take precedence.',
     'kubeai_namespace':
         'Kubernetes namespace the KubeAI chart is installed in '
         '(default: kubeai).',

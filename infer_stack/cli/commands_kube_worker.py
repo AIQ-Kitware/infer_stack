@@ -39,12 +39,17 @@ def _show_result(result, machine=False):
         print(f"  GPU {device['uuid']}: {device['product']}, {device['memory_mib'] / 1024:g} GiB")
     for action in result.get('actions') or []:
         print(f'[plan] {action}')
+    storage = result.get('storage') or {}
+    if storage:
+        print(f"  K3s data: {storage['data_dir']}; available bytes: {storage['available_bytes']}; inodes: {storage['available_inodes']}")
+        for message in storage['warnings']:
+            print(f'[info] {message}')
     for message in result.get('limitations') or []:
         print(f'[info] {message}')
     for device in result.get('serving_devices') or []:
         print(f"  serving GPU: {device['uuid']} ({device['product']})")
     if result.get('generation_verified'):
-        print('[ok] GPU runtime, exact node placement, one-GPU serving replica and real generation')
+        print(f"[ok] GPU runtime, exact node placement, {result.get('serve_gpus', 1)}-GPU serving replica and real generation")
         print('Temporary test resources removed; reusable node profile retained.')
     if 'cleanup_run' in result:
         print(f"Cleanup {result['cleanup_run']}: {'complete' if result['applied'] else 'planned'}")
@@ -54,7 +59,7 @@ class KubeNodeTestCLI(_PathOverridesMixin):
     """Test this exact worker's GPUs, model placement and real generation.
 
     Plans by default. Apply briefly reserves ALL expected GPUs for a device
-    query, then ONE GPU for a temporary serving replica. Leaves a reusable
+    query, then --serve-gpus GPUs for a temporary serving replica. Leaves a reusable
     node profile, deletes only this test's resources, and preserves leases.
     NVIDIA drivers/container toolkit must already be installed on the worker.
     """
@@ -62,6 +67,7 @@ class KubeNodeTestCLI(_PathOverridesMixin):
     __command__ = 'test'
     node = kw.Value(None, type=str, position=1, required=True, help='Exact Kubernetes node name.')
     expected_gpus = kw.Value(None, type=int, help='Required exact count, e.g. 1 for namek, 2 for yardrat, 4 for aiq-gpu2.')
+    serve_gpus = kw.Value(1, type=int, help='GPUs actually used for a tensor-parallel serving generation; model architecture must support this TP size.')
     kubeconfig = kw.Value(None, type=str, help='Explicit admin kubeconfig; otherwise the selected context.')
     namespace = kw.Value('kubeai', type=str, help='Existing KubeAI namespace (use default on aiq-gpu).')
     release = kw.Value('kubeai', type=str, help='Existing KubeAI Helm release.')
@@ -95,13 +101,15 @@ class KubeNodeTestCLI(_PathOverridesMixin):
                 if config.expected_gpus is None:
                     raise RuntimeError('--expected-gpus is required; cluster totals cannot prove this worker is configured')
                 result = plan(manager, node=config.node, namespace=config.namespace,
-                              expected_gpus=config.expected_gpus, resource_profile=config.resource_profile)
+                              expected_gpus=config.expected_gpus, resource_profile=config.resource_profile,
+                              serve_gpus=config.serve_gpus)
                 if config.apply and not config.dry_run:
                     result = acceptance(manager, node=config.node, namespace=config.namespace,
                                         release=config.release, expected_gpus=config.expected_gpus,
                                         base_url=config.base_url, kubeconfig=config.kubeconfig,
                                         run_id=config.run_id or uuid.uuid4().hex[:12],
                                         timeout=config.timeout, model=config.model,
+                                        serve_gpus=config.serve_gpus,
                                         resource_profile=config.resource_profile, progress=progress)
             _show_result(result, config.json)
             if not config.apply or config.dry_run:
@@ -126,6 +134,9 @@ class K3sOnboardCLI(KubeNodeTestCLI):
     server = kw.Value(None, type=str, required=True, help='Existing K3s server URL, e.g. https://aiq-gpu:6443.')
     token_file = kw.Value(None, type=str, required=True, help='Private file containing the join token; never pass token text.')
     version = kw.Value(None, type=str, help='Exact K3s version; otherwise infer from this cluster control plane.')
+    k3s_data_dir = kw.Value(None, type=str, help='Absolute K3s/containerd data path, persisted by the installer. Refuses changing an active agent path.')
+    image_headroom_gib = kw.Value(None, type=float, help='Estimated GiB for image pull plus extraction during storage preflight.')
+    kubelet_config = kw.Value(None, type=str, help='Readable kubelet YAML with evictionHard/evictionMinimumReclaim thresholds for storage preflight.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
@@ -141,7 +152,9 @@ class K3sOnboardCLI(KubeNodeTestCLI):
                 raise RuntimeError('Use infer-stack kube node test NODE --cleanup --run-id=... --apply for interrupted acceptance resources')
             private_file(config.kubeconfig, 'Admin kubeconfig')
             private_file(config.token_file, 'Join token')
-            prepared = onboarding_plan(local, cluster, server=config.server, node=config.node, version=config.version)
+            prepared = onboarding_plan(local, cluster, server=config.server, node=config.node, version=config.version,
+                                       data_dir=config.k3s_data_dir, image_gib=config.image_headroom_gib,
+                                       kubelet_config=config.kubelet_config)
             if config.expected_gpus is not None and config.expected_gpus != prepared['expected_gpus']:
                 raise RuntimeError('--expected-gpus differs from locally detected hardware')
             result = prepared
@@ -151,7 +164,10 @@ class K3sOnboardCLI(KubeNodeTestCLI):
                                  base_url=config.base_url, kubeconfig=config.kubeconfig,
                                  run_id=config.run_id or uuid.uuid4().hex[:12], timeout=config.timeout,
                                  model=config.model, resource_profile=config.resource_profile,
+                                 serve_gpus=config.serve_gpus,
                                  progress=progress)
+                from ..kube.context import remember
+                remember(config.kubeconfig)
             _show_result(result, config.json)
             if not config.apply or config.dry_run:
                 print('No changes made. Authenticate with sudo -v, review this plan, then rerun with --apply.', file=sys.stderr if config.json else sys.stdout)
