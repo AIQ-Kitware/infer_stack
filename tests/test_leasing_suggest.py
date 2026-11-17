@@ -154,9 +154,8 @@ def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
     inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, name='NVIDIA GeForce RTX 3090', compute_cap=8.6)]}
     out = suggest_catalog(inv)
     base = 'qwen3.8-27b-dbirks-hyperqwen'
-    assert {base, f'{base}-long'} <= set(out['endpoints'])
-    assert f'{base}-huge' not in out['endpoints']  # experimental, via --all
-    # One model identity, two default ways to serve it.
+    assert {base, f'{base}-long', f'{base}-huge'} <= set(out['endpoints'])
+    # One model identity, three default ways to serve it.
     assert set(out['models']) & {f'{base}-long'} == set()
     assert out['endpoints'][f'{base}-long']['model'] == base
 
@@ -166,13 +165,13 @@ def test_rtx_3090_adds_explicit_hyperqwen_context_variants():
         65536, 'dflash2', 'fast')
     assert (long['max_model_len'], long['env']['SPEC'], long['env']['CTX']) == (
         150000, 'mtp', 'long')
-    huge = suggest_catalog(inv, all_models=True)['endpoints'][f'{base}-huge']['runtime']
+    huge = out['endpoints'][f'{base}-huge']['runtime']
     assert (huge['max_model_len'], huge['env']['SPEC'], huge['env']['CTX']) == (
         245760, 'dflash2', 'huge')
     # The variants inherit the generic launcher contract rather than repeating
     # a model-specific recipe in Python.  A homogeneous host needs no arbitrary
     # exact pin: the min-VRAM placement is sufficient for this capability class.
-    for name in (f'{base}-long',):
+    for name in (f'{base}-long', f'{base}-huge'):
         ep = out['endpoints'][name]
         assert ep['runtime']['command'] == ['single']
         assert ep['runtime']['env']['MAX_LEN'] == '{max_model_len}'
@@ -211,8 +210,7 @@ def test_hyperqwen_variants_follow_capability_and_vram_classes():
         _gpu(0, 23.99, name='NVIDIA RTX A5000', compute_cap=8.6),
     ]}
     small_eps = suggest_catalog(small)['endpoints']
-    assert {base, f'{base}-long'} <= set(small_eps)
-    assert f'{base}-huge' not in small_eps
+    assert {base, f'{base}-long', f'{base}-huge'} <= set(small_eps)
     assert f'{base}-full' not in small_eps
 
     # A roomy Ampere card keeps the speed-first baseline and gains an ordinary-
@@ -225,6 +223,18 @@ def test_hyperqwen_variants_follow_capability_and_vram_classes():
     assert {base, f'{base}-full'} <= set(roomy_eps)
     assert f'{base}-long' not in roomy_eps
     assert f'{base}-huge' not in roomy_eps
+
+
+def test_default_huge_suggestions_keep_gpu_class_boundaries():
+    name = 'qwen3.8-27b-dbirks-hyperqwen-huge'
+    for memory, capability, expected in [
+        (23.89, 8.6, False), (23.99, 8.6, True),
+        (32, 8.9, True), (32.1, 8.9, False),
+        (24, 7.5, False), (48, 7.5, False),
+    ]:
+        inventory = {'gpu_count': 1, 'gpus': [_gpu(0, memory, compute_cap=capability)]}
+        endpoints = suggest_catalog(inventory)['endpoints']
+        assert (name in endpoints) is expected, (memory, capability)
 
 
 def test_fits_on_respects_vram_and_gpu_count():

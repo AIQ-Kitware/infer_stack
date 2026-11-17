@@ -59,7 +59,8 @@ remain recovery paths.
   image, while hardware discovery and suggestion choose explicit catalog
   profiles by GPU *class* (compute capability + VRAM) rather than product-name
   strings. Memory-tight 24-32 GiB Ampere-or-newer cards get the reference
-  fast/long/huge choices. High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
+  fast/long/huge choices in normal CLI and TUI suggestions, without `--all`.
+  High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
   measured full-262K FP16/Triton profiles, with the prepared `-fast` checkpoint
   preferred. Roomy Ampere-or-newer cards (>=48 GiB) get the fast baseline plus
   a conservative/provisional full-262K ordinary-KV prefab; use

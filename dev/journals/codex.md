@@ -722,3 +722,16 @@ but do not prove Namek has this exact hardware/display state. GPU eligibility
 and optional variant filtering remain intentional. No host catalog, running
 model, or user archives were changed. Reusable takeaway: UI actions must reuse
 configuration precedence rather than supply a historical convenience default.
+
+## 2026-11-17 12:52:36 -0500
+
+The user explicitly wants the HyperQwen huge endpoint restored by ordinary
+GPU suggestions, alongside fast and long. I am GPT-6-based Codex; exact weights
+and runtime configuration are unavailable. I removed only huge's opt-in flag
+from the shared suggestion pool, preserving its Ampere+ and approximately
+24-32 GiB eligibility constraints and all launcher settings. The same pool
+drives both CLI and TUI, so a UI-specific special case would have created a new
+policy discrepancy. Tests now require all three ordinary choices, exercise
+the memory/capability boundaries, and verify huge's reasoning metadata is
+restored by the headless TUI while an unrelated endpoint remains unchanged.
+This changes suggestion visibility, not which models are acquired or run.
