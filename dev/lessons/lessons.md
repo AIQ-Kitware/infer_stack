@@ -244,3 +244,11 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   timed out with zero current requests but one sampled request in its
   60-sample history; a 20-second window passed return-to-zero acceptance.
 - **Applies when:** testing or tuning on-demand KubeAI endpoints.
+
+- **Lesson:** Hardware suggestions in the TUI must honor the same display-GPU
+  policy as the CLI; always reserving display GPUs can suppress otherwise
+  eligible models on workstations and make deleted endpoints appear unrestorable.
+- **Evidence / MWE:** `tests/test_tui.py::test_tui_suggest_respects_display_policy_and_restores_hyperqwen`
+  checks backend overrides, saved policy, restored reasoning metadata, and
+  preservation of existing endpoints on a display-active Ampere GPU.
+- **Applies when:** adding UI entry points to hardware discovery or placement.

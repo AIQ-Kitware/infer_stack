@@ -706,3 +706,19 @@ approval/conflict cases and the additional malformed-source check. Type checking
 fixture shell syntax and diff whitespace checks passed. The real LiteLLM rerun
 passed after catalog persistence was introduced. Test containers are cleaned up
 after validation, while private temporary evidence is retained.
+
+## 2026-11-17 12:47:32 -0500
+
+The user removed HyperQwen entries to regenerate their reasoning metadata but
+the TUI's GPU suggestion did not restore them. I am GPT-6-based Codex; exact
+weights and runtime configuration are unavailable. Investigation confirmed that
+the TUI always excluded display-active GPUs, unlike the CLI's opt-in policy.
+I reused the CLI resolver, honoring an explicit backend choice before persisted
+settings, and retained the existing additive catalog merge. A headless test
+checks all four combinations of backend override and stored policy on a
+display-active 24-GiB Ampere GPU, including restored long-endpoint effort
+metadata and preservation of a custom endpoint. These tests establish the bug,
+but do not prove Namek has this exact hardware/display state. GPU eligibility
+and optional variant filtering remain intentional. No host catalog, running
+model, or user archives were changed. Reusable takeaway: UI actions must reuse
+configuration precedence rather than supply a historical convenience default.

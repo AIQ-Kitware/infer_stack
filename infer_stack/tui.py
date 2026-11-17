@@ -3547,8 +3547,16 @@ class InferStackTUI(App):
                 migrate_known_suggestion_aliases,
                 suggest_catalog,
             )
+            from .cli.commands_leasing import _resolve_skip_display
+            from types import SimpleNamespace
+
             inventory = detect_inventory()
-            frag = suggest_catalog(inventory, reserve_display_gpu='auto')
+            skip_display = _resolve_skip_display(SimpleNamespace(
+                skip_display_gpus=getattr(self.controller.backend, 'skip_display', None),
+            ))
+            frag = suggest_catalog(
+                inventory, reserve_display_gpu='auto' if skip_display else False,
+            )
             if not frag.get('models'):
                 self._after_mutation(
                     'no pooled model fits the detected GPUs — add one with m/n'
