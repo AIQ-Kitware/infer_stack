@@ -355,6 +355,10 @@ also fits. This means a 48 GiB machine still suggests the tiny models and the
 HyperQwen 27B and Qwen3.5 122B appear on compatible hardware. The frontier is
 curated, not a claim of measured statistical dominance.
 
+DeepSeek V4 Flash 0731 is also suggested on four sufficiently large SM120 GPUs.
+See the [workstation profile and first-generation command](docs/deepseek-v4-flash-sm120.md)
+for its serving limits and hardware validation status.
+
 The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
 Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting
 them automatically. All options remain discoverable:

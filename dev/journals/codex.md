@@ -750,3 +750,27 @@ serving configuration was changed. The separate client implementation tests
 header/body evidence with a real SDK over deterministic HTTP responses and
 reads/exports its saved request table through the evaluation system. Live
 gateway/engine propagation and physical resource measurements remain unproven.
+
+## 2026-11-19 16:32:59 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user wants DeepSeek V4 Flash discoverable on a four-card, 96-GiB SM120
+workstation. Added the dated official 0731 checkpoint and revision to the
+frontier pool. The candidate profile uses TP4, 128K context, FP8 indexer/KV
+caches, automatic MoE selection and eager execution. Upstream documents an
+eight-card workstation deployment; four-card loading and throughput are still
+unmeasured. Restricting the profile to known SM120 hardware avoids carrying
+SM100-specific kernels onto workstation Blackwell.
+
+Discovery was dropping source revisions and several standard runtime defaults.
+Preserving those fields makes this profile reach the actual rendered command.
+Unknown capability previously passed newer lower bounds via an Ampere-era
+name fallback; that fallback now only establishes its historical boundary.
+Tests exercise discovery through catalog resolution and command rendering,
+plus insufficient, heterogeneous and display-reserved GPU inventories.
+
+Validation: 114 suggestion, catalog CLI and leasing-catalog tests passed.
+The real offline CLI also renders the profile for `4x96@12.0`. No GPU service
+was started here. The hardware gate and rendered flags are checked; native
+kernel compatibility remains a host-generation result.

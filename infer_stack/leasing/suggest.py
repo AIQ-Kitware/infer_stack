@@ -112,6 +112,7 @@ class SuggestionModel:
     # the same model source. This remains suggestion-time convenience, not a
     # runtime recipe mechanism.
     endpoint_variants: dict[str, dict[str, Any]] = field(default_factory=dict)
+    revision: str | None = None
 
     @classmethod
     def from_entry(cls, name: str, spec: dict[str, Any]) -> SuggestionModel:
@@ -127,6 +128,7 @@ class SuggestionModel:
         return cls(
             name=name,
             hf_model_id=spec['hf_model_id'],
+            revision=spec.get('revision'),
             served_model_name=spec.get('served_model_name'),
             family=spec.get('family'),
             suggestion_tier=tier,
@@ -302,6 +304,11 @@ def _compute_cap_matches(
 
     name = str(gpu.get('name') or '').lower()
     pre_ampere = _needs_fp16(name)
+    # Product-name fallbacks only establish the historical Ampere boundary.
+    # They cannot identify a specific newer kernel target such as SM120.
+    if ((min_cap is not None and min_cap > 8.0)
+            or (max_cap is not None and max_cap >= 8.0)):
+        return False
     if min_cap is not None and min_cap >= 8.0:
         return not pre_ampere
     if max_cap is not None and max_cap < 8.0:
@@ -528,9 +535,14 @@ def derive_runtime(
         if model.defaults.get(key):
             runtime[key] = copy.deepcopy(model.defaults[key])
 
+    for key in ('max_num_seqs', 'max_num_batched_tokens', 'trust_remote_code',
+                'extra_args'):
+        if key in model.defaults:
+            runtime[key] = copy.deepcopy(model.defaults[key])
+
     if any(_gpu_needs_fp16(g) for g in host) and 'command' not in runtime:
         # Stock vLLM only: a custom launcher takes no vLLM flags directly.
-        runtime['extra_args'] = ['--dtype=half']
+        runtime.setdefault('extra_args', []).append('--dtype=half')
 
     return runtime
 
@@ -609,6 +621,8 @@ def suggest_catalog(
     endpoints: dict[str, Any] = {}
     for model in fitting:
         models[model.name] = {'source': f'hf://{model.hf_model_id}'}
+        if model.revision:
+            models[model.name]['revision'] = model.revision
 
         default_host = _default_host_gpus(model, gpus)
         if default_host:
