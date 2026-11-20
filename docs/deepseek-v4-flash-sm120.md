@@ -15,12 +15,20 @@ Run inside tmux for the first image/weight download. `run` releases its lease
 when the test exits; the suggested endpoint stops when its last lease ends.
 Existing leases retain their GPUs. Run this after those GPUs become available.
 
-The starting profile uses TP4, vLLM v0.28.0, 128K context, two sequences,
-FP8 KV and indexer caches, and eager execution. This is a candidate for
-four-card hosts: the upstream [vLLM recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4-Flash.yaml)
-reports an eight-card RTX PRO 6000 configuration. Local loading, generation
-and throughput on four cards remain to be measured. The model supports 1M
-context; this initial profile reserves memory with a shorter limit.
+The profile uses TP4, vLLM v0.28.0, 128K context, two sequences,
+FP8 KV and indexer caches, and eager execution. On November 20, 2026 it loaded
+on four RTX PRO 6000 GPUs and passed the gateway generation-readiness probe.
+The upstream [vLLM recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4-Flash.yaml)
+also reports an eight-card configuration. Workload throughput on four cards
+has not been measured. The model supports 1M context; this profile reserves
+memory with a shorter limit.
+
+The first reported host start spent about 38 minutes between creating the
+model container and verifying generation. The engine's profile/cache/warmup
+phase reported 215 seconds; later kernel JITs still ran on the first request
+despite eager mode. An additional child test hit an unrelated CLI argv bug
+after readiness and triggered normal lease cleanup. The public entrypoint
+now preserves literal child arguments before modal parsing.
 
 SM120 uses FP8 indexer cache and automatic MoE selection. SM100-specific
 FP4-indexer and mega-MoE flags do not belong on this hardware. Speculative

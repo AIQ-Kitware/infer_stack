@@ -224,6 +224,7 @@ def runtime_failure(exc) -> str:
 
 def main(argv=None) -> int:
     import subprocess
+    import sys
 
     from ..leasing import LeaseLockError
     from ..leasing.backend import BackendTimeout
@@ -231,7 +232,15 @@ def main(argv=None) -> int:
     from ..control.errors import ControlError, ControlTimeout
 
     try:
-        rv = ManageCLI.main(argv=argv)
+        # The modal parser smartcasts positional values before invoking a leaf.
+        # `run` owns an opaque child argv after `--`: once "001" has become 1,
+        # the leaf cannot reconstruct it. Dispatch before that first parse.
+        tokens = (list(sys.argv[1:]) if argv is None or argv is True
+                  else list(argv) if isinstance(argv, (list, tuple)) else [])
+        if tokens[:1] == ['run']:
+            rv = RunCLI.main(argv=tokens[1:])
+        else:
+            rv = ManageCLI.main(argv=argv)
     except LeaseLockError as exc:
         # A mutating verb (acquire/release/gc/evict/apply) could not get the
         # cross-process lock; surface the actionable diagnosis, not a traceback.

@@ -774,3 +774,24 @@ Validation: 114 suggestion, catalog CLI and leasing-catalog tests passed.
 The real offline CLI also renders the profile for `4x96@12.0`. No GPU service
 was started here. The hardware gate and rendered flags are checked; native
 kernel compatibility remains a host-generation result.
+
+## 2026-11-20 16:12:05 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user reported a workstation test that reached generation readiness and
+then failed when `run` launched its child. The four-card DeepSeek profile
+did load and answer through the gateway; this is now recorded in its runbook.
+The reported engine initialization took 215 seconds, with additional kernel
+JIT on the first request. Model-default sampling is temperature 1, top-p 1.
+
+Reproduced the later TypeError through the public CLI without GPUs. Existing
+tests called RunCLI directly and preserved raw argv, but the enclosing modal
+parser had already converted child positional strings into numbers before
+invoking that leaf in actual CLI use. Converting back to strings cannot
+recover values such as `001`, so `run` now dispatches from the public entry
+before the first modal parse. Other commands retain the normal modal route.
+Added regressions for both explicit argv and the process argv, including
+numeric, boolean-looking and empty strings. All 71 leasing CLI tests pass.
+Another 35 signal-cleanup, CLI metadata and CLI-equivalence tests pass.
+The fix does not change lease cancellation or teardown semantics.
