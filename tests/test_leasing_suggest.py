@@ -165,6 +165,35 @@ def test_inkling_q4_is_opt_in_and_selects_explicit_gguf():
         include=[name])['endpoints']
 
 
+def test_inkling_native_vllm_is_pinned_tp1_and_hardware_gated():
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'inkling-2-mini'
+    cat = Catalog.from_dict(suggest_catalog(simulate_inventory('4x96@12.0')))
+    req = cat.resolve_endpoint(name).to_request()
+    assert req.spec['hf_model_id'] == 'thinkingmachines/Inkling-2-Mini'
+    assert req.spec['revision'] == 'ed40e7da625f594fc9c4990f5f66be24873c22d7'
+    assert req.spec['runtime'].get('tensor_parallel_size', 1) == 1
+    assert req.spec['runtime']['max_model_len'] == 131072
+    assert not req.spec['runtime'].get('command')
+    deployment = Deployment('native-inkling', req.compat_key, req.engine, req.sharing,
+                            req.capacity, req.spec, {name: req.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'].startswith('vllm/vllm-openai@sha256:')
+    assert '--tensor-parallel-size=1' in args
+    assert service['shm_size'] == '16g'
+    assert '--enable-auto-tool-choice' in args
+    assert args[args.index('--tool-call-parser') + 1] == 'inkling'
+    assert args[args.index('--reasoning-parser') + 1] == 'inkling'
+    assert '--revision=' + req.spec['revision'] in args
+    assert '--language-model-only' in args
+    for spec in ('4x96', '4x96@8.6', '4x96@9.0', '4x48@12.0'):
+        assert name not in suggest_catalog(simulate_inventory(spec))['endpoints']
+
+
 def test_all_and_include_restore_optional_models_without_ignoring_hardware():
     inv = simulate_inventory('1x48')
     default = suggest_catalog(inv)

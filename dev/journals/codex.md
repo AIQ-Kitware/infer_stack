@@ -840,3 +840,21 @@ The distinction between a clean merge and working serving behavior matters:
 342 focused discovery, Compose, CLI and lifecycle tests pass, but this merge
 does not establish native GPU acceptance for the newly registered launcher.
 Further serving changes are a separate reviewable step.
+
+## 2026-11-21 12:25:57 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user approved a native vLLM registration for Inkling 2 Mini. Added the
+official NVFP4/MXFP8 source at a pinned revision and an immutable manifest
+for the dedicated upstream image. The hardware-gated TP1/128K candidate uses
+native reasoning/tool parsers and retains the independent GGUF option.
+Discovery was discarding explicit shared-memory defaults for TP1; preserving
+that generic field makes the declared profile reach Compose correctly.
+
+The profile renders through the ordinary catalog/launch path with no custom
+command. 130 discovery/Compose tests pass, including pinned identity, parsers,
+TP1 and hardware eligibility. Model startup, kernels and throughput on SM120
+remain host acceptance work. Keeping a declared candidate distinct from a
+measured hardware recipe avoids treating command rendering as generation
+proof; no model-specific renderer or launcher was introduced.

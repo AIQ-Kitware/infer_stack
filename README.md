@@ -46,6 +46,12 @@ remain recovery paths.
 
 ## Related work
 
+- **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least
+  80 GiB offers `inkling-2-mini`, using the pinned official checkpoint and
+  Inkling-enabled vLLM image, reasoning/tool parsers, TP1 and 128K context.
+  This is a hardware-gated candidate pending GPU acceptance. The independent
+  Unsloth GGUF profile below remains available for other runtime experiments.
+
 - **Inkling 2 Mini on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
   profile is available for Compose via `infer-stack catalog suggest --include
   inkling-2-mini-unsloth-q4 --apply`, then `infer-stack acquire

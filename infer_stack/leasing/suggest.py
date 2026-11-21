@@ -535,7 +535,7 @@ def derive_runtime(
         if model.defaults.get(key):
             runtime[key] = copy.deepcopy(model.defaults[key])
 
-    for key in ('max_num_seqs', 'max_num_batched_tokens', 'trust_remote_code',
+    for key in ('max_num_seqs', 'max_num_batched_tokens', 'trust_remote_code', 'shm_size',
                 'extra_args'):
         if key in model.defaults:
             runtime[key] = copy.deepcopy(model.defaults[key])
