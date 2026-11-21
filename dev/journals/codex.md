@@ -735,3 +735,31 @@ policy discrepancy. Tests now require all three ordinary choices, exercise
 the memory/capability boundaries, and verify huge's reasoning metadata is
 restored by the headless TUI while an unrelated endpoint remains unchanged.
 This changes suggestion visibility, not which models are acquired or run.
+
+## 2026-11-18 21:57:31 -0500
+
+Model: GPT-6-based Codex; exact runtime model/configuration is not exposed.
+
+The user wants client latency preserved for all providers and local serving
+evidence that can be queried later and joined to client observations. I
+inspected the gateway renderer, accounting store/CLI/controller and upstream
+observability interfaces. The useful boundary is between request observations
+and physical resource attribution. The existing usage API reads imported
+deployment intervals; it is not an automatic collector. Reusing its overlap
+prohibition for request records would incorrectly reject concurrent requests.
+
+Recorded the proposed request-observation feature under docs/planning and
+linked it from the northstar. It uses gateway/engine observability seams,
+explicit request/attempt identities and durable lookup/export, with resource
+attribution separate. Response headers are a small independently useful seam;
+they do not prove trace propagation, durable logging or exclusive GPU time.
+The current mixed-image environment makes enabling a latest-documentation
+flag globally unjustified. Detailed tracing also changes the workload being
+measured, so bounded overhead/provenance checks are part of acceptance.
+
+This is a documentation-only change here. Source review confirmed no live
+request collector or per-request lookup path exists; no service, catalog or
+serving configuration was changed. The separate client implementation tests
+header/body evidence with a real SDK over deterministic HTTP responses and
+reads/exports its saved request table through the evaluation system. Live
+gateway/engine propagation and physical resource measurements remain unproven.

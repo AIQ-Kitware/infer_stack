@@ -333,6 +333,10 @@ better models become available.
 
 ### Attribution must be honest
 
+A proposed [request-observation feature](request-observations.md) separates
+durable request/attempt lookup from deployment resource accounting and
+per-request attribution. It is not an implemented collector.
+
 A deployment may serve several leases and several concurrent requests. The same
 joule must not be counted in full for every lease.
 
