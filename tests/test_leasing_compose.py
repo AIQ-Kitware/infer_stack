@@ -292,6 +292,28 @@ def _hyperqwen_from_suggestion(endpoint_name=None, **runtime_changes):
     return rc.compose['services'][vllm_service_name(deployment)]
 
 
+def test_inkling_suggestion_renders_llama_server_and_persistent_cache():
+    from infer_stack.leasing import Catalog
+    from infer_stack.leasing.suggest import suggest_catalog
+
+    name = 'inkling-2-mini-unsloth-q4'
+    frag = suggest_catalog({'gpu_count': 1, 'gpus': [
+        {'index': 0, 'name': 'RTX 3090', 'memory_gib': 24, 'compute_cap': 8.6}]},
+        include=[name])
+    req = Catalog.from_dict(frag).resolve_endpoint(name).to_request()
+    deployment = vllm('grp-inkling', hf=req.spec['hf_model_id'], served=name)
+    deployment.spec['runtime'] = req.spec['runtime']
+    rc = render_compose([deployment], {'grp-inkling': [3]}, images=IMAGES,
+                        ports=PORTS, state={**STATE, 'runtime': '/cache/runtime'})
+    svc = rc.compose['services'][vllm_service_name(deployment)]
+    assert svc['image'] == 'ghcr.io/ggml-org/llama.cpp:server-cuda'
+    assert svc['command'][svc['command'].index('--alias') + 1] == name
+    assert svc['command'][svc['command'].index('--ctx-size') + 1] == '8192'
+    assert svc['command'][svc['command'].index('--port') + 1] == '8000'
+    assert svc['environment']['LLAMA_CACHE'] == '/models'
+    assert svc['volumes'] == ['/cache/runtime/inkling-2-mini-unsloth/cache:/models']
+
+
 def test_suggested_hyperqwen_renders_what_the_old_recipe_did():
     """Generic catalog data, no recipe name, same container as before."""
     svc = _hyperqwen_from_suggestion()

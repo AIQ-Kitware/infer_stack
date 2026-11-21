@@ -46,6 +46,16 @@ remain recovery paths.
 
 ## Related work
 
+- **Inkling 2 Mini on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
+  profile is available for Compose via `infer-stack catalog suggest --include
+  inkling-2-mini-unsloth-q4 --apply`, then `infer-stack acquire
+  inkling-2-mini-unsloth-q4`. It uses the Unsloth UD-Q4_K_M file and a CUDA
+  llama.cpp server with an 8192-token context. The profile has not yet been
+  validated on a 3090; available VRAM, context overhead, upstream image changes,
+  and model support may affect startup. It downloads the weights on first use.
+  It is a custom OpenAI-compatible launcher under the vLLM catalog engine and
+  is intended for Compose, not KubeAI. Images are disabled in this profile.
+
 - [Qwen3.8-Flash-Next on one RTX 3090](docs/qwen38-flash-next-3090.md):
   `infer-stack catalog import qwen38-flash-next-3090` installs a bundled,
   non-destructive Compose preset; `infer-stack paths runtime_dir` supplies its
@@ -59,7 +69,8 @@ remain recovery paths.
   image, while hardware discovery and suggestion choose explicit catalog
   profiles by GPU *class* (compute capability + VRAM) rather than product-name
   strings. Memory-tight 24-32 GiB Ampere-or-newer cards get the reference
-  fast/long/huge choices. High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
+  fast/long/huge choices in normal CLI and TUI suggestions, without `--all`.
+  High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
   measured full-262K FP16/Triton profiles, with the prepared `-fast` checkpoint
   preferred. Roomy Ampere-or-newer cards (>=48 GiB) get the fast baseline plus
   a conservative/provisional full-262K ordinary-KV prefab; use

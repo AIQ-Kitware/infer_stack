@@ -967,6 +967,9 @@ def test_tui_suggest_respects_display_policy_and_restores_hyperqwen(
     assert saved['endpoints']['qwen-coder'] == CATALOG['endpoints']['qwen-coder']
     if expected:
         assert saved['endpoints'][name + '-long']['reasoning_efforts'] == ['low', 'medium', 'xhigh']
+        assert saved['endpoints'][name + '-huge']['reasoning_efforts'] == ['low', 'medium', 'xhigh']
+    else:
+        assert name + '-huge' not in saved['endpoints']
 
 
 def test_tui_instance_rows_say_what_each_serves():

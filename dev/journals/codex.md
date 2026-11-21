@@ -723,6 +723,19 @@ and optional variant filtering remain intentional. No host catalog, running
 model, or user archives were changed. Reusable takeaway: UI actions must reuse
 configuration precedence rather than supply a historical convenience default.
 
+## 2026-11-17 12:52:36 -0500
+
+The user explicitly wants the HyperQwen huge endpoint restored by ordinary
+GPU suggestions, alongside fast and long. I am GPT-6-based Codex; exact weights
+and runtime configuration are unavailable. I removed only huge's opt-in flag
+from the shared suggestion pool, preserving its Ampere+ and approximately
+24-32 GiB eligibility constraints and all launcher settings. The same pool
+drives both CLI and TUI, so a UI-specific special case would have created a new
+policy discrepancy. Tests now require all three ordinary choices, exercise
+the memory/capability boundaries, and verify huge's reasoning metadata is
+restored by the headless TUI while an unrelated endpoint remains unchanged.
+This changes suggestion visibility, not which models are acquired or run.
+
 ## 2026-11-18 21:57:31 -0500
 
 Model: GPT-6-based Codex; exact runtime model/configuration is not exposed.
@@ -795,3 +808,35 @@ Added regressions for both explicit argv and the process argv, including
 numeric, boolean-looking and empty strings. All 71 leasing CLI tests pass.
 Another 35 signal-cleanup, CLI metadata and CLI-equivalence tests pass.
 The fix does not change lease cancellation or teardown semantics.
+
+## 2026-11-20 19:10:31 -0500
+
+The user asked for a pre-registered Inkling 2 Mini option, particularly for a 3090, and suggested Unsloth's GGUF. Model: GPT-6 (Codex); exact weights and reasoning configuration are not exposed by the runtime.
+
+I chose an opt-in Compose profile using the existing custom container launcher and llama.cpp's CUDA server, with the explicit Unsloth Q4_K_M file, an 8K context and a persistent download cache. The official vLLM launch targets newer GPU generations, while Ollama's published Inkling release targets Apple silicon; neither establishes a 3090 GGUF path. The upstream llama.cpp support is very recent, and the mutable server-cuda image, looped architecture, GPU memory consumption and actual generation remain unverified on a 3090 here. I therefore avoided suggesting it automatically or claiming image support; the profile disables the multimodal projector. The launch adapter is labeled vLLM by the existing catalog, so this is documented as Compose-only rather than presented as a native vLLM or KubeAI integration.
+
+The design takeaway is to distinguish a model file that fits from an engine and hardware combination proven to serve it; keep provisional profiles opt-in and make the exact file and cache behavior explicit. A future GPU acceptance run should check startup, generation, context capacity, and image/tool behavior before expanding the profile or promoting it to the default frontier.
+
+## 2026-11-20 19:36:33 -0500
+
+The user requested fixes for six CI failures involving warm residency, displacement, frozen definitions, gateway key rotation, rollback, and fatal startup handling. Model: gpt-6.1-sol (Codex); reasoning effort and weights configuration are not exposed.
+
+All six reproduced together and shared an outdated assumption: omitted reclaim policy meant a released model stayed warm. The catalog and controller now default to stop, so the tests removed the very residents they meant to exercise. I kept production semantics intact and made keep-warm explicit in the affected catalog/request fixtures. Admission's existing default fixture remains stop; a separate warm catalog and an optional catalog argument to its acquire helper keep the two lifecycle contracts distinct. The rollback test reuses the same explicitly warm request on both acquisitions so it still verifies coalescing. I am confident in the diagnosis because the original failures occurred immediately after release, and all 142 tests in the six affected modules pass with explicit policies. The remaining risk is fixture coupling in other modules, which the broader leasing run checks.
+
+Reusable takeaway: a lifecycle regression test must declare the retention policy needed to reach its asserted state; relying on a default can silently turn a startup, rollback, or gateway test into a test of ordinary release cleanup.
+
+Validation completed: all 676 tests in `python -m pytest -q tests/test_leasing_*.py` passed; `git diff --check` passed.
+
+## 2026-11-21 11:43:00 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user requested the latest development registrations while preserving the
+working branch's serving fixes. Integrated origin/dev/0.7.3 through f0b888a
+into the current feature branch. Both branches appended independent journal
+entries; retained both histories in chronological order when resolving that
+conflict. The model pool and implementation changes merged automatically.
+The distinction between a clean merge and working serving behavior matters:
+342 focused discovery, Compose, CLI and lifecycle tests pass, but this merge
+does not establish native GPU acceptance for the newly registered launcher.
+Further serving changes are a separate reviewable step.

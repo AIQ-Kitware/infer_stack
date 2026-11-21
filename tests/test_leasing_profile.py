@@ -608,8 +608,8 @@ def test_redefining_an_endpoint_nothing_runs_does_not_block_the_host(tmp_path):
 
 
 def test_an_idle_but_resident_keep_warm_definition_stays_frozen(tmp_path):
-    a = Catalog.from_dict(cat('alpha'))
-    changed = Catalog.from_dict(cat('alpha', runtime={'max_model_len': 1024}))
+    a = Catalog.from_dict(cat('alpha', reclaim='keep-warm'))
+    changed = Catalog.from_dict(cat('alpha', reclaim='keep-warm', runtime={'max_model_len': 1024}))
     docker = FakeDocker()
     ledger, ctl = controller(tmp_path, catalog=a, docker=docker)
     out = ctl.acquire('x', a.resolve_names(['alpha']), wait=False)

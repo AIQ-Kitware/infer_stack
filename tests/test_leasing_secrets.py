@@ -22,7 +22,7 @@ from infer_stack.leasing.gateway import (
 )
 from infer_stack.leasing.profile import ProfileMismatch
 from infer_stack.leasing.residency import FINGERPRINT_LABEL
-from test_leasing_admission import CAT, Clock, acquire
+from test_leasing_admission import CAT, WARM_CAT, Clock, acquire
 from test_leasing_compose import IMAGES, PORTS, STATE, FakeDocker, FakeResp
 
 
@@ -293,13 +293,13 @@ def test_rotation_completes_under_a_running_dynamic_routing_gateway(tmp_path):
     backend = ComposeBackend(
         state_dir=state, inventory=simulate_inventory('2x80'), run=docker,
         http=None, images={**IMAGES, 'postgres': 'pg:test'}, ports=PORTS, state=STATE,
-        catalog=CAT, litellm=True, ui=False, dynamic_routing=True,
+        catalog=WARM_CAT, litellm=True, ui=False, dynamic_routing=True,
         sleep=clock.sleep, clock=clock,
     )
     backend.http = backend.gateway.http = AdminGateway(backend.gateway._env_path, docker)
     ledger = Ledger(SqliteStore(str(tmp_path / 'ledger.db')), clock=clock)
     ctl = Controller(ledger, backend, clock=clock, sleep=clock.sleep)
-    ctl.release(acquire(ctl, 'one').lease.id)       # a keep-warm model, routed
+    ctl.release(acquire(ctl, 'one', catalog_obj=WARM_CAT).lease.id)       # a keep-warm model, routed
     old = env(ctl)[API_KEY_ENV]
     assert backend.front_door().gateway_accepts(old) and backend.http.routes
 

@@ -113,6 +113,29 @@ vllm_models:
       gpu_memory_utilization: 0.4
       enable_prefix_caching: true
 
+  # Experimental Compose-only llama-server profile. The Q4 file is 16.61 GB;
+  # context and runtime overhead are additional and have not been measured on
+  # a 3090. Keep it opt-in until an actual GPU acceptance run is available.
+  inkling-2-mini-unsloth-q4:
+    hf_model_id: unsloth/Inkling-2-Mini-GGUF
+    served_model_name: inkling-2-mini-unsloth-q4
+    family: inkling2
+    modalities: [text]
+    memory_class_gib: 16
+    min_vram_gib_per_replica: 23.9
+    preferred_gpu_count: 1
+    context_window: 1048576
+    default_hardware:
+      min_compute_cap: 8.0
+    defaults:
+      max_model_len: 8192
+      image: ghcr.io/ggml-org/llama.cpp:server-cuda
+      command: [--hf-repo, unsloth/Inkling-2-Mini-GGUF, --hf-file, Inkling-2-Mini-UD-Q4_K_M.gguf, --no-mmproj, --host, 0.0.0.0, --port, '{port}', --alias, '{served_model_name}', --ctx-size, '{max_model_len}', --parallel, '1', --n-gpu-layers, '99', --jinja]
+      env:
+        LLAMA_CACHE: /models
+      mounts:
+        /models: inkling-2-mini-unsloth/cache
+
   # -- Qwen3.8-27B / HyperQwen -------------------------------------------
   # Qwen/Qwen3.8-27B has a 262K native window.  This entry starts from
   # dbirks' ~19.5-GB W4A16 AutoRound derivative and delegates preparation / the
@@ -181,8 +204,8 @@ vllm_models:
             SPEC: mtp
             CTX: long
       huge:
-        # Full compressed-context experimentation remains available with --all.
-        suggest_by_default: false
+        # Restore this compressed full-context choice on eligible 24-32 GiB
+        # Ampere-or-newer cards alongside the fast and long profiles.
         min_compute_cap: 8.0
         max_vram_gib_per_replica: 32
         runtime:
