@@ -10,10 +10,11 @@ The reconcile loop is the standard desired-vs-actual converge:
     actual  = backend.observe()
     realize(desired - actual);  teardown(actual - desired)
 
-``reclaim`` policy lives on each deployment's spec (from the catalog): ``keep-warm``
-(default — survive idle until pressure, avoids cold-start thrash) keeps an idle
-deployment running; ``stop`` / ``scale-to-zero`` let it be torn down as soon as demand
-hits zero. TTL expiry is enforced here too: every ``reconcile`` first
+``reclaim`` policy lives on each deployment's spec (from the catalog): ``stop``
+is the default, so a deployment is torn down after its final lease is released.
+Explicit ``keep-warm`` keeps an idle deployment running until GPU pressure;
+``scale-to-zero`` is also available. TTL expiry is enforced here too: every
+``reconcile`` first
 ``sweep``s the ledger, so a crashed job's lease stops protecting its deployment once
 its TTL elapses.
 """
@@ -231,7 +232,7 @@ class Controller:
         *,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] = time.sleep,
-        reclaim_default: str = KEEP_WARM,
+        reclaim_default: str = 'stop',
     ):
         self.ledger = ledger
         self.backend = backend
@@ -472,6 +473,11 @@ class Controller:
         serialized across threads via ``_tlock``, and across processes via an
         exclusive ``flock`` on a file beside the ledger.
         """
+        authority = self.ledger.store.publication_lock()
+        if authority is not None:
+            with authority:
+                yield
+            return
         if self._lock_path is None:
             yield
             return
@@ -597,7 +603,7 @@ class Controller:
     def keeps_up(self, deployment: Deployment) -> bool:
         """Whether the reconciler keeps ``deployment`` running.
 
-        LIVE always; IDLE only under ``keep-warm`` (the default policy). An
+        LIVE always; IDLE only under an explicit ``keep-warm`` policy. An
         IDLE ``stop`` deployment is torn down by the release that idled it
         and stays IDLE in the ledger, so a view that treats every IDLE row as
         running reports a missing container that is exactly as intended.
@@ -632,6 +638,8 @@ class Controller:
         hard: dict[str, list[int]] = {}
         hints: dict[str, list[int]] = {}
         optional: list[Deployment] = []
+        logical = getattr(self.backend, 'logical_idle_ids', None)
+        logical_ids = logical([g for g in by_id.values() if g.state == DeploymentState.IDLE and self.keeps_up(g)]) if logical is not None else set()
         for gid, deployment in by_id.items():
             if deployment.state == DeploymentState.LIVE:
                 if deployment.assigned_gpus is not None:
@@ -649,6 +657,8 @@ class Controller:
                 # KubeAI Model's replicas), a conflict or an unmappable
                 # reservation does not. [] where the cluster places.
                 gpus = residency.resident_gpus(gid) if residency is not None else None
+                if gpus is None and gid in logical_ids:
+                    gpus = []  # logical Model retained; no physical GPU claim
                 if gpus is not None:
                     hints[gid] = gpus
                     optional.append(deployment)
@@ -1730,6 +1740,7 @@ class Controller:
         wait_for_placement: bool = False,
         placement_timeout: float | None = None,
         placement_interval: float | None = None,
+        lease_id: str | None = None,
     ) -> AcquireOutcome:
         """Create a lease, realize its deployments, and (optionally) block on ready.
 
@@ -1766,6 +1777,7 @@ class Controller:
             wait_for_placement=wait_for_placement,
             placement_timeout=timeout if placement_timeout is None else placement_timeout,
             placement_interval=interval if placement_interval is None else placement_interval,
+            lease_id=lease_id,
         )
         return self._finish_acquire(result, rec, apply=apply, wait=wait,
                                     timeout=timeout, interval=interval)
@@ -1773,6 +1785,31 @@ class Controller:
     #: Seconds ``access`` waits for the front door to accept its key, when an
     #: external member has nothing else to wait for.
     FRONT_DOOR_WAIT_S = 120.0
+
+    @contextlib.contextmanager
+    def catalog_snapshot(self, sources: list[dict] | None):
+        """Use accepted catalog inputs for a durable service mutation.
+
+        Admission/publication still validate compatibility with resident
+        workloads. Restore this process's current inputs afterwards; a queued
+        request must neither silently adopt a later catalog nor change what
+        subsequent requests use. Never hold this context during readiness.
+        """
+        if sources is None or self.backend.recovery_profile is None:
+            yield
+            return
+        import copy
+
+        from .profile import CatalogUnion
+
+        CatalogUnion.from_sources(sources)
+        with self._global_lock():
+            original = self.invocation_profile()
+            self._invocation_profile = {**copy.deepcopy(original or {}), 'catalogs': copy.deepcopy(sources)}
+            try:
+                yield
+            finally:
+                self._invocation_profile = original
 
     def access(
         self,
@@ -1785,6 +1822,7 @@ class Controller:
         timeout: float = 300.0,
         interval: float = 2.0,
         wait_for_placement: bool = False,
+        lease_id: str | None = None,
     ) -> AccessResult:
         """Make ``endpoints`` reachable: lease the managed ones, publish all.
 
@@ -1817,7 +1855,7 @@ class Controller:
         if managed:
             outcome = self.acquire(
                 owner, managed, ttl_seconds=ttl_seconds, wait=wait, timeout=timeout,
-                interval=interval, wait_for_placement=wait_for_placement)
+                interval=interval, wait_for_placement=wait_for_placement, lease_id=lease_id)
             rec = outcome.reconcile
         else:
             rec = self.publish_endpoints()
@@ -1885,7 +1923,7 @@ class Controller:
 
     def _acquire_by_admission(
         self, owner, requests, *, ttl_seconds, apply, wait_for_placement,
-        placement_timeout, placement_interval,
+        placement_timeout, placement_interval, lease_id=None,
     ):
         """The acquire: preview in memory, commit only if admissible.
 
@@ -1947,6 +1985,7 @@ class Controller:
                             approved_digest=self._admission_digest if apply else None,
                             # The published endpoints commit with the lease.
                             profile=candidate_profile,
+                            lease_id=lease_id,
                         )
                     except AdmissionConflict:
                         continue            # the ledger moved; preview again

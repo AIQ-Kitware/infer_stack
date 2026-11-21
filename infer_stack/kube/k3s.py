@@ -168,6 +168,8 @@ def bootstrap(*, version: str | None = None, run: RunFunc | None = None) -> bool
         'wait', '--for=condition=Ready', 'node', '--all', '--timeout=180s',
     ])
     default_kubeconfig_ready = _ensure_default_kubeconfig_link()
+    from .context import remember
+    remember(user_kubeconfig())
     _ensure_helm(run)
     return default_kubeconfig_ready
 
@@ -178,11 +180,16 @@ def join(
     token_file: str | Path,
     node_name: str | None = None,
     version: str | None = None,
+    data_dir: str | Path | None = None,
     run: RunFunc | None = None,
 ) -> None:
     """Join this host to an existing K3s server without putting its token on argv."""
     run = run or default_run
     _require_local_tool('sudo')
+    if data_dir is not None:
+        data_dir = str(Path(data_dir).expanduser())
+        if not Path(data_dir).is_absolute():
+            raise ValueError('K3s data directory must be absolute')
     if _active(run, 'k3s'):
         raise RuntimeError('This host runs a K3s server; refusing to replace it with an agent')
     if _active(run, 'k3s-agent'):
@@ -193,6 +200,8 @@ def join(
             raise RuntimeError(f"Active K3s agent server {membership['server']!r} differs from requested {server!r}; stop/reconfigure membership explicitly")
         if node_name and membership['node_name'] != node_name:
             raise RuntimeError(f"Active K3s agent node name {membership['node_name']!r} differs from requested {node_name!r}")
+        if data_dir and membership.get('data_dir') != data_dir:
+            raise RuntimeError('Active K3s data directory differs from requested path; migrate explicitly')
         if version:
             installed = run(['k3s', '--version']).splitlines()[0]
             if installed.split()[2] != version:
@@ -214,6 +223,9 @@ def join(
     env['K3S_URL'] = server
     env['K3S_TOKEN'] = token
     preserve = ['K3S_URL', 'K3S_TOKEN']
+    if data_dir:
+        env['K3S_DATA_DIR'] = data_dir
+        preserve.append('K3S_DATA_DIR')
     if node_name:
         env['K3S_NODE_NAME'] = node_name
         preserve.append('K3S_NODE_NAME')
@@ -273,6 +285,7 @@ def local_status(*, run: RunFunc | None = None) -> dict:
             config.update(values)
         report['server'] = str(flags.get('server') or env.get('K3S_URL') or config.get('server') or '')
         report['node_name'] = str(flags.get('node-name') or env.get('K3S_NODE_NAME') or config.get('node-name') or socket.gethostname().lower())
+        report['data_dir'] = str(flags.get('data-dir') or env.get('K3S_DATA_DIR') or config.get('data-dir') or '/var/lib/rancher/k3s')
         if not report['server']:
             report['errors'].append('Active agent server is unknown')
     except Exception:

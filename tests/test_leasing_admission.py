@@ -19,16 +19,17 @@ from infer_stack.leasing.models import DeploymentState, LeaseState
 from test_leasing_compose import IMAGES, PORTS, STATE, FakeDocker, FakeHttp
 
 
-def catalog(**tps):
+def catalog(*, reclaim='stop', **tps):
     return Catalog.from_dict({
         'models': {n: {'source': f'hf://org/{n}'} for n in tps},
-        'endpoints': {n: {'engine': 'vllm', 'model': n,
+        'endpoints': {n: {'engine': 'vllm', 'model': n, 'reclaim': reclaim,
                           'runtime': {'tensor_parallel_size': tp}}
                       for n, tp in tps.items()},
     })
 
 
 CAT = catalog(big=2, big2=2, one=1, two=1)
+WARM_CAT = catalog(big=2, big2=2, one=1, two=1, reclaim='keep-warm')
 
 
 class Clock:
@@ -58,20 +59,20 @@ def services(ctl):
     return set((yaml.safe_load(ctl.backend.compose_file.read_text()) or {}).get('services') or {})
 
 
-def acquire(ctl, *names, **kw):
+def acquire(ctl, *names, catalog_obj=CAT, **kw):
     kw.setdefault('wait', False)
-    return ctl.acquire('owner', CAT.resolve_names(list(names)), **kw)
+    return ctl.acquire('owner', catalog_obj.resolve_names(list(names)), **kw)
 
 
 # -- P9: the incident ---------------------------------------------------------------
 
 
 def test_warm_idle_resident_yields_to_new_demand_without_queueing(tmp_path):   # 28
-    ledger, ctl, docker = make(tmp_path)
-    a = acquire(ctl, 'big')
+    ledger, ctl, docker = make(tmp_path, catalog_obj=WARM_CAT)
+    a = acquire(ctl, 'big', catalog_obj=WARM_CAT)
     ctl.release(a.lease.id)                                   # keep-warm: still running
     assert len(docker.running) == 1
-    b = acquire(ctl, 'big2')                                  # not queued, still admitted
+    b = acquire(ctl, 'big2', catalog_obj=WARM_CAT)  # not queued, still admitted
     gid = b.deployments[0].id
     assert ledger.get_deployment(gid).assigned_gpus == [0, 1]
     assert b.reconcile.displaced == [a.deployments[0].id]

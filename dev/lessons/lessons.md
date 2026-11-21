@@ -205,3 +205,50 @@ evidence; prefer append-only; supersede incorrect entries with a new one.
   - **Applies when:** a controller advertises endpoint metadata through a proxy
     while sharing/superset placement can map multiple endpoint contracts onto
     one runtime, or the proxy enriches returned metadata independently.
+
+- **Lesson:** A Python finally block is not SIGTERM cleanup unless a handler
+  turns termination into stack unwinding. A command-scoped lease must cover
+  acquisition/readiness as well as the running child, and forward cancellation
+  before killing a Docker client that still needs to signal its worker.
+  - **Evidence / MWE:** `tests/test_cli_run_signals.py` reproduces active leases
+    left behind by default SIGTERM and verifies release after wrapper-only and
+    whole-group cancellation; `infer_stack/cli/_run_lifecycle.py` implements
+    bounded child shutdown and handler restoration.
+  - **Applies when:** a scheduler or operator terminates a Python wrapper that
+    owns resources released in finally blocks. SIGKILL still cannot unwind.
+
+- **Lesson:** A wrapper's child argv must bypass configuration smartcasting.
+  Declaring a variadic positional field type=str did not prevent numeric tokens
+  from becoming integers; converting back also loses leading zeros.
+  - **Evidence / MWE:** `test_run_preserves_literal_child_arguments` in
+    `tests/test_cli_leasing.py`, reproduced with kwconf 0.11.0.
+  - **Applies when:** forwarding everything after -- to an arbitrary command.
+
+- **Lesson:** Sharing compatible engines does not reconcile external GPU
+  reservations or extend the original allocation's lifetime. A caller's
+  allowed_gpus limits new placement; existing engines can be reused elsewhere.
+  - **Evidence / MWE:** `plan_placement()` in `infer_stack/leasing/placement.py`
+    validates existing pins against the full pool while restricting new
+    placements; `docs/slurm-compatibility.md` describes the two-client case.
+  - **Applies when:** a batch scheduler reserves GPUs per client job while
+    infer-stack coalesces their requests onto common deployments.
+- **Lesson:** KubeAI's per-Model scale-down delay is additional to its
+  controller-wide request averaging window. A sampled request can keep the
+  desired replica count positive until it leaves that window, even after all
+  requests finish; bound both settings in scale-to-zero integration tests.
+- **Evidence / MWE:** KubeAI v0.23.2
+  [`values.yaml`](https://github.com/kubeai-project/kubeai/blob/v0.23.2/charts/kubeai/values.yaml)
+  (`modelAutoscaling.timeWindow: 10m`) and
+  [`autoscaler.go`](https://github.com/kubeai-project/kubeai/blob/v0.23.2/internal/modelautoscaler/autoscaler.go)
+  (ceil of moving-average requests / target). The 2026-10-08 service test
+  timed out with zero current requests but one sampled request in its
+  60-sample history; a 20-second window passed return-to-zero acceptance.
+- **Applies when:** testing or tuning on-demand KubeAI endpoints.
+
+- **Lesson:** Hardware suggestions in the TUI must honor the same display-GPU
+  policy as the CLI; always reserving display GPUs can suppress otherwise
+  eligible models on workstations and make deleted endpoints appear unrestorable.
+- **Evidence / MWE:** `tests/test_tui.py::test_tui_suggest_respects_display_policy_and_restores_hyperqwen`
+  checks backend overrides, saved policy, restored reasoning metadata, and
+  preservation of existing endpoints on a display-active Ampere GPU.
+- **Applies when:** adding UI entry points to hardware discovery or placement.

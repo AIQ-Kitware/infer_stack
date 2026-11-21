@@ -172,3 +172,37 @@ def test_paths_flags_state_written_by_another_user(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert 'hf_cache (dir, foreign-owned)' in out
     assert f'chown -R {real + 1}:' in out and 'hf-cache:/d busybox' in out
+
+
+def test_paths_query_single_value_and_metadata(tmp_path: Path) -> None:
+    # Queries are usable verbatim in $(...) (no group heading or status marker).
+    expected = str(tmp_path / 'runtime')
+    assert run_cli(tmp_path, 'paths', 'runtime_dir').stdout == expected + '\n'
+    assert run_cli(tmp_path, 'config', 'paths', 'runtime').stdout == expected + '\n'
+    assert run_cli(tmp_path, 'paths', 'catalog').stdout == str(tmp_path / 'catalog.yaml') + '\n'
+    assert run_cli(tmp_path, 'paths', 'compose_file').stdout == (
+        str(tmp_path / 'leasing/compose/docker-compose.yml') + '\n'
+    )
+    result = json.loads(run_cli(tmp_path, 'paths', 'runtime_dir', '--json').stdout)
+    assert result == {'label': 'runtime', 'kind': 'dir', 'status': 'missing', 'path': expected}
+
+
+def test_paths_query_respects_persisted_data_dir(tmp_path: Path) -> None:
+    import yaml
+
+    configured = tmp_path / 'my-data-volume'
+    (tmp_path / 'settings.yaml').write_text(yaml.safe_dump({'data_dir': str(configured)}))
+    env = os.environ.copy()
+    env['INFER_STACK_CONFIG_DIR'] = str(tmp_path)
+    env.pop('INFER_STACK_DATA_DIR', None)  # let durable settings take precedence
+    proc = subprocess.run(
+        [sys.executable, str(MANAGE_PY), 'paths', 'runtime_dir'],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout == str(configured / 'runtime') + '\n'
+
+
+def test_paths_query_rejects_unknown_name(tmp_path: Path) -> None:
+    proc = run_cli(tmp_path, 'paths', 'not-a-configured-path', check=False)
+    assert proc.returncode != 0
+    assert 'Run `infer-stack paths`' in proc.stderr + proc.stdout

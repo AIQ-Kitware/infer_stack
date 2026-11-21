@@ -67,6 +67,7 @@ class GatewayRoute:
     route_id: str | None = None
     origin: str = field(default='catalog', compare=False)
     max_input_tokens: int | None = None
+    reasoning_efforts: tuple[str, ...] = ()
 
     def entry(self) -> dict[str, Any]:
         """The LiteLLM entry: a static ``model_list`` item, or with a
@@ -82,6 +83,10 @@ class GatewayRoute:
                                   'api_base': self.api_base}
         if self.kind == 'openai':
             params['api_key'] = f'os.environ/{self.key_env}' if self.key_env else 'EMPTY'
+            if self.reasoning_efforts:
+                # The OpenAI-compatible upstream is a custom model name not in
+                # LiteLLM's standard model map. Whitelist this one field.
+                params['allowed_openai_params'] = ['reasoning_effort']
         entry: dict[str, Any] = {'model_name': self.alias, 'litellm_params': params}
         model_info: dict[str, Any] = {}
         if self.route_id:
@@ -92,6 +97,9 @@ class GatewayRoute:
                 model_info['infer_stack_key_env'] = self.key_env
         if self.max_input_tokens is not None:
             model_info['max_input_tokens'] = self.max_input_tokens
+        if self.reasoning_efforts:
+            model_info['supports_reasoning'] = True
+            model_info['reasoning_effort_levels'] = list(self.reasoning_efforts)
         if model_info:
             entry['model_info'] = model_info
         return entry

@@ -2,6 +2,23 @@
 We [keep a changelog](https://keepachangelog.com/en/1.0.0/).
 We aim to adhere to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+### Preserve literal child arguments after `run --`
+
+- Split the child command before configuration parsing. Numeric-looking tokens
+  previously became integers even with `type=str`, causing subprocess launch
+  errors or losing leading zeros. Real child-process tests preserve integers,
+  decimals, booleans, empty strings and child options through list and system argv.
+
+### Command-scoped leases release on SIGTERM
+
+- `run` now unwinds acquisition and command cleanup on SIGTERM (exit 143),
+  instead of exiting with an active lease. Ctrl-C retains its existing exit
+  behavior. Cancellation forwards to the child before a bounded shutdown wait,
+  allowing an initialized Docker worker to stop before its lease is released.
+- Descriptor construction is covered by release cleanup as well. Real-signal
+  regressions cover wrapper-only and process-group cancellation, plus readiness
+  cancellation. SIGKILL and host crashes still require TTL or explicit recovery.
+
 ### Allow slow K3s installs during bootstrap and join
 
 - `infer-stack kube k3s bootstrap` and `infer-stack kube k3s join` now give the
@@ -1179,7 +1196,10 @@ States the part that is not automatic: `$SLURM_JOB_GPUS` must be passed as
 including cards allocated to another job, and the failure surfaces later as a
 CUDA OOM in whichever job loses.
 
-## Version 0.7.2 - Unreleased
+## Version 0.7.3 - Unreleased
+
+
+## Version 0.7.2 - Released 2026-10-07
 
 
 ## Version 0.7.1 - Released 2026-09-24

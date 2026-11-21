@@ -1,5 +1,65 @@
 # Leasing e2e harness (developer tests)
 
+## Remote external access through real LiteLLM
+
+```bash
+PYTHONPATH=. python dev/remote_external_e2e.py
+```
+
+This CPU-only test uses an isolated Compose project, a real pinned LiteLLM
+image and a local mock upstream. It checks external access without a lease or
+an upstream readiness generation, actual gateway inference with the configured
+upstream credential, inference during controller loss, restart idempotency and
+remote `run` preserving exit status 7. It removes only its own Docker resources
+and prints the temporary artifact directory containing `result.json`. Credential
+values remain in private files and are excluded from the report.
+
+## Remote service against real K3s/KubeAI
+
+`dev/kubernetes_service_e2e.py` exercises an isolated, initially quiescent
+namespace in an already prepared cluster. It starts/stops its own remote
+control service with temporary configuration/data and removes only its managed
+test Models/leases. It never installs K3s or deletes a namespace. Do not use a
+namespace shared with an existing infer-stack authority.
+
+For a CPU simulator, build the minimal image context:
+
+```bash
+bash dev/e2e_tests/kubeai-mock/build.sh
+```
+
+Make that image available to every participating node's container runtime
+(for example, save/import it into a disposable K3s node's `k8s.io` image
+namespace). Install the KubeAI chart in the dedicated namespace using
+`dev/e2e_tests/kubeai-service-values.yaml`, plus your chosen reachable service
+configuration. The mock supplies the module entrypoint KubeAI expects and
+request latency for its proxy-load autoscaler; it does not perform inference.
+
+```bash
+PYTHONPATH=. python dev/kubernetes_service_e2e.py \
+  --kubeconfig /absolute/path/test-kubeconfig \
+  --namespace infer-stack-service-test \
+  --base-url http://127.0.0.1:8000/openai/v1 \
+  --check-scaling --timeout 180
+```
+
+The run checks node inventory, audit recovery, bundle generation, two ready replicas under concurrent load,
+inference during service loss, restart idempotency, reclaim, return to zero,
+GC preservation of an on-demand Model, wake and explicit eviction. Preserve
+the printed artifact directory's `result.json` and `server.log`. A timeout can
+leave cleanup incomplete; inspect the dedicated namespace before repeating.
+
+Add `--postgres-dsn-file /absolute/path/private-test.dsn` to exercise a disposable
+PostgreSQL database. The harness creates/drops only a uniquely named test schema
+and retains restart state within the run. It needs `infer-stack[postgres]` and
+schema-creation privileges; use a dedicated test database because service locks
+are database-wide. The token and per-run DSN artifacts are private. CPU/mock
+results prove control/lifecycle wiring, not GPU, model quality or energy.
+
+The short autoscaler interval/window in this fixture make scale-down acceptance
+bounded. A Model's scale-down delay alone does not override KubeAI's default
+ten-minute averaging window.
+
 **This is a developer harness, not a unit suite.** It lives in `dev/` (not
 `tests/`) on purpose: it stands up real docker/GPU/LiteLLM and is meant to be run
 by hand on a serving host (yardrat), produce a report, and let us see what

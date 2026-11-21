@@ -925,6 +925,53 @@ def test_tui_empty_catalog_shows_suggest_hint():
     _run(scenario)
 
 
+@pytest.mark.parametrize('backend_policy,saved_policy,expected', [
+    (None, False, True),
+    (None, True, False),
+    (False, True, True),
+    (True, False, False),
+])
+def test_tui_suggest_respects_display_policy_and_restores_hyperqwen(
+    tmp_path, monkeypatch, backend_policy, saved_policy, expected,
+):
+    import yaml
+    from infer_stack import paths
+    from infer_stack.hardware import simulate_inventory
+    from infer_stack.tui import InferStackTUI
+
+    inventory = simulate_inventory('1x24@8.6')
+    inventory['gpus'][0]['display_active'] = True
+    monkeypatch.setattr('infer_stack.hardware.detect_inventory', lambda: inventory)
+    original_get = paths.get_setting
+    monkeypatch.setattr(paths, 'get_setting', lambda key, *args, **kwargs:
+                        saved_policy if key == 'skip_display_gpus' else original_get(key, *args, **kwargs))
+    controller, catalog = _ctx()
+    if backend_policy is not None:
+        controller.backend.skip_display = backend_policy
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, catalog_path=catalog_path,
+                            interval=999, proc_factory=lambda svc: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_suggest()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    saved = yaml.safe_load(catalog_path.read_text())
+    name = 'qwen3.8-27b-dbirks-hyperqwen'
+    assert (name in saved['models']) is expected
+    assert saved['endpoints']['qwen-coder'] == CATALOG['endpoints']['qwen-coder']
+    if expected:
+        assert saved['endpoints'][name + '-long']['reasoning_efforts'] == ['low', 'medium', 'xhigh']
+        assert saved['endpoints'][name + '-huge']['reasoning_efforts'] == ['low', 'medium', 'xhigh']
+    else:
+        assert name + '-huge' not in saved['endpoints']
+
+
 def test_tui_instance_rows_say_what_each_serves():
     from types import SimpleNamespace
 

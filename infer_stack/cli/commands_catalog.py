@@ -36,7 +36,7 @@ from .options import (
     _PathOverridesMixin,
     _SimulateHardwareMixin,
 )
-
+from .remote import RemoteOptions
 
 
 def _print_yaml(text: str) -> None:
@@ -218,8 +218,11 @@ class CatalogSuggestCLI(
     Introspects the GPU inventory and joins it against the curated suggestion
     pool (``templates/suggestion-pool.yaml``) to derive a concrete, fits-this-box
     set of models + endpoints — sized ``max_model_len`` / ``gpu_memory_utilization``,
-    ``--dtype=half`` on pre-Ampere GPUs, the largest model kept warm. It mirrors
-    the hand-tuning of the leasing demo, but derived rather than guessed.
+    ``--dtype=half`` on pre-Ampere GPUs, and ``reclaim: stop`` for every
+    endpoint by default. A curated frontier retains every size class that fits,
+    plus smoke-test models. Hardware limits are the only reason a curated model
+    disappears on a more capable machine. ``--all`` includes optional models;
+    ``--include`` names individual opt-in models.
 
     Render then apply (a plan/apply split): by default it *renders* the
     suggestion as YAML to stdout and writes nothing — so you can review it, pipe
@@ -239,6 +242,8 @@ class CatalogSuggestCLI(
         infer-stack catalog suggest                      # render only (no write)
         infer-stack catalog suggest --simulate-hardware 4x48
         infer-stack catalog suggest --simulate-hardware 4x96@12.0
+        infer-stack catalog suggest --all                 # all fitting pool entries
+        infer-stack catalog suggest --include mistral-7b-instruct
         infer-stack catalog suggest --apply              # merge into the catalog
     """
 
@@ -251,6 +256,16 @@ class CatalogSuggestCLI(
     force = kw.Value(
         False, isflag=True,
         help='With --apply, overwrite catalog entries that already exist.',
+    )
+    all = kw.Value(
+        False, isflag=True,
+        help='Include every hardware-compatible model and serving variant from '
+        'the registry, including optional/legacy entries.',
+    )
+    include = kw.Value(
+        [], nargs='*', type=str,
+        help='Opt additional registered model name(s) into this suggestion. '
+        'Hardware eligibility still applies.',
     )
     backend = kw.Value(
         None, type=str,
@@ -302,9 +317,15 @@ class CatalogSuggestCLI(
         inventory = inventory or detect_inventory()
         gpus = inventory.get('gpus') or []
         skip_display = _resolve_skip_display(config) and not cluster
-        frag = suggest_catalog(
-            inventory, reserve_display_gpu='auto' if skip_display else False
-        )
+        try:
+            frag = suggest_catalog(
+                inventory,
+                all_models=config.all,
+                include=config.include,
+                reserve_display_gpu='auto' if skip_display else False,
+            )
+        except ValueError as ex:
+            raise SystemExit(f'catalog suggest: {ex}') from ex
         if cluster:
             # A cluster has no host GPU indices: the profile says where.
             for endpoint in frag['endpoints'].values():
@@ -408,6 +429,73 @@ def _merge_or_print(config, frag: dict, what: str) -> int:
     if skipped:
         print(f'  kept existing (pass --force to overwrite): {", ".join(skipped)}')
     return 0
+
+
+# The builtin catalog presets are packaged with infer-stack, so their names
+# resolve regardless of the caller's CWD or the location of the source tree.
+BUILTIN_CATALOGS = {
+    'qwen38-flash-next-3090': 'catalog-qwen38-flash-next-3090.yaml',
+}
+
+
+class CatalogImportCLI(_CatalogCommon):
+    """Merge a built-in catalog preset without overwriting existing entries.
+
+    Example: ``infer-stack catalog import qwen38-flash-next-3090``. Re-running
+    an identical import is a no-op. Differing existing entries are conflicts,
+    not invitations to silently change another operator's configuration.
+    """
+
+    __command__ = 'import'
+    name = kw.Value(None, position=1, type=str, help='Name of bundled catalog preset.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        from copy import deepcopy
+        from importlib import resources
+
+        config = cls.cli(argv=argv, data=kwargs)
+        name = str(config.name or '').strip()
+        if name not in BUILTIN_CATALOGS:
+            known = ', '.join(sorted(BUILTIN_CATALOGS))
+            raise SystemExit(f'Unknown catalog preset {name!r}; available: {known}')
+        preset = resources.files('infer_stack').joinpath(
+            'templates'
+        ).joinpath(BUILTIN_CATALOGS[name])
+        fragment = yaml.safe_load(preset.read_text(encoding='utf-8')) or {}
+        if not isinstance(fragment, dict) or any(
+            section not in SECTIONS for section in fragment
+        ):
+            raise SystemExit(f'Invalid packaged catalog preset: {name}')
+
+        path = _catalog_path(config)
+        existing = load_catalog_source(path)
+        updated = deepcopy(existing)
+        added = []
+        for section in SECTIONS:
+            entries = fragment.get(section, {})
+            if not isinstance(entries, dict):
+                raise SystemExit(f'Invalid {section} in packaged catalog preset: {name}')
+            for key, value in entries.items():
+                if key in updated[section]:
+                    _exists_guard(updated, section, key, False, value)
+                else:
+                    updated[section][key] = deepcopy(value)
+                    added.append(f'{section}:{key}')
+
+        # Canonical writer performs full catalog cross-reference validation.
+        # Validate before reporting a no-op, too, in case the current catalog
+        # has changed independently of the preset.
+        if config.dry_run:
+            _save_catalog(path, updated, dry_run=True)
+        elif added:
+            _save_catalog(path, updated)
+            print(f'imported {name} into {path}: {", ".join(added)}')
+        else:
+            from ..leasing.catalog_edit import validate_catalog_source
+            validate_catalog_source(updated)
+            print(f'catalog preset {name} already present (unchanged)')
+        return 0
 
 
 class CatalogPathCLI(_PathOverridesMixin):
@@ -998,6 +1086,68 @@ class CatalogBundleCLI(kw.ModalCLI):
 # ---------------------------------------------------------------------------
 
 
+class CatalogRevisionsCLI(RemoteOptions, _PathOverridesMixin):
+    """List approved remote revisions, or retrieve one source for review."""
+
+    __command__ = 'revisions'
+    revision = kw.Value(None, position=1, type=str, help='Optional immutable revision SHA256 to retrieve.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from . import remote
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not remote.server_url(config):
+            raise SystemExit('catalog revisions requires a control server')
+        resource = '/v1/catalog/revisions'
+        if config.revision:
+            if len(config.revision) != 64 or any(c not in '0123456789abcdef' for c in config.revision):
+                raise SystemExit('revision must be a catalog SHA256')
+            resource += '/' + config.revision
+        print(json.dumps(remote.client(config).request('GET', resource), indent=2))
+        return 0
+
+
+class CatalogPublishCLI(RemoteOptions, _PathOverridesMixin):
+    """Approve a reviewed YAML catalog for future remote requests."""
+
+    __command__ = 'publish'
+    source = kw.Value(None, position=1, type=str, help='Reviewed catalog YAML path.')
+    base_revision = kw.Value(None, type=str, help='Required current approved SHA256; prevents overwriting another edit.')
+    idempotency_key = kw.Value(None, type=str, help='Stable identity for retries of this exact approval.')
+    timeout = kw.Value(60, type=float)
+    dry_run = kw.Value(False, isflag=True, help='Validate locally and print the proposed revision.')
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from ..control.catalog import validate_source
+        from ..leasing.profile import canonical_digest
+        from . import remote
+
+        config = cls.cli(argv=argv, data=kwargs)
+        if not config.source:
+            raise SystemExit('catalog publish requires a reviewed YAML path')
+        source = yaml.safe_load(Path(config.source).expanduser().read_text())
+        validate_source(source)
+        if config.dry_run:
+            print(json.dumps({'catalog_revision': canonical_digest(source), 'endpoints': sorted(source.get('endpoints', {}))}, indent=2))
+            return 0
+        if not remote.server_url(config):
+            raise SystemExit('catalog publish requires a control server; local catalog edits remain file-based')
+        if not config.base_revision:
+            raise SystemExit('catalog publish requires --base-revision from catalog revisions')
+        client = remote.client(config)
+        operation = client.request('POST', '/v1/catalog/revisions', key=config.idempotency_key,
+                                   payload={'base_revision': config.base_revision, 'source': source})
+        completed = client.wait(operation['id'], timeout=config.timeout)
+        print(json.dumps({'operation_id': operation['id'], **completed['result']}, indent=2))
+        return 0
+
+
 class CatalogModalCLI(kw.ModalCLI):
     """Edit the user serving catalog (models / endpoints / hosts / bundles)."""
 
@@ -1005,6 +1155,7 @@ class CatalogModalCLI(kw.ModalCLI):
 
     init = CatalogInitCLI
     suggest = CatalogSuggestCLI
+    import_preset = CatalogImportCLI
     path = CatalogPathCLI
     show = CatalogShowCLI
     validate = CatalogValidateCLI
@@ -1013,3 +1164,5 @@ class CatalogModalCLI(kw.ModalCLI):
     endpoint = CatalogEndpointCLI
     host = CatalogHostCLI
     bundle = CatalogBundleCLI
+    revisions = CatalogRevisionsCLI
+    publish = CatalogPublishCLI

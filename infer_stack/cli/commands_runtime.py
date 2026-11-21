@@ -22,6 +22,7 @@ from ..paths import config_root, data_root, get_setting, settings_path
 from .commands_leasing import ApplyCLI
 from .context import _apply_path_overrides
 from .options import _PathOverridesMixin
+from .remote import RemoteOptions
 
 # ---------------------------------------------------------------------------
 # the backend behind the day-2 verbs
@@ -37,6 +38,9 @@ def _docker_env() -> dict[str, str]:
 def _day2_backend(config):
     """The configured backend, built as the leasing verbs build it."""
     from .commands_leasing import _make_backend
+    from .remote import server_url
+    if server_url(config):
+        raise SystemExit('This runtime verb does not yet support remote control; no local backend was opened')
 
     _apply_path_overrides(config)
     return _make_backend(config)
@@ -440,7 +444,7 @@ def _print_status_rich(d: dict[str, Any], console) -> None:
         console.print(line)
 
 
-class StatusCLI(_PathOverridesMixin):
+class StatusCLI(RemoteOptions, _PathOverridesMixin):
     """Holistic overview: where things live, the backend, and what is serving.
 
     A leasing summary (active leases, live deployments) with each endpoint's
@@ -455,6 +459,9 @@ class StatusCLI(_PathOverridesMixin):
     def main(cls, argv=True, **kwargs):
         config = cls.cli(argv=argv, data=kwargs)
         _apply_path_overrides(config)
+        from . import remote
+        if remote.server_url(config):
+            return remote.status(config)
         data = _gather_status(config)
         from rich.console import Console
 

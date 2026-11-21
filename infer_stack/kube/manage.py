@@ -42,6 +42,9 @@ def default_run(
     timeout: float | None = None,
 ) -> str:
     """Run a command and return stdout while preserving useful stderr errors."""
+    from .context import command
+
+    args = command(args)
     if timeout is None:
         timeout = (
             360 if ('upgrade' in args or 'wait' in args or 'drain' in args)

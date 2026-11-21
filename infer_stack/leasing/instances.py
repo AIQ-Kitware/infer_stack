@@ -267,6 +267,9 @@ class LogFollower:
             for line in split.feed(old) + split.flush():
                 self._lines.put((prefix, line))
         argv = follow_argv(inst, timestamps=self._timestamps)
+        if argv:
+            from ..kube.context import command
+            argv = command(argv)
         if not running or argv is None or self._stop.is_set():
             return
         # Engines log to stderr, which docker attach passes out on its own stderr.

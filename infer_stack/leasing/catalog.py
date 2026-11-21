@@ -39,7 +39,7 @@ Schema (all sections optional except as referenced)::
         #             env: {MAX_LEN: '{max_model_len}', SPEC: mtp},
         #             mounts: {/cache: my-model/cache}}
         sharing: {mode: shared-compatible}
-        reclaim: {policy: keep-warm}
+        reclaim: {policy: stop}  # default; keep-warm is explicit opt-in
         protocol: chat        # 'chat' (default) or 'completions' — which OpenAI
                               # surface the readiness probe (and clients) use; a
                               # completions-only model needs protocol: completions
@@ -52,6 +52,10 @@ Schema (all sections optional except as referenced)::
         #   placement: {min_vram_gib: 24}
         # Optional exact local override (normally set from the TUI):
         #   placement: {gpu_indices: [1]}
+        # For a specialized image that intentionally offloads most weights
+        # into CPU RAM, the on-disk checkpoint size is NOT a VRAM lower bound.
+        # Opt out of that heuristic while still declaring the real GPU floor:
+        #   placement: {min_vram_gib: 23, weight_floor: false}
       qwen-small:
         engine: ollama
         host: local-ollama
@@ -98,7 +102,7 @@ from .models import (
 VLLM = 'vllm'
 OLLAMA = 'ollama'
 
-DEFAULT_RECLAIM = 'keep-warm'
+DEFAULT_RECLAIM = 'stop'
 
 
 #: How many names a did-you-mean offers.
@@ -192,6 +196,9 @@ class EndpointSpec:
     # /chat/completions, 'completions' hits /completions. A completions-only
     # model never answers a chat probe, so this must match how it is served.
     protocol: str = 'chat'
+    # Per-request wire levels understood by this endpoint's chat template.
+    # This is metadata, not a model launch parameter.
+    reasoning_efforts: tuple[str, ...] = ()
     # Placement constraints / operator overrides (vllm only; validated in
     # errors()). ``min_vram_gib`` is the portable eligibility declaration;
     # ``gpu_indices`` is an optional exact local pin from the TUI/CLI.
@@ -236,7 +243,7 @@ def _parse_protocol(value: Any) -> str:
 #: Keys the endpoint-level ``placement`` block accepts. Deliberately strict —
 #: an unknown key is a typo (min_vram_gb) that would otherwise silently mean
 #: "no constraint", which on a heterogeneous host means an OOM later.
-PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices'})
+PLACEMENT_KEYS = frozenset({'min_vram_gib', 'gpu_indices', 'node', 'pool', 'weight_floor'})
 
 
 def _placement_errors(ep: EndpointSpec) -> list[str]:
@@ -258,6 +265,8 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
             f"(supported: {sorted(PLACEMENT_KEYS)})"
         )
     value = ep.placement.get('min_vram_gib')
+    from .cluster_placement import validate
+    errors.extend(f"endpoint '{ep.name}': {e}" for e in validate(ep.placement))
     if value is not None:
         if not isinstance(value, (int, float)) or isinstance(value, bool) \
                 or value <= 0:
@@ -265,6 +274,11 @@ def _placement_errors(ep: EndpointSpec) -> list[str]:
                 f"endpoint '{ep.name}': placement.min_vram_gib must be a "
                 f"positive number of GiB, got {value!r}"
             )
+    weight_floor = ep.placement.get('weight_floor')
+    if weight_floor is not None and type(weight_floor) is not bool:
+        errors.append(
+            f"endpoint '{ep.name}': placement.weight_floor must be a boolean"
+        )
     indices = ep.placement.get('gpu_indices')
     if indices is not None:
         if not isinstance(indices, list) or not indices:
@@ -321,6 +335,11 @@ def _runtime_errors(ep: EndpointSpec) -> list[str]:
     from .launch import launch_errors
 
     errors = launch_errors(ep.name, ep.engine, ep.runtime)
+    from .serving_policy import policy
+    try:
+        policy(ep.runtime)
+    except ValueError as ex:
+        errors.append(f"endpoint '{ep.name}': {ex}")
     shm = (ep.runtime or {}).get('shm_size')
     if shm is not None:
         if ep.engine != VLLM:
@@ -434,6 +453,8 @@ class Catalog:
                 reclaim=_parse_reclaim(spec.get('reclaim')),
                 served_name=spec.get('served_name') or spec.get('public_name'),
                 protocol=_parse_protocol(spec.get('protocol')),
+                reasoning_efforts=tuple(spec.get('reasoning_efforts') or ())
+                    if isinstance(spec.get('reasoning_efforts'), (list, tuple)) else (),
                 placement=dict(spec.get('placement') or {}),
                 raw=dict(spec),
             )
@@ -503,6 +524,19 @@ class Catalog:
                 errors.append(
                     f"endpoint '{ep.name}' has unknown engine '{ep.engine}'"
                 )
+            if 'reasoning_efforts' in ep.raw:
+                levels = ep.raw['reasoning_efforts']
+                allowed = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
+                if (ep.engine != VLLM or ep.protocol != 'chat'
+                    or not isinstance(levels, list) or not levels
+                    or any(not isinstance(v, str) or v not in allowed for v in levels)
+                    or len(set(levels)) != len(levels)):
+                    errors.append(
+                        f"endpoint '{ep.name}': reasoning_efforts must be a nonempty "
+                        'list of distinct OpenAI reasoning effort levels '
+                        '(none, minimal, low, medium, high, xhigh, max) '
+                        'on a vllm chat endpoint; declare only levels your template supports'
+                    )
             errors.extend(_placement_errors(ep))
             errors.extend(_runtime_errors(ep))
         for bundle, members in self.bundles.items():
@@ -624,6 +658,13 @@ class Catalog:
             gpu_indices=gpu_indices,
             launch=launch_identity(rt),
         )
+        from .serving_policy import identity
+        scaling = identity(rt)
+        if scaling:
+            structural['serving_policy'] = scaling
+        cluster = {k: ep.placement[k] for k in ('node', 'pool') if k in ep.placement}
+        if cluster:
+            structural['cluster_placement'] = cluster
         capacity: dict[str, Any] = {}
         if rt.get('max_model_len') is not None:
             capacity['max_model_len'] = rt['max_model_len']
@@ -658,6 +699,8 @@ class Catalog:
             # alias instead of re-deriving it from the deployment later.
             'max_input_tokens': effective_max_model_len(rt),
         }
+        if ep.reasoning_efforts:
+            served['reasoning_efforts'] = list(ep.reasoning_efforts)
         return EndpointRequest(
             endpoint=ep.name,
             engine=VLLM,

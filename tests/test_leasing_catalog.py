@@ -81,6 +81,12 @@ def test_resolve_vllm_endpoint(catalog):
     assert req.spec['hf_model_id'] == 'Qwen/Qwen2.5-Coder-32B-Instruct'
 
 
+def test_reclaim_defaults_to_stop_but_explicit_keep_warm_remains(catalog):
+    assert catalog.endpoints['draft-model'].reclaim == 'stop'
+    assert catalog.endpoints['qwen-coder-alias'].reclaim == 'stop'
+    assert catalog.endpoints['qwen-coder'].reclaim == 'keep-warm'
+
+
 def test_resolved_endpoint_keeps_derived_request_compatibility(catalog):
     resolved = catalog.resolve_endpoint('qwen-coder')
     req = resolved.to_request()

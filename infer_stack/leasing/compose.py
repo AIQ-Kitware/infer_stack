@@ -344,6 +344,7 @@ def vllm_service_dict(deployment: Deployment) -> dict[str, Any]:
         'command': list(runtime.get('command') or []),
         'env': dict(runtime.get('env') or {}),
         'mounts': dict(runtime.get('mounts') or {}),
+        'compose': dict(runtime.get('compose') or {}),
         # The effective window: one source of truth (launch.py) shared with
         # the LiteLLM route metadata, so the advertised context can never
         # diverge from the one on the engine's command line.
@@ -500,6 +501,10 @@ def _vllm_service(
             'start_period': '1800s',
         },
     }
+    if svc['compose'] and not simulated:
+        # launch_errors() restricts these options to the supported keys.
+        # They are Compose-only; unsupported_runtime_fields rejects them on KubeAI.
+        service.update(svc['compose'])
     if svc['mounts']:
         # An image that keeps prepared weights or caches outside vLLM's
         # /root/.cache layout persists them here, so a release and re-acquire
@@ -1462,7 +1467,7 @@ class ComposeBackend(ConvergeScaffold):
                 hard=dict(placement.hard),
                 optional_hints=dict(placement.optional_hints),
             )
-        return plan_placement(
+        result = plan_placement(
             desired,
             self.inventory,
             allowed_gpus=self.allowed_gpus,
@@ -1471,6 +1476,16 @@ class ComposeBackend(ConvergeScaffold):
             skip_display=self.skip_display,
             **keywords,
         )
+        for deployment in desired:
+            constraints = deployment.spec.get('placement') or {}
+            if constraints.get('node') or constraints.get('pool'):
+                result.assignments.pop(deployment.id, None)
+                result.errors.append(f'{deployment.id}: node/pool placement requires the Kubernetes backend')
+            from .serving_policy import identity
+            if identity(deployment.spec.get('runtime') or {}):
+                result.assignments.pop(deployment.id, None)
+                result.errors.append(f'{deployment.id}: replica/autoscaling policy requires the Kubernetes backend')
+        return result
 
     def preview(self, desired: list[Deployment], placement=None, *, approve: bool = False):
         """Place and render ``desired`` exactly as :meth:`converge` would; write nothing.
@@ -1637,7 +1652,7 @@ class ComposeBackend(ConvergeScaffold):
                     if measured:
                         placement['min_vram_gib'] = measured
                         placement['min_vram_source'] = 'measured'
-                if not placement.get('floor_vram_gib'):
+                if placement.get('weight_floor', True) and not placement.get('floor_vram_gib'):
                     model_id = spec.get('hf_model_id') or ''
                     if model_id not in self._floor_cache:
                         self._floor_cache[model_id] = weight_floor_gib(

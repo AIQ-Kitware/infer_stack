@@ -28,6 +28,7 @@ CATALOG = {
             'engine': 'vllm',
             'model': 'qc',
             'runtime': {'max_model_len': 32768},
+            'reclaim': {'policy': 'keep-warm'},  # explicit resident deployment
         },
         'reranker': {'engine': 'vllm', 'model': 'rr'},
     },
@@ -175,7 +176,7 @@ def test_release_via_env_file(env, capsys):
     assert rc == 0
     data = _leases_json(env, capsys)
     assert data['leases'][0]['state'] == 'released'
-    # default reclaim is keep-warm, so the deployment is idle but not torn down
+    # qwen-coder explicitly opts into keep-warm, so the deployment stays idle.
     assert data['deployments'][0]['state'] == 'idle'
     assert data['deployments'][0]['demand'] == 0
 
@@ -389,6 +390,19 @@ def test_run_returns_child_exit_code(env):
               sys.executable, '-c', 'import sys; sys.exit(3)']
     )
     assert rc == 3
+
+
+@pytest.mark.parametrize('source', ['list', 'sys', 'none'])
+def test_run_preserves_literal_child_arguments(env, monkeypatch, source):
+    out = env.tmp / 'child-args.json'
+    code = 'import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))'
+    child_args = ['8192', '001', '0.6', 'false', 'None', '', '--timeout', '1200', '3,6']
+    args = ['--endpoint', 'qwen-coder', *_base(env), '--',
+            sys.executable, '-c', code, str(out), *child_args]
+    monkeypatch.setattr(sys, 'argv', ['infer-stack run', *args])
+    rc = RunCLI.main(argv=args if source == 'list' else True if source == 'sys' else None)
+    assert rc == 0
+    assert json.loads(out.read_text()) == child_args
 
 
 def test_run_releases_on_exit(env, capsys):

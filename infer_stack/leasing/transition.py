@@ -52,6 +52,8 @@ def rotate_backend(controller, old_backend, *, apply=False) -> dict:
                                   + f". Run infer-stack stack down --backend={current['backend']}")
         version = store.admission_state_version()
         signature = canonical_digest({'profile': current, 'state_version': version})[:16]
+        if store.path is None:
+            raise ValueError('PostgreSQL backend rotation requires a native database backup and an explicit migration')
         if store.path == ':memory:':
             raise ProfileMismatch('ledger rotate requires a file-backed ledger for history archives')
         path = Path(store.path).resolve()

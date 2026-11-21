@@ -476,3 +476,308 @@ and the broader dev e2e comments distinguish worker acceptance from its
 namespace-wide lifecycle assumptions. This preserves one Python installer
 implementation while making the operator's path concrete for all three planned
 worker shapes.
+
+## 2026-10-06 18:40:02 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+
+The user asked whether treating scheduler cancellation as failure had broken
+lease cleanup. The command wrapper owns acquisition and release in one process;
+there is no scheduler release dependency. Real SIGTERM exposed an older defect:
+Python's default termination exits without unwinding the release finally block.
+SIGINT already unwound correctly. I kept release with its owner rather than
+adding a second lifecycle authority in the scheduler.
+
+The new signal context covers acquisition through release, converts SIGTERM
+to exit 143, preserves Ctrl-C behavior and restores previous handlers afterward.
+Repeated termination signals are ignored during cleanup. A Popen wait forwards
+cancellation to the child and permits ten seconds of graceful shutdown before
+killing it. This matters for Docker clients that must forward to an initialized
+worker. Descriptor construction now shares the release guard. Non-main-thread
+embedded calls retain their existing signal behavior. SIGKILL, host crashes and
+cleanup backend failures remain recovery cases; this is not durable finalization.
+
+Five subprocess regressions cover parent-only and whole-group SIGTERM/SIGINT
+and cancellation while waiting for readiness, using isolated real ledgers. A
+downstream real CPU Slurm/Docker integration also confirmed failed cancellation,
+skipped dependencies, stopped container, released lease and cached-node skip.
+Slurm can publish CANCELLED before termination cleanup finishes; checking resource
+state immediately after that report gave a false negative, so the integration
+waits briefly for release. Scheduler status is not a resource-cleanup barrier.
+
+Focused leasing/controller checks: 86 passed. Full suite: 1296 passed, 3 skipped
+and one unrelated rich-colour assertion failed under TERM=dumb/NO_COLOR=1. With
+TERM=xterm and NO_COLOR unset, all 11 CLI-meta tests passed. Scoped Ruff and ty
+checks passed. No production GPU or scheduler resources were mutated.
+
+## 2026-10-06 19:13:53 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+The user reported a child launch TypeError after successful endpoint readiness.
+Reproduced kwconf 0.11.0 smartcasting numeric child tokens into integers despite
+the positional command's type=str. Casting them back would still corrupt 001
+and boolean-looking strings, so run now splits literal child argv at -- before
+configuration parsing. Existing data-based commands remain on their prior path.
+List arguments, True and None system-argv modes are covered by real subprocess
+tests preserving numeric/decimal/boolean/empty tokens and child options.
+Readiness still releases on errors; the reported failure occurred before the
+child started, not in the service. Focused leasing and signal checks: 74 passed.
+Scoped fatal/unused checks and ty validation are recorded with this repair.
+
+## 2026-10-08 20:50:38 -0400
+
+Model: GPT-6 (Codex; weights/config variant unknown).
+The user requested completing an interrupted update and a plan for efficient
+GPU use when concurrent scheduler clients share engines, prioritizing Compose
+and covering Kubernetes. The pending merge joins two local wrapper fixes with
+six upstream commits on dev/0.7.2 (through 3ba2d6f). Only CHANGELOG conflicted;
+both sides add valid entries, so retain all entries. Automatic source merges
+preserve cancellation cleanup and literal child argv across the incoming
+control-plane authority refactor. No runtime restart or live mutation is needed.
+
+The capacity plan separates resource ownership from throughput policy. Sharing
+can avoid duplicate model loads while still duplicating external GPU reservations;
+per-call allowed_gpus only constrains new placement, not an existing engine's
+ownership lifetime. First benchmark explicit dedicated deployments against shared
+engines, then prove a serving allocation that CPU clients borrow. Compose replica
+groups require unique units, readiness-gated routes, draining and device ownership
+fences. KubeAI should retain native pod placement and autoscaling ownership instead
+of having two controllers change the same replica field. Lease count alone is not
+load. These are design proposals; no new replica API is promised by the document.
+
+Link the plan to the existing remote/HA design without making that larger project
+a prerequisite. Correct the Slurm runbook's claim that matching device slices
+reconciles accounting: compatible deployment reuse can still leave reserved GPUs
+idle, or leave a borrowing client dependent on an allocation that ends first.
+Existing modes remain available; performance and lifetime guarantees need real
+hardware checks before changing defaults. Generic documentation carries no
+downstream workload identity or private model-selection intent.
+
+Validation: tests/ has 1268 passed, 2 skipped; package doctests have 44 passed,
+1 skipped. Fatal syntax/name checks and ty pass. This validates the merged code
+and preserved wrappers, not a new replication implementation or GPU throughput.
+## 2026-10-07 23:21:08 -0400
+
+User intent: review the north star and Kubernetes/remote-controller roadmaps,
+revise them where needed, then implement both roadmaps in a coherent order.
+The latest steering ends the broad goal: finish the current catalog feature,
+stop at a coherent checkpoint, and make logical, attributed commits.
+Model/runtime identification: GPT-6-based Codex. The exact runtime model ID and
+weights/configuration variant are not exposed and cannot be determined. No
+delegated agents are authorized or used in this session.
+
+The plans agree on authority and scheduler boundaries, but their seams need
+executable contracts. I tightened constrained routing, warm versus on-demand
+residency, single-server SQLite eligibility, authenticated remote access, and
+destination-side fencing. My main concern is that a successful pod render can
+hide a broken user contract: a shared alias can defeat placement, a zero-replica
+Model can deadlock readiness, and a post-write database check cannot fence an
+external mutation. I favor conservative compatibility and fail-closed admission
+over opportunistic sharing until policy merging is defined.
+
+Implementation starts with the roadmap's locally testable onboarding, placement,
+replica-policy, and accounting foundations, then the service boundary. Physical
+K3s migration/GPU proofs need explicit handover rather than simulated claims.
+Existing untracked benchmark results and setup notes belong to the user and are
+left alone. Reusable takeaways: enforce user constraints through routing as well
+as scheduling; distinguish durable logical presence from warm process residency;
+and prove concurrency protection at the side-effect destination.
+
+The service slice now uses durable typed operations over the existing controller,
+with stable lease IDs for recovery between demand commit and result publication.
+Shared-token access is supplemented by reloadable named identities, ownership,
+endpoint scopes, finite TTL limits and transactional pending/active lease quotas.
+The remote CLI and a separate small Textual dashboard use HTTP only; separating
+that dashboard avoids fabricating a local controller or leaking local commands
+through an adapter. External-endpoint access and the richer local dashboard
+capabilities still need a deliberate remote contract.
+
+I extracted relational ledger operations while preserving the public SQLite
+store. PostgreSQL serializes short writes with an advisory transaction lock and
+whole publications with a separate session lock. This intentionally favors a
+small-fleet, understandable serialization point over speculative fine-grained
+locking. Real PostgreSQL 17 tests passed for contention, rollback on interruption,
+operation idempotency, precision and service exclusion. These locks coordinate
+healthy sessions; they are not destination-side fencing after partitions. HA
+must remain unavailable until that distinction is addressed.
+
+An isolated Docker K3s v1.36.4 / KubeAI v0.23.2 cluster passed the new
+`dev/kubernetes_service_e2e.py` contract with a CPU mock serving image: bundle
+generation, serving during controller loss, restart idempotency, stop-policy
+pruning, return to zero, logical Model retention through GC, wake from zero and
+explicit eviction. This exposed two useful seams: probes must use expanded
+bundle aliases, and pod-only warm residency otherwise prunes an on-demand Model
+at zero replicas. The latter now preserves only an already-existing Model,
+never starts a missing idle workload. A full checkpoint passed 1366 tests with
+9 skips and two existing resource warnings; later changes receive focused and
+final validation. Hardware GPU/TP/energy proof and actual K3s migration remain
+separate from this synthetic-runtime evidence.
+
+The PostgreSQL-backed real K3s/KubeAI service contract also passed, including
+scale-up to two ready replicas under eight concurrent generation loops. A
+first return-to-zero attempt exceeded its timeout even with a one-second
+Model delay: the operator's default ten-minute moving average had sampled a
+request and still calculated one desired replica. Shortening the disposable
+cluster's averaging window to twenty seconds made that test bounded. The
+fixture now records both timing controls; production tuning should preserve
+that distinction. This is a confirmed lesson, not a change to product defaults.
+
+Read-only remote node inventory and cursor-paginated audit history now complement
+the mutation API. Node capacity survives pod-list failure while allocation stays
+unknown. The dashboard preserves selected lease identity across reordered
+refreshes, and accepted HTTP requests finish before service authority is
+released at shutdown. Slow TLS handshakes no longer block the listener, and
+connection/rate limits have bounded state. I am confident in those isolated
+boundaries; destination fencing, authority migration/restore and live power
+collection still deserve their own protocols and failure injection rather than
+being inferred from these tests. The plans and operator guides now expose those
+remaining requirements. The latest SQLite cluster run additionally passed node
+inventory and audit recovery; artifacts remain in
+`/tmp/infer-stack-service-e2e-4_gudm8k`, with PostgreSQL scaling evidence in
+`/tmp/infer-stack-service-e2e-smll_w_q`. Disposable containers are removed after
+validation; no physical user cluster was changed.
+
+Final checkpoint validation passed 1383 tests with four skips and two existing
+resource warnings while real PostgreSQL contract cases were enabled. `ty check
+infer_stack`, scoped Ruff checks, shell syntax and `git diff --check` also passed.
+The broader goal remains active: the next software gaps are external remote
+access, durable catalog administration, authority migration/restore, startup
+history, collectors and destination fencing/agents. Physical K3s HA/GPU proof
+needs the target access, stable address and server-host choices requested from
+the user; that does not prevent independent software work.
+
+The following tranche closes remote external and mixed access. Accepted
+operations now retain their full approved catalog sources, not just a digest
+and resolved managed requests. Restart can use those original inputs without
+silently changing an external upstream or duplicating a committed dedicated
+lease. External-only access publishes routes without a lease or test generation
+upstream; mixed access applies ordinary generation readiness to managed members
+and gateway readiness to external routes. Converging access notices an external
+alias replaced by a newer publication rather than reporting the old contract
+ready. The remote run wrapper clears inherited lease identity, releases only its
+own managed demand, and preserves the child's exit status. The dashboard now
+uses access for approved endpoints, exposes finite TTL selection and respects
+observer/operator capabilities.
+
+Real Docker/LiteLLM acceptance passed twice, including inference with the actual
+upstream credential, controller-loss inference, same-operation restart recovery,
+and a no-lease remote child exiting 7. Latest private artifacts are in
+`/tmp/infer-stack-remote-external-qdcq2wgl`; the harness removes only its unique
+Compose project. The preceding full suite passed 1392 tests with four skips,
+with PostgreSQL contract cases enabled. This validates the data-plane boundary
+without pretending the mock upstream is GPU inference.
+
+I then implemented immutable approved catalog revisions because accepted
+snapshots alone do not establish who may change future intent. Files seed a new
+remote authority once; explicit catalog-admin approval advances a content hash
+in the database. A required base hash prevents concurrent editors from silently
+overwriting each other. Activation and terminal success/audit commit together,
+so interruption cannot leave an approved revision whose retried operation
+misreports failure. Existing leases retain their specifications; approval is
+not deployment replacement, and resident alias compatibility still governs
+publication. Operators can maintain demand but cannot inspect full catalog
+sources or approve launches. Local file editing stays unchanged.
+
+The accepted tradeoff is a reviewed whole-catalog publication rather than a
+field-by-field remote editor or Git integration. It is smaller, reviewable and
+preserves a clear launch-trust boundary. Strict JSON/catalog validation keeps
+malformed sources and credentials embedded in external URLs out of remote
+revisions; errors do not reflect private launch data. Tests exercise concurrent
+SQLite/PostgreSQL approvals, restart with changed bootstrap files, rollback
+before commit, original lease preservation, explicit first publication, HTTP
+role enforcement and CLI retry identity. Reusable takeaways: snapshot accepted
+intent independently from current approval; commit authority changes with their
+durable success record; treat catalog approval and backend realization as
+separate operations.
+
+The user cleared the broad goal and requested a stopping point and logical
+commits. I will finish verification and commit this checkpoint, without starting
+authority migration, agents or HA. Destination fencing, live telemetry/startup
+history, native backup/restore and physical K3s HA/GPU acceptance remain explicit
+roadmap work. Benchmark archives/results and the user's setup notes remain
+untracked and untouched. Commit attribution names the exposed GPT-6-based
+Codex identity and explicitly records that exact runtime/config identification
+is unavailable, rather than copying a previous agent's model attribution.
+
+Stopping-point validation: the full suite passed 1405 tests with four skips and
+the same two existing resource warnings, with real PostgreSQL enabled. The
+final focused catalog suite passed all 14 cases, including real PostgreSQL
+approval/conflict cases and the additional malformed-source check. Type checking, scoped Ruff,
+fixture shell syntax and diff whitespace checks passed. The real LiteLLM rerun
+passed after catalog persistence was introduced. Test containers are cleaned up
+after validation, while private temporary evidence is retained.
+
+## 2026-11-17 12:47:32 -0500
+
+The user removed HyperQwen entries to regenerate their reasoning metadata but
+the TUI's GPU suggestion did not restore them. I am GPT-6-based Codex; exact
+weights and runtime configuration are unavailable. Investigation confirmed that
+the TUI always excluded display-active GPUs, unlike the CLI's opt-in policy.
+I reused the CLI resolver, honoring an explicit backend choice before persisted
+settings, and retained the existing additive catalog merge. A headless test
+checks all four combinations of backend override and stored policy on a
+display-active 24-GiB Ampere GPU, including restored long-endpoint effort
+metadata and preservation of a custom endpoint. These tests establish the bug,
+but do not prove Namek has this exact hardware/display state. GPU eligibility
+and optional variant filtering remain intentional. No host catalog, running
+model, or user archives were changed. Reusable takeaway: UI actions must reuse
+configuration precedence rather than supply a historical convenience default.
+
+## 2026-11-17 12:52:36 -0500
+
+The user explicitly wants the HyperQwen huge endpoint restored by ordinary
+GPU suggestions, alongside fast and long. I am GPT-6-based Codex; exact weights
+and runtime configuration are unavailable. I removed only huge's opt-in flag
+from the shared suggestion pool, preserving its Ampere+ and approximately
+24-32 GiB eligibility constraints and all launcher settings. The same pool
+drives both CLI and TUI, so a UI-specific special case would have created a new
+policy discrepancy. Tests now require all three ordinary choices, exercise
+the memory/capability boundaries, and verify huge's reasoning metadata is
+restored by the headless TUI while an unrelated endpoint remains unchanged.
+This changes suggestion visibility, not which models are acquired or run.
+
+## 2026-11-18 21:57:31 -0500
+
+Model: GPT-6-based Codex; exact runtime model/configuration is not exposed.
+
+The user wants client latency preserved for all providers and local serving
+evidence that can be queried later and joined to client observations. I
+inspected the gateway renderer, accounting store/CLI/controller and upstream
+observability interfaces. The useful boundary is between request observations
+and physical resource attribution. The existing usage API reads imported
+deployment intervals; it is not an automatic collector. Reusing its overlap
+prohibition for request records would incorrectly reject concurrent requests.
+
+Recorded the proposed request-observation feature under docs/planning and
+linked it from the northstar. It uses gateway/engine observability seams,
+explicit request/attempt identities and durable lookup/export, with resource
+attribution separate. Response headers are a small independently useful seam;
+they do not prove trace propagation, durable logging or exclusive GPU time.
+The current mixed-image environment makes enabling a latest-documentation
+flag globally unjustified. Detailed tracing also changes the workload being
+measured, so bounded overhead/provenance checks are part of acceptance.
+
+This is a documentation-only change here. Source review confirmed no live
+request collector or per-request lookup path exists; no service, catalog or
+serving configuration was changed. The separate client implementation tests
+header/body evidence with a real SDK over deterministic HTTP responses and
+reads/exports its saved request table through the evaluation system. Live
+gateway/engine propagation and physical resource measurements remain unproven.
+
+## 2026-11-20 19:10:31 -0500
+
+The user asked for a pre-registered Inkling 2 Mini option, particularly for a 3090, and suggested Unsloth's GGUF. Model: GPT-6 (Codex); exact weights and reasoning configuration are not exposed by the runtime.
+
+I chose an opt-in Compose profile using the existing custom container launcher and llama.cpp's CUDA server, with the explicit Unsloth Q4_K_M file, an 8K context and a persistent download cache. The official vLLM launch targets newer GPU generations, while Ollama's published Inkling release targets Apple silicon; neither establishes a 3090 GGUF path. The upstream llama.cpp support is very recent, and the mutable server-cuda image, looped architecture, GPU memory consumption and actual generation remain unverified on a 3090 here. I therefore avoided suggesting it automatically or claiming image support; the profile disables the multimodal projector. The launch adapter is labeled vLLM by the existing catalog, so this is documented as Compose-only rather than presented as a native vLLM or KubeAI integration.
+
+The design takeaway is to distinguish a model file that fits from an engine and hardware combination proven to serve it; keep provisional profiles opt-in and make the exact file and cache behavior explicit. A future GPU acceptance run should check startup, generation, context capacity, and image/tool behavior before expanding the profile or promoting it to the default frontier.
+
+## 2026-11-20 19:36:33 -0500
+
+The user requested fixes for six CI failures involving warm residency, displacement, frozen definitions, gateway key rotation, rollback, and fatal startup handling. Model: gpt-6.1-sol (Codex); reasoning effort and weights configuration are not exposed.
+
+All six reproduced together and shared an outdated assumption: omitted reclaim policy meant a released model stayed warm. The catalog and controller now default to stop, so the tests removed the very residents they meant to exercise. I kept production semantics intact and made keep-warm explicit in the affected catalog/request fixtures. Admission's existing default fixture remains stop; a separate warm catalog and an optional catalog argument to its acquire helper keep the two lifecycle contracts distinct. The rollback test reuses the same explicitly warm request on both acquisitions so it still verifies coalescing. I am confident in the diagnosis because the original failures occurred immediately after release, and all 142 tests in the six affected modules pass with explicit policies. The remaining risk is fixture coupling in other modules, which the broader leasing run checks.
+
+Reusable takeaway: a lifecycle regression test must declare the retention policy needed to reach its asserted state; relying on a default can silently turn a startup, rollback, or gateway test into a test of ordinary release cleanup.
+
+Validation completed: all 676 tests in `python -m pytest -q tests/test_leasing_*.py` passed; `git diff --check` passed.

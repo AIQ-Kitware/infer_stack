@@ -18,7 +18,7 @@ is infer-stack's.
 `$SLURM_JOB_GPUS` is **not read automatically**. Pass it:
 
 ```bash
-infer-stack acquire "$ENDPOINT" --allowed_gpus "$SLURM_JOB_GPUS" -- ...
+infer-stack acquire "$ENDPOINT" --allowed_gpus "$SLURM_JOB_GPUS"
 infer-stack run --endpoint "$ENDPOINT" --allowed_gpus "$SLURM_JOB_GPUS" -- <cmd>
 ```
 
@@ -43,6 +43,17 @@ The practical consequence: `infer-stack ps` and `infer-stack leases` show the
 whole host, not your slice. Your job's own GPUs are the ones in
 `$SLURM_JOB_GPUS`.
 
+Sharing can leave reserved GPUs idle. For example, two jobs each reserving two
+GPUs can acquire the same two one-GPU engines. Both leases share those engines,
+but Slurm still reserves four GPUs. A second client lease does not create a
+second engine pair or return unused GPUs to Slurm. Existing shared deployments
+also do not acquire a new physical allocation lifetime when another client
+borrows them; `allowed_gpus` alone is not a serving-ownership fence.
+
+The proposed [GPU ownership and serving capacity plan](planning/gpu-ownership-and-serving-capacity.md)
+compares explicit per-allocation engines with a serving pool reserved once
+for CPU clients. Both need lifecycle/routing validation before changing runners.
+
 ## Concurrency
 
 The ledger is SQLite with `BEGIN IMMEDIATE` writes under a lock, so concurrent
@@ -64,5 +75,6 @@ is rejected immediately rather than queued, including one whose deployments are
 each placeable but cannot fit together — but that is minutes into the job
 rather than at `sbatch`.
 
-Declare resources to Slurm and pass the same slice to infer-stack, and the two
-agree. Skip either and they will not.
+Declare resources to Slurm and pass the same slice to infer-stack for safe new
+placement. That does not reconcile duplicate reservations for shared engines,
+nor prevent a borrowed engine's original allocation from ending first.
