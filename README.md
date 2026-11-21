@@ -57,7 +57,7 @@ attestation.
 - **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least
   80 GiB offers `inkling-2-mini`, using the pinned official checkpoint and
   Inkling-enabled vLLM image, reasoning/tool parsers, TP1 and 128K context.
-  This is a hardware-gated candidate pending GPU acceptance. The independent
+  Generation has been verified on a 96-GiB SM120 GPU. The independent
   Unsloth GGUF profile below remains available for other runtime experiments.
 
 - **Inkling 2 Mini on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF

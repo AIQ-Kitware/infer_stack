@@ -885,3 +885,16 @@ lease CLI, reuses its result without another lease, and rejects drift at both
 the catalog and lease boundaries. No GPU acceptance was attempted. The reusable
 lesson is to test the installed producer/consumer command contract, not only a
 consumer fixture that assumes the producer exists.
+
+## 2026-11-21 18:55:30 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user's host log now records generation verification through the native
+Inkling 2 Mini endpoint on a 96-GiB SM120 GPU. Updated the README's provisional
+startup status to reflect that observed generation. This establishes startup
+and a successful request for the pinned image/checkpoint configuration;
+throughput tuning remains unmeasured. A downstream queue failure occurred after
+readiness and was traced to differing Python source imports, not the serving
+recipe. The important distinction is between observed generation and broader
+performance claims; only the former is established by this log.
