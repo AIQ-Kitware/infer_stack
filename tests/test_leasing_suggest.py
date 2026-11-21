@@ -99,6 +99,24 @@ def test_gpt2_debug_endpoint_uses_completions_protocol():
     assert cat.endpoints['smollm2-135m'].protocol == 'chat'
 
 
+def test_inkling_q4_is_opt_in_and_selects_explicit_gguf():
+    name = 'inkling-2-mini-unsloth-q4'
+    inv = {'gpu_count': 1, 'gpus': [_gpu(0, 24, compute_cap=8.6)]}
+    assert name not in suggest_catalog(inv)['endpoints']
+    frag = suggest_catalog(inv, include=[name])
+    cat = Catalog.from_dict(frag)
+    req = cat.resolve_endpoint(name).to_request()
+    assert req.spec['hf_model_id'] == 'unsloth/Inkling-2-Mini-GGUF'
+    runtime = req.spec['runtime']
+    assert runtime['max_model_len'] == 8192
+    assert runtime['image'] == 'ghcr.io/ggml-org/llama.cpp:server-cuda'
+    assert 'Inkling-2-Mini-UD-Q4_K_M.gguf' in runtime['command']
+    assert '--no-mmproj' in runtime['command']
+    assert name not in suggest_catalog(
+        {'gpu_count': 1, 'gpus': [_gpu(0, 16, compute_cap=8.6)]},
+        include=[name])['endpoints']
+
+
 def test_all_and_include_restore_optional_models_without_ignoring_hardware():
     inv = simulate_inventory('1x48')
     default = suggest_catalog(inv)

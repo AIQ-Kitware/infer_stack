@@ -763,3 +763,11 @@ serving configuration was changed. The separate client implementation tests
 header/body evidence with a real SDK over deterministic HTTP responses and
 reads/exports its saved request table through the evaluation system. Live
 gateway/engine propagation and physical resource measurements remain unproven.
+
+## 2026-11-20 19:10:31 -0500
+
+The user asked for a pre-registered Inkling 2 Mini option, particularly for a 3090, and suggested Unsloth's GGUF. Model: GPT-6 (Codex); exact weights and reasoning configuration are not exposed by the runtime.
+
+I chose an opt-in Compose profile using the existing custom container launcher and llama.cpp's CUDA server, with the explicit Unsloth Q4_K_M file, an 8K context and a persistent download cache. The official vLLM launch targets newer GPU generations, while Ollama's published Inkling release targets Apple silicon; neither establishes a 3090 GGUF path. The upstream llama.cpp support is very recent, and the mutable server-cuda image, looped architecture, GPU memory consumption and actual generation remain unverified on a 3090 here. I therefore avoided suggesting it automatically or claiming image support; the profile disables the multimodal projector. The launch adapter is labeled vLLM by the existing catalog, so this is documented as Compose-only rather than presented as a native vLLM or KubeAI integration.
+
+The design takeaway is to distinguish a model file that fits from an engine and hardware combination proven to serve it; keep provisional profiles opt-in and make the exact file and cache behavior explicit. A future GPU acceptance run should check startup, generation, context capacity, and image/tool behavior before expanding the profile or promoting it to the default frontier.
