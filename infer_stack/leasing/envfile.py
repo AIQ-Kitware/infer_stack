@@ -7,9 +7,8 @@ inference-endpoint-injection brainstorm asked for, aligned with the
 file and gets a ready OpenAI-compatible client, instead of every team inventing
 its own env-var contract.
 
-For now ``base_url`` is supplied by the caller (the dry-run/null backend has no
-real front door). Once the Compose/KubeAI backends land they will report the
-realized base URL, and this same descriptor will carry it.
+The CLI supplies the backend's realized base URL; the null backend uses the
+caller-supplied URL. Serving provenance describes the assigned launch spec.
 """
 
 from __future__ import annotations
@@ -90,6 +89,13 @@ def build_descriptor(
         'protocol': 'openai',
         'endpoints': ordered,
         'models': list(ordered.values()),
+    }
+    from .provenance import managed_provenance
+    descriptor['serving_provenance'] = {
+        endpoint: managed_provenance(deployment.engine, deployment.spec, payload)
+        for deployment in deployments
+        for endpoint, payload in deployment.served.items()
+        if endpoint in wanted
     }
     if api_key:
         descriptor['api_key'] = api_key

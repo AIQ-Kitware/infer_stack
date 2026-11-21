@@ -858,3 +858,30 @@ TP1 and hardware eligibility. Model startup, kernels and throughput on SM120
 remain host acceptance work. Keeping a declared candidate distinct from a
 measured hardware recipe avoids treating command rendering as generation
 proof; no model-specific renderer or launcher was introduced.
+
+## 2026-11-21 15:33:38 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user supplied a failed downstream execution log while pursuing the approved
+native serving integration. Its scheduler expected an endpoint provenance CLI
+and a public lease descriptor that did not exist. Earlier compilation and
+request tests bypassed this boundary, so they gave insufficient integration
+coverage. Implemented the missing contract in infer-stack: catalog projection
+and assigned-deployment projection share one function, and command-scoped
+children receive a temporary, credential-free descriptor. Runtime options are
+hashed without exposing custom environment values. Mutable artifacts remain
+explicit uncertainty rather than an immutable identity assertion.
+
+The projection describes configured launch facts, not loaded-weight attestation.
+It hashes runtime options conservatively; a coalesced deployment with a different
+context capacity is distinguishable. Placement and reclaim policy stay outside
+model identity. The descriptor is removed when the child exits; existing
+signal forwarding and lease release remain in the original run lifecycle.
+
+124 focused provenance/CLI/signal tests and 679 existing leasing tests pass.
+A downstream test also executes native Inspect through the real null-backend
+lease CLI, reuses its result without another lease, and rejects drift at both
+the catalog and lease boundaries. No GPU acceptance was attempted. The reusable
+lesson is to test the installed producer/consumer command contract, not only a
+consumer fixture that assumes the producer exists.

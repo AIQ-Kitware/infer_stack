@@ -500,7 +500,7 @@ def _descriptor_for(controller, lease, deployments, config, *, assignments=None,
                 reserved_gpus.extend(assignments.get(deployment.id, []))
         if reserved_gpus:
             cuda_visible_devices = ','.join(str(i) for i in reserved_gpus)
-    return build_descriptor(
+    descriptor = build_descriptor(
         lease,
         deployments,
         base_url=base_url,
@@ -510,6 +510,14 @@ def _descriptor_for(controller, lease, deployments, config, *, assignments=None,
         cuda_visible_devices=cuda_visible_devices,
         endpoints=wanted,
     )
+    catalog = getattr(controller.backend, 'catalog', None)
+    if catalog is not None:
+        from ..leasing.provenance import endpoint_provenance
+        for alias in wanted:
+            if alias not in descriptor['serving_provenance']:
+                descriptor['serving_provenance'][alias] = endpoint_provenance(
+                    catalog.resolve_endpoint(alias))
+    return descriptor
 
 
 def _public_descriptor(descriptor: dict) -> dict:
@@ -2183,7 +2191,14 @@ class RunCLI(_LeasingCommonMixin):
             env = dict(os.environ)
             env.pop('INFER_STACK_LEASE_ID', None)
             env.update(descriptor_env(descriptor))
-            return run_child(command, env=env)
+            import tempfile
+            # A command-scoped, public file survives for the entire child and
+            # disappears on completion/cancellation. Credentials stay in env.
+            with tempfile.TemporaryDirectory(prefix='infer-stack-endpoint-') as temporary:
+                public_path = Path(temporary) / 'endpoint.json'
+                public_path.write_text(json.dumps(_public_descriptor(descriptor), sort_keys=True))
+                env['INFER_STACK_ENDPOINT_DESCRIPTOR'] = str(public_path)
+                return run_child(command, env=env)
         finally:
             if (result is not None and result.lease is not None
                     and not (result.acquire and result.acquire.released_on_timeout)

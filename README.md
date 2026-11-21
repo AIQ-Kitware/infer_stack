@@ -44,6 +44,14 @@ runs inside the wrapper, without a separate scheduler cleanup job. SIGKILL or
 a host crash cannot run cleanup: TTL expiry and explicit `release <lease-id>`
 remain recovery paths.
 
+`infer-stack catalog endpoint provenance <endpoint>` prints configured model,
+image and runtime identity as credential-free JSON. `run` exports
+`INFER_STACK_ENDPOINT_DESCRIPTOR`, the path to a public descriptor containing
+the assigned deployment's serving facts. The file lasts for the child command;
+credentials remain in its environment. Unpinned artifacts are reported as
+uncertain. These facts describe the launch specification, not loaded-weight
+attestation.
+
 ## Related work
 
 - **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least

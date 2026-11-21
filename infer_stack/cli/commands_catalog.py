@@ -923,6 +923,29 @@ class EndpointRmCLI(_CatalogCommon):
         return _rm(config, 'endpoints', config.names)
 
 
+class EndpointProvenanceCLI(_PathOverridesMixin):
+    """Print configured serving identity as credential-free JSON."""
+    __command__ = 'provenance'
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str, required=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from ..leasing.provenance import endpoint_provenance
+        from .commands_leasing import _load_catalog
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        try:
+            value = endpoint_provenance(_load_catalog(config).resolve_endpoint(config.name))
+        except CatalogError as ex:
+            raise SystemExit(str(ex)) from ex
+        print(json.dumps(value, sort_keys=True, allow_nan=False))
+        return 0
+
+
 class CatalogEndpointCLI(kw.ModalCLI):
     """Manage catalog endpoints."""
     __command__ = 'endpoint'
@@ -930,6 +953,7 @@ class CatalogEndpointCLI(kw.ModalCLI):
     list = EndpointListCLI
     show = EndpointShowCLI
     rm = EndpointRmCLI
+    provenance = EndpointProvenanceCLI
 
 
 # ---------------------------------------------------------------------------
