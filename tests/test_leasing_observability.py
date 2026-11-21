@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from infer_stack.leasing.backend import PlacementError
-from test_leasing_admission import acquire, make
+from test_leasing_admission import WARM_CAT, acquire, make
 
 
 def conditions(ctl):
@@ -29,10 +29,10 @@ def test_degraded_is_reported_kept_and_unblocks_on_release(tmp_path):
 
 
 def test_displaced_orphans_unknown_and_pending_are_reported(tmp_path):
-    ledger, ctl, docker = make(tmp_path)
-    a = acquire(ctl, 'big')
+    ledger, ctl, docker = make(tmp_path, catalog_obj=WARM_CAT)
+    a = acquire(ctl, 'big', catalog_obj=WARM_CAT)
     ctl.release(a.lease.id)
-    acquire(ctl, 'big2')
+    acquire(ctl, 'big2', catalog_obj=WARM_CAT)
     docker.add_container('stray', labels={})
     state = ctl.observe_state()
     assert conditions(ctl)[a.deployments[0].id] == 'displaced'

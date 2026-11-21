@@ -13,7 +13,7 @@ import pytest
 
 from infer_stack.leasing.compose import CRASH_LOOP_RESTARTS, classify_engine_log
 from infer_stack.leasing.residency import DEPLOYMENT_LABEL
-from test_leasing_admission import CAT, acquire, make
+from test_leasing_admission import WARM_CAT, acquire, make
 
 # A synthetic log in the shape the engine really emits. The architecture name
 # is invented on purpose: which models an evaluation runs is not this public
@@ -67,14 +67,14 @@ def test_the_wait_ends_at_once_instead_of_holding_the_gpu(tmp_path):
 def test_acquire_releases_the_lease_as_soon_as_the_engine_is_hopeless(tmp_path):
     from infer_stack.leasing import LeaseState
 
-    ledger, ctl, docker = make(tmp_path)
-    warm = acquire(ctl, 'one')                          # occupies the GPU
+    ledger, ctl, docker = make(tmp_path, catalog_obj=WARM_CAT)
+    warm = acquire(ctl, 'one', catalog_obj=WARM_CAT)  # occupies the GPU
     gid = warm.deployments[0].id
     crash_loop(ctl, docker, gid)
     ctl.release_leases([warm.lease.id])
     started = ctl.clock()
 
-    out = ctl.acquire('bob', CAT.resolve_names(['one']), wait=True,
+    out = ctl.acquire('bob', WARM_CAT.resolve_names(['one']), wait=True,
                       timeout=1800.0, interval=5.0)
 
     assert out.released_on_timeout is True              # the lease did not linger

@@ -536,13 +536,15 @@ def test_rollback_keeps_coalesced_warm_deployment_resident(tmp_path):
     ledger = Ledger(SqliteStore(db))
     ctl = Controller(ledger, _NoRoomBackend(shared, threading.Lock()))
 
-    warm = ctl.acquire('alice', [_vreq('m')], wait=False)
+    warm_request = _vreq('m')
+    warm_request.spec['reclaim'] = 'keep-warm'
+    warm = ctl.acquire('alice', [warm_request], wait=False)
     mid = warm.deployments[0].id
     ctl.release(warm.lease.id)      # keep-warm: idles but stays resident
     assert mid in shared['realized']
 
     with pytest.raises(PlacementError):
-        ctl.acquire('bob', [_vreq('m'), _vreq('big')], wait=False)
+        ctl.acquire('bob', [warm_request, _vreq('big')], wait=False)
 
     m = ledger.get_deployment(mid)
     assert m.state == DeploymentState.IDLE      # not STOPPED
