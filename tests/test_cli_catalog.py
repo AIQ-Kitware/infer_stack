@@ -60,6 +60,34 @@ def test_endpoint_add_exact_gpu_pin_merges_with_vram_placement(tmp_path):
     assert ep.placement == {'min_vram_gib': 24.0, 'gpu_indices': [0, 2]}
 
 
+@pytest.mark.parametrize('levels', [
+    ['medium', 'high'], ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+])
+def test_endpoint_add_publishes_reasoning_capability_to_gateway(tmp_path, levels):
+    from infer_stack.leasing.gateway import compose_catalog_route
+
+    ModelAddCLI.main(argv=['custom', '--source', 'hf://example/custom', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['custom', '--model', 'custom', *_opts(tmp_path)])
+    EndpointAddCLI.main(argv=['custom', '--model', 'custom',
+        '--force', '--reasoning-efforts', *levels, *_opts(tmp_path)])
+    cat = Catalog.load(cat_path(tmp_path))
+    request = cat.resolve_endpoint('custom').to_request()
+    assert request.served['reasoning_efforts'] == levels
+    route = compose_catalog_route('custom', request).entry()
+    assert route['litellm_params']['allowed_openai_params'] == ['reasoning_effort']
+    assert route['model_info']['reasoning_effort_levels'] == levels
+
+
+@pytest.mark.parametrize('levels', [['ultra'], ['high', 'high']])
+def test_endpoint_add_rejects_invalid_reasoning_capability_without_writing(tmp_path, levels):
+    ModelAddCLI.main(argv=['custom', '--source', 'hf://example/custom', *_opts(tmp_path)])
+    before = (tmp_path / 'catalog.yaml').read_text()
+    with pytest.raises(SystemExit, match='reasoning_efforts'):
+        EndpointAddCLI.main(argv=['custom', '--model', 'custom',
+            '--reasoning-efforts', *levels, *_opts(tmp_path)])
+    assert (tmp_path / 'catalog.yaml').read_text() == before
+
+
 def test_endpoint_add_rejects_wrong_gpu_pin_count(tmp_path):
     ModelAddCLI.main(argv=['m', '--source', 'hf://org/M', *_opts(tmp_path)])
     with pytest.raises(SystemExit) as exc:

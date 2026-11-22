@@ -52,6 +52,11 @@ credentials remain in its environment. Unpinned artifacts are reported as
 uncertain. These facts describe the launch specification, not loaded-weight
 attestation.
 
+For a custom vLLM chat endpoint, `catalog endpoint add --reasoning-efforts`
+declares the levels its template supports (e.g. `medium high`). The gateway
+then forwards the client's `reasoning_effort` field through LiteLLM. Recreating
+an endpoint must retain this capability alongside its runtime settings.
+
 ## Related work
 
 - **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least

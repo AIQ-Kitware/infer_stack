@@ -898,3 +898,29 @@ throughput tuning remains unmeasured. A downstream queue failure occurred after
 readiness and was traced to differing Python source imports, not the serving
 recipe. The important distinction is between observed generation and broader
 performance claims; only the former is established by this log.
+
+## 2026-11-22 00:09:14 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user asked to inspect a downstream run that reached generation readiness
+but failed its actual inference requests. A derived endpoint had been created
+through the catalog CLI without its source endpoint's reasoning capability.
+The schema, suggestion path and gateway already supported reasoning_efforts;
+endpoint add did not expose that field. LiteLLM consequently rejected an
+explicit reasoning_effort on the custom model name. Readiness's ordinary
+request did not exercise that optional parameter.
+
+Exposed the existing declaration through --reasoning-efforts. Catalog
+validation remains authoritative, and external endpoints reject this managed
+capability flag. The declaration reaches both served metadata and the existing
+gateway's allowed_openai_params projection; no parameters are silently dropped.
+Use parser=str rather than type=str: the CLI otherwise casts the literal
+supported level "none" to Python None before catalog validation.
+
+52 CLI and reasoning/gateway tests pass. Coverage upgrades an existing endpoint
+through the CLI, checks both the full level set and a subset, verifies gateway
+passthrough metadata, and confirms malformed declarations leave the file
+unchanged. The general lesson is that deriving a serving alias must retain its
+request capabilities as well as its launch settings. A plain readiness request
+is evidence of basic generation, not every advertised request option.
