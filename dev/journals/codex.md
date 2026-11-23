@@ -924,3 +924,23 @@ passthrough metadata, and confirms malformed declarations leave the file
 unchanged. The general lesson is that deriving a serving alias must retain its
 request capabilities as well as its launch settings. A plain readiness request
 is evidence of basic generation, not every advertised request option.
+
+
+## 2026-11-23 10:09:33 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user authorized an experimental exploration of local embedding endpoints,
+without implementing a server or changing existing serving behavior. Added
+planning/embedding-endpoints.md and linked it as an exploratory option from
+the north-star document. The plan reuses catalog, lease, placement and gateway
+ownership, identifies the generation-only readiness/protocol assumption, and
+asks for measurements against in-process batch encoding before expanding scope.
+
+My main uncertainty is whether sharing warm encoders pays for the server and
+GPU residency cost on the intended workloads. Existing vLLM embedding support
+makes that a narrower first experiment than adding a new engine immediately.
+Vector preparation/caching remains client work, and hosted APIs need no local
+GPU lease. No code, endpoint registration, GPU workload or runtime configuration
+was changed. Reviewed the existing lifecycle/probe/catalog boundaries and
+upstream serving documentation; no tests were needed for these planning notes.
