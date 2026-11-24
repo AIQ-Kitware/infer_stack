@@ -61,6 +61,39 @@ def test_deepseek_v4_requires_known_sm120_and_four_roomy_eligible_gpus():
     )['models']
 
 
+def test_nanbeige_discovery_renders_pinned_vllm_tool_serving():
+    import json
+
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'nanbeige4.3-33b'
+    fragment = suggest_catalog(simulate_inventory('4x96@12.0'))
+    request = Catalog.from_dict(fragment).resolve_endpoint(name).to_request()
+    assert request.engine == 'vllm'
+    assert request.spec['hf_model_id'] == 'Nanbeige/Nanbeige4.3-33B'
+    deployment = Deployment('test', request.compat_key, request.engine,
+                            request.sharing, request.capacity, request.spec,
+                            {name: request.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'].startswith('vllm/vllm-openai@sha256:')
+    assert '--revision=df919e1e2cf077a22204c78b6c826bf3db18bc08' in args
+    assert '--tensor-parallel-size=4' in args
+    assert '--max-model-len=131072' in args
+    assert '--enable-auto-tool-choice' in args
+    assert args[args.index('--reasoning-parser') + 1] == 'qwen3'
+    assert args[args.index('--tool-call-parser') + 1] == 'qwen3_coder'
+    assert json.loads(args[args.index('--default-chat-template-kwargs') + 1]) == {
+        'preserve_thinking': True,
+        'tool_call_format': 'xml',
+    }
+    assert '--trust-remote-code' not in args
+    for hardware in ('3x96@12.0', '4x24@12.0', '4x96@7.5'):
+        assert name not in suggest_catalog(simulate_inventory(hardware))['endpoints']
+
+
 def _gpu(index, mem, name='GPU', display=False, compute_cap=None):
     gpu = {'index': index, 'name': name, 'memory_gib': mem, 'display_active': display}
     if compute_cap is not None:
