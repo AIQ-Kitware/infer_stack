@@ -25,7 +25,8 @@ def _select(catalog, patterns):
         if any(c in pattern for c in '*?['):
             matches = sorted(fnmatch.filter(catalog.endpoints, pattern))
             if not matches:
-                raise ValueError(f'no catalog endpoint matches {pattern!r}')
+                raise ValueError(f'no catalog endpoint matches {pattern!r}; '
+                                 'see `infer-stack catalog endpoint list`')
             expanded.extend(matches)
         else:
             expanded.extend(catalog.expand([pattern]))
@@ -33,11 +34,18 @@ def _select(catalog, patterns):
 
 
 class BenchmarkRunCLI(_LeasingCommonMixin):
-    """Lease, benchmark and release selected endpoints serially on this host."""
+    """Lease, benchmark and release selected endpoints serially on this host.
+
+    Run `infer-stack catalog endpoint list` to discover available endpoint names.
+    """
 
     __command__ = 'run'
-    names = kw.Value([], nargs='*', position=1, type=str, help='Endpoint aliases, bundles, or quoted glob patterns.')
-    endpoints = kw.Value(None, type=str, help='Optional comma-separated endpoint aliases or glob patterns.')
+    names = kw.Value([], nargs='*', position=1, type=str,
+                     help='Endpoint aliases, bundles, or quoted glob patterns. '
+                          'See `infer-stack catalog endpoint list` for available endpoints.')
+    endpoints = kw.Value(None, type=str,
+                         help='Optional comma-separated endpoint aliases or glob patterns. '
+                              'See `infer-stack catalog endpoint list`.')
     catalog = kw.Value(None, type=str, help='Path to catalog.yaml.')
     base_url = kw.Value('http://127.0.0.1:14042/v1', type=str)
     api_key_env = kw.Value('LITELLM_MASTER_KEY', type=str)
@@ -67,7 +75,8 @@ class BenchmarkRunCLI(_LeasingCommonMixin):
             contexts = list(dict.fromkeys(int(x) for x in _collect_names(config.contexts)))
             names = _collect_names(config.names) + _collect_names(config.endpoints)
             if not names:
-                raise ValueError('give endpoint aliases, bundles, or quoted glob patterns')
+                raise ValueError('give endpoint aliases, bundles, or quoted glob patterns; '
+                                 'see `infer-stack catalog endpoint list`')
             if not contexts or min(contexts) < 1 or config.generation_tokens < 1 or config.repeats < 1:
                 raise ValueError('contexts, generation tokens and repeats must be positive')
             import math
