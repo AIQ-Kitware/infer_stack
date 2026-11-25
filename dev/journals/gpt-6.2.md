@@ -67,3 +67,30 @@ Docker and GPU execution are still unavailable. Future upstream or build
 recipe changes need a new image tag; apt/pip/base-image versions are not
 fully content-pinned. The normal acquisition timeout still applies to model
 startup/download after the build.
+
+## 2026-11-24 19:42:00 -0500
+
+Model: GPT-6.2 (ChatGPT; further configuration not available).
+
+User intent: make building a local runtime image an explicit infer-stack
+operation when no registry artifact is available. The Dockerfile and launcher
+must travel with the package, not require a source checkout. Keep the existing
+automatic cold-acquire path as a convenience, but allow preparation before an
+endpoint even exists.
+
+`infer-stack image list` exposes stable recipe names and versioned tags;
+`infer-stack image build maya-inkling-mini` resolves the same recipe and
+ensures the image exists, using the normal Docker environment. The shared
+`runtime_images.ensure_managed_image` is called by Compose and the CLI so they
+cannot drift on tags, contexts or timeouts. The explicit command does not
+instantiate a backend, touch the lease ledger, or allocate GPUs. It does not
+hold the publication lock, so prebuilding is a way to avoid delaying other
+leasing operations. Concurrent callers can still request the same build;
+no new lock or mutable image tag protocol is introduced. Build recipes remain
+code-owned and packaged; a catalog does not get to execute arbitrary builds.
+
+Validation: 22 targeted tests passed with an import-only ubelt placeholder;
+no ubelt operations exercised. The new CLI dispatch test is included but
+could not be run here because kwconf is unavailable. Wheel contents checked
+against the actual recipe/launcher and CLI source. No actual Docker or CUDA
+build was performed; real host acceptance remains required.

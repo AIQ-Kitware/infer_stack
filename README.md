@@ -52,7 +52,9 @@ remain recovery paths.
   catalog suggest --include inkling-2-mini-maya --apply` and `infer-stack
   acquire inkling-2-mini-maya`. Profiles offer 192K/256K tokens with the
   drafter and 336K without it. The first acquire automatically builds and caches
-  the pinned image; no manual Docker build is needed. Compose manages the
+  the pinned image; optionally prebuild it with `infer-stack image build
+  maya-inkling-mini` (see `infer-stack image list`). No manual Docker build is
+  needed. Compose manages the
   engine through its custom launcher interface (no vLLM in the image). GPU acceptance is pending.
 
 - **Inkling 2 Mini via llama.cpp on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF

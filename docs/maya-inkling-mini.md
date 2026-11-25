@@ -61,10 +61,26 @@ repeatable experiments, or download known revisions to this directory before
 acquiring.
 
 For a slow connection, use a longer readiness budget on the first acquisition
-(e.g. `--timeout 1800`). No special prefetch or image preparation command is
-required for ordinary use. The advanced `config publish --pull` path also
-prepares this built-in image instead of attempting to pull a nonexistent
-registry image.
+(e.g. `--timeout 1800`). No special image preparation command is required for ordinary use.
+
+## Prepare the image separately (optional)
+
+```bash
+infer-stack image list
+infer-stack image build maya-inkling-mini
+```
+
+These commands work from the installed package, even before a catalog or an
+endpoint exists. The recipe name resolves to the exact versioned Docker tag
+used by all three profiles. `image build` checks the Docker cache, builds
+only if missing, and streams Docker's progress. It does not acquire a GPU,
+download model weights, start containers, or change the catalog or ledger.
+This is useful on a new host to avoid compiling during `acquire` while the
+publication lock is held. It targets the Docker daemon selected by the usual
+infer-stack Docker environment, so run it on the actual inference host.
+The advanced `config publish --pull` path also prepares this built-in image
+instead of attempting to pull a nonexistent registry image. The automatic
+path and the explicit build share the same implementation.
 
 Each managed startup extracts the tokenizer with the pinned upstream template and generates a text-only config from the upstream profile.
 The launcher uses the catalog's context, port, and served name verbatim, with

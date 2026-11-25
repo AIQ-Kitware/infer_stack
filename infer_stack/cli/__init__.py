@@ -42,6 +42,7 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_kube import KubeModalCLI
 from .commands_ledger import LedgerModalCLI
+from .commands_images import ImageModalCLI
 from .commands_usage import UsageCLI
 from .commands_server import OperationsCLI, ServerCLI
 from .commands_leasing import (
@@ -163,6 +164,7 @@ class ManageCLI(kw.ModalCLI):
 
     # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
     # at the top level as the two hottest convenience aliases.
+    image = ImageModalCLI  # prepare packaged runtime images without a lease
     stack = StackModalCLI
     logs = LogsCLI
     ps = PsCLI

@@ -2082,19 +2082,9 @@ class ComposeBackend(ConvergeScaffold):
                 pass
 
     def _image_present(self, image: str) -> bool:
-        import subprocess
+        from ..runtime_images import image_present
 
-        args = ['docker', 'image', 'inspect', '--format', '{{.Id}}', image]
-        try:
-            try:
-                # Capture "No such image" rather than let it reach the terminal
-                # (under the TUI it would draw over the screen).
-                self.run(args, stderr_lines=lambda _line: None)
-            except TypeError:           # an injected runner without the keyword
-                self.run(args)
-            return True
-        except subprocess.CalledProcessError:
-            return False
+        return image_present(image, run=self.run)
 
     def _layer_sizes(self, image: str) -> dict[str, int]:
         """Layer sizes by 12-char digest prefix, for this host's platform. Best effort."""
@@ -2120,15 +2110,6 @@ class ComposeBackend(ConvergeScaffold):
                         for l in layers if l.get('digest')}
         return {}
 
-    def _build_managed_image(self, image: str, context: Path) -> None:
-        """Build a shipped recipe on a cold host, without operator action."""
-        if not (context / 'Dockerfile').is_file():
-            raise ApplyAborted(f'packaged Docker build recipe missing for {image}: {context}')
-        self._report(f'building {image}: first use, compiling the bundled CUDA engine')
-        self.run(['docker', 'build', '--progress=plain', '--tag', image, str(context)],
-                 timeout=DOCKER_TIMEOUT_BUILD)
-        self._report(f'built {image}')
-
     def _pull_missing(self, images) -> None:
         """Prepare every missing image, building only shipped local recipes.
 
@@ -2136,13 +2117,19 @@ class ComposeBackend(ConvergeScaffold):
         use that is many minutes of an apply that looks hung. Pulling first
         also means a failed pull aborts before anything is removed.
         """
-        from ..runtime_images import IMAGE_RECIPES
+        from ..runtime_images import (
+            IMAGE_RECIPES, RuntimeImageError, ensure_managed_image,
+        )
 
         for image in sorted({str(i) for i in images if i}):
-            if self._image_present(image):
-                continue
             if image in IMAGE_RECIPES:
-                self._build_managed_image(image, IMAGE_RECIPES[image])
+                try:
+                    ensure_managed_image(image, run=self.run, report=self._report,
+                                         report_cached=False)
+                except RuntimeImageError as exc:
+                    raise ApplyAborted(str(exc)) from exc
+                continue
+            if self._image_present(image):
                 continue
             progress = PullProgress(image, self._layer_sizes(image))
             size = f' ({_size(sum(progress.sizes.values()))})' if progress.sizes else ''
