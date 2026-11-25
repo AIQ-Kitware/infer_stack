@@ -43,6 +43,7 @@ from .commands_catalog import CatalogModalCLI
 from .commands_kube import KubeModalCLI
 from .commands_ledger import LedgerModalCLI
 from .commands_images import ImageModalCLI
+from .commands_benchmark import BenchmarkModalCLI
 from .commands_usage import UsageCLI
 from .commands_server import OperationsCLI, ServerCLI
 from .commands_leasing import (
@@ -151,6 +152,7 @@ class ManageCLI(kw.ModalCLI):
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
     usage = UsageCLI
+    benchmark = BenchmarkModalCLI
     server = ServerCLI
     operations = OperationsCLI
     ledger = LedgerModalCLI

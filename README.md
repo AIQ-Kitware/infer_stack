@@ -57,6 +57,14 @@ declares the levels its template supports (e.g. `medium high`). The gateway
 then forwards the client's `reasoning_effort` field through LiteLLM. Recreating
 an endpoint must retain this capability alongside its runtime settings.
 
+## Benchmark inference configurations
+
+Run `infer-stack benchmark run <endpoint> <endpoint>` to lease and benchmark
+each endpoint serially, recording hardware identity, PCIe topology, context
+throughput and latency in a portable append-only ledger. `infer-stack benchmark
+report` combines historical observations into HTML, Markdown and CSV reports.
+See [the benchmark guide](docs/benchmark.md).
+
 ## Related work
 
 - **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least

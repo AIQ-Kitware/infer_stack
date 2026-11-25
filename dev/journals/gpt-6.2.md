@@ -115,3 +115,21 @@ Validation: 13 focused launcher tests passed (pytest addopts overridden to
 avoid unavailable xdoctest). Docker/CUDA and real weight downloads remain
 host-side validation; the upstream GGUF reader and HF file paths were
 inspected but real model bytes were not downloaded here.
+
+## 2026-11-25 14:43:00 -0500
+
+Model: ChatGPT (GPT-6.2; serving configuration not independently identifiable).
+The user wants a simple kwconf benchmark command taking endpoints, serial
+lease/release, portable append-only observations and a readable report across
+machines. Their two 3090s may have different PCIe links; GPU model alone is not
+a comparison identity. Implemented a local Compose/LiteLLM runner using the
+existing controller, releasing only its own lease and evicting newly idle
+deployments to prevent a keep-warm policy from blocking the next run. Raw
+observations distinguish target vs reported tokens and requested vs observed
+prefix reuse. Host/GPU identity, upstream PCI path, actual image ID where
+available and under-load telemetry preserve the differences otherwise lost in
+an aggregate. Reports keep identities separate and avoid pretending client-side
+stream timings are engine-internal counters. No changes to core lease semantics.
+Risks: new agents can join a deployment during the benchmark, mutable weights
+are not attested, and tokenizer calibration is approximate. Scope intentionally
+limited to local Compose; remote scheduling needs server-side hardware facts.
