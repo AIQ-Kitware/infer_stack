@@ -83,10 +83,12 @@ def test_import_exact_optional_profile(tmp_path, monkeypatch):
     assert CatalogImportCLI.main(argv=argv) == 0
 
 
-def test_import_known_incompatible_profile(tmp_path, monkeypatch):
-    import pytest
-
+def test_import_known_incompatible_profile(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
-    with pytest.raises(SystemExit, match='does not fit'):
-        CatalogImportCLI.main(argv=['inkling-2-mini-maya', '--simulate-hardware', '1x16@8.6'])
-    assert not (tmp_path / 'catalog.yaml').exists()
+    name = 'deepseek-v4-flash-0731'
+    assert CatalogImportCLI.main(argv=[name, '--simulate-hardware', '1x24@8.6']) == 0
+    data = yaml.safe_load((tmp_path / 'catalog.yaml').read_text())
+    assert set(data['endpoints']) == {name}
+    assert data['endpoints'][name]['placement'] == {'min_vram_gib': 80}
+    assert data['endpoints'][name]['runtime']['tensor_parallel_size'] == 4
+    assert 'Outside suggested hardware' in capsys.readouterr().err

@@ -40,10 +40,15 @@ def test_choices_expose_real_variants_and_image_recipe():
     assert rows['gemma4-31b']['tier'] == 'optional'
     assert set(rows[MAYA + '-long']['fragment']['models']) == {MAYA}
     assert set(rows[MAYA + '-long']['fragment']['endpoints']) == {MAYA + '-long'}
-    assert not any(r['name'].startswith(MAYA) for r in profile_choices(
-        simulate_inventory('2x24@8.9')))
-    assert not any(r['managed_build'] for r in profile_choices(
-        simulate_inventory('2x24@8.6'), kubeai=True))
+    wrong_arch = {r['name']: r for r in profile_choices(simulate_inventory('2x24@8.9'))}
+    assert not wrong_arch[MAYA]['hardware_fit']
+    assert 'CUDA compute 8.6' in wrong_arch[MAYA]['warnings'][0]
+    assert wrong_arch[MAYA]['managed_build']
+    cluster = {r['name']: r for r in profile_choices(
+        simulate_inventory('2x24@8.6'), kubeai=True)}
+    assert cluster[MAYA]['hardware_fit'] and not cluster[MAYA]['backend_compatible']
+    assert 'KubeAI' in cluster[MAYA]['warnings'][0]
+    assert cluster[MAYA]['managed_build']
 
 
 def test_exact_import_preserves_existing_and_is_idempotent():
@@ -72,6 +77,56 @@ def test_conflict_refuses_before_partial_import(section):
     assert existing == original
 
 
-def test_incompatible_profile_cannot_be_imported():
+def test_automatic_suggestions_still_filter_incompatible_profiles():
     with pytest.raises(ValueError, match='does not fit'):
         endpoint_fragment(discovery_catalog(simulate_inventory('1x16@8.6')), MAYA)
+
+
+@pytest.mark.parametrize('inventory', [
+    {'gpus': []}, simulate_inventory('2x24@8.6'),
+    simulate_inventory('4x96@12.0'), simulate_inventory('192@9.0,4x96@12.0'),
+])
+def test_complete_registry_and_fitting_recipe_identity(inventory):
+    from infer_stack.leasing import Catalog
+
+    fitting = discovery_catalog(inventory)['endpoints']
+    rows = {r['name']: r for r in profile_choices(inventory)}
+    assert set(rows) == registry_endpoint_names()
+    for name, row in rows.items():
+        Catalog.from_dict(row['fragment'])
+        ep = row['fragment']['endpoints'][name]
+        assert row['hardware_fit'] == (name in fitting)
+        if name in fitting:
+            assert ep == fitting[name]
+        else:
+            assert 'gpu_indices' not in ep.get('placement', {})
+            assert row['warnings']
+
+
+def test_deepseek_profiles_are_visible_with_advisory_constraints():
+    name = 'deepseek-v4-flash-0731'
+    variant = name + '-tp2-experimental'
+    inv = simulate_inventory('2x24@8.6')
+    rows = {r['name']: r for r in profile_choices(inv)}
+    assert not rows[name]['hardware_fit']
+    assert rows[name]['gpu_count'] == 4
+    assert rows[name]['min_vram_gib'] == 80
+    assert 'CUDA compute 12.0' in rows[name]['warnings'][0]
+    assert 'passed generation readiness' in rows[name]['note']
+    assert not rows[variant]['hardware_fit']
+    assert rows[variant]['gpu_count'] == 2
+    assert rows[variant]['context'] == 32768
+    assert rows[variant]['tier'] == 'optional'
+    assert 'unverified' in rows[variant]['note']
+    # Exact import does not relax floors or fabricate hardware pins.
+    fragment = rows[name]['fragment']
+    updated, added = merge_catalog_fragment({}, fragment)
+    assert set(updated['endpoints']) == {name}
+    assert updated['endpoints'][name]['placement'] == {'min_vram_gib': 80}
+    assert merge_catalog_fragment(updated, fragment) == (updated, [])
+    # A two-GPU host only gets the experiment through explicit discovery,
+    # not through default automatic suggestions or an orphan model entry.
+    big = simulate_inventory('2x96@12.0')
+    normal = discovery_catalog(big, all_models=False)
+    assert name not in normal['models'] and variant not in normal['endpoints']
+    assert variant in discovery_catalog(big)['endpoints']

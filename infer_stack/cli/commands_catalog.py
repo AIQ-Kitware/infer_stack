@@ -443,10 +443,11 @@ class CatalogImportCLI(_CatalogCommon, _SimulateHardwareMixin,
                        _AllowedGpusMixin, _DisplayGpuMixin):
     """Import one known endpoint or a built-in catalog preset.
 
-    Registry profiles are sized to the selected hardware, just like suggestions,
-    but only the named endpoint and its model are added (including optional
-    profiles). Presets retain their literal packaged configuration. Repeating
-    an identical import is a no-op; conflicting entries are never overwritten.
+    Registry imports add exactly the named endpoint and its model dependency.
+    Fitting profiles are sized to the selected hardware; other profiles retain
+    their starting configuration and warn instead of refusing import. Presets
+    retain their literal packaged configuration. Repeating an identical import
+    is a no-op; conflicting entries are never overwritten.
     """
 
     __command__ = 'import'
@@ -457,7 +458,7 @@ class CatalogImportCLI(_CatalogCommon, _SimulateHardwareMixin,
     def main(cls, argv=True, **kwargs):
         from importlib import resources
         from ..leasing.discovery import (
-            discovery_catalog, endpoint_fragment, registry_endpoint_names,
+            profile_choices, registry_endpoint_names,
         )
         from ..leasing.suggest import builtin_pool
 
@@ -485,17 +486,24 @@ class CatalogImportCLI(_CatalogCommon, _SimulateHardwareMixin,
                        or get_setting('backend')) == 'kubeai'
             inventory = effective_inventory(config)
             if inventory is None:
-                if cluster:
-                    inventory, _ = _make_backend(config).suggestion_inventory()
-                else:
-                    inventory = detect_inventory()
-            try:
-                fragment = endpoint_fragment(discovery_catalog(
-                    inventory, pool=pool, kubeai=cluster,
-                    reserve_display_gpu='auto' if not cluster and _resolve_skip_display(config) else False,
-                ), name)
-            except ValueError as ex:
-                raise SystemExit(f'catalog import: {ex}') from ex
+                try:
+                    if cluster:
+                        inventory, _ = _make_backend(config).suggestion_inventory()
+                    else:
+                        inventory = detect_inventory()
+                except Exception as ex:
+                    print(f'catalog import: warning: GPU discovery unavailable: {ex}',
+                          file=sys.stderr)
+                    inventory = {'gpus': []}
+            row = next(row for row in profile_choices(
+                inventory, pool=pool, kubeai=cluster,
+                reserve_display_gpu='auto' if not cluster and _resolve_skip_display(config) else False,
+            ) if row['name'] == name)
+            for warning in row['warnings']:
+                print(f'catalog import: warning: {warning}', file=sys.stderr)
+            if row['note']:
+                print(f'catalog import: {row["note"]}', file=sys.stderr)
+            fragment = row['fragment']
 
         try:
             updated, added = merge_catalog_fragment(load_catalog_source(path), fragment)

@@ -156,3 +156,27 @@ fields from the browser. Catalog files are re-read on import to check conflicts.
 Validation: 62 targeted tests passed (ubelt import-only shim and xdoctest
 addopts disabled). Textual and kwconf unavailable; new headless browser and CLI
 import tests are included but unexecuted here. No new GPU tests performed.
+
+## 2026-11-25 — Explicit registry experimentation
+
+Model: ChatGPT (GPT-6.2; serving configuration not independently identifiable).
+The operator wants the registry browser to expose known configurations even
+when detected hardware does not satisfy their suggested resource or architecture
+constraints. The existing DeepSeek V4 Flash 0731 TP4 SM120 recipe was already
+present in the supplied snapshot but hidden on smaller hosts. Explicit discovery
+now renders every suggestion-pool profile, retaining the exact fitting recipe
+where one exists and rendering declared defaults without fabricated GPU pins
+otherwise. Fit and backend support are separate advisory metadata. Normal
+suggestions retain their original hardware and tier gates; acquisition retains
+normal controller placement checks. CLI import uses the same full-registry
+path. The TUI presents warnings and a scrollable YAML preview, and can import
+then open the endpoint editor to adjust settings, including the declared VRAM
+floor and automatic cached-weight floor. Custom-launcher startup remains owned
+by Compose. A second, deliberately opt-in DeepSeek TP2/32K profile for two
+96-GiB SM120 cards is a hypothesis, not a validated deployment. The previous
+TP4 readiness result is preserved; neither recipe is intended for one 3090.
+Standalone packaged presets still use the existing separate CLI import path.
+Validation: 60 focused registry/suggestion/Maya tests pass using an import-only
+ubelt shim; the Textual suite is skipped because Textual is missing, kwconf is
+also unavailable, and no live GPU execution was attempted. CLI and TUI
+regressions are included for execution with the normal project dependencies.

@@ -2456,3 +2456,63 @@ def test_tui_browse_import_exact_optional_profile(tmp_path, monkeypatch, acquire
     assert len(leases) == int(acquire)
     if acquire:
         assert name in leases[0].endpoints
+
+
+
+def test_tui_browse_import_unfitting_profile_and_edit_placement(tmp_path, monkeypatch):
+    import yaml
+    from textual.widgets import Button, DataTable, Input, Select, Static
+
+    from infer_stack.hardware import simulate_inventory
+    from infer_stack.tui import InferStackTUI, _ProfileBrowser, _AddEndpointScreen
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    inv = simulate_inventory('2x24@8.6')
+    monkeypatch.setattr(InferStackTUI, '_discovery_inventory', lambda self: (inv, False))
+    monkeypatch.setattr('infer_stack.hardware.detect_inventory', lambda: inv)
+    name = 'deepseek-v4-flash-0731-tp2-experimental'
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, catalog_path=catalog_path,
+                            interval=999, proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_browse_profiles()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, _ProfileBrowser)
+            screen.query_one('#profile-search', Input).value = name
+            await pilot.pause()
+            table = screen.query_one('#profile-table', DataTable)
+            assert table.row_count == 1
+            assert 'Hardware mismatch' in table.get_row_at(0)
+            detail = str(screen.query_one('#profile-detail', Static).render())
+            assert 'Outside suggested hardware' in detail
+            assert not screen.query_one('#profile-import', Button).disabled
+            assert not screen.query_one('#profile-acquire', Button).disabled
+            await pilot.click('#profile-edit')
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            editor = app.screen
+            assert isinstance(editor, _AddEndpointScreen)
+            assert float(editor.query_one('#e-min-vram', Input).value) == 90
+            editor.query_one('#e-min-vram', Input).value = '22'
+            editor.query_one('#e-weight-floor', Select).value = 'off'
+            await pilot.click('#ok')
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    _run(scenario)
+    raw = yaml.safe_load(catalog_path.read_text())
+    assert set(raw['endpoints']) == set(CATALOG['endpoints']) | {name}
+    assert raw['endpoints'][name]['placement'] == {
+        'min_vram_gib': 22, 'weight_floor': False}
+    assert raw['endpoints'][name]['runtime']['tensor_parallel_size'] == 2
+    leases, _ = controller.ledger.status()
+    assert not leases

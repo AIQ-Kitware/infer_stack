@@ -300,7 +300,7 @@ class _Divider(Static):
 
 
 class _ProfileBrowser(ModalScreen):
-    """Choose an exact compatible serving profile, not just a weight source."""
+    """Choose a registered starting configuration, including mismatched hardware."""
 
     CSS = """
     _ProfileBrowser { align: center middle; }
@@ -309,7 +309,8 @@ class _ProfileBrowser(ModalScreen):
         border: round $accent; background: $surface;
     }
     #profile-table { height: 1fr; }
-    #profile-detail { height: auto; min-height: 3; }
+    #profile-detail-scroll { height: auto; min-height: 3; max-height: 8; }
+    #profile-detail { height: auto; }
     #profile-actions { height: auto; align-horizontal: right; }
     #profile-actions Button { margin: 0 0 0 1; min-width: 10; }
     """
@@ -325,21 +326,22 @@ class _ProfileBrowser(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id='profile-dialog'):
             yield Label('Browse known model profiles')
-            yield Static('Hardware-filtered registry, including optional models. '
-                         'Compatibility estimates are not startup guarantees. '
-                         'Import alone does not download or start anything.')
-            yield Input(placeholder='Search name, source, modality, or tier…',
+            yield Static('All known profiles, including hardware mismatches. '
+                         'Fit is advisory; imports do not start or download anything.')
+            yield Input(placeholder='Search name, source, tier, fit, or modality…',
                         id='profile-search')
             yield DataTable(id='profile-table', cursor_type='row', zebra_stripes=True)
-            yield Static('', id='profile-detail', markup=False)
+            with VerticalScroll(id='profile-detail-scroll'):
+                yield Static('', id='profile-detail', markup=False)
             with Horizontal(id='profile-actions'):
                 yield Button('Cancel', id='profile-cancel')
                 yield Button('Import', id='profile-import', variant='primary')
+                yield Button('Import & edit', id='profile-edit', variant='primary')
                 yield Button('Import & acquire', id='profile-acquire', variant='success')
 
     def on_mount(self) -> None:
         table = self.query_one('#profile-table', DataTable)
-        table.add_columns('Endpoint', 'Tier', 'Context', 'GPU(s)', 'Status')
+        table.add_columns('Endpoint', 'Tier', 'Context', 'GPU(s)', 'Fit', 'Catalog')
         self._ready = True
         self._filter('')
         self.query_one('#profile-search', Input).focus()
@@ -355,6 +357,14 @@ class _ProfileBrowser(ModalScreen):
             return 'Imported'
         return 'Available'
 
+    @staticmethod
+    def _fit_label(row: dict) -> str:
+        if not row['backend_compatible']:
+            return 'Backend mismatch'
+        if not row['hardware_fit']:
+            return 'Hardware mismatch'
+        return 'Suggested fit'
+
     def _filter(self, query: str) -> None:
         table = self.query_one('#profile-table', DataTable)
         table.clear()
@@ -364,6 +374,8 @@ class _ProfileBrowser(ModalScreen):
             state = self._state(row)
             haystack = ' '.join(str(row[k]) for k in (
                 'name', 'source', 'tier', 'modalities', 'image')).casefold() + ' ' + state.casefold()
+            fit = self._fit_label(row)
+            haystack += ' ' + fit.casefold()
             if row['tier'] == 'frontier':
                 haystack += ' recommended'
             if not all(w in haystack for w in words):
@@ -373,7 +385,7 @@ class _ProfileBrowser(ModalScreen):
             vram = row['min_vram_gib']
             gpu = f'{row["gpu_count"]} × {vram:g} GiB' if vram else str(row['gpu_count'])
             tier = 'recommended' if row['tier'] == 'frontier' else row['tier']
-            table.add_row(row['name'], tier, ctx, gpu, state, key=row['name'])
+            table.add_row(row['name'], tier, ctx, gpu, fit, state, key=row['name'])
         if self.visible_rows:
             table.move_cursor(row=0, column=0)
         self._update_detail()
@@ -395,11 +407,21 @@ class _ProfileBrowser(ModalScreen):
         row = self._selected_row()
         state = self._state(row) if row else ''
         self.query_one('#profile-import', Button).disabled = state != 'Available'
-        self.query_one('#profile-acquire', Button).disabled = state != 'Available'
+        self.query_one('#profile-edit', Button).disabled = (
+            state != 'Available' or not row['backend_compatible'])
+        self.query_one('#profile-acquire', Button).disabled = (
+            state != 'Available' or not row['backend_compatible'])
         if not row:
-            detail = 'No matching profiles. Try another search or check GPU eligibility.'
+            detail = 'No matching profiles. Try another search.'
         else:
+            import yaml
+
             detail = f'{row["source"]}  |  {row["modalities"]}'
+            detail += f'\nTarget: {row["requirements"]}'
+            for warning in row['warnings']:
+                detail += f'\nWARNING: {warning}'
+            if row['note']:
+                detail += f'\n{row["note"]}'
             if row['managed_build']:
                 detail += '\nFirst acquire builds the pinned Docker image if missing; later acquires reuse it.'
             elif row['image']:
@@ -407,8 +429,11 @@ class _ProfileBrowser(ModalScreen):
             if state == 'Conflict':
                 detail += '\nAn existing entry differs; edit or rename it before importing.'
             elif state == 'Imported':
-                detail += '\nAlready in your catalog; acquire it from the endpoint table.'
+                detail += '\nAlready in your catalog; edit or acquire it from the endpoint table.'
+            detail += '\nProposed catalog configuration:\n' + yaml.safe_dump(
+                row['fragment'], sort_keys=False).rstrip()
         self.query_one('#profile-detail', Static).update(detail)
+        self.query_one('#profile-detail-scroll', VerticalScroll).scroll_home(animate=False)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -420,7 +445,10 @@ class _ProfileBrowser(ModalScreen):
             return
         row = self._selected_row()
         if row and self._state(row) == 'Available':
-            self.dismiss((row, event.button.id == 'profile-acquire'))
+            action = {'profile-import': 'import', 'profile-edit': 'edit',
+                      'profile-acquire': 'acquire'}.get(event.button.id)
+            if action == 'import' or (action and row['backend_compatible']):
+                self.dismiss((row, action))
 
 
 class _AddModelScreen(ModalScreen):
@@ -548,7 +576,7 @@ class _AddEndpointScreen(ModalScreen):
         env_str = shlex.join(f'{k}={env_string(v)}'
                              for k, v in (rt.get('env') or {}).items())
         extra = rt.get('extra_args') or []
-        extra_str = ' '.join(extra) if isinstance(extra, list) else str(extra)
+        extra_str = shlex.join(str(arg) for arg in extra) if isinstance(extra, list) else str(extra)
         reclaim_spec = self._entry.get('reclaim')
         if isinstance(reclaim_spec, dict):
             reclaim = reclaim_spec.get('policy', '')
@@ -615,6 +643,16 @@ class _AddEndpointScreen(ModalScreen):
                         yield Static(self._gpu_hint(), classes='hint')
                         yield Input(value=self._gpu_pin_value(),
                                     placeholder='auto, 1, or 0,2', id='e-gpu-pin')
+                    yield Label('minimum VRAM per GPU (GiB; blank = no declared floor)')
+                    yield Static('Placement still checks the cached weight-size floor unless explicitly disabled.', classes='hint')
+                    vram_floor = (self._entry.get('placement') or {}).get('min_vram_gib')
+                    yield Input(value='' if vram_floor is None else str(vram_floor),
+                                placeholder='e.g. 23.9', id='e-min-vram')
+                    weight_floor = (self._entry.get('placement') or {}).get('weight_floor')
+                    yield Label('weight-size placement floor (disable only for offload/experimental launchers)')
+                    yield Select([('default (enabled)', ''), ('enabled', 'on'), ('disabled', 'off')],
+                                 value='' if weight_floor is None else ('on' if weight_floor else 'off'),
+                                 allow_blank=False, id='e-weight-floor')
                     yield Label('max concurrent sequences')
                     yield Input(value=self._rt('max_num_seqs'),
                                 placeholder='int, optional', id='e-seqs')
@@ -772,6 +810,19 @@ class _AddEndpointScreen(ModalScreen):
                     placement.pop('gpu_indices', None)
                 else:
                     placement['gpu_indices'] = indices
+                min_vram = self._num(self._v('e-min-vram'), float)
+                if min_vram is not None:
+                    import math
+                    if not math.isfinite(min_vram) or min_vram <= 0:
+                        raise ValueError('minimum VRAM must be a positive finite number')
+                    placement['min_vram_gib'] = min_vram
+                else:
+                    placement.pop('min_vram_gib', None)
+                weight_floor = self.query_one('#e-weight-floor', Select).value
+                if weight_floor in ('on', 'off'):
+                    placement['weight_floor'] = weight_floor == 'on'
+                else:
+                    placement.pop('weight_floor', None)
                 if self._kubeai:
                     result['resource_profile'] = self._v('e-resource-profile').strip()
                 result.update({
@@ -3673,7 +3724,12 @@ class InferStackTUI(App):
         from .leasing.catalog_edit import load_catalog_source
 
         try:
-            inventory, reserve_display = self._discovery_inventory()
+            try:
+                inventory, reserve_display = self._discovery_inventory()
+            except Exception as ex:
+                # The registry is still useful without a working GPU probe.
+                self.call_from_thread(self._status, f'GPU discovery unavailable: {ex}; showing all recipes')
+                inventory, reserve_display = {'gpus': []}, False
             choices = profile_choices(inventory, kubeai=self._is_kube,
                                       reserve_display_gpu=reserve_display)
             existing = load_catalog_source(self._editable_catalog_path())
@@ -3686,11 +3742,11 @@ class InferStackTUI(App):
 
     def _on_profile_choice(self, result) -> None:
         if result is not None:
-            row, acquire = result
-            self._import_profile(row, acquire)
+            row, action = result
+            self._import_profile(row, action)
 
     @work(thread=True, exclusive=True, group='catalog-editor')
-    def _import_profile(self, row: dict, acquire: bool) -> None:
+    def _import_profile(self, row: dict, action: str) -> None:
         from .leasing.catalog_edit import (
             load_catalog_source, merge_catalog_fragment, write_catalog_source,
         )
@@ -3702,11 +3758,11 @@ class InferStackTUI(App):
             data, added = merge_catalog_fragment(load_catalog_source(path), row['fragment'])
             if added:
                 write_catalog_source(path, data)
-            self.call_from_thread(self._profile_imported, name, acquire, bool(added))
+            self.call_from_thread(self._profile_imported, name, action, bool(added))
         except (Exception, SystemExit) as ex:
             self.call_from_thread(self._refuse, f'import {name} failed: {ex}', level='error')
 
-    def _profile_imported(self, name: str, acquire: bool, added: bool) -> None:
+    def _profile_imported(self, name: str, action: str, added: bool) -> None:
         self._reload_catalog()
         if name not in self._endpoint_names:
             self._refuse(f'{name} was not found after catalog reload', level='error')
@@ -3715,7 +3771,9 @@ class InferStackTUI(App):
         table.move_cursor(row=self._endpoint_names.index(name))
         self._cli(cli.command('catalog', 'import', name))
         self._status(f'{"imported" if added else "already imported"} {name}')
-        if acquire:
+        if action == 'edit':
+            self.action_edit_endpoint()
+        elif action == 'acquire':
             # Use the ordinary acquisition path; Compose prepares bundled
             # images before starting a missing service. No separate Docker UI.
             self._start_acquire(name)

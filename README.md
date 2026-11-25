@@ -232,11 +232,19 @@ infer-stack apply                           # start it (or `release --all` to di
 A known endpoint profile or built-in preset can be imported additively without
 locating or editing `catalog.yaml` (for example `infer-stack catalog import
 inkling-2-mini-maya-long` or `infer-stack catalog import qwen38-flash-next-3090`).
-Registry imports size exactly one endpoint to the detected hardware and add its
-model dependency. Presets retain their packaged configuration. In the local TUI,
-**Browse models** (`i`) searches the hardware-compatible registry, including
-optional variants. Select **Import** to save without starting anything or
-**Import & acquire** to use the normal managed deployment path.
+Registry imports add exactly one endpoint and its model dependency. Fitting
+profiles are sized to the detected hardware; other profiles retain their
+starting settings and emit an advisory warning. Presets retain their packaged
+configuration. In the TUI, **Browse models** (`i`) searches the complete
+suggestion registry, including optional variants and profiles outside the
+suggested hardware. The Fit column and scrollable YAML preview show hardware
+and backend constraints. Select **Import** to save without starting anything,
+**Import & edit** to adjust the endpoint (GPU count, context, placement floor,
+image, launcher, flags, and environment), or **Import & acquire** to try it
+through the normal managed deployment path. Importing does not bypass actual
+placement checks. Backend-incompatible recipes can be imported but not
+launched from the browser on that backend. Standalone packaged catalog presets
+remain available through their CLI import names.
 The import is idempotent and rejects differing existing names rather than
 clobbering them. Use `--dry-run` to preview the merged catalog. A single
 path can be queried as plain, absolute stdout using `infer-stack paths NAME`
@@ -413,8 +421,10 @@ option; E4B, 26B and 31B are optional. HyperQwen 27B, Inkling Mini via Maya
 curated, not a claim of measured statistical dominance.
 
 DeepSeek V4 Flash 0731 is also suggested on four sufficiently large SM120 GPUs.
-See the [workstation profile and first-generation command](docs/deepseek-v4-flash-sm120.md)
-for its serving limits and hardware validation status.
+It is visible and importable on other hardware through Browse models, alongside
+an opt-in, unverified TP2 / 32K experimental configuration. Neither is a
+single-3090 configuration. See the [workstation profile and first-generation command](docs/deepseek-v4-flash-sm120.md)
+for serving limits and hardware validation status.
 
 The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
 Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting
@@ -424,7 +434,7 @@ them automatically. All options remain discoverable:
 infer-stack catalog suggest                 # curated fitting frontier + smoke tests
 infer-stack catalog suggest --all           # every hardware-compatible pool entry
 infer-stack catalog suggest --include mistral-7b-instruct
-infer-stack catalog import inkling-2-mini-maya-long  # add exactly one compatible profile
+infer-stack catalog import inkling-2-mini-maya-long  # add one profile; warns on hardware mismatch
 infer-stack catalog suggest --apply         # additive: does not remove old entries
 ```
 

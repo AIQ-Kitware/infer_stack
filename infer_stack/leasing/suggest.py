@@ -113,6 +113,8 @@ class SuggestionModel:
     # runtime recipe mechanism.
     endpoint_variants: dict[str, dict[str, Any]] = field(default_factory=dict)
     revision: str | None = None
+    # Human-readable evidence/caveats for the default serving profile.
+    profile_note: str = ''
 
     @classmethod
     def from_entry(cls, name: str, spec: dict[str, Any]) -> SuggestionModel:
@@ -129,6 +131,7 @@ class SuggestionModel:
             name=name,
             hf_model_id=spec['hf_model_id'],
             revision=spec.get('revision'),
+            profile_note=str(spec.get('profile_note') or ''),
             served_model_name=spec.get('served_model_name'),
             family=spec.get('family'),
             suggestion_tier=tier,
@@ -581,6 +584,7 @@ def suggest_catalog(
     all_models: bool = False,
     include: list[str] | tuple[str, ...] = (),
     reserve_display_gpu: str | bool | None = False,
+    include_unfitting: bool = False,
 ) -> dict[str, Any]:
     """Join an inventory against the pool into a mergeable catalog fragment.
 
@@ -595,6 +599,11 @@ def suggest_catalog(
     calculation. Optional entries remain available with ``all_models=True``
     or by model name in ``include``. All generated endpoints use
     ``reclaim: stop`` unless an endpoint variant explicitly overrides it.
+
+    ``include_unfitting`` is for explicit registry browsing/import, not
+    automatic suggestions. Nonmatching profiles retain their declared runtime
+    defaults and VRAM floors, but get no invented GPU affinity or host-specific
+    flags. Combine with ``all_models=True`` for every registered profile.
 
     Pure and offline: pass ``simulate_inventory('2x80')`` to suggest for
     hardware you do not have in front of you.
@@ -611,7 +620,7 @@ def suggest_catalog(
     fitting = [
         model for model in pool.values()
         if (all_models or model.suggestion_tier != 'optional' or model.name in requested)
-        and fits_on(model, gpus)
+        and (include_unfitting or fits_on(model, gpus))
     ]
     # Small to large is helpful for reviewing the frontier; **never** prune a
     # smaller model just because another fitting model is more capable.
@@ -625,7 +634,7 @@ def suggest_catalog(
             models[model.name]['revision'] = model.revision
 
         default_host = _default_host_gpus(model, gpus)
-        if default_host:
+        if default_host or include_unfitting:
             endpoint: dict[str, Any] = {'engine': 'vllm', 'model': model.name}
             if model.protocol != 'chat':
                 endpoint['protocol'] = model.protocol
@@ -635,9 +644,9 @@ def suggest_catalog(
                 endpoint['placement'] = {
                     'min_vram_gib': model.min_vram_gib_per_replica,
                 }
-            if model.gpu_name_hints or _profile_needs_pin(
+            if default_host and (model.gpu_name_hints or _profile_needs_pin(
                 model, model.default_hardware, gpus
-            ):
+            )):
                 # Hardware-class gates are suggestion-time facts.  The live
                 # placement schema currently expresses only min VRAM + exact
                 # indices, so pin only when a heterogeneous host could otherwise
@@ -660,7 +669,7 @@ def suggest_catalog(
             if (not all_models and not variant.get('suggest_by_default', True)):
                 continue
             variant_host = _variant_host_gpus(model, variant, gpus)
-            if variant_host:
+            if variant_host or include_unfitting:
                 matching_variants.append((variant_name, variant, variant_host))
 
         for variant_name, variant, variant_host in matching_variants:
@@ -678,7 +687,7 @@ def suggest_catalog(
                 min_vram = model.min_vram_gib_per_replica
             if min_vram:
                 placement['min_vram_gib'] = min_vram
-            if model.gpu_name_hints or _profile_needs_pin(model, variant, gpus):
+            if variant_host and (model.gpu_name_hints or _profile_needs_pin(model, variant, gpus)):
                 placement['gpu_indices'] = [
                     int(g['index']) for g in variant_host
                 ]
@@ -704,4 +713,8 @@ def suggest_catalog(
             }
             endpoints[f'{model.name}-{variant_name}'] = variant_endpoint
 
-    return {'models': models, 'endpoints': endpoints}
+    # An optional-only matching variant must not leak an orphan model into
+    # the default suggestion catalog when no endpoint was selected.
+    referenced = {ep['model'] for ep in endpoints.values()}
+    return {'models': {name: spec for name, spec in models.items() if name in referenced},
+            'endpoints': endpoints}
