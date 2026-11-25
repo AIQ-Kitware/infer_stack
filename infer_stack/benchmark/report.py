@@ -11,6 +11,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import dashboard
+
 
 def _stable(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'))
@@ -147,21 +149,47 @@ def write_report(records, directory, *, state=None, run_id=None):
     for key, val in identities.items():
         md.extend([f'### {key} — {val["endpoint"]}', '', '```json', json.dumps(val, indent=2, sort_keys=True), '```', ''])
     _write_text(directory / 'report.md', '\n'.join(md) + '\n')
+    acquisitions = {}
+    for r in ready:
+        key = hashlib.sha256(_stable(_identity(r)).encode()).hexdigest()[:16]
+        acquisitions.setdefault(key, []).append(r)
+    _write_text(directory / 'report.html', render_html(rows, identities, ready, issues,
+                acquisitions=acquisitions, heading=heading, progress=progress,
+                counts=counts, record_count=len(records), state=state))
+    return directory / 'report.html'
+
+
+def render_html(rows, identities, ready, issues, *, acquisitions, heading, progress,
+                counts, record_count, state=None):
+    """Render the dashboard and preserve the complete underlying detail."""
     def esc(value):
         return html.escape(_fmt(value))
-    table = '<table><thead><tr>' + ''.join(f'<th>{esc(k)}</th>' for k in columns) + '</tr></thead><tbody>'
-    for r in rows:
-        table += '<tr>' + ''.join(f'<td>{esc(r[k])}</td>' for k in columns) + '</tr>'
-    table += '</tbody></table>'
+
+    columns = (*COLUMNS, 'gpu')
+    raw = dashboard.table(columns, [[esc(r[k]) for k in columns] for r in rows], klass='raw')
     details = ''.join(f'<details><summary>{esc(k)} — {esc(v["endpoint"])}</summary><pre>{esc(json.dumps(v, indent=2, sort_keys=True))}</pre></details>' for k, v in identities.items())
     failures = ''.join(f'<li>{esc(r["endpoint"])}: {esc(r["status"])} — {esc(r.get("reason", r.get("kind")))}</li>' for r in issues)
     startups = ''.join(f'<li>{esc(r["endpoint"])} on {esc(r.get("host", {}).get("hostname"))}: {esc(r.get("acquire_seconds"))} s</li>' for r in ready)
+    incomplete = [r for r in rows if r['ok'] < r['total']]
+    trial_issues = ''.join(f'<li>{esc(r["endpoint"])} [{esc(r["configuration"])}] · {esc(dashboard.context(r["target"]))} · {esc(r["phase"])}: {r["ok"]}/{r["total"]} successful — {esc(r.get("reason") or "No reason recorded")}</li>' for r in incomplete)
     refresh = '<meta http-equiv="refresh" content="10">' if state == 'Running' else ''
-    _write_text(directory / 'report.html', '<!doctype html><html lang="en"><meta charset="utf-8"><title>Infer-stack benchmark</title>' + refresh +
-        '<style>body{font:15px system-ui;margin:2rem;color:#17212b}table{border-collapse:collapse;font-size:13px}th,td{padding:.5em;border:1px solid #d8dce0;text-align:left}th{background:#eef2f5}tr:nth-child(even){background:#f6f8fa}main{overflow-x:auto}pre{white-space:pre-wrap}details{margin:1em 0}</style>'
-        f'<h1>Infer-stack benchmark report</h1><p><strong>{esc(heading)}</strong></p><p>{esc(progress)}</p><p>{esc(NOTES)}</p><p>{len(records)} records; {len(ready)} ready acquisitions; {len(issues)} issues.</p><main>{table}</main>'
-        f'<h2>Acquisitions</h2><ul>{startups}</ul><h2>Endpoint and release issues</h2><ul>{failures}</ul><h2>Configuration identities</h2>{details}</html>')
-    return directory / 'report.html'
+    cards = ((len(identities), 'Measured configurations'), (len(ready), 'Ready acquisitions'),
+             (counts['ok'], 'Successful trials'), (counts['skipped'], 'Skipped trials'),
+             (counts['failed'], 'Failed trials'))
+    metrics = ''.join(f'<div class="metric"><strong>{v}</strong><span>{esc(label)}</span></div>' for v, label in cards)
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>Infer-stack benchmark</title>' + refresh + '<style>' + dashboard.STYLE + '</style></head><body><main class="page">'
+            f'<header class="header"><p class="eyebrow">Infer-stack / performance</p><h1>Inference benchmark report</h1><p><strong>{esc(heading)}</strong></p><p>{esc(progress)} {record_count} records; {len(issues)} endpoint/release issues.</p><div class="metrics">{metrics}</div>'
+            '<p class="muted">Compare serving performance at matched hardware and workload settings. This is not a model quality benchmark. '
+            '<a href="summary.csv">Summary CSV</a> · <a href="configurations.json">Configuration JSON</a> · <a href="report.md">Markdown report</a></p></header>'
+            + dashboard.dashboard_html(rows, identities, acquisitions) +
+            f'<section><h2>Coverage and diagnostics</h2><h3>Unsuccessful or skipped trial groups ({len(incomplete)})</h3>'
+            + (f'<ul>{trial_issues}</ul>' if trial_issues else '<p>None recorded.</p>') +
+            f'<h3>Acquisitions ({len(ready)} ready)</h3><ul>{startups}</ul><h3>Endpoint and release issues ({len(issues)})</h3>'
+            + (f'<ul>{failures}</ul>' if failures else '<p>None recorded.</p>') + '</section>' +
+            f'<section><h2>Measurement details</h2><details><summary>Full trial summary ({len(rows)} groups)</summary>{raw}</details>'
+            f'<details><summary>Configuration identities ({len(identities)})</summary>{details}</details><p class="footer">{esc(NOTES)}</p>'
+            '<p class="footer">Cache share is the ratio of reported median cached and prompt counts, not a per-trial hit rate. Ready times are medians when repeated. Largest successful target is not the endpoint maximum. All rates and latencies are descriptive; missing points are gaps, and early stopping may change output length.</p></section></main></body></html>')
 
 
 class LiveReport:

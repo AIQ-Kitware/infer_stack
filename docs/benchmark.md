@@ -96,6 +96,21 @@ infer-stack benchmark report results/*.jsonl --output ./benchmark-report
 infer-stack benchmark report --run-id RUN_ID --output ./single-run
 ```
 
+The HTML opens with a comparison dashboard rather than the full trial table.
+Comparison groups share observed host, physical GPU identity and topology,
+workload settings, and infer-stack version; configurations within a group remain
+separate by serving provenance and image. It shows coverage and readiness,
+the largest two recorded target contexts, and metric-specific observed leaders
+at the largest target. Curves cover fresh stream rate and TTFT, extended-prefix
+end-to-end rate and TTFT, exact-prefix TTFT, and reported cached-token share.
+Context axes are categorical (target buckets); latency axes are logarithmic.
+Hover over points or scorecard cells for actual token counts. Missing or failed
+trials are gaps, not zeros, and the coverage table reports the largest successful
+requested target, not the maximum supported context. A single repetition is
+not evidence of a stable difference. The full table and configuration identities
+remain available in expandable sections. No browser network access or external
+plotting libraries are required.
+
 The report is generated offline, without Docker, GPU access or an API key.
 Identical copies of a record are deduplicated; conflicting IDs are errors. The
 report groups by host, GPU UUID and PCI bus address, upstream PCI topology,
