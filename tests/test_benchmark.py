@@ -123,9 +123,15 @@ def test_lease_cleanup_and_serial_order(tmp_path, monkeypatch):
             raise RuntimeError('HTTP 500')
         return {'prompt_tokens': 25 * len(text.splitlines()), 'completion_tokens': 1}
     path = tmp_path / 'ledger.jsonl'
+    publisher = report.LiveReport(tmp_path / 'report', 'run')
+    live_path = publisher.start()
     for name in ('a', 'b'):
         endpoint = NS(alias=name, managed=True, protocol='chat', to_request=lambda: NS(endpoint=name, spec={'runtime': {'max_model_len': 8192}}))
-        runner.benchmark_endpoint(Controller(), endpoint, NS(timeout=10), path, 'run', {}, descriptor_for=descriptor, contexts=[1024], request_fn=request)
+        runner.benchmark_endpoint(Controller(), endpoint, NS(timeout=10), path, 'run', {}, descriptor_for=descriptor, contexts=[1024], request_fn=request, on_record=publisher.record)
+        # No need to wait for the second endpoint to inspect this one's data.
+        assert 'trial observations' in live_path.read_text()
+        assert len(publisher.records) == len(ledger.read([path]))
     assert calls == [('acquire', 'a'), ('release', 'a', True), ('acquire', 'b'), ('release', 'b', True)]
     got = ledger.read([path])
     assert [r['status'] for r in got if r['kind'] == 'trial'] == ['failed', 'ok', 'ok', 'ok']
+    assert '4 trial observations: 3 successful, 1 failed' in live_path.read_text()

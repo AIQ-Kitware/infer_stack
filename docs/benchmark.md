@@ -61,10 +61,34 @@ the host machine ID, GPU UUIDs, and hardware/model identifiers: treat it as
 infrastructure metadata when sharing. A partially written last line from a crash
 is rejected explicitly; preserve a copy and repair before appending.
 
-Each run writes `report.html`, `report.md`, `summary.csv` and
-`configurations.json` in a unique report directory, printed at completion. To
-combine historical ledgers from multiple machines, copy them to a local directory
-and run:
+Each run prints the report directory at startup and writes `report.html`,
+`report.md`, `summary.csv` and `configurations.json` there before the first
+acquisition and after each durable ledger observation. Open the HTML in a
+browser while the sweep is running; it refreshes every ten seconds until the
+final report is published. The terminal prints the reported prompt and output
+token counts, TTFT, estimated streamed and end-to-end generation rates, cached
+tokens (if available), and elapsed time after each request. Failed and skipped
+trials are also printed. No metrics are fabricated for missing API usage.
+
+Reports are replaced atomically per file. They are derived snapshots, not a
+second source of truth. A failed live report update warns without aborting the
+benchmark. The final snapshot is rebuilt from the ledger even on graceful
+interruption. A hard kill can leave a stale report marked Running; use the
+ledger to recover all durable observations. Use `--final-report-only` to omit
+intermediate report writes for large sweeps; terminal results and the ledger
+remain incremental.
+
+You can also generate a snapshot from another terminal during a run, including
+runs launched with an older infer-stack version. Use the run ID printed at
+startup and a separate output directory to avoid racing the live publisher:
+
+```bash
+infer-stack benchmark report --run-id RUN_ID --output /tmp/infer-stack-live
+xdg-open /tmp/infer-stack-live/report.html
+```
+
+Repeat the report command and reload the page to see newer results. To combine
+historical ledgers from multiple machines, copy them to a local directory and run:
 
 ```bash
 infer-stack benchmark report

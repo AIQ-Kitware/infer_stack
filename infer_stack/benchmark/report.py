@@ -5,7 +5,10 @@ import csv
 import hashlib
 import html
 import json
+import os
 import statistics
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -90,19 +93,47 @@ NOTES = ('Medians across matching observations. Target context is approximate; a
          'Serving provenance is configured identity, not weight attestation.')
 
 
-def write_report(records, directory):
+@contextmanager
+def _atomic_text(path, *, newline=None):
+    """Replace each report artifact only after its complete content is written."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline=newline,
+                                         dir=path.parent, prefix=f'.{path.name}.',
+                                         delete=False) as f:
+            tmp = Path(f.name)
+            yield f
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def _write_text(path, content):
+    with _atomic_text(path) as f:
+        f.write(content)
+
+
+def write_report(records, directory, *, state=None, run_id=None):
+    """Render a snapshot; a running report refreshes itself in the browser."""
     directory = Path(directory).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
     rows, identities = summarize(records)
     issues = [r for r in records if r.get('kind') != 'trial' and r.get('status') not in ('ok', 'ready')]
     ready = [r for r in records if r.get('kind') == 'endpoint' and r.get('status') == 'ready']
     columns = (*COLUMNS, 'gpu')
-    with (directory / 'summary.csv').open('w', newline='', encoding='utf-8') as f:
+    with _atomic_text(directory / 'summary.csv', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    (directory / 'configurations.json').write_text(json.dumps(identities, indent=2, sort_keys=True) + '\n')
-    md = ['# Infer-stack benchmark report', '', NOTES, '',
+    _write_text(directory / 'configurations.json', json.dumps(identities, indent=2, sort_keys=True) + '\n')
+    trials = [r for r in records if r.get('kind') == 'trial']
+    counts = {status: sum(r.get('status') == status for r in trials)
+              for status in ('ok', 'failed', 'skipped')}
+    progress = (f"{len(trials)} trial observations: {counts['ok']} successful, "
+                f"{counts['failed']} failed, {counts['skipped']} skipped.")
+    heading = f'Run {run_id}: {state}' if run_id and state else (state or 'Ledger snapshot')
+    md = ['# Infer-stack benchmark report', '', heading, '', progress, '', NOTES, '',
           f'{len(records)} records; {len(ready)} endpoint acquisitions ready; {len(issues)} endpoint/release issues.', '']
     compact = ('endpoint', 'host', 'configuration', 'target', 'phase', 'ok', 'total', 'prompt_tokens', 'completion_tokens', 'ttft_s', 'stream_tps', 'e2e_tps')
     def md_cell(x):
@@ -115,7 +146,7 @@ def write_report(records, directory):
     md.extend(['', '## Configuration identities', ''])
     for key, val in identities.items():
         md.extend([f'### {key} — {val["endpoint"]}', '', '```json', json.dumps(val, indent=2, sort_keys=True), '```', ''])
-    (directory / 'report.md').write_text('\n'.join(md) + '\n', encoding='utf-8')
+    _write_text(directory / 'report.md', '\n'.join(md) + '\n')
     def esc(value):
         return html.escape(_fmt(value))
     table = '<table><thead><tr>' + ''.join(f'<th>{esc(k)}</th>' for k in columns) + '</tr></thead><tbody>'
@@ -125,8 +156,52 @@ def write_report(records, directory):
     details = ''.join(f'<details><summary>{esc(k)} — {esc(v["endpoint"])}</summary><pre>{esc(json.dumps(v, indent=2, sort_keys=True))}</pre></details>' for k, v in identities.items())
     failures = ''.join(f'<li>{esc(r["endpoint"])}: {esc(r["status"])} — {esc(r.get("reason", r.get("kind")))}</li>' for r in issues)
     startups = ''.join(f'<li>{esc(r["endpoint"])} on {esc(r.get("host", {}).get("hostname"))}: {esc(r.get("acquire_seconds"))} s</li>' for r in ready)
-    (directory / 'report.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><title>Infer-stack benchmark</title>'
+    refresh = '<meta http-equiv="refresh" content="10">' if state == 'Running' else ''
+    _write_text(directory / 'report.html', '<!doctype html><html lang="en"><meta charset="utf-8"><title>Infer-stack benchmark</title>' + refresh +
         '<style>body{font:15px system-ui;margin:2rem;color:#17212b}table{border-collapse:collapse;font-size:13px}th,td{padding:.5em;border:1px solid #d8dce0;text-align:left}th{background:#eef2f5}tr:nth-child(even){background:#f6f8fa}main{overflow-x:auto}pre{white-space:pre-wrap}details{margin:1em 0}</style>'
-        f'<h1>Infer-stack benchmark report</h1><p>{esc(NOTES)}</p><p>{len(records)} records; {len(ready)} ready acquisitions; {len(issues)} issues.</p><main>{table}</main>'
-        f'<h2>Acquisitions</h2><ul>{startups}</ul><h2>Endpoint and release issues</h2><ul>{failures}</ul><h2>Configuration identities</h2>{details}</html>', encoding='utf-8')
+        f'<h1>Infer-stack benchmark report</h1><p><strong>{esc(heading)}</strong></p><p>{esc(progress)}</p><p>{esc(NOTES)}</p><p>{len(records)} records; {len(ready)} ready acquisitions; {len(issues)} issues.</p><main>{table}</main>'
+        f'<h2>Acquisitions</h2><ul>{startups}</ul><h2>Endpoint and release issues</h2><ul>{failures}</ul><h2>Configuration identities</h2>{details}</html>')
     return directory / 'report.html'
+
+
+class LiveReport:
+    """Publish per-run snapshots after durable ledger appends, outside GPU timing.
+
+    A reporting error must not abort a request, skip a trial, or leak a lease.
+    The append-only ledger is still authoritative; the final snapshot is read
+    from it by the CLI, including any observation appended before cancellation.
+    """
+
+    def __init__(self, directory, run_id, *, enabled=True):
+        self.directory = Path(directory).expanduser()
+        self.run_id = run_id
+        self.enabled = enabled
+        self.records = []
+        self.error = None
+
+    def publish(self, records, *, state):
+        import sys
+        try:
+            path = write_report(records, self.directory, state=state, run_id=self.run_id)
+        except Exception as exc:
+            message = f'{type(exc).__name__}: {exc}'
+            if self.error != message:
+                print(f'Benchmark report update failed (ledger remains authoritative): {message}',
+                      file=sys.stderr, flush=True)
+            self.error = message
+            return None
+        self.error = None
+        return path
+
+    def start(self):
+        if self.enabled:
+            return self.publish(self.records, state='Running')
+        return None
+
+    def record(self, row):
+        if self.enabled:
+            self.records.append(row)
+            self.publish(self.records, state='Running')
+
+    def finish(self, records, *, state):
+        return self.publish(records, state=state)

@@ -50,12 +50,13 @@ class BenchmarkRunCLI(_LeasingCommonMixin):
     effort = kw.Value(None, type=str, help='Optional explicit reasoning_effort; otherwise the endpoint default.')
     results = kw.Value(None, type=str, help='Append-only JSONL path; defaults to the infer-stack data directory.')
     output = kw.Value(None, type=str, help='Report directory; defaults to a unique per-run directory.')
+    final_report_only = kw.Value(False, isflag=True, help='Write the report only when the sweep ends; still log each result.')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
         from ..benchmark import hardware, ledger, report, runner
         from ..leasing import ComposeBackend
-        from ._run_lifecycle import cancellation_signals
+        from ._run_lifecycle import RunCancelled, cancellation_signals
         from .remote import server_url
 
         config = cls.cli(argv=argv, data=kwargs)
@@ -86,19 +87,39 @@ class BenchmarkRunCLI(_LeasingCommonMixin):
         destination = Path(config.output).expanduser() if config.output else path.parent / 'reports' / run_id
         host = hardware.host_facts()
         failures = 0
-        print(f'Benchmark run {run_id}\nAppend-only ledger: {path}', flush=True)
+        publisher = report.LiveReport(destination, run_id, enabled=not config.final_report_only)
+        print(f'Benchmark run {run_id}\nAppend-only ledger: {path}\nReport directory: {destination}', flush=True)
+        state = 'Aborted'
         try:
             with cancellation_signals():
+                live_path = publisher.start()
+                if live_path is not None:
+                    print(f'Live report: {live_path}', flush=True)
                 for endpoint in endpoints:
                     failures += runner.benchmark_endpoint(
                         controller, endpoint, config, path, run_id, host, descriptor_for=_descriptor_for,
                         contexts=contexts, repeats=config.repeats, generation_tokens=config.generation_tokens,
-                        request_timeout=config.request_timeout, effort=config.effort)
+                        request_timeout=config.request_timeout, effort=config.effort,
+                        on_record=publisher.record)
+                state = 'Finished with failures' if failures else 'Finished'
+        except (KeyboardInterrupt, RunCancelled):
+            state = 'Interrupted'
+            raise
         finally:
-            if path.exists():
-                records = [r for r in ledger.read([path]) if r['run_id'] == run_id]
-                if records:
-                    print(f'Report: {report.write_report(records, destination)}', flush=True)
+            # Re-read the durable source of truth even after cancellation.
+            # Report errors must not mask the original run/lease exception.
+            try:
+                records = [r for r in ledger.read([path]) if r['run_id'] == run_id] if path.exists() else []
+            except (OSError, ValueError, KeyError) as exc:
+                import sys
+                print(f'Unable to read final benchmark ledger: {exc}', file=sys.stderr, flush=True)
+                failures += 1
+            else:
+                final_path = publisher.finish(records, state=state)
+                if final_path is not None:
+                    print(f'Report: {final_path}', flush=True)
+                else:
+                    failures += 1
         return 1 if failures else 0
 
 

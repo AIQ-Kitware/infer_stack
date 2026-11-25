@@ -6,6 +6,7 @@ import hashlib
 import os
 import time
 import uuid
+from functools import partial
 
 from .. import __version__
 from . import hardware, ledger, workload
@@ -18,11 +19,37 @@ def record_base(run_id, endpoint, host, settings):
             'host': host, 'settings': settings, 'infer_stack_version': __version__}
 
 
-def emit(path, base, **fields):
+def emit(path, base, *, on_record=None, **fields):
     row = {**base, **fields, 'id': uuid.uuid4().hex,
            'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()}
     ledger.append(path, row)
+    if row.get('kind') == 'trial':
+        print(format_trial(row), flush=True)
+    if on_record is not None:
+        on_record(row)
     return row
+
+
+def format_trial(row):
+    """Report observed counts, not the approximate requested context."""
+    if row['status'] != 'ok':
+        return (f"    {row['target_context']:,} target / {row['phase']}: "
+                f"{row['status']} ({row.get('reason') or 'no reason recorded'})")
+    metrics = row.get('metrics', {})
+
+    def value(key, fmt):
+        v = metrics.get(key)
+        if not isinstance(v, (int, float)):
+            return '-'
+        return format(v, fmt)
+
+    return (f"    prompt {value('prompt_tokens', ',')} tok | "
+            f"output {value('completion_tokens', ',')} tok | "
+            f"TTFT {value('ttft_seconds', '.2f')} s | "
+            f"stream {value('stream_tps_estimate', '.1f')} tok/s | "
+            f"e2e {value('e2e_completion_tps', '.1f')} tok/s | "
+            f"cached {value('cached_prompt_tokens', ',')} tok | "
+            f"elapsed {value('elapsed_seconds', '.2f')} s")
 
 
 def _reason(exc):
@@ -35,13 +62,15 @@ def _reason(exc):
 
 def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, descriptor_for,
                        contexts=DEFAULT_CONTEXTS, repeats=1, generation_tokens=512,
-                       request_timeout=180, effort=None, request_fn=workload.request):
+                       request_timeout=180, effort=None, request_fn=workload.request, on_record=None):
     """Always release our own lease. A release failure aborts the outer run.
 
     A normal release may retain a keep-warm model, so atomically evict only
     deployments newly idled by this lease. Never release or evict another lease.
     """
     from ..leasing.launch import effective_max_model_len
+
+    record = partial(emit, path, on_record=on_record)
     settings = {'workload': workload.WORKLOAD, 'generation_tokens': generation_tokens,
                 'temperature': 0.0, 'reasoning_effort': effort, 'request_timeout': request_timeout,
                 'repeats': repeats, 'append_lines': 16, 'transport': 'openai-sse'}
@@ -51,7 +80,7 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
     failures = 0
     try:
         if not endpoint.managed or endpoint.protocol not in ('chat', 'completions'):
-            emit(path, base, kind='endpoint', status='skipped', reason='requires a managed chat/completions endpoint')
+            record(base, kind='endpoint', status='skipped', reason='requires a managed chat/completions endpoint')
             return 1
         # A bounded lease backstop exceeds the sum of configured waits and
         # request deadlines even when every benchmark request is slow.
@@ -63,10 +92,10 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
                                      interval=2.0, wait_for_placement=False)
         acquire_seconds = time.monotonic() - started
         if outcome.released_on_timeout or (outcome.wait is not None and not outcome.wait.ready):
-            emit(path, base, kind='endpoint', status='failed', reason='endpoint not ready', acquire_seconds=acquire_seconds)
+            record(base, kind='endpoint', status='failed', reason='endpoint not ready', acquire_seconds=acquire_seconds)
             return 1
         if outcome.reconcile.publication_pending:
-            emit(path, base, kind='endpoint', status='failed', reason='publication pending', acquire_seconds=acquire_seconds)
+            record(base, kind='endpoint', status='failed', reason='publication pending', acquire_seconds=acquire_seconds)
             return 1
         dep = next(d for d in outcome.deployments if endpoint.alias in d.served)
         assigned = dep.assigned_gpus
@@ -86,11 +115,11 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
                         for d in live_deployments)
         demand = next((d.demand for d in live_deployments if d.id == dep.id), dep.demand)
         if demand > 1 or competing:
-            emit(path, base, kind='endpoint', status='skipped', reason='deployment already leased by another client')
+            record(base, kind='endpoint', status='skipped', reason='deployment already leased by another client')
             return 1
         base_url = descriptor.get('base_url')
         if not base_url or not controller.backend.connection_info():
-            emit(path, base, kind='endpoint', status='failed', reason='no OpenAI connection')
+            record(base, kind='endpoint', status='failed', reason='no OpenAI connection')
             return 1
         key = descriptor.get('api_key') or os.environ.get(descriptor.get('api_key_env') or '')
         model = descriptor['endpoints'][endpoint.alias]
@@ -112,14 +141,14 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
             calibration = 'heuristic-no-usage'
         max_context = min(effective_max_model_len(dep.spec.get('runtime')),
                           effective_max_model_len(endpoint_request.spec.get('runtime'))) if dep.engine == 'vllm' else None
-        emit(path, base, kind='endpoint', status='ready', calibration=calibration,
+        record(base, kind='endpoint', status='ready', calibration=calibration,
              calibration_counts=counts, configured_context=max_context)
         for target in contexts:
             for repeat in range(repeats):
                 # Leave room for tokenizer variation, the appended suffix and
                 # the generation allowance; don't label an impossible prompt.
                 if max_context and target + generation_tokens + 512 > max_context:
-                    emit(path, base, kind='trial', status='skipped', reason='target plus generation exceeds configured context headroom',
+                    record(base, kind='trial', status='skipped', reason='target plus generation exceeds configured context headroom',
                          target_context=target, repeat=repeat, phase='fresh')
                     continue
                 nlines = max(1, int((target - overhead) / slope))
@@ -137,7 +166,7 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
                             status, reason = 'ok', None
                         except Exception as exc:
                             metrics, status, reason = {}, 'failed', _reason(exc)
-                    emit(path, base, kind='trial', status=status, reason=reason, phase=phase,
+                    record(base, kind='trial', status=status, reason=reason, phase=phase,
                          target_context=target, repeat=repeat, seed=str(seed), prompt_lines=nlines + (16 if phase == 'extended-prefix' else 0),
                          prompt_bytes=len(content.encode()), calibration=calibration, metrics=metrics,
                          telemetry=sampler.samples)
@@ -148,7 +177,7 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
                         break
         return failures
     except Exception as exc:
-        emit(path, base, kind='endpoint', status='failed', reason=_reason(exc),
+        record(base, kind='endpoint', status='failed', reason=_reason(exc),
              acquire_seconds=time.monotonic() - started)
         print(f'  failed: {_reason(exc)}', flush=True)
         return failures + 1
@@ -160,6 +189,6 @@ def benchmark_endpoint(controller, endpoint, config, path, run_id, host, *, desc
                 if released.reconcile and released.reconcile.publication_pending:
                     raise RuntimeError('release publication pending')
             except BaseException:
-                emit(path, base, kind='release', status='failed', lease_id=outcome.lease.id)
+                record(base, kind='release', status='failed', lease_id=outcome.lease.id)
                 raise
-            emit(path, base, kind='release', status='ok', lease_id=outcome.lease.id)
+            record(base, kind='release', status='ok', lease_id=outcome.lease.id)
