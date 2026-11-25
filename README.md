@@ -4,879 +4,156 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/infer-stack.svg)](https://pypi.org/project/infer-stack/)
 [![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
 
-Declare models in a catalog (`infer-stack catalog …`) and `acquire` or `run`
-endpoints on demand. `infer-stack help tree` prints the whole command surface;
-[docs/source/manual/](docs/source/manual/) has the Ollama + Open WebUI
-tutorial and the leasing demo.
+**Run local language models on demand, without managing a separate Docker
+stack for each model.**
 
-## Primary leasing workflow
+Infer-stack manages model configurations, GPU placement, and the lifetime of
+inference servers. Acquire a model when you need it, use a consistent API URL,
+and release it when you're done. Use it from the command line, a terminal UI,
+or an automated evaluation pipeline.
 
-The normal user path has three steps and no separate publication phase:
+- **Discover** model configurations for your hardware, or import and tune known
+  configurations yourself.
+- **Serve** vLLM, Ollama, and compatible custom engines behind a shared LiteLLM
+  gateway, optionally with Open WebUI.
+- **Lease** endpoints for a standing service or a single command; reuse compatible
+  deployments and reclaim idle ones.
+- **Compare** inference performance across contexts, configurations, and machines
+  with a live benchmark report and a portable results ledger.
 
-```bash
-infer-stack config init
-infer-stack catalog suggest --apply
-infer-stack acquire <endpoint>
-```
+## Quickstart
 
-No GPU here? `infer-stack catalog suggest --simulator --apply` adds
-`mock-smol`, a simulator that answers like vLLM with random text, so the same
-three steps run on any host with Docker ([docs/mock-endpoints.md](docs/mock-endpoints.md)).
+### 1. Install and configure
 
-`settings.yaml` (`infer-stack config …`) and `catalog.yaml` are the user
-configuration. Leasing keeps an
-internal frozen recovery snapshot so a crash cannot re-render committed state
-with different settings, but ordinary `acquire` advances that snapshot
-automatically. Compatible catalog additions can be acquired while other models
-are live; conflicting redefinitions or global setting changes take effect once
-the affected stack is quiescent. `infer-stack config publish` is an advanced
-pre-seeding/preview tool for multi-catalog operators, not a required fourth
-step. See [ADR 0001](docs/adr/0001-user-config-is-authoritative.md).
+Start with a Linux workstation, Python 3.10+, Docker and the Docker Compose
+plugin. For NVIDIA GPU inference, install a working NVIDIA driver and NVIDIA
+Container Toolkit first. The no-GPU simulator below does not require the NVIDIA software or hardware.
 
-For a command-scoped lease, use `infer-stack run --endpoint <endpoint> --
-<command>`. Arguments after `--` pass to the child unchanged, including numeric
-strings and child options. Completion, Ctrl-C and SIGTERM release the command's own lease;
-cancellation during endpoint readiness also rolls back acquisition. SIGTERM
-returns status 143. The wrapper forwards cancellation to its child and waits
-up to ten seconds before killing an unresponsive child. Docker workers should
-use `docker run --init` so termination reaches the container process. Release
-runs inside the wrapper, without a separate scheduler cleanup job. SIGKILL or
-a host crash cannot run cleanup: TTL expiry and explicit `release <lease-id>`
-remain recovery paths.
-
-`infer-stack catalog endpoint provenance <endpoint>` prints configured model,
-image and runtime identity as credential-free JSON. `run` exports
-`INFER_STACK_ENDPOINT_DESCRIPTOR`, the path to a public descriptor containing
-the assigned deployment's serving facts. The file lasts for the child command;
-credentials remain in its environment. Unpinned artifacts are reported as
-uncertain. These facts describe the launch specification, not loaded-weight
-attestation.
-
-For a custom vLLM chat endpoint, `catalog endpoint add --reasoning-efforts`
-declares the levels its template supports (e.g. `medium high`). The gateway
-then forwards the client's `reasoning_effort` field through LiteLLM. Recreating
-an endpoint must retain this capability alongside its runtime settings.
-
-## Benchmark inference configurations
-
-Run `infer-stack benchmark run <endpoint> <endpoint>` to lease and benchmark
-each endpoint serially, recording hardware identity, PCIe topology, context
-throughput and latency in a portable append-only ledger. `infer-stack benchmark
-report` combines historical observations into HTML, Markdown and CSV reports.
-See [the benchmark guide](docs/benchmark.md).
-
-## Related work
-
-- **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least
-  80 GiB offers `inkling-2-mini`, using the pinned official checkpoint and
-  Inkling-enabled vLLM image, reasoning/tool parsers, TP1 and 128K context.
-  Generation has been verified on a 96-GiB SM120 GPU.
-
-- **[Inkling 2 Mini via Maya on one RTX 3090](docs/maya-inkling-mini.md):**
-  a text-only native CUDA serving profile with compressed NVFP4 experts,
-  FP8 KV and DSpark. On matching GPUs, 192/256 Ki-token profiles appear in
-  normal suggestions; the 336 Ki-token profile without DSpark is optional.
-  Use the TUI **Browse models** button or `infer-stack catalog import
-  inkling-2-mini-maya-long`, then `infer-stack acquire inkling-2-mini-maya-long`. The first acquire automatically builds and caches
-  the pinned image; optionally prebuild it with `infer-stack image build
-  maya-inkling-mini` (see `infer-stack image list`). No manual Docker build is
-  needed. Compose manages the
-  engine through its custom launcher interface (no vLLM in the image). The
-  long profile has reached readiness on a 3090; throughput and quality
-  validation remain separate.
-
-- **Inkling 2 Mini via llama.cpp on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
-  profile is available for Compose via `infer-stack catalog suggest --include
-  inkling-2-mini-unsloth-q4 --apply`, then `infer-stack acquire
-  inkling-2-mini-unsloth-q4`. It uses the Unsloth UD-Q4_K_M file and a CUDA
-  llama.cpp server with an 8192-token context. The profile has not yet been
-  validated on a 3090; available VRAM, context overhead, upstream image changes,
-  and model support may affect startup. It downloads the weights on first use.
-  It is a custom OpenAI-compatible launcher under the vLLM catalog engine and
-  is intended for Compose, not KubeAI. Images are disabled in this profile.
-
-- [Qwen3.8-Flash-Next on one RTX 3090](docs/qwen38-flash-next-3090.md):
-  `infer-stack catalog import qwen38-flash-next-3090` installs a bundled,
-  non-destructive Compose preset; `infer-stack paths runtime_dir` supplies its
-  configured weight/cache root directly for download commands. The patched
-  vLLM backend offloads experts to host RAM and reserves only GPU 1, leaving
-  GPU 0 available.
-
-- [HyperQwen](https://github.com/syv-ai/HyperQwen) is a specialized model-preparation
-  and serving stack for Qwen3.8-27B. infer-stack delegates requantization,
-  patched-vLLM launchers, speculative decoding, and GPU-level tuning to its
-  image, while hardware discovery and suggestion choose explicit catalog
-  profiles by GPU *class* (compute capability + VRAM) rather than product-name
-  strings. Memory-tight 24-32 GiB Ampere-or-newer cards get the reference
-  fast/long/huge choices in normal CLI and TUI suggestions, without `--all`.
-  High-VRAM Turing cards (sm75-sm79, >=48 GiB) get the
-  measured full-262K FP16/Triton profiles, with the prepared `-fast` checkpoint
-  preferred. Roomy Ampere-or-newer cards (>=48 GiB) get the fast baseline plus
-  a conservative/provisional full-262K ordinary-KV prefab; use
-  `dev/profile_qwen38_hyperqwen.sh` to refine that class on new hardware such as
-  Blackwell. Exact GPU-name gates remain available for future exceptions backed
-  by model-specific measurements. The model identity is
-  `qwen3.8-27b-dbirks-hyperqwen` because it starts from the
-  `dbirks/Qwen3.8-27B-W4A16-AutoRound` derivative; the unsuffixed
-  `qwen3.8-27b` identity is left available for the official checkpoint.
-
-## Supported platform
-
-`infer-stack` supports **Linux hosts only**. Its process locking, container
-runtime integration, GPU discovery, and deployment workflows are intentionally
-Linux-oriented. Windows is not a supported or tested execution platform.
-
-Operational and security constraints that are accepted during the current
-planning-stage release are tracked in
-[docs/planning/known-limitations.md](docs/planning/known-limitations.md).
-
-The [GPU ownership and serving capacity plan](docs/planning/gpu-ownership-and-serving-capacity.md)
-describes how to reduce duplicate scheduler reservations when clients share
-engines, then add measured Compose/KubeAI capacity. It is a proposed roadmap;
-existing acquisition and placement behavior remains the current interface.
-
-`infer-stack` serves the endpoints declared in a catalog. `acquire` takes a
-lease on an endpoint; the controller places its engine on free GPUs and
-reconciles the backend to run it:
-
-* **engines**: vLLM (one container per deployment) and Ollama (one daemon per
-  `runtime_hosts` entry, serving many tags);
-* **LiteLLM gateway**: one OpenAI base URL, `http://127.0.0.1:14042/v1`, in
-  front of every endpoint alias. On by default; `config set litellm false`
-  drops it;
-* **Open WebUI**: on by default at `http://127.0.0.1:13000`;
-  `config set ui false` or `acquire --no-ui` drops it;
-* **reverse proxy**: an optional single-port nginx in front of both.
-
-Two backends run this: **Compose** (single host; vLLM and Ollama) and
-**KubeAI** (a Kubernetes cluster; vLLM only).
-
-## Main commands
+In a Python virtual environment:
 
 ```bash
-infer-stack config init               # data dir + default backend -> settings.yaml
-infer-stack catalog suggest --apply   # seed catalog.yaml from this host's GPUs
-infer-stack catalog show              # what can be acquired
-infer-stack kube inventory           # Kubernetes/GPU/KubeAI facts, before or after install
-infer-stack kube doctor              # detailed readiness + actionable fixes
-infer-stack kube node test NODE --expected-gpus=1  # plan worker GPU + real generation acceptance
-infer-stack kube node detach NODE     # preview handing a cluster GPU host to Compose
-infer-stack acquire <endpoint>        # lease, render, bring up, wait for a real generation
-infer-stack access <endpoint> --env-file e.env  # reach it, managed or external; leases only what runs here
-infer-stack test <endpoint>           # one generation through the gateway
-infer-stack leases                    # desired vs running, per deployment
-infer-stack status                    # paths, backend and a lease summary
-infer-stack release --all             # drop every lease
-infer-stack paths                     # grouped inventory of config, data and leasing paths
-infer-stack paths runtime_dir         # just one configured directory, for $(...)
-infer-stack version
-infer-stack help tree                 # the whole command surface
+pip install 'infer-stack[tui]'
 ```
 
-The CLI is built on [`kwconf`](https://github.com/Erotemic/kwconf),
-so every subcommand is also importable as a Python class:
-
-```python
-from infer_stack.cli import AcquireCLI, TestCLI
-
-AcquireCLI.main(argv=False, names=['smol135-1'], yes=True)
-TestCLI.main(argv=False, name='smol135-1')
-```
-
-`manage.py` and `infer-stack` are aliases for the same entry point;
-shell examples below use `infer-stack`.
-
-## Operating the rendered Compose stack
-
-`ps` and `logs` read the backend directly; `stack` wraps `docker compose` on
-the rendered project, so you never `cd` into it or repeat `-f`/`--env-file`.
+The `tui` extra is optional. From a source checkout, use `pip install -e '.[tui]'`
+instead. Initialize the Compose backend and select a data directory with room
+for model weights and caches:
 
 ```bash
-infer-stack ps                            # engines, gateway, UI
-infer-stack ps -a                         # include exited instances
-infer-stack logs -f <endpoint>            # follow whatever serves an endpoint
-infer-stack logs --tail 200 litellm       # the gateway's backlog
-infer-stack logs -f --raw litellm         # full LiteLLM tracebacks
-infer-stack stack restart open-webui      # docker compose restart
-infer-stack stack stop                    # stop everything (no remove)
-infer-stack stack start                   # start it back up
-infer-stack stack pull                    # refresh images
-infer-stack stack compose -- ps --format json   # any other docker compose command
-```
-
-`logs` accepts a service or pod name, a container id prefix, a deployment id
-or an endpoint alias. Interactive `infer-stack logs -f` compacts only
-explicitly registered, known-noisy LiteLLM traceback shapes; unknown
-tracebacks pass through unchanged. Redirected or piped output stays raw, and
-`--raw` disables compaction in an interactive follow. `--no-color` drops the
-name-prefix colors. The TUI uses the same compactor.
-
-Ollama tags are pulled into the daemon on the first `acquire` of an endpoint
-that serves them. `stack compose` reaches the daemon for anything else, e.g.
-`infer-stack stack compose -- exec ollama-local-ollama ollama list`.
-
-On the KubeAI backend `ps` and `logs` read pods, and the `stack` Compose verbs
-act on the gateway's Compose project on this host.
-
-## Inspect an endpoint before running it
-
-```bash
-infer-stack catalog show <endpoint>
-infer-stack acquire <endpoint> --no-apply   # declare + write the compose project; start nothing
-infer-stack paths leasing                   # where docker-compose.yml landed
-infer-stack apply                           # start it (or `release --all` to discard)
-```
-
-## Catalog model
-
-A known endpoint profile or built-in preset can be imported additively without
-locating or editing `catalog.yaml` (for example `infer-stack catalog import
-inkling-2-mini-maya-long` or `infer-stack catalog import qwen38-flash-next-3090`).
-Registry imports add exactly one endpoint and its model dependency. Fitting
-profiles are sized to the detected hardware; other profiles retain their
-starting settings and emit an advisory warning. Presets retain their packaged
-configuration. In the TUI, **Browse models** (`i`) searches the complete
-suggestion registry, including optional variants and profiles outside the
-suggested hardware. The Fit column and scrollable YAML preview show hardware
-and backend constraints. Select **Import** to save without starting anything,
-**Import & edit** to adjust the endpoint (GPU count, context, placement floor,
-image, launcher, flags, and environment), or **Import & acquire** to try it
-through the normal managed deployment path. Importing does not bypass actual
-placement checks. Backend-incompatible recipes can be imported but not
-launched from the browser on that backend. Standalone packaged catalog presets
-remain available through their CLI import names.
-The import is idempotent and rejects differing existing names rather than
-clobbering them. Use `--dry-run` to preview the merged catalog. A single
-path can be queried as plain, absolute stdout using `infer-stack paths NAME`
-(`runtime_dir`, `catalog`, `compose_file`, and inventory labels are supported);
-`--json` returns status metadata for that entry. The grouped `infer-stack
-paths` inventory is unchanged.
-
-`catalog.yaml` is the one user-edited description of what can run. Its
-sections:
-
-* `models`: weight sources (`hf://org/name`, with optional `revision`,
-  `quantization`, `dtype`);
-* `endpoints`: served API names. Each picks an `engine` (`vllm` or `ollama`),
-  a `model` (a `models` key, or an Ollama tag), and optionally `runtime`
-  (vLLM settings), `protocol`, `placement`, `sharing` and `reclaim`;
-* `runtime_hosts`: Ollama daemons, each with its GPUs and daemon settings;
-* `bundles`: named lists of endpoints to acquire together.
-
-An endpoint can instead name a server that already runs elsewhere, with
-`external: {api_base, model, api_key_env}` in place of `engine`/`model`.
-It has no lease: `infer-stack access` (or `run`) publishes its route on the
-LiteLLM front door, and the client asks for the alias through the same base
-URL as any other endpoint. Moving an alias between a managed runtime and an
-external server changes neither the alias nor the workflow:
-
-```bash
-infer-stack env REMOTE_QWEN_KEY=sk-...          # the upstream's key, by name
-infer-stack access qwen-remote --env-file qwen.env
-source qwen.env                                 # OPENAI_BASE_URL, OPENAI_API_KEY, ...
-```
-
-`api_base` is resolved from inside the gateway's container or pod:
-`localhost` there is the gateway itself, so a server on the same host is
-reached through the Docker bridge address (e.g. `http://172.17.0.1:8000/v1`).
-See [docs/planning/external-endpoints.md](docs/planning/external-endpoints.md).
-
-```yaml
-models:
-  smol135:
-    source: hf://HuggingFaceTB/SmolLM2-135M-Instruct
-
-endpoints:
-  smol135-1:
-    engine: vllm
-    model: smol135
-    runtime: {max_model_len: 8192}
-  chat:
-    engine: ollama
-    host: local-ollama
-    model: qwen3.5:4b
-
-runtime_hosts:
-  local-ollama:
-    engine: ollama
-    placement: {gpu_indices: [0]}
-    settings: {keep_alive: 30m}
-
-bundles:
-  both: [smol135-1, chat]
-```
-
-Edit it with `infer-stack catalog model|endpoint|host|bundle add …`, or by
-hand with `infer-stack catalog edit`; `infer-stack catalog validate` checks it.
-The schema reference is the docstring of `infer_stack/leasing/catalog.py`.
-
-Shapes the stack renders:
-
-```text
-Open WebUI -> LiteLLM -> vLLM / Ollama     # the default
-                     \-> an external OpenAI-compatible server (external:)
-Open WebUI -> vLLM / Ollama                # config set litellm false
-```
-
-The named stack profiles of earlier releases (`setup`, `switch`,
-`--profile`) are gone; see
-[docs/stack-graph-profiles.md](docs/stack-graph-profiles.md).
-
-## Where config and rendered artifacts live
-
-`infer-stack` follows XDG basedir conventions, so the directory you invoke it
-from never changes which config it reads or where it writes. There are two
-roots:
-
-| What | Default location | How to relocate |
-| --- | --- | --- |
-| `settings.yaml`, `catalog.yaml` | `~/.config/infer_stack/` (resp. `$XDG_CONFIG_HOME`) | `--config-dir` or `INFER_STACK_CONFIG_DIR` |
-| **Everything generated**: `leasing/` (the ledger, the compose project, its `.env`) and the bind-mounted state (`hf-cache/`, `vllm-cache/`, `open-webui/`, `ollama/`, …) | `~/.local/share/infer_stack/` (resp. `$XDG_DATA_HOME`) | `config set data_dir <path>`, `--data-dir` or `INFER_STACK_DATA_DIR` |
-
-`infer-stack paths` prints every resolved path and whether it exists.
-
-The data dir **relocates the one infer-stack installation controlling a
-host/backend; it does not create an isolated second installation**. Do not run
-controllers from multiple config/data roots against the same Docker host or
-Kubernetes namespace. See the
-[single-owner limitation](docs/planning/known-limitations.md#one-control-plane-per-host-or-backend-namespace).
-
-```bash
-# Persist it once; later commands read it from settings.yaml.
-infer-stack config set data_dir /data/service/docker/infer-stack
-
-# Or keep both roots in a checkout for an ad-hoc experiment.
-export INFER_STACK_CONFIG_DIR=$PWD/cfg INFER_STACK_DATA_DIR=$PWD/stack
-infer-stack paths
-```
-
-`--config-dir` / `--data-dir` are accepted by every subcommand, after the
-subcommand name.
-
-## Constraining placement to specific GPUs
-
-```bash
-# Only place onto GPU 1 (e.g. GPU 0 is running a display).
-infer-stack acquire <endpoint> --allowed-gpus 1
-
-# Or confine a TP=2 endpoint to physical GPUs 1 and 3.
-infer-stack acquire <tp2-endpoint> --allowed-gpus 1,3
-```
-
-`--allowed-gpus` (or `INFER_STACK_ALLOWED_GPUS=1,3`) filters the detected
-inventory before placement for that call only. Real indices are preserved, so
-the rendered compose stack pins `device_ids` to those exact GPUs. The durable
-forms live in data:
-
-* `placement: {gpu_indices: [1]}` on a vLLM endpoint pins it exactly (the list
-  length must equal tp×pp×dp); Ollama daemons pin through their
-  `runtime_hosts` entry;
-* `placement: {min_vram_gib: 24}` makes smaller GPUs ineligible;
-* `config set skip_display_gpus true` (or `--skip-display-gpus`) leaves the
-  GPU driving a monitor free.
-
-## Demos / integration recipes
-
-The user manual under [docs/source/manual/](docs/source/manual/) has two
-walkthroughs on the current CLI:
-[the Ollama + Open WebUI tutorial](docs/source/manual/ollama-openwebui-tutorial.md)
-and [the leasing demo](docs/source/manual/leasing-demo.md) (standing service,
-Open WebUI, several models side by side).
-
----
-
-## Backend 1: Compose
-
-Use Compose for single-host serving. It runs vLLM and Ollama engines, mixed
-freely, behind the optional gateway and UI.
-
-### Getting started
-
-Prerequisite: Docker and the `docker compose` plugin.
-
-```bash
+umask 077
 infer-stack config init --backend compose
-infer-stack doctor --gpu
-infer-stack catalog init
-
-# A vLLM endpoint.
-infer-stack catalog model add smol135 --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
-infer-stack catalog endpoint add --model smol135    # -> smol135-1
-infer-stack acquire smol135-1
-
-# An Ollama endpoint, on a daemon pinned to GPU 0.
-infer-stack catalog host add local-ollama --engine ollama --gpu 0
-infer-stack catalog endpoint add chat --engine ollama --host local-ollama --model qwen3.5:4b
-infer-stack acquire chat
 ```
 
-`infer-stack catalog suggest --apply` fills the catalog with endpoints sized
-for the detected GPUs instead. The normal suggestions are a curated *frontier*
-across model sizes and modalities, plus GPT-2 and SmolLM2-135M smoke-test
-models. **Every frontier model that fits is included**, even when a larger one
-also fits. This means a 48 GiB machine still suggests the tiny models and the
-0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 E2B retains the small multimodal
-option; E4B, 26B and 31B are optional. HyperQwen 27B, Inkling Mini via Maya
-(192/256 Ki-token profiles on sm_86), and Qwen3.5 122B appear on compatible hardware. The frontier is
-curated, not a claim of measured statistical dominance.
+**Security:** The default Open WebUI has no login screen, and Compose publishes
+its ports on the host. Use a trusted, firewalled machine; do not expose it to
+untrusted networks. For API-only use, run `infer-stack config set ui false`
+before acquisition. Keep config/data directories private and generated
+environment files secret (do not commit `lease.env`). See [known limitations](docs/planning/known-limitations.md).
 
-DeepSeek V4 Flash 0731 is also suggested on four sufficiently large SM120 GPUs.
-It is visible and importable on other hardware through Browse models, alongside
-an opt-in, unverified TP2 / 32K experimental configuration. Neither is a
-single-3090 configuration. See the [workstation profile and first-generation command](docs/deepseek-v4-flash-sm120.md)
-for serving limits and hardware validation status.
-
-The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
-Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting
-them automatically. All options remain discoverable:
+### 2. Discover and acquire a model
 
 ```bash
-infer-stack catalog suggest                 # curated fitting frontier + smoke tests
-infer-stack catalog suggest --all           # every hardware-compatible pool entry
-infer-stack catalog suggest --include mistral-7b-instruct
-infer-stack catalog import inkling-2-mini-maya-long  # add one profile; warns on hardware mismatch
-infer-stack catalog suggest --apply         # additive: does not remove old entries
+infer-stack catalog suggest --apply
+infer-stack catalog endpoint list
 ```
 
-GPT-2 is suggested as a `completions` endpoint (it has no chat template),
-while SmolLM2-135M-Instruct remains a `chat` debugging endpoint.
-
-Suggested endpoints use `reclaim: stop` by default: the last released/expired
-lease frees their resources. Keep-warm requires an explicit per-endpoint policy,
-and is not selected automatically based on model size. Changing the suggestions
-does **not** prune previously added catalog entries; remove unwanted entries
-explicitly after checking for leases or other references.
-
-### Test that it is responding
-
-With LiteLLM enabled, every endpoint is reachable by its alias at:
-
-```text
-http://127.0.0.1:14042/v1
-```
-
-`acquire` already blocks until the endpoint returns a real generation through
-that front door, which is stronger than Docker's container health. After
-`acquire --no-wait`, block separately; to check again later, send one request:
+Suggestions are additive, hardware-aware starting configurations, not guarantees
+that every model will fit. Choose an endpoint from the list. For a small chat
+smoke test on a compatible GPU, use:
 
 ```bash
-infer-stack wait smol135-1
-infer-stack test smol135-1
-infer-stack test chat --prompt "Name three colors." --max-tokens 32
+ENDPOINT=smollm2-135m
+infer-stack acquire "$ENDPOINT" --env-file lease.env
+infer-stack test "$ENDPOINT"
 ```
 
-Clients read the front door and the managed key from the env file:
+Review and confirm deployment changes when prompted. The first acquisition can
+pull or build an image and download weights. It waits for a real generation,
+not just a running container; allow a longer `--timeout` for large models.
+
+**No GPU?** Substitute these commands for step 2 to exercise the same workflow:
 
 ```bash
-export OPENAI_BASE_URL=$(infer-stack env OPENAI_BASE_URL)
-export OPENAI_API_KEY=$(infer-stack env LITELLM_MASTER_KEY)
+infer-stack catalog suggest --simulator --apply
+ENDPOINT=mock-smol
+infer-stack acquire "$ENDPOINT" --env-file lease.env
+infer-stack test "$ENDPOINT"
 ```
 
-or get both, plus per-endpoint names, from
-`infer-stack acquire <endpoint> --env-file lease.env`.
+The [simulator](docs/mock-endpoints.md) generates mock text; it is not a real
+model or a performance benchmark.
 
-To replace the gateway's master key (refused while leases are active; the
-gateway restarts, and clients must fetch the key again):
+### 3. Use the endpoint
+
+- **Browser:** open <http://127.0.0.1:13000> if Open WebUI is enabled.
+- **API:** use the endpoint name as the model ID and the default LiteLLM base
+  URL `http://127.0.0.1:14042/v1`. Load the credentials from your trusted local
+  `lease.env` file (it exports `OPENAI_BASE_URL` and `OPENAI_API_KEY`).
+- **Terminal UI:** run `infer-stack tui` to browse/import models, monitor GPUs,
+  edit endpoints, acquire/release leases, and view logs.
+
+For example, send a chat request through the OpenAI-compatible API (with the
+normal LiteLLM gateway enabled and `curl` installed):
 
 ```bash
-infer-stack secrets rotate
+(
+    source lease.env
+    curl -fsS "$OPENAI_BASE_URL/chat/completions" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$INFER_STACK_MODELS\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"max_tokens\":64}"
+)
 ```
 
-### Stop it
+### 4. Release it
 
 ```bash
-infer-stack release --all            # drop every lease
-infer-stack release --all --evict    # ...and stop the engines now
-infer-stack clean -f                 # no leases, nothing on a GPU; the gateway stays
-infer-stack stack down               # docker compose down, bypassing the ledger
+infer-stack leases
+infer-stack release --env-file lease.env
 ```
 
-After the final `release` on an endpoint, the default `reclaim: stop` tears the
-model down. Endpoints explicitly set to `reclaim: keep-warm` remain resident
-until another lease needs their GPUs or `infer-stack evict` stops them.
-`stack down` releases no lease, so the next `apply` or `acquire` brings leased
-models back.
-
-All state is bind-mounted from the data dir, so none of these delete it,
-including `stack down --volumes`. For a destructive reset, remove the
-directories `infer-stack paths` lists.
-
-### Open WebUI authentication
-
-Open WebUI runs with `WEBUI_AUTH=False`: no login screen, and anyone who can
-reach port 13000 gets the UI. No setting changes that. Keep the host on a
-trusted network, or run without the UI (`config set ui false`).
-
-### Reverse proxy
-
-An optional nginx service publishes one HTTP port with the UI at `/` and the
-API at `/v1`. It needs the LiteLLM gateway.
-
-```bash
-infer-stack config set reverse_proxy true                        # port 80
-infer-stack config set reverse_proxy '{enabled: true, port: 8080}'
-```
-
-`acquire --reverse-proxy` turns it on for one call. Add `config_path:
-/path/to/nginx.conf` to the block to mount your own config at
-`/etc/nginx/conf.d/default.conf` instead of the generated one.
-
-It does no TLS and no authentication. Only the one port is published and no
-certificate is mounted, so terminate TLS in a proxy in front of it. The TLS
-and LDAP settings of the pre-leasing profiles no longer exist.
-
-### Persistent state and database layout
-
-Everything lives under the data dir (`infer-stack paths`):
-
-* `open-webui/`: Open WebUI's data directory (accounts, chats, settings),
-  mounted at `/app/backend/data`;
-* `postgres-litellm/`: LiteLLM's route store, rendered only with
-  `config set dynamic_routing true`;
-* `ollama/`: the Ollama model store, mounted at `/root/.ollama`;
-* `hf-cache/`, `vllm-cache/`, `torch-cache/`, `triton-cache/`, `cuda-cache/`:
-  vLLM weights and compile caches (see
-  [docs/persistent-caches-and-warm-restarts.md](docs/persistent-caches-and-warm-restarts.md));
-* `runtime/`: directories an endpoint's `runtime.mounts` asks for;
-* `leasing/`: the ledger and the rendered compose project.
-
-Open WebUI chat history is not tied to the models currently served, so old
-chats may name aliases the gateway no longer advertises. That is expected.
-
-### Custom .env values are preserved
-
-The compose project's `.env` holds the managed secrets (`LITELLM_MASTER_KEY`,
-`HF_TOKEN`, …). `infer-stack env KEY=VALUE` merges a value into it, and keys
-you add are kept across renders. Compose uses the file for interpolation, so a
-key reaches a container only when the rendered service references it (as
-`HF_TOKEN` does for vLLM). Set `HF_TOKEN` before the first `acquire` of a
-gated model.
-
-### Switching models
-
-There is no single active model to switch. `acquire` another endpoint and it
-runs beside the first; release the first when you are done:
-
-```bash
-infer-stack acquire smol135-1
-infer-stack acquire chat          # now both are served
-infer-stack leases                # find smol135-1's lease id
-infer-stack release <lease-id>
-```
-
-The gateway carries a route for every catalog endpoint, so adding or removing
-a model does not recreate LiteLLM, and Open WebUI stays up. When GPUs are
-short, `acquire` fails fast; `--queue` waits for a GPU instead, and idle
-`keep-warm` deployments are evicted to make room. vLLM containers are named
-after the served alias (`vllm-<alias>`), so `docker ps` and
-`infer-stack logs vllm-<alias>` identify them.
-
-### Protocol modes for base vs. instruct models
-
-An endpoint's `protocol` is `chat` (the default) or `completions`. It decides
-which surface the readiness probe and `infer-stack test` use, so a base model
-without a chat template must declare `completions` or its `acquire` never sees
-a ready generation:
-
-```bash
-infer-stack catalog model add pythia-160m --source hf://EleutherAI/pythia-160m
-infer-stack catalog endpoint add --model pythia-160m --protocol completions
-infer-stack acquire pythia-160m-1
-infer-stack test pythia-160m-1              # hits /v1/completions
-```
-
-The gateway forwards `/v1/completions` unchanged, so evaluation clients that
-need exact prompt control should call it directly. Open WebUI is a chat UI and
-sends chat requests, which a base model cannot answer.
-
-### Images with their own launcher
-
-Some images wrap vLLM in their own launcher and are configured through
-environment variables rather than `vllm serve` flags. Describe that in the
-endpoint's `runtime`; infer-stack has no model-specific code for it:
-
-```yaml
-runtime:
-  image: example.org/my-vllm-launcher:1.0
-  max_model_len: 65536
-  gpu_memory_utilization: 0.93
-  command: [single]              # replaces `vllm serve MODEL <flags>`
-  env:                           # container environment
-    PORT: '{port}'
-    MAX_LEN: '{max_model_len}'   # filled from the field above
-    GPU_UTIL: '{gpu_memory_utilization}'
-    EXTRA_ARGS: '--served-model-name={served_model_name}'
-  mounts:                        # persisted under the runtime data dir
-    /app/models: my-launcher/models
-```
-
-Changing the launcher's mode is a data edit, in the catalog or the TUI's
-endpoint editor. The HyperQwen suggestion (see "Related work") is a worked
-example: `catalog suggest` uses compute capability and VRAM to emit the serving
-profiles appropriate to the detected hardware class (and exact name gates only
-for measured exceptions). The hardware check happens only while suggesting;
-the resulting catalog holds ordinary explicit runtime data, so `apply`/`acquire`
-never retunes an endpoint after the fact.
-
-- `{max_model_len}`, `{gpu_memory_utilization}`, `{served_model_name}` and
-  `{port}` are filled in from the endpoint, so a launcher that takes them
-  through its own variables stays in step when the fields change.
-- Env values are written as strings (`true`/`false` for booleans), and `$`
-  is literal. `HF_TOKEN`, `VLLM_ATTENTION_BACKEND`, `CUDA_VISIBLE_DEVICES` and
-  `NVIDIA_VISIBLE_DEVICES` are infer-stack's and are refused.
-- `extra_args` stay what they were: flags appended to the stock `vllm serve`
-  command, after infer-stack's own, so vLLM keeps the extra value for a
-  repeated flag. Repeating a flag infer-stack acts on (served name, parallel
-  sizes, `--max-model-len`) is refused; with `command`, pass flags through the
-  launcher instead.
-- All of these are deployment identity: endpoints that launch differently
-  never share a process.
-- `env` works on both backends (on KubeAI it becomes the Model's `spec.env`).
-  `command` and `mounts` are Compose only; KubeAI refuses an endpoint with
-  either rather than serve stock vLLM in its place.
-
-### Reasoning / thinking models
-
-vLLM separates a reasoning trace from the answer when it is started with a
-reasoning parser. Pass the flag through `runtime.extra_args`:
-
-```yaml
-endpoints:
-  qwen3-think:
-    engine: vllm
-    model: qwen3-0.6b
-    runtime:
-      extra_args: [--reasoning-parser=qwen3]
-```
-
-The parser name depends on the model family and the vLLM version (`vllm serve
---help` lists them). To test end to end:
-
-```bash
-infer-stack test qwen3-think --prompt "Think step by step: 17*23" --max-tokens 512
-
-# Streaming, through the gateway:
-curl -N "$(infer-stack env OPENAI_BASE_URL)/chat/completions" \
-  -H "Authorization: Bearer $(infer-stack env LITELLM_MASTER_KEY)" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3-think","stream":true,
-       "messages":[{"role":"user","content":"Think step by step: 17*23"}]}'
-```
-
-In Open WebUI, reasoning shows up best with streaming enabled in the
-chat settings.
-
----
-
-## Backend 2: KubeAI
-
-`--backend kubeai` runs the same leasing verbs against a Kubernetes cluster
-running [KubeAI](https://www.kubeai.org): the same catalog, ledger, TTLs,
-env file and TUI, with `Model` custom resources in place of compose
-services and the cluster scheduler in place of the local GPU planner. The
-LiteLLM gateway still fronts everything, so a card sees one `OPENAI_BASE_URL`,
-the managed key and the endpoint alias on either backend.
-
-* Creating/joining a cluster and the distribution boundary:
-  [docs/cluster-setup.md](docs/cluster-setup.md).
-* KubeAI setup, settings and semantics:
-  [docs/kubeai-backend.md](docs/kubeai-backend.md).
-* Authenticated remote CLI/TUI, optional PostgreSQL authority and usage facts:
-  [remote control service](docs/kubeai-backend.md#remote-control-service).
-* What matches Compose, what does not yet, and what is deliberate:
-  [docs/backend-parity.md](docs/backend-parity.md); the plan to close the
-  rest: [docs/planning/backend-parity-roadmap.md](docs/planning/backend-parity-roadmap.md).
-
-The short version:
-
-```bash
-infer-stack kube inventory
-infer-stack kube doctor
-# New local cluster / NVIDIA plugin + GFD prerequisites (review before applying):
-infer-stack kube bootstrap --provider=k3s
-sudo -v
-infer-stack kube bootstrap --provider=k3s --apply
-# Automatic profiles from Kubernetes node labels; no temporary values file needed:
-infer-stack kube install
-infer-stack kube install --apply
-infer-stack kube doctor
-infer-stack catalog suggest --backend kubeai
-infer-stack config set backend kubeai
-infer-stack config set kubeai_gateway cluster
-infer-stack doctor --backend kubeai
-infer-stack acquire <endpoint> --ttl 2h --env-file lease.env --yes
-```
-
-If the workstation already has a Compose ledger/configuration that you plan to
-return to, keep that authority intact rather than switching backend kinds in
-the same ledger. The cluster setup guide documents the temporary test pattern:
-use `INFER_STACK_BACKEND=kubeai` with a separate KubeAI data root, and use
-`infer-stack kube node detach/attach` to hand each physical GPU host between
-Kubernetes scheduling and direct Compose use without uninstalling or rejoining
-the node. See [docs/cluster-setup.md](docs/cluster-setup.md).
-
-### Switching an existing recovery ledger to KubeAI
-
-Stopping the Compose realization retains its recovery backend and historical
-ledger. Backend kinds require separate recovery epochs. After releasing every
-old lease and stopping the old runtime:
-
-```bash
-infer-stack release --all --backend compose
-infer-stack stack down --backend compose
-infer-stack config set backend kubeai
-infer-stack status                     # configured kubeai / active recovery compose
-infer-stack ledger rotate              # verify quiescence and preview the archive
-infer-stack ledger rotate --yes        # archive old history; initialize KubeAI epoch
-infer-stack ledger archives            # archive paths + history inspection commands
-infer-stack acquire <endpoint> --yes
-```
-
-Rotation refuses active leases, remaining old runtime objects, and unknown
-runtime state. It does not change configuration/catalogs or silently tear down
-workloads. Old leases, deployments and the recovery profile remain in SQLite
-archives under `<ledger-directory>/archives/`. Rotation is transactional and
-safe to retry; a matching recovery backend makes the command a no-op. `gc`
-reports backend mismatches with transition instructions; `gc --forget` remains
-a history-only operation.
-
-### Kubernetes cluster setup and KubeAI integration
-
-[docs/cluster-setup.md](docs/cluster-setup.md) describes server/worker setup.
-`kube inventory` and `kube status` report structured facts; `--json` includes
-probe errors without discarding other discoveries. Inventory and catalog
-suggestions work before the KubeAI chart or namespace exists.
-
-`kube doctor` checks Kubernetes, NVIDIA scheduling/discovery, and KubeAI in
-dependency order. Top-level `doctor --backend kubeai` remains the operational
-preflight for acquiring work. If Helm installation succeeds but the configured
-KubeAI API URL is unavailable, doctor reports that remaining routing issue.
-Set `kubeai_base_url` to a reachable OpenAI URL for the installed service.
-
-`kube bootstrap` defaults to a read-only plan; `--apply` (or `--yes`) authorizes
-host/cluster changes. K3s is the implemented provisioning provider; inventory,
-installation and the backend work with any Kubernetes distribution. Bootstrap
-always provisions/reconciles the local K3s server, preserves unrelated selected
-contexts and kubeconfigs, installs Helm if missing,
-and reconciles NVIDIA device plugin **0.17.1** with GPU Feature Discovery.
-Install the host NVIDIA driver and container toolkit first. K3s discovers the
-installed runtime on startup; bootstrap restarts local K3s only when runtime
-discovery needs repair. It waits for Ready nodes, GPU allocation and GFD labels, and verifies unknown
-GPU-node runtime handlers with small node-specific canary pods. Root admin
-credentials stay `0600`; a private `0600` copy lives at
-`~/.kube/infer-stack-k3s.yaml`. Existing default configs are preserved. Bootstrap
-saves that path as infer-stack's `kubeconfig` setting; raw shell kubectl/Helm
-can select it with `export KUBECONFIG=~/.kube/infer-stack-k3s.yaml`.
-Rerun bootstrap to refresh copied certificates.
-
-`kube install` shows inferred Helm values; `--apply` uses Helm upgrade/install
-and checks readiness afterward. `--dry-run`/`--plan` forces read-only behavior.
-`--namespace`, `--release`, `--chart`, `--version` and `--values` allow overrides.
-Existing named profiles and custom values are preserved; `HF_TOKEN` overrides
-the chart token using a temporary protected file. Generated public values live
-at `<data>/generated/kube/kubeai-values.yaml`.
-
-`kube setup` is a deprecated alias of `kube install`; it no longer owns a
-separate prerequisite workflow. `kube k3s bootstrap` provisions only the local
-server, `join` verifies requested worker membership, and `status` reports local
-membership independently of any stale selected admin context. Setup scripts are compatibility wrappers around the
-package commands.
-
-### Debugging serving failures
-
-`infer-stack kube status` summarizes live Kubernetes state. `infer-stack acquire`
-reports pod failures such as `ImagePullBackOff`, `Unschedulable`, and engine
-crashes. Use `infer-stack ps` and `infer-stack logs -f <endpoint>` to inspect
-model serving. If `/models` works but completions return 404, check that clients
-use the gateway alias; direct KubeAI requests use the Model name from the env
-file (`INFER_STACK_ENDPOINT_*`). Missing `libcuda.so.1` usually indicates that
-the model profile did not request GPUs or select the correct runtime.
-
----
-
-## Which backend should I start with?
-
-**Compose** when one workstation is enough: it is the fastest path to a
-working server, everything it renders is a file you can read, and it needs
-only Docker.
-
-**KubeAI** when the models must run on more than one machine, or a cluster
-already exists. It is Compose plus a scheduler: the same catalog, verbs and
-env file, with a cluster and `resourceProfiles` supplied. Expect more
-first-request overhead (pod creation, image pull, model load).
-
-A catalog written for Compose runs on KubeAI, with two exceptions: ollama
-endpoints and custom container launches (`runtime.command` / `mounts`),
-which stay Compose-only. [docs/backend-parity.md](docs/backend-parity.md)
-has the full matrix.
-
-## vLLM startup caches
-
-Generated Compose mounts persist Hugging Face, vLLM, PyTorch/TorchInductor,
-Triton, and CUDA JIT caches. Warm starts avoid redownloading and redoing many
-compile/JIT steps, but a vLLM model swap still creates a new engine process and
-must reload weights into GPU memory.
-
-### Diagnosing readiness
-
-`docker compose` health only means a container-level healthcheck passed. It
-is not "the routed model answers a request through the front door", which is
-what `acquire` and `wait` check: a model swap starts a new engine process,
-and LiteLLM stays up while returning upstream connection errors until vLLM
-has loaded the weights.
-
-```bash
-infer-stack acquire <endpoint> --yes     # waits for a real generation
-infer-stack wait <endpoint>              # after acquire --no-wait
-infer-stack test <endpoint>              # one generation through the gateway
-infer-stack status                       # desired vs running, per deployment
-infer-stack logs <service> --tail 80     # the engine or gateway log
-```
-
-A crash-looping engine fails the acquire at once with its error quoted, so
-the timeout is only for a model that is loading. Reading Docker's own
-signals: `litellm exited with code 137` is a SIGKILL (an OOM kill or a forced
-replacement), whereas LiteLLM returning HTTP 500 with `Cannot connect to host
-vllm-*` means LiteLLM is running and its upstream vLLM is not ready yet.
-
-### Join and accept GPU workers
-
-`infer-stack kube k3s onboard namek --server=... --token-file=... --kubeconfig=...`
-plans a local GPU worker join and node-specific acceptance; add `--apply` to
-execute it. Host NVIDIA drivers/toolkit are prerequisites. It infers the server
-version, verifies every locally detected device, then checks actual one-GPU
-KubeAI placement and generation on this worker by default. `--serve-gpus=N`
-adds multi-GPU serving acceptance with a compatible model. `--k3s-data-dir`,
-`--image-headroom-gib` and `--kubelet-config` expose storage preflight decisions.
-Admin credentials are explicit
-private files, separate from any selected EKS context.
-
-For an already joined worker, run `infer-stack kube node test namek
---expected-gpus=1 --namespace=default --apply` from the control plane. The same
-surface accepts two-device `yardrat` and four-device `aiq-gpu2`; mixed products
-are reported separately. Tests preserve leases and unrelated Models, remove
-their temporary resources, and retain a reusable node profile. See the
-[worker onboarding instructions](docs/cluster-setup.md#join-and-test-a-gpu-worker-in-one-reviewed-operation)
-for plan/apply, credentials, interrupted cleanup and heterogeneous-node limits.
-
-### Kubernetes dashboard
-
-`infer-stack tui` provides a **Cluster** tab in the expanded runtime pane on the
-KubeAI backend. It shows Ready/scheduling state, GPU allocation and scheduled
-requests across namespaces, GFD labels, runtime evidence, managed Models and
-KubeAI/NVIDIA pod startup/restart state. GPU requests are scheduling facts, not
-live GPU utilization; the system pane explicitly describes the local host.
-
-Cluster monitoring uses three batched API reads, cached for at least 15 seconds
-and polled only while the tab is visible. Slow probes cannot overlap or block
-keyboard input; **Refresh cluster** forces a sample, and **Doctor** runs the
-shared detailed checks on demand. Pod samples also feed the Instances view.
-
-Select a node for **Detach node** or **Attach node**. Each previews its workload
-and scheduling state and requires confirmation; detach drains workloads and
-emptyDir data, while attach confirms local Compose workloads have stopped.
-These reuse `kube node detach/attach` and preserve cluster membership. The
-Control tab provides **Apply** through the leasing controller and confirmed
-**Down** for managed Models and the gateway. Leases remain after Down. The
-KubeAI endpoint editor selects resource profiles; Kubernetes chooses node/GPU
-placement.
+This releases only the lease recorded in `lease.env`. Suggested endpoints stop when
+their last lease ends; model weights and caches remain on disk. The gateway and
+UI remain available for the next model. Remove the local `lease.env` when you
+no longer need its credentials. For a full stack shutdown, see [operations](docs/operations.md#shutdown-and-reclaim).
+
+## Everyday workflows
+
+| I want to… | Command |
+| --- | --- |
+| See available endpoint names | `infer-stack catalog endpoint list` |
+| Discover or edit known configurations | `infer-stack tui` → Browse models |
+| Import a known profile | `infer-stack catalog import NAME` |
+| Run a job with an automatic lease | `infer-stack run --endpoint NAME -- COMMAND` |
+| See running deployments | `infer-stack leases` / `infer-stack ps` |
+| Follow only model engine logs | `infer-stack logs --engine -f` |
+| Benchmark several endpoints serially | `infer-stack benchmark run NAME1 NAME2` |
+| Compare historical measurements | `infer-stack benchmark report` |
+| Find configuration and cache directories | `infer-stack paths` |
+| Explore all CLI commands | `infer-stack help tree` |
+
+In the TUI, **Suggest** recommends configurations for the detected hardware;
+**Browse models** shows the full registered suggestion pool, including optional
+and experimental configurations with hardware-fit warnings. Import & edit is
+the path for trying a model on different hardware. Importing does not override
+placement checks. See [model discovery and profiles](docs/model-profiles.md).
+
+## Choose a backend
+
+**Compose** is the simplest way to serve models on one machine. For a Kubernetes
+cluster, **KubeAI** uses the same catalog/lease interface with cluster scheduling
+and vLLM; Ollama and custom launcher commands/mounts are Compose-only. See the
+[backend comparison](docs/backend-parity.md) and [cluster setup](docs/cluster-setup.md).
+
+## Documentation
+
+The **[documentation index](docs/index.md)** organizes all the guides by task.
+For common next steps: [custom endpoints](docs/catalog.md),
+[operations and troubleshooting](docs/operations.md),
+[Compose configuration](docs/compose.md), [benchmarking](docs/benchmark.md),
+and [KubeAI and remote control](docs/kubeai-backend.md).
+
+Infer-stack is a Linux-oriented, planning-stage project. See
+[known limitations](docs/planning/known-limitations.md) for operational and
+security boundaries. For contributors, see [AGENTS.md](AGENTS.md) and
+[dev/README.md](dev/README.md).

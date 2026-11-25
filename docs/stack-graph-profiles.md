@@ -8,8 +8,8 @@ declares `models`, `endpoints`, `runtime_hosts` and `bundles`, and
 behind the LiteLLM gateway and Open WebUI. Gateway and UI are settings
 (`infer-stack config set litellm|ui|reverse_proxy …`), not graph nodes.
 
-Start with the README's "Primary leasing workflow" and "Catalog model"
-sections, then [the user manual](source/manual/index.md) and
+Start with the [quickstart](../README.md#quickstart), [operations](operations.md)
+and [catalog guide](catalog.md), then
 [litellm-gateway-routing.md](litellm-gateway-routing.md).
 
 "Profile" survives in one place: the ledger's **recovery snapshot**, the

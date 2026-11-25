@@ -310,7 +310,7 @@ class CatalogSuggestCLI(
                     'no cluster node reports GPUs: suggest needs each GPU node\'s '
                     'allocatable nvidia.com/gpu and GPU Feature Discovery\'s '
                     'nvidia.com/gpu.product / .memory labels (the NVIDIA device '
-                    'plugin with gfd.enabled=true; see the README). Pass '
+                    'plugin with gfd.enabled=true; see docs/cluster-setup.md). Pass '
                     '--simulate-hardware NxM to plan without them.',
                     file=sys.stderr,
                 )

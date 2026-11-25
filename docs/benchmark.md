@@ -8,6 +8,7 @@ infer-stack benchmark run qwen3.8-27b inkling-2-mini-maya-long
 infer-stack benchmark run 'qwen3.8-*' 'inkling-2-mini-maya*'
 ```
 
+Run `infer-stack catalog endpoint list` to discover available endpoint names.
 Use the endpoint names from your catalog. No GPU selection or special Docker
 commands are necessary. The runner acquires each endpoint using normal placement,
 waits for readiness, measures it, then releases its own lease and evicts only the

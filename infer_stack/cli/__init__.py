@@ -98,23 +98,19 @@ class ManageCLI(kw.ModalCLI):
     )
 
     __epilog__ = """
-    Quickstart:
-        infer-stack config init                 # storage + default backend
-        infer-stack catalog init                # start a model catalog
-        infer-stack catalog model add smol135 \\
-            --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
-        infer-stack catalog endpoint add --model smol135   # -> smol135-1
-        infer-stack acquire smol135-1           # render + bring up + wait
-        infer-stack leases                      # what is desired vs running
-        infer-stack test smol135-1              # one real generation
-        infer-stack release --all               # tear it back down
+    Quickstart (Linux + Docker Compose):
+        infer-stack config init --backend compose
+        infer-stack catalog suggest --apply     # detect GPUs + seed catalog
+        infer-stack catalog endpoint list       # choose an endpoint name
+        infer-stack acquire NAME --env-file lease.env
+        infer-stack test NAME
+        infer-stack release --env-file lease.env
 
-    Mental model:
-        catalog (what can run) -> acquire (declare intent, a lease; --ttl for a
-        soft TTL) -> the controller reconciles a compose project (gateway +
-        models + Open WebUI) onto your GPUs. `acquire --no-apply` writes that
-        project without starting it (then `apply`); `leases` shows desired vs
-        actual. Run `infer-stack help tree` for the whole command surface.
+    No GPU? Use `catalog suggest --simulator --apply` and acquire mock-smol.
+    Browse and edit model configurations with `infer-stack tui`.
+    Open WebUI (when enabled) has no login screen; keep it on a trusted network.
+    `infer-stack help tree` lists all commands. See the README quickstart and
+    docs/index.md for guides.
     """
 
     # Backs the modal ``--version`` flag (kwconf reads ``__version__``).
