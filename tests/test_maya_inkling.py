@@ -116,6 +116,52 @@ def test_maya_prepare_reuses_local_files_without_hf(tmp_path, monkeypatch):
     monkeypatch.setenv('MAYA_MODEL_DIR', str(tmp_path))
     monkeypatch.setenv('MAYA_DSPARK', '1')
     for name in [launcher.MODEL_FILE, launcher.DRAFT_FILE]:
-        (tmp_path / name).write_bytes(b'test fixture')
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'test fixture')
+    monkeypatch.setattr(launcher, 'validate_weights', lambda path: None)
     # No huggingface_hub dependency or network is needed for an existing cache.
     launcher.main(['prepare'])
+
+
+@pytest.mark.parametrize('metadata', [
+    {'general.architecture': 'inkling2_loop', 'inkling2_loop.block_count': 24},
+    {'general.architecture': 'inkling2', 'inkling2.block_count': 24},
+    {},
+])
+def test_maya_rejects_incompatible_gguf_metadata(metadata):
+    with pytest.raises(ValueError, match='incompatible GGUF'):
+        launcher.require_maya_layout(metadata, 'bad.gguf')
+    launcher.require_maya_layout({'general.architecture': 'inkling2',
+                                  'inkling2.block_count': 48}, 'good.gguf')
+
+
+def test_maya_download_uses_pins_and_separate_cache(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        path = Path(kwargs['local_dir']) / kwargs['filename']
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'fixture')
+        return str(path)
+
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(hf_hub_download=download))
+    monkeypatch.setattr(launcher, 'validate_weights', lambda path: None)
+    monkeypatch.setenv('MAYA_MODEL_DIR', str(tmp_path))
+    monkeypatch.setenv('MAYA_DSPARK', '1')
+    incompatible = tmp_path / 'Inkling-2-Mini-UD-Q4_K_XL.gguf'
+    incompatible.write_bytes(b'mainline layout')
+    launcher.main(['prepare'])
+    assert calls == [dict(repo_id=launcher.MODEL_REPO, filename=launcher.MODEL_FILE,
+                          revision=launcher.MODEL_REV, local_dir=tmp_path),
+                     dict(repo_id=launcher.DRAFT_REPO, filename=launcher.DRAFT_FILE,
+                          revision=launcher.DRAFT_REV, local_dir=tmp_path)]
+    assert launcher.MODEL_FILE.startswith('Old_Support/')
+    assert launcher.MODEL_FILE.endswith('.gguf_file')
+    assert incompatible.read_bytes() == b'mainline layout'
+    launcher.main(['prepare'])
+    assert len(calls) == 2

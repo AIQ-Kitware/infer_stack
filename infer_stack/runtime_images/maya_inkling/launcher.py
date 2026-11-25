@@ -15,9 +15,14 @@ from pathlib import Path
 
 ROOT = Path('/opt/maya')
 MODEL_REPO = 'unsloth/Inkling-2-Mini-GGUF'
-MODEL_FILE = 'Inkling-2-Mini-UD-Q4_K_XL.gguf'
+# The root GGUF switched to the incompatible inkling2_loop layout on Nov 23.
+# Keep the old layout in a different local path so existing root files cannot
+# silently shadow the compatible model. The suffix is upstream's actual name.
+MODEL_FILE = 'Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file'
+MODEL_REV = '8078d149286eec7193795413b9e0643da6d11fa1'
 DRAFT_REPO = 'thinkingmachines/Inkling-2-Mini'
 DRAFT_FILE = 'mtp.safetensors'
+DRAFT_REV = '1fb4134b9a74f9681054f4ef82e4bf1f458a2337'
 
 
 def settings(env):
@@ -40,7 +45,7 @@ def settings(env):
     return draft, context, port, name, model_dir
 
 
-def ensure_file(repo, filename, model_dir):
+def ensure_file(repo, filename, model_dir, *, revision):
     """HF's local-dir downloader handles resumable downloads and file locks.
 
     Existing complete files can be used offline. To replace weights, explicitly
@@ -51,8 +56,32 @@ def ensure_file(repo, filename, model_dir):
         return path
     from huggingface_hub import hf_hub_download
 
-    print(f'Maya: downloading {repo}/{filename} into {model_dir}', flush=True)
-    return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=model_dir))
+    print(f'Maya: downloading {repo}/{filename} at {revision} into {model_dir}', flush=True)
+    return Path(hf_hub_download(repo_id=repo, filename=filename,
+                                revision=revision, local_dir=model_dir))
+
+
+def require_maya_layout(metadata, path):
+    """Reject mainline llama.cpp's GGUF before starting the native engine."""
+    architecture = metadata.get('general.architecture')
+    blocks = metadata.get('inkling2.block_count')
+    if architecture != 'inkling2' or blocks != 48:
+        raise ValueError(
+            f'{path}: incompatible GGUF (architecture={architecture!r}, '
+            f'inkling2.block_count={blocks!r}); Maya expects the old Inkling '
+            f'layout. Use {MODEL_REPO}/{MODEL_FILE} at {MODEL_REV}.'
+        )
+
+
+def validate_weights(path):
+    # Reuse the pinned upstream reader, which reads only the GGUF header.
+    # Unlike gguf-py, it also supports the quantization types Maya expects.
+    sys.path.insert(0, str(ROOT / 'tools'))
+    try:
+        from gguf_reader import GGUFFile
+        require_maya_layout(GGUFFile(path).metadata, path)
+    finally:
+        sys.path.pop(0)
 
 
 def make_config(root, model_dir, *, draft, context, name):
@@ -87,9 +116,13 @@ def main(argv=None):
     except ValueError as exc:
         raise SystemExit(f'Maya: {exc}') from exc
     model_dir.mkdir(parents=True, exist_ok=True)
-    weights = ensure_file(MODEL_REPO, MODEL_FILE, model_dir)
+    weights = ensure_file(MODEL_REPO, MODEL_FILE, model_dir, revision=MODEL_REV)
+    try:
+        validate_weights(weights)
+    except ValueError as exc:
+        raise SystemExit(f'Maya: {exc}') from exc
     if draft:
-        ensure_file(DRAFT_REPO, DRAFT_FILE, model_dir)
+        ensure_file(DRAFT_REPO, DRAFT_FILE, model_dir, revision=DRAFT_REV)
     if argv == ['prepare']:
         return
     os.chdir(ROOT)

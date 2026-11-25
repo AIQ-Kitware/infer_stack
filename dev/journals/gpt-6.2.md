@@ -94,3 +94,24 @@ no ubelt operations exercised. The new CLI dispatch test is included but
 could not be run here because kwconf is unavailable. Wheel contents checked
 against the actual recipe/launcher and CLI source. No actual Docker or CUDA
 build was performed; real host acceptance remains required.
+
+## 2026-11-24: Maya GGUF layout hotfix
+
+The user's real container reached the native CUDA executable, then failed
+with `maya-ik2: no key inkling2.block_count`. Unsloth changed its root GGUFs
+on November 23 to mainline llama.cpp's `inkling2_loop` layout; its original
+Maya-compatible GGUF remains in `Old_Support` with a `.gguf_file` suffix.
+Pin the model download to 8078d149286eec7193795413b9e0643da6d11fa1 and the
+official drafter download to 1fb4134b9a74f9681054f4ef82e4bf1f458a2337. Use a
+separate cache path for the old layout and leave the existing mainline file
+untouched. Check architecture and logical block count with Maya's own GGUF
+reader. Preserve native stderr in container logs, with a checked patch of
+the pinned upstream source after the CUDA build step. Bump the bundled
+image recipe to r2; the Docker build cache can reuse the compiler layers.
+Existing r1 catalog entries need their image reference updated. Existing
+local files are not fully hash-verified. No change to context or DSpark.
+
+Validation: 13 focused launcher tests passed (pytest addopts overridden to
+avoid unavailable xdoctest). Docker/CUDA and real weight downloads remain
+host-side validation; the upstream GGUF reader and HF file paths were
+inspected but real model bytes were not downloaded here.

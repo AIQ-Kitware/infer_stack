@@ -34,6 +34,12 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 ENV MAYA_GGUF_PY=/opt/maya/build/_deps/strata_llamacpp-src/gguf-py
 RUN python serve/server.py --help >/dev/null \
     && python tools/strata_tokenizer.py --help >/dev/null
+# With no file log configured, upstream discards native stderr. In a
+# container it must inherit stderr so infer-stack logs includes startup errors.
+# Keep this after compilation so changing the recipe does not invalidate nvcc.
+RUN grep -Fq 'self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL' serve/server.py \
+    && sed -i 's/if log else subprocess.DEVNULL$/if log else None/' serve/server.py \
+    && grep -Fq 'self.log = open(log, "a", encoding="utf-8") if log else None' serve/server.py
 COPY launcher.py /usr/local/bin/maya_inkling_launcher.py
 ENV HF_HOME=/models/.hf MAYA_MODEL_DIR=/models
 EXPOSE 8000

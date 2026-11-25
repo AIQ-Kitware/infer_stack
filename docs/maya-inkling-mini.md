@@ -49,16 +49,28 @@ not a GPU-validated infer-stack build yet. Base image and Python dependency
 versions are not fully digest/lockfile pinned. Future recipe changes need a new
 image tag so that a cached image cannot silently mask the change.
 
-The first launch downloads `Inkling-2-Mini-UD-Q4_K_XL.gguf` (about 17.6 GB)
-from `unsloth/Inkling-2-Mini-GGUF` and `mtp.safetensors` from
-`thinkingmachines/Inkling-2-Mini` (about 0.6 GB). Do not substitute the older
-llama.cpp profile's Q4_K_M GGUF; Maya expects this particular weight layout.
+The first launch downloads the **old-layout** GGUF
+`Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file` (about 17.6 GB) from
+`unsloth/Inkling-2-Mini-GGUF` at revision
+[`8078d149286eec7193795413b9e0643da6d11fa1`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/commit/8078d149286eec7193795413b9e0643da6d11fa1),
+and `mtp.safetensors` (about 0.6 GB) from `thinkingmachines/Inkling-2-Mini`
+at revision `1fb4134b9a74f9681054f4ef82e4bf1f458a2337`.
+On November 23, 2026 Unsloth switched its root GGUFs to mainline llama.cpp's
+`inkling2_loop` format. The pinned Maya engine expects `inkling2` with 48
+logical blocks. The old layout lives in `Old_Support`, including the literal
+`.gguf_file` suffix. Do not substitute a root GGUF: the new launcher validates
+its architecture and block count before launching Maya. Existing root GGUFs
+are retained, not overwritten or reused. Native stderr is inherited so
+`infer-stack logs` includes actual engine errors.
+
 Downloads go into `$(infer-stack paths runtime_dir)/maya/inkling-2-mini/models`.
-Existing weights are reused across releases and across the three endpoint
-variants. The launcher accepts infer-stack's managed `HF_TOKEN` if required.
-The HF files are not revision-pinned by default; keep the existing files for
-repeatable experiments, or download known revisions to this directory before
-acquiring.
+Existing files at the correct cache paths are reused offline across profiles;
+the header check is not a complete cryptographic integrity check. The
+launcher accepts infer-stack's managed `HF_TOKEN` if required.
+For catalogs generated with the previous `-r1` recipe, update the three Maya
+profiles' image references to `-r2` (see `infer-stack image list`). Existing
+containers must be recreated to use the new image; the shared model cache
+is preserved. The new image can reuse Docker's cached CUDA compilation layers.
 
 For a slow connection, use a longer readiness budget on the first acquisition
 (e.g. `--timeout 1800`). No special image preparation command is required for ordinary use.

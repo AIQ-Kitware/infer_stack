@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 MAYA_REF = '27daec5e608aa59dab45184e82a1f0611ea7c1aa'
-MAYA_IMAGE = f'local/infer-stack-maya-inkling-mini:{MAYA_REF[:12]}-cuda128-sm86-r1'
+MAYA_IMAGE = f'local/infer-stack-maya-inkling-mini:{MAYA_REF[:12]}-cuda128-sm86-r2'
 
 IMAGE_RECIPES = {
     MAYA_IMAGE: Path(__file__).resolve().parent / 'maya_inkling',
