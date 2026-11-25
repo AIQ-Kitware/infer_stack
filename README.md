@@ -46,7 +46,15 @@ remain recovery paths.
 
 ## Related work
 
-- **Inkling 2 Mini on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
+- **[Inkling 2 Mini via Maya on one RTX 3090](docs/maya-inkling-mini.md):**
+  an opt-in, text-only native CUDA serving profile with resident NVFP4 experts,
+  FP8 KV and DSpark. Build the local Docker image once, then use `infer-stack
+  catalog suggest --include inkling-2-mini-maya --apply` and `infer-stack
+  acquire inkling-2-mini-maya`. Profiles offer 192K/256K tokens with the
+  drafter and 336K without it. Compose manages the engine through its custom
+  launcher interface (no vLLM in the image). GPU acceptance is pending.
+
+- **Inkling 2 Mini via llama.cpp on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
   profile is available for Compose via `infer-stack catalog suggest --include
   inkling-2-mini-unsloth-q4 --apply`, then `infer-stack acquire
   inkling-2-mini-unsloth-q4`. It uses the Unsloth UD-Q4_K_M file and a CUDA

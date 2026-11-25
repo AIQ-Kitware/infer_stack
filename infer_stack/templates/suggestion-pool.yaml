@@ -136,6 +136,52 @@ vllm_models:
       mounts:
         /models: inkling-2-mini-unsloth/cache
 
+  # Maya's native CUDA engine, not vLLM. Build the local image first (see
+  # docs/maya-inkling-mini.md). The GGUF must be Q4_K_XL, not the llama.cpp
+  # profile's Q4_K_M. Text only; reserve one GPU, never spill to the second.
+  # Keep opt-in until infer-stack GPU acceptance is done. The default is a
+  # reduced-window variant of upstream's 262K DSpark/FP8 configuration.
+  inkling-2-mini-maya:
+    hf_model_id: unsloth/Inkling-2-Mini-GGUF
+    served_model_name: inkling-2-mini-maya
+    family: inkling2
+    modalities: [text]
+    # Maya's frontend currently maps minimal to none; do not advertise it as
+    # a separate setting. max is an alias of xhigh.
+    reasoning_efforts: [none, low, medium, high, xhigh]
+    memory_class_gib: 17
+    min_vram_gib_per_replica: 23.9
+    preferred_gpu_count: 1
+    context_window: 344064
+    # The shipped image compiles for sm_86 (RTX 3090/A6000 class).
+    default_hardware:
+      min_compute_cap: 8.6
+      max_compute_cap: 8.6
+    defaults:
+      max_model_len: 196608
+      image: local/maya-inkling-mini:cuda128-sm86
+      command: [serve]
+      env:
+        PORT: '{port}'
+        MAYA_MAX_CONTEXT: '{max_model_len}'
+        MAYA_MODEL_NAME: '{served_model_name}'
+        MAYA_DSPARK: '1'
+      mounts:
+        /models: maya/inkling-2-mini/models
+    endpoint_variants:
+      long:
+        min_compute_cap: 8.6
+        max_compute_cap: 8.6
+        runtime:
+          max_model_len: 262144
+      huge:
+        min_compute_cap: 8.6
+        max_compute_cap: 8.6
+        runtime:
+          max_model_len: 344064
+          env:
+            MAYA_DSPARK: '0'
+
   # -- Qwen3.8-27B / HyperQwen -------------------------------------------
   # Qwen/Qwen3.8-27B has a 262K native window.  This entry starts from
   # dbirks' ~19.5-GB W4A16 AutoRound derivative and delegates preparation / the
