@@ -48,11 +48,12 @@ remain recovery paths.
 
 - **[Inkling 2 Mini via Maya on one RTX 3090](docs/maya-inkling-mini.md):**
   an opt-in, text-only native CUDA serving profile with resident NVFP4 experts,
-  FP8 KV and DSpark. Build the local Docker image once, then use `infer-stack
+  FP8 KV and DSpark. Use `infer-stack
   catalog suggest --include inkling-2-mini-maya --apply` and `infer-stack
   acquire inkling-2-mini-maya`. Profiles offer 192K/256K tokens with the
-  drafter and 336K without it. Compose manages the engine through its custom
-  launcher interface (no vLLM in the image). GPU acceptance is pending.
+  drafter and 336K without it. The first acquire automatically builds and caches
+  the pinned image; no manual Docker build is needed. Compose manages the
+  engine through its custom launcher interface (no vLLM in the image). GPU acceptance is pending.
 
 - **Inkling 2 Mini via llama.cpp on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
   profile is available for Compose via `infer-stack catalog suggest --include

@@ -34,3 +34,36 @@ The implementation and host commands are in `docs/maya-inkling-mini.md`.
 Design takeaway: maintain the serving protocol and placement/lifecycle
 contract in the catalog; keep engine-specific setup in its image. Separate
 upstream context capacity from measured decode rate at occupied context.
+
+## 2026-11-24 19:23:14 -0500
+
+Model: GPT-6.2 (ChatGPT; further configuration not available).
+
+User intent: do not make infer-stack users reason about Docker compilation or
+upstream Git revisions in order to acquire a catalog endpoint. Pin a default
+Maya revision and make image preparation part of the existing acquisition path.
+
+Upstream's Docker recipe does not include `maya-ik2`; I found no usable
+published image for this fork. Use a bundled build context keyed by a
+versioned image reference, not a catalog-supplied Dockerfile or mutable
+`main`. The source pin is upstream 27daec5e608aa59dab45184e82a1f0611ea7c1aa,
+whose Inkling guide and configuration I checked. It is not a verified GPU
+build. The image is built only if absent and preparation runs before removal
+of existing containers. Registry images keep the existing pull path.
+`config publish --pull` also handles bundled recipes. Package resources allow
+a wheel install to build without a repository checkout. Build logs use the
+existing Docker runner; the stderr callback now drains concurrently with
+stdout to avoid deadlocking on large compiler output. A cold build holds the
+same publication lock as an image pull, so it can delay other leasing changes.
+A prebuilt registry image would eliminate that wait, but this patch neither
+requires registry credentials nor claims that such an image already exists.
+
+Validation: 172 targeted tests passed, 4 skipped, 2 excluded after confirming
+the same failures on the previous source: test_converge_to_empty_keeps_the_front_door
+and test_converge_no_change_does_not_prompt. As before, an import-only ubelt
+placeholder was required in this environment; no ubelt operations were needed
+by these tests. Built a wheel and checked it contains the recipe and launcher.
+Docker and GPU execution are still unavailable. Future upstream or build
+recipe changes need a new image tag; apt/pip/base-image versions are not
+fully content-pinned. The normal acquisition timeout still applies to model
+startup/download after the build.

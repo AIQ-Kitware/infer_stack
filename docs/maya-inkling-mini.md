@@ -25,41 +25,29 @@ reserve the card for Maya. The drafter's own context remains at upstream's
 `IK2_DRAFT_CTX=65536`; this is not the target model's context. Speculative
 speedup at 128K+ occupied context needs a real benchmark.
 
-## Build the image once per GPU host
-
-From an infer-stack source checkout, with Docker, the NVIDIA container runtime
-and a CUDA 12.8-compatible host driver (the CUDA compiler is in the image):
-
-```bash
-# Resolve and record the exact upstream source revision for this build.
-MAYA_REF=$(git ls-remote https://github.com/alesha-pro/maya-inkling-mini.git refs/heads/main | cut -f1)
-test -n "$MAYA_REF" && docker build \
-    --build-arg MAYA_REF="$MAYA_REF" \
-    -t local/maya-inkling-mini:cuda128-sm86 \
-    -f dockerfiles/maya-inkling-mini.dockerfile .
-```
-
-Keep `MAYA_REF` in your experiment notes. To reproduce the same source build,
-reuse that exact commit rather than querying `main` again. Inspect the built
-image's `org.opencontainers.image.revision` label for the resolved commit.
-Python dependencies and the base image tag are not digest/lockfile pinned.
-`BUILD_JOBS` defaults to 8; raise it if your machine has enough RAM for parallel
-CUDA compilation. Only `maya-ik2` is built, not the optional vision encoder.
-
-This is a locally built image, not an image published to Docker Hub; build it
-before acquiring the endpoint. To deploy on another CUDA architecture, rebuild
-with a matching `CUDA_ARCHITECTURES` and explicitly adjust the catalog's image
-and placement (the shipped profile and tag target sm_86). Do not assume other
-GPU classes have been benchmarked.
-
 ## Add and acquire
+
+The first acquisition automatically builds the bundled Maya image if it is
+not already present. Docker and the NVIDIA container runtime must be working,
+with a CUDA 12.8-compatible host driver. No host CUDA compiler, Maya checkout,
+manual Docker build, or upstream revision selection is required.
 
 ```bash
 # Use the installed infer-stack from this checkout (e.g. pip install -e .).
 infer-stack catalog suggest --include inkling-2-mini-maya --apply
-infer-stack catalog show inkling-2-mini-maya
-infer-stack acquire inkling-2-mini-maya --timeout 1800 --env-file maya.env
+infer-stack acquire inkling-2-mini-maya
 ```
+
+Image preparation occurs before infer-stack removes any departing containers.
+It reports the build, caches the image in Docker, and reuses it for all three
+variants. The source revision is pinned to
+[`27daec5e608aa59dab45184e82a1f0611ea7c1aa`](https://github.com/alesha-pro/maya-inkling-mini/commit/27daec5e608aa59dab45184e82a1f0611ea7c1aa)
+in the bundled Dockerfile; the image tag identifies that revision and recipe.
+The build context ships in the Python distribution, including installed wheels.
+The default build uses CUDA 12.8 and sm_86. This is a fixed upstream revision,
+not a GPU-validated infer-stack build yet. Base image and Python dependency
+versions are not fully digest/lockfile pinned. Future recipe changes need a new
+image tag so that a cached image cannot silently mask the change.
 
 The first launch downloads `Inkling-2-Mini-UD-Q4_K_XL.gguf` (about 17.6 GB)
 from `unsloth/Inkling-2-Mini-GGUF` and `mtp.safetensors` from
@@ -72,19 +60,13 @@ The HF files are not revision-pinned by default; keep the existing files for
 repeatable experiments, or download known revisions to this directory before
 acquiring.
 
-For a slow connection, optionally populate the cache without holding a GPU
-lease (and without requiring a visible GPU):
+For a slow connection, use a longer readiness budget on the first acquisition
+(e.g. `--timeout 1800`). No special prefetch or image preparation command is
+required for ordinary use. The advanced `config publish --pull` path also
+prepares this built-in image instead of attempting to pull a nonexistent
+registry image.
 
-```bash
-MAYA_MODELS="$(infer-stack paths runtime_dir)/maya/inkling-2-mini/models"
-mkdir -p "$MAYA_MODELS"
-docker run --rm -e HF_TOKEN -v "$MAYA_MODELS:/models" \
-    local/maya-inkling-mini:cuda128-sm86 prepare
-```
-
-Add `-e MAYA_DSPARK=0` to this standalone `docker run` invocation to
-download only the target model. Each managed startup extracts the tokenizer with the pinned
-upstream template and generates a text-only config from the upstream profile.
+Each managed startup extracts the tokenizer with the pinned upstream template and generates a text-only config from the upstream profile.
 The launcher uses the catalog's context, port, and served name verbatim, with
 Maya's own load/unload API disabled and automatic idle unload turned off so
 infer-stack owns lifecycle. Maya's own sampling and loop-guard behavior are

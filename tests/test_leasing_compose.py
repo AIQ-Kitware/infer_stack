@@ -1914,6 +1914,20 @@ def test_default_docker_run_can_redirect_stderr_lines():
     assert out.strip() == 'out' and seen == ['err1', 'err2']
 
 
+def test_default_docker_run_streams_both_pipes_without_blocking():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    # Much more than a pipe buffer on stderr while the stdout reader is
+    # active. Build/pull progress must not cause a blocked child.
+    stdout, stderr = [], []
+    out = _default_docker_run(
+        ['sh', '-c', 'head -c 262144 /dev/zero | tr "\\000" x >&2; echo >&2; echo done'],
+        timeout=10, stdout_lines=stdout.append, stderr_lines=stderr.append,
+    )
+    assert stdout == ['done'] and out.strip() == 'done'
+    assert stderr == ['x' * 262144]
+
+
 def test_open_webui_runs_as_its_data_directorys_owner(tmp_path):
     """As root it left files only root could delete (the data root could not
     be removed without sudo); now it runs as the directory's owner, with a

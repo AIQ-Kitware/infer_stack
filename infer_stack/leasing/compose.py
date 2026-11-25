@@ -731,6 +731,7 @@ DOCKER_TIMEOUT_QUERY = 60.0        # ps, inspect, version, images
 DOCKER_TIMEOUT_LIFECYCLE = 300.0   # stop, rm, start, unpause, exec
 DOCKER_TIMEOUT_CONVERGE = 1800.0   # compose up / down
 DOCKER_TIMEOUT_PULL = 3600.0       # pull, manifest inspect, in-container model pulls
+DOCKER_TIMEOUT_BUILD = 7200.0      # cold native CUDA image compilation
 
 
 
@@ -746,6 +747,8 @@ def _docker_timeout(args: list[str]) -> float:
         3600.0
     """
     words = set(args[1:])
+    if 'build' in words:
+        return DOCKER_TIMEOUT_BUILD
     if 'pull' in words or 'manifest' in words:
         return DOCKER_TIMEOUT_PULL
     if 'up' in words or 'down' in words:
@@ -854,16 +857,16 @@ def _default_docker_run(
     # written (docker's progress), through a pipe of our own so its last lines
     # can also go into the error: "port is already allocated" belongs in the
     # message, not only scrolled past above it.
-    tee = None
-    if stderr_lines is None:
-        tee = _StderrTee()
+    # Always drain stderr concurrently, including when a TUI callback is
+    # supplied. Native image compilation can produce a large stderr stream;
+    # do not buffer it until completion or deadlock against the stdout reader.
+    tee = _StderrTee(on_line=stderr_lines)
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, text=True, start_new_session=True,
         env=docker_environment(),
-        stderr=subprocess.PIPE if tee is None else tee.write_end,
+        stderr=tee.write_end,
     )
-    if tee is not None:
-        tee.start()
+    tee.start()
     query = _read_only(args)
     if query:
         _RUNNING_QUERIES.add(proc)
@@ -893,12 +896,7 @@ def _default_docker_run(
     finally:
         if query:
             _RUNNING_QUERIES.discard(proc)
-    if stderr_lines is not None:
-        for line in (err or '').splitlines():
-            if line.strip():
-                stderr_lines(line.rstrip())
-    if tee is not None:
-        err = tee.finish()
+    err = tee.finish()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, args, output=out, stderr=err)
     return out
@@ -907,13 +905,14 @@ def _default_docker_run(
 class _StderrTee:
     """A child's stderr, echoed to ours as it arrives, with its last lines kept."""
 
-    def __init__(self, keep: int = 20):
+    def __init__(self, keep: int = 20, on_line=None):
         import collections
         import os
 
         self._read_end, self.write_end = os.pipe()
         self._tail: collections.deque = collections.deque(maxlen=keep)
         self._thread = None
+        self._on_line = on_line
 
     def start(self) -> None:
         import os
@@ -928,8 +927,11 @@ class _StderrTee:
                 for line in stream:
                     self._tail.append(line)
                     try:
-                        sys.stderr.write(line)
-                        sys.stderr.flush()
+                        if self._on_line is None:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        elif line.strip():
+                            self._on_line(line.rstrip())
                     except Exception:  # noqa: BLE001 - never fail the command
                         pass
 
@@ -964,6 +966,8 @@ def _communicate_streaming(proc, bound: float, on_line) -> tuple[str, str | None
     reader.start()
     proc.wait(timeout=bound)
     reader.join(timeout=5.0)
+    if not reader.is_alive():
+        proc.stdout.close()
     err = proc.stderr.read() if proc.stderr is not None else None
     return ''.join(lines), err
 
@@ -1571,12 +1575,16 @@ class ComposeBackend(ConvergeScaffold):
     on_addresses: Any = None
 
     def pull_images(self, images) -> list[str]:
-        """Pull ``images``; ``config publish`` passes :func:`profile_images`."""
+        """Prepare ``images``; ``config publish`` passes :func:`profile_images`."""
         from .._log import logger
+        from ..runtime_images import IMAGE_RECIPES
 
         for image in sorted(set(images)):
-            logger.info('docker pull {}', image)
-            self.run(['docker', 'pull', image])
+            if image in IMAGE_RECIPES:
+                self._pull_missing([image])
+            else:
+                logger.info('docker pull {}', image)
+                self.run(['docker', 'pull', image])
         return sorted(set(images))
 
     def plan_on_idle_host(self, desired: list[Deployment]):
@@ -2112,15 +2120,29 @@ class ComposeBackend(ConvergeScaffold):
                         for l in layers if l.get('digest')}
         return {}
 
+    def _build_managed_image(self, image: str, context: Path) -> None:
+        """Build a shipped recipe on a cold host, without operator action."""
+        if not (context / 'Dockerfile').is_file():
+            raise ApplyAborted(f'packaged Docker build recipe missing for {image}: {context}')
+        self._report(f'building {image}: first use, compiling the bundled CUDA engine')
+        self.run(['docker', 'build', '--progress=plain', '--tag', image, str(context)],
+                 timeout=DOCKER_TIMEOUT_BUILD)
+        self._report(f'built {image}')
+
     def _pull_missing(self, images) -> None:
-        """Pull every image not present locally, reporting as layers arrive.
+        """Prepare every missing image, building only shipped local recipes.
 
         ``docker compose up`` would pull them itself, silently: on a first
         use that is many minutes of an apply that looks hung. Pulling first
         also means a failed pull aborts before anything is removed.
         """
+        from ..runtime_images import IMAGE_RECIPES
+
         for image in sorted({str(i) for i in images if i}):
             if self._image_present(image):
+                continue
+            if image in IMAGE_RECIPES:
+                self._build_managed_image(image, IMAGE_RECIPES[image])
                 continue
             progress = PullProgress(image, self._layer_sizes(image))
             size = f' ({_size(sum(progress.sizes.values()))})' if progress.sizes else ''

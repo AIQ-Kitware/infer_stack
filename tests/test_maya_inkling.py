@@ -10,7 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    'maya_inkling_launcher', ROOT / 'dockerfiles/maya_inkling_launcher.py')
+    'maya_inkling_launcher', ROOT / 'infer_stack/runtime_images/maya_inkling/launcher.py')
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
 
@@ -46,7 +46,8 @@ def test_maya_managed_profile(variant, context, draft):
         ports={'ollama': 11434}, state={'hf_cache': '/cache/hf',
         'ollama': '/cache/ollama', 'runtime': '/cache/runtime'})
     svc = rc.compose['services'][vllm_service_name(dep)]
-    assert svc['image'] == 'local/maya-inkling-mini:cuda128-sm86'
+    from infer_stack.runtime_images import MAYA_IMAGE
+    assert svc['image'] == MAYA_IMAGE
     assert svc['command'] == ['serve']
     assert svc['volumes'] == ['/cache/runtime/maya/inkling-2-mini/models:/models']
     devices = svc['deploy']['resources']['reservations']['devices']

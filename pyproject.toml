@@ -62,6 +62,8 @@ package-data.infer_stack = [
   "templates/*.yaml",
   "templates/*.j2",
   "mockserver/data/*.yaml",
+  "runtime_images/maya_inkling/Dockerfile",
+  "runtime_images/maya_inkling/launcher.py",
 ]
 package-data."*" = [
   "requirements/*.txt",

@@ -136,9 +136,9 @@ vllm_models:
       mounts:
         /models: inkling-2-mini-unsloth/cache
 
-  # Maya's native CUDA engine, not vLLM. Build the local image first (see
-  # docs/maya-inkling-mini.md). The GGUF must be Q4_K_XL, not the llama.cpp
-  # profile's Q4_K_M. Text only; reserve one GPU, never spill to the second.
+  # Maya's native CUDA engine, not vLLM. infer-stack builds and caches its
+  # bundled versioned image automatically on first use. The GGUF must be
+  # Q4_K_XL, not the llama.cpp profile's Q4_K_M. Text only; reserve one GPU, never spill to the second.
   # Keep opt-in until infer-stack GPU acceptance is done. The default is a
   # reduced-window variant of upstream's 262K DSpark/FP8 configuration.
   inkling-2-mini-maya:
@@ -159,7 +159,7 @@ vllm_models:
       max_compute_cap: 8.6
     defaults:
       max_model_len: 196608
-      image: local/maya-inkling-mini:cuda128-sm86
+      image: local/infer-stack-maya-inkling-mini:27daec5e608a-cuda128-sm86-r1
       command: [serve]
       env:
         PORT: '{port}'
