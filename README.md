@@ -44,7 +44,25 @@ runs inside the wrapper, without a separate scheduler cleanup job. SIGKILL or
 a host crash cannot run cleanup: TTL expiry and explicit `release <lease-id>`
 remain recovery paths.
 
+`infer-stack catalog endpoint provenance <endpoint>` prints configured model,
+image and runtime identity as credential-free JSON. `run` exports
+`INFER_STACK_ENDPOINT_DESCRIPTOR`, the path to a public descriptor containing
+the assigned deployment's serving facts. The file lasts for the child command;
+credentials remain in its environment. Unpinned artifacts are reported as
+uncertain. These facts describe the launch specification, not loaded-weight
+attestation.
+
+For a custom vLLM chat endpoint, `catalog endpoint add --reasoning-efforts`
+declares the levels its template supports (e.g. `medium high`). The gateway
+then forwards the client's `reasoning_effort` field through LiteLLM. Recreating
+an endpoint must retain this capability alongside its runtime settings.
+
 ## Related work
+
+- **Inkling 2 Mini through native vLLM:** discovery on SM120 GPUs with at least
+  80 GiB offers `inkling-2-mini`, using the pinned official checkpoint and
+  Inkling-enabled vLLM image, reasoning/tool parsers, TP1 and 128K context.
+  Generation has been verified on a 96-GiB SM120 GPU.
 
 - **[Inkling 2 Mini via Maya on one RTX 3090](docs/maya-inkling-mini.md):**
   an opt-in, text-only native CUDA serving profile with resident NVFP4 experts,
@@ -376,6 +394,10 @@ also fits. This means a 48 GiB machine still suggests the tiny models and the
 0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 adds distinct multimodal choices;
 HyperQwen 27B and Qwen3.5 122B appear on compatible hardware. The frontier is
 curated, not a claim of measured statistical dominance.
+
+DeepSeek V4 Flash 0731 is also suggested on four sufficiently large SM120 GPUs.
+See the [workstation profile and first-generation command](docs/deepseek-v4-flash-sm120.md)
+for its serving limits and hardware validation status.
 
 The registry retains superseded / comparison entries (e.g. Qwen2.5, Llama,
 Mistral, GPT-OSS, and the 27B/35B Qwen3.5 alternatives) without suggesting

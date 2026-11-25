@@ -405,6 +405,20 @@ def test_run_preserves_literal_child_arguments(env, monkeypatch, source):
     assert json.loads(out.read_text()) == child_args
 
 
+@pytest.mark.parametrize('source', ['list', 'sys'])
+def test_public_entrypoint_preserves_literal_run_arguments(env, monkeypatch, source):
+    from infer_stack.cli import main
+
+    out = env.tmp / 'public-child-args.json'
+    code = 'import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))'
+    child_args = ['512', '001', '0.6', 'false', 'None', '', '--timeout', '180']
+    args = ['run', '--endpoint', 'qwen-coder', *_base(env), '--',
+            sys.executable, '-c', code, str(out), *child_args]
+    monkeypatch.setattr(sys, 'argv', ['infer-stack', *args])
+    assert main(argv=args if source == 'list' else None) == 0
+    assert json.loads(out.read_text()) == child_args
+
+
 def test_run_releases_on_exit(env, capsys):
     RunCLI.main(
         argv=['--endpoint', 'qwen-coder', *_base(env), '--',

@@ -746,6 +746,11 @@ class EndpointAddCLI(_CatalogCommon):
              'follows this — declaring chat for a completions-only serve '
              'blocks `acquire` until the TTL. Default (unset): chat.',
     )
+    reasoning_efforts = kw.Value(
+        [], nargs='*', parser=str,
+        help='Supported per-request reasoning levels; enables gateway passthrough '
+             'of reasoning_effort for a custom vLLM chat model.',
+    )
     min_vram_gib = kw.Value(
         None, type=float,
         help='placement.min_vram_gib — the VRAM this endpoint needs, so the '
@@ -819,6 +824,8 @@ class EndpointAddCLI(_CatalogCommon):
             entry['reclaim'] = {'policy': config.reclaim}
         if config.protocol:
             entry['protocol'] = config.protocol
+        if config.reasoning_efforts:
+            entry['reasoning_efforts'] = list(config.reasoning_efforts)
         placement: dict[str, Any] = {}
         if config.min_vram_gib is not None:
             placement['min_vram_gib'] = config.min_vram_gib
@@ -858,6 +865,7 @@ class EndpointAddCLI(_CatalogCommon):
             '--max-model-len': config.max_model_len, '--gpu-mem': config.gpu_mem,
             '--tensor-parallel': config.tensor_parallel,
             '--extra-args': config.extra_args, '--runtime': config.runtime or None,
+            '--reasoning-efforts': config.reasoning_efforts or None,
         }
         given = [flag for flag, value in managed.items() if value is not None]
         if given:
@@ -923,6 +931,29 @@ class EndpointRmCLI(_CatalogCommon):
         return _rm(config, 'endpoints', config.names)
 
 
+class EndpointProvenanceCLI(_PathOverridesMixin):
+    """Print configured serving identity as credential-free JSON."""
+    __command__ = 'provenance'
+    catalog = kw.Value(None, type=str)
+    name = kw.Value(None, position=1, type=str, required=True)
+
+    @classmethod
+    def main(cls, argv=True, **kwargs):
+        import json
+
+        from ..leasing.provenance import endpoint_provenance
+        from .commands_leasing import _load_catalog
+
+        config = cls.cli(argv=argv, data=kwargs)
+        _apply_path_overrides(config)
+        try:
+            value = endpoint_provenance(_load_catalog(config).resolve_endpoint(config.name))
+        except CatalogError as ex:
+            raise SystemExit(str(ex)) from ex
+        print(json.dumps(value, sort_keys=True, allow_nan=False))
+        return 0
+
+
 class CatalogEndpointCLI(kw.ModalCLI):
     """Manage catalog endpoints."""
     __command__ = 'endpoint'
@@ -930,6 +961,7 @@ class CatalogEndpointCLI(kw.ModalCLI):
     list = EndpointListCLI
     show = EndpointShowCLI
     rm = EndpointRmCLI
+    provenance = EndpointProvenanceCLI
 
 
 # ---------------------------------------------------------------------------

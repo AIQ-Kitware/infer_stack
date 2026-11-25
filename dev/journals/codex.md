@@ -764,6 +764,51 @@ header/body evidence with a real SDK over deterministic HTTP responses and
 reads/exports its saved request table through the evaluation system. Live
 gateway/engine propagation and physical resource measurements remain unproven.
 
+## 2026-11-19 16:32:59 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user wants DeepSeek V4 Flash discoverable on a four-card, 96-GiB SM120
+workstation. Added the dated official 0731 checkpoint and revision to the
+frontier pool. The candidate profile uses TP4, 128K context, FP8 indexer/KV
+caches, automatic MoE selection and eager execution. Upstream documents an
+eight-card workstation deployment; four-card loading and throughput are still
+unmeasured. Restricting the profile to known SM120 hardware avoids carrying
+SM100-specific kernels onto workstation Blackwell.
+
+Discovery was dropping source revisions and several standard runtime defaults.
+Preserving those fields makes this profile reach the actual rendered command.
+Unknown capability previously passed newer lower bounds via an Ampere-era
+name fallback; that fallback now only establishes its historical boundary.
+Tests exercise discovery through catalog resolution and command rendering,
+plus insufficient, heterogeneous and display-reserved GPU inventories.
+
+Validation: 114 suggestion, catalog CLI and leasing-catalog tests passed.
+The real offline CLI also renders the profile for `4x96@12.0`. No GPU service
+was started here. The hardware gate and rendered flags are checked; native
+kernel compatibility remains a host-generation result.
+
+## 2026-11-20 16:12:05 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user reported a workstation test that reached generation readiness and
+then failed when `run` launched its child. The four-card DeepSeek profile
+did load and answer through the gateway; this is now recorded in its runbook.
+The reported engine initialization took 215 seconds, with additional kernel
+JIT on the first request. Model-default sampling is temperature 1, top-p 1.
+
+Reproduced the later TypeError through the public CLI without GPUs. Existing
+tests called RunCLI directly and preserved raw argv, but the enclosing modal
+parser had already converted child positional strings into numbers before
+invoking that leaf in actual CLI use. Converting back to strings cannot
+recover values such as `001`, so `run` now dispatches from the public entry
+before the first modal parse. Other commands retain the normal modal route.
+Added regressions for both explicit argv and the process argv, including
+numeric, boolean-looking and empty strings. All 71 leasing CLI tests pass.
+Another 35 signal-cleanup, CLI metadata and CLI-equivalence tests pass.
+The fix does not change lease cancellation or teardown semantics.
+
 ## 2026-11-20 19:10:31 -0500
 
 The user asked for a pre-registered Inkling 2 Mini option, particularly for a 3090, and suggested Unsloth's GGUF. Model: GPT-6 (Codex); exact weights and reasoning configuration are not exposed by the runtime.
@@ -781,3 +826,145 @@ All six reproduced together and shared an outdated assumption: omitted reclaim p
 Reusable takeaway: a lifecycle regression test must declare the retention policy needed to reach its asserted state; relying on a default can silently turn a startup, rollback, or gateway test into a test of ordinary release cleanup.
 
 Validation completed: all 676 tests in `python -m pytest -q tests/test_leasing_*.py` passed; `git diff --check` passed.
+
+## 2026-11-21 11:43:00 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user requested the latest development registrations while preserving the
+working branch's serving fixes. Integrated origin/dev/0.7.3 through f0b888a
+into the current feature branch. Both branches appended independent journal
+entries; retained both histories in chronological order when resolving that
+conflict. The model pool and implementation changes merged automatically.
+The distinction between a clean merge and working serving behavior matters:
+342 focused discovery, Compose, CLI and lifecycle tests pass, but this merge
+does not establish native GPU acceptance for the newly registered launcher.
+Further serving changes are a separate reviewable step.
+
+## 2026-11-21 12:25:57 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user approved a native vLLM registration for Inkling 2 Mini. Added the
+official NVFP4/MXFP8 source at a pinned revision and an immutable manifest
+for the dedicated upstream image. The hardware-gated TP1/128K candidate uses
+native reasoning/tool parsers and retains the independent GGUF option.
+Discovery was discarding explicit shared-memory defaults for TP1; preserving
+that generic field makes the declared profile reach Compose correctly.
+
+The profile renders through the ordinary catalog/launch path with no custom
+command. 130 discovery/Compose tests pass, including pinned identity, parsers,
+TP1 and hardware eligibility. Model startup, kernels and throughput on SM120
+remain host acceptance work. Keeping a declared candidate distinct from a
+measured hardware recipe avoids treating command rendering as generation
+proof; no model-specific renderer or launcher was introduced.
+
+## 2026-11-21 15:33:38 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user supplied a failed downstream execution log while pursuing the approved
+native serving integration. Its scheduler expected an endpoint provenance CLI
+and a public lease descriptor that did not exist. Earlier compilation and
+request tests bypassed this boundary, so they gave insufficient integration
+coverage. Implemented the missing contract in infer-stack: catalog projection
+and assigned-deployment projection share one function, and command-scoped
+children receive a temporary, credential-free descriptor. Runtime options are
+hashed without exposing custom environment values. Mutable artifacts remain
+explicit uncertainty rather than an immutable identity assertion.
+
+The projection describes configured launch facts, not loaded-weight attestation.
+It hashes runtime options conservatively; a coalesced deployment with a different
+context capacity is distinguishable. Placement and reclaim policy stay outside
+model identity. The descriptor is removed when the child exits; existing
+signal forwarding and lease release remain in the original run lifecycle.
+
+124 focused provenance/CLI/signal tests and 679 existing leasing tests pass.
+A downstream test also executes native Inspect through the real null-backend
+lease CLI, reuses its result without another lease, and rejects drift at both
+the catalog and lease boundaries. No GPU acceptance was attempted. The reusable
+lesson is to test the installed producer/consumer command contract, not only a
+consumer fixture that assumes the producer exists.
+
+## 2026-11-21 18:55:30 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user's host log now records generation verification through the native
+Inkling 2 Mini endpoint on a 96-GiB SM120 GPU. Updated the README's provisional
+startup status to reflect that observed generation. This establishes startup
+and a successful request for the pinned image/checkpoint configuration;
+throughput tuning remains unmeasured. A downstream queue failure occurred after
+readiness and was traced to differing Python source imports, not the serving
+recipe. The important distinction is between observed generation and broader
+performance claims; only the former is established by this log.
+
+## 2026-11-22 00:09:14 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user asked to inspect a downstream run that reached generation readiness
+but failed its actual inference requests. A derived endpoint had been created
+through the catalog CLI without its source endpoint's reasoning capability.
+The schema, suggestion path and gateway already supported reasoning_efforts;
+endpoint add did not expose that field. LiteLLM consequently rejected an
+explicit reasoning_effort on the custom model name. Readiness's ordinary
+request did not exercise that optional parameter.
+
+Exposed the existing declaration through --reasoning-efforts. Catalog
+validation remains authoritative, and external endpoints reject this managed
+capability flag. The declaration reaches both served metadata and the existing
+gateway's allowed_openai_params projection; no parameters are silently dropped.
+Use parser=str rather than type=str: the CLI otherwise casts the literal
+supported level "none" to Python None before catalog validation.
+
+52 CLI and reasoning/gateway tests pass. Coverage upgrades an existing endpoint
+through the CLI, checks both the full level set and a subset, verifies gateway
+passthrough metadata, and confirms malformed declarations leave the file
+unchanged. The general lesson is that deriving a serving alias must retain its
+request capabilities as well as its launch settings. A plain readiness request
+is evidence of basic generation, not every advertised request option.
+
+
+## 2026-11-23 10:09:33 -0500
+
+Model: GPT-6 (Codex); exact serving variant/configuration unavailable.
+
+The user authorized an experimental exploration of local embedding endpoints,
+without implementing a server or changing existing serving behavior. Added
+planning/embedding-endpoints.md and linked it as an exploratory option from
+the north-star document. The plan reuses catalog, lease, placement and gateway
+ownership, identifies the generation-only readiness/protocol assumption, and
+asks for measurements against in-process batch encoding before expanding scope.
+
+My main uncertainty is whether sharing warm encoders pays for the server and
+GPU residency cost on the intended workloads. Existing vLLM embedding support
+makes that a narrower first experiment than adding a new engine immediately.
+Vector preparation/caching remains client work, and hosted APIs need no local
+GPU lease. No code, endpoint registration, GPU workload or runtime configuration
+was changed. Reviewed the existing lifecycle/probe/catalog boundaries and
+upstream serving documentation; no tests were needed for these planning notes.
+
+## 2026-11-24 16:34:58 -0500
+
+GPT-6.2-sol. Add Nanbeige4.3-33B to GPU discovery with the publisher's native
+vLLM parser pair and TP4. The checkpoint has about 62 GiB of BF16 weights.
+The 128K serving profile leaves room for KV cache on four 48 GiB or larger
+BF16-capable GPUs. It preserves reasoning history and selects XML tool calls in
+the chat template. Both model revision and image manifest are pinned so a
+successful host run identifies a repeatable recipe.
+
+The simulated 4x96 GiB inventory rendered the complete Compose command,
+including the parser and template arguments. The test also excludes inventories
+with too few GPUs, insufficient memory or a pre-Ampere compute capability.
+The suggestion and Compose suites passed 131 tests. Live GPU acceptance is pending.
+
+## 2026-11-24 22:20:51 -0500
+
+GPT-6.2-sol. Consolidate the serving changes on `dev/0.7.3` for review alongside
+the packaged Maya runtime. Both branches added Inkling documentation, so the
+README keeps the native vLLM, Maya and llama.cpp profiles documented. Comparing
+rendered Compose services on a simulated four-GPU SM120 host confirmed that the
+merge preserves the existing Inkling vLLM, DeepSeek and Nanbeige launch specs.
+The pinned Nanbeige profile has also completed live generation and tool calls
+on four SM120 GPUs.

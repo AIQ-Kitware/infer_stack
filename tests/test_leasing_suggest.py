@@ -13,6 +13,87 @@ from infer_stack.leasing.suggest import (
 )
 
 
+def test_deepseek_v4_discovery_preserves_pinned_sm120_serving_recipe():
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'deepseek-v4-flash-0731'
+    fragment = suggest_catalog(simulate_inventory('4x96@12.0'))
+    catalog = Catalog.from_dict(fragment)
+    request = catalog.resolve_endpoint(name).to_request()
+    assert request.spec['hf_model_id'] == 'deepseek-ai/DeepSeek-V4-Flash-0731'
+    assert request.spec['revision'] == '7872f01b1d1fe23eabc4c98b48bffcef5a386062'
+    assert request.served['reasoning_efforts'] == ['low', 'high', 'max']
+    assert request.spec['runtime']['tensor_parallel_size'] == 4
+    assert request.spec['runtime']['max_model_len'] == 131072
+    deployment = Deployment('test', request.compat_key, request.engine,
+                            request.sharing, request.capacity, request.spec,
+                            {name: request.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'] == 'vllm/vllm-openai:v0.28.0'
+    assert '--trust-remote-code' in args
+    assert '--max-num-seqs=2' in args
+    assert '--max-num-batched-tokens=4096' in args
+    assert '--tensor-parallel-size=4' in args
+    assert '--revision=' + request.spec['revision'] in args
+    assert args[args.index('--tokenizer-mode') + 1] == 'deepseek_v4'
+    assert args[args.index('--attention_config.indexer_kv_dtype') + 1] == 'fp8'
+    assert args[args.index('--moe-backend') + 1] == 'auto'
+    assert '--enforce-eager' in args
+    assert not any('speculative' in arg for arg in args)
+
+
+def test_deepseek_v4_requires_known_sm120_and_four_roomy_eligible_gpus():
+    name = 'deepseek-v4-flash-0731'
+    for spec in ('4x96', '4x96@8.6', '4x96@9.0', '4x192@10.0',
+                 '4x96@12.1', '2x96@12.0', '4x48@12.0',
+                 '3x96@12.0,96@9.0'):
+        assert name not in suggest_catalog(simulate_inventory(spec))['models'], spec
+    # A class gate cannot accidentally place the endpoint onto the bigger
+    # incompatible GPU on a heterogeneous host, even with enough aggregate VRAM.
+    fragment = suggest_catalog(simulate_inventory('192@9.0,4x96@12.0'))
+    assert fragment['endpoints'][name]['placement']['gpu_indices'] == [1, 2, 3, 4]
+    assert name not in suggest_catalog(
+        {'gpus': [_gpu(i, 96, compute_cap=12.0, display=(i == 0)) for i in range(4)]},
+        reserve_display_gpu=True,
+    )['models']
+
+
+def test_nanbeige_discovery_renders_pinned_vllm_tool_serving():
+    import json
+
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'nanbeige4.3-33b'
+    fragment = suggest_catalog(simulate_inventory('4x96@12.0'))
+    request = Catalog.from_dict(fragment).resolve_endpoint(name).to_request()
+    assert request.engine == 'vllm'
+    assert request.spec['hf_model_id'] == 'Nanbeige/Nanbeige4.3-33B'
+    deployment = Deployment('test', request.compat_key, request.engine,
+                            request.sharing, request.capacity, request.spec,
+                            {name: request.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'].startswith('vllm/vllm-openai@sha256:')
+    assert '--revision=df919e1e2cf077a22204c78b6c826bf3db18bc08' in args
+    assert '--tensor-parallel-size=4' in args
+    assert '--max-model-len=131072' in args
+    assert '--enable-auto-tool-choice' in args
+    assert args[args.index('--reasoning-parser') + 1] == 'qwen3'
+    assert args[args.index('--tool-call-parser') + 1] == 'qwen3_coder'
+    assert json.loads(args[args.index('--default-chat-template-kwargs') + 1]) == {
+        'preserve_thinking': True,
+        'tool_call_format': 'xml',
+    }
+    assert '--trust-remote-code' not in args
+    for hardware in ('3x96@12.0', '4x24@12.0', '4x96@7.5'):
+        assert name not in suggest_catalog(simulate_inventory(hardware))['endpoints']
+
+
 def _gpu(index, mem, name='GPU', display=False, compute_cap=None):
     gpu = {'index': index, 'name': name, 'memory_gib': mem, 'display_active': display}
     if compute_cap is not None:
@@ -115,6 +196,35 @@ def test_inkling_q4_is_opt_in_and_selects_explicit_gguf():
     assert name not in suggest_catalog(
         {'gpu_count': 1, 'gpus': [_gpu(0, 16, compute_cap=8.6)]},
         include=[name])['endpoints']
+
+
+def test_inkling_native_vllm_is_pinned_tp1_and_hardware_gated():
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'inkling-2-mini'
+    cat = Catalog.from_dict(suggest_catalog(simulate_inventory('4x96@12.0')))
+    req = cat.resolve_endpoint(name).to_request()
+    assert req.spec['hf_model_id'] == 'thinkingmachines/Inkling-2-Mini'
+    assert req.spec['revision'] == 'ed40e7da625f594fc9c4990f5f66be24873c22d7'
+    assert req.spec['runtime'].get('tensor_parallel_size', 1) == 1
+    assert req.spec['runtime']['max_model_len'] == 131072
+    assert not req.spec['runtime'].get('command')
+    deployment = Deployment('native-inkling', req.compat_key, req.engine, req.sharing,
+                            req.capacity, req.spec, {name: req.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'].startswith('vllm/vllm-openai@sha256:')
+    assert '--tensor-parallel-size=1' in args
+    assert service['shm_size'] == '16g'
+    assert '--enable-auto-tool-choice' in args
+    assert args[args.index('--tool-call-parser') + 1] == 'inkling'
+    assert args[args.index('--reasoning-parser') + 1] == 'inkling'
+    assert '--revision=' + req.spec['revision'] in args
+    assert '--language-model-only' in args
+    for spec in ('4x96', '4x96@8.6', '4x96@9.0', '4x48@12.0'):
+        assert name not in suggest_catalog(simulate_inventory(spec))['endpoints']
 
 
 def test_all_and_include_restore_optional_models_without_ignoring_hardware():

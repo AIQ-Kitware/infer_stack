@@ -22,6 +22,12 @@ Related implementation documents:
 - [vram-aware-placement.md](vram-aware-placement.md) — current resource-fit
   model.
 
+Exploratory options, not implementation commitments:
+
+- [embedding-endpoints.md](embedding-endpoints.md) — whether local embedding
+  servers should reuse the existing lifecycle, and what to measure before
+  deciding scope or adding a serving engine.
+
 Implementation progress is recorded in the roadmap checkpoints. The current
 service has one authority, remote clients and recomputable usage facts; machine
 failure tolerance, live energy collection and physical multi-GPU acceptance
