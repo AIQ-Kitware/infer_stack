@@ -133,3 +133,26 @@ stream timings are engine-internal counters. No changes to core lease semantics.
 Risks: new agents can join a deployment during the benchmark, mutable weights
 are not attested, and tokenizer calibration is approximate. Scope intentionally
 limited to local Compose; remote scheduling needs server-side hardware facts.
+
+## 2026-11-25 15:17:07 -0500 — Catalog discovery and shortlist
+
+Model: ChatGPT (GPT-6.2; serving configuration not independently identifiable).
+Promoted Maya's 192/256 Ki-token DSpark profiles after operator-reported
+262144-token readiness; retained the 336 Ki-token no-drafter variant as opt-in.
+Gemma E2B preserves a distinct small multimodal option; E4B, 26B and 31B move
+out of the frontier. Older Qwen2.5/Llama/Mistral/GPT-OSS entries were already
+optional. Kept the separate Qwen small/large classes and smoke tests. This is
+curation, not proof of measured performance dominance.
+
+The browser compiles the registry against the active backend's hardware and
+placement restrictions, includes optional profiles, and imports the exact
+selected endpoint plus its model through a non-overwriting merge. CLI import
+shares this path; literal packaged presets remain unchanged. Import is a
+catalog operation, not deployment. Import & acquire goes through the existing
+controller, where Compose prepares bundled images automatically before startup.
+No new Docker build logic in the TUI. KubeAI excludes unsupported custom runtime
+fields from the browser. Catalog files are re-read on import to check conflicts.
+
+Validation: 62 targeted tests passed (ubelt import-only shim and xdoctest
+addopts disabled). Textual and kwconf unavailable; new headless browser and CLI
+import tests are included but unexecuted here. No new GPU tests performed.

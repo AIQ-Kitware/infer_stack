@@ -141,6 +141,9 @@ def test_builtin_pool_is_nonempty_and_real():
     assert pool['qwen3.5-0.8b'].suggestion_tier == 'frontier'
     assert pool['qwen3.5-122b-a10b'].suggestion_tier == 'frontier'
     assert pool['gemma4-e2b'].suggestion_tier == 'frontier'
+    for name in ('gemma4-e4b', 'gemma4-26b', 'gemma4-31b'):
+        assert pool[name].suggestion_tier == 'optional'
+    assert pool['inkling-2-mini-maya'].suggestion_tier == 'frontier'
     assert pool['qwen3.5-27b'].suggestion_tier == 'optional'
     assert pool['qwen3.5-35b-a3b'].suggestion_tier == 'optional'
     assert pool['gpt-oss-20b'].suggestion_tier == 'optional'
@@ -159,7 +162,8 @@ def test_frontier_is_hardware_filtered_not_pruned_by_larger_models():
     big = set(catalogs[-1]['models'])
     assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-2b',
             'qwen3.5-4b', 'qwen3.5-9b', 'qwen3.8-27b-dbirks-hyperqwen',
-            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'} <= big
+            'gemma4-e2b'} <= big
+    assert not {'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'} & big
     assert 'qwen3.5-122b-a10b' not in big  # still needs two 80 GiB GPUs
     assert 'qwen3.5-27b' not in big           # non-frontier, though it fits
     assert 'qwen3.5-35b-a3b' not in big
@@ -170,8 +174,7 @@ def test_large_multi_gpu_frontier_includes_122b_and_smaller_models():
     models = suggest_catalog(simulate_inventory('4x96'))['models']
     assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-9b',
             'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-122b-a10b',
-            'qwen3.5-122b-a10b-fp8', 'gemma4-e2b', 'gemma4-e4b',
-            'gemma4-26b', 'gemma4-31b'} <= set(models)
+            'qwen3.5-122b-a10b-fp8', 'gemma4-e2b'} <= set(models)
 
 
 def test_gpt2_debug_endpoint_uses_completions_protocol():
@@ -270,7 +273,7 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     models = suggest_catalog(inv)['models']
     fits = {'gpt2', 'smollm2-135m', 'qwen3.8-27b-dbirks-hyperqwen',
             'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
-            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'}
+            'gemma4-e2b', 'inkling-2-mini-maya'}
     too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
                'qwen3.6-35b-a3b'}  # 35b-a3b needs 2 GPUs even at 24 GiB each
     assert fits <= set(models)

@@ -68,3 +68,25 @@ def test_import_rejects_unknown_preset(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='available: qwen38-flash-next-3090'):
         CatalogImportCLI.main(argv=['not-present'])
     assert not (tmp_path / 'catalog.yaml').exists()
+
+
+def test_import_exact_optional_profile(tmp_path, monkeypatch):
+    from infer_stack.runtime_images import MAYA_IMAGE
+
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    argv = ['inkling-2-mini-maya-huge', '--simulate-hardware', '2x24@8.6']
+    assert CatalogImportCLI.main(argv=argv) == 0
+    data = yaml.safe_load((tmp_path / 'catalog.yaml').read_text())
+    assert set(data['models']) == {'inkling-2-mini-maya'}
+    assert set(data['endpoints']) == {'inkling-2-mini-maya-huge'}
+    assert data['endpoints']['inkling-2-mini-maya-huge']['runtime']['image'] == MAYA_IMAGE
+    assert CatalogImportCLI.main(argv=argv) == 0
+
+
+def test_import_known_incompatible_profile(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setenv('INFER_STACK_CONFIG_DIR', str(tmp_path))
+    with pytest.raises(SystemExit, match='does not fit'):
+        CatalogImportCLI.main(argv=['inkling-2-mini-maya', '--simulate-hardware', '1x16@8.6'])
+    assert not (tmp_path / 'catalog.yaml').exists()

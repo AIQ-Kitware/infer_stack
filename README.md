@@ -73,15 +73,17 @@ See [the benchmark guide](docs/benchmark.md).
   Generation has been verified on a 96-GiB SM120 GPU.
 
 - **[Inkling 2 Mini via Maya on one RTX 3090](docs/maya-inkling-mini.md):**
-  an opt-in, text-only native CUDA serving profile with resident NVFP4 experts,
-  FP8 KV and DSpark. Use `infer-stack
-  catalog suggest --include inkling-2-mini-maya --apply` and `infer-stack
-  acquire inkling-2-mini-maya`. Profiles offer 192K/256K tokens with the
-  drafter and 336K without it. The first acquire automatically builds and caches
+  a text-only native CUDA serving profile with compressed NVFP4 experts,
+  FP8 KV and DSpark. On matching GPUs, 192/256 Ki-token profiles appear in
+  normal suggestions; the 336 Ki-token profile without DSpark is optional.
+  Use the TUI **Browse models** button or `infer-stack catalog import
+  inkling-2-mini-maya-long`, then `infer-stack acquire inkling-2-mini-maya-long`. The first acquire automatically builds and caches
   the pinned image; optionally prebuild it with `infer-stack image build
   maya-inkling-mini` (see `infer-stack image list`). No manual Docker build is
   needed. Compose manages the
-  engine through its custom launcher interface (no vLLM in the image). GPU acceptance is pending.
+  engine through its custom launcher interface (no vLLM in the image). The
+  long profile has reached readiness on a 3090; throughput and quality
+  validation remain separate.
 
 - **Inkling 2 Mini via llama.cpp on a 24 GiB NVIDIA GPU:** an experimental text-only GGUF
   profile is available for Compose via `infer-stack catalog suggest --include
@@ -227,8 +229,14 @@ infer-stack apply                           # start it (or `release --all` to di
 
 ## Catalog model
 
-A built-in catalog preset can be imported additively without locating or editing
-`catalog.yaml` (for example `infer-stack catalog import qwen38-flash-next-3090`).
+A known endpoint profile or built-in preset can be imported additively without
+locating or editing `catalog.yaml` (for example `infer-stack catalog import
+inkling-2-mini-maya-long` or `infer-stack catalog import qwen38-flash-next-3090`).
+Registry imports size exactly one endpoint to the detected hardware and add its
+model dependency. Presets retain their packaged configuration. In the local TUI,
+**Browse models** (`i`) searches the hardware-compatible registry, including
+optional variants. Select **Import** to save without starting anything or
+**Import & acquire** to use the normal managed deployment path.
 The import is idempotent and rejects differing existing names rather than
 clobbering them. Use `--dry-run` to preview the merged catalog. A single
 path can be queried as plain, absolute stdout using `infer-stack paths NAME`
@@ -399,8 +407,9 @@ for the detected GPUs instead. The normal suggestions are a curated *frontier*
 across model sizes and modalities, plus GPT-2 and SmolLM2-135M smoke-test
 models. **Every frontier model that fits is included**, even when a larger one
 also fits. This means a 48 GiB machine still suggests the tiny models and the
-0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 adds distinct multimodal choices;
-HyperQwen 27B and Qwen3.5 122B appear on compatible hardware. The frontier is
+0.8B / 2B / 4B / 9B Qwen3.5 options. Gemma 4 E2B retains the small multimodal
+option; E4B, 26B and 31B are optional. HyperQwen 27B, Inkling Mini via Maya
+(192/256 Ki-token profiles on sm_86), and Qwen3.5 122B appear on compatible hardware. The frontier is
 curated, not a claim of measured statistical dominance.
 
 DeepSeek V4 Flash 0731 is also suggested on four sufficiently large SM120 GPUs.
@@ -415,6 +424,7 @@ them automatically. All options remain discoverable:
 infer-stack catalog suggest                 # curated fitting frontier + smoke tests
 infer-stack catalog suggest --all           # every hardware-compatible pool entry
 infer-stack catalog suggest --include mistral-7b-instruct
+infer-stack catalog import inkling-2-mini-maya-long  # add exactly one compatible profile
 infer-stack catalog suggest --apply         # additive: does not remove old entries
 ```
 

@@ -169,10 +169,12 @@ vllm_models:
   # Maya's native CUDA engine, not vLLM. infer-stack builds and caches its
   # bundled versioned image automatically on first use. The GGUF must be
   # Q4_K_XL, not the llama.cpp profile's Q4_K_M. Text only; reserve one GPU, never spill to the second.
-  # Keep opt-in until infer-stack GPU acceptance is done. The default is a
-  # reduced-window variant of upstream's 262K DSpark/FP8 configuration.
+  # The 262K profile has reached readiness on a real RTX 3090 through
+  # infer-stack. Throughput and task quality still need acceptance tests.
+  # Prefer the 192/256 Ki-token DSpark profiles in normal suggestions.
   inkling-2-mini-maya:
     hf_model_id: unsloth/Inkling-2-Mini-GGUF
+    suggestion_tier: frontier
     served_model_name: inkling-2-mini-maya
     family: inkling2
     modalities: [text]
@@ -205,6 +207,8 @@ vllm_models:
         runtime:
           max_model_len: 262144
       huge:
+        # Max context without DSpark: available for experiments, not default.
+        suggest_by_default: false
         min_compute_cap: 8.6
         max_compute_cap: 8.6
         runtime:
@@ -719,9 +723,10 @@ vllm_models:
       enable_prefix_caching: false
 
   # -- Gemma 4 (current gen, multimodal, reasoning) ----------------------
-  # Audio-capable E2B/E4B and image-capable 26B MoE / 31B dense expose useful
-  # speed/capability tradeoffs not covered by the text-only Qwen frontier.
-  # Each remains in the suggested set if it fits, even on large GPUs.
+  # Keep E2B as the small image/audio option. The E4B, 26B MoE and 31B
+  # alternatives remain importable but are no longer default suggestions.
+  # The larger entries have no explicit quantized serving recipe; the pool
+  # VRAM estimates alone do not establish that they boot on a 24 GiB card.
   gemma4-e2b:
     hf_model_id: google/gemma-4-E2B-it
     suggestion_tier: frontier
@@ -738,7 +743,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-e4b:
     hf_model_id: google/gemma-4-E4B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-e4b
     family: gemma4
     modalities: [text, image, audio]
@@ -752,7 +757,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-26b:
     hf_model_id: google/gemma-4-26B-A4B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-26b
     family: gemma4
     modalities: [text, image]
@@ -766,7 +771,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-31b:
     hf_model_id: google/gemma-4-31B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-31b
     family: gemma4
     modalities: [text, image]

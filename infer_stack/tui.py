@@ -8,7 +8,7 @@ polled while hidden:
 * **Catalog** (left) — the models + endpoints you can run; Acquire the selected
   endpoint (double-click a row, press Enter, or the Acquire button — a lone
   click only highlights, so a stray click never brings one up), Suggest a set
-  sized to your GPUs, or add one by hand. Ctrl+click a served endpoint to open
+  sized to your GPUs, Browse known profiles, or add one by hand. Ctrl+click a served endpoint to open
   it in Open WebUI.
 * **Leases** + **Deployments** (center) — the live ledger (desired *state* vs what's
   actually *running*, and which GPUs), with Release / Evict / Clean-up.
@@ -126,6 +126,8 @@ ACTIVITY_VERBS = {
     '_do_node_action': 'updating node',
     '_save_endpoint': 'saving endpoint',
     '_do_suggest': 'inspecting GPUs for a suggestion',
+    '_prepare_profile_browser': 'discovering known profiles',
+    '_import_profile': 'importing known profile',
     '_prepare_endpoint_editor': 'inspecting GPUs',
     '_do_api_send': 'waiting for the model',
     '_do_api_test_all': 'testing every model',
@@ -295,6 +297,130 @@ class _Divider(Static):
         self._dragging = False
         self.release_mouse()
         event.stop()
+
+
+class _ProfileBrowser(ModalScreen):
+    """Choose an exact compatible serving profile, not just a weight source."""
+
+    CSS = """
+    _ProfileBrowser { align: center middle; }
+    #profile-dialog {
+        width: 95%; max-width: 128; height: 88%; padding: 1 2;
+        border: round $accent; background: $surface;
+    }
+    #profile-table { height: 1fr; }
+    #profile-detail { height: auto; min-height: 3; }
+    #profile-actions { height: auto; align-horizontal: right; }
+    #profile-actions Button { margin: 0 0 0 1; min-width: 10; }
+    """
+    BINDINGS = [Binding('escape', 'cancel', 'Cancel', show=False)]
+
+    def __init__(self, choices: list[dict], existing: dict):
+        super().__init__()
+        self.choices = choices
+        self.existing = existing
+        self.visible_rows: list[dict] = []
+        self._ready = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='profile-dialog'):
+            yield Label('Browse known model profiles')
+            yield Static('Hardware-filtered registry, including optional models. '
+                         'Compatibility estimates are not startup guarantees. '
+                         'Import alone does not download or start anything.')
+            yield Input(placeholder='Search name, source, modality, or tier…',
+                        id='profile-search')
+            yield DataTable(id='profile-table', cursor_type='row', zebra_stripes=True)
+            yield Static('', id='profile-detail', markup=False)
+            with Horizontal(id='profile-actions'):
+                yield Button('Cancel', id='profile-cancel')
+                yield Button('Import', id='profile-import', variant='primary')
+                yield Button('Import & acquire', id='profile-acquire', variant='success')
+
+    def on_mount(self) -> None:
+        table = self.query_one('#profile-table', DataTable)
+        table.add_columns('Endpoint', 'Tier', 'Context', 'GPU(s)', 'Status')
+        self._ready = True
+        self._filter('')
+        self.query_one('#profile-search', Input).focus()
+
+    def _state(self, row: dict) -> str:
+        fragment = row['fragment']
+        for section in ('models', 'endpoints'):
+            current = self.existing.get(section) or {}
+            for name, entry in fragment[section].items():
+                if name in current and current[name] != entry:
+                    return 'Conflict'
+        if row['name'] in (self.existing.get('endpoints') or {}):
+            return 'Imported'
+        return 'Available'
+
+    def _filter(self, query: str) -> None:
+        table = self.query_one('#profile-table', DataTable)
+        table.clear()
+        words = query.casefold().split()
+        self.visible_rows = []
+        for row in self.choices:
+            state = self._state(row)
+            haystack = ' '.join(str(row[k]) for k in (
+                'name', 'source', 'tier', 'modalities', 'image')).casefold() + ' ' + state.casefold()
+            if row['tier'] == 'frontier':
+                haystack += ' recommended'
+            if not all(w in haystack for w in words):
+                continue
+            self.visible_rows.append(row)
+            ctx = f'{row["context"]:,}' if row['context'] else '—'
+            vram = row['min_vram_gib']
+            gpu = f'{row["gpu_count"]} × {vram:g} GiB' if vram else str(row['gpu_count'])
+            tier = 'recommended' if row['tier'] == 'frontier' else row['tier']
+            table.add_row(row['name'], tier, ctx, gpu, state, key=row['name'])
+        if self.visible_rows:
+            table.move_cursor(row=0, column=0)
+        self._update_detail()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == 'profile-search' and self._ready:
+            self._filter(event.value)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == 'profile-table' and self._ready:
+            self._update_detail()
+
+    def _selected_row(self) -> dict | None:
+        table = self.query_one('#profile-table', DataTable)
+        i = table.cursor_row
+        return self.visible_rows[i] if 0 <= i < len(self.visible_rows) else None
+
+    def _update_detail(self) -> None:
+        row = self._selected_row()
+        state = self._state(row) if row else ''
+        self.query_one('#profile-import', Button).disabled = state != 'Available'
+        self.query_one('#profile-acquire', Button).disabled = state != 'Available'
+        if not row:
+            detail = 'No matching profiles. Try another search or check GPU eligibility.'
+        else:
+            detail = f'{row["source"]}  |  {row["modalities"]}'
+            if row['managed_build']:
+                detail += '\nFirst acquire builds the pinned Docker image if missing; later acquires reuse it.'
+            elif row['image']:
+                detail += f'\nImage: {row["image"]}'
+            if state == 'Conflict':
+                detail += '\nAn existing entry differs; edit or rename it before importing.'
+            elif state == 'Imported':
+                detail += '\nAlready in your catalog; acquire it from the endpoint table.'
+        self.query_one('#profile-detail', Static).update(detail)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == 'profile-cancel':
+            self.action_cancel()
+            return
+        row = self._selected_row()
+        if row and self._state(row) == 'Available':
+            self.dismiss((row, event.button.id == 'profile-acquire'))
 
 
 class _AddModelScreen(ModalScreen):
@@ -891,6 +1017,7 @@ class InferStackTUI(App):
         # deployments table; release/evict then act on every checked row.
         Binding('space', 'toggle_select', 'Select row', show=False),
         Binding('g', 'suggest', 'Suggest', show=False),
+        Binding('i', 'browse_profiles', 'Browse models', show=False),
         Binding('m', 'add_model', 'Add model', show=False),
         Binding('n', 'add_endpoint', 'Add endpoint', show=False),
         Binding('o', 'open', 'Open in browser', show=False),
@@ -1107,7 +1234,8 @@ class InferStackTUI(App):
             yield Button('Edit', id='btn-edit-endpoint')
             yield Button('Remove', id='btn-remove-endpoint')
         with Horizontal(id='suggest-actions'):
-            yield Button('✨  Suggest from my GPUs', id='btn-suggest')
+            yield Button('Suggest', id='btn-suggest')
+            yield Button('Browse models', id='btn-browse-profiles')
 
     def _compose_models(self) -> ComposeResult:
         yield Static('Models: servable weights', classes='desc')
@@ -1741,12 +1869,13 @@ class InferStackTUI(App):
         if not self._endpoint_names:
             help_.update(
                 'No endpoints yet. Press [b]g[/b] to suggest a set sized to '
-                'your GPUs, or [b]m[/b]/[b]n[/b] to add a model/endpoint.'
+                'your GPUs, [b]i[/b] to browse known profiles, or [b]m[/b]/[b]n[/b] '
+                'to add a custom model/endpoint.'
             )
         else:
             help_.update(
-                'Select an endpoint and Acquire it. Ctrl+click a served one to '
-                'open it in Open WebUI.'
+                'Select an endpoint and Acquire it, or browse known models ([b]i[/b]). '
+                'Ctrl+click a served one to open it in Open WebUI.'
             )
 
     def _catalog_stamp(self):
@@ -2882,6 +3011,7 @@ class InferStackTUI(App):
             'btn-evict': self.action_evict,
             'btn-evict-all': self.action_evict_all,
             'btn-suggest': self.action_suggest,
+            'btn-browse-profiles': self.action_browse_profiles,
             'btn-add-model': self.action_add_model,
             'btn-add-endpoint': self.action_add_endpoint,
             'btn-edit-endpoint': self.action_edit_endpoint,
@@ -3530,6 +3660,85 @@ class InferStackTUI(App):
         data[section][name] = entry
         write_catalog_source(catalog_path, data)  # validates; raises on a bad write
 
+    def action_browse_profiles(self) -> None:
+        if not self.catalog_path:
+            self._refuse('no catalog path — launch the TUI with a catalog to edit')
+            return
+        self._status('inspecting GPUs and loading known profiles…')
+        self._prepare_profile_browser()
+
+    @work(thread=True, exclusive=True, group='catalog-editor')
+    def _prepare_profile_browser(self) -> None:
+        from .leasing.discovery import profile_choices
+        from .leasing.catalog_edit import load_catalog_source
+
+        try:
+            inventory, reserve_display = self._discovery_inventory()
+            choices = profile_choices(inventory, kubeai=self._is_kube,
+                                      reserve_display_gpu=reserve_display)
+            existing = load_catalog_source(self._editable_catalog_path())
+            self.call_from_thread(self._show_profile_browser, choices, existing)
+        except (Exception, SystemExit) as ex:
+            self.call_from_thread(self._refuse, f'could not browse profiles: {ex}', level='error')
+
+    def _show_profile_browser(self, choices: list[dict], existing: dict) -> None:
+        self.push_screen(_ProfileBrowser(choices, existing), self._on_profile_choice)
+
+    def _on_profile_choice(self, result) -> None:
+        if result is not None:
+            row, acquire = result
+            self._import_profile(row, acquire)
+
+    @work(thread=True, exclusive=True, group='catalog-editor')
+    def _import_profile(self, row: dict, acquire: bool) -> None:
+        from .leasing.catalog_edit import (
+            load_catalog_source, merge_catalog_fragment, write_catalog_source,
+        )
+
+        name = row['name']
+        try:
+            path = self._editable_catalog_path()
+            # Re-read: do not overwrite edits made while the browser was open.
+            data, added = merge_catalog_fragment(load_catalog_source(path), row['fragment'])
+            if added:
+                write_catalog_source(path, data)
+            self.call_from_thread(self._profile_imported, name, acquire, bool(added))
+        except (Exception, SystemExit) as ex:
+            self.call_from_thread(self._refuse, f'import {name} failed: {ex}', level='error')
+
+    def _profile_imported(self, name: str, acquire: bool, added: bool) -> None:
+        self._reload_catalog()
+        if name not in self._endpoint_names:
+            self._refuse(f'{name} was not found after catalog reload', level='error')
+            return
+        table = self.query_one('#endpoints', DataTable)
+        table.move_cursor(row=self._endpoint_names.index(name))
+        self._cli(cli.command('catalog', 'import', name))
+        self._status(f'{"imported" if added else "already imported"} {name}')
+        if acquire:
+            # Use the ordinary acquisition path; Compose prepares bundled
+            # images before starting a missing service. No separate Docker UI.
+            self._start_acquire(name)
+
+    def _discovery_inventory(self) -> tuple[dict, bool | str]:
+        """Honor the active backend and its placement restrictions."""
+        from .hardware import detect_inventory
+        from .cli.commands_leasing import _resolve_skip_display
+        from .cli.context import _filter_inventory_to_allowed
+        from types import SimpleNamespace
+
+        backend = self.controller.backend
+        if self._is_kube:
+            inventory, _ = backend.suggestion_inventory()
+            return inventory, False
+        inventory = getattr(backend, 'inventory', None)
+        if inventory is None:
+            inventory = detect_inventory()
+        inventory = _filter_inventory_to_allowed(inventory, getattr(backend, 'allowed_gpus', None))
+        skip = _resolve_skip_display(SimpleNamespace(
+            skip_display_gpus=getattr(backend, 'skip_display', None)))
+        return inventory, 'auto' if skip else False
+
     def action_suggest(self) -> None:
         if not self.catalog_path:
             self._refuse('no catalog path — launch the TUI with a catalog to edit')
@@ -3542,21 +3751,12 @@ class InferStackTUI(App):
     @work(thread=True, exclusive=True, group='mutate')
     def _do_suggest(self) -> None:
         try:
-            from .hardware import detect_inventory
-            from .leasing.suggest import (
-                migrate_known_suggestion_aliases,
-                suggest_catalog,
-            )
-            from .cli.commands_leasing import _resolve_skip_display
-            from types import SimpleNamespace
+            from .leasing.discovery import discovery_catalog
+            from .leasing.suggest import migrate_known_suggestion_aliases
 
-            inventory = detect_inventory()
-            skip_display = _resolve_skip_display(SimpleNamespace(
-                skip_display_gpus=getattr(self.controller.backend, 'skip_display', None),
-            ))
-            frag = suggest_catalog(
-                inventory, reserve_display_gpu='auto' if skip_display else False,
-            )
+            inventory, reserve_display = self._discovery_inventory()
+            frag = discovery_catalog(inventory, all_models=False, kubeai=self._is_kube,
+                                     reserve_display_gpu=reserve_display)
             if not frag.get('models'):
                 self._after_mutation(
                     'no pooled model fits the detected GPUs — add one with m/n'

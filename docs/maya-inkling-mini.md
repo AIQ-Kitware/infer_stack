@@ -7,7 +7,7 @@ kernels rather than requiring native Blackwell FP4 hardware. infer-stack
 manages it with the existing generic custom launcher (`engine: vllm`, Compose
 only); there is no vLLM inside this image.
 
-The opt-in suggestion targets one 24 GiB sm_86 GPU (3090/A6000 class). It
+The suggestion targets one 24 GiB sm_86 GPU (3090/A6000 class). It
 reserves a whole GPU and keeps the other GPUs available. The profiles share
 one persistent model directory and use the upstream FP8 KV configuration.
 
@@ -15,7 +15,7 @@ one persistent model directory and use the upstream FP8 KV configuration.
 | --- | ---: | --- |
 | `inkling-2-mini-maya` | 196608 | on |
 | `inkling-2-mini-maya-long` | 262144 | on |
-| `inkling-2-mini-maya-huge` | 344064 | off |
+| `inkling-2-mini-maya-huge` (optional) | 344064 | off |
 
 The default leaves room for 163840 prompt tokens plus generation. The other
 windows follow the upstream [guide](https://github.com/alesha-pro/maya-inkling-mini/blob/main/docs/INKLING2-MINI.md).
@@ -27,6 +27,12 @@ speedup at 128K+ occupied context needs a real benchmark.
 
 ## Add and acquire
 
+The 192/256 Ki-token DSpark profiles appear in normal suggestions on compatible
+hardware. The huge variant is available in **Browse models** in the local TUI
+(or `catalog suggest --all`) and can be imported explicitly. **Import** only
+adds the catalog entry; **Import & acquire** starts it through the ordinary
+acquisition path.
+
 The first acquisition automatically builds the bundled Maya image if it is
 not already present. Docker and the NVIDIA container runtime must be working,
 with a CUDA 12.8-compatible host driver. No host CUDA compiler, Maya checkout,
@@ -34,8 +40,8 @@ manual Docker build, or upstream revision selection is required.
 
 ```bash
 # Use the installed infer-stack from this checkout (e.g. pip install -e .).
-infer-stack catalog suggest --include inkling-2-mini-maya --apply
-infer-stack acquire inkling-2-mini-maya
+infer-stack catalog import inkling-2-mini-maya-long
+infer-stack acquire inkling-2-mini-maya-long
 ```
 
 Image preparation occurs before infer-stack removes any departing containers.
@@ -45,7 +51,8 @@ variants. The source revision is pinned to
 in the bundled Dockerfile; the image tag identifies that revision and recipe.
 The build context ships in the Python distribution, including installed wheels.
 The default build uses CUDA 12.8 and sm_86. This is a fixed upstream revision,
-not a GPU-validated infer-stack build yet. Base image and Python dependency
+with readiness demonstrated on a 3090; the full performance/quality acceptance
+matrix is still outstanding. Base image and Python dependency
 versions are not fully digest/lockfile pinned. Future recipe changes need a new
 image tag so that a cached image cannot silently mask the change.
 
@@ -135,7 +142,9 @@ variants separately if needed. The upstream project reports roughly 128 t/s
 plain short-context decode and up to 212 t/s with DSpark on edits, not a
 guarantee of that throughput for every coding prompt or context.
 
-This integration has not yet been validated by building/running CUDA on a real
-GPU. The included regression tests cover catalog/launcher contracts without
-requiring CUDA; keep the suggestion opt-in until the host-side acceptance
-above is complete. KubeAI remains unsupported for these custom launchers.
+The 262144-token profile reached server readiness on a real 3090 after the
+GGUF compatibility fix (operator report, 2026-11-25). That verifies startup,
+not expert residency, speed, tool calls, reasoning quality, or the other
+context profiles. The included regression tests cover catalog/launcher
+contracts without requiring CUDA. KubeAI remains unsupported for these
+custom launchers.

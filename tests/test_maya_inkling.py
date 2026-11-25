@@ -31,8 +31,8 @@ def test_maya_managed_profile(variant, context, draft):
     inv = {'gpu_count': 2, 'gpus': [
         {'index': i, 'name': 'RTX 3090', 'memory_gib': 24, 'compute_cap': 8.6}
         for i in range(2)]}
-    assert name not in suggest_catalog(inv)['endpoints']
-    frag = suggest_catalog(inv, include=[base])
+    assert (name in suggest_catalog(inv)['endpoints']) == (variant != '-huge')
+    frag = suggest_catalog(inv, all_models=True)
     req = Catalog.from_dict(frag).resolve_endpoint(name).to_request()
     assert req.spec['hf_model_id'] == launcher.MODEL_REPO
     assert req.spec['placement'] == {'min_vram_gib': 23.9}

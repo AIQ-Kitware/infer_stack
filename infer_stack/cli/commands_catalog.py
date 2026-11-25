@@ -24,6 +24,7 @@ from ..leasing.catalog_edit import (
     SECTIONS,
     dump_catalog_source,
     load_catalog_source,
+    merge_catalog_fragment,
     next_indexed_name,
     slug_alias,
     write_catalog_source,
@@ -438,63 +439,75 @@ BUILTIN_CATALOGS = {
 }
 
 
-class CatalogImportCLI(_CatalogCommon):
-    """Merge a built-in catalog preset without overwriting existing entries.
+class CatalogImportCLI(_CatalogCommon, _SimulateHardwareMixin,
+                       _AllowedGpusMixin, _DisplayGpuMixin):
+    """Import one known endpoint or a built-in catalog preset.
 
-    Example: ``infer-stack catalog import qwen38-flash-next-3090``. Re-running
-    an identical import is a no-op. Differing existing entries are conflicts,
-    not invitations to silently change another operator's configuration.
+    Registry profiles are sized to the selected hardware, just like suggestions,
+    but only the named endpoint and its model are added (including optional
+    profiles). Presets retain their literal packaged configuration. Repeating
+    an identical import is a no-op; conflicting entries are never overwritten.
     """
 
     __command__ = 'import'
-    name = kw.Value(None, position=1, type=str, help='Name of bundled catalog preset.')
+    name = kw.Value(None, position=1, type=str, help='Known endpoint or bundled catalog preset.')
+    backend = kw.Value(None, type=str, help='Backend for hardware discovery (default: configured backend).')
 
     @classmethod
     def main(cls, argv=True, **kwargs):
-        from copy import deepcopy
         from importlib import resources
+        from ..leasing.discovery import (
+            discovery_catalog, endpoint_fragment, registry_endpoint_names,
+        )
+        from ..leasing.suggest import builtin_pool
 
         config = cls.cli(argv=argv, data=kwargs)
         name = str(config.name or '').strip()
-        if name not in BUILTIN_CATALOGS:
-            known = ', '.join(sorted(BUILTIN_CATALOGS))
-            raise SystemExit(f'Unknown catalog preset {name!r}; available: {known}')
-        preset = resources.files('infer_stack').joinpath(
-            'templates'
-        ).joinpath(BUILTIN_CATALOGS[name])
-        fragment = yaml.safe_load(preset.read_text(encoding='utf-8')) or {}
-        if not isinstance(fragment, dict) or any(
-            section not in SECTIONS for section in fragment
-        ):
-            raise SystemExit(f'Invalid packaged catalog preset: {name}')
-
         path = _catalog_path(config)
-        existing = load_catalog_source(path)
-        updated = deepcopy(existing)
-        added = []
-        for section in SECTIONS:
-            entries = fragment.get(section, {})
-            if not isinstance(entries, dict):
-                raise SystemExit(f'Invalid {section} in packaged catalog preset: {name}')
-            for key, value in entries.items():
-                if key in updated[section]:
-                    _exists_guard(updated, section, key, False, value)
-                else:
-                    updated[section][key] = deepcopy(value)
-                    added.append(f'{section}:{key}')
+        if name in BUILTIN_CATALOGS:
+            preset = resources.files('infer_stack').joinpath(
+                'templates', BUILTIN_CATALOGS[name])
+            fragment = yaml.safe_load(preset.read_text(encoding='utf-8')) or {}
+        else:
+            pool = builtin_pool()
+            if name not in registry_endpoint_names(pool):
+                known = ', '.join(sorted(BUILTIN_CATALOGS))
+                raise SystemExit(f'Unknown catalog preset or profile {name!r}; '
+                                 f'available: {known} (presets); '
+                                 'see catalog suggest --all for fitting profiles')
+            from ..hardware import detect_inventory
+            from ..paths import get_setting
+            from .commands_leasing import _make_backend, _resolve_skip_display
+            from .context import effective_inventory
 
-        # Canonical writer performs full catalog cross-reference validation.
-        # Validate before reporting a no-op, too, in case the current catalog
-        # has changed independently of the preset.
+            import os
+            cluster = (config.backend or os.environ.get('INFER_STACK_BACKEND')
+                       or get_setting('backend')) == 'kubeai'
+            inventory = effective_inventory(config)
+            if inventory is None:
+                if cluster:
+                    inventory, _ = _make_backend(config).suggestion_inventory()
+                else:
+                    inventory = detect_inventory()
+            try:
+                fragment = endpoint_fragment(discovery_catalog(
+                    inventory, pool=pool, kubeai=cluster,
+                    reserve_display_gpu='auto' if not cluster and _resolve_skip_display(config) else False,
+                ), name)
+            except ValueError as ex:
+                raise SystemExit(f'catalog import: {ex}') from ex
+
+        try:
+            updated, added = merge_catalog_fragment(load_catalog_source(path), fragment)
+        except ValueError as ex:
+            raise SystemExit(f'catalog import: {ex}') from ex
         if config.dry_run:
             _save_catalog(path, updated, dry_run=True)
         elif added:
             _save_catalog(path, updated)
             print(f'imported {name} into {path}: {", ".join(added)}')
         else:
-            from ..leasing.catalog_edit import validate_catalog_source
-            validate_catalog_source(updated)
-            print(f'catalog preset {name} already present (unchanged)')
+            print(f'catalog profile {name} already present (unchanged)')
         return 0
 
 

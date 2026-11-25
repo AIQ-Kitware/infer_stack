@@ -2407,3 +2407,52 @@ def test_tui_log_pane_grows_when_the_terminal_does():
             assert app.query_one('#docker-tabs').styles.height.value == app._log_height(50)
 
     _run(scenario)
+
+
+@pytest.mark.parametrize('acquire', [False, True])
+def test_tui_browse_import_exact_optional_profile(tmp_path, monkeypatch, acquire):
+    from textual.widgets import Button, DataTable, Input, Static
+
+    from infer_stack.hardware import simulate_inventory
+    from infer_stack.leasing import Catalog
+    from infer_stack.tui import InferStackTUI, _ProfileBrowser
+
+    controller, catalog = _ctx()
+    catalog_path = tmp_path / 'catalog.yaml'
+    import yaml
+    catalog_path.write_text(yaml.safe_dump(CATALOG))
+    inv = simulate_inventory('2x24@8.6')
+    monkeypatch.setattr(InferStackTUI, '_discovery_inventory',
+                        lambda self: (inv, False))
+    name = 'inkling-2-mini-maya-huge'
+
+    async def scenario():
+        app = InferStackTUI(controller, catalog, catalog_path=catalog_path,
+                            interval=999, proc_factory=lambda svc: None)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_browse_profiles()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, _ProfileBrowser)
+            screen.query_one('#profile-search', Input).value = name
+            await pilot.pause()
+            assert screen.query_one('#profile-table', DataTable).row_count == 1
+            assert 'optional' in screen.query_one('#profile-table', DataTable).get_row_at(0)
+            assert 'builds the pinned Docker image' in str(screen.query_one('#profile-detail', Static).render())
+            assert not screen.query_one('#profile-import', Button).disabled
+            button = '#profile-acquire' if acquire else '#profile-import'
+            await pilot.click(button)
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert name in app._endpoint_names
+
+    _run(scenario)
+    updated = Catalog.load(catalog_path)
+    assert set(updated.endpoints) == set(CATALOG['endpoints']) | {name}
+    leases, _ = controller.ledger.status()
+    assert len(leases) == int(acquire)
+    if acquire:
+        assert name in leases[0].endpoints
