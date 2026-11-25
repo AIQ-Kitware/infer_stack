@@ -158,7 +158,12 @@ Watch it come up from another shell:
 infer-stack leases          # leases + deployments: state (desired) vs running, and GPUs
 infer-stack stack ps        # vllm-… + litellm + open-webui  (alias: infer-stack ps)
 infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stack logs -f)
+infer-stack logs --engine -f  # only engine logs, including engines acquired later
 ```
+
+`--engine` uses the same deployment-based filter as the TUI's engines
+view, excluding LiteLLM, Open WebUI and other front-door services. It also
+works with `--tail` for recent history, or with specific engine targets.
 
 `leases` now shows the **deployments** table with both what the ledger *wants*
 (`state`) and what's *actually up* (`running`), plus the GPUs each model is on

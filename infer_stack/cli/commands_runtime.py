@@ -647,9 +647,17 @@ class LogsCLI(_InstancesBase):
     ``infer-stack logs qwen -f`` follows whatever serves the ``qwen``
     endpoint, container or pod; with no names, every instance. Following
     picks up instances that start later and follows a restarted one again.
+    Use ``infer-stack logs --engine -f`` for only model-serving instances
+    (like the TUI's engines view), excluding the gateway and UI.
     """
 
     __command__ = 'logs'
+
+    engine = kw.Value(
+        False, isflag=True,
+        help='Only model-serving instances (exclude LiteLLM, Open WebUI, '
+        'and other front-door services). Also restricts named targets.',
+    )
 
     follow = kw.Value(
         False, isflag=True, short_alias=['f'],
@@ -686,6 +694,11 @@ class LogsCLI(_InstancesBase):
         names = list(config.services or [])
 
         def pick(instances):
+            # Same deployment-based classification as the TUI's engines view.
+            # Apply it on every poll, not just to the initial snapshot: an
+            # unqualified follow must see newly acquired model instances.
+            if config.engine:
+                instances = [i for i in instances if i.is_engine]
             return resolve(instances, names, served) if names else instances
 
         try:
@@ -694,6 +707,10 @@ class LogsCLI(_InstancesBase):
             raise SystemExit(str(ex))
         color = sys.stdout.isatty() and bool(config.color)
         if config.follow:
+            if config.engine and not chosen:
+                print('No engine instances running; waiting for an engine to start.',
+                      file=sys.stderr)
+
             def listing():
                 try:
                     return pick(backend.instances())
@@ -714,7 +731,8 @@ class LogsCLI(_InstancesBase):
                 follower.terminate()
             return 0
         if not chosen:
-            print(f'nothing running ({_backend_name(backend)} backend)')
+            what = 'no engine instances running' if config.engine else 'nothing running'
+            print(f'{what} ({_backend_name(backend)} backend)')
             return 0
         prefix = len(chosen) > 1
         status = 0

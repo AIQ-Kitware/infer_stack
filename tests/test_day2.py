@@ -139,6 +139,88 @@ def test_logs_reads_the_named_endpoint_through_its_runtime(monkeypatch, capsys):
         rt.LogsCLI.main(argv=['nope'])
 
 
+@pytest.mark.parametrize('argv', [
+    ['--engine'], ['--engine', 'qwen'], ['qwen', '--engine'],
+])
+def test_logs_engine_history_excludes_front_door(monkeypatch, capsys, argv):
+    import subprocess
+
+    # A gateway with an engine-looking name is still not a deployment.
+    # An engine with a custom service name need not begin with "vllm-".
+    ui = Instance('open-webui', 'ui', '', 'running')
+    custom = Instance('custom-maya', 'maya-id', 'grp-1', 'restarting')
+    proxy = Instance('vllm-proxy', 'proxy', '', 'running')
+    rt = _cli(monkeypatch, _Backend([GATEWAY, POD, ui, custom, proxy]),
+              {'grp-1': ['qwen']})
+    ran = []
+
+    def fake_run(argv, **kw):
+        ran.append(argv)
+        return SimpleNamespace(stdout=b'engine output\n', returncode=0)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    assert rt.LogsCLI.main(argv=[*argv, '--tail', '5']) == 0
+    assert ran == [
+        ['kubectl', '-n', 'kubeai', 'logs', '--tail', '5', POD.id],
+        ['docker', 'logs', '--tail', '5', custom.id],
+    ]
+    out = capsys.readouterr().out
+    assert POD.name in out and custom.name in out
+    assert all(i.name not in out for i in (GATEWAY, ui, proxy))
+
+
+def test_logs_engine_empty_and_explicit_gateway(monkeypatch, capsys):
+    import subprocess
+
+    rt = _cli(monkeypatch, _Backend([GATEWAY]))
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail('must not read gateway logs in engines-only mode')
+
+    monkeypatch.setattr(subprocess, 'run', unexpected_run)
+    assert rt.LogsCLI.main(argv=['--engine']) == 0
+    assert 'no engine instances running' in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="no instance matches 'litellm'"):
+        rt.LogsCLI.main(argv=['--engine', 'litellm'])
+
+
+def test_logs_engine_follow_picks_up_new_deployments(monkeypatch, capsys):
+    from infer_stack.leasing import instances as instances_mod
+
+    backend = _Backend([GATEWAY])
+    rt = _cli(monkeypatch, backend)
+    later = Instance('maya', 'later-id', 'grp-2', 'running')
+    stopped = []
+
+    class Follower:
+        def __init__(self, listing, **kw):
+            assert listing() == []
+            backend._instances = [GATEWAY, POD]
+            assert listing() == [POD]
+            backend._instances = [GATEWAY, later]
+            assert listing() == [later]
+            self.stdout = iter(['maya  | ready\n'])
+
+        def terminate(self):
+            stopped.append(True)
+
+    monkeypatch.setattr(instances_mod, 'LogFollower', Follower)
+    assert rt.LogsCLI.main(argv=['--engine', '-f']) == 0
+    assert stopped == [True]
+    captured = capsys.readouterr()
+    assert captured.out == 'maya  | ready\n'
+    assert 'waiting for an engine' in captured.err
+
+
+def test_logs_engine_defaults_off_and_does_not_swallow_target():
+    from infer_stack.cli.commands_runtime import LogsCLI
+
+    assert LogsCLI.cli(argv=[]).engine is False
+    config = LogsCLI.cli(argv=['-f', '--engine', 'qwen'])
+    assert config.engine is True and config.follow is True
+    assert list(config.services or []) == ['qwen']
+
+
 def test_status_health_comes_from_residency(monkeypatch):
     from infer_stack.cli.commands_runtime import _served_models
     from infer_stack.leasing import DeploymentState
