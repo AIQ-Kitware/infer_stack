@@ -2,11 +2,20 @@
   "name": "infer-stack-technical-overview",
   "version": "1.0.0",
   "private": true,
-  "description": "Source-only build for the infer-stack technical overview",
+  "description": "Source-only build for the infer-stack presentation suite",
   "scripts": {
-    "build": "node build.cjs",
-    "pdf": "npm run build && libreoffice --headless --convert-to pdf --outdir build build/infer-stack-technical-overview.pptx"
+    "build": "node build.cjs && node build-suite.cjs",
+    "build:technical": "node build.cjs",
+    "build:why": "node build-suite.cjs why",
+    "build:how": "node build-suite.cjs how",
+    "build:evidence": "node build-suite.cjs evidence",
+    "build:demo": "node build-suite.cjs demo",
+    "pdf": "npm run build && libreoffice --headless --convert-to pdf --outdir build build/infer-stack-*.pptx"
   },
-  "engines": { "node": ">=20" },
-  "devDependencies": { "pptxgenjs": "4.0.0" }
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "pptxgenjs": "4.0.0"
+  }
 }

@@ -5,3 +5,6 @@ build/
 *.ppt
 *.pdf
 *.odp
+# Private demo connection files (prefer a temporary directory outside the repo).
+*.env
+__pycache__/
