@@ -10,7 +10,8 @@
     "build:how": "node build-suite.cjs how",
     "build:evidence": "node build-suite.cjs evidence",
     "build:demo": "node build-suite.cjs demo",
-    "pdf": "npm run build && libreoffice --headless --convert-to pdf --outdir build build/infer-stack-*.pptx"
+    "pdf": "npm run build && libreoffice --headless --convert-to pdf --outdir build build/infer-stack-*.pptx",
+    "build:what": "node build-suite.cjs what"
   },
   "engines": {
     "node": ">=20"

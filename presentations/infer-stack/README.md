@@ -1,12 +1,13 @@
 # Infer-stack presentation suite
 
-Five independent decks for different audiences, sharing a pinned PptxGenJS
+Six independent decks for different audiences, sharing a pinned PptxGenJS
 build and the anonymized historical benchmark snapshot. The audience decks
 are deliberately short and tell different stories; use the technical overview
 when a deeper architecture explanation is needed.
 
 | Deck | Audience | Slides | Suggested delivery | Build |
 |---|---|---:|---|---|
+| What is infer-stack? | Newcomers, mixed technical audiences | 8 | 8–10 min | `npm run build:what` |
 | Why infer-stack? | Prospective adopters, research leads | 7 | 5–8 min | `npm run build:why` |
 | Using infer-stack | Developers and researchers | 9 | 15–20 min | `npm run build:how` |
 | Measuring inference | ML engineers, evaluation researchers | 8 | 10–15 min | `npm run build:evidence` |
@@ -29,9 +30,9 @@ npm ci
 npm run build
 ```
 
-`npm run build` now generates all five PowerPoints in `build/`. To generate
-only the four new audience decks, run `node build-suite.cjs`; to generate one
-or several, pass the corresponding names (`why`, `how`, `evidence`, `demo`).
+`npm run build` now generates all six PowerPoints in `build/`. To generate
+only the five audience decks, run `node build-suite.cjs`; to generate one
+or several, pass the corresponding names (`what`, `why`, `how`, `evidence`, `demo`).
 The original `node build.cjs` still builds the technical overview.
 
 ```sh
@@ -42,6 +43,7 @@ libreoffice --headless --convert-to pdf --outdir build build/infer-stack-why.ppt
 
 | Output stem under `build/` | Contents |
 |---|---|
+| `infer-stack-what` | Conceptual introduction |
 | `infer-stack-why` | Adoption brief |
 | `infer-stack-how` | Hands-on tutorial |
 | `infer-stack-evidence` | Performance case study |
@@ -65,6 +67,8 @@ It does not print the API key. Run it from this folder, or use its full path.
 The build and demo execution are separate: never start GPU work merely to
 regenerate slides.
 
+- First introduction: use the what deck to explain the product, its abstractions,
+  and its boundaries without a tutorial or adoption argument.
 - Adoption talk: explain the problem and the lease contract, then show the
   measured tradeoff and invite the audience to try the simulator.
 - Workshop: walk through the how deck, then select one or two demo modules.
@@ -77,7 +81,7 @@ regenerate slides.
 
 - `build.cjs`: original 18-slide technical overview.
 - `build-suite.cjs`: sequential audience-deck builder.
-- `decks/{why,how,evidence,demo}.cjs`: slide content and notes, one block per slide.
+- `decks/{what,why,how,evidence,demo}.cjs`: slide content and notes, one block per slide.
 - `layout.cjs`: common design and native drawing helpers.
 - `metrics.cjs`: shared lookup into the dated numerical snapshot; the chart
   values and selected numerical headlines in audience decks come from it.

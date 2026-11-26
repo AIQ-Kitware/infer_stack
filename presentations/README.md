@@ -8,13 +8,14 @@ the audience:
 
 | Talk | Goal |
 |---|---|
+| What is infer-stack? | Product definition, conceptual model, and scope |
 | Why infer-stack? | Adoption, use cases, value proposition |
 | Using infer-stack | Practical quickstart and client integration |
 | Measuring inference | Benchmark method, evidence and tradeoffs |
 | Infer-stack live | Demonstrate interactive discovery, shared leases, scoped jobs, GPU placement, simulators, live reports |
 | Technical overview | Detailed architecture, catalog, backends and original case study |
 
-The five decks share one local Node project and the dated benchmark dataset.
+The six decks share one local Node project and the dated benchmark dataset.
 See the [build instructions](infer-stack/README.md#build) and
 [presenter runbook](infer-stack/DEMO.md). For another presentation series, use a
 separate subdirectory when it has its own build needs. Keep sources and

@@ -1,5 +1,5 @@
-// Build one audience deck or all four; keep the original technical deck intact.
-const names=['why','how','evidence','demo'];
+// Build one audience deck or all audience decks; keep the original technical deck intact.
+const names=['what','why','how','evidence','demo'];
 async function main(){
     const args=process.argv.slice(2);
     const requested=args.length?args:names;
