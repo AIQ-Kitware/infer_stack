@@ -4,8 +4,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/infer-stack.svg)](https://pypi.org/project/infer-stack/)
 [![License](https://img.shields.io/pypi/l/infer-stack.svg)](https://github.com/AIQ-Kitware/infer_stack/blob/main/LICENSE)
 
-**Run local language models on demand, without managing a separate Docker
-stack for each model.**
+**Run local language models on demand, using Docker, but with simple wrappers.**
 
 Infer-stack manages model configurations, GPU placement, and the lifetime of
 inference servers. Acquire a model when you need it, use a consistent API URL,
