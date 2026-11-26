@@ -259,14 +259,14 @@ routes only: dynamic routing and Open WebUI need the host placement.
 On the server node, copy the K3s token into a protected file on the new host
 through whatever secure channel you normally use, and record the server's K3s
 version. Then on the new workstation (after NVIDIA driver/container-runtime
-setup when it is a GPU node):
+setup when it is a GPU node; replace the uppercase placeholders below):
 
 ```bash
 infer-stack kube k3s join \
-  --server=https://<first-node-ip>:6443 \
+  --server="https://FIRST_NODE_IP:6443" \
   --token-file=~/.private/k3s-token \
-  --node-name=<name> \
-  --version=<same-k3s-version>
+  --node-name=WORKER_NAME \
+  --version=SERVER_K3S_VERSION
 ```
 
 After join, use `infer-stack kube k3s status` on the worker for local membership.
@@ -354,6 +354,16 @@ Acquire/wait logs changed readiness states once: pending/scheduler reasons,
 scheduled node and image, container startup/model loading, replica readiness,
 and finally generation verification. It does not log every unchanged poll.
 
+## Diagnosing serving failures
+
+`infer-stack kube status` summarizes live Kubernetes state. `infer-stack acquire`
+reports pod failures such as `ImagePullBackOff`, `Unschedulable`, and engine
+crashes. Use `infer-stack ps`, `infer-stack logs -f NAME`, or
+`infer-stack logs --engine -f` to inspect model serving. If `/models` works
+but completions return 404, check that clients use the gateway alias; direct KubeAI requests use the Model name from the env
+file (`INFER_STACK_ENDPOINT_*`). Missing `libcuda.so.1` usually indicates that
+the model profile did not request GPUs or select the correct runtime.
+
 ## TUI cluster monitoring and control
 
 Open `infer-stack tui`, expand runtime (`c`), and select **Cluster**. The cached
@@ -410,15 +420,16 @@ it does not create independent Kubernetes replicas. KubeAI pod replication uses
 ## Placement and replica policy
 
 Administrators classify canonical Kubernetes node names and install selector
-profiles using the existing Helm release:
+profiles using the existing Helm release. Substitute your actual node name
+for the illustrative `gpu-worker-1.example.org`:
 
 ```bash
-infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090
-infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090 --apply
+infer-stack kube node classify gpu-worker-1.example.org --pool interactive --class rtx3090
+infer-stack kube node classify gpu-worker-1.example.org --pool interactive --class rtx3090 --apply
 ```
 
 Users can narrow an approved endpoint with `acquire`, `access`, or `run`
-`--node namek.kitware.com` or `--pool interactive`. Node and pool constraints
+`--node gpu-worker-1.example.org` or `--pool interactive`. Node and pool constraints
 intersect the catalog's node/pool constraints; they cannot broaden permission.
 Kubernetes still assigns physical GPUs. Constraint equality is required for
 sharing, and simultaneously live deployments with the same public alias but

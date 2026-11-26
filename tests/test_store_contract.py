@@ -63,10 +63,14 @@ def test_concurrent_coalescing_and_distinct_leases(stores):
     assert len({a.lease.id for a in acquired}) == 8
     assert len({a.deployments[0].id for a in acquired}) == 1
     ledger = authorities[0]
-    assert ledger.get_deployment(acquired[0].deployments[0].id).demand == 8
+    deployment = ledger.get_deployment(acquired[0].deployments[0].id)
+    assert deployment is not None
+    assert deployment.demand == 8
     for outcome in acquired:
         ledger.release(outcome.lease.id)
-    assert ledger.get_deployment(acquired[0].deployments[0].id).state == 'idle'
+    deployment = ledger.get_deployment(acquired[0].deployments[0].id)
+    assert deployment is not None
+    assert deployment.state == 'idle'
 
 
 def test_rollback_on_interrupt_and_durable_publication_marker(stores):
@@ -115,7 +119,9 @@ def test_fractional_ttl_and_generations(stores):
     store = stores()
     ledger = Ledger(store, clock=lambda: now[0])
     lease = ledger.acquire('alice', requests(), ttl_seconds=.5).lease
-    assert ledger.get_lease(lease.id).expires_at == now[0] + .5
+    stored_lease = ledger.get_lease(lease.id)
+    assert stored_lease is not None
+    assert stored_lease.expires_at == now[0] + .5
     generation = store.desired_generation()
     store.set_applied_generation(generation)
     store.set_applied_generation(generation - 1)

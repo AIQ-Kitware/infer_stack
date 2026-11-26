@@ -39,12 +39,12 @@ def test_aiq_optional_mps_zero_zero_is_not_failure(monkeypatch, capsys):
 
 
 def test_runtime_class_is_not_a_node_handler():
-    cluster = Cluster(nodes=[node('aiq-gpu'), node('namek')])
+    cluster = Cluster(nodes=[node('gpu-control'), node('gpu-worker-1')])
     m = manager(cluster)
     def run(args, **kw):
         if args[:3] == ['kubectl', 'get', 'pods']:
             return json.dumps({'items': [{'metadata': {'name': 'plugin'},
-                'spec': {'nodeName': 'aiq-gpu', 'runtimeClassName': 'nvidia'},
+                'spec': {'nodeName': 'gpu-control', 'runtimeClassName': 'nvidia'},
                 'status': {'containerStatuses': [{'state': {'running': { 'startedAt': 'now'}}}]}}]})
         return cluster(args, **kw)
     m.run = run
@@ -93,7 +93,7 @@ def test_bootstrap_enforces_root_0600_without_restart(monkeypatch):
     assert not any('restart' in c or ('chmod' in c and '0644' in c) for c in calls)
 
 
-def agent_runner(server='https://old:6443', name='namek', config=None):
+def agent_runner(server='https://old:6443', name='gpu-worker-1', config=None):
     calls = []
     def run(args, **kw):
         calls.append(args)
@@ -116,9 +116,9 @@ def agent_runner(server='https://old:6443', name='namek', config=None):
 
 
 @pytest.mark.parametrize('server,name,version,match', [
-    ('https://new:6443', 'namek', None, 'differs from requested'),
+    ('https://new:6443', 'gpu-worker-1', None, 'differs from requested'),
     ('https://old:6443', 'new-name', None, 'node name'),
-    ('https://old:6443', 'namek', 'v1.34.3+k3s10', 'implicit agent upgrade'),
+    ('https://old:6443', 'gpu-worker-1', 'v1.34.3+k3s10', 'implicit agent upgrade'),
 ])
 def test_active_agent_join_refuses_incompatible_state(monkeypatch, server, name, version, match):
     run, calls = agent_runner()
@@ -131,20 +131,20 @@ def test_active_agent_join_refuses_incompatible_state(monkeypatch, server, name,
 def test_active_agent_correct_state_is_idempotent_and_secrets_hidden(monkeypatch):
     run, calls = agent_runner()
     monkeypatch.setattr(k3s, '_require_local_tool', lambda name: None)
-    k3s.join(server='https://old:6443/', node_name='namek', token_file='unused', version='v1.34.3+k3s1', run=run)
+    k3s.join(server='https://old:6443/', node_name='gpu-worker-1', token_file='unused', version='v1.34.3+k3s1', run=run)
     report = k3s.local_status(run=run)
     assert report['server'] == 'https://old:6443'
-    assert report['node_name'] == 'namek'
+    assert report['node_name'] == 'gpu-worker-1'
     assert 'NEVER-PRINT-ME' not in json.dumps(report)
     assert not report['errors']
 
 
 def test_agent_config_dropins_inspected():
     run, _ = agent_runner(config=['server: https://first:6443\nnode-name: a',
-                                 'server: https://second:6443\nnode-name: namek'])
+                                 'server: https://second:6443\nnode-name: gpu-worker-1'])
     report = k3s.local_status(run=run)
     assert report['server'] == 'https://second:6443'
-    assert report['node_name'] == 'namek'
+    assert report['node_name'] == 'gpu-worker-1'
 
 
 def test_explicit_provider_scopes_every_cluster_mutation_to_local_copy(tmp_path, monkeypatch):
@@ -167,9 +167,9 @@ def test_canary_is_node_scoped_and_does_not_reserve_gpu():
         if 'apply' in args:
             documents.append(json.loads(kw['input_text']))
         return ''
-    report = {'nodes': [{'name': 'namek', 'gpu_count': 1, 'nvidia_runtime_verified': None}]}
+    report = {'nodes': [{'name': 'gpu-worker-1', 'gpu_count': 1, 'nvidia_runtime_verified': None}]}
     verify_node_runtimes(KubeManager(run=run), report)
-    assert documents[0]['spec']['nodeName'] == 'namek'
+    assert documents[0]['spec']['nodeName'] == 'gpu-worker-1'
     assert documents[0]['spec']['runtimeClassName'] == 'nvidia'
     assert 'resources' not in documents[0]['spec']['containers'][0]
     assert documents[0]['spec']['automountServiceAccountToken'] is False
@@ -189,7 +189,7 @@ def test_setup_cli_is_deprecated_alias_of_install(monkeypatch):
     assert calls == [dict(argv=False, apply=True, namespace='default', release='kubeai', gpu='none', values=None, version=None)]
 
 
-def test_controller_reports_only_readiness_transitions():
+def test_controller_reports_only_readiness_transitions(monkeypatch):
     from infer_stack.leasing import (
         Catalog,
         Controller,
@@ -200,14 +200,15 @@ def test_controller_reports_only_readiness_transitions():
     from infer_stack.leasing.backend import Readiness
     catalog = Catalog.from_dict({'models': {'q': {'source': 'hf://org/model'}},
                                  'endpoints': {'qwen-coder': {'engine': 'vllm', 'model': 'q'}}})
-    controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
+    backend = NullBackend()
+    controller = Controller(Ledger(SqliteStore(':memory:')), backend)
     deployment = controller.acquire('test', catalog.resolve_names(['qwen-coder'])).deployments[0]
     transitions = iter([Readiness(False, 'pending'), Readiness(False, 'pending'),
-                        Readiness(False, 'scheduled on namek; pulling image'),
-                        Readiness(False, 'scheduled on namek; pulling image'), Readiness(True, 'ok')])
-    controller.backend.probe_ready = lambda *a: next(transitions)
+                        Readiness(False, 'scheduled on gpu-worker-1; pulling image'),
+                        Readiness(False, 'scheduled on gpu-worker-1; pulling image'), Readiness(True, 'ok')])
+    monkeypatch.setattr(backend, 'probe_ready', lambda *a: next(transitions))
     messages = []
-    controller.backend.progress = messages.append
+    monkeypatch.setattr(backend, 'progress', messages.append, raising=False)
     controller.sleep = lambda seconds: None
     assert controller.wait_ready([deployment], timeout=10).ready
     assert len(messages) == 3
@@ -216,17 +217,20 @@ def test_controller_reports_only_readiness_transitions():
 
 def test_startup_details_expose_node_image_and_replica_state():
     from infer_stack.backends.kubeai import model_startup_progress
-    pod = {'spec': {'containers': [{'image': 'vllm/vllm-openai:v0.11.2'}]}, 'status': {}}
+    spec: dict[str, object] = {'containers': [{'image': 'vllm/vllm-openai:v0.11.2'}]}
+    status: dict[str, object] = {}
+    pod = {'spec': spec, 'status': status}
     assert 'waiting for scheduler' in model_startup_progress([pod])
-    pod['spec']['nodeName'] = 'namek'
-    assert 'scheduled on namek' in model_startup_progress([pod])
+    spec['nodeName'] = 'gpu-worker-1'
+    assert 'scheduled on gpu-worker-1' in model_startup_progress([pod])
     assert 'vllm/vllm-openai:v0.11.2' in model_startup_progress([pod])
-    pod['status']['containerStatuses'] = [{'ready': False, 'state': {'waiting': {'reason': 'ImagePullBackOff'}}}]
+    status['containerStatuses'] = [{'ready': False, 'state': {'waiting': {'reason': 'ImagePullBackOff'}}}]
     assert 'ImagePullBackOff' in model_startup_progress([pod])
-    pod['status']['containerStatuses'] = [{'ready': False, 'state': {'running': {'startedAt': 'now'}}}]
+    container_status: dict[str, object] = {'ready': False, 'state': {'running': {'startedAt': 'now'}}}
+    status['containerStatuses'] = [container_status]
     assert 'container started; model loading' in model_startup_progress([pod])
-    pod['status']['containerStatuses'][0]['ready'] = True
-    pod['status']['conditions'] = [{'type': 'Ready', 'status': 'True'}]
+    container_status['ready'] = True
+    status['conditions'] = [{'type': 'Ready', 'status': 'True'}]
     assert '1/1 replicas ready' in model_startup_progress([pod])
     assert 'verifying generation' in model_startup_progress([pod])
 
@@ -265,10 +269,10 @@ def test_runtime_canary_refreshes_all_gpu_nodes_and_detects_new_failure():
         return ''
     report = {'nodes': [
         {'name': name, 'gpu_count': count, 'nvidia_runtime_verified': True}
-        for name, count in [('aiq-gpu', 4), ('namek', 1), ('cpu-node', 0)]]}
+        for name, count in [('gpu-control', 4), ('gpu-worker-1', 1), ('cpu-node', 0)]]}
     m = KubeManager(run=run)
     verify_node_runtimes(m, report)
-    assert [d['spec']['nodeName'] for d in documents] == ['aiq-gpu', 'namek']
+    assert [d['spec']['nodeName'] for d in documents] == ['gpu-control', 'gpu-worker-1']
     with pytest.raises(RuntimeError, match='no longer configured'):
         verify_node_runtimes(m, report)
     assert len(documents) == 3
@@ -280,7 +284,7 @@ def test_runtime_canary_never_replaces_unrelated_pod():
     def run(args, **kw):
         calls.append(args)
         return json.dumps({'metadata': {'labels': {}}})
-    report = {'nodes': [{'name': 'namek', 'gpu_count': 1, 'nvidia_runtime_verified': True}]}
+    report = {'nodes': [{'name': 'gpu-worker-1', 'gpu_count': 1, 'nvidia_runtime_verified': True}]}
     with pytest.raises(RuntimeError, match='unrelated pod'):
         verify_node_runtimes(KubeManager(run=run), report)
     assert len(calls) == 1 and 'get' in calls[0]
@@ -294,9 +298,9 @@ def test_join_reports_local_gpu_separately_from_cluster_availability(monkeypatch
     m = KubeManager(run=lambda args: products)
     m.command_exists = lambda name: name == 'nvidia-smi'
     monkeypatch.setattr('infer_stack.cli.commands_kube.KubeManager', lambda: m)
-    assert K3sJoinCLI.main(argv=False, server='https://server:6443', token_file='unused', node_name='namek') == 0
+    assert K3sJoinCLI.main(argv=False, server='https://server:6443', token_file='unused', node_name='gpu-worker-1') == 0
     text = capsys.readouterr().out
-    assert 'infer-stack kube node status namek' in text
+    assert 'infer-stack kube node status gpu-worker-1' in text
     assert ('Local GPU detected' in text) == bool(products)
     if products:
         assert 'RTX 3090' in text

@@ -55,7 +55,12 @@ def private_text(path: str | Path) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server: ControlHTTPServer
+    @property
+    def control_server(self) -> ControlHTTPServer:
+        server = self.server
+        assert isinstance(server, ControlHTTPServer)
+        return server
+
     server_version = 'infer-stack-control/1'
 
     def setup(self):
@@ -73,31 +78,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         if status == 429:
             import math
-            self.send_header('Retry-After', str(max(1, math.ceil(60 / self.server.rate_limit.rate))))
+            self.send_header('Retry-After', str(max(1, math.ceil(60 / self.control_server.rate_limit.rate))))
         self.end_headers()
         self.wfile.write(data)
 
     def _authenticate(self) -> Identity | None:
-        if not self.server.rate_limit.allow('peer:' + self.client_address[0]):
+        server = self.control_server
+        if not server.rate_limit.allow('peer:' + self.client_address[0]):
             self._send(429, {'error': 'Control request rate limit exceeded; retry later'})
             return None
         try:
-            if self.server.identity_file is not None:
-                registry = identities(private_text(self.server.identity_file))
+            if server.identity_file is not None:
+                registry = identities(private_text(server.identity_file))
                 bearer = self.headers.get('Authorization', '')
                 identity = authenticate(bearer.removeprefix('Bearer '), registry) if bearer.startswith('Bearer ') else None
             else:
-                assert self.server.token_file is not None
-                expected = 'Bearer ' + private_text(self.server.token_file)
+                assert server.token_file is not None
+                expected = 'Bearer ' + private_text(server.token_file)
                 valid = hmac.compare_digest(self.headers.get('Authorization', '').encode(), expected.encode())
-                identity = Identity(self.server.principal) if valid else None
+                identity = Identity(server.principal) if valid else None
         except (OSError, ValueError):
             self._send(503, {'error': 'Control credentials are unavailable'})
             return None
         if identity is None:
             self._send(401, {'error': 'Authentication required'})
             return None
-        if not self.server.rate_limit.allow('principal:' + identity.principal):
+        if not server.rate_limit.allow('principal:' + identity.principal):
             self._send(429, {'error': 'Control request rate limit exceeded; retry later'})
             return None
         return identity
@@ -120,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
         identity = self._authenticate()
         if identity is None:
             return
-        service, principal = self.server.service, identity.principal
+        service, principal = self.control_server.service, identity.principal
         path = urlsplit(self.path).path
         key = self.headers.get('Idempotency-Key', '')
         if self.command != 'GET' and not identity.can_lease:
@@ -207,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {'error': 'Unknown control resource'})
 
     def _status(self, identity):
-        status = self.server.service.status()
+        status = self.control_server.service.status()
         status['identity'] = {'principal': identity.principal, 'role': identity.role,
                               'max_ttl_seconds': identity.max_ttl_seconds,
                               'max_active_leases': identity.max_active_leases}

@@ -8,6 +8,7 @@ or model entry, and it is reached through the front door like any other.
 from __future__ import annotations
 
 import json
+from typing import TypedDict
 
 import pytest
 import yaml
@@ -17,8 +18,20 @@ from infer_stack.leasing import Catalog
 from infer_stack.leasing.catalog import CatalogError
 from infer_stack.leasing.endpoints import ExternalTarget
 
-REMOTE = {'external': {'api_base': 'http://box:8000/v1', 'model': 'Qwen/Qwen3-32B',
-                       'api_key_env': 'REMOTE_QWEN_KEY'}, 'protocol': 'chat'}
+
+class _RemoteFixture(TypedDict):
+    external: dict[str, str]
+    protocol: str
+
+
+REMOTE: _RemoteFixture = {
+    'external': {
+        'api_base': 'http://box:8000/v1',
+        'model': 'Qwen/Qwen3-32B',
+        'api_key_env': 'REMOTE_QWEN_KEY',
+    },
+    'protocol': 'chat',
+}
 
 
 def catalog(**endpoints):

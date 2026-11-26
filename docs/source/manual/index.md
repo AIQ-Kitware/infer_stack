@@ -2,6 +2,12 @@
 
 Task-oriented guides for running `infer-stack`'s leasing/controller stack.
 
+For installation and the first endpoint, start with the
+[project quickstart](https://github.com/AIQ-Kitware/infer_stack/blob/main/README.md#quickstart).
+The [repository documentation index](https://github.com/AIQ-Kitware/infer_stack/blob/main/docs/index.md)
+links to the current model registry, catalog, operations, benchmarks and backend
+guides. The worked tutorials below are also included in this built manual.
+
 ```{toctree}
 :maxdepth: 1
 

@@ -390,13 +390,10 @@ def test_generic_launch_mapping_order_is_canonical_across_ledger_roundtrip():
             '/app/models': 'hyperqwen/qwen3.8-27b/models',
         },
     })
-    kwargs = {
-        'images': IMAGES,
-        'ports': PORTS,
-        'state': {**STATE, 'runtime': '/cache/runtime'},
-    }
+    state = {**STATE, 'runtime': '/cache/runtime'}
     before = yaml.safe_dump(
-        render_compose([deployment], {'grp-order': [0]}, **kwargs).compose,
+        render_compose([deployment], {'grp-order': [0]},
+                       images=IMAGES, ports=PORTS, state=state).compose,
         sort_keys=False,
     )
 
@@ -406,7 +403,8 @@ def test_generic_launch_mapping_order_is_canonical_across_ledger_roundtrip():
     reloaded.spec = json.loads(json.dumps(deployment.spec, sort_keys=True))
     reloaded.served = json.loads(json.dumps(deployment.served, sort_keys=True))
     after = yaml.safe_dump(
-        render_compose([reloaded], {'grp-order': [0]}, **kwargs).compose,
+        render_compose([reloaded], {'grp-order': [0]},
+                       images=IMAGES, ports=PORTS, state=state).compose,
         sort_keys=False,
     )
 
@@ -646,6 +644,7 @@ def test_render_reverse_proxy(tmp_path):
     assert svc['depends_on'] == ['litellm', 'open-webui']
     # generated conf path-routes /v1 -> gateway, / -> UI
     conf = rc.nginx_config
+    assert conf is not None
     assert 'location /v1/' in conf and 'litellm:4000' in conf
     assert 'location /' in conf and 'open-webui:8080' in conf
     assert 'connection_upgrade' in conf            # websockets for the UI
@@ -701,10 +700,10 @@ def test_observe_tolerates_unreadable_compose_file(tmp_path):
     # A stale/invalid file makes `docker compose ps` raise; observe must not
     # propagate it (else acquire bricks before converge can overwrite the file).
     class RaisingPs(FakeDocker):
-        def __call__(self, args):
+        def __call__(self, args, **kwargs):
             if args[:2] == ['docker', 'compose'] and 'ps' in args:
                 raise RuntimeError('compose schema error on a stale file')
-            return super().__call__(args)
+            return super().__call__(args, **kwargs)
 
     be = ComposeBackend(
         state_dir=tmp_path, inventory=simulate_inventory('4x80'),
@@ -778,6 +777,7 @@ def test_controller_compose_end_to_end(tmp_path):
     ctl = Controller(ledger, backend)
 
     out = ctl.acquire('alice', catalog.resolve_names(['qwen-coder', 'reranker']))
+    assert out.wait is not None
     assert out.wait.ready is True
     assert set(backend.observe()) == set(g.id for g in out.deployments)
     # two vLLM services + the LiteLLM front door
@@ -1170,9 +1170,9 @@ def test_acquire_rolls_back_lease_on_decline(tmp_path):
     from infer_stack.leasing import EndpointRequest, LeaseState, vllm_structural
     from infer_stack.leasing.backend import ConvergeAborted
 
-    from infer_stack.leasing.backend import SimpleAdmission
+    from infer_stack.leasing.backend import NullBackend
 
-    class DeclineBackend(SimpleAdmission):
+    class DeclineBackend(NullBackend):
         """The operator declines the diff, which admission asks at preview."""
 
         def observe(self):
@@ -1214,6 +1214,7 @@ def test_acquire_rolls_back_when_deployment_cannot_be_placed(tmp_path):
     ctl = Controller(ledger, backend)
 
     first = ctl.acquire('alice', catalog.resolve_names(['qwen-coder']))
+    assert first.wait is not None
     assert first.wait.ready                            # claims the only GPU
     qwen_gid = first.deployments[0].id
 
@@ -1370,10 +1371,10 @@ def test_ollama_pull_is_idempotent(tmp_path):
 
 
 class _FailingExecDocker(FakeDocker):
-    def __call__(self, args):
+    def __call__(self, args, **kwargs):
         if 'exec' in args and 'pull' in args:
             raise RuntimeError('daemon not ready')
-        return super().__call__(args)
+        return super().__call__(args, **kwargs)
 
 
 def test_ollama_not_ready_when_pull_fails(tmp_path):
@@ -1912,6 +1913,20 @@ def test_default_docker_run_can_redirect_stderr_lines():
     out = _default_docker_run(['sh', '-c', 'echo out; echo err1 >&2; echo err2 >&2'],
                               timeout=10, stderr_lines=seen.append)
     assert out.strip() == 'out' and seen == ['err1', 'err2']
+
+
+def test_default_docker_run_streams_both_pipes_without_blocking():
+    from infer_stack.leasing.compose import _default_docker_run
+
+    # Much more than a pipe buffer on stderr while the stdout reader is
+    # active. Build/pull progress must not cause a blocked child.
+    stdout, stderr = [], []
+    out = _default_docker_run(
+        ['sh', '-c', 'head -c 262144 /dev/zero | tr "\\000" x >&2; echo >&2; echo done'],
+        timeout=10, stdout_lines=stdout.append, stderr_lines=stderr.append,
+    )
+    assert stdout == ['done'] and out.strip() == 'done'
+    assert stderr == ['x' * 262144]
 
 
 def test_open_webui_runs_as_its_data_directorys_owner(tmp_path):

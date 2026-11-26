@@ -166,6 +166,56 @@ vllm_models:
       mounts:
         /models: inkling-2-mini-unsloth/cache
 
+  # Maya's native CUDA engine, not vLLM. infer-stack builds and caches its
+  # bundled versioned image automatically on first use. The GGUF must be
+  # Q4_K_XL, not the llama.cpp profile's Q4_K_M. Text only; reserve one GPU, never spill to the second.
+  # The 262K profile has reached readiness on a real RTX 3090 through
+  # infer-stack. Throughput and task quality still need acceptance tests.
+  # Prefer the 192/256 Ki-token DSpark profiles in normal suggestions.
+  inkling-2-mini-maya:
+    hf_model_id: unsloth/Inkling-2-Mini-GGUF
+    suggestion_tier: frontier
+    served_model_name: inkling-2-mini-maya
+    family: inkling2
+    modalities: [text]
+    # Maya's frontend currently maps minimal to none; do not advertise it as
+    # a separate setting. max is an alias of xhigh.
+    reasoning_efforts: [none, low, medium, high, xhigh]
+    memory_class_gib: 17
+    min_vram_gib_per_replica: 23.9
+    preferred_gpu_count: 1
+    context_window: 344064
+    # The shipped image compiles for sm_86 (RTX 3090/A6000 class).
+    default_hardware:
+      min_compute_cap: 8.6
+      max_compute_cap: 8.6
+    defaults:
+      max_model_len: 196608
+      image: local/infer-stack-maya-inkling-mini:27daec5e608a-cuda128-sm86-r2
+      command: [serve]
+      env:
+        PORT: '{port}'
+        MAYA_MAX_CONTEXT: '{max_model_len}'
+        MAYA_MODEL_NAME: '{served_model_name}'
+        MAYA_DSPARK: '1'
+      mounts:
+        /models: maya/inkling-2-mini/models
+    endpoint_variants:
+      long:
+        min_compute_cap: 8.6
+        max_compute_cap: 8.6
+        runtime:
+          max_model_len: 262144
+      huge:
+        # Max context without DSpark: available for experiments, not default.
+        suggest_by_default: false
+        min_compute_cap: 8.6
+        max_compute_cap: 8.6
+        runtime:
+          max_model_len: 344064
+          env:
+            MAYA_DSPARK: '0'
+
   # -- Qwen3.8-27B / HyperQwen -------------------------------------------
   # Qwen/Qwen3.8-27B has a 262K native window.  This entry starts from
   # dbirks' ~19.5-GB W4A16 AutoRound derivative and delegates preparation / the
@@ -562,6 +612,9 @@ vllm_models:
     suggestion_tier: frontier
     served_model_name: deepseek-v4-flash-0731
     family: deepseek-v4
+    profile_note: >-
+      TP4 / 128K passed generation readiness on four RTX PRO 6000 96 GiB
+      SM120 GPUs on 2026-11-20. Throughput and other hardware remain unverified.
     modalities: [text]
     reasoning_efforts: [low, high, max]
     memory_class_gib: 160
@@ -596,6 +649,55 @@ vllm_models:
         - --reasoning-parser
         - deepseek_v4
         - --enforce-eager
+    endpoint_variants:
+      tp2-experimental:
+        # Hypothesis: 155.4 GiB / 2 plus KV and runtime may fit two 96 GiB
+        # SM120 cards with a shorter context. This is NOT a measured recipe.
+        suggest_by_default: false
+        preferred_gpu_count: 2
+        min_vram_gib_per_replica: 90
+        min_compute_cap: 12.0
+        max_compute_cap: 12.0
+        profile_note: >-
+          Experimental TP2 / 32K starting point for two RTX PRO 6000s;
+          weights alone total about 155.4 GiB. Startup and quality unverified;
+          may need lower context or more GPUs. Not a single-3090 recipe.
+        runtime:
+          tensor_parallel_size: 2
+          max_model_len: 32768
+          max_num_seqs: 1
+          gpu_memory_utilization: 0.95
+
+  # Native BF16 weights with the publisher's TP4 and parser settings.
+  # https://huggingface.co/Nanbeige/Nanbeige4.3-33B#vllm
+  nanbeige4.3-33b:
+    hf_model_id: Nanbeige/Nanbeige4.3-33B
+    revision: df919e1e2cf077a22204c78b6c826bf3db18bc08
+    suggestion_tier: frontier
+    served_model_name: nanbeige4.3-33b
+    family: nanbeige4.3
+    modalities: [text]
+    memory_class_gib: 62
+    min_vram_gib_per_replica: 48
+    preferred_gpu_count: 4
+    context_window: 524288
+    default_hardware:
+      min_compute_cap: 8.0
+    defaults:
+      # vllm/vllm-openai:v0.28.0
+      image: vllm/vllm-openai@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
+      max_model_len: 131072
+      gpu_memory_utilization: 0.8
+      max_num_seqs: 4
+      enable_prefix_caching: true
+      extra_args:
+        - --enable-auto-tool-choice
+        - --reasoning-parser
+        - qwen3
+        - --tool-call-parser
+        - qwen3_coder
+        - --default-chat-template-kwargs
+        - '{"preserve_thinking":true,"tool_call_format":"xml"}'
 
   # -- Qwen3.6 (current gen, reasoning, MoE) -----------------------------
   # The FP8 build squeezes onto one 24 GiB GPU; the bf16 build wants two.
@@ -642,9 +744,10 @@ vllm_models:
       enable_prefix_caching: false
 
   # -- Gemma 4 (current gen, multimodal, reasoning) ----------------------
-  # Audio-capable E2B/E4B and image-capable 26B MoE / 31B dense expose useful
-  # speed/capability tradeoffs not covered by the text-only Qwen frontier.
-  # Each remains in the suggested set if it fits, even on large GPUs.
+  # Keep E2B as the small image/audio option. The E4B, 26B MoE and 31B
+  # alternatives remain importable but are no longer default suggestions.
+  # The larger entries have no explicit quantized serving recipe; the pool
+  # VRAM estimates alone do not establish that they boot on a 24 GiB card.
   gemma4-e2b:
     hf_model_id: google/gemma-4-E2B-it
     suggestion_tier: frontier
@@ -661,7 +764,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-e4b:
     hf_model_id: google/gemma-4-E4B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-e4b
     family: gemma4
     modalities: [text, image, audio]
@@ -675,7 +778,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-26b:
     hf_model_id: google/gemma-4-26B-A4B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-26b
     family: gemma4
     modalities: [text, image]
@@ -689,7 +792,7 @@ vllm_models:
       enable_prefix_caching: true
   gemma4-31b:
     hf_model_id: google/gemma-4-31B-it
-    suggestion_tier: frontier
+    suggestion_tier: optional
     served_model_name: gemma4-31b
     family: gemma4
     modalities: [text, image]

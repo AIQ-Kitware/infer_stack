@@ -140,6 +140,7 @@ def test_reservation_acquire_is_ready_and_reports_the_gpu(tmp_path):
     ctl = Controller(ledger, backend)
 
     out = ctl.acquire('alice', [reservation_request(1)])
+    assert out.wait is not None
     assert out.wait.ready is True              # nothing to probe -> ready at once
     gid = out.deployments[0].id
     assert out.reconcile.assignments[gid] == [0]

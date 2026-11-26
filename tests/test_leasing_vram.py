@@ -38,6 +38,7 @@ V0_LOG = (
 
 def test_parse_v1_profile():
     profile = parse_vllm_memory_profile(V1_LOG)
+    assert profile is not None
     assert profile['weights_gib'] == 18.26
     assert profile['non_kv_total_gib'] == 20.19
     assert profile['activation_gib'] == 1.42
@@ -46,6 +47,7 @@ def test_parse_v1_profile():
 
 def test_parse_v0_profile():
     profile = parse_vllm_memory_profile(V0_LOG)
+    assert profile is not None
     assert profile['weights_gib'] == 17.89
     assert profile['non_torch_gib'] == 0.62
     assert profile['activation_gib'] == 19.73
@@ -59,6 +61,7 @@ def test_parse_uses_last_serve_after_restart():
         '20.19', '5.80'
     )
     profile = parse_vllm_memory_profile(two_serves)
+    assert profile is not None
     assert profile['weights_gib'] == 4.53
     assert profile['non_kv_total_gib'] == 5.80
 

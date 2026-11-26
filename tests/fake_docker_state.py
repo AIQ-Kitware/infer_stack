@@ -29,7 +29,7 @@ class ComposeFake:
         self.project = 'infer-stack'
         self.started: list[list[str]] = []     # service batches per `up`
         self.initial_health = 'healthy'        # health a new healthchecked container reports
-        self.networks: dict[str, str] = {}     # name -> subnet (persist like the daemon's)
+        self.networks: dict[str, str | None] = {}     # name -> subnet (persist like the daemon's)
 
     # Existing tests read `running` as the list of running service names.
     @property

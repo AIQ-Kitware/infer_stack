@@ -682,6 +682,7 @@ def test_test_command_smokes_endpoint(tmp_path, monkeypatch, capsys):
             return {'choices': [{'message': {'content': 'ready'}}]}
 
     def fake_post(url, headers=None, json=None, timeout=None):
+        assert headers is not None and json is not None
         captured['url'] = url
         captured['auth'] = headers.get('Authorization')
         captured['model'] = json['model']
@@ -1022,7 +1023,7 @@ def test_apply_exits_nonzero_while_publication_stays_pending(env, capsys, monkey
 
     class RoutesNeverVerify(MemoryBackend):
         def converge(self, desired, *, apply=True, placement=None):
-            self.last_unplaced, self.last_errors, self.last_assignments = [], [], {}
+            self.last_unplaced, self.last_errors, self.last_assignments = set(), [], {}
 
         def apply(self):
             return False
@@ -1274,6 +1275,7 @@ def test_a_seed_conflict_that_appears_after_the_plan_leaves_no_marker(tmp_path, 
     controller = cl._open_controller(config, interactive=False)
     plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
     gateway = controller.backend.front_door()
+    assert gateway is not None
     real_lock = controller._global_lock
 
     def racing_lock():
@@ -1303,6 +1305,7 @@ def test_replace_is_compare_and_swap_against_what_was_shown(tmp_path, monkeypatc
     config = cl.RoutesSeedCLI.cli(argv=['--ledger', db, str(tmp_path / 'x.yaml')])
     controller = cl._open_controller(config, interactive=False)
     gateway = controller.backend.front_door()
+    assert gateway is not None
     gateway.replace_route_entries({'alpha': {'engine': 'vllm', 'served': 'shown'}})
     plan = controller.plan_route_seed([Catalog.from_dict(_one_endpoint_catalog('alpha'))])
     assert list(plan.conflicted) == ['alpha']               # shown: 'shown' -> alpha

@@ -66,10 +66,10 @@ class KubeNodeTestCLI(_PathOverridesMixin):
 
     __command__ = 'test'
     node = kw.Value(None, type=str, position=1, required=True, help='Exact Kubernetes node name.')
-    expected_gpus = kw.Value(None, type=int, help='Required exact count, e.g. 1 for namek, 2 for yardrat, 4 for aiq-gpu2.')
+    expected_gpus = kw.Value(None, type=int, help='Exact number of GPUs expected on the selected worker (e.g. 1, 2, or 4).')
     serve_gpus = kw.Value(1, type=int, help='GPUs actually used for a tensor-parallel serving generation; model architecture must support this TP size.')
     kubeconfig = kw.Value(None, type=str, help='Explicit admin kubeconfig; otherwise the selected context.')
-    namespace = kw.Value('kubeai', type=str, help='Existing KubeAI namespace (use default on aiq-gpu).')
+    namespace = kw.Value('kubeai', type=str, help='Namespace containing the existing KubeAI installation.')
     release = kw.Value('kubeai', type=str, help='Existing KubeAI Helm release.')
     resource_profile = kw.Value(None, type=str, help='Optional installed one-GPU base profile to constrain to this node.')
     base_url = kw.Value(None, type=str, help='Direct KubeAI OpenAI URL; default: temporary loopback service forwarding.')
@@ -131,7 +131,7 @@ class K3sOnboardCLI(KubeNodeTestCLI):
 
     __command__ = 'onboard'
     kubeconfig = kw.Value(None, type=str, required=True, help='Private admin kubeconfig selecting the SAME --server; never inferred from stale context.')
-    server = kw.Value(None, type=str, required=True, help='Existing K3s server URL, e.g. https://aiq-gpu:6443.')
+    server = kw.Value(None, type=str, required=True, help='Existing K3s server URL, e.g. https://gpu-control.example.org:6443.')
     token_file = kw.Value(None, type=str, required=True, help='Private file containing the join token; never pass token text.')
     version = kw.Value(None, type=str, help='Exact K3s version; otherwise infer from this cluster control plane.')
     k3s_data_dir = kw.Value(None, type=str, help='Absolute K3s/containerd data path, persisted by the installer. Refuses changing an active agent path.')

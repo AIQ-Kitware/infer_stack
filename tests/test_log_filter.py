@@ -269,7 +269,7 @@ def _follow_logs(monkeypatch, lines, *, no_color, tty=True):
     from infer_stack.leasing.instances import Instance
 
     config = SimpleNamespace(follow=True, raw=False, color=not no_color, tail=None,
-                             timestamps=False, services=None)
+                             timestamps=False, services=None, engine=False)
 
     class Backend:
         def instances(self):

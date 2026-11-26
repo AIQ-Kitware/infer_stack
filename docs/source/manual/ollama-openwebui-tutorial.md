@@ -12,10 +12,16 @@ doesn't care.
 
 ---
 
-## TL;DR
+## Quickstart
+
+Use a trusted, firewalled host: Open WebUI has no login screen by default, and
+this gateway-free setup publishes the native Ollama API. Keep the config and
+data directories private. Install infer-stack and its prerequisites as described
+in the [project quickstart](https://github.com/AIQ-Kitware/infer_stack/blob/main/README.md#quickstart).
 
 ```bash
 # 1. one-time setup
+umask 077
 infer-stack config init                 # storage + pick backend = compose
 infer-stack config set litellm false    # lean: Open WebUI talks straight to ollama
 
@@ -47,7 +53,7 @@ That's the whole thing. The rest of this doc explains each piece and the knobs.
 Open WebUI's **Ollama connection** points straight at the daemon, so its
 *Settings → Models* panel can pull, run, and delete models, and the daemon loads
 them on demand — just like talking to ollama directly. Chat history and pulled
-models persist across restarts (docker volumes under your data dir).
+models persist across restarts (bind-mounted directories under your data dir).
 
 If you'd rather also have a unified OpenAI `base_url` for scripts/other clients,
 **keep LiteLLM on** (skip `config set litellm false`). Then you get a third
@@ -81,8 +87,8 @@ A runtime host is the long-lived daemon (one daemon serves many tags):
 ```bash
 infer-stack catalog host add local-ollama \
     --engine ollama \
-    --gpu 0 1 \           # pin to GPU 0 and 1 (both 1080 Tis)
-    --keep_alive 30m      # how long a model stays resident after last use
+    --gpu 0 1 \
+    --keep_alive 30m
 ```
 
 `--gpu` is exactly the GPU restriction you wanted: the daemon only ever sees the

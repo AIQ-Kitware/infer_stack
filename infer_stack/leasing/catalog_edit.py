@@ -81,6 +81,37 @@ def write_catalog_source(path: str | Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+
+def merge_catalog_fragment(existing: dict[str, Any], fragment: dict[str, Any]
+                           ) -> tuple[dict[str, Any], list[str]]:
+    """Merge without overwriting differing entries; validate the full result.
+
+    Leave the input untouched, including on conflict. Both the preset import
+    CLI and the TUI's exact profile import use this guard. An existing model
+    with a different revision/quantization is not the same model.
+    """
+    if not isinstance(fragment, dict) or any(k not in SECTIONS for k in fragment):
+        raise ValueError('invalid catalog fragment sections')
+    updated = copy.deepcopy(existing)
+    added = []
+    for section in SECTIONS:
+        entries = fragment.get(section, {})
+        if not isinstance(entries, dict):
+            raise ValueError(f'invalid {section} in catalog fragment')
+        current = updated.setdefault(section, {})
+        for name, entry in entries.items():
+            if name in current:
+                if current[name] != entry:
+                    raise ValueError(
+                        f"{section[:-1]} '{name}' already exists and differs; "
+                        'edit or rename the existing entry before importing'
+                    )
+            else:
+                current[name] = copy.deepcopy(entry)
+                added.append(f'{section}:{name}')
+    validate_catalog_source(updated)
+    return updated, added
+
 def next_indexed_name(existing: Any, base: str) -> str:
     """First free ``{base}-{N}`` (N starts at 1)."""
     n = 1

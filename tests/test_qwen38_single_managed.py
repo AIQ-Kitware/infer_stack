@@ -65,6 +65,7 @@ def test_offloaded_checkpoint_floor_is_not_used():
 
 def test_custom_compose_options_change_deployment_identity():
     data = Catalog.load(EXAMPLE).source
+    assert data is not None
     original = Catalog.from_dict(data).resolve_endpoint('qwen38-flash-next-3090').to_request()
     data['endpoints']['qwen38-flash-next-3090']['runtime']['compose']['ulimits']['stack'] = 65536
     updated = Catalog.from_dict(data).resolve_endpoint('qwen38-flash-next-3090').to_request()
@@ -82,6 +83,7 @@ def test_custom_compose_options_change_deployment_identity():
 ])
 def test_bad_compose_options_are_rejected(compose, needle):
     data = Catalog.load(EXAMPLE).source
+    assert data is not None
     data['endpoints']['qwen38-flash-next-3090']['runtime']['compose'] = compose
     with pytest.raises(CatalogError, match=needle):
         Catalog.from_dict(data)

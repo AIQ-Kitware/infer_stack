@@ -64,15 +64,15 @@ cluster target and stable address before any host changes.
 
 ## Current proof point
 
-As of 2026-10-07, the important real-hardware facts are:
+As of 2026-10-07, the important real-hardware facts are (node names anonymized):
 
-- `yardrat` is a K3s server/control-plane node and GPU worker;
-- `namek.kitware.com` joined as a physical K3s agent/worker;
+- `gpu-worker-2` is a K3s server/control-plane node and GPU worker;
+- `gpu-worker-1.example.org` joined as a physical K3s agent/worker;
 - both nodes became Ready and advertised NVIDIA resources through the device
   plugin/GFD stack;
-- `namek.kitware.com` advertised one RTX 3090;
-- `infer-stack kube node test namek.kitware.com --expected-gpus=1 --apply`
-  scheduled a serving replica exactly on `namek`, verified the actual GPU UUID
+- `gpu-worker-1.example.org` advertised one RTX 3090;
+- `infer-stack kube node test gpu-worker-1.example.org --expected-gpus=1 --apply`
+  scheduled a serving replica exactly on `gpu-worker-1`, verified the actual GPU UUID
   and model, and completed a real generation;
 - the KubeAI Model CRD/operator path therefore works across two physical
   machines.
@@ -91,22 +91,22 @@ Keep these as regression targets rather than tribal knowledge:
 1. **K3s installation can exceed 60 seconds.** The generic subprocess timeout
    killed a healthy worker install. Installer operations need an explicit long
    timeout.
-2. **Canonical node names may be FQDNs.** `namek` registered as
-   `namek.kitware.com`; exact-node operations must use/discover the canonical
+2. **Canonical node names may be FQDNs.** `gpu-worker-1` registered as
+   `gpu-worker-1.example.org`; exact-node operations must use/discover the canonical
    Kubernetes name.
 3. **K3s's bundled `kubectl` may prefer `/etc/rancher/k3s/k3s.yaml`.** A
    normal `~/.kube/config` symlink was not enough on the server host. infer-stack
    needs a deliberate persisted cluster/kubeconfig target for its own commands;
    it should not silently weaken the root-owned K3s admin kubeconfig.
 4. **Container image storage competes with kubelet ephemeral storage.** On
-   `namek`, old Docker images/build cache consumed the root filesystem while
+   `gpu-worker-1`, old Docker images/build cache consumed the root filesystem while
    K3s/containerd also used it. Pulling the ~14 GB vLLM image crossed K3s's
    configured `imagefs.available/nodefs.available` eviction threshold.
 5. **Recovery has hysteresis.** K3s had `evictionHard=5%`,
    `evictionMinimumReclaim=10%`, and a 5-minute pressure transition period, so
    DiskPressure did not clear immediately after freeing space.
 6. **A Pending pod can still reserve a GPU.** A stale model pod already bound
-   to `namek` held its `nvidia.com/gpu: 1` allocation and made the next
+   to `gpu-worker-1` held its `nvidia.com/gpu: 1` allocation and made the next
    acceptance probe Unschedulable.
 7. **Failed/evicted acceptance pods need first-class diagnostics and cleanup.**
    A serving pod evicted for ephemeral storage regressed to a misleading
@@ -172,14 +172,14 @@ The next target is deliberately simpler than full HA:
           +------------------+------------------+
           |                  |                  |
        worker             worker             worker
-      yardrat            namek             4x A6000
+    gpu-worker-2       gpu-worker-1          4x A6000
           |                  |                  |
           +------- KubeAI Models / replicas ---+
                              |
                          stable gateway
 ```
 
-Near term, the infer-stack authority may remain on `yardrat`. The architecture
+Near term, the infer-stack authority may remain on `gpu-worker-2`. The architecture
 must stop treating that colocation as permanent.
 
 ---
@@ -192,7 +192,7 @@ before layering more features on top.
 ### Tasks
 
 - Run and preserve the result of `dev/handover/p5_two_hosts.sh` across
-  `yardrat` and `namek.kitware.com`.
+  `gpu-worker-2` and `gpu-worker-1.example.org`.
 - Keep the worker acceptance test able to identify:
   - scheduling failure reason;
   - failed/evicted pod reason/message;
@@ -300,7 +300,7 @@ GPUs. Do not claim a TP=4 acceptance from an inventory-only check.
 On the physical A6000 host prove:
 
 - [ ] clean preflight before installation;
-- [ ] worker joins the existing `yardrat` cluster;
+- [ ] worker joins the existing `gpu-worker-2` cluster;
 - [ ] canonical node name is reported;
 - [ ] all four A6000 device UUIDs/models are visible;
 - [ ] `nvidia.com/gpu=4` is allocatable;
@@ -402,7 +402,7 @@ facts, and define clearly which Kubernetes placement policies are expressible
 at node granularity.
 
 Homogeneous 4x A6000 hardware is a good next target, but the design must not
-silently misrepresent machines such as `yardrat` with different GPU products.
+silently misrepresent machines such as `gpu-worker-2` with different GPU products.
 
 ---
 
@@ -745,7 +745,7 @@ state/controller replicas, rather than simply because a client is remote.
 ### 6.4 TUI becomes a client
 
 The TUI should be able to connect to the canonical infer-stack service from
-`yardrat`, `namek`, or an unrelated workstation and see the same authority.
+`gpu-worker-2`, `gpu-worker-1`, or an unrelated workstation and see the same authority.
 
 Do not achieve this by copying the SQLite database/data root to each client.
 
@@ -753,7 +753,7 @@ Do not achieve this by copying the SQLite database/data root to each client.
 
 # Phase 7 — make the Kubernetes control plane replaceable
 
-**Goal:** `yardrat` stops being a permanent single point of Kubernetes control
+**Goal:** `gpu-worker-2` stops being a permanent single point of Kubernetes control
 without conflating this with infer-stack controller HA.
 
 Do this after the worker/resource model is stable enough that control-plane
@@ -763,7 +763,7 @@ migration is not being debugged at the same time as basic scheduling.
 
 Introduce a stable cluster-control name/address before adding redundant servers.
 Workers and administrative kubeconfigs should target that stable endpoint rather
-than treating `yardrat` as permanent identity.
+than treating `gpu-worker-2` as permanent identity.
 
 ### 7.2 Move from single-server datastore to HA-capable K3s mode
 
@@ -774,7 +774,7 @@ the exact procedure against the pinned K3s version.
 Prefer an odd number of control-plane/datastore members for quorum. Three is the
 normal small-cluster target.
 
-### 7.3 Add new server(s), then remove yardrat if desired
+### 7.3 Add new server(s), then remove gpu-worker-2 if desired
 
 Acceptance must prove:
 
@@ -782,7 +782,7 @@ Acceptance must prove:
 - KubeAI resources remain intact;
 - healthy inference survives one control-plane server loss;
 - a fresh acquire/release still works after failover;
-- `yardrat` can be drained/removed as a server without redefining the logical
+- `gpu-worker-2` can be drained/removed as a server without redefining the logical
   cluster.
 
 The infer-stack authority may still be a single process during this phase.

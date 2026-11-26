@@ -62,7 +62,9 @@ def test_first_explicit_apply_publishes_approved_catalog_after_restart(tmp_path)
     ledger, controller = _ctl(tmp_path, source, FakeDocker(), ui=False)
     try:
         service = ControlService(controller, source)
-        approved_source = {**source.source, 'endpoints': {**source.source['endpoints'],
+        source_data = source.source
+        assert source_data is not None
+        approved_source = {**source_data, 'endpoints': {**source_data['endpoints'],
                            'remote': {**REMOTE, 'external': {**REMOTE['external'], 'model': 'org/approved'}}}}
         approved = approval(service, source=approved_source)
         service.step()

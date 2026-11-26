@@ -62,6 +62,8 @@ package-data.infer_stack = [
   "templates/*.yaml",
   "templates/*.j2",
   "mockserver/data/*.yaml",
+  "runtime_images/*/Dockerfile",
+  "runtime_images/*/launcher.py",
 ]
 package-data."*" = [
   "requirements/*.txt",
@@ -118,7 +120,7 @@ ignore_missing_imports = true
 [tool.ty]
 rules.unused-ignore-comment = "ignore"
 rules.unused-type-ignore-comment = "ignore"
-rules.unresolved-import = "ignore"
+rules.import-not-found = "ignore"
 
 [tool.pytest]
 ini_options.addopts = "-p no:doctest --xdoctest --xdoctest-style=google --ignore-glob=setup.py --ignore-glob=dev --ignore-glob=docs"

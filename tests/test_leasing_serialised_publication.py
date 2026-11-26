@@ -59,7 +59,7 @@ class SharedStackBackend(SimpleAdmission):
         self.shared = shared
         self.guard = guard
         self.apply_sleep = apply_sleep
-        self.last_unplaced: list[str] = []
+        self.last_unplaced: set[str] = set()
         self.last_errors: list[str] = []
         self.last_assignments: dict[str, list[int]] = {}
 
@@ -132,7 +132,9 @@ def test_apply_runs_under_the_lock_that_serialises_renders(tmp_path):
         def apply(self) -> None:
             ctl = holder['ctl']
             seen['depth'] = ctl._flock_depth
-            handle = ctl._open_flock(ctl._lock_path)
+            lock_path = ctl._lock_path
+            assert lock_path is not None
+            handle = ctl._open_flock(lock_path)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 seen['lock_free'] = True
@@ -455,7 +457,7 @@ class _NoRoomBackend(SharedStackBackend):
 
         self.last_planned_digest = self._digest(*self._preview(list(desired), placement))
         refused = self.refuse(desired)
-        self.last_unplaced = list(refused)
+        self.last_unplaced = set(refused)
         super().converge([g for g in desired if g.id not in refused], apply=apply)
 
 
@@ -478,7 +480,7 @@ class _RenderRefusesBackend(_NoRoomBackend):
         refused = [g.id for g in desired if 'big' in g.served]
         SharedStackBackend.converge(
             self, [g for g in desired if g.id not in refused], apply=apply)
-        self.last_unplaced = refused
+        self.last_unplaced = set(refused)
 
 
 def test_a_refused_acquire_commits_nothing(tmp_path):
@@ -547,6 +549,7 @@ def test_rollback_keeps_coalesced_warm_deployment_resident(tmp_path):
         ctl.acquire('bob', [warm_request, _vreq('big')], wait=False)
 
     m = ledger.get_deployment(mid)
+    assert m is not None
     assert m.state == DeploymentState.IDLE      # not STOPPED
     assert mid in shared['realized']            # still resident
 
@@ -681,7 +684,9 @@ def _lapsed_idle_lease(tmp_path, shared, backend_cls=None, **kw):
     clock.now += 200
     ledger.release(b.lease.id)
     gid = a.deployments[0].id
-    assert ledger.get_deployment(gid).state == 'idle'
+    deployment = ledger.get_deployment(gid)
+    assert deployment is not None
+    assert deployment.state == 'idle'
     return ledger, ctl, a.lease.id, gid
 
 
@@ -739,7 +744,9 @@ def test_a_reviving_renew_waits_for_an_in_flight_apply(tmp_path):
     t2 = threading.Thread(target=renew)
     t2.start()
     time.sleep(0.3)
-    assert ledger.get_deployment(gid).state == 'idle'   # blocked on the lock
+    deployment = ledger.get_deployment(gid)
+    assert deployment is not None
+    assert deployment.state == 'idle'   # blocked on the lock
     finish.set()
     t1.join(THREAD_TIMEOUT_S)
     t2.join(THREAD_TIMEOUT_S)

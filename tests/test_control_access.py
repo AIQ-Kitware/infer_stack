@@ -172,7 +172,8 @@ def test_real_remote_cli_access_run_and_release_external_env(external_service, t
             service.step()
     worker = threading.Thread(target=process, daemon=True)
     worker.start()
-    flags = dict(argv=False, server_url=f'http://127.0.0.1:{server.server_port}', server_token_file=str(token))
+    server_url = f'http://127.0.0.1:{server.server_port}'
+    flags = dict(argv=False, server_url=server_url, server_token_file=str(token))
     env = tmp_path / 'access.env'
     try:
         AccessCLI.main(**flags, names=['remote'], timeout=5, interval=.01, env_file=str(env), json=True)
@@ -192,7 +193,7 @@ def test_real_remote_cli_access_run_and_release_external_env(external_service, t
         observer = Identity('observer', 'observer')
         with pytest.raises(PermissionError):
             service.access(observer.principal, 'observer', {'endpoints': ['remote']}, identity=observer)
-        assert Client(flags['server_url'], token).request('GET', '/v1/status')['leases'] == []
+        assert Client(server_url, str(token)).request('GET', '/v1/status')['leases'] == []
     finally:
         stop.set()
         worker.join(5)

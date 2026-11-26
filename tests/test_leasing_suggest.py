@@ -61,6 +61,39 @@ def test_deepseek_v4_requires_known_sm120_and_four_roomy_eligible_gpus():
     )['models']
 
 
+def test_nanbeige_discovery_renders_pinned_vllm_tool_serving():
+    import json
+
+    from infer_stack.leasing.compose import vllm_service_dict
+    from infer_stack.leasing.models import Deployment, DeploymentState
+    from infer_stack.profile_runtime import vllm_args
+
+    name = 'nanbeige4.3-33b'
+    fragment = suggest_catalog(simulate_inventory('4x96@12.0'))
+    request = Catalog.from_dict(fragment).resolve_endpoint(name).to_request()
+    assert request.engine == 'vllm'
+    assert request.spec['hf_model_id'] == 'Nanbeige/Nanbeige4.3-33B'
+    deployment = Deployment('test', request.compat_key, request.engine,
+                            request.sharing, request.capacity, request.spec,
+                            {name: request.served}, DeploymentState.LIVE, 0, 0)
+    service = vllm_service_dict(deployment)
+    args = vllm_args(service)
+    assert service['image'].startswith('vllm/vllm-openai@sha256:')
+    assert '--revision=df919e1e2cf077a22204c78b6c826bf3db18bc08' in args
+    assert '--tensor-parallel-size=4' in args
+    assert '--max-model-len=131072' in args
+    assert '--enable-auto-tool-choice' in args
+    assert args[args.index('--reasoning-parser') + 1] == 'qwen3'
+    assert args[args.index('--tool-call-parser') + 1] == 'qwen3_coder'
+    assert json.loads(args[args.index('--default-chat-template-kwargs') + 1]) == {
+        'preserve_thinking': True,
+        'tool_call_format': 'xml',
+    }
+    assert '--trust-remote-code' not in args
+    for hardware in ('3x96@12.0', '4x24@12.0', '4x96@7.5'):
+        assert name not in suggest_catalog(simulate_inventory(hardware))['endpoints']
+
+
 def _gpu(index, mem, name='GPU', display=False, compute_cap=None):
     gpu = {'index': index, 'name': name, 'memory_gib': mem, 'display_active': display}
     if compute_cap is not None:
@@ -108,6 +141,9 @@ def test_builtin_pool_is_nonempty_and_real():
     assert pool['qwen3.5-0.8b'].suggestion_tier == 'frontier'
     assert pool['qwen3.5-122b-a10b'].suggestion_tier == 'frontier'
     assert pool['gemma4-e2b'].suggestion_tier == 'frontier'
+    for name in ('gemma4-e4b', 'gemma4-26b', 'gemma4-31b'):
+        assert pool[name].suggestion_tier == 'optional'
+    assert pool['inkling-2-mini-maya'].suggestion_tier == 'frontier'
     assert pool['qwen3.5-27b'].suggestion_tier == 'optional'
     assert pool['qwen3.5-35b-a3b'].suggestion_tier == 'optional'
     assert pool['gpt-oss-20b'].suggestion_tier == 'optional'
@@ -126,7 +162,8 @@ def test_frontier_is_hardware_filtered_not_pruned_by_larger_models():
     big = set(catalogs[-1]['models'])
     assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-2b',
             'qwen3.5-4b', 'qwen3.5-9b', 'qwen3.8-27b-dbirks-hyperqwen',
-            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'} <= big
+            'gemma4-e2b'} <= big
+    assert not {'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'} & big
     assert 'qwen3.5-122b-a10b' not in big  # still needs two 80 GiB GPUs
     assert 'qwen3.5-27b' not in big           # non-frontier, though it fits
     assert 'qwen3.5-35b-a3b' not in big
@@ -137,8 +174,7 @@ def test_large_multi_gpu_frontier_includes_122b_and_smaller_models():
     models = suggest_catalog(simulate_inventory('4x96'))['models']
     assert {'gpt2', 'smollm2-135m', 'qwen3.5-0.8b', 'qwen3.5-9b',
             'qwen3.8-27b-dbirks-hyperqwen', 'qwen3.5-122b-a10b',
-            'qwen3.5-122b-a10b-fp8', 'gemma4-e2b', 'gemma4-e4b',
-            'gemma4-26b', 'gemma4-31b'} <= set(models)
+            'qwen3.5-122b-a10b-fp8', 'gemma4-e2b'} <= set(models)
 
 
 def test_gpt2_debug_endpoint_uses_completions_protocol():
@@ -237,7 +273,7 @@ def test_rtx_3090_suggests_the_current_gen_models_that_fit():
     models = suggest_catalog(inv)['models']
     fits = {'gpt2', 'smollm2-135m', 'qwen3.8-27b-dbirks-hyperqwen',
             'qwen3.5-0.8b', 'qwen3.5-2b', 'qwen3.5-4b', 'qwen3.5-9b',
-            'gemma4-e2b', 'gemma4-e4b', 'gemma4-26b', 'gemma4-31b'}
+            'gemma4-e2b', 'inkling-2-mini-maya'}
     too_big = {'qwen3.5-27b', 'qwen3.5-35b-a3b', 'qwen3.5-122b-a10b',
                'qwen3.6-35b-a3b'}  # 35b-a3b needs 2 GPUs even at 24 GiB each
     assert fits <= set(models)

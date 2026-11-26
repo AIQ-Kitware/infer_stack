@@ -1,21 +1,20 @@
-# Leasing demo — deploy a model behind Open WebUI (yardrat)
+# Leasing demo — deploy a model behind Open WebUI
 
-A walkthrough, not a test plan. Where `leasing-test-plan.md` pokes at edges,
-this shows the **happy path a real user takes**: set up your config + storage
-once, deploy a chat model as a standing service, talk to it from Open WebUI,
-then run several models side by side — all through the leasing CLI.
+A worked example for running multiple models side by side. For a shorter first
+run using automatic model suggestions, see the
+[quickstart](https://github.com/AIQ-Kitware/infer_stack/blob/main/README.md#quickstart).
+This guide deliberately builds the catalog by hand so you can see how model
+sources, endpoints, reclaim policies and GPU placement relate.
 
-Validated against **yardrat**: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
+Validated on a heterogeneous workstation: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
 Quadro RTX 5000 (16 GiB, display-attached). Both Turing (sm_75): **fp16 only**,
 so every vLLM endpoint pins `--dtype=half`.
 
-Setup is now durable config, not shell exports: `config set` persists your
-storage location and default backend, and `catalog` edits the model list — so
-the per-command flags stay short and every block is copy-paste-independent.
-
-> The point of infer-stack is that you switch freely between models and configs.
-> "demo settings" and "real settings" are the same settings — we write to the
-> real config + real storage and can re-point either at any time.
+The examples change the actual config and data roots. Use them on a trusted
+installation where you can manage the existing leases; do not run two controllers
+against the same Docker host. Open WebUI has no login screen by default, so
+keep the host firewalled. Use a private data directory and `umask 077` before
+setup and rendering.
 
 Run `infer-stack help tree` any time to see the whole command surface.
 
@@ -32,9 +31,9 @@ and set Compose as the default backend so you never repeat `--backend`:
 
 ```bash
 # It is a good idea to setup the data-dir beforehand with appropriate permissions
-export INFER_STACK_DATA_DIR=/data/service/docker/infer-stack
-mkdir -p "$INFER_STACK_DATA_DIR"
-chown "$USER" "$INFER_STACK_DATA_DIR"
+umask 077
+# Optional: choose a writable storage root when config init prompts.
+mkdir -p "$HOME/infer-stack"
 
 # Interactive: prompts for each setting (data dir, backend, Open WebUI,
 # display-GPU skipping), shows them, confirms. Re-run to edit; --fresh to reset.
@@ -60,8 +59,8 @@ infer-stack catalog model add smol135 --source hf://HuggingFaceTB/SmolLM2-135M-I
 # lineage and you can run them side by side (see §5):
 infer-stack catalog model add qwen15 --source hf://Qwen/Qwen2.5-1.5B-Instruct
 infer-stack catalog model add qwen05 --source hf://Qwen/Qwen2.5-0.5B-Instruct
-# Omit the endpoint NAME and it defaults to the model, so what you serve and see
-# in Open WebUI *is* the model (Turing => --dtype=half). The main one is kept warm:
+# Omit the endpoint NAME to use an automatically numbered model-based name.
+# Turing => --dtype=half. The main endpoint is kept warm:
 infer-stack catalog endpoint add --model smol17b \
     --max-model-len 8192 --gpu-mem 0.4 --extra-args='--dtype=half' --reclaim keep-warm
 # the small one frees its GPU on release:
@@ -109,7 +108,7 @@ The rest of this demo uses the model-centric ones.
 
 `acquire` with no `--ttl` is an infinite lease — "deploy this and keep it up"
 (add `--ttl 2h` for a time-boxed reservation instead).
-`--require-generation` makes readiness honest (waits for a real token). The first
+Readiness always verifies a real generation. The first
 run downloads the weights (a few GiB), so allow time. No `--backend` — it comes
 from your settings. A managed **Open WebUI comes up alongside the gateway by
 default** (disable with `--no-ui`, or globally `infer-stack config set ui false`).
@@ -125,7 +124,7 @@ infer-stack also narrates what it's doing (placement, `docker compose up`,
 readiness) on stderr.
 
 ```bash
-infer-stack acquire smol17b-1 --require-generation --timeout 1200
+infer-stack acquire smol17b-1 --timeout 1200
 # shows the compose diff, asks to apply (or pass --yes), then:
 #   open webui: http://127.0.0.1:13000
 ```
@@ -142,7 +141,7 @@ infer-stack acquire smol17b-1 --no-apply    # stage: writes the project, no `up`
 #   compose: …/leasing/compose/docker-compose.yml
 cat "$(infer-stack config get data_dir)"/leasing/compose/docker-compose.yml  # inspect
 infer-stack apply                           # bring the staged set up (the trigger)
-infer-stack wait smol17b-1 --require-generation   # then block until ready
+infer-stack wait smol17b-1   # then block until ready
 # (change your mind instead? `infer-stack release --all` discards the staged lease.)
 ```
 
@@ -158,7 +157,12 @@ Watch it come up from another shell:
 infer-stack leases          # leases + deployments: state (desired) vs running, and GPUs
 infer-stack stack ps        # vllm-… + litellm + open-webui  (alias: infer-stack ps)
 infer-stack stack logs -f   # follow startup (Ctrl-C to stop) (alias: infer-stack logs -f)
+infer-stack logs --engine -f  # only engine logs, including engines acquired later
 ```
+
+`--engine` uses the same deployment-based filter as the TUI's engines
+view, excluding LiteLLM, Open WebUI and other front-door services. It also
+works with `--tail` for recent history, or with specific engine targets.
 
 `leases` now shows the **deployments** table with both what the ledger *wants*
 (`state`) and what's *actually up* (`running`), plus the GPUs each model is on
@@ -254,14 +258,14 @@ its own name:
 > **One model per GPU.** Placement is whole-GPU: each model lands on its own GPU,
 > and `--gpu-mem` is only vLLM's reservation *within* that GPU, not a knob to pack
 > two models onto one. So the first model takes GPU 0 and the second takes GPU 1
-> — including yardrat's display-attached GPU 1, since placement uses **every** GPU
+> — including the example workstation's display-attached GPU 1, since placement uses **every** GPU
 > by default (so single-GPU hosts work too). Want to keep the monitor's GPU free?
 > `infer-stack config set skip_display_gpus true` (or `--skip-display-gpus` per
 > command) — then a second model has nowhere to go and `acquire` fails fast.
 > `infer-stack leases` shows which GPU each model is on.
 
 ```bash
-infer-stack acquire smol135-1 --require-generation --timeout 600
+infer-stack acquire smol135-1 --timeout 600
 infer-stack leases            # two live deployments now — GPU 0 and GPU 1
 infer-stack test smol135-1    # confirm the new model serves
 ```
@@ -278,7 +282,7 @@ Here we fan out a SmolLM2 and a Qwen endpoint so both lineages serve side by sid
 # two models -> two GPUs (GPU 1 is the display GPU, used by default; see note above)
 infer-stack acquire smol17b-1 --no-wait --yes   # SmolLM2 -> GPU 0
 infer-stack acquire qwen15-1  --no-wait --yes   # Qwen -> GPU 1
-infer-stack wait smol17b-1 qwen15-1 --require-generation --timeout 1200
+infer-stack wait smol17b-1 qwen15-1 --timeout 1200
 # (bare `infer-stack wait` waits for every live model)
 infer-stack test qwen15-1                       # confirm the Qwen endpoint serves
 ```
@@ -288,18 +292,16 @@ two families from the same UI. `infer-stack leases` shows each on its own GPU
 (GPU 0 and GPU 1); the 16 GiB display GPU holds a small model like `qwen15-1`
 comfortably at `--gpu-mem 0.4`.
 
-> `--require-generation` is the readiness *criterion* (ready == a real generated
-> token, not just a listed model); `--no-wait` / `wait` are the *blocking*
-> control. They're separate knobs: `acquire` already waits unless you say
-> `--no-wait`, and `wait` re-blocks later.
+> Readiness always verifies actual generation. `acquire` waits unless you
+> say `--no-wait`; `wait` re-blocks later.
 
 Drop a standing service when you're done. A standing `acquire` lease taken
-without `--env-file` has none, so release it by its lease id (copy it from
+without `--env-file` has no env-file, so release it by its lease id (copy it from
 `leases`):
 
 ```bash
 infer-stack leases          # note the lease id of the lease to drop
-infer-stack release <SESSION_ID>
+infer-stack release LEASE_ID  # replace with the id from leases
 # smol17b-1 is reclaim:keep-warm (stays resident); smol135-1 is reclaim:stop
 # (its container is torn down once no lease protects it).
 ```
@@ -308,10 +310,10 @@ A `keep-warm` model stays resident after release (no cold-start next time) — b
 it holds its GPU. To free that GPU now, **evict** it (overrides keep-warm):
 
 ```bash
-infer-stack evict smol17b-1  # tear down the idle `smol17b-1` deployment now (by name)
+infer-stack evict smol17b-1  # tear down the idle smol17b-1 deployment now (by name)
 infer-stack evict --all      # ...or every idle/released model at once
 # or do it in one step at release time:
-infer-stack release <SESSION_ID> --evict
+infer-stack release LEASE_ID  # replace with the id from leases --evict
 ```
 
 `release`/`evict` only tear down **models** (freeing GPUs). The front door — the
@@ -342,35 +344,13 @@ echo "done"
 
 ---
 
-## Ergonomic notes
+## Daily operation
 
-The earlier draft of this demo flagged five ergonomic smells; building the
-`config`/`catalog`/`secret` submodals resolved the first cluster:
-
-- ✅ **Default backend** — `infer-stack config set backend compose`; the leasing
-  verbs default to it, so no more `--backend` on every call.
-- ✅ **Storage in durable config** — `infer-stack config set data_dir <path>`;
-  `data_root()` honors it (override > `$INFER_STACK_DATA_DIR` > setting > XDG), so
-  no `~/.bashrc` export.
-- ✅ **Managed `HF_TOKEN`** — `infer-stack env HF_TOKEN=…` writes the managed
-  `.env` Compose auto-loads, set once before `acquire`.
-- ✅ **Managed Open WebUI** — bundled into the leasing stack and on by default
-  (`--no-ui` / `config set ui false` to opt out). Stable across model switches
-  *and* down to zero models — the gateway + UI are a standing front door that
-  `release`/`evict` leave running (only `stack down` removes them), so it never
-  blinks and reconnects as you serve again.
-- ✅ **Concise smoke test** — `infer-stack test smol17b-1` instead of
-  hand-rolled `curl`.
-
-Still open (tracked in `dev/leasing-followups.md`):
-
-- **No endpoint-addressed teardown for standing services.** Stopping a standing
-  `acquire` means copying a lease id out of `infer-stack leases`. Want
-  `infer-stack release --endpoint smol17b-1`. (`evict
-  smol17b-1` already tears the deployment down, but doesn't release the lease.)
-
-
-
-### JON TEST
-
-infer-stack acquire qwen05-1
+Use `infer-stack catalog endpoint list` to find endpoint names, `infer-stack tui`
+for interactive discovery and monitoring, and `infer-stack logs --engine -f`
+for model-only logs. For a job-scoped lease, use
+`infer-stack run --endpoint NAME -- COMMAND`. See the
+[operations guide](https://github.com/AIQ-Kitware/infer_stack/blob/main/docs/operations.md)
+for lifecycle, diagnostics and cleanup. `release --all` and `stack down` in the
+teardown example affect the entire installation; prefer releasing your own
+lease ID on a shared host.

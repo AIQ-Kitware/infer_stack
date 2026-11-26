@@ -95,7 +95,9 @@ def test_full_real_machine_migration_sequence(environment, capsys):
     assert result['changed']
     archived = Ledger(SqliteStore(result['archive']))
     assert archived.profile() == profile
-    assert archived.get_lease(outcome.lease.id).state == leases[0].state
+    archived_lease = archived.get_lease(outcome.lease.id)
+    assert archived_lease is not None
+    assert archived_lease.state == leases[0].state
     assert archived.get_deployment(outcome.deployments[0].id) is not None
     current = env.controller('kubeai')
     assert current.ledger.status() == ([], [])

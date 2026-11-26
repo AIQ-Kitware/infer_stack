@@ -198,46 +198,52 @@ network.
 
 ### Join and test a GPU worker in one reviewed operation
 
-On **aiq-gpu**, prepare the bundle without printing credentials:
+In the examples below, `gpu-control` and `gpu-worker-1` are illustrative names.
+Substitute your reachable server URL and actual Kubernetes node names (see
+`kubectl get nodes`). Use the namespace containing your KubeAI installation.
+
+On the control-plane host, prepare the bundle without printing credentials:
 
 ```bash
+SERVER_URL=https://gpu-control.example.org:6443  # replace with your reachable URL
 infer-stack kube k3s export \
-    --server=https://<aiq-gpu-address>:6443 \
-    --directory=~/.private/namek-join
+    --server="$SERVER_URL" \
+    --directory=~/.private/gpu-worker-1-join
 sudo -v
 infer-stack kube k3s export \
-    --server=https://<aiq-gpu-address>:6443 \
-    --directory=~/.private/namek-join --apply
+    --server="$SERVER_URL" \
+    --directory=~/.private/gpu-worker-1-join --apply
 ```
 
 The directory is `0700`; `token`, `kubeconfig.yaml` and `manifest.json` are
 `0600`. Export rewrites the server URL in this copy, leaves original kubeconfigs
 unchanged, and can refresh an owned bundle after interruption/certificate
 rotation. It refuses unrelated directories or a bundle for another cluster.
-Securely transfer the directory to **namek** using your normal transport,
+Securely transfer the directory to **gpu-worker-1** using your normal transport,
 retaining those permissions.
 
-On `namek`, with the NVIDIA driver and container toolkit already installed,
+On `gpu-worker-1`, with the NVIDIA driver and container toolkit already installed,
 use the private bundle files. The kubeconfig's selected server must be
 **the same URL** passed to `--server`, including the reachable LAN/VPN address
 instead of `127.0.0.1`. Do not overwrite an existing EKS/default kubeconfig.
 The onboarding command requires `kubectl` and Helm on the invoking machine.
 These credentials grant administrative access; keep the separate files private.
 
-Preview on `namek`:
+Preview on `gpu-worker-1`:
 
 ```bash
-infer-stack kube k3s onboard namek \
-    --server=https://<aiq-gpu-address>:6443 \
-    --token-file=~/.private/namek-join/token \
-    --kubeconfig=~/.private/namek-join/kubeconfig.yaml \
+SERVER_URL=https://gpu-control.example.org:6443  # same URL used for export
+infer-stack kube k3s onboard gpu-worker-1 \
+    --server="$SERVER_URL" \
+    --token-file=~/.private/gpu-worker-1-join/token \
+    --kubeconfig=~/.private/gpu-worker-1-join/kubeconfig.yaml \
     --namespace=default
 ```
 
 Then run the same command with `--apply` after authenticating with `sudo -v`.
 It detects local GPU count/products/memory/UUIDs and infers the control plane's
 K3s version, verifies existing membership or installs the agent, checks local
-containerd NVIDIA discovery, waits for **namek itself** to become Ready with the
+containerd NVIDIA discovery, waits for **gpu-worker-1 itself** to become Ready with the
 expected GPU resources and GFD labels, and runs real GPU/model acceptance.
 It uses the existing NVIDIA/KubeAI installers if those components are absent.
 Host drivers/toolkit remain prerequisites: a missing toolkit fails before any
@@ -274,19 +280,19 @@ minutes (`--timeout=900` by default). State changes are printed while waiting.
 No manually started port-forward or Docker gateway is needed: the test opens
 and closes a temporary, loopback-only KubeAI service forward.
 
-For an already joined worker, repeat acceptance from **aiq-gpu** or another
+For an already joined worker, repeat acceptance from **gpu-control** or another
 administrative host, without distributing admin credentials to the worker:
 
 ```bash
-infer-stack kube node test namek --expected-gpus=1 --namespace=default
-infer-stack kube node test namek --expected-gpus=1 --namespace=default --apply
+infer-stack kube node test gpu-worker-1 --expected-gpus=1 --namespace=default
+infer-stack kube node test gpu-worker-1 --expected-gpus=1 --namespace=default --apply
 
 # The same acceptance surface handles later workers:
-infer-stack kube node test yardrat --expected-gpus=2 --namespace=default --apply
-infer-stack kube node test aiq-gpu2 --expected-gpus=4 --namespace=default --apply
+infer-stack kube node test gpu-worker-2 --expected-gpus=2 --namespace=default --apply
+infer-stack kube node test gpu-worker-4 --expected-gpus=4 --namespace=default --apply
 
 # Separately prove four-GPU serving with an architecture compatible with TP=4:
-infer-stack kube node test aiq-gpu2 --expected-gpus=4 --serve-gpus=4 \
+infer-stack kube node test gpu-worker-4 --expected-gpus=4 --serve-gpus=4 \
   --model=Qwen/Qwen2.5-1.5B-Instruct --namespace=default --apply
 ```
 
@@ -300,7 +306,7 @@ preserving installed chart version and values. That reusable profile remains
 installed and is printed for subsequent catalog use; it is not a host GPU index.
 The initial profile addition can roll KubeAI's controller, as the plan states.
 
-For heterogeneous `yardrat`, the device query reports both GPU products and
+For a heterogeneous worker such as `gpu-worker-2`, the device query reports both GPU products and
 memories independently. GFD selectors describe nodes, and Kubernetes' generic
 `nvidia.com/gpu` allocation does not select a particular physical product within
 a mixed node. The generation check verifies one allocated GPU and reports which
@@ -326,7 +332,7 @@ normal success/failure deletes only that run's resources. After process/host
 interruption, use the printed ID (and the same namespace/kubeconfig):
 
 ```bash
-infer-stack kube node test namek --namespace=default \
+infer-stack kube node test gpu-worker-1 --namespace=default \
     --run-id=<printed-id> --cleanup --apply
 ```
 
@@ -336,13 +342,14 @@ run ID is refused until explicit cleanup. Plans and results also support
 control-plane lifecycle/gateway suite and should run in a quiescent test namespace;
 use the targeted test above to accept individual joining workers.
 
-Operational notes from the first physical two-node acceptance run (2026-10-07):
+Operational notes from the first physical two-node acceptance run (2026-10-07;
+node names anonymized):
 
 - Use the **actual Kubernetes node object name** from `kubectl get nodes`. A host
-  whose shell hostname is `namek` registered as `namek.kitware.com`; targeting
-  `node/namek` correctly returned NotFound.
+  whose shell hostname is `gpu-worker-1` registered as `gpu-worker-1.example.org`; targeting
+  `node/gpu-worker-1` correctly returned NotFound.
 - A first vLLM pull can consume substantial ephemeral storage while downloading
-  and unpacking the serving image. On `namek`, Docker and K3s/containerd shared
+  and unpacking the serving image. On `gpu-worker-1`, Docker and K3s/containerd shared
   the root filesystem; an old Docker image/build cache pushed the node through
   K3s's configured `imagefs.available`/`nodefs.available` eviction threshold even
   though `/var/lib/rancher/k3s` itself was small. Diagnose with node events plus
@@ -593,7 +600,7 @@ A stale EKS context on the worker does not mean local membership failed.
 Join establishes membership, not NVIDIA driver/toolkit readiness. If local GPUs
 are detected, join warns that control-plane verification is required. Check the
 specific worker, rather than relying on another GPU node to make the cluster
-look ready: for `namek`, expect Ready, one allocatable GPU, RTX 3090 GFD product,
+look ready: for `gpu-worker-1`, expect Ready, one allocatable GPU, RTX 3090 GFD product,
 roughly 24 GiB GFD memory, and a fresh runtime canary from `kube install --apply`. Active
 agents must match requested server/name/version before join can return success.
 

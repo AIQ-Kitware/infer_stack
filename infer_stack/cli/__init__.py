@@ -42,6 +42,8 @@ from . import (  # noqa: F401
 from .commands_catalog import CatalogModalCLI
 from .commands_kube import KubeModalCLI
 from .commands_ledger import LedgerModalCLI
+from .commands_images import ImageModalCLI
+from .commands_benchmark import BenchmarkModalCLI
 from .commands_usage import UsageCLI
 from .commands_server import OperationsCLI, ServerCLI
 from .commands_leasing import (
@@ -96,23 +98,19 @@ class ManageCLI(kw.ModalCLI):
     )
 
     __epilog__ = """
-    Quickstart:
-        infer-stack config init                 # storage + default backend
-        infer-stack catalog init                # start a model catalog
-        infer-stack catalog model add smol135 \\
-            --source hf://HuggingFaceTB/SmolLM2-135M-Instruct
-        infer-stack catalog endpoint add --model smol135   # -> smol135-1
-        infer-stack acquire smol135-1           # render + bring up + wait
-        infer-stack leases                      # what is desired vs running
-        infer-stack test smol135-1              # one real generation
-        infer-stack release --all               # tear it back down
+    Quickstart (Linux + Docker Compose):
+        infer-stack config init --backend compose
+        infer-stack catalog suggest --apply     # detect GPUs + seed catalog
+        infer-stack catalog endpoint list       # choose an endpoint name
+        infer-stack acquire NAME --env-file lease.env
+        infer-stack test NAME
+        infer-stack release --env-file lease.env
 
-    Mental model:
-        catalog (what can run) -> acquire (declare intent, a lease; --ttl for a
-        soft TTL) -> the controller reconciles a compose project (gateway +
-        models + Open WebUI) onto your GPUs. `acquire --no-apply` writes that
-        project without starting it (then `apply`); `leases` shows desired vs
-        actual. Run `infer-stack help tree` for the whole command surface.
+    No GPU? Use `catalog suggest --simulator --apply` and acquire mock-smol.
+    Browse and edit model configurations with `infer-stack tui`.
+    Open WebUI (when enabled) has no login screen; keep it on a trusted network.
+    `infer-stack help tree` lists all commands. See the README quickstart and
+    docs/index.md for guides.
     """
 
     # Backs the modal ``--version`` flag (kwconf reads ``__version__``).
@@ -150,6 +148,7 @@ class ManageCLI(kw.ModalCLI):
     wait = WaitCLI  # block until endpoints are ready (acquire --no-wait fan-out)
     leases = LeasesCLI
     usage = UsageCLI
+    benchmark = BenchmarkModalCLI
     server = ServerCLI
     operations = OperationsCLI
     ledger = LedgerModalCLI
@@ -163,6 +162,7 @@ class ManageCLI(kw.ModalCLI):
 
     # Day-2 ops on the running stack, grouped under `stack`; logs/ps also kept
     # at the top level as the two hottest convenience aliases.
+    image = ImageModalCLI  # prepare packaged runtime images without a lease
     stack = StackModalCLI
     logs = LogsCLI
     ps = PsCLI

@@ -363,6 +363,7 @@ def test_ledger_coalescing_preserves_each_alias_context_payload():
     little = ledger.acquire('small-user', [small])
     assert big.deployments[0].id == little.deployments[0].id
     deployment = ledger.get_deployment(big.deployments[0].id)
+    assert deployment is not None
     assert deployment.served['small']['max_input_tokens'] == 65536
     assert deployment.served['full']['max_input_tokens'] == 262144
 

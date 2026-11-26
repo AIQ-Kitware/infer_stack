@@ -930,7 +930,8 @@ Everything known to be open that is not a numbered item above or in
 campaign 2. None blocks campaign 2.
 
 - [ ] **GPU handover runs (operator).** Targeted physical-worker acceptance
-  passed 2026-10-07: `namek.kitware.com` joined `yardrat`, exposed one RTX 3090,
+  passed 2026-10-07 (node names anonymized): `gpu-worker-1.example.org`
+  joined `gpu-worker-2`, exposed one RTX 3090,
   ran the fresh GPU probe, scheduled the one-GPU KubeAI serving replica on that
   exact node, and completed a real generation. The run also exposed/fixed
   acceptance diagnostics and cleanup races below. Still run
@@ -979,7 +980,7 @@ campaign 2. None blocks campaign 2.
   k3s); the second node is recreated by `dev/k3s_agent_container.sh` with the
   same setting.
 - [x] **Worker-acceptance failure/cleanup diagnostics.** *Done 2026-10-07 in
-  this change after the first physical `namek` run.* A serving pod evicted for
+  this change after the first physical `gpu-worker-1` run.* A serving pod evicted for
   ephemeral-storage was filtered out of the active set, so status regressed from
   "container running; model loading" to "waiting for scheduler" until the
   15-minute timeout. Failed pods now terminate acceptance immediately with pod

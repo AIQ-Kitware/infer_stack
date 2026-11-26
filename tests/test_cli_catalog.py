@@ -73,7 +73,9 @@ def test_endpoint_add_publishes_reasoning_capability_to_gateway(tmp_path, levels
     cat = Catalog.load(cat_path(tmp_path))
     request = cat.resolve_endpoint('custom').to_request()
     assert request.served['reasoning_efforts'] == levels
-    route = compose_catalog_route('custom', request).entry()
+    gateway_route = compose_catalog_route('custom', request)
+    assert gateway_route is not None
+    route = gateway_route.entry()
     assert route['litellm_params']['allowed_openai_params'] == ['reasoning_effort']
     assert route['model_info']['reasoning_effort_levels'] == levels
 

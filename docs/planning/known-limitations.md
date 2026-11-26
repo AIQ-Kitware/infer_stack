@@ -7,29 +7,25 @@ is intended to be operated.
 ## Generated shell environment files require trusted inputs
 
 Lease helper commands can emit shell files containing `export NAME=value`
-assignments. Values are not currently shell-escaped. Sourcing one of these files
-can therefore execute shell syntax embedded in a configured value.
-
-Treat the catalog, config, model names, endpoint URLs, API keys, and generated
-shell files as fully trusted local input. Do not source generated environment
-files derived from untrusted or multi-tenant configuration. This is a known
-security limitation, not a supported sanitization boundary.
-
-A future hardening pass should quote values for the target shell, validate
-variable names, and reject values containing unsupported control characters.
+assignments. The current `render_env_file` implementation uses `shlex.quote`
+for values, but generated files are still executable shell input containing
+credentials. Only source files from trusted configurations and paths. Do not
+accept arbitrary catalogs, configuration or shell files from mutually untrusted
+users as a supported security boundary.
 
 ## Generated Compose environment files may be readable by other local users
 
-Generated Compose `.env` files can contain deployment credentials such as the
-LiteLLM master key or database password. They are currently created using the
-process umask rather than an enforced private file mode. On a multi-user host,
-a permissive umask can make those files readable by other local accounts.
+Generated Compose `.env` and lease environment files can contain deployment
+credentials such as the LiteLLM master key or database password. They are
+created using the process umask rather than a uniformly enforced private file
+mode. A permissive umask can expose those files to other local accounts.
 
-Operate infer-stack under a dedicated trusted account and keep its config/data
-roots private. Until file modes are enforced by the application, use a
+Operate infer-stack under a dedicated trusted account, or a deliberately
+trusted operator group. Keep config/data roots private to that group. Use a
 restrictive umask such as `umask 077` before setup, render, and controller
-operations. Do not treat the generated directory as safe for mutually
-untrusted local users.
+operations, and verify existing file permissions; the umask does not change
+already-existing files. Do not treat generated directories as a security
+boundary for mutually untrusted users.
 
 ## Only the gateway master key can be rotated (current)
 

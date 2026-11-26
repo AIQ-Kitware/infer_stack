@@ -1,7 +1,9 @@
 # DeepSeek V4 Flash on SM120 workstations
 
-`deepseek-v4-flash-0731` appears in Discover models and `catalog suggest` on
-hosts with at least four eligible SM120 GPUs with 80 GiB each. The official
+`deepseek-v4-flash-0731` appears in **Browse models** on every host, with a
+warning on hardware outside the suggested configuration. Automatic `catalog
+suggest` remains restricted to hosts with at least four eligible SM120 GPUs
+with 80 GiB each. The official
 [0731 checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
 is pinned by revision. Its mixed FP4/FP8 weight files total about 155.4 GiB.
 
@@ -45,3 +47,33 @@ infer-stack catalog suggest --simulate-hardware 4x96@12.0
 
 Unknown compute capability cannot select this profile. GPU discovery must
 report SM120, and display-GPU reservation can reduce the eligible count.
+
+
+## Explicit import and experimentation
+
+On other hardware, use **Browse models**, select the profile, preview the
+configuration, and choose **Import & edit**. Alternatively:
+
+```bash
+infer-stack catalog import deepseek-v4-flash-0731 --dry-run
+infer-stack catalog import deepseek-v4-flash-0731
+```
+
+Importing an unmatched recipe does not reserve GPUs, download weights, or
+lower its VRAM floor. The ordinary controller still validates actual placement
+at acquisition. The endpoint editor permits deliberate changes to tensor
+parallelism, context, GPU memory utilization, per-GPU VRAM requirements, and
+vLLM arguments. Only disable the automatic cached-weight floor if the chosen
+runtime actually supports offloading or another arrangement where it would
+be inappropriate.
+
+A second registry profile, `deepseek-v4-flash-0731-tp2-experimental`, is an
+**unverified** TP2 / 32768-token starting configuration for two SM120 cards
+with at least 90 GiB each. It uses the same pinned checkpoint and vLLM image,
+one concurrent sequence, and a 0.95 memory utilization target. The checkpoint
+weight bytes alone amount to roughly 77.7 GiB per GPU before runtime overhead,
+so two 96-GiB cards may still be insufficient. It is deliberately excluded from
+normal suggestions even when the hardware matches. Use `catalog suggest --all`
+on matching hardware, or explicitly browse/import it on any host. No single
+RTX 3090 recipe is claimed by either profile; using this model on much smaller
+GPUs would need a different quantization or offload backend.

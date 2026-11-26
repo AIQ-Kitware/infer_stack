@@ -944,3 +944,27 @@ Vector preparation/caching remains client work, and hosted APIs need no local
 GPU lease. No code, endpoint registration, GPU workload or runtime configuration
 was changed. Reviewed the existing lifecycle/probe/catalog boundaries and
 upstream serving documentation; no tests were needed for these planning notes.
+
+## 2026-11-24 16:34:58 -0500
+
+GPT-6.2-sol. Add Nanbeige4.3-33B to GPU discovery with the publisher's native
+vLLM parser pair and TP4. The checkpoint has about 62 GiB of BF16 weights.
+The 128K serving profile leaves room for KV cache on four 48 GiB or larger
+BF16-capable GPUs. It preserves reasoning history and selects XML tool calls in
+the chat template. Both model revision and image manifest are pinned so a
+successful host run identifies a repeatable recipe.
+
+The simulated 4x96 GiB inventory rendered the complete Compose command,
+including the parser and template arguments. The test also excludes inventories
+with too few GPUs, insufficient memory or a pre-Ampere compute capability.
+The suggestion and Compose suites passed 131 tests. Live GPU acceptance is pending.
+
+## 2026-11-24 22:20:51 -0500
+
+GPT-6.2-sol. Consolidate the serving changes on `dev/0.7.3` for review alongside
+the packaged Maya runtime. Both branches added Inkling documentation, so the
+README keeps the native vLLM, Maya and llama.cpp profiles documented. Comparing
+rendered Compose services on a simulated four-GPU SM120 host confirmed that the
+merge preserves the existing Inkling vLLM, DeepSeek and Nanbeige launch specs.
+The pinned Nanbeige profile has also completed live generation and tool calls
+on four SM120 GPUs.
