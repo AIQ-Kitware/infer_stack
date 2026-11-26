@@ -1,0 +1,12 @@
+{
+  "name": "infer-stack-technical-overview",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Source-only build for the infer-stack technical overview",
+  "scripts": {
+    "build": "node build.cjs",
+    "pdf": "npm run build && libreoffice --headless --convert-to pdf --outdir build build/infer-stack-technical-overview.pptx"
+  },
+  "engines": { "node": ">=20" },
+  "devDependencies": { "pptxgenjs": "4.0.0" }
+}

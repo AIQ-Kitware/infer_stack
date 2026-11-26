@@ -1,0 +1,7 @@
+# Generated slide artifacts and local build dependencies. Commit sources only.
+node_modules/
+build/
+*.pptx
+*.ppt
+*.pdf
+*.odp
