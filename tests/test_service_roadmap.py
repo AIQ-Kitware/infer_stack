@@ -67,7 +67,7 @@ def test_admin_classification_profiles_enforce_node_and_pool():
     w = Worker(count=4)
     w.nodes[1]['metadata']['labels'].update(labels(pool='a6000', machine_class='4xa6000'))
     generated = profiles(w.nodes)
-    assert any(p['nodeSelector'] == {'kubernetes.io/hostname': 'namek', 'infer-stack.ai/pool': 'a6000'} for p in generated.values())
+    assert any(p['nodeSelector'] == {'kubernetes.io/hostname': 'gpu-worker-1', 'infer-stack.ai/pool': 'a6000'} for p in generated.values())
     assert any(p['nodeSelector'].get('infer-stack.ai/pool') == 'a6000'
                and 'kubernetes.io/hostname' not in p['nodeSelector'] for p in generated.values())
 

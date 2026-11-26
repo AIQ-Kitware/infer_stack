@@ -29,7 +29,7 @@ Two layers, kept apart on purpose:
 
 Example:
     >>> from infer_stack.hardware import simulate_inventory
-    >>> # a single 48 GiB GPU (yardrat's free Quadro RTX 8000)
+    >>> # a single 48 GiB GPU (e.g. a Quadro RTX 8000)
     >>> out = suggest_catalog(simulate_inventory('1x48'))
     >>> 'qwen3.5-9b' in out['models'] and 'qwen2.5-7b' not in out['models']
     True
@@ -235,7 +235,7 @@ def migrate_known_suggestion_aliases(data: dict[str, Any]) -> list[str]:
 # a compatibility fallback for older drivers and historical/synthetic inventory
 # dictionaries that predate that field.
 _TURING_NAME_HINTS = (
-    'quadro rtx',  # RTX 8000/6000/5000/4000 — e.g. yardrat
+    'quadro rtx',  # RTX 8000/6000/5000/4000
     'titan rtx',
     'tesla t4',
     ' t4',

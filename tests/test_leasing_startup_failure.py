@@ -239,7 +239,7 @@ def test_an_exhausted_on_failure_budget_counts_as_no_retry(tmp_path):
 def test_an_interrupted_wait_does_not_leave_the_lease_holding_a_gpu(tmp_path):
     """Ctrl-C during the readiness wait must release, like a timeout does.
 
-    Measured on aiq-gpu: an interrupted `run` left its lease ACTIVE and its
+    Measured on a real GPU host: an interrupted `run` left its lease ACTIVE and its
     deployment LIVE, so `evict --all` could not reclaim the GPU (eviction is for
     idle deployments) and every later acquire was refused -- the stack was not
     quiescent, so the catalog it had been edited to no longer matched the frozen

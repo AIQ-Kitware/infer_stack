@@ -188,7 +188,7 @@ def test_new_deployment_restricted_to_allowed_gpus():
 # ---------------------------------------------------------------------------
 # VRAM-aware placement (docs/planning/vram-aware-placement.md).
 #
-# The motivating host is yardrat: GPU0 = 48 GiB (RTX 8000), GPU1 = 16 GiB
+# The motivating host has heterogeneous GPUs: GPU0 = 48 GiB (RTX 8000), GPU1 = 16 GiB
 # (RTX 5000). A 9B model (~24 GiB declared) must NEVER land on GPU1; small
 # models should gravitate to GPU1 (best-fit) so the big card stays free.
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ def test_declared_best_fit_prefers_smallest_eligible():
 
 def test_undeclared_deployments_keep_legacy_index_order():
     # No declaration -> exactly today's behavior (index-order first-fit), so
-    # existing catalogs see byte-identical plans. (A yardrat 9B endpoint that
+    # existing catalogs see byte-identical plans. (A 9B endpoint on the example host that
     # has not yet declared min_vram_gib still lands on GPU0 as it does today.)
     plan = plan_placement([vllm('a', t=0), vllm('b', t=1)], inv('48,16'))
     assert plan.assignments == {'a': [0], 'b': [1]}

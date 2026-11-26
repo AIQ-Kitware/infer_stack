@@ -58,21 +58,22 @@ def test_snapshot_budget_and_independent_failure():
 
 
 def test_gpu_requests_and_pod_diagnosis_include_other_namespace_usage():
+    status: dict[str, object] = {'phase': 'Running'}
     pod: dict[str, Any] = {'metadata': {'name': 'other', 'namespace': 'other'},
            'spec': {'nodeName': 'gpu-a', 'containers': [{'resources': {'limits': {'nvidia.com/gpu': 2}}}],
                     'initContainers': [{'resources': {'requests': {'nvidia.com/gpu': 3}}}]},
-           'status': {'phase': 'Running'}}
+           'status': status}
     assert gpu_request(pod) == 3
     report = {'namespace': 'default', 'nodes': [node()], 'pods': [pod]}
     assert node_rows(report)[0][4] == '3'
     assert pod_rows(report) == []
     pod['metadata']['namespace'] = 'default'
-    pod['status']['containerStatuses'] = [{'ready': False, 'restartCount': 4,
-                                           'state': {'waiting': {'reason': 'ImagePullBackOff'}}}]
+    status['containerStatuses'] = [{'ready': False, 'restartCount': 4,
+                                    'state': {'waiting': {'reason': 'ImagePullBackOff'}}}]
     row = pod_rows(report)[0]
     assert row[:3] == ('default/other', 'gpu-a', 'ImagePullBackOff')
     assert row[4] == '4'
-    pod['status']['phase'] = 'Succeeded'
+    status['phase'] = 'Succeeded'
     assert node_rows(report)[0][4] == '0'
 
 
@@ -179,25 +180,25 @@ def test_node_control_previews_confirms_and_reuses_manager(tmp_path):
         app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None, kube_manager=m)
         async with app.run_test(size=(180, 55)) as pilot:
             await pilot.pause()
-            app._node_names = ['namek']
-            app.query_one('#cluster-nodes', DataTable).add_row('namek', *['-'] * 8)
+            app._node_names = ['gpu-worker-1']
+            app.query_one('#cluster-nodes', DataTable).add_row('gpu-worker-1', *['-'] * 8)
             app.action_node_control('detach')
             await app.workers.wait_for_complete()
             assert isinstance(app.screen, _ConfirmScreen)
             assert 'default/q' in app.screen._message
             assert 'emptyDir' in app.screen._message
-            assert calls == [('plan', 'namek')]
+            assert calls == [('plan', 'gpu-worker-1')]
             app.screen.dismiss(False)
             await pilot.pause()
-            assert calls == [('plan', 'namek')]
+            assert calls == [('plan', 'gpu-worker-1')]
             app.action_node_control('attach')
             await app.workers.wait_for_complete()
             assert isinstance(app.screen, _ConfirmScreen)
             app.screen.dismiss(True)
             await pilot.pause()
             await app.workers.wait_for_complete()
-            assert calls[-1] == ('attach', 'namek')
-            assert any('infer-stack kube node attach namek --yes' in line for line in app._app_log_lines)
+            assert calls[-1] == ('attach', 'gpu-worker-1')
+            assert any('infer-stack kube node attach gpu-worker-1 --yes' in line for line in app._app_log_lines)
     asyncio.run(scenario())
 
 
@@ -371,20 +372,22 @@ def test_kubeai_lifecycle_evidence_and_namespace_scope():
     from infer_stack.kube.monitor import model_states
     r = lifecycle_report()
     assert model_states(r)['grp-q']['stage'] == 'declared'
+    status: dict[str, object] = {'phase': 'Pending'}
     pod: dict[str, Any] = {'metadata': {'name': 'vllm', 'namespace': 'default', 'uid': 'pod-1',
                        'labels': {'infer-stack/deployment': 'grp-q'}},
-           'spec': {'nodeName': 'namek'}, 'status': {'phase': 'Pending'}}
+           'spec': {'nodeName': 'gpu-worker-1'}, 'status': status}
     r['pods'] = [pod]
     assert model_states(r)['grp-q']['stage'] == 'scheduled'
-    pod['status'] = {'phase': 'Running', 'containerStatuses': [
-        {'containerID': 'container-1', 'state': {'running': {'startedAt': 'now'}}}]}
+    container_status: dict[str, object] = {
+        'containerID': 'container-1', 'state': {'running': {'startedAt': 'now'}}}
+    status.update(phase='Running', containerStatuses=[container_status])
     assert model_states(r)['grp-q']['stage'] == 'pod running'
     r['models'][0]['status']['replicas']['ready'] = 1
     assert not model_states(r)['grp-q']['replica_ready']  # stale CR counter cannot override unready pods
-    pod['status']['conditions'] = [{'type': 'Ready', 'status': 'True'}]
+    status['conditions'] = [{'type': 'Ready', 'status': 'True'}]
     assert model_states(r)['grp-q']['stage'] == 'replica ready'
     before = model_states(r)['grp-q']['identity']
-    pod['status']['containerStatuses'][0]['restartCount'] = 1
+    container_status['restartCount'] = 1
     assert model_states(r)['grp-q']['identity'] != before
     pod['metadata']['namespace'] = 'unrelated'
     assert not model_states(r)['grp-q']['replica_ready']
@@ -434,7 +437,7 @@ def test_pending_model_never_offered_as_ready_then_real_generation_is_distinct(t
             assert requests == []  # no generation during passive refresh
             r['pods'] = [{'metadata': {'namespace': 'default', 'uid': 'pod-1',
                                        'labels': {'infer-stack/deployment': 'grp-q'}},
-                          'spec': {'nodeName': 'namek'},
+                          'spec': {'nodeName': 'gpu-worker-1'},
                           'status': {'conditions': [{'type': 'Ready', 'status': 'True'}],
                                      'containerStatuses': [{'containerID': 'container-1', 'restartCount': 0}]}}]
             app._receive_cluster(r)

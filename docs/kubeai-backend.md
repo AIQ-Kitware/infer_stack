@@ -420,15 +420,16 @@ it does not create independent Kubernetes replicas. KubeAI pod replication uses
 ## Placement and replica policy
 
 Administrators classify canonical Kubernetes node names and install selector
-profiles using the existing Helm release:
+profiles using the existing Helm release. Substitute your actual node name
+for the illustrative `gpu-worker-1.example.org`:
 
 ```bash
-infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090
-infer-stack kube node classify namek.kitware.com --pool interactive --class rtx3090 --apply
+infer-stack kube node classify gpu-worker-1.example.org --pool interactive --class rtx3090
+infer-stack kube node classify gpu-worker-1.example.org --pool interactive --class rtx3090 --apply
 ```
 
 Users can narrow an approved endpoint with `acquire`, `access`, or `run`
-`--node namek.kitware.com` or `--pool interactive`. Node and pool constraints
+`--node gpu-worker-1.example.org` or `--pool interactive`. Node and pool constraints
 intersect the catalog's node/pool constraints; they cannot broaden permission.
 Kubernetes still assigns physical GPUs. Constraint equality is required for
 sharing, and simultaneously live deployments with the same public alias but

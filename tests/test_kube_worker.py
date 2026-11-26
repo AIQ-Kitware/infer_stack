@@ -33,14 +33,14 @@ class _Device(TypedDict):
 
 class Worker:
     """Commands traverse real rendering and operations; only the cluster is fake."""
-    def __init__(self, name='namek', count=1, products=None):
+    def __init__(self, name='gpu-worker-1', count=1, products=None):
         self.name, self.count = name, count
         self.devices: list[_Device] = [
             {'uuid': f'GPU-{i}', 'product': p,
              'memory_mib': 24576 - (i * 8192 if products and len(set(products)) > 1 else 0)}
             for i, p in enumerate(products or ['NVIDIA RTX 3090'] * count)
         ]
-        self.nodes = [node('aiq-gpu', count=4), node(name, count=count)]
+        self.nodes = [node('gpu-control', count=4), node(name, count=count)]
         self.nodes[1]['metadata']['labels']['nvidia.com/gpu.product'] = self.devices[0]['product'].replace(' ', '-') if self.devices else 'NVIDIA-RTX-3090'
         for n in self.nodes:
             n['metadata']['labels']['kubernetes.io/hostname'] = n['metadata']['name']
@@ -73,9 +73,9 @@ class Worker:
             self.handler = True
             return ''
         if args == ['kubectl', 'config', 'current-context']:
-            return 'aiq-gpu'
+            return 'gpu-control'
         if args[:3] == ['kubectl', 'config', 'view']:
-            return json.dumps({'clusters': [{'cluster': {'server': 'https://aiq-gpu:6443'}}]})
+            return json.dumps({'clusters': [{'cluster': {'server': 'https://gpu-control:6443'}}]})
         if args[:2] == ['kubectl', 'version']:
             return '{}'
         if args == ['kubectl', 'get', 'nodes', '-o', 'json']:
@@ -139,9 +139,9 @@ def run_test(worker, **kwargs):
 
 
 @pytest.mark.parametrize('name,products', [
-    ('namek', ['NVIDIA RTX 3090']),
-    ('yardrat', ['NVIDIA RTX A6000', 'NVIDIA RTX 4080']),
-    ('aiq-gpu2', ['NVIDIA RTX 4070'] * 4),
+    ('gpu-worker-1', ['NVIDIA RTX 3090']),
+    ('gpu-worker-2', ['NVIDIA RTX A6000', 'NVIDIA RTX 4080']),
+    ('gpu-worker-4', ['NVIDIA RTX 4070'] * 4),
 ])
 def test_named_worker_real_rendering_device_inventory_and_cleanup(name, products):
     worker = Worker(name, len(products), products)
@@ -163,20 +163,20 @@ def test_named_worker_real_rendering_device_inventory_and_cleanup(name, products
 
 def test_plan_is_read_only_and_aggregate_does_not_mask_broken_worker():
     w = Worker(count=0)
-    result = plan(w.manager, node='namek', namespace='default', expected_gpus=1)
+    result = plan(w.manager, node='gpu-worker-1', namespace='default', expected_gpus=1)
     assert 'exposes 0 GPUs' in '; '.join(result['facts']['errors'])
     assert w.nodes[0]['status']['allocatable']['nvidia.com/gpu'] == '4'
     assert not w.resources and not w.upgrades
     with pytest.raises(RuntimeError, match='expected 1'):
-        acceptance(w.manager, node='namek', namespace='default', release='kubeai', expected_gpus=1,
+        acceptance(w.manager, node='gpu-worker-1', namespace='default', release='kubeai', expected_gpus=1,
                    base_url='unused', run_id='abcdefgh')
     assert not any('create' in c for c in w.calls)
 
 
-@pytest.mark.parametrize('change,match', [('landing', 'expected namek'), ('model_gpu_count', 'exactly 1 GPU')])
+@pytest.mark.parametrize('change,match', [('landing', 'expected gpu-worker-1'), ('model_gpu_count', 'exactly 1 GPU')])
 def test_wrong_placement_or_gpu_request_fails_and_cleans(change, match):
     w = Worker()
-    setattr(w, change, 'aiq-gpu' if change == 'landing' else 2)
+    setattr(w, change, 'gpu-control' if change == 'landing' else 2)
     with pytest.raises(RuntimeError, match=match):
         run_test(w)
     assert not w.resources and not w.generation_calls
@@ -231,7 +231,7 @@ def test_cleanup_rechecks_after_kubectl_wait_timeout_race():
     w = Worker()
     name = 'infer-stack-e2e-abcdefgh'
     w.resources[('Model', name)] = {
-        'metadata': {'labels': {RUN_LABEL: 'abcdefgh', NODE_LABEL: 'namek'}},
+        'metadata': {'labels': {RUN_LABEL: 'abcdefgh', NODE_LABEL: 'gpu-worker-1'}},
     }
     original = w.manager.run
     waits = []
@@ -247,7 +247,7 @@ def test_cleanup_rechecks_after_kubectl_wait_timeout_race():
         return original(args, **kw)
 
     w.manager.run = run
-    cleanup(w.manager, node='namek', namespace='default', run_id='abcdefgh')
+    cleanup(w.manager, node='gpu-worker-1', namespace='default', run_id='abcdefgh')
     assert not w.resources
     assert len(waits) == 2
 
@@ -281,11 +281,11 @@ def test_explicit_interrupted_run_cleanup_refuses_unrelated_and_retries_safely()
     name = 'infer-stack-e2e-abcdefgh'
     w.resources[('Model', name)] = {'metadata': {'labels': {}}}
     with pytest.raises(RuntimeError, match='unrelated'):
-        cleanup(w.manager, node='namek', namespace='default', run_id='abcdefgh')
+        cleanup(w.manager, node='gpu-worker-1', namespace='default', run_id='abcdefgh')
     assert ('Model', name) in w.resources
-    w.resources[('Model', name)]['metadata']['labels'] = {RUN_LABEL: 'abcdefgh', NODE_LABEL: 'namek'}
-    cleanup(w.manager, node='namek', namespace='default', run_id='abcdefgh')
-    cleanup(w.manager, node='namek', namespace='default', run_id='abcdefgh')
+    w.resources[('Model', name)]['metadata']['labels'] = {RUN_LABEL: 'abcdefgh', NODE_LABEL: 'gpu-worker-1'}
+    cleanup(w.manager, node='gpu-worker-1', namespace='default', run_id='abcdefgh')
+    cleanup(w.manager, node='gpu-worker-1', namespace='default', run_id='abcdefgh')
     assert not w.resources
     run_test(w, run_id='abcdefgh')
 
@@ -296,13 +296,13 @@ def test_profile_constraints_preserve_base_and_refuse_operator_collision():
                             'requests': {'nvidia.com/gpu': '1'}, 'limits': {'nvidia.com/gpu': '1'},
                             'nodeSelector': {'nvidia.com/gpu.product': 'NVIDIA-RTX-3090'}}
     before = copy.deepcopy(w.profiles)
-    p = plan(w.manager, node='namek', namespace='default', expected_gpus=1, resource_profile='custom')
+    p = plan(w.manager, node='gpu-worker-1', namespace='default', expected_gpus=1, resource_profile='custom')
     assert w.profiles == before
     assert p['profile']['imageName'] == 'custom-vllm'
-    assert p['profile']['nodeSelector']['kubernetes.io/hostname'] == 'namek'
+    assert p['profile']['nodeSelector']['kubernetes.io/hostname'] == 'gpu-worker-1'
     w.profiles[p['profile_name']] = {}
     with pytest.raises(RuntimeError, match='overwrite'):
-        plan(w.manager, node='namek', namespace='default', expected_gpus=1, resource_profile='custom')
+        plan(w.manager, node='gpu-worker-1', namespace='default', expected_gpus=1, resource_profile='custom')
 
 
 def test_scoping_never_replaces_stale_context(tmp_path, monkeypatch):
@@ -319,22 +319,22 @@ def test_scoping_never_replaces_stale_context(tmp_path, monkeypatch):
 
 
 def test_onboarding_plan_infers_version_and_preserves_heterogeneous_hardware():
-    w = Worker('yardrat', 2, ['RTX A6000', 'RTX 4080'])
-    prepared = onboarding_plan(w.manager, w.manager, server='https://aiq-gpu:6443', node='yardrat')
+    w = Worker('gpu-worker-2', 2, ['RTX A6000', 'RTX 4080'])
+    prepared = onboarding_plan(w.manager, w.manager, server='https://gpu-control:6443', node='gpu-worker-2')
     assert prepared['version'] == 'v1.34.3+k3s1'
     assert prepared['expected_gpus'] == 2
     assert prepared['devices'] == w.devices
     assert not w.upgrades and not w.resources
     with pytest.raises(RuntimeError, match='differs'):
-        onboarding_plan(w.manager, w.manager, server='https://wrong:6443', node='yardrat')
+        onboarding_plan(w.manager, w.manager, server='https://wrong:6443', node='gpu-worker-2')
     w.manager.command_exists = lambda name: name != 'nvidia-container-runtime'
     with pytest.raises(RuntimeError, match='container toolkit'):
-        onboarding_plan(w.manager, w.manager, server='https://aiq-gpu:6443', node='yardrat')
+        onboarding_plan(w.manager, w.manager, server='https://gpu-control:6443', node='gpu-worker-2')
 
 
 def test_onboard_integration_join_runtime_discovery_then_exact_worker_test(monkeypatch):
     w = Worker()
-    prepared = onboarding_plan(w.manager, w.manager, server='https://aiq-gpu:6443', node='namek')
+    prepared = onboarding_plan(w.manager, w.manager, server='https://gpu-control:6443', node='gpu-worker-1')
     joins = []
     monkeypatch.setattr(k3s, 'join', lambda **kw: joins.append(kw))
     from infer_stack.kube import inspect
@@ -343,7 +343,7 @@ def test_onboard_integration_join_runtime_discovery_then_exact_worker_test(monke
     w.handler = False
     out = onboard(w.manager, w.manager, prepared, token_file='private-file', namespace='default',
                   release='kubeai', base_url='http://kubeai/openai/v1', run_id='onboard12345', http=w.http)
-    assert joins[0]['node_name'] == 'namek' and joins[0]['version'] == prepared['version']
+    assert joins[0]['node_name'] == 'gpu-worker-1' and joins[0]['version'] == prepared['version']
     assert ['sudo', '-n', 'systemctl', 'restart', 'k3s-agent'] in w.calls
     assert out['generation_verified'] and not w.resources
 
@@ -353,16 +353,16 @@ def test_cli_registration_plan_apply_and_cleanup(tmp_path, monkeypatch, capsys):
     from infer_stack.cli import commands_kube_worker as cli
     w = Worker()
     monkeypatch.setattr(cli, 'KubeManager', lambda: w.manager)
-    assert KubeNodeTestCLI.main(argv=['namek', '--expected-gpus=1', '--namespace=default', '--json']) == 0
-    assert json.loads(capsys.readouterr().out)['profile']['nodeSelector']['kubernetes.io/hostname'] == 'namek'
+    assert KubeNodeTestCLI.main(argv=['gpu-worker-1', '--expected-gpus=1', '--namespace=default', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['profile']['nodeSelector']['kubernetes.io/hostname'] == 'gpu-worker-1'
     assert not w.upgrades and not w.resources
     import requests
     monkeypatch.setattr(requests, 'post', w.post)
-    assert KubeNodeTestCLI.main(argv=False, node='namek', expected_gpus=1, namespace='default', apply=True, base_url='http://kubeai/openai/v1') == 0
-    assert ManageCLI.main(argv=['kube', 'node', 'test', 'namek', '--expected-gpus=1', '--namespace=default', '--apply', '--base-url=http://kubeai/openai/v1']) in (None, 0)
+    assert KubeNodeTestCLI.main(argv=False, node='gpu-worker-1', expected_gpus=1, namespace='default', apply=True, base_url='http://kubeai/openai/v1') == 0
+    assert ManageCLI.main(argv=['kube', 'node', 'test', 'gpu-worker-1', '--expected-gpus=1', '--namespace=default', '--apply', '--base-url=http://kubeai/openai/v1']) in (None, 0)
     assert not w.resources
     with pytest.raises(SystemExit, match='run-id'):
-        KubeNodeTestCLI.main(argv=False, node='namek', cleanup=True)
+        KubeNodeTestCLI.main(argv=False, node='gpu-worker-1', cleanup=True)
     ManageCLI.main(argv=['help', 'tree'])
     tree = capsys.readouterr().out
     assert 'onboard' in tree and 'test' in tree
@@ -383,7 +383,7 @@ def test_device_parser_rejects_missing_or_duplicate_identity():
 def test_onboard_does_not_accept_existing_other_node_gpus(monkeypatch):
     from infer_stack.kube import inspect
     w = Worker()
-    prepared = onboarding_plan(w.manager, w.manager, server='https://aiq-gpu:6443', node='namek')
+    prepared = onboarding_plan(w.manager, w.manager, server='https://gpu-control:6443', node='gpu-worker-1')
     w.nodes[1]['status']['allocatable']['nvidia.com/gpu'] = '0'
     monkeypatch.setattr(k3s, 'join', lambda **kw: None)
     monkeypatch.setattr(inspect, 'inventory', lambda *a, **kw: {'device_plugin': [{'name': 'nvdp'}]})
@@ -396,7 +396,7 @@ def test_onboard_does_not_accept_existing_other_node_gpus(monkeypatch):
 def test_onboard_uses_shared_plugin_and_kubeai_installers(monkeypatch):
     from infer_stack.kube import inspect, operations
     w = Worker()
-    prepared = onboarding_plan(w.manager, w.manager, server='https://aiq-gpu:6443', node='namek')
+    prepared = onboarding_plan(w.manager, w.manager, server='https://gpu-control:6443', node='gpu-worker-1')
     plugin_calls, chart_calls = [], []
     monkeypatch.setattr(k3s, 'join', lambda **kw: None)
     monkeypatch.setattr(inspect, 'inventory', lambda *a, **kw: {
@@ -428,7 +428,7 @@ def test_onboard_kwconf_plan_and_apply_from_root(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(k3s, 'join', lambda **kw: joins.append(kw))
     monkeypatch.setattr(inspect, 'inventory', lambda *a, **kw: {
         'device_plugin': [{'name': 'nvdp'}], 'kubeai': {'crd': True, 'namespace_exists': True}})
-    args = ['kube', 'k3s', 'onboard', 'namek', '--server=https://aiq-gpu:6443',
+    args = ['kube', 'k3s', 'onboard', 'gpu-worker-1', '--server=https://gpu-control:6443',
             f'--kubeconfig={admin}', f'--token-file={token}', '--namespace=default',
             '--base-url=http://kubeai/openai/v1', '--json']
     ManageCLI.main(argv=args)
@@ -441,7 +441,7 @@ def test_onboard_kwconf_plan_and_apply_from_root(tmp_path, monkeypatch, capsys):
     assert len(joins) == 1 and not w.resources
     token.chmod(0o644)
     with pytest.raises(SystemExit, match='private'):
-        K3sOnboardCLI.main(argv=False, node='namek', server='https://aiq-gpu:6443',
+        K3sOnboardCLI.main(argv=False, node='gpu-worker-1', server='https://gpu-control:6443',
                           kubeconfig=str(admin), token_file=str(token))
 
 
@@ -514,7 +514,7 @@ def test_join_bundle_private_refresh_and_interrupted_retry(tmp_path):
             return ''
         return yaml.safe_dump(original) if args[-1] == str(k3s.K3S_KUBECONFIG) else 'SECRET-TOKEN'
     path = tmp_path / 'bundle'
-    result = k3s.export_join_info(server='https://aiq-gpu:6443', directory=path, run=run)
+    result = k3s.export_join_info(server='https://gpu-control:6443', directory=path, run=run)
     assert path.stat().st_mode & 0o777 == 0o700
     assert all(p.stat().st_mode & 0o777 == 0o600 for p in path.iterdir())
     assert (path / 'token').read_text().strip() == 'SECRET-TOKEN'
@@ -522,11 +522,11 @@ def test_join_bundle_private_refresh_and_interrupted_retry(tmp_path):
     assert original['clusters'][0]['cluster']['server'] == 'https://127.0.0.1:6443'
     assert 'SECRET-TOKEN' not in json.dumps(result) and 'ADMIN-PRIVATE-KEY' not in json.dumps(result)
     (path / 'token').unlink()  # interrupted write resumes from owned manifest
-    k3s.export_join_info(server='https://aiq-gpu:6443', directory=path, run=run)
+    k3s.export_join_info(server='https://gpu-control:6443', directory=path, run=run)
     assert (path / 'token').exists()
     original['clusters'][0]['cluster']['certificate-authority-data'] = 'different-CA'
     with pytest.raises(RuntimeError, match='different cluster'):
-        k3s.export_join_info(server='https://aiq-gpu:6443', directory=path, run=run)
+        k3s.export_join_info(server='https://gpu-control:6443', directory=path, run=run)
 
 
 def test_join_bundle_refuses_unrelated_directory_and_agent(tmp_path):
@@ -541,16 +541,16 @@ def test_join_bundle_refuses_unrelated_directory_and_agent(tmp_path):
         return yaml.safe_dump({'current-context': 'default', 'contexts': [{'name': 'default', 'context': {'cluster': 'default'}}],
                               'clusters': [{'name': 'default', 'cluster': {'certificate-authority-data': 'CA'}}]})
     with pytest.raises(RuntimeError, match='nonempty'):
-        k3s.export_join_info(server='https://aiq-gpu:6443', directory=path, run=run)
+        k3s.export_join_info(server='https://gpu-control:6443', directory=path, run=run)
     assert (path / 'important').read_text() == 'preserve me'
     def inactive(args):
         raise RuntimeError('inactive')
     with pytest.raises(RuntimeError, match='local K3s server'):
-        k3s.export_join_info(server='https://aiq-gpu:6443', directory=path, run=inactive)
+        k3s.export_join_info(server='https://gpu-control:6443', directory=path, run=inactive)
 
 
 def test_join_bundle_kwconf_plan_reads_no_credentials(tmp_path, monkeypatch, capsys):
     from infer_stack.cli import ManageCLI
     monkeypatch.setattr(k3s, 'export_join_info', lambda **kw: pytest.fail('plan read credentials'))
-    ManageCLI.main(argv=['kube', 'k3s', 'export', '--server=https://aiq-gpu:6443', f'--directory={tmp_path}', '--plan', '--apply'])
+    ManageCLI.main(argv=['kube', 'k3s', 'export', '--server=https://gpu-control:6443', f'--directory={tmp_path}', '--plan', '--apply'])
     assert 'No credentials read or written' in capsys.readouterr().out

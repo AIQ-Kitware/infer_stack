@@ -1,4 +1,4 @@
-# Leasing demo — deploy a model behind Open WebUI (yardrat)
+# Leasing demo — deploy a model behind Open WebUI
 
 A worked example for running multiple models side by side. For a shorter first
 run using automatic model suggestions, see the
@@ -6,7 +6,7 @@ run using automatic model suggestions, see the
 This guide deliberately builds the catalog by hand so you can see how model
 sources, endpoints, reclaim policies and GPU placement relate.
 
-Validated against **yardrat**: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
+Validated on a heterogeneous workstation: GPU 0 Quadro RTX 8000 (48 GiB, free), GPU 1
 Quadro RTX 5000 (16 GiB, display-attached). Both Turing (sm_75): **fp16 only**,
 so every vLLM endpoint pins `--dtype=half`.
 
@@ -258,7 +258,7 @@ its own name:
 > **One model per GPU.** Placement is whole-GPU: each model lands on its own GPU,
 > and `--gpu-mem` is only vLLM's reservation *within* that GPU, not a knob to pack
 > two models onto one. So the first model takes GPU 0 and the second takes GPU 1
-> — including yardrat's display-attached GPU 1, since placement uses **every** GPU
+> — including the example workstation's display-attached GPU 1, since placement uses **every** GPU
 > by default (so single-GPU hosts work too). Want to keep the monitor's GPU free?
 > `infer-stack config set skip_display_gpus true` (or `--skip-display-gpus` per
 > command) — then a second model has nowhere to go and `acquire` fails fast.

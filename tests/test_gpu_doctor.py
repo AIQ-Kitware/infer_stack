@@ -1,7 +1,7 @@
 """
 The checks that tell a wedged GPU from a lying gauge.
 
-Every case here is one that actually happened on aiq-gpu, twice. The one that
+Every case here is one that actually happened on a real GPU host, twice. The one that
 matters most is ``test_unprivileged_holder_check_is_unknown_not_clear``:
 unprivileged ``lsof``/``fuser`` see only the caller's own processes, so they
 reported "nothing holds it" while ``nvidia-smi -r`` said ``In use by another

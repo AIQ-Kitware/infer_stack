@@ -16,7 +16,7 @@ implementation, now in design §2/§3: the automatically-enriched floor gates
 ELIGIBILITY only — a floored-but-undeclared deployment keeps legacy
 index-order selection, so merely downloading weights never moves an
 existing catalog's deployments on a host where everything fits.
-**Origin:** eval_audit Qwen3.5 small-model planning (yardrat, heterogeneous
+**Origin:** eval_audit Qwen3.5 small-model planning (gpu-worker-2, heterogeneous
 2-GPU host). Written down so the objective survives even if this particular
 plan gets reconsidered.
 
@@ -61,7 +61,7 @@ otherwise.
 
 ## Motivating scenario
 
-yardrat has two GPUs:
+The motivating workstation (anonymized as `gpu-worker-2`) has two GPUs:
 
 | idx | card | VRAM | note |
 |-----|------|------|------|
@@ -191,7 +191,7 @@ Within the existing three-tier structure of `plan_placement()`:
   needs it. This mirrors `suggest._host_gpus()`'s smallest-that-fits logic.
   **Undeclared deployments keep legacy index-order first-fit** — not
   best-fit — so pre-declaration catalogs place byte-identically (an
-  undeclared 9B on yardrat still lands on GPU 0 exactly as today, rather
+  undeclared 9B on gpu-worker-2 still lands on GPU 0 exactly as today, rather
   than being "best-fit" onto the 16-GiB card it can't run on).
 - **Pinned tier wins over new declarations:** an already-realized deployment
   keeps its persisted GPUs even if a newly added `min_vram_gib` says
@@ -271,7 +271,7 @@ lasts. Fine at this scale.
 
 - Extend `simulate_inventory` to accept heterogeneous specs
   (e.g. `'48,16'` — comma-separated per-GPU GiB) so tests and demos can model
-  yardrat exactly.
+  gpu-worker-2 exactly.
 - New cases in `tests/test_leasing_placement.py`:
   - 9B(24 GiB) + 4B(12) + 0.8B(3) on `'48,16'` → 9B→GPU0, one small→GPU1,
     rest queue; **never** 9B→GPU1.
@@ -288,7 +288,7 @@ lasts. Fine at this scale.
   - Floor clamp: a declared guess *below* the weight-bytes floor is raised
     to the floor (a 9B declared at 8 GiB still never lands on the 16-GiB
     card).
-- End-to-end (yardrat, manual): two concurrent schedules, no
+- End-to-end (gpu-worker-2, manual): two concurrent schedules, no
   `INFER_STACK_ALLOWED_GPUS` set, 9B + smalls in one catalog; observe smalls
   land on GPU 1, 9B on GPU 0.
 
@@ -312,7 +312,7 @@ lasts. Fine at this scale.
   guesses for the Qwen3.5 family (weight bytes + margin); tighten via
   `placement measure` only if a guess fails; retire the plan to pin
   small-model runbooks via `INFER_STACK_ALLOWED_GPUS`; then the 9B re-run
-  and the small-model batch share yardrat under concurrent schedules with
+  and the small-model batch share gpu-worker-2 under concurrent schedules with
   no GPU indices anywhere in config.
 - **Phase 5 — future.** Co-hosting opt-in (multiple vLLM servers on one big
   GPU for very small models — the greedy capacity accounting from Phase 2 is
