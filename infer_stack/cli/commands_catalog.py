@@ -467,7 +467,7 @@ class CatalogImportCLI(_CatalogCommon, _SimulateHardwareMixin,
         path = _catalog_path(config)
         if name in BUILTIN_CATALOGS:
             preset = resources.files('infer_stack').joinpath(
-                'templates', BUILTIN_CATALOGS[name])
+                'templates').joinpath(BUILTIN_CATALOGS[name])
             fragment = yaml.safe_load(preset.read_text(encoding='utf-8')) or {}
         else:
             pool = builtin_pool()

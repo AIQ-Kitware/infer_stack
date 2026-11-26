@@ -195,7 +195,9 @@ def test_catalog_to_ledger_coalesces(catalog):
     b = ledger.acquire('bob', catalog.resolve_names(['qwen-coder-alias']))
     # alias resolves to the same deployment identity -> one deployment, demand 2
     assert a.deployments[0].id == b.deployments[0].id
-    assert ledger.get_deployment(a.deployments[0].id).demand == 2
+    deployment = ledger.get_deployment(a.deployments[0].id)
+    assert deployment is not None
+    assert deployment.demand == 2
 
 
 def test_catalog_ollama_bundle_one_daemon(catalog):
@@ -204,6 +206,7 @@ def test_catalog_ollama_bundle_one_daemon(catalog):
     # two tags, one daemon -> a single deployment serving both endpoints
     assert len(res.deployments) == 1
     deployment = ledger.get_deployment(res.deployments[0].id)
+    assert deployment is not None
     assert set(deployment.served) == {'qwen-small', 'smollm'}
 
 

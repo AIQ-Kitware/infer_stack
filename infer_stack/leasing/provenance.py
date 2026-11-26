@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from typing import Any
 
 from .endpoints import ExternalTarget
 from .launch import VLLM_DEFAULTS
@@ -27,15 +28,17 @@ def _envelope(payload, reasons):
             'immutable': not reasons, 'unknown_reasons': reasons}
 
 
-def managed_provenance(engine, spec, served):
+def managed_provenance(engine: str, spec: dict[str, Any], served: dict[str, Any]):
     """Project either a resolved request or its assigned deployment.
 
     Hash all launch options conservatively, including environment and custom
     commands, instead of publishing them in logs. Placement, reclaim policy,
     aliases, ports and credentials used by the gateway are not model identity.
     """
-    runtime = {**(VLLM_DEFAULTS if engine == 'vllm' else {}),
-               **spec.get('runtime', {})}
+    runtime: dict[str, Any] = {
+        **(VLLM_DEFAULTS if engine == 'vllm' else {}),
+        **spec.get('runtime', {}),
+    }
     revision = spec.get('revision')
     image = runtime.get('image')
     reasons = []

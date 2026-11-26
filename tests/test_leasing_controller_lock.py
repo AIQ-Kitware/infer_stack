@@ -40,8 +40,8 @@ class OverlapBackend(SimpleAdmission):
         self.active = 0
         self.max_active = 0
         self._guard = threading.Lock()
-        self.last_unplaced: tuple = ()
-        self.last_errors: tuple = ()
+        self.last_unplaced: set[str] = set()
+        self.last_errors: list[str] = []
         self.last_assignments: dict = {}
 
     def converge(self, desired, *, apply: bool = True, placement=None) -> None:
@@ -184,8 +184,8 @@ class SharedOverlapBackend(SimpleAdmission):
     def __init__(self, shared: dict, guard: threading.Lock) -> None:
         self.shared = shared
         self.guard = guard
-        self.last_unplaced: tuple = ()
-        self.last_errors: tuple = ()
+        self.last_unplaced: set[str] = set()
+        self.last_errors: list[str] = []
         self.last_assignments: dict = {}
         self._ids: set = set()
 

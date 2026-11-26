@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -505,7 +506,7 @@ def test_tui_drag_resizes_sidebar():
 
 
 def test_tui_pane_scoped_action_buttons():
-    from textual.widgets import Button
+    from textual.widgets import Button, DataTable
 
     from infer_stack.leasing import LeaseState
     from infer_stack.tui import InferStackTUI
@@ -521,7 +522,7 @@ def test_tui_pane_scoped_action_buttons():
             assert app.query_one('#btn-acquire', Button)
             assert app.query_one('#btn-release', Button)
             assert app.query_one('#btn-evict', Button)
-            app.query_one('#endpoints').move_cursor(row=0)
+            app.query_one('#endpoints', DataTable).move_cursor(row=0)
             await pilot.click('#btn-acquire')
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -992,7 +993,9 @@ def test_tui_instance_rows_say_what_each_serves():
         async with app.run_test() as pilot:
             await pilot.pause()
             app._last_deployments = [SimpleNamespace(id='grp-1', served={'qwen': {}})]
-            engine, gateway = app._ps_rows(instances)
+            rows = app._ps_rows(instances)
+            assert rows is not None
+            engine, gateway = rows
             assert engine['serves'] == 'qwen'
             assert engine['status'] == 'restarting (CrashLoopBackOff, 2 restarts)'
             # Shown in local time, like every other time a person reads here.
@@ -2078,7 +2081,7 @@ def test_tui_refusals_pop_up_instead_of_doing_nothing():
                             proc_factory=lambda svc: None)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.catalog_path = 'catalog.yaml'     # editing is otherwise refused earlier
+            app.catalog_path = Path('catalog.yaml')     # editing is otherwise refused earlier
             notifications = []
             app.notify = lambda message, **kw: notifications.append((message, kw))
             app.query_one('#endpoints').focus()
@@ -2250,7 +2253,7 @@ def test_an_edit_made_outside_the_tui_appears_on_the_next_refresh(tmp_path):
             assert 'qwen-extra' in app._endpoint_names
 
             refused = []
-            app._refuse = lambda msg, **kw: refused.append(msg)
+            app._refuse = lambda message, **kw: refused.append(message)
             catalog_path.write_text('endpoints: [not, a, mapping\n')
             app.action_refresh()
             app.action_refresh()
@@ -2400,11 +2403,16 @@ def test_tui_log_pane_grows_when_the_terminal_does():
                             proc_factory=lambda svc: None)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
-            small = app.query_one('#docker-tabs').styles.height.value
+            tabs = app.query_one('#docker-tabs')
+            height = tabs.styles.height
+            assert height is not None
+            small = height.value
             await pilot.resize_terminal(200, 50)
             await pilot.pause()
-            assert app.query_one('#docker-tabs').styles.height.value > small
-            assert app.query_one('#docker-tabs').styles.height.value == app._log_height(50)
+            height = tabs.styles.height
+            assert height is not None
+            assert height.value > small
+            assert height.value == app._log_height(50)
 
     _run(scenario)
 

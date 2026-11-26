@@ -78,6 +78,7 @@ def test_litellm_route_opt_in_explicitly_allows_request_field():
 def test_static_catalog_route_advertises_efforts():
     cat = _catalog()
     route = compose_catalog_route('hq', cat.resolve_endpoint('hq').to_request())
+    assert route is not None
     assert route.entry()['model_info']['reasoning_effort_levels'] == [
         'low', 'medium', 'xhigh']
 
@@ -92,7 +93,9 @@ def test_dynamic_route_and_registry_keep_per_alias_capabilities():
     assert routes[0].entry()['model_info']['reasoning_effort_levels'] == [
         'low', 'medium', 'xhigh']
     rows = remembered_rows([dep], {'d': [0]}, defined=set())
-    assert registry_route('hq', rows['hq']).entry()['model_info'][
+    route = registry_route('hq', rows['hq'])
+    assert route is not None
+    assert route.entry()['model_info'][
         'reasoning_effort_levels'] == ['low', 'medium', 'xhigh']
     # An already-running deployment created before the new metadata remains
     # visible when the catalog's current definition now supplies the levels.

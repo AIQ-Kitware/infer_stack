@@ -110,7 +110,7 @@ def test_a_docker_container_holding_a_device_is_named():
     assert 'docker container' in h.where
 
 
-def test_sampling_takes_the_minimum_so_one_spike_is_not_load():
+def test_sampling_takes_the_minimum_so_one_spike_is_not_load(monkeypatch):
     """Utilization is a windowed average; a spike right after a process exits
     is not sustained load."""
     from infer_stack import gpu_doctor
@@ -119,12 +119,8 @@ def test_sampling_takes_the_minimum_so_one_spike_is_not_load():
         '0, 0, 2, P8\n',
         '0, 0, 2, P8\n',
     ])
-    gpu_doctor._run = lambda *a, **k: next(seq)
-    try:
-        got = gpu_doctor.sample_gpus(samples=3, interval=0, _sleep=lambda s: None)
-    finally:
-        import importlib
-        importlib.reload(gpu_doctor)
+    monkeypatch.setattr(gpu_doctor, '_run', lambda *a, **k: next(seq))
+    got = gpu_doctor.sample_gpus(samples=3, interval=0, _sleep=lambda s: None)
     assert len(got) == 1
     assert got[0].util == 0, 'a single 100% sample must not read as busy'
 

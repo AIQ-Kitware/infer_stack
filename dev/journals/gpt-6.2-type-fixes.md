@@ -1,0 +1,11 @@
+# Type-check cleanup
+
+## 2026-11-25 19:00:51 -0500
+
+Model: ChatGPT (GPT-6.2); runtime configuration beyond the model name not exposed.
+
+The user supplied `ty check infer_stack tests/` with 175 errors and one renamed-rule warning and asked to fix the errors. I reconstructed the November 25 source archive at `0b637511df60` with the later registry, benchmark, logging and documentation overlays. Every reported error line matched that reconstructed source. This is intentionally a type-contract cleanup rather than a behavioral refactor.
+
+The convergence scaffold now describes the sidecar path as a property, as its concrete implementations do. The control HTTP handler uses a read-only narrowed accessor instead of overriding the standard library's writable `server` attribute. Catalog resources are joined one component at a time for compatibility with the Traversable API. Serving provenance describes the heterogeneous launch mapping explicitly, preserving its digest construction; the profile picker checks the empty selection explicitly. Test fixtures now model actual backend collection types, signatures and deployment objects; optional values are asserted before dereferencing; heterogeneous wire-format data and fixed-shape fixture records have appropriate types. The existing import-ignore setting is only renamed, not broadened. No type-ignore comments were added.
+
+Validation: Python 3.10 grammar and diff whitespace checks passed. Runtime tests were executed with an import-only ubelt placeholder (the dependency is absent, and the test fixture isolates config/data paths). kwconf and textual are unavailable, as is the ty executable; attempts to install packages failed because package index access is unavailable. Two Compose test failures (empty converge restarting the front door and redundant diff prompt) also reproduce on the unmodified reconstructed baseline; they are not fixed here. The source archive and overlays were modified in a temporary directory, not a git worktree. The overlay only contains paths changed during this cleanup. Run `ty check infer_stack tests/` with the project's actual installed dependencies after applying it; the full static check is still an open validation gate.

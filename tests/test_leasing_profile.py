@@ -323,6 +323,7 @@ def test_cli_catalog_edit_then_acquire_needs_no_publish_step(tmp_path, monkeypat
         argv=['beta', '--ledger', db, '--catalog', str(f), '--no-wait', '--yes']
     ) == 0
     profile = Ledger(SqliteStore(db)).profile()
+    assert profile is not None
     assert set(CatalogUnion.from_sources(profile['catalogs']).endpoints) == {
         'alpha', 'beta'
     }
@@ -419,7 +420,9 @@ def test_config_publish_cli_publishes_a_union_and_rejects_conflicts(tmp_path, mo
     fc.write_text(yaml.safe_dump(cat('alpha', source='other')))
 
     assert cl.ConfigPublishCLI.main(argv=['--ledger', db, str(fa), str(fb), '--yes']) == 0
-    assert len(Ledger(SqliteStore(db)).profile()['catalogs']) == 2
+    profile = Ledger(SqliteStore(db)).profile()
+    assert profile is not None
+    assert len(profile['catalogs']) == 2
     with pytest.raises(SystemExit, match='defined differently'):
         cl.ConfigPublishCLI.main(argv=['--ledger', db, str(fa), str(fc), '--yes'])
 

@@ -80,6 +80,7 @@ def test_acquire_realizes_and_ready():
     gid = out.deployments[0].id
     assert backend.realize_calls == [gid]
     assert backend.observe() == {gid}
+    assert out.wait is not None
     assert out.wait.ready is True
 
 
@@ -177,6 +178,7 @@ def test_wait_ready_becomes_ready():
 
     ctl = Controller(ledger, backend, sleep=sleep)
     out = ctl.acquire('alice', [vreq('qwen')], timeout=100, interval=2)
+    assert out.wait is not None
     assert out.wait.ready is True
     assert state['n'] == 1                               # one poll, then ready
 
@@ -242,6 +244,7 @@ def test_controller_with_catalog():
     assert len(out.deployments) == 1
     assert backend.realize_calls == [out.deployments[0].id]
     assert set(out.deployments[0].served) == {'e1', 'e2'}
+    assert out.wait is not None
     assert out.wait.ready is True
 
 

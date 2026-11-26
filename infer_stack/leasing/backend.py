@@ -497,12 +497,14 @@ class ConvergeScaffold:
     _approve_title = 'infer-stack will update the rendered state'
     _state_noun = 'rendered state'
 
-    # Provided by subclasses, as the docstring says. Annotation-only, so
-    # nothing is created at runtime -- this states the contract to a type
-    # checker, which otherwise flags every use of them in this class.
+    # Provided by subclasses, as the docstring says.
     state_dir: Path
     assume_yes: bool
-    _state_file: Path
+
+    @property
+    def _state_file(self) -> Path:
+        """Read-only sidecar path, supplied by backends that use it."""
+        raise NotImplementedError
 
     @staticmethod
     def _atomic_write(path, text: str) -> None:

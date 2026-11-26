@@ -11,8 +11,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     'maya_inkling_launcher', ROOT / 'infer_stack/runtime_images/maya_inkling/launcher.py')
+assert SPEC is not None
+loader = SPEC.loader
+assert loader is not None
 launcher = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(launcher)
+loader.exec_module(launcher)
 
 
 @pytest.mark.parametrize('variant, context, draft', [
@@ -54,7 +57,9 @@ def test_maya_managed_profile(variant, context, draft):
     assert devices[0]['device_ids'] == ['1']
     assert svc['healthcheck']['test'][-1] == 'http://localhost:8000/health'
     assert launcher.settings(svc['environment'])[:4] == (draft, context, 8000, name)
-    route = compose_catalog_route(name, req).entry()
+    gateway_route = compose_catalog_route(name, req)
+    assert gateway_route is not None
+    route = gateway_route.entry()
     assert route['litellm_params']['model'] == 'openai/' + name
     assert route['litellm_params']['allowed_openai_params'] == ['reasoning_effort']
     assert route['model_info']['max_input_tokens'] == context

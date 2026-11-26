@@ -407,10 +407,9 @@ class _ProfileBrowser(ModalScreen):
         row = self._selected_row()
         state = self._state(row) if row else ''
         self.query_one('#profile-import', Button).disabled = state != 'Available'
-        self.query_one('#profile-edit', Button).disabled = (
-            state != 'Available' or not row['backend_compatible'])
-        self.query_one('#profile-acquire', Button).disabled = (
-            state != 'Available' or not row['backend_compatible'])
+        can_acquire = row is not None and state == 'Available' and row['backend_compatible']
+        self.query_one('#profile-edit', Button).disabled = not can_acquire
+        self.query_one('#profile-acquire', Button).disabled = not can_acquire
         if not row:
             detail = 'No matching profiles. Try another search.'
         else:

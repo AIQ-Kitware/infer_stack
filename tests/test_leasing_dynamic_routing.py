@@ -374,6 +374,7 @@ def test_reconcile_delete_tolerates_already_gone(tmp_path, monkeypatch):
         def post(self, url, **kw):
             if url.endswith('/model/delete'):
                 rid = (kw.get('json') or {}).get('id')
+                assert isinstance(rid, str)
                 self.calls.append(('delete', rid))
                 return FakeResp(
                     400, {'error': f'Model with id={rid} not found in db'}

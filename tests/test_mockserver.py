@@ -22,14 +22,16 @@ from infer_stack.mockserver import (
 )
 
 
-COHORT = {
+QUESTIONS = {f'q{i}': f'Question number {i} about topic {i}?' for i in range(40)}
+
+COHORT: dict[str, object] = {
     'seed': 'test-seed',
     'models': {
         'weak': {'ability': 0.05},
         'middling': {'ability': 0.5},
         'strong': {'ability': 0.95},
     },
-    'questions': {f'q{i}': f'Question number {i} about topic {i}?' for i in range(40)},
+    'questions': QUESTIONS,
     'answer_key': {f'q{i}': f'gold-{i}' for i in range(40)},
 }
 
@@ -41,7 +43,7 @@ def _simulator(config=None):
 
 
 def _ask(sim, model_id, question_id, temperature=0.0, sample_index=0):
-    messages = [{'role': 'user', 'content': COHORT['questions'][question_id]}]
+    messages = [{'role': 'user', 'content': QUESTIONS[question_id]}]
     return sim.complete(
         model_id, messages, temperature=temperature, sample_index=sample_index
     )
@@ -60,7 +62,7 @@ def test_identical_requests_give_identical_answers():
 
 def test_two_servers_with_the_same_seed_agree():
     a, b = _simulator(), _simulator()
-    for question_id in list(COHORT['questions'])[:10]:
+    for question_id in list(QUESTIONS)[:10]:
         assert _ask(a, 'strong', question_id).text == _ask(
             b, 'strong', question_id
         ).text
@@ -72,7 +74,7 @@ def test_changing_the_seed_changes_the_world():
     changed = _simulator(other)
     answers_differ = any(
         _ask(baseline, 'middling', q).text != _ask(changed, 'middling', q).text
-        for q in list(COHORT['questions'])[:20]
+        for q in list(QUESTIONS)[:20]
     )
     assert answers_differ
 
@@ -87,9 +89,9 @@ def test_ability_orders_accuracy_across_the_cohort():
     rates = {}
     for model_id in ('weak', 'middling', 'strong'):
         correct = sum(
-            _ask(sim, model_id, q).is_correct for q in COHORT['questions']
+            _ask(sim, model_id, q).is_correct for q in QUESTIONS
         )
-        rates[model_id] = correct / len(COHORT['questions'])
+        rates[model_id] = correct / len(QUESTIONS)
 
     assert rates['weak'] < rates['middling'] < rates['strong'], rates
 
@@ -98,8 +100,8 @@ def test_difficulty_is_shared_across_models():
     # Errors must be correlated across the cohort; independent errors would
     # leave a cohort-level fit with nothing to learn.
     sim = _simulator()
-    hard = max(COHORT['questions'], key=sim.difficulty_for)
-    easy = min(COHORT['questions'], key=sim.difficulty_for)
+    hard = max(QUESTIONS, key=sim.difficulty_for)
+    easy = min(QUESTIONS, key=sim.difficulty_for)
     assert sim.difficulty_for(hard) > sim.difficulty_for(easy)
     # The same question object is scored identically regardless of model.
     assert sim.difficulty_for(hard) == sim.difficulty_for(hard)
@@ -123,13 +125,13 @@ def test_sampling_diverges_and_tracks_the_consistency_rate():
     agreements = {}
     for model_id in ('weak', 'strong'):
         agree = 0
-        for question_id in COHORT['questions']:
+        for question_id in QUESTIONS:
             base = _ask(sim, model_id, question_id, temperature=0.7)
             resample = _ask(
                 sim, model_id, question_id, temperature=0.7, sample_index=1
             )
             agree += (base.text == resample.text)
-        agreements[model_id] = agree / len(COHORT['questions'])
+        agreements[model_id] = agree / len(QUESTIONS)
 
     assert agreements['strong'] > agreements['weak'], agreements
     # Not degenerate in either direction.
@@ -156,14 +158,14 @@ def test_rephrased_prompts_about_a_known_question_share_an_identity():
     # must be able to agree with its own direct answer; that only works if
     # both calls resolve to the same latent question.
     sim = _simulator()
-    direct = [{'role': 'user', 'content': COHORT['questions']['q5']}]
+    direct = [{'role': 'user', 'content': QUESTIONS['q5']}]
     wrapped = [
         {'role': 'system', 'content': 'Answer concisely.'},
         {
             'role': 'user',
             'content': (
                 f'Passage: some context.\n'
-                f'{COHORT["questions"]["q5"]}\n'
+                f'{QUESTIONS["q5"]}\n'
                 f'Answer with a short phrase.'
             ),
         },
@@ -215,7 +217,7 @@ def test_openai_chat_completions_shape():
             {
                 'model': 'strong',
                 'messages': [
-                    {'role': 'user', 'content': COHORT['questions']['q1']}
+                    {'role': 'user', 'content': QUESTIONS['q1']}
                 ],
                 'temperature': 0.0,
             },
@@ -233,7 +235,7 @@ def test_n_samples_returns_n_choices():
             {
                 'model': 'weak',
                 'messages': [
-                    {'role': 'user', 'content': COHORT['questions']['q2']}
+                    {'role': 'user', 'content': QUESTIONS['q2']}
                 ],
                 'temperature': 0.7,
                 'n': 3,
@@ -286,7 +288,7 @@ def test_repeated_sampling_requests_diverge_over_http():
     # self-consistency score would be identically 1.0.
     body = {
         'model': 'weak',
-        'messages': [{'role': 'user', 'content': COHORT['questions']['q4']}],
+        'messages': [{'role': 'user', 'content': QUESTIONS['q4']}],
         'temperature': 0.7,
     }
     with MockServer(COHORT, port=0) as server:
@@ -302,7 +304,7 @@ def test_repeated_sampling_requests_diverge_over_http():
 def test_repeated_greedy_requests_stay_identical_over_http():
     body = {
         'model': 'weak',
-        'messages': [{'role': 'user', 'content': COHORT['questions']['q4']}],
+        'messages': [{'role': 'user', 'content': QUESTIONS['q4']}],
         'temperature': 0.0,
     }
     with MockServer(COHORT, port=0) as server:
@@ -318,12 +320,12 @@ def test_repeated_greedy_requests_stay_identical_over_http():
 def test_a_strong_model_resamples_more_stably_than_a_weak_one():
     def _spread(model_id, server):
         distinct = 0
-        for question_id in list(COHORT['questions'])[:25]:
+        for question_id in list(QUESTIONS)[:25]:
             body = {
                 'model': model_id,
                 'messages': [
                     {'role': 'user',
-                     'content': COHORT['questions'][question_id]}
+                     'content': QUESTIONS[question_id]}
                 ],
                 'temperature': 0.7,
             }
@@ -349,7 +351,7 @@ def test_n_greater_than_one_reserves_a_contiguous_block():
     # cannot silently share sample indices.
     body = {
         'model': 'weak',
-        'messages': [{'role': 'user', 'content': COHORT['questions']['q6']}],
+        'messages': [{'role': 'user', 'content': QUESTIONS['q6']}],
         'temperature': 0.7,
         'n': 3,
     }
@@ -406,7 +408,7 @@ def test_completions_endpoint_shape():
     with MockServer(COHORT, port=0) as server:
         body = _post(
             server.url + '/v1/completions',
-            {'model': 'strong', 'prompt': COHORT['questions']['q1'],
+            {'model': 'strong', 'prompt': QUESTIONS['q1'],
              'temperature': 0.0},
         )
     assert body['object'] == 'text_completion'
@@ -416,7 +418,7 @@ def test_completions_endpoint_shape():
 
 
 def test_completions_and_chat_agree_on_the_same_prompt():
-    prompt = COHORT['questions']['q3']
+    prompt = QUESTIONS['q3']
     with MockServer(COHORT, port=0) as server:
         completion = _post(
             server.url + '/v1/completions',
@@ -433,7 +435,7 @@ def test_completions_and_chat_agree_on_the_same_prompt():
 
 def test_completions_n_indices_are_per_response():
     # OpenAI indices are 0..n-1 within a response, not a running counter.
-    body = {'model': 'weak', 'prompt': COHORT['questions']['q2'],
+    body = {'model': 'weak', 'prompt': QUESTIONS['q2'],
             'temperature': 0.7, 'n': 3}
     with MockServer(COHORT, port=0) as server:
         first = _post(server.url + '/v1/completions', body)
@@ -460,7 +462,7 @@ def test_sycophant_mode_always_agrees():
     with MockServer(_mode_cohort('sycophant'), port=0) as server:
         texts = {
             _post(server.url + '/v1/completions',
-                  {'model': 'm', 'prompt': COHORT['questions'][f'q{i}']}
+                  {'model': 'm', 'prompt': QUESTIONS[f'q{i}']}
                   )['choices'][0]['text']
             for i in range(8)
         }
@@ -481,7 +483,7 @@ def test_echo_mode_returns_the_prompt_it_was_sent():
 def test_thinking_mode_emits_a_strippable_reasoning_segment():
     with MockServer(_mode_cohort('thinking'), port=0) as server:
         text = _post(server.url + '/v1/completions',
-                     {'model': 'm', 'prompt': COHORT['questions']['q1']}
+                     {'model': 'm', 'prompt': QUESTIONS['q1']}
                      )['choices'][0]['text']
     assert text.startswith('<think>')
     assert '</think>' in text
@@ -490,14 +492,14 @@ def test_thinking_mode_emits_a_strippable_reasoning_segment():
 def test_truncated_mode_reports_length_not_stop():
     with MockServer(_mode_cohort('truncated'), port=0) as server:
         choice = _post(server.url + '/v1/completions',
-                       {'model': 'm', 'prompt': COHORT['questions']['q1']}
+                       {'model': 'm', 'prompt': QUESTIONS['q1']}
                        )['choices'][0]
     assert choice['finish_reason'] == 'length'
 
 
 def test_modes_are_still_deterministic():
     for mode in ('sycophant', 'magic_8ball', 'pirate', 'confidently_wrong'):
-        payload = {'model': 'm', 'prompt': COHORT['questions']['q2']}
+        payload = {'model': 'm', 'prompt': QUESTIONS['q2']}
         with MockServer(_mode_cohort(mode), port=0) as server:
             first = _post(server.url + '/v1/completions', payload)
         with MockServer(_mode_cohort(mode), port=0) as server:

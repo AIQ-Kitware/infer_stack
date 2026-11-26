@@ -2,6 +2,7 @@
 import copy
 import json
 from types import SimpleNamespace
+from typing import TypedDict
 
 import pytest
 import yaml
@@ -24,12 +25,21 @@ from infer_stack.kube.worker import (
 )
 
 
+class _Device(TypedDict):
+    uuid: str
+    product: str
+    memory_mib: int
+
+
 class Worker:
     """Commands traverse real rendering and operations; only the cluster is fake."""
     def __init__(self, name='namek', count=1, products=None):
         self.name, self.count = name, count
-        self.devices = [{'uuid': f'GPU-{i}', 'product': p, 'memory_mib': 24576 - (i * 8192 if products and len(set(products)) > 1 else 0)}
-                        for i, p in enumerate(products or ['NVIDIA RTX 3090'] * count)]
+        self.devices: list[_Device] = [
+            {'uuid': f'GPU-{i}', 'product': p,
+             'memory_mib': 24576 - (i * 8192 if products and len(set(products)) > 1 else 0)}
+            for i, p in enumerate(products or ['NVIDIA RTX 3090'] * count)
+        ]
         self.nodes = [node('aiq-gpu', count=4), node(name, count=count)]
         self.nodes[1]['metadata']['labels']['nvidia.com/gpu.product'] = self.devices[0]['product'].replace(' ', '-') if self.devices else 'NVIDIA-RTX-3090'
         for n in self.nodes:
@@ -125,7 +135,7 @@ def run_test(worker, **kwargs):
     return acceptance(worker.manager, node=worker.name, namespace='default', release='kubeai',
                       expected_gpus=worker.count, base_url='http://kubeai/openai/v1',
                       run_id=kwargs.pop('run_id', 'abcdef123456'), http=worker.http,
-                      expected_devices=worker.devices, **kwargs)
+                      expected_devices=[dict(device) for device in worker.devices], **kwargs)
 
 
 @pytest.mark.parametrize('name,products', [
@@ -178,7 +188,8 @@ def test_generation_failure_and_device_mismatch_cleanup():
     with pytest.raises(RuntimeError, match='no choices'):
         run_test(w)
     assert not w.resources
-    w.devices.append(dict(w.devices[0], uuid='GPU-extra'))
+    w.devices.append({'uuid': 'GPU-extra', 'product': w.devices[0]['product'],
+                      'memory_mib': w.devices[0]['memory_mib']})
     with pytest.raises(RuntimeError, match='identities differ'):
         run_test(w)
     assert not w.resources

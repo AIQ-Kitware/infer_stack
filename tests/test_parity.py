@@ -494,8 +494,9 @@ def test_the_tui_reads_either_backend(make_stack):
             # What _render keeps, without racing the app's own refresh.
             app._last_deployments = data['deployments']
             app._last_instances = data['instances']
-            (engine,) = [r for r in app._ps_rows(data['instances'])
-                         if r['serves'] == 'one']
+            rows = app._ps_rows(data['instances'])
+            assert rows is not None
+            (engine,) = [r for r in rows if r['serves'] == 'one']
             assert engine['status'] == 'running'
             target, _ = app._resolve_log_target(ENGINE_SERVICES)
             assert target == [engine['name']]
@@ -707,7 +708,9 @@ def test_kubeai_settles_its_host_gateway_after_an_interrupted_apply(tmp_path):
     stack.front_runtime.apply = timed_out
     with pytest.raises(BackendTimeout):
         stack.acquire('one')
-    assert stack.ctl.ledger.publication_pending()['interrupted']
+    pending = stack.ctl.ledger.publication_pending()
+    assert pending is not None
+    assert pending['interrupted']
 
     samples = iter(range(1000))                    # Docker still changing
     stack.front_runtime.settle_snapshot = lambda: ((f'c{next(samples)}', 'running'),)

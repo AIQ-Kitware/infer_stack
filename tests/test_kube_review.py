@@ -1,6 +1,7 @@
 """Real-host bootstrap review regressions; no privileged host mutations."""
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_kube_readiness import HTTP, Cluster, manager, node
@@ -189,7 +190,7 @@ def test_setup_cli_is_deprecated_alias_of_install(monkeypatch):
     assert calls == [dict(argv=False, apply=True, namespace='default', release='kubeai', gpu='none', values=None, version=None)]
 
 
-def test_controller_reports_only_readiness_transitions():
+def test_controller_reports_only_readiness_transitions(monkeypatch):
     from infer_stack.leasing import (
         Catalog,
         Controller,
@@ -200,14 +201,15 @@ def test_controller_reports_only_readiness_transitions():
     from infer_stack.leasing.backend import Readiness
     catalog = Catalog.from_dict({'models': {'q': {'source': 'hf://org/model'}},
                                  'endpoints': {'qwen-coder': {'engine': 'vllm', 'model': 'q'}}})
-    controller = Controller(Ledger(SqliteStore(':memory:')), NullBackend())
+    backend = NullBackend()
+    controller = Controller(Ledger(SqliteStore(':memory:')), backend)
     deployment = controller.acquire('test', catalog.resolve_names(['qwen-coder'])).deployments[0]
     transitions = iter([Readiness(False, 'pending'), Readiness(False, 'pending'),
                         Readiness(False, 'scheduled on namek; pulling image'),
                         Readiness(False, 'scheduled on namek; pulling image'), Readiness(True, 'ok')])
-    controller.backend.probe_ready = lambda *a: next(transitions)
+    monkeypatch.setattr(backend, 'probe_ready', lambda *a: next(transitions))
     messages = []
-    controller.backend.progress = messages.append
+    monkeypatch.setattr(backend, 'progress', messages.append, raising=False)
     controller.sleep = lambda seconds: None
     assert controller.wait_ready([deployment], timeout=10).ready
     assert len(messages) == 3
@@ -216,7 +218,7 @@ def test_controller_reports_only_readiness_transitions():
 
 def test_startup_details_expose_node_image_and_replica_state():
     from infer_stack.backends.kubeai import model_startup_progress
-    pod = {'spec': {'containers': [{'image': 'vllm/vllm-openai:v0.11.2'}]}, 'status': {}}
+    pod: dict[str, Any] = {'spec': {'containers': [{'image': 'vllm/vllm-openai:v0.11.2'}]}, 'status': {}}
     assert 'waiting for scheduler' in model_startup_progress([pod])
     pod['spec']['nodeName'] = 'namek'
     assert 'scheduled on namek' in model_startup_progress([pod])

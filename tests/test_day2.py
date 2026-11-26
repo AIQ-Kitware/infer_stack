@@ -32,7 +32,9 @@ def test_log_commands_follow_the_runtime():
         'kubectl', '-n', 'kubeai', 'logs', '--tail', '0', 'model-qwen-0-abc', '--follow']
     assert history_argv(GATEWAY, tail='all', timestamps=True) == [
         'docker', 'logs', '--tail', 'all', '--timestamps', 'c0ffee1234']
-    assert follow_argv(GATEWAY)[:2] == ['docker', 'attach']
+    gateway_argv = follow_argv(GATEWAY)
+    assert gateway_argv is not None
+    assert gateway_argv[:2] == ['docker', 'attach']
     memory = Instance('grp-1', 'grp-1', 'grp-1', 'running', runtime=MEMORY)
     assert history_argv(memory) is None and follow_argv(memory) is None
 

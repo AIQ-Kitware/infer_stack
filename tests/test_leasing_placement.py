@@ -369,21 +369,16 @@ def test_the_weight_floor_is_divided_by_the_shards_not_the_gpus():
     """
     from infer_stack.leasing.placement import min_vram_per_gpu
 
-    class _D:
-        def __init__(self, **runtime):
-            self.spec = {'runtime': runtime,
-                         'placement': {'floor_vram_gib': 135.43}}
-
-    assert min_vram_per_gpu(_D()) == pytest.approx(135.43)
-    assert min_vram_per_gpu(_D(tensor_parallel_size=2)) == pytest.approx(67.715)
+    assert min_vram_per_gpu(vllm('floor', floor=135.43)) == pytest.approx(135.43)
+    assert min_vram_per_gpu(vllm('floor', floor=135.43, tp=2)) == pytest.approx(67.715)
     # Pipeline parallelism splits layers, so it splits weights too.
     assert min_vram_per_gpu(
-        _D(tensor_parallel_size=2, pipeline_parallel_size=2)
+        vllm('floor', floor=135.43, tp=2, pp=2)
     ) == pytest.approx(33.8575)
     # Data parallelism REPLICATES: every replica needs the whole model.
-    assert min_vram_per_gpu(_D(data_parallel_size=2)) == pytest.approx(135.43)
+    assert min_vram_per_gpu(vllm('floor', floor=135.43, dp=2)) == pytest.approx(135.43)
     assert min_vram_per_gpu(
-        _D(tensor_parallel_size=2, data_parallel_size=2)
+        vllm('floor', floor=135.43, tp=2, dp=2)
     ) == pytest.approx(67.715)
 
 
@@ -395,11 +390,8 @@ def test_a_declared_requirement_is_already_per_gpu():
     """
     from infer_stack.leasing.placement import min_vram_per_gpu
 
-    class _D:
-        spec = {'runtime': {'tensor_parallel_size': 2},
-                'placement': {'min_vram_gib': 90.0, 'floor_vram_gib': 135.43}}
-
-    assert min_vram_per_gpu(_D()) == pytest.approx(90.0)
+    dep = vllm('declared', tp=2, vram=90.0, floor=135.43)
+    assert min_vram_per_gpu(dep) == pytest.approx(90.0)
 
 
 def test_a_measurement_beats_the_weight_floor(tmp_path):

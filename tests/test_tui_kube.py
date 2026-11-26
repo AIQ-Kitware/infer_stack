@@ -3,6 +3,7 @@ import asyncio
 import json
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -57,7 +58,7 @@ def test_snapshot_budget_and_independent_failure():
 
 
 def test_gpu_requests_and_pod_diagnosis_include_other_namespace_usage():
-    pod = {'metadata': {'name': 'other', 'namespace': 'other'},
+    pod: dict[str, Any] = {'metadata': {'name': 'other', 'namespace': 'other'},
            'spec': {'nodeName': 'gpu-a', 'containers': [{'resources': {'limits': {'nvidia.com/gpu': 2}}}],
                     'initContainers': [{'resources': {'requests': {'nvidia.com/gpu': 3}}}]},
            'status': {'phase': 'Running'}}
@@ -162,8 +163,18 @@ def test_node_control_previews_confirms_and_reuses_manager(tmp_path):
     m = KubeManager(run=lambda args: '{"items": []}')
     m.node_lifecycle_plan = lambda name: calls.append(('plan', name)) or NodeLifecyclePlan(
         name, True, True, None, False, workload_pods=['default/q'])
-    m.detach_node_for_compose = lambda name: calls.append(('detach', name))
-    m.attach_node_from_compose = lambda name: calls.append(('attach', name))
+
+    def detach(name: str, *, timeout_seconds: int = 300) -> NodeLifecyclePlan:
+        calls.append(('detach', name))
+        return NodeLifecyclePlan(name, True, False, 'true', False)
+
+    def attach(name: str, *, timeout_seconds: int = 180) -> NodeLifecyclePlan:
+        calls.append(('attach', name))
+        return NodeLifecyclePlan(name, True, True, None, False)
+
+    m.detach_node_for_compose = detach
+    m.attach_node_from_compose = attach
+
     async def scenario():
         app = InferStackTUI(controller, catalog, interval=999, proc_factory=lambda svc: None, kube_manager=m)
         async with app.run_test(size=(180, 55)) as pilot:
@@ -311,7 +322,7 @@ def test_log_followers_pause_while_cluster_or_other_top_tab_is_visible(tmp_path)
         async with app.run_test(size=(180, 55)) as pilot:
             await pilot.pause()
             calls = []
-            app._restart_logs = lambda svc: calls.append('start')
+            app._restart_logs = lambda service: calls.append('start')
             app._terminate_logs = lambda: calls.append('stop')
             app.query_one('#docker', Collapsible).collapsed = False
             await pilot.pause()
@@ -360,7 +371,7 @@ def test_kubeai_lifecycle_evidence_and_namespace_scope():
     from infer_stack.kube.monitor import model_states
     r = lifecycle_report()
     assert model_states(r)['grp-q']['stage'] == 'declared'
-    pod = {'metadata': {'name': 'vllm', 'namespace': 'default', 'uid': 'pod-1',
+    pod: dict[str, Any] = {'metadata': {'name': 'vllm', 'namespace': 'default', 'uid': 'pod-1',
                        'labels': {'infer-stack/deployment': 'grp-q'}},
            'spec': {'nodeName': 'namek'}, 'status': {'phase': 'Pending'}}
     r['pods'] = [pod]
@@ -480,7 +491,7 @@ def test_kubeai_editor_refuses_existing_unsupported_launch(tmp_path, launch):
         async with app.run_test() as pilot:
             screen = _AddEndpointScreen(['qc'], kubeai=True, name='q',
                                         entry={'engine': 'vllm', 'model': 'qc', 'runtime': launch})
-            screen._error = errors.append
+            screen._error = lambda message: errors.append(message)
             app.push_screen(screen, results.append)
             await pilot.pause()
             screen.on_button_pressed(Button.Pressed(Button(id='ok')))
